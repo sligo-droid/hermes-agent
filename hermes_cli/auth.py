@@ -3933,6 +3933,36 @@ def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> b
         return False
 
 
+def _xai_proactive_refresh_skew_seconds(access_token: str) -> int:
+    """How far before JWT ``exp`` to proactively refresh xAI OAuth tokens.
+
+    Short-lived device-code JWTs should not use the full gateway refresh skew:
+    that would refresh on every credential resolution and can burn single-use
+    refresh tokens. Long-lived tokens keep the configured default skew.
+    """
+    max_skew = XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+    if not isinstance(access_token, str) or "." not in access_token:
+        return max_skew
+    try:
+        parts = access_token.split(".")
+        if len(parts) < 2:
+            return max_skew
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return max_skew
+        remaining = float(exp) - time.time()
+        if remaining <= 0:
+            return max_skew
+        if remaining <= 45 * 60:
+            return min(120, max_skew)
+        return max_skew
+    except Exception:
+        return max_skew
+
+
 def _xai_validate_oauth_endpoint(url: str, *, field: str) -> str:
     """Refuse any OIDC discovery endpoint that isn't HTTPS on the xAI origin.
 
@@ -4212,7 +4242,7 @@ def resolve_xai_oauth_runtime_credentials(
     *,
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
-    refresh_skew_seconds: int = XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    refresh_skew_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     data = _read_xai_oauth_tokens()
     tokens = dict(data["tokens"])
@@ -4222,9 +4252,14 @@ def resolve_xai_oauth_runtime_credentials(
     token_endpoint = str(discovery.get("token_endpoint", "") or "").strip()
     redirect_uri = str(data.get("redirect_uri", "") or "").strip()
 
+    effective_skew = (
+        int(refresh_skew_seconds)
+        if refresh_skew_seconds is not None
+        else _xai_proactive_refresh_skew_seconds(access_token)
+    )
     should_refresh = bool(force_refresh)
     if (not should_refresh) and refresh_if_expiring:
-        should_refresh = _xai_access_token_is_expiring(access_token, refresh_skew_seconds)
+        should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_xai_oauth_tokens(_lock=False)
@@ -4233,9 +4268,14 @@ def resolve_xai_oauth_runtime_credentials(
             discovery = dict(data.get("discovery") or {})
             token_endpoint = str(discovery.get("token_endpoint", "") or "").strip()
             redirect_uri = str(data.get("redirect_uri", "") or "").strip()
+            effective_skew = (
+                int(refresh_skew_seconds)
+                if refresh_skew_seconds is not None
+                else _xai_proactive_refresh_skew_seconds(access_token)
+            )
             should_refresh = bool(force_refresh)
             if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _xai_access_token_is_expiring(access_token, refresh_skew_seconds)
+                should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
             if should_refresh:
                 if not token_endpoint:
                     token_endpoint = _xai_oauth_discovery(refresh_timeout_seconds)["token_endpoint"]

@@ -177,7 +177,49 @@ class TestNestedTerminalCwdPlaceholderSkip:
         result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/from/env"})
         assert result["TERMINAL_ENV"] == "docker"
         assert result["TERMINAL_TIMEOUT"] == "300"
-        assert result["TERMINAL_CWD"] == "/from/env"
+        assert result.get("TERMINAL_CWD") is None
+
+    def test_docker_placeholder_does_not_inherit_host_home(self):
+        """terminal.cwd: '.' + docker + mount off must not resolve to host home."""
+        cfg = {
+            "terminal": {
+                "cwd": ".",
+                "backend": "docker",
+                "docker_mount_cwd_to_workspace": False,
+            },
+        }
+        result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/home/user"})
+        assert "TERMINAL_CWD" not in result
+
+    def test_docker_placeholder_mount_on_preserves_messaging_cwd(self):
+        """Mount-enabled docker still needs the host cwd signal for /workspace."""
+        cfg = {
+            "terminal": {
+                "cwd": ".",
+                "backend": "docker",
+                "docker_mount_cwd_to_workspace": True,
+            },
+        }
+        result = _simulate_config_bridge(
+            cfg, {"MESSAGING_CWD": "/host/project"}
+        )
+        assert result["TERMINAL_CWD"] == "/host/project"
+        assert result["TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"] == "True"
+
+    def test_ssh_placeholder_does_not_inherit_host_home(self):
+        cfg = {"terminal": {"cwd": "auto", "backend": "ssh"}}
+        result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/home/user"})
+        assert "TERMINAL_CWD" not in result
+
+    def test_local_placeholder_still_falls_back_to_messaging_cwd(self):
+        cfg = {"terminal": {"cwd": ".", "backend": "local"}}
+        result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/home/user"})
+        assert result["TERMINAL_CWD"] == "/home/user"
+
+    def test_terminal_home_mode_bridges_to_env(self):
+        cfg = {"terminal": {"home_mode": "profile"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_HOME_MODE"] == "profile"
 
 
 class TestTildeExpansion:
@@ -207,6 +249,30 @@ class TestTildeExpansion:
         }
         result = _simulate_config_bridge(cfg)
         assert result["TERMINAL_CWD"] == os.path.expanduser("~/nested")
+
+    def test_ssh_terminal_cwd_tilde_preserved_for_remote_shell(self, monkeypatch):
+        """SSH cwd '~' must mean the remote user's home, not the gateway host HOME."""
+        monkeypatch.setenv("HOME", "/opt/data")
+        cfg = {"terminal": {"backend": "ssh", "cwd": "~"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_ENV"] == "ssh"
+        assert result["TERMINAL_CWD"] == "~"
+
+    def test_ssh_terminal_cwd_tilde_child_preserved_for_remote_shell(self, monkeypatch):
+        """SSH cwd '~/x' must survive until the SSH shell expands remote HOME."""
+        monkeypatch.setenv("HOME", "/opt/data")
+        cfg = {"terminal": {"backend": "ssh", "cwd": "~/work"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_CWD"] == "~/work"
+
+    def test_ssh_terminal_placeholder_cwd_does_not_fallback_to_host_home(self, monkeypatch):
+        """SSH placeholder cwd should let terminal_tool use its remote-home default."""
+        monkeypatch.setenv("HOME", "/opt/data")
+        cfg = {"terminal": {"backend": "ssh", "cwd": "auto"}}
+        result = _simulate_config_bridge(cfg)
+        assert "TERMINAL_CWD" not in result
+
+
 class TestVercelTerminalBridge:
     def test_vercel_terminal_settings_bridge(self):
         cfg = {

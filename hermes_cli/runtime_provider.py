@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,12 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         return "codex_responses"
     if hostname == "api.openai.com":
         return "codex_responses"
-    if normalized.endswith("/anthropic"):
+    # Direct native Anthropic host: use /v1/messages, not the OpenAI-compatible
+    # /chat/completions shim that burns a separate extra-usage pool.
+    if hostname == "api.anthropic.com":
+        return "anthropic_messages"
+    path = urlparse(normalized).path.rstrip("/")
+    if path.endswith("/anthropic") or path.endswith("/anthropic/v1"):
         return "anthropic_messages"
     if hostname == "api.kimi.com" and "/coding" in normalized:
         return "anthropic_messages"

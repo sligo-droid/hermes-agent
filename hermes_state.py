@@ -1872,6 +1872,7 @@ class SessionDB:
         codex_message_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
+        timestamp: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -1895,7 +1896,16 @@ class SessionDB:
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
-        stored_content = self._encode_content(sanitize_history_content(content))
+        stored_content = self._encode_content(content)
+        message_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                if hasattr(timestamp, "timestamp"):
+                    message_timestamp = float(timestamp.timestamp())
+                else:
+                    message_timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
 
         # Pre-compute tool call count
         num_tool_calls = 0
@@ -1916,7 +1926,7 @@ class SessionDB:
                     tool_call_id,
                     tool_calls_json,
                     tool_name,
-                    time.time(),
+                    message_timestamp,
                     token_count,
                     finish_reason,
                     reasoning,
@@ -2283,7 +2293,20 @@ class SessionDB:
             except Exception:
                 return session_id
             if row is not None:
-                return session_id
+                child_row = self._conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE parent_session_id = ? "
+                    "ORDER BY started_at DESC, id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if child_row is None:
+                    return session_id
+                child_id = child_row["id"] if hasattr(child_row, "keys") else child_row[0]
+                msg_row = self._conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                    (child_id,),
+                ).fetchone()
+                return child_id if msg_row is not None else session_id
 
             # Walk descendants: at each step, pick the most-recently-started
                 # child session; stop once we find one with messages.

@@ -61,6 +61,7 @@ def session_context_engaged() -> bool:
 # ---------------------------------------------------------------------------
 
 _SESSION_PLATFORM: ContextVar = ContextVar("HERMES_SESSION_PLATFORM", default=_UNSET)
+_SESSION_SOURCE: ContextVar = ContextVar("HERMES_SESSION_SOURCE", default=_UNSET)
 _SESSION_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_CHAT_ID", default=_UNSET)
 _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=_UNSET)
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
@@ -69,6 +70,8 @@ _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
+_SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+_SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 _PROJECT_PATH: ContextVar = ContextVar("HERMES_PROJECT_PATH", default=_UNSET)
 _PROJECT_NAME: ContextVar = ContextVar("HERMES_PROJECT_NAME", default=_UNSET)
 _PROJECT_GITHUB_URL: ContextVar = ContextVar("HERMES_PROJECT_GITHUB_URL", default=_UNSET)
@@ -91,6 +94,7 @@ _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
+    "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
     "HERMES_SESSION_CHAT_ID": _SESSION_CHAT_ID,
     "HERMES_SESSION_CHAT_NAME": _SESSION_CHAT_NAME,
     "HERMES_SESSION_THREAD_ID": _SESSION_THREAD_ID,
@@ -99,6 +103,7 @@ _VAR_MAP = {
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_CWD": _SESSION_CWD,
+    "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_PROJECT_PATH": _PROJECT_PATH,
     "HERMES_PROJECT_NAME": _PROJECT_NAME,
     "HERMES_PROJECT_GITHUB_URL": _PROJECT_GITHUB_URL,
@@ -132,13 +137,18 @@ def set_current_session_id(session_id: str) -> None:
 
 def set_session_vars(
     platform: str = "",
+    source: str = "",
     chat_id: str = "",
     chat_name: str = "",
     thread_id: str = "",
     user_id: str = "",
     user_name: str = "",
     session_key: str = "",
+    session_id: str = "",
     session_cwd: str = "",
+    cwd: str = "",
+    profile: str = "",
+    async_delivery: bool = True,
     project_path: str = "",
     project_name: str = "",
     project_github_url: str = "",
@@ -160,16 +170,21 @@ def set_session_vars(
     """
     global _session_context_engaged
     _session_context_engaged = True
+    effective_cwd = cwd or session_cwd
 
     tokens = [
         _SESSION_PLATFORM.set(platform),
+        _SESSION_SOURCE.set(source),
         _SESSION_CHAT_ID.set(chat_id),
         _SESSION_CHAT_NAME.set(chat_name),
         _SESSION_THREAD_ID.set(thread_id),
         _SESSION_USER_ID.set(user_id),
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
-        _SESSION_CWD.set(session_cwd),
+        _SESSION_ID.set(session_id),
+        _SESSION_CWD.set(effective_cwd),
+        _SESSION_PROFILE.set(profile),
+        _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
         _PROJECT_PATH.set(project_path),
         _PROJECT_NAME.set(project_name),
         _PROJECT_GITHUB_URL.set(project_github_url),
@@ -181,6 +196,12 @@ def set_session_vars(
         _KANBAN_NOTIFY_PROFILE.set(kanban_notify_profile),
         _SESSION_MESSAGE_ID.set(message_id),
     ]
+    try:
+        from agent.runtime_cwd import set_session_cwd
+
+        set_session_cwd(effective_cwd)
+    except Exception:
+        pass
     return tokens
 
 
@@ -197,6 +218,7 @@ def clear_session_vars(tokens: list) -> None:
     """
     for var in (
         _SESSION_PLATFORM,
+        _SESSION_SOURCE,
         _SESSION_CHAT_ID,
         _SESSION_CHAT_NAME,
         _SESSION_THREAD_ID,
@@ -205,6 +227,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_KEY,
         _SESSION_ID,
         _SESSION_CWD,
+        _SESSION_PROFILE,
         _PROJECT_PATH,
         _PROJECT_NAME,
         _PROJECT_GITHUB_URL,
@@ -217,6 +240,26 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
     ):
         var.set("")
+    _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    try:
+        from agent.runtime_cwd import clear_session_cwd
+
+        clear_session_cwd()
+    except Exception:
+        pass
+
+
+def reset_session_vars() -> None:
+    """Reset session context variables to the unbound sentinel for this context."""
+    for var in _VAR_MAP.values():
+        var.set(_UNSET)
+    _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    try:
+        from agent.runtime_cwd import clear_session_cwd
+
+        clear_session_cwd()
+    except Exception:
+        pass
 
 
 def get_session_env(name: str, default: str = "") -> str:
@@ -243,3 +286,11 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def async_delivery_supported() -> bool:
+    """Whether the current session can deliver background completions later."""
+    value = _SESSION_ASYNC_DELIVERY.get()
+    if value is _UNSET:
+        return True
+    return bool(value)

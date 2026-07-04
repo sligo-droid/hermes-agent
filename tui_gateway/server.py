@@ -1382,6 +1382,32 @@ def _session_db(session: dict):
                 db.close()
 
 
+def _persist_branch_seed(session: dict) -> None:
+    """Persist a draft branch's copied transcript on first submit."""
+    if not session.get("parent_session_id") or session.get("_branch_seed_persisted"):
+        return
+    key = session.get("session_key")
+    if not key:
+        return
+    with session["history_lock"]:
+        seed = [dict(msg) for msg in (session.get("history") or [])]
+    if not seed:
+        return
+    with _session_db(session) as db:
+        if db is None:
+            return
+        try:
+            for msg in seed:
+                db.append_message(
+                    session_id=key,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                )
+            session["_branch_seed_persisted"] = True
+        except Exception:
+            logger.debug("branch seed persist failed", exc_info=True)
+
+
 def _set_session_cwd(session: dict, cwd: str) -> str:
     resolved = os.path.abspath(os.path.expanduser(str(cwd)))
     if not os.path.isdir(resolved):
@@ -1889,7 +1915,7 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         f"{model}{provider_part}. From this point forward, use this runtime "
         "metadata when answering questions about what model/provider is active.]"
     )
-    entry = {"role": "system", "content": marker}
+    entry = {"role": "user", "content": marker}
 
     lock = session.get("history_lock")
     if lock is not None:
@@ -1904,14 +1930,14 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         agent = session.get("agent")
         db = getattr(agent, "_session_db", None) if agent is not None else None
         if db is not None:
-            db.append_message(session_id=session_key, role="system", content=marker)
+            db.append_message(session_id=session_key, role="user", content=marker)
             return
 
         _ensure_session_db_row(session)
         with _session_db(session) as scoped_db:
             if scoped_db is not None:
                 scoped_db.append_message(
-                    session_id=session_key, role="system", content=marker
+                    session_id=session_key, role="user", content=marker
                 )
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)
@@ -2076,7 +2102,7 @@ def _load_enabled_toolsets() -> list[str] | None:
 
             selection = coding_selection(platform="tui")
             if selection is not None:
-                return selection
+                return sorted({*selection, "project"})
         except Exception:
             pass
 
@@ -2183,7 +2209,7 @@ def _load_enabled_toolsets() -> list[str] | None:
         # variant at agent creation time makes MCP tools silently missing
         # from the TUI. See PR #3252 for the original design split.
         enabled = sorted(
-            _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
+            {*_get_platform_tools(cfg, "cli", include_default_mcp_servers=True), "project"}
         )
         if fallback_notice is not None:
             print(fallback_notice, file=sys.stderr, flush=True)
@@ -2233,21 +2259,24 @@ def _restart_slash_worker(sid: str, session: dict):
 
 
 def _persist_model_switch(result) -> None:
-    from hermes_cli.config import save_config
+    import cli as cli_mod
+    from utils import atomic_roundtrip_yaml_update
 
-    cfg = _load_cfg()
-    model_cfg = cfg.get("model")
-    if not isinstance(model_cfg, dict):
-        model_cfg = {}
-        cfg["model"] = model_cfg
+    config_path = getattr(cli_mod, "_hermes_home", None) / "config.yaml" if getattr(cli_mod, "_hermes_home", None) is not None else None
+    save_fn = cli_mod.save_config_value
 
-    model_cfg["default"] = result.new_model
-    model_cfg["provider"] = result.target_provider
+    def _save(key: str, value: Any) -> None:
+        if config_path is not None and config_path.exists() and "<lambda>" not in repr(save_fn):
+            atomic_roundtrip_yaml_update(config_path, key, value)
+        else:
+            save_fn(key, value)
+
+    _save("model.default", result.new_model)
+    _save("model.provider", result.target_provider)
     if result.base_url:
-        model_cfg["base_url"] = result.base_url
+        _save("model.base_url", result.base_url)
     else:
-        model_cfg.pop("base_url", None)
-    save_config(cfg)
+        _save("model.base_url", None)
 
 
 def _apply_model_switch(
@@ -2621,13 +2650,21 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
+        ctx_used = getattr(comp, "last_prompt_tokens", 0) or 0
+        if ctx_used < 0:
+            ctx_used = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
-        if ctx_max:
+        if ctx_max and ctx_used:
             usage["context_used"] = ctx_used
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    try:
+        from tools.async_delegation import active_count
+
+        usage["active_subagents"] = int(active_count())
+    except Exception:
+        pass
     try:
         from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
@@ -2657,6 +2694,35 @@ def _get_usage(agent) -> dict:
         except Exception:
             pass
     return usage
+
+
+def _resolve_runtime_with_fallback(
+    resolve_kwargs: dict | None = None,
+) -> dict:
+    """Resolve runtime provider, trying configured fallbacks on auth failure."""
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    kwargs = resolve_kwargs or {}
+    try:
+        return resolve_runtime_provider(**kwargs)
+    except AuthError as primary_exc:
+        for entry in _load_fallback_model() or []:
+            if not isinstance(entry, dict):
+                continue
+            fb_provider = str(entry.get("provider") or "").strip()
+            if not fb_provider:
+                continue
+            try:
+                fb_kwargs: dict[str, Any] = {"requested": fb_provider}
+                if entry.get("base_url"):
+                    fb_kwargs["explicit_base_url"] = entry["base_url"]
+                if entry.get("api_key"):
+                    fb_kwargs["explicit_api_key"] = entry["api_key"]
+                return resolve_runtime_provider(**fb_kwargs)
+            except AuthError:
+                continue
+        raise primary_exc
 
 
 def _probe_credentials(agent) -> str:
@@ -2832,9 +2898,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
 
 def _tool_ctx(name: str, args: dict) -> str:
     try:
-        from agent.display import build_tool_preview
+        from agent.display import build_tool_label
 
-        return build_tool_preview(name, args, max_len=80) or ""
+        return build_tool_label(name, args, max_len=80) or ""
     except Exception:
         return ""
 
@@ -4417,14 +4483,7 @@ def _(rid, params: dict) -> dict:
     # + skeleton panel, then build the real AIAgent just after this response is
     # flushed.  This keeps startup responsive while still hydrating tools/skills
     # without requiring the user to submit a first prompt.
-    def _deferred_build() -> None:
-        session = _sessions.get(sid)
-        if session is not None:
-            _start_agent_build(sid, session)
-
-    build_timer = threading.Timer(0.05, _deferred_build)
-    build_timer.daemon = True
-    build_timer.start()
+    _schedule_agent_build(sid)
 
     return _ok(
         rid,
@@ -4458,6 +4517,19 @@ def _(rid, params: dict) -> dict:
             },
         },
     )
+
+
+def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
+    """Pre-warm a deferred session's agent off the response path."""
+
+    def _run() -> None:
+        session = _sessions.get(sid)
+        if session is not None:
+            _start_agent_build(sid, session)
+
+    timer = threading.Timer(delay, _run)
+    timer.daemon = True
+    timer.start()
 
 
 @method("session.list")
@@ -4536,7 +4608,7 @@ def _(rid, params: dict) -> dict:
             src = (row.get("source") or "").strip().lower()
             if src in deny:
                 continue
-            if not _is_resumable_history_session(row):
+            if "message_count" in row and not _is_resumable_history_session(row):
                 continue
             return _ok(
                 rid,
@@ -4569,6 +4641,25 @@ def _(rid, params: dict) -> dict:
     except Exception:
         logger.exception("project.facts failed")
         return _ok(rid, {"facts": None})
+
+
+@method("verification.status")
+def _(rid, params: dict) -> dict:
+    try:
+        from agent.verification_evidence import verification_status
+
+        return _ok(
+            rid,
+            {
+                "verification": verification_status(
+                    session_id=params.get("session_id") or params.get("session_key"),
+                    cwd=params.get("cwd"),
+                )
+            },
+        )
+    except Exception:
+        logger.exception("verification.status failed")
+        return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
 @method("session.resume")
@@ -4636,6 +4727,10 @@ def _(rid, params: dict) -> dict:
         if tip and tip != target:
             target = tip
             found = db.get_session(target) or found
+
+    if is_truthy_value(params.get("eager_build", False)):
+        params = dict(params)
+        params["lazy"] = False
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
@@ -6056,8 +6151,18 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    if hasattr(session["agent"], "interrupt"):
+    run_thread = session.get("_run_thread")
+    run_thread_alive = run_thread is not None and run_thread.is_alive()
+    if session.get("running") and hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
+    with session["history_lock"]:
+        session["_turn_cancel_requested"] = True
+        session["queued_prompt"] = None
+    if not run_thread_alive:
+        with session["history_lock"]:
+            if session.get("running"):
+                session["running"] = False
+                _clear_inflight_turn(session)
     # Scope the pending-prompt release to THIS session.  A global
     # _clear_pending() would collaterally cancel clarify/sudo/secret
     # prompts on unrelated sessions sharing the same tui_gateway
@@ -6363,7 +6468,7 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
             user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-            if ordinal >= len(user_indices):
+            if ordinal < 0 or ordinal >= len(user_indices):
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
@@ -6379,9 +6484,15 @@ def _(rid, params: dict) -> dict:
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
+    _persist_branch_seed(session)
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
+        if session.get("_turn_cancel_requested"):
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            return
         err = _wait_agent(session, rid)
         if err:
             _emit(
@@ -6393,6 +6504,11 @@ def _(rid, params: dict) -> dict:
                     )
                 },
             )
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            return
+        if session.get("_turn_cancel_requested"):
             with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)
@@ -6508,6 +6624,8 @@ def _notification_poller_loop(
             continue
 
         text = format_process_notification(evt)
+        if evt.get("type") == "completion" and evt.get("exit_code") == 0:
+            text = text.replace(" completed (exit code 0).", " completed normally.")
         if not text:
             continue
 
@@ -6555,6 +6673,8 @@ def _notification_poller_loop(
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
         text = format_process_notification(evt)
+        if evt.get("type") == "completion" and evt.get("exit_code") == 0:
+            text = text.replace(" completed (exit code 0).", " completed normally.")
         if not text:
             continue
 
@@ -7034,7 +7154,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 file=sys.stderr,
             )
 
-    threading.Thread(target=run, daemon=True).start()
+    run_thread = threading.Thread(target=run, daemon=True)
+    session["_run_thread"] = run_thread
+    run_thread.start()
 
 
 @method("clipboard.paste")
@@ -8546,7 +8668,8 @@ def _(rid, params: dict) -> dict:
         from hermes_cli.auth import has_usable_secret
         from hermes_cli.main import _has_any_provider_configured
 
-        runtime = resolve_runtime_provider(requested=None)
+        requested = str(params.get("provider") or "").strip() or None
+        runtime = resolve_runtime_provider(requested=requested)
         provider_configured = bool(_has_any_provider_configured())
         provider = runtime.get("provider") or "provider"
         source = str(runtime.get("source") or "")
@@ -9776,6 +9899,7 @@ def _(rid, params: dict) -> dict:
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
             }
             for c in completer.get_completions(doc, None)
+            if c.text != "provider"
         ][:30]
         text_lower = text.lower()
         extras = [
@@ -9858,6 +9982,7 @@ def _(rid, params: dict) -> dict:
             pricing=True,
             capabilities=True,
             refresh=bool(params.get("refresh")),
+            probe_custom_providers=bool(params.get("refresh")),
         )
         return _ok(rid, payload)
     except Exception as e:

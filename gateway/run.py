@@ -1075,8 +1075,12 @@ def _bridge_gateway_config_to_env(
 
     ``config.yaml`` is authoritative for terminal settings.  Top-level
     ``cwd``/``backend`` are convenience aliases, but nested ``terminal``
-    values take precedence when present.
+    values take precedence when present. Placeholder cwd values are resolved
+    with backend-aware semantics so container/SSH gateways do not inherit the
+    host Hermes home as a bogus remote working directory.
     """
+    from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
+
     target_env = env if env is not None else os.environ
 
     # Top-level simple values (fallback only — don't override .env)
@@ -1086,10 +1090,17 @@ def _bridge_gateway_config_to_env(
 
     terminal_cfg = cfg.get("terminal", {})
     if terminal_cfg and isinstance(terminal_cfg, dict):
+        terminal_backend = str(
+            terminal_cfg.get("backend")
+            or terminal_cfg.get("env_type")
+            or target_env.get("TERMINAL_ENV")
+            or ""
+        ).strip().lower()
         terminal_env_map = {
             "backend": "TERMINAL_ENV",
             "cwd": "TERMINAL_CWD",
             "timeout": "TERMINAL_TIMEOUT",
+            "home_mode": "TERMINAL_HOME_MODE",
             "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
             "docker_image": "TERMINAL_DOCKER_IMAGE",
             "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
@@ -1117,10 +1128,15 @@ def _bridge_gateway_config_to_env(
         for cfg_key, env_var in terminal_env_map.items():
             if cfg_key in terminal_cfg:
                 val = terminal_cfg[cfg_key]
-                if cfg_key == "cwd" and str(val) in {".", "auto", "cwd"}:
+                if cfg_key == "cwd" and str(val) in CWD_PLACEHOLDERS:
                     continue
                 if cfg_key == "cwd" and isinstance(val, str):
-                    val = os.path.expanduser(val)
+                    stripped = val.strip()
+                    ssh_remote_tilde = terminal_backend == "ssh" and (
+                        stripped == "~" or stripped.startswith("~/")
+                    )
+                    if not ssh_remote_tilde:
+                        val = os.path.expanduser(stripped)
                 if isinstance(val, (list, dict)):
                     target_env[env_var] = json.dumps(val)
                 else:
@@ -1151,9 +1167,21 @@ def _bridge_gateway_config_to_env(
             target_env["TERMINAL_ENV"] = alias_val.strip()
 
     configured_cwd = str(target_env.get("TERMINAL_CWD", "")).strip()
-    if not configured_cwd or configured_cwd in {".", "auto", "cwd"}:
-        fallback = target_env.get("MESSAGING_CWD") or str(hermes_home or get_hermes_home())
-        target_env["TERMINAL_CWD"] = str(fallback)
+    if not configured_cwd or configured_cwd in CWD_PLACEHOLDERS:
+        resolved_cwd = resolve_placeholder_terminal_cwd(
+            configured_cwd=configured_cwd,
+            terminal_backend=str(target_env.get("TERMINAL_ENV", "")),
+            messaging_cwd=target_env.get("MESSAGING_CWD"),
+            docker_mount_cwd_to_workspace=str(
+                target_env.get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+            ).lower()
+            in {"true", "1", "yes"},
+            home_fallback=str(hermes_home or get_hermes_home()),
+        )
+        if resolved_cwd is None:
+            target_env.pop("TERMINAL_CWD", None)
+        else:
+            target_env["TERMINAL_CWD"] = resolved_cwd
 
     return target_env
 
@@ -1327,13 +1355,27 @@ os.environ["HERMES_EXEC_ASK"] = "1"
 
 # Set terminal working directory for messaging platforms.
 # config.yaml terminal.cwd is the canonical source (bridged to TERMINAL_CWD
-# by the config bridge above).  When it's unset or a placeholder, default
-# to the active Hermes home.  MESSAGING_CWD is accepted as a backward-compat
-# fallback (deprecated — the warning above tells users to migrate).
+# by the config bridge above).  Placeholder values are resolved per-backend —
+# see gateway/cwd_placeholder.py for the three-case contract (local vs docker
+# mount-off vs docker mount-on).  MESSAGING_CWD is a backward-compat fallback.
+from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
+
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
-if not _configured_cwd or _configured_cwd in {".", "auto", "cwd"}:
-    _fallback = os.getenv("MESSAGING_CWD") or str(get_hermes_home())
-    os.environ["TERMINAL_CWD"] = _fallback
+if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
+    _resolved_cwd = resolve_placeholder_terminal_cwd(
+        configured_cwd=_configured_cwd,
+        terminal_backend=os.environ.get("TERMINAL_ENV", ""),
+        messaging_cwd=os.getenv("MESSAGING_CWD"),
+        docker_mount_cwd_to_workspace=os.getenv(
+            "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false"
+        ).lower()
+        in {"true", "1", "yes"},
+        home_fallback=str(get_hermes_home()),
+    )
+    if _resolved_cwd is None:
+        os.environ.pop("TERMINAL_CWD", None)
+    else:
+        os.environ["TERMINAL_CWD"] = _resolved_cwd
 
 
 def _apply_gateway_process_cwd() -> bool:
@@ -1344,7 +1386,7 @@ def _apply_gateway_process_cwd() -> bool:
         return False
 
     raw_cwd = os.environ.get("TERMINAL_CWD", "").strip()
-    if not raw_cwd or raw_cwd in {".", "auto", "cwd"}:
+    if not raw_cwd or raw_cwd in CWD_PLACEHOLDERS:
         return False
 
     try:
@@ -2114,7 +2156,7 @@ def _normalize_empty_agent_response(
         return (
             "⚠️ No response was generated before the turn started. "
             "This usually means the previous /stop or restart invalidated the "
-            "session state; send your message again or use /reset if it repeats."
+            "session state; send it again or use /reset if it repeats."
         )
 
     return response
