@@ -24,6 +24,10 @@ def _make_runner():
     runner._pending_approvals = {}
     runner._queued_events = {}
     runner._busy_ack_ts = {}
+    runner._session_model_overrides = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._evict_cached_agent = MagicMock()
     runner._draining = False
     runner._busy_input_mode = "interrupt"
     runner._is_user_authorized = lambda _source: True
@@ -48,27 +52,48 @@ def _make_event(text="/fable build X"):
 
 
 @pytest.mark.asyncio
-async def test_fable_command_returns_runner_plan_without_normal_agent(monkeypatch):
+async def test_fable_command_routes_through_normal_agent_with_fable_override(monkeypatch):
     from gateway.run import GatewayRunner
-    from hermes_cli.fable_planner import FablePlanResult
 
     runner = _make_runner()
 
-    def fake_generate(request, config=None):
+    def fake_build(request, task_id=None):
         assert request.prompt == "build X"
         assert request.platform == "discord"
-        return FablePlanResult(True, "# Implementation Plan\n\nPlan only.", "anthropic_oauth", "claude-fable-5")
+        assert task_id == build_session_key(_make_event().source)
+        return "PLAN SKILL: build X"
 
-    monkeypatch.setattr("hermes_cli.fable_planner.generate_fable_plan", fake_generate)
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", fake_build)
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (
+            {
+                "model": "claude-fable-5",
+                "provider": "anthropic",
+                "api_key": "sk-ant-oat01-test",
+                "base_url": "https://api.anthropic.com",
+                "api_mode": "anthropic_messages",
+            },
+            "",
+        ),
+    )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
 
     result = await GatewayRunner._handle_message(runner, _make_event())
 
     assert isinstance(result, MetadataReply)
-    assert "Implementation Plan" in result
+    assert result == "agent response"
     assert result.metadata["command"] == "fable"
     assert result.metadata["plan_artifact_kind"] == "fable_plan"
-    runner._handle_message_with_agent.assert_not_awaited()
+    assert result.metadata["provider"] == "anthropic"
+    assert result.metadata["model"] == "claude-fable-5"
+    assert result.metadata["transport"] == "anthropic_oauth"
+    assert result.metadata["source_message_id"] == "msg1"
+    runner._handle_message_with_agent.assert_awaited_once()
+    agent_event = runner._handle_message_with_agent.await_args.args[0]
+    assert agent_event.text == "PLAN SKILL: build X"
+    assert agent_event.invoked_skill_command == "fable"
+    assert build_session_key(agent_event.source) not in runner._session_model_overrides
 
 
 @pytest.mark.asyncio
@@ -85,14 +110,14 @@ async def test_fable_command_usage_without_args(monkeypatch):
 @pytest.mark.asyncio
 async def test_fable_command_failure_is_not_plan_artifact_metadata(monkeypatch):
     from gateway.run import GatewayRunner
-    from hermes_cli.fable_planner import FablePlanResult
 
     runner = _make_runner()
 
-    def fake_generate(request, config=None):
-        return FablePlanResult(False, "", "anthropic_oauth", "claude-fable-5", error="route unavailable")
-
-    monkeypatch.setattr("hermes_cli.fable_planner.generate_fable_plan", fake_generate)
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", lambda *_args, **_kwargs: "PLAN")
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (None, "route unavailable"),
+    )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
 
     result = await GatewayRunner._handle_message(runner, _make_event())

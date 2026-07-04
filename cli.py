@@ -8528,27 +8528,29 @@ class HermesCLI:
             print(output)
 
     def _handle_fable_command(self, cmd: str) -> None:
-        """Handle /fable <request> as a plan-only one-shot."""
+        """Handle /fable <request> by enqueueing the plan skill for the agent loop."""
         parts = cmd.split(None, 1)
         prompt = parts[1].strip() if len(parts) > 1 else ""
         if not prompt:
             _cprint("  Usage: /fable <request>")
             return
 
-        from hermes_cli.fable_planner import FablePlanRequest, generate_fable_plan
+        from hermes_cli.fable_planner import FablePlanRequest, build_fable_plan_invocation
 
-        request = FablePlanRequest(
+        msg = build_fable_plan_invocation(FablePlanRequest(
             prompt=prompt,
             session_id=getattr(self, "session_id", "") or "",
             workdir=os.getcwd(),
             source_text=cmd,
             platform="cli",
-        )
-        result = generate_fable_plan(request)
-        if result.ok:
-            print(result.content)
+        ))
+        if msg:
+            if hasattr(self, '_pending_input'):
+                self._pending_input.put(msg)
+            else:
+                print(msg)
             return
-        _cprint(f"\033[1;31m{_escape(result.error or 'Fable plan generation failed.')}{_RST}")
+        _cprint("\033[1;31m/fable requires the `plan` skill, but it is not installed or could not be loaded.\033[0m")
 
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
