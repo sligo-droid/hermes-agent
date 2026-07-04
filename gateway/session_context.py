@@ -44,6 +44,18 @@ from typing import Any
 # When it holds "" (after clear_session_vars resets it), we return "" — no fallback.
 _UNSET: Any = object()
 
+# Process-level latch: once any code in this process binds session ContextVars,
+# subprocess-env builders must treat ContextVars as authoritative and strip
+# stale process-global HERMES_SESSION_* values when the ContextVar is _UNSET.
+# Pure one-shot CLI paths that never call set_session_vars keep the os.environ
+# fallback for backwards compatibility.
+_session_context_engaged: bool = False
+
+
+def session_context_engaged() -> bool:
+    return _session_context_engaged
+
+
 # ---------------------------------------------------------------------------
 # Per-task session variables
 # ---------------------------------------------------------------------------
@@ -146,6 +158,9 @@ def set_session_vars(
     Returns a list of ``Token`` objects (one per variable) that can be
     passed to ``clear_session_vars``.
     """
+    global _session_context_engaged
+    _session_context_engaged = True
+
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_CHAT_ID.set(chat_id),

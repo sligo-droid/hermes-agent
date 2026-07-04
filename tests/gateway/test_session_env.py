@@ -348,6 +348,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         )
     finally:
         runner._clear_session_env(tokens)
+        runner._shutdown_executor()
 
     assert result == {
         "platform": "telegram",
@@ -365,7 +366,10 @@ async def test_run_in_executor_with_context_forwards_args():
     def add(a, b):
         return a + b
 
-    result = await runner._run_in_executor_with_context(add, 3, 7)
+    try:
+        result = await runner._run_in_executor_with_context(add, 3, 7)
+    finally:
+        runner._shutdown_executor()
     assert result == 10
 
 
@@ -377,5 +381,46 @@ async def test_run_in_executor_with_context_propagates_exceptions():
     def blow_up():
         raise ValueError("boom")
 
-    with pytest.raises(ValueError, match="boom"):
-        await runner._run_in_executor_with_context(blow_up)
+    try:
+        with pytest.raises(ValueError, match="boom"):
+            await runner._run_in_executor_with_context(blow_up)
+    finally:
+        runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_run_in_executor_with_context_survives_default_executor_shutdown():
+    """Gateway agent work should not depend on asyncio's default executor."""
+    runner = _gateway_runner()
+    loop = asyncio.get_running_loop()
+
+    await loop.run_in_executor(None, lambda: None)
+    await loop.shutdown_default_executor()
+
+    try:
+        result = await runner._run_in_executor_with_context(lambda: "ok")
+    finally:
+        runner._shutdown_executor()
+
+    assert result == "ok"
+
+
+@pytest.mark.asyncio
+async def test_gateway_executor_refuses_resurrection_after_shutdown():
+    """A real gateway shutdown must NOT be resurrected by the recreate path.
+
+    _shutdown_executor() means "we're stopping" — the recreate-on-shutdown
+    logic exists to survive an *external* teardown of the loop default
+    (test_..._survives_default_executor_shutdown), not to undo our own stop.
+    """
+    runner = _gateway_runner()
+
+    try:
+        first = await runner._run_in_executor_with_context(lambda: "first")
+        assert first == "first"
+        runner._shutdown_executor()
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await runner._run_in_executor_with_context(lambda: "second")
+    finally:
+        runner._shutdown_executor()

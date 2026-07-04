@@ -37,6 +37,23 @@ from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
 
+judge_goal: Any
+try:
+    from hermes_cli import goals as _goals
+
+    judge_goal = _goals.judge_goal
+except Exception:  # pragma: no cover - import should succeed in normal runtime
+    def _fallback_judge_goal(
+        goal: str,
+        last_response: str,
+        *,
+        timeout: float = 30.0,
+        subgoals=None,
+    ) -> tuple[str, str, bool]:
+        return "continue", "auxiliary client unavailable", False
+
+    judge_goal = _fallback_judge_goal
+
 
 # ---------------------------------------------------------------------------
 # Gating
@@ -196,6 +213,22 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"tasks, or kanban_create to spawn follow-up work."
         )
     return None
+
+
+def _goal_judge_available() -> bool:
+    """Return whether the auxiliary goal judge is configured.
+
+    Goal-mode Kanban completion is fail-open when no judge is reachable; that
+    prevents workers from wedging forever on hosts without an auxiliary model.
+    Tests monkeypatch this probe to exercise both branches without network.
+    """
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+
+        client, model = get_text_auxiliary_client("goal_judge")
+        return client is not None and bool(model)
+    except Exception:
+        return False
 
 
 def _connect(board: Optional[str] = None):
@@ -591,6 +624,36 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
+            if task is not None and getattr(task, "goal_mode", False) and _goal_judge_available():
+                last_response = "\n\n".join(
+                    str(part).strip()
+                    for part in (summary, result)
+                    if part is not None and str(part).strip()
+                )
+                try:
+                    judgment = judge_goal(
+                        str(getattr(task, "body", "") or getattr(task, "title", "") or ""),
+                        last_response,
+                        timeout=30.0,
+                    )
+                    verdict = str(judgment[0] if len(judgment) > 0 else "continue").strip().lower()
+                    judge_reason = str(judgment[1] if len(judgment) > 1 else "goal not verified")
+                except Exception as judge_exc:
+                    logger.info(
+                        "kanban_complete goal judge failed for %s; allowing completion: %s",
+                        tid,
+                        judge_exc,
+                    )
+                    verdict = "done"
+                    judge_reason = "judge unavailable"
+                if verdict != "done":
+                    return tool_error(
+                        "Goal completion rejected by judge: "
+                        f"{judge_reason}. Your task is still in-flight. "
+                        "Continue working, or create explicit follow-up/child tasks "
+                        f"with parents=[{tid}] before completing."
+                    )
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -646,13 +709,26 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    kind = args.get("kind")
+    if kind is not None:
+        kind = str(kind).strip() or None
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
+            if task is not None and getattr(task, "goal_mode", False):
+                if kind not in {"dependency", "needs_input"}:
+                    return tool_error(
+                        "goal_mode tasks may only use kanban_block for genuine "
+                        "external blockers with kind='dependency' or "
+                        "kind='needs_input'. Continue working or call "
+                        "kanban_complete when the goal is actually satisfied."
+                    )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
+                kind=kind,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1217,6 +1293,17 @@ KANBAN_BLOCK_SCHEMA = {
                     "What you need answered, in one or two sentences. "
                     "Don't paste the whole conversation; the human has "
                     "the board and can ask follow-ups via comments."
+                ),
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "description": (
+                    "Typed blocker. Use 'dependency' when waiting on another "
+                    "task, 'needs_input' for a human decision, 'capability' "
+                    "for missing access/permissions, or 'transient' for a "
+                    "temporary external failure. Goal-mode tasks may only "
+                    "block with 'dependency' or 'needs_input'."
                 ),
             },
             "board": _board_schema_prop(),

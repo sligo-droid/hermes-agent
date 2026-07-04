@@ -116,7 +116,13 @@ def _refresh_worker_entry(pool: Any, entry: Any) -> Any:
     if not _string_attr(entry, "access_token") or not _string_attr(entry, "refresh_token"):
         return None
     try:
-        refreshed = pool._refresh_entry(entry, force=False)  # type: ignore[attr-defined]
+        # Worker homes need Codex's id_token, not just a valid access token.
+        # CredentialPool._refresh_entry(force=False) can short-circuit when the
+        # access token is still fresh, leaving legacy pool rows without an
+        # id_token unusable for app-server workers. Force the refresh when we
+        # reached this path: _usable_worker_entry already proved the entry is
+        # missing required worker tokens or needs refresh.
+        refreshed = pool._refresh_entry(entry, force=True)  # type: ignore[attr-defined]
     except Exception as exc:
         logger.debug(
             "Could not refresh openai-codex worker credential %s: %s",

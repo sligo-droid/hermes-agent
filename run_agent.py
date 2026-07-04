@@ -1681,12 +1681,50 @@ class AIAgent:
         str(error) for everything else.
         """
         raw = str(error)
+        response_text = ""
+        response = getattr(error, "response", None)
+        if response is not None:
+            candidate = getattr(response, "text", "")
+            if isinstance(candidate, str):
+                response_text = candidate.strip()
 
         if (
             isinstance(error, ValueError)
             and "expected ident at line" in raw.lower()
         ):
-            return f"Malformed provider streaming response: {raw[:300]}"
+            return f"Malformed provider streaming response: {redact_sensitive_text(raw[:300])}"
+
+        # JSON body errors from OpenAI/Anthropic SDKs
+        body = getattr(error, "body", None)
+        if isinstance(body, dict):
+            msg = body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
+            if msg:
+                status_code = getattr(error, "status_code", None)
+                prefix = f"HTTP {status_code}: " if status_code else ""
+                return f"{prefix}{redact_sensitive_text(str(msg)[:300])}"
+
+        # Some SDK errors leave ``body`` empty and ``str(error)`` blank while
+        # the real provider/proxy payload is still on ``error.response.text``.
+        # Prefer a structured JSON error message when possible; otherwise use
+        # the raw response text so users do not see a bare "HTTP 400".
+        if response_text and not raw.strip():
+            try:
+                parsed = json.loads(response_text)
+            except Exception:
+                raw = response_text
+            else:
+                if isinstance(parsed, dict):
+                    parsed_error = parsed.get("error")
+                    msg = None
+                    if isinstance(parsed_error, dict):
+                        msg = parsed_error.get("message")
+                    elif isinstance(parsed_error, str):
+                        msg = parsed_error
+                    if not msg:
+                        msg = parsed.get("message")
+                    raw = str(msg) if msg else response_text
+                else:
+                    raw = response_text
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
         if "<!DOCTYPE" in raw or "<html" in raw:
@@ -1699,24 +1737,15 @@ class AIAgent:
             parts = []
             if status_code:
                 parts.append(f"HTTP {status_code}")
-            parts.append(title)
+            parts.append(redact_sensitive_text(title))
             if ray_id:
-                parts.append(f"Ray {ray_id}")
+                parts.append(f"Ray {redact_sensitive_text(ray_id)}")
             return " — ".join(parts)
-
-        # JSON body errors from OpenAI/Anthropic SDKs
-        body = getattr(error, "body", None)
-        if isinstance(body, dict):
-            msg = body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
-            if msg:
-                status_code = getattr(error, "status_code", None)
-                prefix = f"HTTP {status_code}: " if status_code else ""
-                return f"{prefix}{msg[:300]}"
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
-        return f"{prefix}{raw[:500]}"
+        return f"{prefix}{redact_sensitive_text(raw[:500])}"
 
     def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
         # Azure Foundry Entra ID bearer providers are callables — never

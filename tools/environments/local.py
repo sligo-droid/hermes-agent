@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -37,6 +38,18 @@ def _msys_to_windows_path(cwd: str) -> str:
     drive = m.group(1).upper()
     tail = (m.group(2) or "").replace('/', '\\')
     return f"{drive}:{tail or chr(92)}"  # chr(92) = backslash, avoid raw-string escape
+
+
+def _windows_to_msys_path(cwd: str) -> str:
+    """Translate a native Windows path (``C:\\Users\\x``) to Git Bash form."""
+    if not _IS_WINDOWS or not cwd:
+        return cwd
+    m = re.match(r'^([a-zA-Z]):[\\/]*(.*)$', cwd)
+    if not m:
+        return cwd
+    drive = m.group(1).lower()
+    tail = (m.group(2) or "").replace('\\', '/').lstrip('/')
+    return f"/{drive}/{tail}" if tail else f"/{drive}/"
 
 
 def _resolve_safe_cwd(cwd: str) -> str:
@@ -127,7 +140,10 @@ def _build_provider_env_blocklist() -> frozenset:
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
         for pconfig in PROVIDER_REGISTRY.values():
-            blocked.update(pconfig.api_key_env_vars)
+            blocked.update(
+                var for var in pconfig.api_key_env_vars
+                if var != "CLAUDE_CODE_OAUTH_TOKEN"
+            )
             if pconfig.auth_type == "aws_sdk":
                 blocked.update(_AWS_SDK_CREDENTIAL_ENV_VARS)
             if pconfig.base_url_env_var:
@@ -155,8 +171,9 @@ def _build_provider_env_blocklist() -> frozenset:
         "OPENROUTER_API_KEY",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
         "LLM_MODEL",
+        "VERTEX_CREDENTIALS_PATH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_API_KEY",
         "DEEPSEEK_API_KEY",
         "MISTRAL_API_KEY",
@@ -198,7 +215,11 @@ def _build_provider_env_blocklist() -> frozenset:
         "EMAIL_SMTP_HOST",
         "EMAIL_HOME_ADDRESS",
         "EMAIL_HOME_ADDRESS_NAME",
+        "HERMES_DASHBOARD_SESSION_TOKEN",
         "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_RELAY_ID",
+        "GATEWAY_RELAY_SECRET",
+        "GATEWAY_RELAY_DELIVERY_KEY",
         "GH_TOKEN",
         "GITHUB_APP_ID",
         "GITHUB_APP_PRIVATE_KEY_PATH",
@@ -211,6 +232,53 @@ def _build_provider_env_blocklist() -> frozenset:
 
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+
+# Active-virtualenv markers from the Hermes host must not leak into child
+# processes for unrelated projects. The Hermes venv remains on PATH; these
+# variables only confuse uv/poetry/conda into mutating the wrong environment.
+_ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
+
+
+def _is_hermes_internal_secret(key: str) -> bool:
+    """Return True for dynamically named Hermes-internal secrets."""
+    upper = key.upper()
+    if upper.startswith("AUXILIARY_") and (
+        upper.endswith("_API_KEY") or upper.endswith("_BASE_URL")
+    ):
+        return True
+    if upper.startswith("GATEWAY_RELAY_") and (
+        upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
+    ):
+        return True
+    return False
+
+
+def _inject_session_context_env(env: dict) -> None:
+    """Bridge session ContextVars into env and strip stale globals when engaged."""
+    try:
+        from gateway.session_context import (
+            _UNSET,
+            _VAR_MAP,
+            session_context_engaged,
+        )
+    except Exception:
+        return
+
+    engaged = session_context_engaged()
+    for var_name, var in _VAR_MAP.items():
+        value = var.get()
+        if value is not _UNSET:
+            env[var_name] = "" if value is None else str(value)
+        elif engaged:
+            env.pop(var_name, None)
+
+
+def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
+    """Disable MSYS argument path conversion for Git Bash subprocesses."""
+    if not _IS_WINDOWS:
+        return
+    env.setdefault("MSYS_NO_PATHCONV", "1")
+    env.setdefault("MSYS2_ARG_CONV_EXCL", "*")
 
 
 def _inject_context_hermes_home(env: dict) -> None:
@@ -339,7 +407,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if _is_blocked_hermes_control_env(key):
+        if _is_blocked_hermes_control_env(key) or _is_hermes_internal_secret(key):
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
@@ -347,10 +415,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_blocked_hermes_control_env(real_key):
+            if _is_blocked_hermes_control_env(real_key) or _is_hermes_internal_secret(real_key):
                 continue
             sanitized[real_key] = value
-        elif _is_blocked_hermes_control_env(key):
+        elif _is_blocked_hermes_control_env(key) or _is_hermes_internal_secret(key):
             continue
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
@@ -365,8 +433,66 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     if "HERMES_HOME" not in explicit_keys:
         _inject_context_hermes_home(sanitized)
     _bootstrap_profile_subprocess_env(sanitized, explicit_keys)
+    _inject_session_context_env(sanitized)
+    for marker in _ACTIVE_VENV_MARKER_VARS:
+        sanitized.pop(marker, None)
+    _apply_windows_msys_bash_env_defaults(sanitized)
 
     return sanitized
+
+
+# Tier-1 secrets stripped from every spawned subprocess, even when provider
+# credentials are intentionally inherited by model-driving CLIs.
+_ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY_PATH",
+    "GITHUB_APP_INSTALLATION_ID",
+    "TELEGRAM_BOT_TOKEN",
+    "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN",
+    "SLACK_SIGNING_SECRET",
+    "GATEWAY_ALLOWED_USERS",
+    "GATEWAY_ALLOW_ALL_USERS",
+    "GATEWAY_RELAY_ID",
+    "GATEWAY_RELAY_SECRET",
+    "GATEWAY_RELAY_DELIVERY_KEY",
+    "HASS_TOKEN",
+    "EMAIL_PASSWORD",
+    "HERMES_DASHBOARD_SESSION_TOKEN",
+    "MODAL_TOKEN_ID",
+    "MODAL_TOKEN_SECRET",
+    "DAYTONA_API_KEY",
+})
+
+
+def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+    """Build a sanitized environment for non-terminal subprocess spawns."""
+    env = os.environ.copy()
+
+    for key in _ALWAYS_STRIP_KEYS:
+        env.pop(key, None)
+
+    for key in list(env):
+        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+            env.pop(key, None)
+        elif _is_blocked_hermes_control_env(key) or _is_hermes_internal_secret(key):
+            env.pop(key, None)
+
+    if not inherit_credentials:
+        for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            env.pop(key, None)
+
+    env.setdefault("PYTHONUTF8", "1")
+    _inject_context_hermes_home(env)
+    _bootstrap_profile_subprocess_env(env, set())
+    _inject_session_context_env(env)
+    for marker in _ACTIVE_VENV_MARKER_VARS:
+        env.pop(marker, None)
+    _apply_windows_msys_bash_env_defaults(env)
+    return env
 
 
 def _find_bash() -> str:
@@ -432,6 +558,91 @@ _SANE_PATH = (
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
+# Cached directory containing the ``hermes`` console-script.
+_SENTINEL = object()
+_HERMES_BIN_DIR: "str | None | object" = _SENTINEL
+
+
+def _resolve_hermes_bin_dir() -> str | None:
+    """Return the directory holding the ``hermes`` console-script, or None."""
+    global _HERMES_BIN_DIR
+    if _HERMES_BIN_DIR is not _SENTINEL:
+        return _HERMES_BIN_DIR  # type: ignore[return-value]
+
+    candidate: str | None = None
+
+    which = shutil.which("hermes")
+    if which:
+        candidate = os.path.dirname(which)
+
+    if candidate is None:
+        argv0 = sys.argv[0] if sys.argv else ""
+        base = os.path.basename(argv0).lower()
+        if (
+            os.path.isabs(argv0)
+            and (base == "hermes" or base.startswith("hermes."))
+            and os.path.isfile(argv0)
+        ):
+            candidate = os.path.dirname(argv0)
+
+    if candidate is None:
+        exe_dir = os.path.dirname(sys.executable) if sys.executable else ""
+        if exe_dir:
+            shim = "hermes.exe" if _IS_WINDOWS else "hermes"
+            if os.path.isfile(os.path.join(exe_dir, shim)):
+                candidate = exe_dir
+
+    if candidate and not os.path.isdir(candidate):
+        candidate = None
+
+    _HERMES_BIN_DIR = candidate
+    return candidate
+
+
+def _prepend_hermes_bin_dir(existing_path: str) -> str:
+    """Prepend the hermes install dir to ``existing_path`` if missing."""
+    bin_dir = _resolve_hermes_bin_dir()
+    if not bin_dir:
+        return existing_path
+    sep = os.pathsep
+    entries = [e for e in existing_path.split(sep) if e] if existing_path else []
+    if bin_dir in entries:
+        return existing_path
+    return sep.join([bin_dir, *entries])
+
+
+def _append_missing_sane_path_entries(existing_path: str) -> str:
+    """Normalize POSIX PATH and append missing sane fallback entries."""
+    if _IS_WINDOWS:
+        return existing_path
+
+    sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
+    if not existing_path:
+        return ":".join(sane_entries)
+
+    seen: set[str] = set()
+    ordered_entries: list[str] = []
+    for entry in existing_path.split(":"):
+        if not entry or entry in seen:
+            continue
+        seen.add(entry)
+        ordered_entries.append(entry)
+
+    for entry in sane_entries:
+        if entry not in seen:
+            ordered_entries.append(entry)
+    return ":".join(ordered_entries)
+
+
+def _path_env_key(run_env: dict) -> str | None:
+    """Return the PATH env key to update without altering Windows casing."""
+    if not _IS_WINDOWS:
+        return "PATH"
+    for key in run_env:
+        if key.upper() == "PATH":
+            return key
+    return None
+
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
@@ -445,24 +656,17 @@ def _make_run_env(env: dict) -> dict:
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_blocked_hermes_control_env(real_key):
+            if _is_blocked_hermes_control_env(real_key) or _is_hermes_internal_secret(real_key):
                 continue
             run_env[real_key] = v
-        elif _is_blocked_hermes_control_env(k):
+        elif _is_blocked_hermes_control_env(k) or _is_hermes_internal_secret(k):
             continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
-    existing_path = run_env.get("PATH", "")
-    # The "/usr/bin not already present → inject sane POSIX path" heuristic
-    # only makes sense on POSIX.  On Windows the PATH separator is ";"
-    # (the split(":") above turns a full Windows PATH into a single
-    # unrecognisable chunk, which then triggers prepending POSIX paths
-    # to a Windows PATH — completely wrong).  Skip the injection entirely
-    # on Windows; the native PATH already points at whatever shell
-    # Hermes is driving via _find_bash (Git Bash), and Git Bash itself
-    # prepends its MSYS2 /usr/bin equivalent via the shell-init files.
-    if not _IS_WINDOWS and "PATH" not in env and "/usr/bin" not in existing_path.split(":"):
-        run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+    path_key = _path_env_key(run_env)
+    if path_key is not None:
+        new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
+        run_env[path_key] = _prepend_hermes_bin_dir(new_path)
 
     explicit_keys = set(env.keys())
     explicit_keys.update(
@@ -475,16 +679,10 @@ def _make_run_env(env: dict) -> dict:
         _inject_context_hermes_home(run_env)
     _bootstrap_profile_subprocess_env(run_env, explicit_keys)
 
-    # Inject ContextVar-based session vars into subprocess env.
-    # ContextVars don't propagate to child processes, so we bridge them here.
-    try:
-        from gateway.session_context import _UNSET, _VAR_MAP
-        for var_name, var in _VAR_MAP.items():
-            value = var.get()
-            if value is not _UNSET and value:
-                run_env[var_name] = value
-    except Exception:
-        pass
+    _inject_session_context_env(run_env)
+    for marker in _ACTIVE_VENV_MARKER_VARS:
+        run_env.pop(marker, None)
+    _apply_windows_msys_bash_env_defaults(run_env)
 
     return run_env
 
@@ -634,6 +832,11 @@ class LocalEnvironment(BaseEnvironment):
 
         return "/tmp"
 
+    @staticmethod
+    def _quote_cwd_for_cd(cwd: str) -> str:
+        """Use native paths for Python, but Git Bash-friendly paths for cd."""
+        return BaseEnvironment._quote_cwd_for_cd(_windows_to_msys_path(cwd))
+
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
@@ -678,7 +881,7 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs: dict[str, object] = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
             args,
@@ -689,8 +892,7 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            start_new_session=True,
             cwd=_popen_cwd,
             **_popen_kwargs,
         )
@@ -739,7 +941,16 @@ class LocalEnvironment(BaseEnvironment):
 
         try:
             if _IS_WINDOWS:
-                proc.terminate()
+                try:
+                    from gateway.status import terminate_pid
+
+                    terminate_pid(proc.pid, force=True)
+                except Exception:
+                    proc.kill()
+                try:
+                    proc.wait(timeout=2.0)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
             else:
                 try:
                     pgid = os.getpgid(proc.pid)
