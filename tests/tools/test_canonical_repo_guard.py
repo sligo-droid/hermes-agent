@@ -142,7 +142,11 @@ def test_execute_code_refuses_project_mode_inside_protected_main(tmp_path, monke
     import tools.terminal_tool as terminal_tool
 
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
-    monkeypatch.setattr(approval, "check_execute_code_guard", lambda code, env_type: {"approved": True})
+    monkeypatch.setattr(
+        approval,
+        "check_execute_code_guard",
+        lambda code, env_type, **_kwargs: {"approved": True},
+    )
     monkeypatch.setattr(code_execution_tool, "_get_execution_mode", lambda: "project")
     monkeypatch.setattr(code_execution_tool, "_resolve_child_cwd", lambda mode, staging_dir: str(repo))
 

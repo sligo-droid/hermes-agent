@@ -2334,6 +2334,27 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        # Canonical project/main checkouts are inspection-only. Block broad
+        # terminal commands there because arbitrary shell commands can bypass
+        # the file-tool write guard.
+        effective_cwd_for_guard = workdir or cwd
+        if env_type == "local" and effective_cwd_for_guard:
+            try:
+                from tools.canonical_repo_guard import canonical_main_terminal_violation
+
+                canonical_error = canonical_main_terminal_violation(
+                    effective_cwd_for_guard, command
+                )
+            except Exception:
+                canonical_error = None
+            if canonical_error:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": canonical_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
