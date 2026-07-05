@@ -523,7 +523,7 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home  # noqa: F811,E402
+from hermes_constants import display_hermes_home, get_hermes_home  # noqa: F811,E402
 from utils import atomic_replace
 
 def get_config_path() -> Path:
@@ -5199,6 +5199,217 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
+@dataclass(frozen=True)
+class HighRiskConfigPath:
+    path: str
+    risk_class: str
+    rationale: str
+
+
+HIGH_RISK_CONFIG_PATHS: Tuple[HighRiskConfigPath, ...] = (
+    HighRiskConfigPath(
+        "coding_worker.opencode.dangerously_skip_permissions",
+        "security/autonomy",
+        "Disables opencode permission prompts for delegated coding work.",
+    ),
+    HighRiskConfigPath(
+        "coding_worker.opencode.startup_timeout_seconds",
+        "scheduling/timeout",
+        "Controls how long Hermes waits for opencode worker startup.",
+    ),
+    HighRiskConfigPath(
+        "coding_worker.simple_build_reasoning_level",
+        "worker execution",
+        "Changes coding-worker reasoning depth for simple build tasks.",
+    ),
+    HighRiskConfigPath(
+        "delegation.child_timeout_seconds",
+        "scheduling/timeout",
+        "Controls wall-clock timeout for delegated child agents.",
+    ),
+    HighRiskConfigPath(
+        "delegation.max_concurrent_children",
+        "worker execution",
+        "Controls maximum parallel delegated child agents.",
+    ),
+    HighRiskConfigPath(
+        "delegation.subagent_auto_approve",
+        "security/autonomy",
+        "Allows delegated subagents to auto-approve dangerous-command prompts.",
+    ),
+    HighRiskConfigPath(
+        "compression.protect_last_n",
+        "memory/compression",
+        "Changes how much recent conversation context is protected from compression.",
+    ),
+    HighRiskConfigPath(
+        "terminal.cwd",
+        "local path behavior",
+        "Changes the default working directory for Hermes terminal execution.",
+    ),
+    HighRiskConfigPath(
+        "kanban.dispatch_stale_timeout_seconds",
+        "scheduling/timeout",
+        "Controls how quickly running Kanban tasks are reclaimed as stale.",
+    ),
+)
+
+
+_SECRET_PATH_RE = re.compile(
+    r"(?:token|key|secret|password|credential|auth|bearer|webhook)",
+    re.IGNORECASE,
+)
+
+
+def get_config_drift_rationale_path() -> Path:
+    """Return the profile-local non-secret high-risk drift rationale path."""
+    return get_hermes_home() / "config-drift-rationales.yaml"
+
+
+def _get_dotted_value(config: Dict[str, Any], dotted_key: str, default: Any = None) -> Any:
+    node: Any = config
+    for part in dotted_key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def _has_dotted_value(config: Dict[str, Any], dotted_key: str) -> bool:
+    marker = object()
+    return _get_dotted_value(config, dotted_key, marker) is not marker
+
+
+def _contains_env_reference(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(re.search(r"\$\{[^}]+\}", value))
+    if isinstance(value, dict):
+        return any(_contains_env_reference(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_env_reference(v) for v in value)
+    return False
+
+
+def _redact_config_drift_value(path: str, value: Any, *, source_uses_env: bool = False) -> Any:
+    if source_uses_env or _SECRET_PATH_RE.search(path):
+        return "<redacted>"
+    return value
+
+
+def _load_config_drift_rationales(path: Optional[Path] = None) -> Tuple[Dict[str, Dict[str, Any]], Optional[Path], Optional[str]]:
+    rationale_path = path or get_config_drift_rationale_path()
+    if not rationale_path.exists():
+        return {}, rationale_path, None
+
+    try:
+        with open(rationale_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as exc:
+        return {}, rationale_path, f"Could not read rationale file {rationale_path}: {exc}"
+
+    entries = data.get("rationales", data) if isinstance(data, dict) else {}
+    if not isinstance(entries, dict):
+        return {}, rationale_path, f"Rationale file {rationale_path} must contain a mapping"
+
+    rationales: Dict[str, Dict[str, Any]] = {}
+    for config_path, entry in entries.items():
+        if not isinstance(config_path, str):
+            continue
+        if isinstance(entry, str):
+            rationales[config_path] = {"rationale": entry}
+        elif isinstance(entry, dict):
+            rationales[config_path] = dict(entry)
+    return rationales, rationale_path, None
+
+
+def build_high_risk_config_drift_report(
+    *,
+    active_config: Optional[Dict[str, Any]] = None,
+    default_config: Optional[Dict[str, Any]] = None,
+    raw_config: Optional[Dict[str, Any]] = None,
+    rationale_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Build a read-only report for high-risk config values that differ from defaults."""
+    active = active_config if active_config is not None else load_config()
+    defaults = default_config if default_config is not None else DEFAULT_CONFIG
+    raw = raw_config if raw_config is not None else read_raw_config()
+    rationales, loaded_rationale_path, rationale_warning = _load_config_drift_rationales(rationale_path)
+    config_path = get_config_path()
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for spec in HIGH_RISK_CONFIG_PATHS:
+        active_value = _get_dotted_value(active, spec.path)
+        default_value = _get_dotted_value(defaults, spec.path)
+        if active_value == default_value:
+            continue
+
+        raw_value = _get_dotted_value(raw, spec.path)
+        source_uses_env = _contains_env_reference(raw_value)
+        if _has_dotted_value(raw, spec.path):
+            source = str(config_path)
+            if source_uses_env:
+                source = f"{source} (${{VAR}} reference; value redacted)"
+        else:
+            source = "runtime/default merge"
+
+        rationale_entry = rationales.get(spec.path) or {}
+        item = {
+            "path": spec.path,
+            "risk_class": spec.risk_class,
+            "active": _redact_config_drift_value(spec.path, active_value, source_uses_env=source_uses_env),
+            "default": _redact_config_drift_value(spec.path, default_value),
+            "source": source,
+            "known_intentional": bool(rationale_entry),
+            "rationale": rationale_entry.get("rationale") or "unclassified",
+            "risk_rationale": spec.rationale,
+        }
+        grouped.setdefault(spec.risk_class, []).append(item)
+
+    return {
+        "rationale_path": str(loaded_rationale_path) if loaded_rationale_path else None,
+        "rationale_warning": rationale_warning,
+        "groups": grouped,
+    }
+
+
+def print_high_risk_config_drift_report() -> None:
+    """Print the high-risk config drift report for ``hermes config audit --risk``."""
+    report = build_high_risk_config_drift_report()
+    groups = report["groups"]
+    display_rationale_path = str(report.get("rationale_path") or get_config_drift_rationale_path())
+    home = str(get_hermes_home())
+    display_rationale_path = display_rationale_path.replace(home, display_hermes_home(), 1)
+
+    print()
+    print(color("High-risk config drift audit", Colors.CYAN, Colors.BOLD))
+    print(f"  Defaults:  {get_project_root() / 'hermes_cli' / 'config.py'}")
+    print(f"  Active:    {get_config_path()}")
+    print(f"  Rationale: {display_rationale_path}")
+    print("  Mode:      read-only; drift does not fail doctor or mutate config")
+
+    if report.get("rationale_warning"):
+        print(color(f"  Warning:   {report['rationale_warning']}", Colors.YELLOW))
+
+    if not groups:
+        print()
+        print(color("No high-risk config drift detected.", Colors.GREEN))
+        print()
+        return
+
+    for risk_class in sorted(groups):
+        print()
+        print(color(risk_class, Colors.BOLD))
+        for item in groups[risk_class]:
+            status = "known intentional" if item["known_intentional"] else "unclassified"
+            print(f"  - {item['path']} ({status})")
+            print(f"      active: {item['active']!r}")
+            print(f"      default: {item['default']!r}")
+            print(f"      source: {item['source']}")
+            print(f"      rationale: {item['rationale']}")
+            print(f"      risk: {item['risk_rationale']}")
+    print()
+
+
 
 def read_raw_config() -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
@@ -6271,6 +6482,14 @@ def config_command(args):
         
         print()
     
+    elif subcmd == "audit":
+        risk_only = bool(getattr(args, "risk", False))
+        if not risk_only:
+            print("Usage: hermes config audit --risk")
+            print("Only the read-only high-risk drift audit is currently supported.")
+            sys.exit(1)
+        print_high_risk_config_drift_report()
+
     elif subcmd == "check":
         # Non-interactive check for what's missing
         print()
@@ -6316,6 +6535,7 @@ def config_command(args):
         print("  hermes config           Show current configuration")
         print("  hermes config edit      Open config in editor")
         print("  hermes config set <key> <value>   Set a config value")
+        print("  hermes config audit --risk        Show high-risk drift rationale report")
         print("  hermes config check     Check for missing/outdated config")
         print("  hermes config migrate   Update config with new options")
         print("  hermes config path      Show config file path")

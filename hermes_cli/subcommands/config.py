@@ -43,6 +43,17 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     # config check
     config_subparsers.add_parser("check", help="Check for missing/outdated config")
 
+    # config audit
+    config_audit = config_subparsers.add_parser(
+        "audit",
+        help="Read-only config inspection reports",
+    )
+    config_audit.add_argument(
+        "--risk",
+        action="store_true",
+        help="Show high-risk config drift rationale report",
+    )
+
     # config migrate
     config_subparsers.add_parser("migrate", help="Update config with new options")
 
