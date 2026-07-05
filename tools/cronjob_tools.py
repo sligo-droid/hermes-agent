@@ -542,6 +542,7 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    profile: Optional[str] = None,
     no_agent: Optional[bool] = None,
     disable_on_terminal_success: Optional[bool] = None,
     task_id: str = None,
@@ -609,6 +610,7 @@ def cronjob(
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
+                profile=_normalize_optional_job_value(profile),
                 no_agent=_no_agent,
                 disable_on_terminal_success=bool(disable_on_terminal_success),
             )

@@ -891,6 +891,8 @@ def create_job(
     Returns:
         The created job dict
     """
+    from cron.lifecycle_guard import check_gateway_lifecycle
+
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -917,6 +919,7 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    check_gateway_lifecycle(prompt, normalized_script)
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
