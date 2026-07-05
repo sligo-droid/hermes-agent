@@ -648,6 +648,64 @@ def record_terminal_result(
     return {"id": event_id, **evidence.__dict__, "created_at": created_at}
 
 
+def mark_workspace_edited(
+    *,
+    session_id: str | None,
+    cwd: str | Path | None,
+    paths: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Mark a workspace's verification evidence stale after a landed edit."""
+    try:
+        from agent.coding_context import project_facts_for
+
+        facts = project_facts_for(cwd)
+    except Exception:
+        facts = None
+    if not facts:
+        return None
+
+    sid = str(session_id or "default")
+    root = str(facts.get("root") or Path(cwd or ".").resolve())
+    changed_paths = sorted({str(p) for p in (paths or []) if p})
+    edited_at = _utc_now()
+
+    with _DB_LOCK:
+        with _connect() as conn:
+            row = conn.execute(
+                """
+                SELECT changed_paths_json FROM verification_state
+                WHERE session_id = ? AND root = ?
+                """,
+                (sid, root),
+            ).fetchone()
+            existing: set[str] = set()
+            if row is not None:
+                try:
+                    existing = set(json.loads(row["changed_paths_json"] or "[]"))
+                except (TypeError, ValueError):
+                    existing = set()
+            merged = sorted((existing | set(changed_paths)))[-200:]
+            conn.execute(
+                """
+                INSERT INTO verification_state(
+                    session_id, root, last_event_id, last_edit_at, changed_paths_json
+                ) VALUES (?, ?, NULL, ?, ?)
+                ON CONFLICT(session_id, root) DO UPDATE SET
+                    last_edit_at = excluded.last_edit_at,
+                    changed_paths_json = excluded.changed_paths_json
+                """,
+                (sid, root, edited_at, json.dumps(merged)),
+            )
+            conn.commit()
+
+    return {
+        "session_id": sid,
+        "root": root,
+        "last_edit_at": edited_at,
+        "changed_paths": changed_paths,
+    }
+
+
 def verification_status(
     *,
     session_id: str | None,
@@ -659,7 +717,7 @@ def verification_status(
         facts = project_facts_for(cwd)
     except Exception:
         facts = None
-    if not facts or not facts.get("verifyCommands"):
+    if not facts:
         return {"status": "not_applicable", "evidence": None}
 
     sid = str(session_id or "default")

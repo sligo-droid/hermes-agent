@@ -177,10 +177,30 @@ from agent.tool_dispatch_helpers import (
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,  # noqa: F401  # re-exported for tests that `from run_agent import _append_subdir_hint_to_multimodal`
     _extract_file_mutation_targets,
+    _extract_landed_file_mutation_paths,
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname
+
+
+_EPHEMERAL_SCAFFOLDING_FLAGS = (
+    "_empty_recovery_synthetic",
+    "_empty_terminal_sentinel",
+    "_thinking_prefill",
+    # verify-on-stop appends a synthetic assistant attempt plus a synthetic
+    # user nudge to drive one more loop before a final answer. It must never
+    # become durable transcript state.
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+)
+
+
+def _is_ephemeral_scaffolding(msg: Any) -> bool:
+    """Return True for internal loop scaffolding that should not persist."""
+    return isinstance(msg, dict) and any(
+        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+    )
 
 
 
@@ -395,6 +415,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        verify_on_stop: bool | str | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -469,6 +490,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            verify_on_stop=verify_on_stop,
         )
 
     def _get_session_db_for_recall(self):
@@ -1513,6 +1535,8 @@ class AIAgent:
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
+                if _is_ephemeral_scaffolding(msg):
+                    continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 # Persist multimodal tool results as their text summary only —
@@ -1886,6 +1910,8 @@ class AIAgent:
             # Clean assistant content for session logs
             cleaned = []
             for msg in messages:
+                if _is_ephemeral_scaffolding(msg):
+                    continue
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
@@ -2117,6 +2143,26 @@ class AIAgent:
         if not targets:
             return
         landed = file_mutation_result_landed(tool_name, result)
+        if landed:
+            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
+            changed = getattr(self, "_turn_file_mutation_paths", None)
+            if changed is not None:
+                changed.update(landed_paths)
+            try:
+                from agent.verification_evidence import mark_workspace_edited
+
+                cwd = (
+                    getattr(self, "terminal_cwd", None)
+                    or getattr(self, "session_cwd", None)
+                    or (str(Path(landed_paths[0]).parent) if landed_paths else None)
+                )
+                mark_workspace_edited(
+                    session_id=getattr(self, "session_id", None),
+                    cwd=cwd,
+                    paths=landed_paths,
+                )
+            except Exception:
+                logger.debug("verification stale marker failed", exc_info=True)
         if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
@@ -2181,10 +2227,15 @@ class AIAgent:
                 break
             preview = (info.get("error_preview") or "").strip()
             tool = info.get("tool") or "patch"
+            safe_path = f"`{path}`"
             if preview:
-                lines.append(f"  • {path} — [{tool}] {preview}")
+                # Keep local paths visible to humans but inline-code wrapped so
+                # gateway media extraction does not auto-attach sensitive files
+                # mentioned in verifier warnings.
+                preview = preview.replace(str(path), safe_path)
+                lines.append(f"  • {safe_path} — [{tool}] {preview}")
             else:
-                lines.append(f"  • {path} — [{tool}] failed")
+                lines.append(f"  • {safe_path} — [{tool}] failed")
             shown += 1
         remaining = len(failed) - shown
         if remaining > 0:

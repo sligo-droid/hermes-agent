@@ -147,6 +147,7 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
+    assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
     assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
     assert init.get("skip_memory", False) is False
@@ -189,6 +190,7 @@ async def test_discord_goal_feature_summary_does_not_use_fast_path(monkeypatch):
     init = _CapturingAgent.last_init
     assert init is not None
     assert "tool_delay" not in init
+    assert "verify_on_stop" not in init
     assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert "Discord action-request thread guidance" not in str(init.get("ephemeral_system_prompt") or "")
 
@@ -306,3 +308,4 @@ async def test_discord_action_request_cache_signature_records_fast_path(monkeypa
     assert captured_cache_keys[0]["gateway.discord_action_request_fast_path"] is True
     assert captured_cache_keys[0]["gateway.discord_feature_request_fast_path"] is True
     assert captured_cache_keys[0]["gateway.tool_delay"] == 0.0
+    assert captured_cache_keys[0]["gateway.verify_on_stop"] is True
