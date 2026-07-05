@@ -3,7 +3,7 @@
 Covers:
 - Defense 1: gateway stop/restart refuse when _HERMES_GATEWAY=1
 - Defense 2: cron create rejects prompts containing gateway lifecycle commands
-- _contains_gateway_lifecycle_command pattern matching
+- contains_gateway_lifecycle_command pattern matching
 """
 
 import json
@@ -12,14 +12,12 @@ from argparse import Namespace
 
 import pytest
 
-from hermes_cli.cron import (
-    _contains_gateway_lifecycle_command,
-    cron_command,
-)
+from cron.lifecycle_guard import contains_gateway_lifecycle_command
+from hermes_cli.cron import cron_command
 
 
 # ---------------------------------------------------------------------------
-# Defense 2: _contains_gateway_lifecycle_command pattern tests
+# Defense 2: contains_gateway_lifecycle_command pattern tests
 # ---------------------------------------------------------------------------
 
 class TestGatewayLifecyclePattern:
@@ -33,7 +31,7 @@ class TestGatewayLifecyclePattern:
         "HERMES GATEWAY RESTART",           # uppercase
     ])
     def test_hermes_gateway_commands(self, text):
-        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+        assert contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
 
     @pytest.mark.parametrize("text", [
         "launchctl kickstart gui/501/ai.hermes.gateway",
@@ -44,7 +42,7 @@ class TestGatewayLifecyclePattern:
         "systemctl start hermes-gateway",
     ])
     def test_service_manager_commands(self, text):
-        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+        assert contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
 
     @pytest.mark.parametrize("text", [
         "kill hermes gateway process",
@@ -52,7 +50,7 @@ class TestGatewayLifecyclePattern:
         "pkill -f gateway.*hermes",          # inverse token order
     ])
     def test_kill_commands(self, text):
-        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+        assert contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
 
     @pytest.mark.parametrize("text", [
         "restart the server application",
@@ -86,7 +84,7 @@ class TestGatewayLifecyclePattern:
         "compare AWS API Gateway vs Cloudflare on restart latency",
     ])
     def test_safe_commands(self, text):
-        assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
+        assert not contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
 
 
 class TestCronCreateLifecycleBlock:

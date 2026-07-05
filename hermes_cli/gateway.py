@@ -5478,6 +5478,13 @@ def _gateway_command_inner(args):
         gateway_setup()
         return
 
+    if os.environ.get("_HERMES_GATEWAY") == "1" and subcmd in {"stop", "restart"}:
+        print_error(
+            "Refusing to stop or restart the gateway from inside the running gateway process. "
+            "Run `hermes gateway restart` from a separate shell outside the gateway."
+        )
+        sys.exit(1)
+
     # Service management commands
     if subcmd == "install":
         if is_managed():
