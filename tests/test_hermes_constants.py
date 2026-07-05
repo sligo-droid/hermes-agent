@@ -1,6 +1,7 @@
 """Tests for hermes_constants module."""
 
 import os
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 import hermes_constants
 from hermes_constants import (
     VALID_REASONING_EFFORTS,
+    agent_browser_runnable,
     get_default_hermes_root,
     is_container,
     parse_reasoning_effort,
@@ -116,6 +118,34 @@ class TestIsContainer:
         # Even if we make os.path.exists return False, cached value wins
         monkeypatch.setattr(os.path, "exists", lambda p: False)
         assert is_container() is True
+
+
+class TestAgentBrowserRunnable:
+    def test_missing_path_is_false(self):
+        assert agent_browser_runnable(None) is False
+        assert agent_browser_runnable("") is False
+
+    def test_dangling_or_missing_path_is_false(self, tmp_path):
+        assert agent_browser_runnable(str(tmp_path / "agent-browser")) is False
+
+    def test_npx_fallback_is_accepted_without_stat(self):
+        assert agent_browser_runnable("npx agent-browser") is True
+
+    def test_executable_runs_version_probe(self, monkeypatch, tmp_path):
+        candidate = tmp_path / "agent-browser"
+        candidate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        candidate.chmod(0o755)
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append((cmd, kwargs))
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        assert agent_browser_runnable(str(candidate)) is True
+        assert seen[0][0] == [str(candidate), "--version"]
+        assert seen[0][1]["timeout"] == 10
 
 
 class TestParseReasoningEffort:

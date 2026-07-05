@@ -445,6 +445,7 @@ def _coding_worker_git_lifecycle_env(workdir: str, parent_agent: Any) -> dict[st
         env = _sanitize_subprocess_env(os.environ, extra)
     except Exception:
         env = _coding_worker_fallback_env(extra)
+    env["HERMES_SESSION_KEY"] = session_key
     for secret_key in ("GH_TOKEN", "GITHUB_TOKEN"):
         env.pop(secret_key, None)
     if _repo_has_ssh_remote(workdir):
@@ -490,6 +491,7 @@ def _coding_worker_basic_env(parent_agent: Any) -> dict[str, str]:
         env = _sanitize_subprocess_env(os.environ, extra)
     except Exception:
         env = _coding_worker_fallback_env(extra)
+    env["HERMES_SESSION_KEY"] = extra["HERMES_SESSION_KEY"]
     for secret_key in ("GH_TOKEN", "GITHUB_TOKEN"):
         env.pop(secret_key, None)
     return env
