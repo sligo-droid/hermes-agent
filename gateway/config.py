@@ -489,6 +489,12 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
 
+    # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
+    # When True, this gateway can serve inbound messages for every profile on
+    # the host with per-profile adapters, HERMES_HOME overrides, and credential
+    # scopes. When False, behavior remains single-profile.
+    multiplex_profiles: bool = False
+
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
@@ -593,6 +599,7 @@ class GatewayConfig:
             "stt_enabled": self.stt_enabled,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
+            "multiplex_profiles": self.multiplex_profiles,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -638,6 +645,12 @@ class GatewayConfig:
 
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
+        multiplex_profiles = data.get("multiplex_profiles")
+        nested_gateway = data.get("gateway") if isinstance(data.get("gateway"), dict) else {}
+        if multiplex_profiles is None and isinstance(nested_gateway, dict):
+            # Also honor gateway.multiplex_profiles written by
+            # ``hermes config set gateway.multiplex_profiles true``.
+            multiplex_profiles = nested_gateway.get("multiplex_profiles")
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -664,6 +677,7 @@ class GatewayConfig:
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
+            multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
@@ -754,6 +768,11 @@ def load_gateway_config() -> GatewayConfig:
             if "thread_sessions_per_user" in yaml_cfg:
                 gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
 
+            # Multiplexing flag: accept both top-level multiplex_profiles and
+            # nested gateway.multiplex_profiles (from_dict resolves nested too).
+            if "multiplex_profiles" in yaml_cfg:
+                gw_data["multiplex_profiles"] = yaml_cfg["multiplex_profiles"]
+
             streaming_cfg = yaml_cfg.get("streaming")
             if not isinstance(streaming_cfg, dict):
                 # Fall back to nested gateway.streaming written by
@@ -784,6 +803,12 @@ def load_gateway_config() -> GatewayConfig:
             # ``platforms``. Merge nested first so top-level config keeps
             # precedence, matching the existing gateway.streaming fallback.
             gateway_cfg = yaml_cfg.get("gateway")
+            if (
+                "multiplex_profiles" not in gw_data
+                and isinstance(gateway_cfg, dict)
+                and "multiplex_profiles" in gateway_cfg
+            ):
+                gw_data["multiplex_profiles"] = gateway_cfg["multiplex_profiles"]
             gateway_platforms = gateway_cfg.get("platforms") if isinstance(gateway_cfg, dict) else None
             platforms_data = gw_data.setdefault("platforms", {})
             if not isinstance(platforms_data, dict):

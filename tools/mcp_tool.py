@@ -289,6 +289,19 @@ _CREDENTIAL_PATTERN = re.compile(
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
 
+def _env_ref_name(ref: str) -> str:
+    """Normalize a ``${...}`` reference body into an env-var name.
+
+    Accepts Cursor-style ``${env:VAR}`` in addition to plain ``${VAR}`` by
+    stripping a leading ``env:`` prefix. The result is the bare variable name
+    to look up in the secret scope / ``os.environ``.
+    """
+    ref = ref.strip()
+    if ref.startswith("env:"):
+        ref = ref[len("env:"):].strip()
+    return ref
+
+
 # ---------------------------------------------------------------------------
 # Security helpers
 # ---------------------------------------------------------------------------
@@ -2431,10 +2444,20 @@ def _interrupted_call_result() -> str:
 # ---------------------------------------------------------------------------
 
 def _interpolate_env_vars(value):
-    """Recursively resolve ``${VAR}`` placeholders from ``os.environ``."""
+    """Recursively resolve ``${VAR}`` placeholders.
+
+    Both ``${VAR}`` and Cursor-style ``${env:VAR}`` are accepted — the
+    ``env:`` prefix is stripped so a copied MCP config resolves the same secret.
+    Resolves from the active profile's secret scope when multiplexing is on, so
+    a server config's ``${API_KEY}`` uses the routed profile's value rather than
+    process-global ``os.environ``. Unset vars keep the literal placeholder.
+    """
+    from agent.secret_scope import get_secret as _get_secret
+
     if isinstance(value, str):
         def _replace(m):
-            return os.environ.get(m.group(1), m.group(0))
+            name = _env_ref_name(m.group(1))
+            return _get_secret(name, m.group(0)) or m.group(0)
         return _ENV_VAR_PATTERN.sub(_replace, value)
     if isinstance(value, dict):
         return {k: _interpolate_env_vars(v) for k, v in value.items()}

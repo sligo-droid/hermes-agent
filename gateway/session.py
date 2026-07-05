@@ -98,6 +98,10 @@ class SessionSource:
     project_channel_id: Optional[str] = None
     project_mapping_source: Optional[str] = None
     project_mapping_resolved: Optional[bool] = None
+    # Profile this inbound message is routed to in a multiplexing gateway.
+    # None => active/default profile. Drives session-key namespacing and the
+    # per-turn config/credential scope.
+    profile: Optional[str] = None
     
     @property
     def description(self) -> str:
@@ -153,6 +157,8 @@ class SessionSource:
             d["project_mapping_source"] = self.project_mapping_source
         if self.project_mapping_resolved is not None:
             d["project_mapping_resolved"] = self.project_mapping_resolved
+        if self.profile:
+            d["profile"] = self.profile
         return d
 
     @classmethod
@@ -177,6 +183,7 @@ class SessionSource:
             project_channel_id=data.get("project_channel_id"),
             project_mapping_source=data.get("project_mapping_source"),
             project_mapping_resolved=data.get("project_mapping_resolved"),
+            profile=data.get("profile"),
         )
     
 
@@ -673,10 +680,23 @@ def is_shared_multi_user_session(
     return not group_sessions_per_user
 
 
+def _session_key_namespace(profile: Optional[str]) -> str:
+    """Return the ``agent:<ns>`` namespace prefix for a session key.
+
+    The historical key format is ``agent:main:<platform>:<chat_type>:...``.
+    Multiplexing reuses the ``main`` slot to carry a named profile while keeping
+    default/None byte-identical for existing sessions and positional parsers.
+    """
+    if not profile or profile == "default":
+        return "agent:main"
+    return f"agent:{profile}"
+
+
 def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
+    profile: Optional[str] = None,
 ) -> str:
     """Build a deterministic session key from a message source.
 
@@ -701,6 +721,7 @@ def build_session_key(
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
+    ns = _session_key_namespace(profile)
     platform = source.platform.value
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
@@ -709,11 +730,23 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"agent:main:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"agent:main:{platform}:dm:{dm_chat_id}"
+                return f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"{ns}:{platform}:dm:{dm_chat_id}"
+        # Without chat_id, use the sender identifier before falling back to the
+        # bare per-platform sink; otherwise multiple synthetic DMs can collapse.
+        dm_participant_id = source.user_id_alt or source.user_id
+        if dm_participant_id and source.platform == Platform.WHATSAPP:
+            dm_participant_id = (
+                canonical_whatsapp_identifier(str(dm_participant_id))
+                or dm_participant_id
+            )
+        if dm_participant_id:
+            if source.thread_id:
+                return f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
+            return f"{ns}:{platform}:dm:{dm_participant_id}"
         if source.thread_id:
-            return f"agent:main:{platform}:dm:{source.thread_id}"
-        return f"agent:main:{platform}:dm"
+            return f"{ns}:{platform}:dm:{source.thread_id}"
+        return f"{ns}:{platform}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -721,7 +754,7 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = ["agent:main", platform, source.chat_type]
+    key_parts = [ns, platform, source.chat_type]
 
     if source.chat_id:
         key_parts.append(source.chat_id)
@@ -834,12 +867,25 @@ class SessionStore:
                 logger.debug("Could not remove temp file %s: %s", tmp_path, e)
             raise
     
+    def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
+        """Return the profile namespace for session keys, or None when off."""
+        if not getattr(self.config, "multiplex_profiles", False):
+            return None
+        if source is not None and getattr(source, "profile", None):
+            return source.profile
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            return get_active_profile_name() or "default"
+        except Exception:
+            return None
+
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
         return build_session_key(
             source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            profile=self._resolve_profile_for_key(source),
         )
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
