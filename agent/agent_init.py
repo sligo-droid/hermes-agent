@@ -139,6 +139,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    verify_on_stop: bool | str | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -221,6 +222,7 @@ def init_agent(
     agent.load_soul_identity = load_soul_identity
     agent.memory_read_only = bool(memory_read_only)
     agent.pass_session_id = pass_session_id
+    agent.verify_on_stop = verify_on_stop
     agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""

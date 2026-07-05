@@ -20853,6 +20853,7 @@ class GatewayRunner:
                     "gateway.discord_feature_request_fast_path": standard_discord_action_request,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
                     "gateway.tool_delay": 0.0 if standard_discord_action_request else None,
+                    "gateway.verify_on_stop": True if standard_discord_action_request else None,
                 },
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
@@ -20911,6 +20912,7 @@ class GatewayRunner:
                 }
                 if standard_discord_action_request:
                     agent_kwargs["tool_delay"] = 0.0
+                    agent_kwargs["verify_on_stop"] = True
                 agent = AIAgent(**agent_kwargs)
                 if _cache_lock and _cache is not None:
                     with _cache_lock:

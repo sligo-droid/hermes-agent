@@ -727,6 +727,13 @@ DEFAULT_CONFIG = {
         # plausible-looking output when a real path is blocked.  Costs ~80
         # tokens in the cached system prompt.  Set False to disable globally.
         "task_completion_guidance": True,
+        # Verification closure: after the agent edits files in a code workspace,
+        # do not accept a final answer until fresh verification evidence exists
+        # or the agent explains why it cannot run checks. "auto" keeps this on
+        # for interactive/programmatic surfaces and lets gateway action-request
+        # paths opt in explicitly when they need human-request accountability.
+        # Set true/false to force the behavior globally.
+        "verify_on_stop": "auto",
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP
