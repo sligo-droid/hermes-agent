@@ -5209,47 +5209,47 @@ class HighRiskConfigPath:
 HIGH_RISK_CONFIG_PATHS: Tuple[HighRiskConfigPath, ...] = (
     HighRiskConfigPath(
         "coding_worker.opencode.dangerously_skip_permissions",
-        "execution_approval",
+        "security/autonomy",
         "Disables opencode permission prompts for delegated coding work.",
     ),
     HighRiskConfigPath(
         "coding_worker.opencode.startup_timeout_seconds",
-        "worker_timeouts",
+        "scheduling/timeout",
         "Controls how long Hermes waits for opencode worker startup.",
     ),
     HighRiskConfigPath(
         "coding_worker.simple_build_reasoning_level",
-        "model_reasoning",
+        "worker execution",
         "Changes coding-worker reasoning depth for simple build tasks.",
     ),
     HighRiskConfigPath(
         "delegation.child_timeout_seconds",
-        "worker_timeouts",
+        "scheduling/timeout",
         "Controls wall-clock timeout for delegated child agents.",
     ),
     HighRiskConfigPath(
         "delegation.max_concurrent_children",
-        "concurrency",
+        "worker execution",
         "Controls maximum parallel delegated child agents.",
     ),
     HighRiskConfigPath(
         "delegation.subagent_auto_approve",
-        "execution_approval",
+        "security/autonomy",
         "Allows delegated subagents to auto-approve dangerous-command prompts.",
     ),
     HighRiskConfigPath(
         "compression.protect_last_n",
-        "context_retention",
+        "memory/compression",
         "Changes how much recent conversation context is protected from compression.",
     ),
     HighRiskConfigPath(
         "terminal.cwd",
-        "workspace_scope",
+        "local path behavior",
         "Changes the default working directory for Hermes terminal execution.",
     ),
     HighRiskConfigPath(
         "kanban.dispatch_stale_timeout_seconds",
-        "kanban_dispatch",
+        "scheduling/timeout",
         "Controls how quickly running Kanban tasks are reclaimed as stale.",
     ),
 )

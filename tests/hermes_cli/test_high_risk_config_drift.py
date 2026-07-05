@@ -5,10 +5,20 @@ import yaml
 
 from hermes_cli.config import (
     DEFAULT_CONFIG,
+    HIGH_RISK_CONFIG_PATHS,
     build_high_risk_config_drift_report,
     config_command,
     load_config,
 )
+
+
+REQUIRED_RISK_CLASSES = {
+    "security/autonomy",
+    "worker execution",
+    "scheduling/timeout",
+    "memory/compression",
+    "local path behavior",
+}
 
 
 def _set_path(config, dotted_path, value):
@@ -27,6 +37,23 @@ def _risk_items(report):
     }
 
 
+def test_high_risk_registry_uses_required_acceptance_taxonomy():
+    assert {spec.risk_class for spec in HIGH_RISK_CONFIG_PATHS} == REQUIRED_RISK_CLASSES
+
+    risk_classes_by_path = {spec.path: spec.risk_class for spec in HIGH_RISK_CONFIG_PATHS}
+    assert risk_classes_by_path == {
+        "coding_worker.opencode.dangerously_skip_permissions": "security/autonomy",
+        "coding_worker.opencode.startup_timeout_seconds": "scheduling/timeout",
+        "coding_worker.simple_build_reasoning_level": "worker execution",
+        "delegation.child_timeout_seconds": "scheduling/timeout",
+        "delegation.max_concurrent_children": "worker execution",
+        "delegation.subagent_auto_approve": "security/autonomy",
+        "compression.protect_last_n": "memory/compression",
+        "terminal.cwd": "local path behavior",
+        "kanban.dispatch_stale_timeout_seconds": "scheduling/timeout",
+    }
+
+
 def test_high_risk_drift_groups_required_paths_and_sources(tmp_path):
     active = copy.deepcopy(DEFAULT_CONFIG)
     raw = {
@@ -39,7 +66,7 @@ def test_high_risk_drift_groups_required_paths_and_sources(tmp_path):
     with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}):
         report = build_high_risk_config_drift_report(active_config=active, raw_config=raw)
 
-    assert set(report["groups"]) == {"concurrency", "workspace_scope"}
+    assert set(report["groups"]) == {"worker execution", "local path behavior"}
     items = _risk_items(report)
     assert items["delegation.max_concurrent_children"]["active"] == 7
     assert items["delegation.max_concurrent_children"]["default"] == 3
@@ -139,7 +166,7 @@ def test_config_audit_risk_cli_uses_effective_config_and_does_not_mutate(tmp_pat
     output = capsys.readouterr().out
     assert "High-risk config drift audit" in output
     assert "delegation.max_concurrent_children" in output
-    assert "concurrency" in output
+    assert "worker execution" in output
     assert "read-only" in output
     assert loaded["delegation"]["max_concurrent_children"] == 5
     assert config_path.read_text(encoding="utf-8") == before
