@@ -363,6 +363,34 @@ def apply_subprocess_home_env(env: dict) -> None:
             env[key] = str(path)
 
 
+def agent_browser_runnable(path: str | None) -> bool:
+    """Return True only when *path* is an agent-browser CLI that runs.
+
+    Presence checks are not enough: a stale global npm symlink can still be
+    discoverable while pointing at a removed local package. Validate candidates
+    before callers advertise browser automation as available.
+    """
+    if not path:
+        return False
+    if " " in path and path.split()[0].endswith("npx"):
+        return True
+    if not os.path.exists(path) or not os.access(path, os.X_OK):
+        return False
+
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            timeout=10,
+            env=os.environ.copy(),
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+    return result.returncode == 0
+
+
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 
