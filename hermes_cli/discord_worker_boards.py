@@ -807,6 +807,38 @@ def _terminal_worker_has_non_green_finalization(worker: dict[str, Any]) -> bool:
     return False
 
 
+def _worker_meta_allows_ready_dispatch(worker: dict[str, Any], *, counts: dict[str, Any]) -> bool:
+    """Return True when live Kanban work supersedes stale finalizer-blocked metadata."""
+    status = str(worker.get("goal_status") or "").strip().lower()
+    phase = str(worker.get("phase") or "").strip().lower()
+    if status != "blocked" and phase != "blocked":
+        return False
+    if not (int(counts.get("ready") or 0) > 0 or int(counts.get("review") or 0) > 0):
+        return False
+    blocked_reason = str(worker.get("blocked_reason") or "").strip().lower()
+    finalizer_blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip()
+    return (
+        blocked_reason == "approved reviewer pr finalization failed"
+        or bool(finalizer_blocker)
+        or _pr_finalizer_failure_is_failed_checks(worker)
+        or _pr_finalizer_failure_is_merge_conflict(worker)
+    )
+
+
+def _has_dispatchable_worker_tasks(conn: Any) -> bool:
+    placeholders = ",".join("?" for _ in ROLE_ASSIGNEES)
+    if not placeholders:
+        return False
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tasks "
+        "WHERE status IN ('ready', 'review') "
+        "AND lower(assignee) IN "
+        f"({placeholders})",
+        tuple(sorted(ROLE_ASSIGNEES)),
+    ).fetchone()
+    return bool(row and int(row[0] or 0) > 0)
+
+
 def _terminal_reaction_synced_state(worker: dict[str, Any]) -> str:
     return str(worker.get("terminal_reaction_synced_state") or "").strip().lower()
 
@@ -2921,32 +2953,38 @@ def board_thread_state(board: str) -> str:
     worker = _read_worker_meta(board)
     if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
         return "errored"
-    terminal_state = _terminal_worker_reaction_state(worker)
-    is_terminal = terminal_state in {"done", "blocked", "errored"}
-    has_worker_blocker = (
-        bool(str(worker.get("blocked_reason") or "").strip())
-        or worker.get("goal_status") == "blocked"
-    )
-
     with kanban_db.connect_closing(board=board) as conn:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
-        if tasks:
-            blocked_tasks = [task for task in tasks if task.status == "blocked"]
-            if blocked_tasks:
-                # The public Discord marker should reflect the current board
-                # state, not the run outcome that explained how it got there.
-                # A crashed/timed-out role worker parks the ticket in Kanban's
-                # blocked lane for operator attention; leaving the source
-                # message on ⏳ hides that stall, while showing ❌ implies a
-                # terminal failure rather than a human-actionable blocker.
-                return "blocked"
-            if terminal_state in {"blocked", "errored"}:
-                return terminal_state
-            if is_terminal and all(task.status == "done" for task in tasks):
-                return terminal_state or "done"
-            if any(task.status == "running" for task in tasks):
-                return "running"
-            return "active"
+        counts = kanban_db.board_stats(conn).get("by_status", {})
+
+    stale_blocked_meta = _worker_meta_allows_ready_dispatch(worker, counts=counts)
+    terminal_state = "" if stale_blocked_meta else _terminal_worker_reaction_state(worker)
+    is_terminal = terminal_state in {"done", "blocked", "errored"}
+    has_worker_blocker = (
+        not stale_blocked_meta
+        and (
+            bool(str(worker.get("blocked_reason") or "").strip())
+            or worker.get("goal_status") == "blocked"
+        )
+    )
+
+    if tasks:
+        blocked_tasks = [task for task in tasks if task.status == "blocked"]
+        if blocked_tasks:
+            # The public Discord marker should reflect the current board
+            # state, not the run outcome that explained how it got there.
+            # A crashed/timed-out role worker parks the ticket in Kanban's
+            # blocked lane for operator attention; leaving the source
+            # message on hourglass hides that stall, while showing an error
+            # implies a terminal failure rather than a human-actionable blocker.
+            return "blocked"
+        if terminal_state in {"blocked", "errored"}:
+            return terminal_state
+        if is_terminal and all(task.status == "done" for task in tasks):
+            return terminal_state or "done"
+        if any(task.status == "running" for task in tasks):
+            return "running"
+        return "active"
 
     if is_terminal:
         return terminal_state or "done"
@@ -4273,6 +4311,8 @@ def _board_runtime_snapshot(
     queued_review = int(counts.get("review") or 0)
     queued_total = queued_ready + queued_todo + queued_review
     running_count = len(running)
+    meta_blocked = bool(str(worker.get("blocked_reason") or "").strip()) or worker.get("goal_status") == "blocked"
+    meta_blocked_superseded = _worker_meta_allows_ready_dispatch(worker, counts=counts)
 
     if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
         state = "cancelled"
@@ -4280,11 +4320,10 @@ def _board_runtime_snapshot(
     elif running_count > 0:
         state = "running"
         reason = _running_status_text(running)
-    elif (
-        str(worker.get("blocked_reason") or "").strip()
-        or worker.get("goal_status") == "blocked"
-        or int(counts.get("blocked") or 0) > 0
-    ):
+    elif int(counts.get("blocked") or 0) > 0:
+        state = "blocked"
+        reason = _blocked_runtime_reason(worker, conn=conn)
+    elif meta_blocked and not meta_blocked_superseded:
         state = "blocked"
         reason = _blocked_runtime_reason(worker, conn=conn)
     elif int(counts.get("running") or 0) > 0:
@@ -6956,12 +6995,18 @@ def is_discord_worker_board(board: str) -> bool:
 
 def is_executable_worker_board(board: str) -> bool:
     worker = _read_worker_meta(board)
-    return (
-        worker.get("kind") == "discord_worker_board"
-        and worker.get("execution_mode") == "kanban_pipeline"
-        and worker.get("goal_status") == "active"
-        and not _worker_source_message_too_old(worker)
-    )
+    if worker.get("kind") != "discord_worker_board":
+        return False
+    if worker.get("execution_mode") != "kanban_pipeline":
+        return False
+    if _worker_source_message_too_old(worker):
+        return False
+    if worker.get("goal_status") == "active":
+        return True
+    if worker.get("goal_status") != "blocked" or worker.get("paused") or worker.get("cancelled"):
+        return False
+    with kanban_db.connect_closing(board=board) as conn:
+        return _has_dispatchable_worker_tasks(conn)
 
 
 def is_paused_or_cancelled(board: str) -> bool:
