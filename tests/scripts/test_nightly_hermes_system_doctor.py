@@ -191,6 +191,54 @@ def test_record_honcho_watchdog_result_accepts_ok_status():
     assert issues == []
 
 
+def test_check_xai_plugin_imports_records_helper_provenance(monkeypatch):
+    facts = {}
+    issues = []
+    output = json.dumps(
+        {
+            "has_build_xai_storage_options": True,
+            "helper_module_file": "/repo/tools/xai_http.py",
+            "plugins.image_gen.xai": "/repo/plugins/image_gen/xai/__init__.py",
+            "plugins.video_gen.xai": "/repo/plugins/video_gen/xai/__init__.py",
+            "plugins.model-providers.xai": "/repo/plugins/model-providers/xai/__init__.py",
+            "tools.xai_http": "/repo/tools/xai_http.py",
+        },
+        sort_keys=True,
+    )
+
+    monkeypatch.setattr(
+        doctor,
+        "python_smoke",
+        lambda code, timeout=180: {"exit": 0, "output": output},
+    )
+
+    doctor.check_xai_plugin_imports(issues, facts)
+
+    assert issues == []
+    assert facts["xai_plugin_imports_exit"] == 0
+    assert '"has_build_xai_storage_options": true' in facts["xai_plugin_imports_output"]
+
+
+def test_check_xai_plugin_imports_reports_missing_storage_helper(monkeypatch):
+    facts = {}
+    issues = []
+
+    monkeypatch.setattr(
+        doctor,
+        "python_smoke",
+        lambda code, timeout=180: {
+            "exit": 1,
+            "output": "ImportError: cannot import name 'build_xai_storage_options' from 'tools.xai_http' (/stale/tools/xai_http.py)",
+        },
+    )
+
+    doctor.check_xai_plugin_imports(issues, facts)
+
+    assert facts["xai_plugin_imports_exit"] == 1
+    assert [issue["name"] for issue in issues] == ["xAI optional plugin import smoke failed"]
+    assert "build_xai_storage_options" in issues[0]["detail"]
+
+
 def test_check_codex_auth_incidents_records_one_redacted_issue(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True)

@@ -362,6 +362,37 @@ def python_smoke(code: str, timeout: int = 180) -> dict[str, Any]:
     return run([str(python), "-c", code], timeout=timeout, cwd=REPO)
 
 
+def check_xai_plugin_imports(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
+    """Verify xAI optional plugin imports without resolving credentials or calling xAI."""
+    code = r'''
+import importlib
+import json
+
+modules = [
+    "tools.xai_http",
+    "plugins.image_gen.xai",
+    "plugins.video_gen.xai",
+    "plugins.model-providers.xai",
+]
+result = {}
+for name in modules:
+    mod = importlib.import_module(name)
+    result[name] = getattr(mod, "__file__", None)
+
+from tools import xai_http
+
+helper = getattr(xai_http, "build_xai_storage_options", None)
+result["has_build_xai_storage_options"] = callable(helper)
+result["helper_module_file"] = getattr(xai_http, "__file__", None)
+print(json.dumps(result, sort_keys=True))
+'''
+    r = python_smoke(code, timeout=60)
+    facts["xai_plugin_imports_exit"] = r["exit"]
+    facts["xai_plugin_imports_output"] = r["output"]
+    if r["exit"] != 0 or '"has_build_xai_storage_options": true' not in r["output"]:
+        add_issue(issues, "critical", "xAI optional plugin import smoke failed", r["output"])
+
+
 def check_main_inference(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
     code = r'''
 from agent.auxiliary_client import call_llm
@@ -731,6 +762,7 @@ def main() -> int:
     check_hermes_doctor(issues, facts)
     check_auth_list(issues, facts)
     check_codex_auth_incidents(issues, facts)
+    check_xai_plugin_imports(issues, facts)
     check_main_inference(issues, facts)
     check_compression_inference(issues, facts)
     check_honcho(issues, facts)
