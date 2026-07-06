@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -55,6 +56,11 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 HONCHO_INFERENCE_DISABLED_RE = re.compile(
     r"RuntimeError:\s*inference disabled by HONCHO_WATCHDOG_NO_INFERENCE=1"
 )
+QMD_EXPECTED_TARGETS = [
+    {"name": "qmd-8181", "host": "127.0.0.1", "port": 8181},
+    {"name": "qmd-8182", "host": "127.0.0.1", "port": 8182},
+]
+QMD_ALLOWED_STATUSES = {"healthy", "process_missing", "port_closed", "wrong_bind", "unknown"}
 
 
 def coding_worker_backend() -> str:
@@ -91,6 +97,111 @@ def run(cmd: list[str], *, timeout: int = 120, cwd: Path | None = None, env: dic
         return {"cmd": " ".join(cmd), "exit": 124, "output": clean((exc.stdout or "") + "\n<TIMEOUT>")}
     except Exception as exc:  # noqa: BLE001 - watchdog should report, not crash silently
         return {"cmd": " ".join(cmd), "exit": 125, "output": f"<exception> {type(exc).__name__}: {exc}"}
+
+
+def collect_qmd_process_commands() -> list[str]:
+    """Return local QMD-ish process commands without exposing environment values."""
+    r = run(["ps", "-eo", "pid=,args="], timeout=10, cwd=Path("/"))
+    if r["exit"] != 0:
+        return []
+    commands: list[str] = []
+    current_pid = str(os.getpid())
+    for line in str(r.get("output") or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(maxsplit=1)
+        if len(parts) != 2 or parts[0] == current_pid:
+            continue
+        command = parts[1]
+        lower = command.lower()
+        if "qmd" in lower and "nightly_hermes_system_doctor" not in lower:
+            commands.append(clean(command, 500))
+    return commands[:25]
+
+
+def qmd_tcp_ready(host: str, port: int, timeout: float = 0.5) -> tuple[bool, str | None]:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, None
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _qmd_command_matches_target(command: str, port: int) -> bool:
+    lower = command.lower()
+    return "qmd" in lower and re.search(rf"(?<!\d){port}(?!\d)", command) is not None
+
+
+def _qmd_command_has_nonlocal_bind(command: str) -> bool:
+    lower = command.lower()
+    loopback_hosts = ("127.0.0.1", "localhost", "::1")
+    return ("--host" in lower or "--bind" in lower) and not any(item in lower for item in loopback_hosts)
+
+
+def classify_qmd_target(
+    target: dict[str, Any],
+    process_commands: list[str],
+    connector: Any = qmd_tcp_ready,
+) -> dict[str, Any]:
+    host = str(target["host"])
+    port = int(target["port"])
+    matching_commands = [cmd for cmd in process_commands if _qmd_command_matches_target(cmd, port)]
+    any_qmd_process = any("qmd" in cmd.lower() for cmd in process_commands)
+    port_ready, port_error = connector(host, port)
+
+    if matching_commands and port_ready:
+        status = "healthy"
+    elif not matching_commands:
+        status = "process_missing"
+    elif _qmd_command_has_nonlocal_bind("\n".join(matching_commands)):
+        status = "wrong_bind"
+    elif port_error:
+        status = "port_closed"
+    else:
+        status = "unknown"
+
+    result = {
+        "name": str(target["name"]),
+        "host": host,
+        "port": port,
+        "status": status,
+        "process_present": bool(matching_commands),
+        "qmd_process_seen": any_qmd_process,
+        "port_ready": port_ready,
+        "port_error": clean(port_error or "", 300),
+        "process_excerpt": clean(matching_commands[0], 300) if matching_commands else "",
+    }
+    if result["status"] not in QMD_ALLOWED_STATUSES:
+        result["status"] = "unknown"
+    return result
+
+
+def check_qmd_health(
+    issues: list[dict[str, str]],
+    facts: dict[str, Any],
+    *,
+    process_collector: Any = collect_qmd_process_commands,
+    connector: Any = qmd_tcp_ready,
+) -> list[dict[str, Any]]:
+    process_commands = process_collector()
+    results = [classify_qmd_target(target, process_commands, connector) for target in QMD_EXPECTED_TARGETS]
+    facts["qmd_expected_target_source"] = "nightly doctor defaults: local ports 8181 and 8182"
+    facts["qmd_health"] = results
+    for item in results:
+        if item["status"] == "healthy":
+            continue
+        detail = (
+            f"{item['name']} expected {item['host']}:{item['port']} status={item['status']} "
+            f"process_present={item['process_present']} port_ready={item['port_ready']}. "
+            "Inspect QMD/Honcho service logs and the Honcho operator runbook; do not infer QMD health from process presence alone."
+        )
+        if item.get("port_error"):
+            detail += f" port_error={item['port_error']}"
+        if item.get("process_excerpt"):
+            detail += f" process_excerpt={item['process_excerpt']}"
+        add_issue(issues, "critical", f"QMD service readiness failed: {item['name']} {item['status']}", detail)
+    return results
 
 
 def sha256_file(path: Path) -> str | None:
@@ -534,6 +645,8 @@ def post_json(url: str, body: dict[str, Any], timeout: int = 90) -> tuple[int, s
 
 
 def check_honcho(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
+    check_qmd_health(issues, facts)
+
     if HONCHO_WATCHDOG.exists():
         r = run(
             [str(PYTHON if PYTHON.exists() else Path(sys.executable)), str(HONCHO_WATCHDOG), "--status"],
@@ -780,7 +893,7 @@ def main() -> int:
         return 0
 
     if args.status:
-        checked = "hermes doctor/auth/main inference/compression/honcho"
+        checked = "hermes doctor/auth/main inference/compression/honcho/qmd"
         if not args.skip_coding_worker_smoke:
             checked += "/codex-worker"
         print(

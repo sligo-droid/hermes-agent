@@ -191,6 +191,84 @@ def test_record_honcho_watchdog_result_accepts_ok_status():
     assert issues == []
 
 
+def test_classify_qmd_target_requires_process_and_port_ready():
+    target = {"name": "qmd-8181", "host": "127.0.0.1", "port": 8181}
+
+    result = doctor.classify_qmd_target(
+        target,
+        ["python -m qmd --host 127.0.0.1 --port 8181"],
+        lambda _host, _port: (True, None),
+    )
+
+    assert result["status"] == "healthy"
+    assert result["process_present"] is True
+    assert result["port_ready"] is True
+
+
+def test_classify_qmd_target_reports_process_present_port_closed():
+    target = {"name": "qmd-8181", "host": "127.0.0.1", "port": 8181}
+
+    result = doctor.classify_qmd_target(
+        target,
+        ["python -m qmd --host 127.0.0.1 --port 8181"],
+        lambda _host, _port: (False, "ConnectionRefusedError: refused"),
+    )
+
+    assert result["status"] == "port_closed"
+    assert result["process_present"] is True
+    assert result["port_ready"] is False
+    assert "refused" in result["port_error"]
+
+
+def test_classify_qmd_target_reports_process_missing_even_if_port_open():
+    target = {"name": "qmd-8182", "host": "127.0.0.1", "port": 8182}
+
+    result = doctor.classify_qmd_target(
+        target,
+        ["python -m qmd --host 127.0.0.1 --port 8181"],
+        lambda _host, _port: (True, None),
+    )
+
+    assert result["status"] == "process_missing"
+    assert result["process_present"] is False
+    assert result["port_ready"] is True
+
+
+def test_classify_qmd_target_reports_wrong_bind_when_command_advertises_non_loopback_host():
+    target = {"name": "qmd-8181", "host": "127.0.0.1", "port": 8181}
+
+    result = doctor.classify_qmd_target(
+        target,
+        ["python -m qmd --host 0.0.0.0 --port 8181"],
+        lambda _host, _port: (False, "ConnectionRefusedError: refused"),
+    )
+
+    assert result["status"] == "wrong_bind"
+    assert result["process_present"] is True
+    assert result["port_ready"] is False
+
+
+def test_check_qmd_health_records_facts_and_issues_for_unhealthy_targets():
+    facts = {}
+    issues = []
+
+    results = doctor.check_qmd_health(
+        issues,
+        facts,
+        process_collector=lambda: ["python -m qmd --host 127.0.0.1 --port 8181"],
+        connector=lambda _host, _port: (False, "ConnectionRefusedError: refused"),
+    )
+
+    assert [item["status"] for item in results] == ["port_closed", "process_missing"]
+    assert facts["qmd_expected_target_source"] == "nightly doctor defaults: local ports 8181 and 8182"
+    assert facts["qmd_health"] == results
+    assert [issue["name"] for issue in issues] == [
+        "QMD service readiness failed: qmd-8181 port_closed",
+        "QMD service readiness failed: qmd-8182 process_missing",
+    ]
+    assert "do not infer QMD health from process presence alone" in issues[0]["detail"]
+
+
 def test_check_xai_plugin_imports_records_helper_provenance(monkeypatch):
     facts = {}
     issues = []
