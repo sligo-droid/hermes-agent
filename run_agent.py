@@ -2699,6 +2699,8 @@ class AIAgent:
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
+            "max_iterations_source": getattr(self, "max_iterations_source", "constructor"),
+            "max_iterations_route": getattr(self, "max_iterations_route", self.platform or "unknown"),
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:

@@ -195,6 +195,8 @@ def init_agent(
 
     agent.model = model
     agent.max_iterations = max_iterations
+    agent.max_iterations_source = "constructor"
+    agent.max_iterations_route = platform or "unknown"
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
