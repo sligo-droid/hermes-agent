@@ -4297,6 +4297,94 @@ def test_reconcile_board_retries_retryable_pr_amend_head_advance_blocker(monkeyp
     assert worker["pr_amend_head_advanced"] is True
 
 
+def test_reconcile_board_retries_operator_blocked_canonical_sync_after_merged_pr(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    worktree = tmp_path / "repo"
+    worktree.mkdir()
+    board = dwb.start_direct_goal(thread_id="review-finalizer-canonical-sync-lag", goal="Ship merged PR")
+    blocker = "Canonical checkout is dirty"
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "execution_mode": "kanban_pipeline",
+            "worktree_path": str(worktree),
+            "review_loop_count": 2,
+            "blocked_reason": "approved reviewer PR finalization failed",
+            "pr_error": blocker,
+            "pr_blocker": blocker,
+            "pr_state": "MERGED",
+            "pr_merged_at": "2026-07-06T07:32:03Z",
+            "pr_merge_commit": "abc123",
+            "pr_checks_status": "passed",
+            "pr_checks_failed": [],
+            "pr_finalizer_recovery_state": "operator_blocked",
+            "pr_finalizer_recovery_blocker": blocker,
+            "canonical_sync_state": "blocked",
+            "canonical_sync_error": blocker,
+        },
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R2: Review Discord implementation",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            reviewer_id,
+            summary="Approved.",
+            metadata={"raw": {"status": "approved"}},
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    calls = []
+
+    def fake_ensure_pr(board_arg, workspace_arg):
+        calls.append((board_arg, workspace_arg))
+        dwb._update_worker_meta(
+            board_arg,
+            {
+                "pr_error": None,
+                "pr_blocker": "",
+                "pr_state": "MERGED",
+                "pr_merged_at": "2026-07-06T07:32:03Z",
+                "pr_merge_commit": "abc123",
+                "pr_checks_status": "passed",
+                "pr_checks_failed": [],
+                "canonical_sync_state": "blocked",
+                "canonical_sync_error": blocker,
+            },
+        )
+        return True
+
+    monkeypatch.setattr(kanban_codex_worker, "_ensure_pr", fake_ensure_pr)
+
+    assert dwb.reconcile_board(board.slug) == "approved_reviewer_finalized"
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert calls == [(board.slug, str(worktree))]
+    assert worker["phase"] == "complete"
+    assert worker["goal_status"] == "done"
+    assert worker["blocked_reason"] == ""
+    assert worker["pr_error"] is None
+    assert worker["pr_blocker"] == ""
+    assert worker["canonical_sync_state"] == "blocked"
+    assert worker["canonical_sync_error"] == blocker
+    assert worker["terminal_completion_message_pending"] is True
+
+
 def test_ensure_pr_clears_stale_pr_amend_blocker_after_head_advances(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

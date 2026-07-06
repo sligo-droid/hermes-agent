@@ -6619,6 +6619,16 @@ def _pr_amend_head_advance_blocker_is_retryable(worker: dict[str, Any], blocker:
     return not upstream_head or not trigger_head or upstream_head == trigger_head
 
 
+def _pr_finalizer_canonical_sync_blocker_is_retryable(worker: dict[str, Any], blocker: str) -> bool:
+    """Return whether an operator-blocked finalizer should retry after local sync failure."""
+    normalized = str(blocker or "").strip().lower()
+    if "canonical checkout" not in normalized:
+        return False
+    canonical_error = str(worker.get("canonical_sync_error") or "").strip().lower()
+    canonical_state = str(worker.get("canonical_sync_state") or "").strip().lower()
+    return canonical_state == "blocked" or bool(canonical_error and canonical_error == normalized)
+
+
 def _recover_blocked_approved_reviewer_finalizer(
     board: str,
     worker: dict[str, Any],
@@ -6646,6 +6656,7 @@ def _recover_blocked_approved_reviewer_finalizer(
         and str(worker.get("pr_finalizer_recovery_blocker") or "") == finalizer_blocker
         and not _pr_finalizer_failure_is_merge_conflict(worker)
         and not _pr_amend_head_advance_blocker_is_retryable(worker, finalizer_blocker)
+        and not _pr_finalizer_canonical_sync_blocker_is_retryable(worker, finalizer_blocker)
     ):
         return None
 
