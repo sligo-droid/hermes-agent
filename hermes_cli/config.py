@@ -2104,6 +2104,9 @@ DEFAULT_CONFIG = {
         # off preserves legacy cron isolation. read_only injects configured
         # memory context without allowing writes. read_write is explicit opt-in.
         "memory_mode": "off",
+        # Operator status grace for persisted next_run_at values. Jobs older
+        # than this window are surfaced as missed without mutating cron state.
+        "missed_run_grace_seconds": 300,
     },
 
     "self_improvement": {

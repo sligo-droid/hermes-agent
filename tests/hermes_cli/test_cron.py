@@ -1,6 +1,7 @@
 """Tests for hermes_cli.cron command handling."""
 
 from argparse import Namespace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -232,6 +233,35 @@ class TestCronCommandLifecycle:
         assert "Runtime heartbeat: running (PID: 1167299)" in out
         assert "Process/service not visible from this namespace" in out
         assert "Gateway is not running" not in out
+
+    def test_status_renders_missed_cron_runs(self, tmp_cron_dir, capsys, monkeypatch):
+        now = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        monkeypatch.setattr(
+            "hermes_cli.gateway.get_gateway_runtime_health",
+            lambda: GatewayRuntimeHealth(True, "process", pid=123),
+        )
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 10)
+        monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: 10)
+        monkeypatch.setattr("cron.jobs.audit_overdue_self_improvement_proposals", lambda: [])
+        job = create_job(prompt="", schedule="every 1h", name="Status overdue")
+        update_job(
+            job["id"],
+            {
+                "next_run_at": (now - timedelta(minutes=20)).isoformat(),
+                "created_at": (now - timedelta(days=1)).isoformat(),
+                "last_run_at": (now - timedelta(hours=2)).isoformat(),
+                "last_status": "error",
+            },
+        )
+
+        cron_status()
+
+        out = capsys.readouterr().out
+        assert "cron job(s) missed scheduled fire" in out
+        assert "Status overdue" in out
+        assert "Overdue: 20m" in out
+        assert "Last status: error" in out
 
 
 def test_overdue_proposal_findings_render_operator_evidence(capsys):
