@@ -126,6 +126,54 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
+def test_run_agent_uses_config_budget_and_records_source(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "agent:\n  max_turns: 1000\n",
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text("HERMES_MAX_ITERATIONS=100\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "100")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"agent": {"max_turns": 1000}})
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    _CapturingAgent.last_init = None
+    runner = _make_runner()
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        user_id="user-1",
+        thread_id="thread-1",
+    )
+    session_key = "agent:main:discord:thread:thread-1:thread-1"
+
+    result = asyncio.run(
+        runner._run_agent(
+            message="ping",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+        )
+    )
+
+    cached_agent = runner._agent_cache[session_key][0]
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["max_iterations"] == 1000
+    assert cached_agent.max_iterations_source == "config:agent.max_turns"
+    assert cached_agent.max_iterations_route == "gateway:discord"
+
+
 @pytest.mark.asyncio
 async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
@@ -260,4 +308,3 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
-

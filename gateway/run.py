@@ -1063,13 +1063,34 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
 
 
+def _current_max_iterations_with_source() -> tuple[int, str]:
+    """Return current per-turn iteration budget and sanitized provenance."""
+    _reload_runtime_env_preserving_config_authority()
+    raw = os.getenv("HERMES_MAX_ITERATIONS")
+    try:
+        value = int(raw if raw is not None else "1000")
+    except (TypeError, ValueError):
+        return 1000, "default:invalid_HERMES_MAX_ITERATIONS"
+
+    config_path = _hermes_home / 'config.yaml'
+    if config_path.exists():
+        try:
+            import yaml as _yaml
+            with open(config_path, encoding="utf-8") as f:
+                cfg = _yaml.safe_load(f) or {}
+            agent_cfg = cfg.get("agent", {})
+            if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
+                return value, "config:agent.max_turns"
+        except Exception:
+            pass
+    if raw is not None:
+        return value, "env:HERMES_MAX_ITERATIONS"
+    return value, "default:1000"
+
+
 def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh."""
-    _reload_runtime_env_preserving_config_authority()
-    try:
-        return int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-    except (TypeError, ValueError):
-        return 90
+    return _current_max_iterations_with_source()[0]
 
 
 # Platforms that bind a local TCP listener/webhook cannot be safely started for
@@ -4850,11 +4871,11 @@ class GatewayRunner:
         # config.yaml → env bridge did the right thing at a glance (instead
         # of silently running at a stale .env value for weeks).
         try:
-            _effective_max_iter = _current_max_iterations()
+            _effective_max_iter, _max_iter_source = _current_max_iterations_with_source()
             logger.info(
-                "Agent budget: max_iterations=%d (agent.max_turns from config.yaml, "
-                "or HERMES_MAX_ITERATIONS from .env, or default 1000)",
+                "Agent budget: max_iterations=%d source=%s route=gateway/startup",
                 _effective_max_iter,
+                _max_iter_source,
             )
         except Exception:
             pass
@@ -15800,7 +15821,7 @@ class GatewayRunner:
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
-            max_iterations = _current_max_iterations()
+            max_iterations, max_iterations_source = _current_max_iterations_with_source()
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -15853,6 +15874,8 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                agent.max_iterations_source = max_iterations_source
+                agent.max_iterations_route = f"gateway/background:{platform_key}"
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -20678,8 +20701,8 @@ class GatewayRunner:
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
-            # Read from env var or use default (same as CLI)
-            max_iterations = _current_max_iterations()
+            # Read from config/env/default and keep provenance with the agent.
+            max_iterations, max_iterations_source = _current_max_iterations_with_source()
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -20854,6 +20877,7 @@ class GatewayRunner:
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
                     "gateway.tool_delay": 0.0 if standard_discord_action_request else None,
                     "gateway.verify_on_stop": True if standard_discord_action_request else None,
+                    "gateway.max_iterations": max_iterations,
                 },
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
@@ -20874,6 +20898,10 @@ class GatewayRunner:
                             except KeyError:
                                 pass
                         self._init_cached_agent_for_turn(agent, _interrupt_depth)
+                        agent.max_iterations = max_iterations
+                        agent.iteration_budget.max_total = max_iterations
+                        agent.max_iterations_source = max_iterations_source
+                        agent.max_iterations_route = f"gateway:{platform_key}"
                         logger.debug("Reusing cached agent for session %s", session_key)
 
             if agent is None:
@@ -20914,6 +20942,8 @@ class GatewayRunner:
                     agent_kwargs["tool_delay"] = 0.0
                     agent_kwargs["verify_on_stop"] = True
                 agent = AIAgent(**agent_kwargs)
+                agent.max_iterations_source = max_iterations_source
+                agent.max_iterations_route = f"gateway:{platform_key}"
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
