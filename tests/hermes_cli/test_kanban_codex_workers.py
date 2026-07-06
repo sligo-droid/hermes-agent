@@ -4889,6 +4889,7 @@ def test_ensure_pr_syncs_already_merged_pr(monkeypatch, tmp_path):
     assert worker._ensure_pr(board.slug, str(workspace)) is True
 
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
     assert ["git", "status", "--porcelain"] in calls
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_state"] == "MERGED"
@@ -4905,7 +4906,7 @@ def test_ensure_pr_syncs_already_merged_pr(monkeypatch, tmp_path):
         ("ancestor", True, {"ancestor_failed": True}, "Canonical checkout does not contain PR merge commit"),
     ],
 )
-def test_ensure_pr_blocks_when_canonical_sync_fails(
+def test_ensure_pr_records_nonblocking_canonical_sync_failure_after_merge(
     monkeypatch, tmp_path, case, project_exists, sync_kwargs, expected
 ):
     _home(monkeypatch, tmp_path)
@@ -4944,14 +4945,14 @@ def test_ensure_pr_blocks_when_canonical_sync_fails(
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_state"] == "MERGED"
+    assert meta.get("pr_error") in (None, "")
+    assert meta["pr_blocker"] == ""
     assert meta["canonical_sync_state"] == "blocked"
     assert expected in meta["canonical_sync_error"]
-    assert meta["pr_error"] == meta["canonical_sync_error"]
-    assert meta["pr_blocker"] == meta["pr_error"]
     if not project_exists:
         assert ["git", "status", "--porcelain"] not in calls
 

@@ -2927,12 +2927,27 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
     raw_project_path = str(worker.get("project_path") or "").strip()
     project_path = Path(raw_project_path)
     merge_commit = str(worker.get("pr_merge_commit") or "").strip()
-    if not raw_project_path or not project_path.is_dir():
+
+    def fail(
+        message: str,
+        result: Optional[subprocess.CompletedProcess[str]] = None,
+        *,
+        sync_path: Optional[Path] = None,
+    ) -> bool:
+        """Record local canonical checkout sync failure without failing the merged PR."""
+        detail = ""
+        if result is not None:
+            detail = (result.stderr or result.stdout or "").strip()
+        effective_path = sync_path or project_path
         worker["canonical_sync_state"] = "blocked"
-        worker["canonical_sync_error"] = f"Canonical checkout missing or invalid: {raw_project_path or '(missing)'}"
-        worker["pr_error"] = worker["canonical_sync_error"]
-        worker["pr_blocker"] = worker["pr_error"]
+        worker["canonical_sync_path"] = str(effective_path)
+        worker["canonical_sync_branch"] = branch
+        worker["canonical_sync_merge_commit"] = merge_commit
+        worker["canonical_sync_error"] = f"{message}: {detail}" if detail else message
         return False
+
+    if not raw_project_path or not project_path.is_dir():
+        return fail(f"Canonical checkout missing or invalid: {raw_project_path or '(missing)'}")
 
     def run_git(
         args: list[str],
@@ -2948,25 +2963,6 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
             timeout=timeout,
             env=_github_cli_env(),
         )
-
-    def fail(
-        message: str,
-        result: Optional[subprocess.CompletedProcess[str]] = None,
-        *,
-        sync_path: Optional[Path] = None,
-    ) -> bool:
-        detail = ""
-        if result is not None:
-            detail = (result.stderr or result.stdout or "").strip()
-        effective_path = sync_path or project_path
-        worker["canonical_sync_state"] = "blocked"
-        worker["canonical_sync_path"] = str(effective_path)
-        worker["canonical_sync_branch"] = branch
-        worker["canonical_sync_merge_commit"] = merge_commit
-        worker["pr_error"] = f"{message}: {detail}" if detail else message
-        worker["canonical_sync_error"] = worker["pr_error"]
-        worker["pr_blocker"] = worker["pr_error"]
-        return False
 
     def find_existing_branch_worktree() -> Optional[Path]:
         try:
@@ -3128,36 +3124,43 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 worker["pr_merge_state"] = "unknown"
                 worker["pr_blocker"] = target_error
                 raise RuntimeError(target_error)
-            has_commits = _branch_has_commits(root, base=base, branch=branch)
-            if _is_foreman_generated_worker(worker) and has_commits is False:
-                worker["pr_skipped_no_changes"] = True
-                worker["pr_state"] = "not_needed"
-                worker["pr_checks_status"] = "passed"
-                worker["pr_checks_total"] = 0
-                worker["pr_checks_failed"] = []
-                worker["pr_merge_state"] = "clean"
-                worker["pr_mergeable"] = True
-                worker["pr_blocker"] = ""
-            else:
-                opened = _ensure_pr_open(
-                    worker,
-                    root=root,
-                    repo=repo,
-                    branch=branch,
-                    base=base,
-                    board=board,
-                )
-                if opened and policy == MERGE_POLICY_AUTO:
-                    if _ensure_pr_merged(worker, root=root, repo=repo):
-                        _sync_canonical_checkout_after_merge(worker, branch=base)
-                elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
-                    worker["pr_merge_skipped"] = True
-                    worker["pr_merge_skipped_reason"] = policy
-                    worker["pr_blocker"] = _pr_open_blocker(worker)
-                elif not worker.get("pr_skipped_no_changes"):
-                    worker.setdefault("pr_checks_status", "not checked")
-                    worker.setdefault("pr_merge_state", "unknown")
-                    worker["pr_blocker"] = _pr_open_blocker(worker)
+            if _pr_ref(worker):
+                _refresh_pr_status(worker, root=root, repo=repo)
+                if policy == MERGE_POLICY_AUTO and _pr_is_merged(worker):
+                    worker["pr_blocker"] = ""
+                    _sync_canonical_checkout_after_merge(worker, branch=base)
+                    skip_pr_lifecycle = True
+            if not skip_pr_lifecycle:
+                has_commits = _branch_has_commits(root, base=base, branch=branch)
+                if _is_foreman_generated_worker(worker) and has_commits is False:
+                    worker["pr_skipped_no_changes"] = True
+                    worker["pr_state"] = "not_needed"
+                    worker["pr_checks_status"] = "passed"
+                    worker["pr_checks_total"] = 0
+                    worker["pr_checks_failed"] = []
+                    worker["pr_merge_state"] = "clean"
+                    worker["pr_mergeable"] = True
+                    worker["pr_blocker"] = ""
+                else:
+                    opened = _ensure_pr_open(
+                        worker,
+                        root=root,
+                        repo=repo,
+                        branch=branch,
+                        base=base,
+                        board=board,
+                    )
+                    if opened and policy == MERGE_POLICY_AUTO:
+                        if _ensure_pr_merged(worker, root=root, repo=repo):
+                            _sync_canonical_checkout_after_merge(worker, branch=base)
+                    elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
+                        worker["pr_merge_skipped"] = True
+                        worker["pr_merge_skipped_reason"] = policy
+                        worker["pr_blocker"] = _pr_open_blocker(worker)
+                    elif not worker.get("pr_skipped_no_changes"):
+                        worker.setdefault("pr_checks_status", "not checked")
+                        worker.setdefault("pr_merge_state", "unknown")
+                        worker["pr_blocker"] = _pr_open_blocker(worker)
         if not worker.get("pr_blocker") and not _verify_pr_amend_head_advanced(worker, root=root):
             worker.setdefault("pr_checks_status", "not checked")
             worker.setdefault("pr_merge_state", "unknown")
