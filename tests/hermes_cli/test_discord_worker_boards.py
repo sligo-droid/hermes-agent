@@ -1436,6 +1436,41 @@ def test_board_thread_state_completed_board_ignores_stale_worker_blocker(monkeyp
     assert dwb.board_thread_state(board.slug) == "done"
 
 
+def test_ready_ticket_supersedes_stale_blocked_board_metadata(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="78013", goal="Recover ready foreman repair")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee=dwb.ROLE_FOREMAN,
+            tenant=board.slug,
+            initial_status="running",
+        )
+        assert kanban_db.move_task_status(conn, task_id, "ready")
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "approved reviewer PR finalization failed",
+        },
+    )
+
+    assert dwb.board_thread_state(board.slug) == "active"
+    assert dwb.board_thread_reaction_state(board.slug) == "active"
+    assert dwb.is_executable_worker_board(board.slug) is True
+    snapshot = dwb.feature_summary_snapshot(board.slug)
+    assert snapshot["state"] == "active"
+
+
 def test_terminal_non_green_finalization_keeps_summary_and_reaction_blocked(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
