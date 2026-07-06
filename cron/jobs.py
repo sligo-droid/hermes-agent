@@ -662,6 +662,99 @@ def audit_overdue_self_improvement_proposals(
     return findings
 
 
+def detect_missed_cron_runs(
+    *,
+    jobs: Optional[List[Dict[str, Any]]] = None,
+    now: Optional[datetime] = None,
+    grace_seconds: int = 300,
+    claim_ttl_seconds: int = 600,
+    limit: int = 10,
+) -> Dict[str, Any]:
+    """Return read-only missed-run status for enabled cron jobs.
+
+    This intentionally does not mirror ``get_due_jobs`` by advancing stale
+    schedules. It reports persisted ``next_run_at`` values that are older than
+    the operator grace window so scheduler-loop liveness can be assessed
+    separately from missed scheduled fires.
+    """
+    check_now = now or _hermes_now()
+    grace = max(0, int(grace_seconds or 0))
+    claim_ttl = max(0, int(claim_ttl_seconds or 0))
+    source_jobs = jobs if jobs is not None else load_jobs()
+    offenders: List[Dict[str, Any]] = []
+
+    for raw_job in source_jobs:
+        job = _normalize_job_record(copy.deepcopy(raw_job))
+        if not job.get("enabled", True) or job.get("state") in {"paused", "completed"}:
+            continue
+
+        schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+        if schedule.get("kind") not in {"cron", "interval"}:
+            continue
+
+        next_run_at = job.get("next_run_at")
+        next_run_dt = _parse_cron_timestamp(next_run_at)
+        if next_run_dt is None:
+            continue
+
+        created_at_dt = _parse_cron_timestamp(job.get("created_at"))
+        if created_at_dt and created_at_dt > next_run_dt:
+            continue
+
+        manual = job.get("manual_run") if isinstance(job.get("manual_run"), dict) else None
+        if manual and manual.get("state") in {"queued", "running"}:
+            continue
+
+        claim = job.get("fire_claim") if isinstance(job.get("fire_claim"), dict) else None
+        if claim:
+            claimed_at = _parse_cron_timestamp(claim.get("claimed_at"))
+            if claimed_at and (check_now - claimed_at).total_seconds() < claim_ttl:
+                continue
+
+        overdue_seconds = int((check_now - next_run_dt).total_seconds())
+        if overdue_seconds <= grace:
+            continue
+
+        job_id = job.get("id", "unknown")
+        offenders.append(
+            {
+                "job_id": job_id,
+                "job_name": job.get("name") or job_id,
+                "last_run_at": job.get("last_run_at"),
+                "next_run_at": next_run_at,
+                "overdue_seconds": overdue_seconds,
+                "overdue_age": _format_duration_seconds(overdue_seconds),
+                "last_status": job.get("last_status"),
+                "last_output_path": job.get("last_terminal_output_path") or _newest_job_output_path(job_id),
+            }
+        )
+
+    offenders.sort(key=lambda item: item["overdue_seconds"], reverse=True)
+    limited = offenders[: max(0, int(limit or 0))]
+    return {
+        "missed_count": len(offenders),
+        "grace_seconds": grace,
+        "offenders": limited,
+    }
+
+
+def _format_duration_seconds(seconds: int) -> str:
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, secs = divmod(remaining, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
     """
     Compute the next run time for a schedule.

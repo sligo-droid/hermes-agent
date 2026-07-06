@@ -177,6 +177,24 @@ def _print_overdue_proposal_findings(findings):
     print()
 
 
+def _print_missed_cron_runs(status):
+    missed_count = int(status.get("missed_count") or 0)
+    if missed_count <= 0:
+        return
+
+    grace = int(status.get("grace_seconds") or 0)
+    print(color(f"  ⚠  {missed_count} cron job(s) missed scheduled fire(s)", Colors.YELLOW))
+    print(f"     Scheduler heartbeat may be healthy; next_run_at is older than grace ({grace}s).")
+    for offender in status.get("offenders") or []:
+        print(f"  - {offender.get('job_id')} ({offender.get('job_name')})")
+        print(f"    Next run: {offender.get('next_run_at') or 'unknown'}")
+        print(f"    Overdue: {offender.get('overdue_age') or 'unknown'}")
+        print(f"    Last run: {offender.get('last_run_at') or 'never'}")
+        print(f"    Last status: {offender.get('last_status') or 'unknown'}")
+        print(f"    Last output: {offender.get('last_output_path') or 'unavailable'}")
+    print()
+
+
 def cron_tick():
     """Run due jobs once and exit."""
     from cron.scheduler import tick
@@ -187,10 +205,12 @@ def cron_status():
     """Show cron execution status."""
     from cron.jobs import (
         audit_overdue_self_improvement_proposals,
+        detect_missed_cron_runs,
         get_ticker_heartbeat_age,
         get_ticker_success_age,
         list_jobs,
     )
+    from hermes_cli.config import load_config
     from hermes_cli.gateway import get_gateway_runtime_health
 
     print()
@@ -228,6 +248,14 @@ def cron_status():
             print(f"  Next run: {min(next_runs)}")
     else:
         print("  No active jobs")
+
+    cfg = load_config()
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    missed_grace = cron_cfg.get("missed_run_grace_seconds", 300)
+    missed_status = detect_missed_cron_runs(grace_seconds=missed_grace)
+    if missed_status.get("missed_count"):
+        print()
+        _print_missed_cron_runs(missed_status)
 
     paused_terminal_jobs = [
         j for j in list_jobs(include_disabled=True)
