@@ -46,7 +46,7 @@ import tempfile
 import time
 import threading
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -494,6 +494,7 @@ class AIAgent:
         )
         self._session_log_written_count: int = -1
         self._session_log_written_path: Optional[Path] = None
+        self._session_log_written_stat: Optional[Tuple[int, int]] = None
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -1933,10 +1934,13 @@ class AIAgent:
             # with partial history and would otherwise clobber the full JSON log.
             written_count = getattr(self, "_session_log_written_count", -1)
             written_path = getattr(self, "_session_log_written_path", None)
+            written_stat = getattr(self, "_session_log_written_stat", None)
             should_read_existing = not (
                 written_count >= 0
                 and len(cleaned) >= written_count
                 and Path(self.session_log_file) == written_path
+                and written_stat is not None
+                and self._session_log_stat_unchanged(written_stat)
             )
             if should_read_existing and self.session_log_file.exists():
                 try:
@@ -1972,10 +1976,29 @@ class AIAgent:
             )
             self._session_log_written_count = len(cleaned)
             self._session_log_written_path = Path(self.session_log_file)
+            try:
+                st = Path(self.session_log_file).stat()
+                self._session_log_written_stat = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                self._session_log_written_stat = None
 
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
+
+    def _session_log_stat_unchanged(self, written_stat) -> bool:
+        """True if the session log file is byte-identical to our last write.
+
+        A cheap stat() replaces the full read-back only when no OTHER writer
+        (e.g. an overlapping process during restart handoff) has touched the
+        file since this process last wrote it; any mismatch falls back to the
+        full read-back guard.
+        """
+        try:
+            st = Path(self.session_log_file).stat()
+        except OSError:
+            return False
+        return (st.st_mtime_ns, st.st_size) == written_stat
 
     def interrupt(self, message: str = None) -> None:
         """

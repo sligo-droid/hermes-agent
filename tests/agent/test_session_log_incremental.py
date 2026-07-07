@@ -21,6 +21,7 @@ def _agent(tmp_path, session_id="session-log-incremental"):
     agent.verbose_logging = False
     agent._session_log_written_count = -1
     agent._session_log_written_path = None
+    agent._session_log_written_stat = None
     return agent
 
 
@@ -109,3 +110,21 @@ def test_fresh_process_guard_prevents_clobbering_fuller_log(tmp_path):
     assert data["message_count"] == 5
     assert len(data["messages"]) == 5
     assert agent_b._session_log_written_count == -1
+
+
+def test_external_writer_reenables_guard_and_prevents_clobber(tmp_path):
+    agent = _agent(tmp_path)
+    agent._save_session_log(_messages(2))
+
+    # Another process (e.g. restart-handoff overlap) writes a FULLER log to
+    # the same path after our last write: the stat fingerprint must force the
+    # read-back guard, which then refuses to clobber the fuller log.
+    _write_log(agent.session_log_file, 6)
+
+    with patch.object(Path, "read_text", autospec=True, wraps=Path.read_text) as read_text:
+        agent._save_session_log(_messages(3))
+
+    assert read_text.call_count == 1
+    data = _read_log(agent.session_log_file)
+    assert data["message_count"] == 6
+    assert len(data["messages"]) == 6
