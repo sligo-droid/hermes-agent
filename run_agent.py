@@ -492,6 +492,8 @@ class AIAgent:
             pass_session_id=pass_session_id,
             verify_on_stop=verify_on_stop,
         )
+        self._session_log_written_count: int = -1
+        self._session_log_written_path: Optional[Path] = None
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -1929,7 +1931,14 @@ class AIAgent:
             # This protects against data loss when --resume loads a session whose
             # messages weren't fully written to SQLite — the resumed agent starts
             # with partial history and would otherwise clobber the full JSON log.
-            if self.session_log_file.exists():
+            written_count = getattr(self, "_session_log_written_count", -1)
+            written_path = getattr(self, "_session_log_written_path", None)
+            should_read_existing = not (
+                written_count >= 0
+                and len(cleaned) >= written_count
+                and Path(self.session_log_file) == written_path
+            )
+            if should_read_existing and self.session_log_file.exists():
                 try:
                     existing = json.loads(self.session_log_file.read_text(encoding="utf-8"))
                     existing_count = existing.get("message_count", len(existing.get("messages", [])))
@@ -1961,6 +1970,8 @@ class AIAgent:
                 indent=2,
                 default=str,
             )
+            self._session_log_written_count = len(cleaned)
+            self._session_log_written_path = Path(self.session_log_file)
 
         except Exception as e:
             if self.verbose_logging:
