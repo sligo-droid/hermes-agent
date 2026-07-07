@@ -1101,8 +1101,8 @@ def run_conversation(
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("memory manager on_turn_start failed; continuing without: %s", exc)
 
     # External memory provider: prefetch once before the tool loop.
     # Reuse the cached result on every iteration to avoid re-calling
@@ -1114,8 +1114,8 @@ def run_conversation(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("memory prefetch failed; turn runs without recall context: %s", exc)
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -1439,7 +1439,9 @@ def run_conversation(
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         approx_request_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+            api_messages,
+            tools=agent.tools or None,
+            messages_tokens=approx_tokens,
         )
 
         _runtime_context_error = _ollama_context_limit_error(
