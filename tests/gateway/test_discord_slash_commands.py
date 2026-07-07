@@ -842,6 +842,107 @@ class _FakeThreadChannel(_discord_mod.Thread):
         return _empty()
 
 
+def test_fable_text_command_counts_as_threaded_work(adapter):
+    assert adapter._slash_command_starts_threaded_work("/fable plan reporting") is True
+    assert adapter._slash_command_starts_threaded_work("/FABLE plan reporting") is True
+    assert adapter._slash_command_starts_threaded_work("/fable") is False
+    assert adapter._slash_command_starts_threaded_work("/usage") is False
+
+
+@pytest.mark.asyncio
+async def test_fable_slash_in_parent_channel_creates_thread_before_dispatch(adapter):
+    parent = _FakeTextChannel(channel_id=123, name="planning")
+    interaction = SimpleNamespace(
+        channel=parent,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock(
+        return_value={"success": True, "thread_id": "555", "thread_name": "Fable plan — plan the work"}
+    )
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = AsyncMock(side_effect=capture_handle)
+
+    await adapter._run_simple_slash(interaction, "/fable plan the work")
+
+    adapter._create_thread.assert_awaited_once_with(
+        interaction,
+        name="Fable plan — plan the work",
+        message="",
+        auto_archive_duration=1440,
+        reason_command="fable",
+    )
+    adapter.handle_message.assert_awaited_once()
+    event = captured_events[0]
+    assert event.text == "/fable plan the work"
+    assert event.source.chat_id == "555"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "555"
+    assert event.source.parent_chat_id == "123"
+    interaction.delete_original_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fable_slash_in_existing_thread_does_not_create_nested_thread(adapter):
+    thread = _FakeThreadChannel(channel_id=555, name="already-threaded", parent_id=123)
+    interaction = SimpleNamespace(
+        channel=thread,
+        channel_id=555,
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock()
+    captured_events = []
+    adapter.handle_message = AsyncMock(side_effect=lambda event: captured_events.append(event))
+
+    await adapter._run_simple_slash(interaction, "/fable plan the work")
+
+    adapter._create_thread.assert_not_awaited()
+    event = captured_events[0]
+    assert event.source.chat_id == "555"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "555"
+
+
+@pytest.mark.asyncio
+async def test_fable_slash_refuses_top_level_dispatch_when_thread_creation_fails(adapter):
+    parent = _FakeTextChannel(channel_id=123, name="planning")
+    interaction = SimpleNamespace(
+        channel=parent,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock(return_value={"error": "no thread perms"})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._run_simple_slash(interaction, "/fable plan the work")
+
+    adapter.handle_message.assert_not_awaited()
+    interaction.edit_original_response.assert_awaited_once()
+    _args, kwargs = interaction.edit_original_response.await_args
+    assert "did not run it in the top-level channel" in kwargs["content"]
+    assert "no thread perms" in kwargs["content"]
+    interaction.delete_original_response.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_goal_slash_routes_official_command_to_hermes_goal_loop(adapter):
     parent = _FakeTextChannel(channel_id=123, name="features")
