@@ -109,7 +109,28 @@ async def test_fable_command_routes_through_normal_agent_with_fable_override(mon
     agent_event = runner._handle_message_with_agent.await_args.args[0]
     assert agent_event.text == "PLAN SKILL: build X"
     assert agent_event.invoked_skill_command == "fable"
+    assert agent_event.fable_enabled_toolsets == ["file", "terminal", "web", "browser", "discord"]
     assert build_session_key(agent_event.source) not in runner._session_model_overrides
+
+
+@pytest.mark.asyncio
+async def test_fable_command_uses_configured_toolset_budget(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", lambda *_args, **_kwargs: "PLAN")
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (_fable_override(), ""),
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {"fable": {"enabled_toolsets": ["file", "web"]}})
+
+    result = await GatewayRunner._handle_message(runner, _make_event())
+
+    assert isinstance(result, MetadataReply)
+    agent_event = runner._handle_message_with_agent.await_args.args[0]
+    assert agent_event.fable_enabled_toolsets == ["file", "web"]
 
 
 @pytest.mark.asyncio
@@ -216,8 +237,81 @@ def test_fable_run_agent_disables_fallback_and_restricts_provider(monkeypatch):
     assert result == "fable ok"
     assert captured["model"] == "claude-fable-5"
     assert captured["provider"] == "anthropic"
+    assert captured["enabled_toolsets"] == ["file", "terminal", "web", "browser", "discord"]
     assert captured["fallback_model"] is None
     assert captured["providers_allowed"] == ["anthropic"]
+
+
+def test_fable_run_agent_uses_event_toolset_override(monkeypatch):
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    import gateway.run as gateway_run
+
+    captured = {}
+
+    class CapturingAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.tools = []
+
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
+            return {
+                "final_response": "fable ok",
+                "messages": [],
+                "api_calls": 1,
+                "model": "claude-fable-5",
+                "provider": "anthropic",
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"tools": {"discord": {"enabled": ["all"]}}})
+    GatewayRunner = gateway_run.GatewayRunner
+
+    runner = _make_runner()
+    runner._handle_message_with_agent = GatewayRunner._handle_message_with_agent.__get__(runner, GatewayRunner)
+    runner._run_agent = GatewayRunner._run_agent.__get__(runner, GatewayRunner)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: ("claude-fable-5", _fable_override())
+    runner._agent_cache_lock = threading.Lock()
+    runner._fallback_model = None
+    runner._provider_routing = {}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._voice_mode = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._show_reasoning = False
+    runner._service_tier = None
+    runner._session_db = None
+    runner._background_tasks = set()
+    runner.adapters = {}
+    event = _make_event()
+    event.text = "PLAN"
+    event.fable_plan_metadata = {"command": "fable"}
+    event.fable_enabled_toolsets = ["file", "web"]
+    session_entry = _session_entry_for_event(event)
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.update_session = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.has_any_sessions.return_value = True
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(
+            event,
+            event.source,
+            build_session_key(event.source),
+            1,
+        )
+    )
+
+    assert result == "fable ok"
+    assert captured["enabled_toolsets"] == ["file", "web"]
 
 
 def test_fable_run_agent_refuses_non_fable_model_result(monkeypatch):

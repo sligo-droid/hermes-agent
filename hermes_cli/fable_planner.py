@@ -11,6 +11,7 @@ FABLE_MODEL = "claude-fable-5"
 FABLE_ROUTE = "anthropic_oauth"
 FABLE_TRANSPORT = "anthropic_oauth"
 FABLE_REASONING = {"enabled": True, "effort": "high"}
+FABLE_DEFAULT_TOOLSETS = ["file", "terminal", "web", "browser", "discord"]
 
 FABLE_RUNTIME_NOTE = """This is `/fable`: use Claude Fable 5, planning only, inspect repo with read-only tools as needed, save a plan artifact if the plan skill requires it, and do not implement. Do not edit files, create branches, open pull requests, deploy, or claim that implementation, tests, commits, PRs, or deployment happened. Generate a concrete Markdown implementation plan only. Your final answer must contain the full plan markdown, plus the saved path if you wrote one; do not answer with only a brief path/status note. Hermes/gateway will handle Discord delivery, threading, and artifact indexing outside the Fable turn, so do not describe or perform those operational steps."""
 
@@ -54,6 +55,16 @@ def fable_metadata(result: FablePlanResult | None = None) -> dict[str, Any]:
         metadata["ok"] = result.ok
         metadata["refusal"] = result.refusal
     return metadata
+
+
+def fable_enabled_toolsets(config: dict[str, Any] | None = None) -> list[str]:
+    cfg = _fable_config(config)
+    configured = cfg.get("enabled_toolsets")
+    if isinstance(configured, list):
+        toolsets = [str(item).strip() for item in configured if str(item).strip()]
+        if toolsets:
+            return toolsets
+    return list(FABLE_DEFAULT_TOOLSETS)
 
 
 def build_fable_user_instruction(request: FablePlanRequest) -> str:

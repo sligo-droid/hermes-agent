@@ -1038,6 +1038,7 @@ DEFAULT_CONFIG = {
         "provider": "anthropic",
         "model": "claude-fable-5",
         "route": "anthropic_oauth",
+        "enabled_toolsets": ["file", "terminal", "web", "browser", "discord"],
         "timeout_seconds": 300,
         "max_tokens": 12000,
         "save_local_plan": False,
