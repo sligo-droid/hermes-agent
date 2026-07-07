@@ -196,6 +196,17 @@ def _discord_action_request_reasoning_config(config: Optional[dict]) -> dict | N
     return parse_reasoning_effort("xhigh")
 
 
+def _fable_fail_closed_error(detail: str = "") -> str:
+    base = (
+        "⚠️ /fable is pinned to Claude Fable 5 via Hermes' Anthropic OAuth route "
+        "and will not fall back to another model or provider."
+    )
+    cleaned = " ".join(str(detail or "").split())[:500]
+    if cleaned:
+        return f"{base} {cleaned}"
+    return base
+
+
 def _discord_feature_request_reasoning_config(config: Optional[dict]) -> dict | None:
     return _discord_action_request_reasoning_config(config)
 
@@ -10848,7 +10859,11 @@ class GatewayRunner:
             _flow_dispatch_start_ts = time.time()
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             _fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
-            if _fable_plan_metadata and isinstance(_agent_result, str):
+            if (
+                _fable_plan_metadata
+                and isinstance(_agent_result, str)
+                and not _agent_result.startswith("⚠️ /fable is pinned")
+            ):
                 _agent_result = MetadataReply(_agent_result, _fable_plan_metadata)
             self._log_gateway_flow_telemetry(
                 route_type=_flow_route_type,
@@ -11987,6 +12002,24 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
+            if fable_plan_metadata:
+                actual_model = str(agent_result.get("model") or "")
+                actual_provider = str(agent_result.get("provider") or "")
+                if agent_result.get("failed"):
+                    detail = str(agent_result.get("error") or response or "Fable route unavailable.")
+                    return _fable_fail_closed_error(detail)
+                if actual_model != "claude-fable-5" or actual_provider != "anthropic":
+                    logger.error(
+                        "/fable resolved unexpected route provider=%r model=%r; refusing fallback result for session %s",
+                        actual_provider,
+                        actual_model,
+                        session_key,
+                    )
+                    return _fable_fail_closed_error(
+                        "Resolved unexpected route "
+                        f"provider={actual_provider!r} model={actual_model!r}; refusing fallback result."
+                    )
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -20938,6 +20971,8 @@ class GatewayRunner:
                     "session_db": self._session_db,
                     "fallback_model": None if fable_plan_metadata else self._fallback_model,
                 }
+                if fable_plan_metadata:
+                    agent_kwargs["providers_allowed"] = ["anthropic"]
                 if standard_discord_action_request:
                     agent_kwargs["tool_delay"] = 0.0
                     agent_kwargs["verify_on_stop"] = True
@@ -21387,7 +21422,8 @@ class GatewayRunner:
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
-            _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _resolved_model = (result.get("model") if isinstance(result, dict) else None) or (getattr(_agent, "model", None) if _agent else None)
+            _resolved_provider = (result.get("provider") if isinstance(result, dict) else None) or (getattr(_agent, "provider", None) if _agent else None)
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -21408,6 +21444,7 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "provider": _resolved_provider,
                     "context_length": _context_length,
                     "runtime_breakdown": result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
                 }
@@ -21624,6 +21661,7 @@ class GatewayRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _resolved_provider,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),

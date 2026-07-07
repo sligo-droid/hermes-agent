@@ -44,6 +44,7 @@ def test_fable_session_model_override_uses_anthropic_oauth_route(monkeypatch):
         "api_key": "sk-ant-oat01-test",
         "base_url": "https://api.anthropic.com",
         "api_mode": "anthropic_messages",
+        "disable_fallback": "true",
     }
 
 
