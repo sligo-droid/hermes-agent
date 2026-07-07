@@ -43,6 +43,7 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DISCORD_MAX_APP_COMMANDS = 100
 _DISCORD_FEATURE_SUMMARY_EDIT_BACKOFF_SECONDS = 30.0
 _DISCORD_AUDIO_EXTENSIONS = frozenset({
     ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
@@ -2878,10 +2879,15 @@ class DiscordAdapter(BasePlatformAdapter):
         if not cleaned.startswith("/"):
             return False
         match = re.match(r"^/([^\s]+)(?:\s+(.*))?$", cleaned, re.DOTALL)
-        if not match or match.group(1).lower() != "goal":
+        if not match:
             return False
-        args = match.group(2) or ""
-        lower_args = args.strip().lower()
+        command = match.group(1).lower()
+        args = (match.group(2) or "").strip()
+        if command == "fable":
+            return bool(args)
+        if command != "goal":
+            return False
+        lower_args = args.lower()
         return bool(
             lower_args
             and lower_args not in GOAL_CONTROL_COMMANDS
@@ -6211,6 +6217,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
         await interaction.response.defer(ephemeral=True)
         event = self._build_slash_event(interaction, command_text)
+        if self._is_fable_command_text(command_text):
+            if not await self._route_fable_slash_to_thread(interaction, event, command_text):
+                return
         await self.handle_message(event)
         try:
             if followup_msg:
@@ -6219,6 +6228,80 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.delete_original_response()
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
+
+    @staticmethod
+    def _is_fable_command_text(text: str) -> bool:
+        return bool(re.match(r"^/fable(?:\s|$)", str(text or "").strip(), re.IGNORECASE))
+
+    @staticmethod
+    def _fable_thread_name(command_text: str) -> str:
+        content = re.sub(r"^/fable(?:\s+|$)", "", str(command_text or "").strip(), flags=re.IGNORECASE)
+        content = re.sub(r"<@[!&]?\d+>", "", content)
+        content = re.sub(r"<#\d+>", "", content)
+        content = re.sub(r"\s+", " ", content).strip()
+        base = f"Fable plan — {content}" if content else "Fable plan"
+        return base[:80] if len(base) <= 80 else base[:77].rstrip() + "..."
+
+    async def _route_fable_slash_to_thread(
+        self,
+        interaction: Any,
+        event: MessageEvent,
+        command_text: str,
+    ) -> bool:
+        """Ensure top-level Discord /fable slash commands run inside a fresh thread."""
+
+        source = getattr(event, "source", None)
+        if source is None:
+            return True
+        if getattr(source, "chat_type", "") == "dm" or getattr(source, "thread_id", None):
+            return True
+
+        result = await self._create_thread(
+            interaction,
+            name=self._fable_thread_name(command_text),
+            message="",
+            auto_archive_duration=1440,
+            reason_command="fable",
+        )
+        if not result.get("success"):
+            error = str(result.get("error") or "unknown Discord thread creation failure")
+            logger.warning("[%s] /fable thread creation failed; refusing top-level delivery: %s", self.name, error)
+            try:
+                await interaction.edit_original_response(
+                    content=(
+                        "⚠️ Failed to create a Discord thread for `/fable`, so I did not run it "
+                        f"in the top-level channel. {error}"
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Discord /fable thread failure notice failed: %s", exc)
+            return False
+
+        parent_chat_id = str(getattr(interaction, "channel_id", "") or getattr(source, "chat_id", "") or "")
+        thread_id = str(result.get("thread_id") or "").strip()
+        thread_name = str(result.get("thread_name") or self._fable_thread_name(command_text)).strip()
+        if not thread_id:
+            logger.warning("[%s] /fable thread creation returned success without a thread_id; refusing top-level delivery", self.name)
+            try:
+                await interaction.edit_original_response(
+                    content=(
+                        "⚠️ Failed to create a Discord thread for `/fable`, so I did not run it "
+                        "in the top-level channel. Discord did not return a thread id."
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Discord /fable malformed thread notice failed: %s", exc)
+            return False
+
+        source.parent_chat_id = parent_chat_id
+        source.chat_id = thread_id
+        source.thread_id = thread_id
+        source.chat_type = "thread"
+        if thread_name:
+            guild = getattr(interaction, "guild", None)
+            guild_name = str(getattr(guild, "name", "") or "").strip()
+            source.chat_name = f"{guild_name} / #{thread_name}" if guild_name else thread_name
+        return True
 
 
     def _register_slash_commands(self) -> None:
@@ -6420,6 +6503,8 @@ class DiscordAdapter(BasePlatformAdapter):
             config_overrides = _resolve_config_gates()
 
             for cmd_def in COMMAND_REGISTRY:
+                if len(already_registered) >= _DISCORD_MAX_APP_COMMANDS:
+                    break
                 if not _is_gateway_available(cmd_def, config_overrides):
                     continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
@@ -6455,6 +6540,8 @@ class DiscordAdapter(BasePlatformAdapter):
             from hermes_cli.commands import _iter_plugin_command_entries
 
             for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries():
+                if len(already_registered) >= _DISCORD_MAX_APP_COMMANDS:
+                    break
                 discord_name = plugin_name.lower()[:32]
                 if discord_name in already_registered:
                     continue
@@ -6478,7 +6565,13 @@ class DiscordAdapter(BasePlatformAdapter):
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
-        self._register_skill_group(tree)
+        if len(already_registered) < _DISCORD_MAX_APP_COMMANDS:
+            self._register_skill_group(tree)
+        else:
+            logger.warning(
+                "Discord slash command registration reached cap (%d); skipping /skill group.",
+                _DISCORD_MAX_APP_COMMANDS,
+            )
 
         # Optional defense-in-depth: hide every slash command from non-admin
         # guild members in Discord's slash picker. Server-side authorization
@@ -8676,6 +8769,7 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         message: str = "",
         auto_archive_duration: int = 1440,
+        reason_command: str = "thread",
     ) -> Dict[str, Any]:
         """Create a thread in the current Discord channel.
 
@@ -8702,7 +8796,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return {"error": "Could not determine a parent text channel for the new thread."}
 
         display_name = getattr(getattr(interaction, "user", None), "display_name", None) or "unknown user"
-        reason = f"Requested by {display_name} via /thread"
+        reason_slug = re.sub(r"[^a-z0-9_-]+", "-", str(reason_command or "thread").strip().lower()).strip("-") or "thread"
+        reason = f"Requested by {display_name} via /{reason_slug}"
         starter_message = (message or "").strip()
 
         direct_thread_kwargs = {
