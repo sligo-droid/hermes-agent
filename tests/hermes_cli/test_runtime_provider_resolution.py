@@ -44,10 +44,33 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
-def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
+def test_resolve_runtime_provider_anthropic_adapter_respects_config_base_url(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "anthropic",
+            "base_url": "https://proxy.example.com/anthropic",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: "adapter-token",
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["api_key"] == "adapter-token"
+    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+
+
+def test_resolve_runtime_provider_anthropic_prefers_claude_code_over_pool_for_fable(monkeypatch):
     class _Entry:
         access_token = "pool-token"
-        source = "manual"
+        source = "manual:hermes_pkce"
         base_url = "https://api.anthropic.com"
 
     class _Pool:
@@ -63,17 +86,26 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
         "_get_model_config",
         lambda: {
             "provider": "anthropic",
-            "base_url": "https://proxy.example.com/anthropic",
+            "base_url": "https://api.anthropic.com",
         },
     )
     monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: "claude-code-token",
+    )
 
-    resolved = rp.resolve_runtime_provider(requested="anthropic")
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        target_model="claude-fable-5",
+    )
 
     assert resolved["provider"] == "anthropic"
     assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "pool-token"
-    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+    assert resolved["base_url"] == "https://api.anthropic.com"
+    assert resolved["api_key"] == "claude-code-token"
+    assert resolved["source"] == "env"
+    assert resolved.get("credential_pool") is None
 
 
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):

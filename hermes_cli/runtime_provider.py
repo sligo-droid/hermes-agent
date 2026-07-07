@@ -1107,6 +1107,77 @@ def _resolve_explicit_runtime(
     return None
 
 
+def _resolve_anthropic_runtime(
+    *,
+    requested_provider: str,
+    model_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    # Allow base URL override from config.yaml model.base_url, but only
+    # when the configured provider is anthropic — otherwise a non-Anthropic
+    # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
+    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+    cfg_base_url = ""
+    if cfg_provider == "anthropic":
+        cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+    base_url = cfg_base_url or "https://api.anthropic.com"
+
+    # For Microsoft Foundry endpoints, use ANTHROPIC_API_KEY directly —
+    # Claude Code OAuth tokens (sk-ant-oat01) are not accepted by Azure.
+    # Azure keys don't start with "sk-ant-" so resolve_anthropic_token()
+    # would find the Claude Code OAuth token first (priority 3) and return
+    # that instead, causing 401s. Detect Azure endpoints and use the env
+    # key directly to bypass the OAuth priority chain.
+    _is_azure_endpoint = "azure.com" in base_url.lower() or (
+        cfg_base_url and "azure.com" in cfg_base_url.lower()
+    )
+    if _is_azure_endpoint:
+        # Honor user-specified env var hints on the model config before
+        # falling back to the built-in AZURE_ANTHROPIC_KEY / ANTHROPIC_API_KEY
+        # chain.  Accept both `key_env` (Hermes canonical — matches the
+        # custom_providers field name) and `api_key_env` (documented in the
+        # Azure Foundry guide and read by most Hermes-compatible importers).
+        # Matches the config.yaml examples in website/docs/guides/azure-foundry.md.
+        token = ""
+        for hint_key in ("key_env", "api_key_env"):
+            env_var = str(model_cfg.get(hint_key) or "").strip()
+            if env_var:
+                token = _getenv(env_var, "").strip()
+                if token:
+                    break
+        # Next: an inline api_key on the model config (useful in multi-profile
+        # setups that want to avoid env-var juggling).
+        if not token:
+            token = str(model_cfg.get("api_key") or "").strip()
+        # Finally fall back to the historical fixed names.
+        if not token:
+            token = (
+                _getenv("AZURE_ANTHROPIC_KEY", "").strip()
+                or _getenv("ANTHROPIC_API_KEY", "").strip()
+            )
+        if not token:
+            raise AuthError(
+                "No Azure Anthropic API key found. Set AZURE_ANTHROPIC_KEY or "
+                "ANTHROPIC_API_KEY, or point key_env/api_key_env in your "
+                "config.yaml model section at a custom env var."
+            )
+    else:
+        from agent.anthropic_adapter import resolve_anthropic_token
+        token = resolve_anthropic_token()
+        if not token:
+            raise AuthError(
+                "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
+                "run 'claude setup-token', or authenticate with 'claude /login'."
+            )
+    return {
+        "provider": "anthropic",
+        "api_mode": "anthropic_messages",
+        "base_url": base_url,
+        "api_key": token,
+        "source": "env",
+        "requested_provider": requested_provider,
+    }
+
+
 def resolve_runtime_provider(
     *,
     requested: Optional[str] = None,
@@ -1185,6 +1256,12 @@ def resolve_runtime_provider(
     )
     if explicit_runtime:
         return explicit_runtime
+
+    if provider == "anthropic":
+        return _resolve_anthropic_runtime(
+            requested_provider=requested_provider,
+            model_cfg=model_cfg,
+        )
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
@@ -1366,73 +1443,6 @@ def resolve_runtime_provider(
             "command": creds.get("command", ""),
             "args": list(creds.get("args") or []),
             "source": creds.get("source", "process"),
-            "requested_provider": requested_provider,
-        }
-
-    # Anthropic (native Messages API)
-    if provider == "anthropic":
-        # Allow base URL override from config.yaml model.base_url, but only
-        # when the configured provider is anthropic — otherwise a non-Anthropic
-        # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
-        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
-        cfg_base_url = ""
-        if cfg_provider == "anthropic":
-            cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
-        base_url = cfg_base_url or "https://api.anthropic.com"
-
-        # For Microsoft Foundry endpoints, use ANTHROPIC_API_KEY directly —
-        # Claude Code OAuth tokens (sk-ant-oat01) are not accepted by Azure.
-        # Azure keys don't start with "sk-ant-" so resolve_anthropic_token()
-        # would find the Claude Code OAuth token first (priority 3) and return
-        # that instead, causing 401s. Detect Azure endpoints and use the env
-        # key directly to bypass the OAuth priority chain.
-        _is_azure_endpoint = "azure.com" in base_url.lower() or (
-            cfg_base_url and "azure.com" in cfg_base_url.lower()
-        )
-        if _is_azure_endpoint:
-            # Honor user-specified env var hints on the model config before
-            # falling back to the built-in AZURE_ANTHROPIC_KEY / ANTHROPIC_API_KEY
-            # chain.  Accept both `key_env` (Hermes canonical — matches the
-            # custom_providers field name) and `api_key_env` (documented in the
-            # Azure Foundry guide and read by most Hermes-compatible importers).
-            # Matches the config.yaml examples in website/docs/guides/azure-foundry.md.
-            token = ""
-            for hint_key in ("key_env", "api_key_env"):
-                env_var = str(model_cfg.get(hint_key) or "").strip()
-                if env_var:
-                    token = _getenv(env_var, "").strip()
-                    if token:
-                        break
-            # Next: an inline api_key on the model config (useful in multi-profile
-            # setups that want to avoid env-var juggling).
-            if not token:
-                token = str(model_cfg.get("api_key") or "").strip()
-            # Finally fall back to the historical fixed names.
-            if not token:
-                token = (
-                    _getenv("AZURE_ANTHROPIC_KEY", "").strip()
-                    or _getenv("ANTHROPIC_API_KEY", "").strip()
-                )
-            if not token:
-                raise AuthError(
-                    "No Azure Anthropic API key found. Set AZURE_ANTHROPIC_KEY or "
-                    "ANTHROPIC_API_KEY, or point key_env/api_key_env in your "
-                    "config.yaml model section at a custom env var."
-                )
-        else:
-            from agent.anthropic_adapter import resolve_anthropic_token
-            token = resolve_anthropic_token()
-            if not token:
-                raise AuthError(
-                    "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
-                    "run 'claude setup-token', or authenticate with 'claude /login'."
-                )
-        return {
-            "provider": "anthropic",
-            "api_mode": "anthropic_messages",
-            "base_url": base_url,
-            "api_key": token,
-            "source": "env",
             "requested_provider": requested_provider,
         }
 
