@@ -1123,13 +1123,15 @@ class DiscordAdapter(BasePlatformAdapter):
     def _resolve_discord_project_context_with_shared_db(self, channel: Any):
         db = self._shared_session_db()
         if db is None:
-            return resolve_discord_project_context(channel, session_db=None)
+            return resolve_discord_project_context(channel)
         try:
             return resolve_discord_project_context(channel, session_db=db)
         except Exception as exc:
             logger.debug("[%s] shared SessionDB project-context lookup failed: %s", self.name, exc)
             self._invalidate_shared_session_db()
-            return resolve_discord_project_context(channel, session_db=None)
+            # Kwarg-free fallback: matches the pre-shared-DB call shape, so it
+            # keeps working if the resolver (or a test stub) lacks session_db.
+            return resolve_discord_project_context(channel)
 
     def _invalidate_relevant_root_channels_cache_for_context(self, project_context_obj: Any) -> None:
         if project_context_obj is None or not getattr(project_context_obj, "resolved", False):
