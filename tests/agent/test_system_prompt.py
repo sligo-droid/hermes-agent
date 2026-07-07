@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.prompt_builder import KANBAN_GUIDANCE
 from agent.system_prompt import build_system_prompt_parts
 
 
@@ -54,7 +55,7 @@ class TestContextFileCwd:
 
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        assert _captured_context_cwd(_make_agent()) == tmp_path
+        assert _captured_context_cwd(_make_agent()) == str(tmp_path)
 
 
 def _stable_prompt(agent):
@@ -76,14 +77,54 @@ def _init_code_repo(path):
     (path / "main.py").write_text("print('hi')\n")
 
 
+class TestToolGuidance:
+    def test_normal_agent_gets_clarifying_question_guidance(self):
+        agent = _make_agent(valid_tool_names=["clarify"])
+
+        stable = _stable_prompt(agent)
+
+        assert "# Clarifying questions" in stable
+        assert "Do not call `clarify`" not in stable
+
+    def test_kanban_worker_suppresses_clarifying_question_guidance(self):
+        agent = _make_agent(
+            valid_tool_names=["clarify", "kanban_show"],
+            _kanban_worker_guidance=KANBAN_GUIDANCE,
+        )
+
+        stable = _stable_prompt(agent)
+
+        assert "# Clarifying questions" not in stable
+        assert "Do not call `clarify`" in stable
+
+    def test_skill_routing_and_maintenance_directives_are_not_duplicated(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "software-development" / "hermes-agent"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: hermes-agent\n"
+            "description: Configure Hermes Agent.\n"
+            "---\n"
+        )
+        agent = _make_agent(valid_tool_names=["skill_manage", "skill_view"])
+
+        stable = _stable_prompt(agent)
+
+        assert stable.count("skill_manage(action='patch')") == 1
+        assert stable.count("load the `hermes-agent` skill") == 1
+
+
 class TestCodingContextBlock:
-    def test_injected_when_active(self, monkeypatch, tmp_path):
+    def test_absent_when_active(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
         stable = _stable_prompt(agent)
-        assert "coding agent" in stable
-        assert "Workspace" in stable
+        assert "coding agent" not in stable
+        assert "Workspace" not in stable
 
     def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)

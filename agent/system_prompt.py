@@ -120,18 +120,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    if "clarify" in agent.valid_tool_names:
-        tool_guidance.append(CLARIFYING_QUESTION_GUIDANCE)
-    if any(name.startswith("mcp_qmd_") for name in agent.valid_tool_names):
-        tool_guidance.append(QMD_MCP_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
     # this block. Resolved once at __init__ (see _kanban_worker_guidance).
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
+    _is_kanban_worker = bool(_kanban_guidance) or (
+        _kanban_guidance is None and "kanban_show" in agent.valid_tool_names
+    )
+    if "clarify" in agent.valid_tool_names and not _is_kanban_worker:
+        tool_guidance.append(CLARIFYING_QUESTION_GUIDANCE)
+    if any(name.startswith("mcp_qmd_") for name in agent.valid_tool_names):
+        tool_guidance.append(QMD_MCP_GUIDANCE)
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
+    elif _is_kanban_worker:
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
