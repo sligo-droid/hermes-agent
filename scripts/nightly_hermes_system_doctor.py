@@ -61,6 +61,7 @@ QMD_EXPECTED_TARGETS = [
     {"name": "qmd-8182", "host": "127.0.0.1", "port": 8182},
 ]
 QMD_ALLOWED_STATUSES = {"healthy", "process_missing", "port_closed", "wrong_bind", "unknown"}
+QMD_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
 def coding_worker_backend() -> str:
@@ -101,12 +102,22 @@ def run(cmd: list[str], *, timeout: int = 120, cwd: Path | None = None, env: dic
 
 def collect_qmd_process_commands() -> list[str]:
     """Return local QMD-ish process commands without exposing environment values."""
-    r = run(["ps", "-eo", "pid=,args="], timeout=10, cwd=Path("/"))
-    if r["exit"] != 0:
+    try:
+        p = subprocess.run(
+            ["ps", "-ww", "-eo", "pid=,args="],
+            cwd="/",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001 - readiness evidence is best-effort
+        return []
+    if p.returncode != 0:
         return []
     commands: list[str] = []
     current_pid = str(os.getpid())
-    for line in str(r.get("output") or "").splitlines():
+    for line in p.stdout.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
@@ -116,7 +127,7 @@ def collect_qmd_process_commands() -> list[str]:
         command = parts[1]
         lower = command.lower()
         if "qmd" in lower and "nightly_hermes_system_doctor" not in lower:
-            commands.append(clean(command, 500))
+            commands.append(clean(command, 2000))
     return commands[:25]
 
 
@@ -126,6 +137,21 @@ def qmd_tcp_ready(host: str, port: int, timeout: float = 0.5) -> tuple[bool, str
             return True, None
     except OSError as exc:
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def qmd_loopback_ready(
+    host: str,
+    port: int,
+    connector: Any = qmd_tcp_ready,
+) -> tuple[bool, str, str | None, dict[str, str]]:
+    candidates = list(dict.fromkeys([host, *QMD_LOOPBACK_HOSTS]))
+    errors: dict[str, str] = {}
+    for candidate in candidates:
+        ready, error = connector(candidate, port)
+        if ready:
+            return True, candidate, None, errors
+        errors[candidate] = clean(error or "closed", 200)
+    return False, candidates[0], errors.get(candidates[0], "closed"), errors
 
 
 def _qmd_command_matches_target(command: str, port: int) -> bool:
@@ -148,7 +174,7 @@ def classify_qmd_target(
     port = int(target["port"])
     matching_commands = [cmd for cmd in process_commands if _qmd_command_matches_target(cmd, port)]
     any_qmd_process = any("qmd" in cmd.lower() for cmd in process_commands)
-    port_ready, port_error = connector(host, port)
+    port_ready, reachable_host, port_error, loopback_errors = qmd_loopback_ready(host, port, connector)
 
     if matching_commands and port_ready:
         status = "healthy"
@@ -169,7 +195,9 @@ def classify_qmd_target(
         "process_present": bool(matching_commands),
         "qmd_process_seen": any_qmd_process,
         "port_ready": port_ready,
+        "reachable_host": reachable_host if port_ready else "",
         "port_error": clean(port_error or "", 300),
+        "loopback_errors": loopback_errors,
         "process_excerpt": clean(matching_commands[0], 300) if matching_commands else "",
     }
     if result["status"] not in QMD_ALLOWED_STATUSES:

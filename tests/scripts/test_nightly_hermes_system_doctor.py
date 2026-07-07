@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 from scripts import nightly_hermes_system_doctor as doctor
@@ -205,6 +206,26 @@ def test_classify_qmd_target_requires_process_and_port_ready():
     assert result["port_ready"] is True
 
 
+def test_classify_qmd_target_accepts_ipv6_loopback_when_ipv4_refuses():
+    target = {"name": "qmd-8181", "host": "127.0.0.1", "port": 8181}
+
+    def connector(host, _port):
+        if host == "::1":
+            return True, None
+        return False, f"ConnectionRefusedError: refused on {host}"
+
+    result = doctor.classify_qmd_target(
+        target,
+        ["/home/droid/.local/bin/qmd --index pid-docs --port 8181"],
+        connector,
+    )
+
+    assert result["status"] == "healthy"
+    assert result["port_ready"] is True
+    assert result["reachable_host"] == "::1"
+    assert "127.0.0.1" in result["loopback_errors"]
+
+
 def test_classify_qmd_target_reports_process_present_port_closed():
     target = {"name": "qmd-8181", "host": "127.0.0.1", "port": 8181}
 
@@ -218,6 +239,31 @@ def test_classify_qmd_target_reports_process_present_port_closed():
     assert result["process_present"] is True
     assert result["port_ready"] is False
     assert "refused" in result["port_error"]
+
+
+def test_collect_qmd_process_commands_uses_wide_ps_and_preserves_late_qmd_args(monkeypatch):
+    long_prefix = "x" * 500
+
+    def fake_run(cmd, **kwargs):
+        assert cmd == ["ps", "-ww", "-eo", "pid=,args="]
+        assert kwargs["cwd"] == "/"
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=(
+                f" 111 python unrelated {long_prefix}\n"
+                f" 222 /usr/bin/python {long_prefix} /home/droid/.local/bin/qmd --index skills --port 8182\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+
+    commands = doctor.collect_qmd_process_commands()
+
+    assert len(commands) == 1
+    assert "/home/droid/.local/bin/qmd" in commands[0]
+    assert "--port 8182" in commands[0]
 
 
 def test_classify_qmd_target_reports_process_missing_even_if_port_open():
