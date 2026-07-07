@@ -462,6 +462,115 @@ def test_autoreview_helper_preserves_existing_repo_helper(tmp_path):
     assert skill.read_text(encoding="utf-8") == "custom skill"
 
 
+def test_checkpoint_commit_commits_dirty_repo(tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "worker@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Worker"], cwd=tmp_path, check=True)
+    (tmp_path / "changed.txt").write_text("worker progress\n", encoding="utf-8")
+
+    assert worker._checkpoint_commit(str(tmp_path), "task-123", "implemented checkpoint") is None
+    log = subprocess.run(
+        ["git", "log", "-1", "--pretty=%s"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert log.stdout.strip() == "checkpoint task-123: implemented checkpoint"
+
+
+def test_checkpoint_commit_returns_and_logs_commit_failure(monkeypatch, tmp_path, caplog):
+    from hermes_cli import kanban_codex_worker as worker
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ["git", "status", "--porcelain"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=" M file.py\n", stderr="")
+        if cmd == ["git", "add", "-A"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["git", "commit"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="hook rejected")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    caplog.set_level("WARNING")
+
+    err = worker._checkpoint_commit(str(tmp_path), "task-123", "implemented checkpoint")
+
+    assert err is not None
+    assert "hook rejected" in err
+    assert "checkpoint commit failed for task task-123" in caplog.text
+    assert "hook rejected" in caplog.text
+
+
+def test_checkpoint_commit_clean_repo_is_noop(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "worker@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Worker"], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.txt").write_text("already committed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    real_run = subprocess.run
+    calls: list[list[str]] = []
+
+    def recording_run(cmd, **kwargs):
+        calls.append(cmd)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(worker.subprocess, "run", recording_run)
+
+    assert worker._checkpoint_commit(str(tmp_path), "task-123", "nothing changed") is None
+    assert calls == [["git", "status", "--porcelain"]]
+
+
+def test_dev_completion_records_checkpoint_commit_error_and_completes(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = "checkpoint-error-board"
+    kanban_db.create_board(board, name="Checkpoint Error Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Dev ticket",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        monkeypatch.setattr(worker, "_checkpoint_commit", lambda *args, **kwargs: "hook rejected")
+
+        worker._apply_role_output(
+            conn,
+            task_id,
+            ROLE_DEV,
+            {"status": "completed", "summary": "Implemented.", "changed_files": ["file.py"]},
+            board=board,
+            workspace=str(tmp_path),
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kanban_db.get_task(conn, task_id)
+        run = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+
+    assert task is not None
+    assert task.status == "done"
+    assert run is not None
+    assert run.outcome == "completed"
+    assert isinstance(run.metadata, dict)
+    assert run.metadata["checkpoint_commit_error"] == "hook rejected"
+    assert run.metadata["changed_files"] == ["file.py"]
+
+
 def test_worker_pr_body_adds_project_state_justification_for_operational_changes():
     from hermes_cli import kanban_codex_worker as worker
     from scripts.check_pr_body_format import check_project_state_requirement
