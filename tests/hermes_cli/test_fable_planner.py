@@ -3,10 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from hermes_cli.fable_planner import (
+    FABLE_DEFAULT_TOOLSETS,
     FABLE_MODEL,
     FablePlanRequest,
     build_fable_plan_invocation,
     build_fable_user_instruction,
+    fable_enabled_toolsets,
     fable_metadata,
     fable_session_model_override,
 )
@@ -160,6 +162,15 @@ def test_default_config_pins_fable_route():
     assert DEFAULT_CONFIG["fable"]["provider"] == "anthropic"
     assert DEFAULT_CONFIG["fable"]["model"] == FABLE_MODEL
     assert DEFAULT_CONFIG["fable"]["route"] == "anthropic_oauth"
+    assert DEFAULT_CONFIG["fable"]["enabled_toolsets"] == FABLE_DEFAULT_TOOLSETS
+
+
+def test_fable_enabled_toolsets_defaults_to_compact_budget():
+    assert fable_enabled_toolsets(config={}) == ["file", "terminal", "web", "browser", "discord"]
+
+
+def test_fable_enabled_toolsets_allows_config_override():
+    assert fable_enabled_toolsets(config={"fable": {"enabled_toolsets": ["file", "web"]}}) == ["file", "web"]
 
 
 def test_fable_metadata_for_artifact():

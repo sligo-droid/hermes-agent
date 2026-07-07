@@ -11975,6 +11975,7 @@ class GatewayRunner:
                 feature_summary=getattr(event, "feature_summary", None),
                 project_summary=getattr(event, "project_summary", None),
                 fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
+                fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -17596,6 +17597,7 @@ class GatewayRunner:
         from hermes_cli.fable_planner import (
             FablePlanRequest,
             build_fable_plan_invocation,
+            fable_enabled_toolsets,
             fable_metadata,
             fable_session_model_override,
         )
@@ -17624,6 +17626,7 @@ class GatewayRunner:
                 "session_id": session_key,
                 "source_message_id": str(event.message_id or ""),
             }
+            event.fable_enabled_toolsets = fable_enabled_toolsets(cfg)
         except Exception:
             pass
 
@@ -20032,6 +20035,7 @@ class GatewayRunner:
         feature_summary: Optional[Dict[str, Any]] = None,
         project_summary: Optional[Dict[str, Any]] = None,
         fable_plan_metadata: Optional[Dict[str, Any]] = None,
+        fable_toolsets: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20081,6 +20085,10 @@ class GatewayRunner:
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
             enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
+        if fable_plan_metadata:
+            from hermes_cli.fable_planner import fable_enabled_toolsets
+
+            enabled_toolsets = list(fable_toolsets or fable_enabled_toolsets(user_config))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
