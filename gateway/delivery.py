@@ -11,6 +11,7 @@ Routes messages to the appropriate destination based on:
 import logging
 import os
 import re
+import uuid
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -326,12 +327,13 @@ class DeliveryRouter:
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Save content to local files."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        suffix = uuid.uuid4().hex[:4]
         
         if job_id:
-            output_path = self.output_dir / job_id / f"{timestamp}.md"
+            output_path = self.output_dir / job_id / f"{timestamp}_{suffix}.md"
         else:
-            output_path = self.output_dir / "misc" / f"{timestamp}.md"
+            output_path = self.output_dir / "misc" / f"{timestamp}_{suffix}.md"
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -366,10 +368,11 @@ class DeliveryRouter:
     
     def _save_full_output(self, content: str, job_id: str) -> Path:
         """Save full cron output to disk and return the file path."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        suffix = uuid.uuid4().hex[:4]
         out_dir = get_hermes_home() / "cron" / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{job_id}_{timestamp}.txt"
+        path = out_dir / f"{job_id}_{timestamp}_{suffix}.txt"
         path.write_text(content)
         return path
 
@@ -551,7 +554,6 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
 
 
 
