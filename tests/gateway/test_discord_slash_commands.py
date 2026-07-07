@@ -1289,6 +1289,35 @@ async def test_auto_thread_enabled_by_default_slash_commands(adapter, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_mention_fable_text_routes_to_threaded_fable_command(adapter, monkeypatch):
+    """Mention/text /fable must keep PR #636 threaded routing and reach gateway as /fable."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+
+    fake_thread = _FakeThreadChannel(channel_id=999, name="fable-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    msg = _fake_message(_FakeTextChannel(), content="<@99999> /fable plan the fix")
+    msg.mentions = [adapter._client.user]
+
+    await adapter._handle_message(msg)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    assert len(captured_events) == 1
+    assert captured_events[0].text == "/fable plan the fix"
+    assert captured_events[0].message_type.name == "COMMAND"
+    assert captured_events[0].source.chat_id == "999"
+    assert captured_events[0].source.chat_type == "thread"
+
+
+@pytest.mark.asyncio
 async def test_auto_thread_can_be_disabled(adapter, monkeypatch):
     """Setting DISCORD_AUTO_THREAD=false keeps messages in the channel."""
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")

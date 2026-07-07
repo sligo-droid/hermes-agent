@@ -126,6 +126,7 @@ def fable_session_model_override(config: dict[str, Any] | None = None) -> tuple[
         "api_key": api_key,
         "base_url": str(runtime.get("base_url") or "https://api.anthropic.com"),
         "api_mode": str(runtime.get("api_mode") or "anthropic_messages"),
+        "disable_fallback": "true",
     }, ""
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -7,7 +8,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, MetadataReply
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 def _make_runner():
@@ -39,6 +40,30 @@ def _make_runner():
     return runner
 
 
+def _session_entry_for_event(event):
+    now = datetime.now()
+    return SessionEntry(
+        session_key=build_session_key(event.source),
+        session_id="session-1",
+        created_at=now,
+        updated_at=now,
+        origin=event.source,
+        platform=event.source.platform,
+        chat_type=event.source.chat_type,
+    )
+
+
+def _fable_override():
+    return {
+        "model": "claude-fable-5",
+        "provider": "anthropic",
+        "api_key": "sk-ant-oat01-test",
+        "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages",
+        "disable_fallback": "true",
+    }
+
+
 def _make_event(text="/fable build X"):
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -66,16 +91,7 @@ async def test_fable_command_routes_through_normal_agent_with_fable_override(mon
     monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", fake_build)
     monkeypatch.setattr(
         "hermes_cli.fable_planner.fable_session_model_override",
-        lambda config=None: (
-            {
-                "model": "claude-fable-5",
-                "provider": "anthropic",
-                "api_key": "sk-ant-oat01-test",
-                "base_url": "https://api.anthropic.com",
-                "api_mode": "anthropic_messages",
-            },
-            "",
-        ),
+        lambda config=None: (_fable_override(), ""),
     )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
 
@@ -105,6 +121,171 @@ async def test_fable_command_usage_without_args(monkeypatch):
 
     assert result == "Usage: /fable <request>"
     runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fable_command_reports_failed_route_without_artifact_metadata(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+    runner._handle_message_with_agent = AsyncMock(
+        return_value="⚠️ /fable is pinned to Claude Fable 5 via Hermes' Anthropic OAuth route and will not fall back to another model or provider. spend limit reached"
+    )
+
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", lambda *_args, **_kwargs: "PLAN")
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (_fable_override(), ""),
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
+
+    result = await GatewayRunner._handle_message(runner, _make_event())
+
+    assert isinstance(result, str)
+    assert not isinstance(result, MetadataReply)
+    assert "will not fall back to another model or provider" in result
+
+
+def test_fable_run_agent_disables_fallback_and_restricts_provider(monkeypatch):
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    import gateway.run as gateway_run
+
+    captured = {}
+
+    class CapturingAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.tools = []
+
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
+            return {
+                "final_response": "fable ok",
+                "messages": [],
+                "api_calls": 1,
+                "model": "claude-fable-5",
+                "provider": "anthropic",
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    GatewayRunner = gateway_run.GatewayRunner
+
+    runner = _make_runner()
+    runner._handle_message_with_agent = GatewayRunner._handle_message_with_agent.__get__(runner, GatewayRunner)
+    runner._run_agent = GatewayRunner._run_agent.__get__(runner, GatewayRunner)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: ("claude-fable-5", _fable_override())
+    runner._agent_cache_lock = threading.Lock()
+    runner._fallback_model = {"provider": "openai-codex", "model": "gpt-5.5"}
+    runner._provider_routing = {"only": ["openai-codex"]}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._voice_mode = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._show_reasoning = False
+    runner._service_tier = None
+    runner._session_db = None
+    runner._background_tasks = set()
+    runner.adapters = {}
+    event = _make_event()
+    event.text = "PLAN"
+    event.fable_plan_metadata = {"command": "fable"}
+    session_entry = _session_entry_for_event(event)
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.update_session = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.has_any_sessions.return_value = True
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(
+            event,
+            event.source,
+            build_session_key(event.source),
+            1,
+        )
+    )
+
+    assert result == "fable ok"
+    assert captured["model"] == "claude-fable-5"
+    assert captured["provider"] == "anthropic"
+    assert captured["fallback_model"] is None
+    assert captured["providers_allowed"] == ["anthropic"]
+
+
+def test_fable_run_agent_refuses_non_fable_model_result(monkeypatch):
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    import gateway.run as gateway_run
+
+    class FallbackAgent:
+        def __init__(self, **_kwargs):
+            self.tools = []
+            self.model = "gpt-5.5"
+
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
+            return {
+                "final_response": "fallback response",
+                "messages": [],
+                "api_calls": 1,
+                "model": "gpt-5.5",
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FallbackAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    GatewayRunner = gateway_run.GatewayRunner
+
+    runner = _make_runner()
+    runner._handle_message_with_agent = GatewayRunner._handle_message_with_agent.__get__(runner, GatewayRunner)
+    runner._run_agent = GatewayRunner._run_agent.__get__(runner, GatewayRunner)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: ("claude-fable-5", _fable_override())
+    runner._agent_cache_lock = threading.Lock()
+    runner._fallback_model = {"provider": "openai-codex", "model": "gpt-5.5"}
+    runner._provider_routing = {}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._voice_mode = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._show_reasoning = False
+    runner._service_tier = None
+    runner._session_db = None
+    runner._background_tasks = set()
+    runner.adapters = {}
+    event = _make_event()
+    event.text = "PLAN"
+    event.fable_plan_metadata = {"command": "fable"}
+    session_entry = _session_entry_for_event(event)
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.update_session = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.has_any_sessions.return_value = True
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(
+            event,
+            event.source,
+            build_session_key(event.source),
+            1,
+        )
+    )
+
+    assert "will not fall back to another model or provider" in result
+    assert "gpt-5.5" in result
 
 
 @pytest.mark.asyncio
