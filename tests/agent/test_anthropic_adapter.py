@@ -298,6 +298,7 @@ class TestResolveAnthropicToken:
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
         assert resolve_anthropic_token() == "sk-ant-oat01-mytoken"
 
     def test_does_not_resolve_primary_api_key_as_native_anthropic_token(self, monkeypatch, tmp_path):
@@ -306,6 +307,7 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         (tmp_path / ".claude.json").write_text(json.dumps({"primaryApiKey": "sk-ant-api03-primary"}))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
 
         assert resolve_anthropic_token() is None
 
@@ -314,6 +316,7 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
         assert resolve_anthropic_token() == "sk-ant-api03-mykey"
 
     def test_falls_back_to_token(self, monkeypatch, tmp_path):
@@ -321,6 +324,7 @@ class TestResolveAnthropicToken:
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
         assert resolve_anthropic_token() == "sk-ant-oat01-mytoken"
 
     def test_returns_none_with_no_creds(self, monkeypatch, tmp_path):
@@ -328,6 +332,7 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
         assert resolve_anthropic_token() is None
 
     def test_falls_back_to_claude_code_oauth_token(self, monkeypatch, tmp_path):
@@ -335,6 +340,7 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test-token")
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
         assert resolve_anthropic_token() == "sk-ant-oat01-test-token"
 
     def test_falls_back_to_claude_code_credentials(self, monkeypatch, tmp_path):
@@ -351,6 +357,7 @@ class TestResolveAnthropicToken:
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
         assert resolve_anthropic_token() == "cc-auto-token"
 
     def test_falls_back_to_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
@@ -492,6 +499,7 @@ class TestResolveAnthropicToken:
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
 
         assert resolve_anthropic_token() == "cc-auto-token"
 
@@ -502,6 +510,7 @@ class TestResolveAnthropicToken:
         claude_json = tmp_path / ".claude.json"
         claude_json.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-managed-key"}))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
 
         assert resolve_anthropic_token() == "sk-ant-oat01-static-token"
 

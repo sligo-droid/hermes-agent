@@ -5,8 +5,10 @@ from unittest.mock import patch, MagicMock
 
 
 from agent.anthropic_adapter import (
+    _claude_code_config_homes,
     _read_claude_code_credentials_from_keychain,
     read_claude_code_credentials,
+    resolve_anthropic_token,
     _refresh_oauth_token,
 )
 
@@ -94,6 +96,97 @@ class TestReadClaudeCodeCredentialsFromKeychain:
 class TestReadClaudeCodeCredentialsPriority:
     """Bug 4: Keychain must be checked before the JSON file."""
 
+    def test_reads_os_account_home_when_path_home_is_sandboxed(self, tmp_path, monkeypatch):
+        sandbox_home = tmp_path / "sandbox-home"
+        account_home = tmp_path / "account-home"
+        cred_file = account_home / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "account-home-token",
+                "refreshToken": "account-refresh",
+                "expiresAt": 9999999999999,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: sandbox_home)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.pwd.getpwuid",
+            lambda _uid: type("Pw", (), {"pw_dir": str(account_home)})(),
+        )
+
+        with patch("agent.anthropic_adapter.platform.system", return_value="Linux"):
+            creds = read_claude_code_credentials()
+
+        assert creds is not None
+        assert creds["accessToken"] == "account-home-token"
+        assert creds["source"] == "claude_code_credentials_file"
+
+    def test_path_home_takes_priority_over_os_account_home(self, tmp_path, monkeypatch):
+        sandbox_home = tmp_path / "sandbox-home"
+        account_home = tmp_path / "account-home"
+        for home, token in (
+            (sandbox_home, "sandbox-token"),
+            (account_home, "account-token"),
+        ):
+            cred_file = home / ".claude" / ".credentials.json"
+            cred_file.parent.mkdir(parents=True)
+            cred_file.write_text(json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": token,
+                    "refreshToken": "refresh",
+                    "expiresAt": 9999999999999,
+                }
+            }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: sandbox_home)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.pwd.getpwuid",
+            lambda _uid: type("Pw", (), {"pw_dir": str(account_home)})(),
+        )
+
+        with patch("agent.anthropic_adapter.platform.system", return_value="Linux"):
+            creds = read_claude_code_credentials()
+
+        assert creds is not None
+        assert creds["accessToken"] == "sandbox-token"
+
+    def test_duplicate_path_home_and_account_home_are_deduplicated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.pwd.getpwuid",
+            lambda _uid: type("Pw", (), {"pw_dir": str(tmp_path)})(),
+        )
+
+        homes = _claude_code_config_homes()
+
+        assert homes == (tmp_path,)
+
+    def test_resolve_prefers_account_home_claude_code_credentials_over_pool(self, tmp_path, monkeypatch):
+        sandbox_home = tmp_path / "sandbox-home"
+        account_home = tmp_path / "account-home"
+        cred_file = account_home / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "account-home-token",
+                "refreshToken": "account-refresh",
+                "expiresAt": 9999999999999,
+            }
+        }))
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: sandbox_home)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.pwd.getpwuid",
+            lambda _uid: type("Pw", (), {"pw_dir": str(account_home)})(),
+        )
+        pool_entry = type("PoolEntry", (), {"auth_type": "oauth", "access_token": "pool-token"})()
+        pool = type("Pool", (), {"_available_entries": lambda self, **_kwargs: [pool_entry]})()
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+
+        with patch("agent.anthropic_adapter.platform.system", return_value="Linux"):
+            assert resolve_anthropic_token() == "account-home-token"
+
     def test_keychain_takes_priority_over_json_file(self, tmp_path, monkeypatch):
         """When both Keychain and JSON file have credentials, Keychain wins."""
         # Set up JSON file with "older" token
@@ -155,6 +248,10 @@ class TestReadClaudeCodeCredentialsPriority:
     def test_returns_none_when_neither_keychain_nor_json_has_creds(self, tmp_path, monkeypatch):
         """No credentials anywhere — must return None cleanly."""
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.pwd.getpwuid",
+            lambda _uid: type("Pw", (), {"pw_dir": str(tmp_path)})(),
+        )
 
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
              patch("agent.anthropic_adapter.subprocess.run") as mock_run:
@@ -189,6 +286,10 @@ class TestReadClaudeCodeCredentialsDesync:
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.pwd.getpwuid",
+            lambda _uid: type("Pw", (), {"pw_dir": str(tmp_path)})(),
+        )
 
     def _keychain_payload(self, *, access_token, expires_at, refresh_token="kc-refresh"):
         return MagicMock(
