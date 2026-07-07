@@ -55,6 +55,11 @@ def _get_anthropic_sdk():
 
 logger = logging.getLogger(__name__)
 
+try:
+    import pwd
+except ImportError:  # pragma: no cover - Windows has no pwd module
+    pwd = None  # type: ignore[assignment]
+
 THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
 # Anthropic exposes 5 levels on 4.7+: low, medium, high, xhigh, max.
@@ -914,12 +919,71 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     return None
 
 
+def _read_claude_code_credentials_file(config_home: Path) -> Optional[Dict[str, Any]]:
+    cred_path = config_home / ".claude" / ".credentials.json"
+    if not cred_path.exists():
+        return None
+
+    try:
+        data = json.loads(cred_path.read_text(encoding="utf-8"))
+        oauth_data = data.get("claudeAiOauth")
+        if oauth_data and isinstance(oauth_data, dict):
+            access_token = oauth_data.get("accessToken", "")
+            if access_token:
+                return {
+                    "accessToken": access_token,
+                    "refreshToken": oauth_data.get("refreshToken", ""),
+                    "expiresAt": oauth_data.get("expiresAt", 0),
+                    "source": "claude_code_credentials_file",
+                }
+    except (json.JSONDecodeError, OSError, IOError) as e:
+        logger.debug("Failed to read %s: %s", cred_path, e)
+
+    return None
+
+
+def _claude_code_config_homes() -> Tuple[Path, ...]:
+    """Return homes that may contain Claude Code's config, deduplicated.
+
+    Gateway/tool subprocesses run with a sandboxed HOME, but Claude Code stores
+    OAuth credentials under the real OS account home. Check both locations so a
+    sandboxed HOME does not hide valid Claude Code credentials.
+    """
+    homes: List[Path] = []
+
+    try:
+        homes.append(Path.home())
+    except Exception:
+        pass
+
+    account_home = ""
+    if pwd is not None:
+        try:
+            account_home = pwd.getpwuid(os.getuid()).pw_dir
+        except Exception:
+            account_home = ""
+    if account_home:
+        homes.append(Path(account_home).expanduser())
+
+    deduped: List[Path] = []
+    seen = set()
+    for home in homes:
+        key = os.path.normcase(os.path.normpath(str(home)))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(home)
+
+    return tuple(deduped)
+
+
 def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """Read refreshable Claude Code OAuth credentials.
 
-    Checks two sources in order:
+    Checks sources in order:
       1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
-      2. ~/.claude/.credentials.json file
+      2. ~/.claude/.credentials.json under Path.home()
+      3. ~/.claude/.credentials.json under the OS account home when different
 
     This intentionally excludes ~/.claude.json primaryApiKey. Opencode's
     subscription flow is OAuth/setup-token based with refreshable credentials,
@@ -928,28 +992,24 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
     """
-    # Try macOS Keychain first (covers Claude Code >=2.1.114)
+    candidates: List[Dict[str, Any]] = []
+
+    # Try macOS Keychain first (covers Claude Code >=2.1.114). We still compare
+    # against JSON credentials below so a fresher file can repair stale Keychain
+    # state after Claude Code refreshes only one source.
     kc_creds = _read_claude_code_credentials_from_keychain()
     if kc_creds:
-        return kc_creds
+        candidates.append(kc_creds)
 
-    # Fall back to JSON file
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if cred_path.exists():
-        try:
-            data = json.loads(cred_path.read_text(encoding="utf-8"))
-            oauth_data = data.get("claudeAiOauth")
-            if oauth_data and isinstance(oauth_data, dict):
-                access_token = oauth_data.get("accessToken", "")
-                if access_token:
-                    return {
-                        "accessToken": access_token,
-                        "refreshToken": oauth_data.get("refreshToken", ""),
-                        "expiresAt": oauth_data.get("expiresAt", 0),
-                        "source": "claude_code_credentials_file",
-                    }
-        except (json.JSONDecodeError, OSError, IOError) as e:
-            logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+    # Fall back to JSON file(s). Path.home() can be a Hermes sandbox HOME;
+    # the OS account home is where Claude Code itself stores OAuth credentials.
+    for config_home in _claude_code_config_homes():
+        file_creds = _read_claude_code_credentials_file(config_home)
+        if file_creds:
+            candidates.append(file_creds)
+
+    if candidates:
+        return max(candidates, key=lambda creds: creds.get("expiresAt", 0) or 0)
 
     return None
 
@@ -1031,6 +1091,12 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
 
 def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     """Attempt to refresh an expired Claude Code OAuth token."""
+    live_creds = read_claude_code_credentials()
+    if live_creds and is_claude_code_token_valid(live_creds):
+        return live_creds.get("accessToken")
+    if live_creds and live_creds.get("refreshToken"):
+        creds = live_creds
+
     refresh_token = creds.get("refreshToken", "")
     if not refresh_token:
         logger.debug("No refresh token available — cannot refresh")
