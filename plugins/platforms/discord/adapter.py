@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -85,6 +86,7 @@ _DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME = "discord_root_channel_recovery.j
 _DISCORD_ROOT_MENTION_RECOVERY_LIMIT = 25
 _DISCORD_ROOT_MENTION_RECOVERY_PAGE_LIMIT = 4
 _DISCORD_ROOT_MENTION_RECOVERY_MAX_AGE_SECONDS = 10 * 60
+_DISCORD_RELEVANT_ROOT_CHANNEL_IDS_CACHE_SECONDS = 60.0
 _DISCORD_ALLOW_BOTS_MODES = {"none", "mentions", "all"}
 
 
@@ -783,6 +785,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self._post_connect_task: Optional[asyncio.Task] = None
         self._thread_backfill_task: Optional[asyncio.Task] = None
         self._root_mention_recovery_state_lock = threading.RLock()
+        self._hot_session_db = None
+        self._relevant_root_channels_cache: Optional[Tuple[float, frozenset[str]]] = None
+        self._last_recorded_root_seen: Dict[str, str] = {}
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
@@ -1084,11 +1089,65 @@ class DiscordAdapter(BasePlatformAdapter):
         if channel is None:
             return None
         try:
-            context = resolve_discord_project_context(channel)
+            context = self._resolve_discord_project_context_with_shared_db(channel)
         except Exception as exc:
             logger.debug("[%s] Failed to resolve Discord project context: %s", self.name, exc)
             return None
         return context.to_dict() if context else None
+
+    def _shared_session_db(self):
+        """Long-lived SessionDB for hot-path reads; recreated on failure."""
+        db = getattr(self, "_hot_session_db", None)
+        if db is not None:
+            return db
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+        except Exception as exc:
+            logger.debug("[%s] shared SessionDB unavailable: %s", self.name, exc)
+            return None
+        self._hot_session_db = db
+        return db
+
+    def _invalidate_shared_session_db(self) -> None:
+        db = getattr(self, "_hot_session_db", None)
+        self._hot_session_db = None
+        close = getattr(db, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _resolve_discord_project_context_with_shared_db(self, channel: Any):
+        db = self._shared_session_db()
+        if db is None:
+            return resolve_discord_project_context(channel, session_db=None)
+        try:
+            return resolve_discord_project_context(channel, session_db=db)
+        except Exception as exc:
+            logger.debug("[%s] shared SessionDB project-context lookup failed: %s", self.name, exc)
+            self._invalidate_shared_session_db()
+            return resolve_discord_project_context(channel, session_db=None)
+
+    def _invalidate_relevant_root_channels_cache_for_context(self, project_context_obj: Any) -> None:
+        if project_context_obj is None or not getattr(project_context_obj, "resolved", False):
+            return
+        cached = getattr(self, "_relevant_root_channels_cache", None)
+        if cached is None:
+            return
+        _, cached_ids = cached
+        context_ids = {
+            str(channel_id).strip()
+            for channel_id in (
+                getattr(project_context_obj, "channel_id", None),
+                getattr(project_context_obj, "parent_channel_id", None),
+            )
+            if str(channel_id or "").strip()
+        }
+        if context_ids and context_ids.isdisjoint(cached_ids):
+            self._relevant_root_channels_cache = None
 
     @staticmethod
     def _project_context_source_kwargs(project_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -7652,26 +7711,46 @@ class DiscordAdapter(BasePlatformAdapter):
         include those exact mapped roots, but only those roots — never every
         guild channel — to avoid historical sweeps.
         """
-        try:
-            from hermes_state import SessionDB
-
-            db = SessionDB()
-        except Exception as exc:
-            logger.debug("[%s] Discord project mappings unavailable for root recovery: %s", self.name, exc)
+        db = self._shared_session_db()
+        if db is None:
+            logger.debug("[%s] Discord project mappings unavailable for root recovery", self.name)
             return set()
         try:
+            rows = db.list_discord_project_mappings()
+        except sqlite3.Error as exc:
+            logger.debug("[%s] Discord project mappings unreadable for root recovery: %s", self.name, exc)
+            self._invalidate_shared_session_db()
             try:
-                rows = db.list_discord_project_mappings()
-            except Exception as exc:
-                logger.debug("[%s] Discord project mappings unreadable for root recovery: %s", self.name, exc)
+                from hermes_state import SessionDB
+
+                fallback_db = SessionDB()
+            except Exception as fallback_exc:
+                logger.debug(
+                    "[%s] Discord project mappings fallback unavailable for root recovery: %s",
+                    self.name,
+                    fallback_exc,
+                )
                 return set()
-        finally:
-            close = getattr(db, "close", None)
-            if callable(close):
+            try:
                 try:
-                    close()
-                except Exception:
-                    pass
+                    rows = fallback_db.list_discord_project_mappings()
+                except Exception as fallback_exc:
+                    logger.debug(
+                        "[%s] Discord project mappings fallback unreadable for root recovery: %s",
+                        self.name,
+                        fallback_exc,
+                    )
+                    return set()
+            finally:
+                close = getattr(fallback_db, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.debug("[%s] Discord project mappings unreadable for root recovery: %s", self.name, exc)
+            return set()
 
         ids: set[str] = set()
         for row in rows:
@@ -7683,6 +7762,13 @@ class DiscordAdapter(BasePlatformAdapter):
         return ids
 
     def _discord_relevant_root_channel_ids(self) -> list[str]:
+        now = time.monotonic()
+        cached = getattr(self, "_relevant_root_channels_cache", None)
+        if cached is not None:
+            cached_at, cached_ids = cached
+            if now - cached_at < _DISCORD_RELEVANT_ROOT_CHANNEL_IDS_CACHE_SECONDS:
+                return sorted(cached_ids, key=lambda value: int(value) if value.isdigit() else value)
+
         ids: set[str] = set()
         allowed = self._discord_allowed_channel_ids()
         if allowed and "*" not in allowed:
@@ -7701,9 +7787,12 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Discord root recovery state unreadable while listing channels", self.name, exc_info=True)
         ignored = self._discord_ignored_channel_ids()
         if "*" in ignored:
+            self._relevant_root_channels_cache = (now, frozenset())
             return []
         ids.difference_update(ignored)
-        return sorted(ids, key=lambda value: int(value) if value.isdigit() else value)
+        result = sorted(ids, key=lambda value: int(value) if value.isdigit() else value)
+        self._relevant_root_channels_cache = (now, frozenset(result))
+        return result
 
     async def _resolve_root_channel_for_recovery(self, channel_id: str) -> Optional[Any]:
         if not self._client:
@@ -7819,21 +7908,26 @@ class DiscordAdapter(BasePlatformAdapter):
         channel_id = str(getattr(channel, "id", "") or "")
         if not channel_id:
             return
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return
+        last_recorded = getattr(self, "_last_recorded_root_seen", {})
+        if last_recorded.get(channel_id) == message_id:
+            return
         if channel_id not in set(self._discord_relevant_root_channel_ids()):
             if not self._message_mentions_self(message):
                 return
             ignored = self._discord_ignored_channel_ids()
             if "*" in ignored or channel_id in ignored:
                 return
-        message_id = str(getattr(message, "id", "") or "")
-        if not message_id:
-            return
         try:
             self._update_discord_root_channel_recovery_watermark(
                 channel_id,
                 message_id,
                 observed_at=time.time(),
             )
+            last_recorded[channel_id] = message_id
+            self._last_recorded_root_seen = last_recorded
         except Exception:
             logger.debug("[%s] Failed to update Discord root-channel recovery watermark", self.name, exc_info=True)
 
@@ -9857,7 +9951,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     and not replies_to_self
                 ):
                     return
-        project_context_obj = resolve_discord_project_context(message.channel)
+        project_context_obj = self._resolve_discord_project_context_with_shared_db(message.channel)
+        self._invalidate_relevant_root_channels_cache_for_context(project_context_obj)
         project_context = project_context_obj.to_dict() if project_context_obj else None
         preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
         direct_question_prompt = False
