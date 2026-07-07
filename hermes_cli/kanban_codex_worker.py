@@ -1901,18 +1901,21 @@ def _apply_role_output(
             return
         _update_phase(board, "blocked", goal_status="blocked")
         return
-    _checkpoint_commit(workspace, task_id, summary)
+    checkpoint_commit_error = _checkpoint_commit(workspace, task_id, summary)
+    metadata = {
+        "changed_files": _string_list(payload.get("changed_files")),
+        "tests": payload.get("tests") if isinstance(payload.get("tests"), list) else [],
+        "handoff": payload.get("handoff") if isinstance(payload.get("handoff"), dict) else {},
+        "pr_ready": bool(payload.get("pr_ready")),
+        "raw": payload,
+    }
+    if checkpoint_commit_error:
+        metadata["checkpoint_commit_error"] = checkpoint_commit_error
     completed = _complete_role_task(
         conn,
         task_id,
         summary=summary or "Dev task completed.",
-        metadata={
-            "changed_files": _string_list(payload.get("changed_files")),
-            "tests": payload.get("tests") if isinstance(payload.get("tests"), list) else [],
-            "handoff": payload.get("handoff") if isinstance(payload.get("handoff"), dict) else {},
-            "pr_ready": bool(payload.get("pr_ready")),
-            "raw": payload,
-        },
+        metadata=metadata,
         expected_run_id=expected_run_id,
     )
     if not completed:
@@ -2240,17 +2243,30 @@ def _git_summary(workspace: str) -> str:
         return f"git summary unavailable: {exc}"
 
 
-def _checkpoint_commit(workspace: str, task_id: str, summary: str) -> None:
+def _checkpoint_commit(workspace: str, task_id: str, summary: str) -> Optional[str]:
+    import logging
+
+    logger = logging.getLogger(__name__)
     try:
         root = Path(workspace)
         status = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=10)
         if not (status.stdout or "").strip():
-            return
-        subprocess.run(["git", "add", "-A"], cwd=root, timeout=60)
+            return None
+        added = subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True, timeout=60)
+        if added.returncode != 0:
+            err = (added.stderr or added.stdout or "git add failed").strip()
+            logger.warning("checkpoint commit failed for task %s: %s", task_id, err)
+            return err
         message = f"checkpoint {task_id}: {(summary or 'worker progress')[:80]}"
-        subprocess.run(["git", "commit", "-m", message], cwd=root, timeout=120)
-    except Exception:
-        return
+        committed = subprocess.run(["git", "commit", "-m", message], cwd=root, capture_output=True, text=True, timeout=120)
+        if committed.returncode != 0:
+            err = (committed.stderr or committed.stdout or "git commit failed").strip()
+            logger.warning("checkpoint commit failed for task %s: %s", task_id, err)
+            return err
+        return None
+    except Exception as exc:
+        logger.warning("checkpoint commit failed for task %s: %s", task_id, exc)
+        return str(exc)
 
 
 def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:

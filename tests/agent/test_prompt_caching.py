@@ -1,6 +1,8 @@
 """Tests for agent/prompt_caching.py — Anthropic cache control injection."""
 
 
+import copy
+
 from agent.prompt_caching import (
     _apply_cache_marker,
     _can_carry_marker,
@@ -223,3 +225,44 @@ class TestApplyAnthropicCacheControl:
         assert isinstance(result[1]["content"], list)
         assert result[1]["content"][0]["cache_control"] == {"type": "ephemeral"}
         assert "cache_control" not in result[1]
+
+    def test_only_marked_messages_are_copied_and_input_is_unmutated(self):
+        msgs = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "older user"},
+            {"role": "assistant", "content": "older assistant"},
+            {"role": "tool", "content": ""},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"},
+                ],
+            },
+            {"role": "assistant", "content": "", "tool_calls": [{"type": "function"}]},
+            {"role": "tool", "content": "tool result"},
+            {"role": "user", "content": "latest user"},
+        ]
+        original = copy.deepcopy(msgs)
+
+        result = apply_anthropic_cache_control(msgs, native_anthropic=False)
+
+        assert msgs == original
+        assert result is not msgs
+        for idx in (1, 2, 3, 5):
+            assert result[idx] is msgs[idx]
+        for idx in (0, 4, 6, 7):
+            assert result[idx] is not msgs[idx]
+
+        expected = copy.deepcopy(original)
+        expected[0]["content"] = [
+            {"type": "text", "text": "System", "cache_control": MARKER}
+        ]
+        expected[4]["content"][1]["cache_control"] = MARKER
+        expected[6]["content"] = [
+            {"type": "text", "text": "tool result", "cache_control": MARKER}
+        ]
+        expected[7]["content"] = [
+            {"type": "text", "text": "latest user", "cache_control": MARKER}
+        ]
+        assert result == expected

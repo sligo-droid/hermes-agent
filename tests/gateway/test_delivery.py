@@ -1,5 +1,9 @@
 """Tests for the delivery routing module."""
 
+import re
+from datetime import datetime
+from pathlib import Path
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform
@@ -308,6 +312,50 @@ class NonChunkingAdapter:
     async def send(self, chat_id, content, metadata=None):
         self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
         return {"success": True}
+
+
+class FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 7, 7, 12, 34, 56, 123456)
+        if tz is not None:
+            return value.replace(tzinfo=tz)
+        return value
+
+
+def test_save_full_output_uses_collision_proof_filenames(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("gateway.delivery.datetime", FixedDateTime)
+    router = DeliveryRouter(GatewayConfig())
+
+    first = router._save_full_output("first output", "job1")
+    second = router._save_full_output("second output", "job1")
+
+    assert first != second
+    assert first.exists()
+    assert second.exists()
+    assert first.read_text() == "first output"
+    assert second.read_text() == "second output"
+    assert re.match(r"^job1_\d{8}_\d{6}_\d{6}_[0-9a-f]{4}\.txt$", first.name)
+    assert re.match(r"^job1_\d{8}_\d{6}_\d{6}_[0-9a-f]{4}\.txt$", second.name)
+
+
+def test_deliver_local_uses_collision_proof_filenames(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("gateway.delivery.datetime", FixedDateTime)
+    router = DeliveryRouter(GatewayConfig())
+
+    first = router._deliver_local("local first", "job-local", None, None)
+    second = router._deliver_local("local second", "job-local", None, None)
+
+    first_path = tmp_path / "cron" / "output" / "job-local" / Path(first["path"]).name
+    second_path = tmp_path / "cron" / "output" / "job-local" / Path(second["path"]).name
+
+    assert first_path != second_path
+    assert first_path.exists()
+    assert second_path.exists()
+    assert "local first" in first_path.read_text()
+    assert "local second" in second_path.read_text()
 
 
 @pytest.mark.asyncio
