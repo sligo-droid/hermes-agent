@@ -1111,6 +1111,7 @@ def _resolve_anthropic_runtime(
     *,
     requested_provider: str,
     model_cfg: Dict[str, Any],
+    credential_preference: str = "default",
 ) -> Dict[str, Any]:
     # Allow base URL override from config.yaml model.base_url, but only
     # when the configured provider is anthropic — otherwise a non-Anthropic
@@ -1161,8 +1162,12 @@ def _resolve_anthropic_runtime(
                 "config.yaml model section at a custom env var."
             )
     else:
-        from agent.anthropic_adapter import resolve_anthropic_token
-        token = resolve_anthropic_token()
+        from agent.anthropic_adapter import resolve_anthropic_token, resolve_anthropic_token_pool_first
+
+        if credential_preference == "pool_first":
+            token = resolve_anthropic_token_pool_first()
+        else:
+            token = resolve_anthropic_token()
         if not token:
             raise AuthError(
                 "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
@@ -1184,6 +1189,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    credential_preference: str = "default",
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1261,6 +1267,7 @@ def resolve_runtime_provider(
         return _resolve_anthropic_runtime(
             requested_provider=requested_provider,
             model_cfg=model_cfg,
+            credential_preference=credential_preference,
         )
 
     should_use_pool = provider != "openrouter"

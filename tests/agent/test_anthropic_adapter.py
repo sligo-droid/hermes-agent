@@ -24,6 +24,7 @@ from agent.anthropic_adapter import (
     normalize_model_name,
     read_claude_code_credentials,
     resolve_anthropic_token,
+    resolve_anthropic_token_pool_first,
     run_oauth_setup_token,
 )
 from agent.transports import get_transport
@@ -359,6 +360,62 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
         assert resolve_anthropic_token() == "cc-auto-token"
+
+    def test_pool_first_prefers_anthropic_credential_pool_over_claude_code(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "cc-env-token")
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-auto-token",
+                "refreshToken": "refresh",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
+
+        pool_entry = SimpleNamespace(auth_type="oauth", access_token="pool-oauth-token")
+        pool = SimpleNamespace(_available_entries=lambda **_kwargs: [pool_entry])
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+
+        assert resolve_anthropic_token_pool_first() == "pool-oauth-token"
+        assert resolve_anthropic_token() == "cc-auto-token"
+
+    def test_pool_first_falls_back_to_claude_code_env_when_pool_empty(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "cc-env-token")
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
+
+        pool = SimpleNamespace(_available_entries=lambda **_kwargs: [])
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+
+        assert resolve_anthropic_token_pool_first() == "cc-env-token"
+
+    def test_pool_first_falls_back_to_claude_code_credentials_when_pool_empty(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-auto-token",
+                "refreshToken": "refresh",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._claude_code_config_homes", lambda: (tmp_path,))
+
+        pool = SimpleNamespace(_available_entries=lambda **_kwargs: [])
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+
+        assert resolve_anthropic_token_pool_first() == "cc-auto-token"
 
     def test_falls_back_to_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

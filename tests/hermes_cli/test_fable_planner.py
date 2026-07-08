@@ -29,7 +29,7 @@ def test_fable_session_model_override_uses_anthropic_oauth_route(monkeypatch):
     monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: EmptyPool())
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested, target_model: {
+        lambda requested, target_model, credential_preference: {
             "provider": requested,
             "api_mode": "anthropic_messages",
             "base_url": "https://api.anthropic.com",
@@ -40,6 +40,7 @@ def test_fable_session_model_override_uses_anthropic_oauth_route(monkeypatch):
     override, error = fable_session_model_override(config={})
 
     assert error == ""
+    assert override is not None
     assert override == {
         "model": FABLE_MODEL,
         "provider": "anthropic",
@@ -48,6 +49,34 @@ def test_fable_session_model_override_uses_anthropic_oauth_route(monkeypatch):
         "api_mode": "anthropic_messages",
         "disable_fallback": "true",
     }
+
+
+def test_fable_session_model_override_requests_pool_first_credentials(monkeypatch):
+    calls = []
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: EmptyPool())
+
+    def fake_resolve_runtime_provider(**kwargs):
+        calls.append(kwargs)
+        return {
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-oat01-test",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve_runtime_provider)
+
+    override, error = fable_session_model_override(config={})
+
+    assert error == ""
+    assert override is not None
+    assert calls == [
+        {
+            "requested": "anthropic",
+            "target_model": FABLE_MODEL,
+            "credential_preference": "pool_first",
+        }
+    ]
 
 
 def test_fable_session_model_override_errors_when_route_unavailable(monkeypatch):

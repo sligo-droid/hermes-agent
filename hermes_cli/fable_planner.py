@@ -113,7 +113,11 @@ def fable_session_model_override(config: dict[str, Any] | None = None) -> tuple[
         from agent.anthropic_adapter import _is_oauth_token
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested=FABLE_PROVIDER, target_model=FABLE_MODEL)
+        runtime = resolve_runtime_provider(
+            requested=FABLE_PROVIDER,
+            target_model=FABLE_MODEL,
+            credential_preference="pool_first",
+        )
     except Exception as exc:
         return None, f"Fable 5 is not configured through Hermes' Anthropic OAuth route: {exc}"
 
