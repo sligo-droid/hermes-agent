@@ -849,6 +849,13 @@ def test_fable_text_command_counts_as_threaded_work(adapter):
     assert adapter._slash_command_starts_threaded_work("/usage") is False
 
 
+def test_fable_text_command_does_not_create_worker_board(adapter):
+    assert adapter._slash_command_creates_worker_board("/fable plan reporting") is False
+    assert adapter._slash_command_creates_worker_board("/FABLE plan reporting") is False
+    assert adapter._slash_command_creates_worker_board("/goal ship reporting") is True
+    assert adapter._slash_command_creates_worker_board("/goal stop") is False
+
+
 @pytest.mark.asyncio
 async def test_fable_slash_in_parent_channel_creates_thread_before_dispatch(adapter):
     parent = _FakeTextChannel(channel_id=123, name="planning")
