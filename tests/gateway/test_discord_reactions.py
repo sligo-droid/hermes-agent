@@ -1712,6 +1712,63 @@ def test_feature_summary_loader_falls_back_to_source_scoped_thread_handle(adapte
 
 
 @pytest.mark.asyncio
+async def test_processing_start_fable_turn_uses_progress_emoji_in_kanban_thread(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="👀", me=True)],
+    )
+    event = _make_event("9", raw_message)
+    event.invoked_skill_command = "fable"
+    event.feature_summary = {"kanban_board": {"slug": "discord-1000"}}
+
+    await adapter.on_processing_start(event)
+
+    assert [call.args for call in raw_message.add_reaction.await_args_list] == [("⏳",)]
+
+
+@pytest.mark.asyncio
+async def test_processing_complete_fable_turn_uses_outcome_rather_than_kanban(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="👀", me=True)],
+    )
+    event = _make_event("9", raw_message)
+    event.invoked_skill_command = "fable"
+    event.feature_summary = {
+        "thread_id": "1000",
+        "kanban_board": {"slug": "discord-1000"},
+    }
+    adapter._feature_kanban_reaction_state = MagicMock(return_value="active")
+
+    await adapter.on_processing_start(event)
+    adapter._feature_kanban_reaction_state.reset_mock()
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert [call.args for call in raw_message.add_reaction.await_args_list] == [
+        ("⏳",),
+        ("✅",),
+    ]
+    adapter._feature_kanban_reaction_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_processing_lifecycle_does_not_rename_discord_thread(adapter):
+    thread = _StatusThread(name="Build dashboard")
+    event = _thread_status_event("1", thread)
+    adapter._client.fetch_channel = AsyncMock(side_effect=LookupError("parent unavailable"))
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert thread.name == "Build dashboard"
+    thread.edit.assert_not_awaited()
+    event.raw_message.add_reaction.assert_any_await("⏳")
+    event.raw_message.add_reaction.assert_any_await("✅")
+
+
+@pytest.mark.asyncio
 async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter, monkeypatch):
     origin_message = SimpleNamespace(
         id=1000,
@@ -1765,21 +1822,6 @@ async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter, monkeyp
         ("👀",),
         ("👀",),
     ]
-
-
-@pytest.mark.asyncio
-async def test_processing_lifecycle_does_not_rename_discord_thread(adapter):
-    thread = _StatusThread(name="Build dashboard")
-    event = _thread_status_event("1", thread)
-    adapter._client.fetch_channel = AsyncMock(side_effect=LookupError("parent unavailable"))
-
-    await adapter.on_processing_start(event)
-    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
-
-    assert thread.name == "Build dashboard"
-    thread.edit.assert_not_awaited()
-    event.raw_message.add_reaction.assert_any_await("⏳")
-    event.raw_message.add_reaction.assert_any_await("✅")
 
 
 def _ship_payload(*, emoji="👍", user_id=42, channel_id=123, message_id=999, guild_id=10):

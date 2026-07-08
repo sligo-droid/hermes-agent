@@ -4598,6 +4598,14 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Discord plan artifact persistence skipped: %s", self.name, exc, exc_info=True)
             return None
 
+    def _is_fable_event(self, event: MessageEvent) -> bool:
+        invoked_skill_command = str(getattr(event, "invoked_skill_command", "") or "").strip().lower()
+        fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
+        return invoked_skill_command == "fable" or (
+            isinstance(fable_plan_metadata, dict)
+            and str(fable_plan_metadata.get("command", "") or "").strip().lower() == "fable"
+        )
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 
@@ -4613,10 +4621,11 @@ class DiscordAdapter(BasePlatformAdapter):
         feature_summary = getattr(event, "feature_summary", None)
         has_feature_summary = feature_summary is not None
         has_kanban_board = self._feature_kanban_board_slug(feature_summary) is not None
+        is_fable_event = self._is_fable_event(event)
         for message in messages:
             if not hasattr(message, "add_reaction"):
                 continue
-            if has_kanban_board:
+            if has_kanban_board and not is_fable_event:
                 await self._set_message_reaction_state(message, "👀")
                 continue
             if has_feature_summary:
@@ -4628,12 +4637,15 @@ class DiscordAdapter(BasePlatformAdapter):
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
-        kanban_state = self._feature_kanban_reaction_state(getattr(event, "feature_summary", None))
-        if outcome == ProcessingOutcome.SUCCESS:
-            kanban_state = self._feature_kanban_completion_state(
-                getattr(event, "feature_summary", None),
-                kanban_state,
-            )
+        is_fable_event = self._is_fable_event(event)
+        kanban_state = None
+        if not is_fable_event:
+            kanban_state = self._feature_kanban_reaction_state(getattr(event, "feature_summary", None))
+            if outcome == ProcessingOutcome.SUCCESS:
+                kanban_state = self._feature_kanban_completion_state(
+                    getattr(event, "feature_summary", None),
+                    kanban_state,
+                )
         kanban_emoji = self._feature_kanban_reaction_emoji(kanban_state)
         has_feature_summary = getattr(event, "feature_summary", None) is not None
         messages = await self._processing_reaction_messages(event)
