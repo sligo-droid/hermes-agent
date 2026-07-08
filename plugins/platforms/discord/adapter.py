@@ -1985,6 +1985,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
     def _feature_kanban_reaction_state(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not self._feature_summary_uses_kanban_reactions(handle):
+            return None
         source_state = self._feature_source_task_reaction_state(handle)
         if source_state:
             return source_state
@@ -2013,6 +2015,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         handle: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        if not self._feature_summary_uses_kanban_reactions(handle):
+            return None
         slug = self._feature_kanban_board_slug(handle)
         if not slug:
             return None
@@ -2107,7 +2111,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return state or None
         if not isinstance(handle, dict):
             return state
-        if "kanban_board" not in handle:
+        if not self._feature_summary_uses_kanban_reactions(handle):
             return state
         thread_id = str(handle.get("thread_id") or "").strip()
         if not thread_id:
@@ -2195,6 +2199,12 @@ class DiscordAdapter(BasePlatformAdapter):
         if lower in {"running", "working"}:
             return "⏳"
         return "👀"
+
+    def _feature_summary_uses_kanban_reactions(self, handle: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(handle, dict) or "kanban_board" not in handle:
+            return False
+        initial_request = str(handle.get("initial_request") or "").strip()
+        return not self._is_fable_command_text(initial_request)
 
     def _feature_summary_reaction_emoji(
         self,
@@ -2484,7 +2494,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         board_handle: Optional[Dict[str, Any]] = None
         request_id = str(source_message_id or "").strip()
-        if self._slash_command_starts_threaded_work(initial_request):
+        if self._slash_command_creates_worker_board(initial_request):
             try:
                 from hermes_cli.discord_worker_boards import ensure_discord_thread_board
 
@@ -2953,6 +2963,18 @@ class DiscordAdapter(BasePlatformAdapter):
             lower_args
             and lower_args not in GOAL_CONTROL_COMMANDS
         )
+
+    def _slash_command_creates_worker_board(self, text: str) -> bool:
+        cleaned = str(text or "").strip()
+        if not cleaned.startswith("/"):
+            return False
+        match = re.match(r"^/([^\s]+)(?:\s+(.*))?$", cleaned, re.DOTALL)
+        if not match:
+            return False
+        command = match.group(1).lower()
+        if command == "fable":
+            return False
+        return self._slash_command_starts_threaded_work(cleaned)
 
     def _slash_goal_uses_text_attachment_body(self, text: str, attachments: Iterable[Any]) -> bool:
         cleaned = str(text or "").strip()
@@ -4620,7 +4642,7 @@ class DiscordAdapter(BasePlatformAdapter):
         messages = await self._processing_reaction_messages(event)
         feature_summary = getattr(event, "feature_summary", None)
         has_feature_summary = feature_summary is not None
-        has_kanban_board = self._feature_kanban_board_slug(feature_summary) is not None
+        has_kanban_board = self._feature_summary_uses_kanban_reactions(feature_summary)
         is_fable_event = self._is_fable_event(event)
         for message in messages:
             if not hasattr(message, "add_reaction"):

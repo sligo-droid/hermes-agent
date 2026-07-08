@@ -473,6 +473,34 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_fable_feature_summary_reactions_ignore_kanban_state(adapter, monkeypatch):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("10", raw_message)
+    event.invoked_skill_command = "fable"
+    event.feature_summary = {
+        "thread_id": "123",
+        "message_id": "456",
+        "initial_request": "/fable plan reporting",
+        "kanban_board": {"slug": "discord-123"},
+    }
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.board_thread_reaction_state",
+        lambda _slug: "active",
+    )
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert [call.args for call in raw_message.add_reaction.await_args_list] == [
+        ("⏳",),
+        ("✅",),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_processing_complete_success_resolves_stale_kanban_running_to_done(
     adapter,
     monkeypatch,
