@@ -1877,7 +1877,13 @@ DEFAULT_CONFIG = {
         # scanned regardless of this setting.
         "guard_agent_created": False,
         "index": {
-            "workers": "full",  # full | focus
+            # Delegated worker child agents get a names-only skill index for
+            # non-coding categories ("focus"); every skill stays loadable via
+            # skills_list/skill_view, and HERMES_SKILLS_INDEX=full restores
+            # the full index. Set to "full" to give workers the operator
+            # index. Operator sessions are governed by agent.coding_context
+            # instead and are never affected by this key.
+            "workers": "focus",  # focus | full
             "debug": False,
         },
     },

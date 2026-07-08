@@ -163,6 +163,30 @@ def test_last_index_report_reflects_rendered_tiers_and_bytes(monkeypatch, tmp_pa
     assert full_report["categories"]["media"]["tier"] == "full"
 
 
+def test_worker_demotes_by_default_and_workers_full_opts_out(
+    monkeypatch,
+    tmp_path,
+):
+    # DEFAULT_CONFIG ships skills.index.workers = "focus": a worker child
+    # agent gets the names-only index with NO user config present, and
+    # "workers: full" restores the operator index for workers.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _seed_skill(tmp_path, "media", "podcast-edit", "Edit podcast audio")
+
+    worker_stable = _stable_prompt(_make_agent(session_role="worker"))
+    assert "    - names: podcast-edit" in worker_stable
+    assert "podcast-edit: Edit podcast audio" not in worker_stable
+
+    (tmp_path / "config.yaml").write_text(
+        "skills:\n  index:\n    workers: full\n",
+        encoding="utf-8",
+    )
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    worker_full = _stable_prompt(_make_agent(session_role="worker"))
+    assert "podcast-edit: Edit podcast audio" in worker_full
+    assert "    - names: podcast-edit" not in worker_full
+
+
 def test_system_prompt_worker_focus_demotes_default_operator_does_not(
     monkeypatch,
     tmp_path,
