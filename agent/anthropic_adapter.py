@@ -1311,6 +1311,42 @@ def resolve_anthropic_token() -> Optional[str]:
     return None
 
 
+def resolve_anthropic_token_pool_first() -> Optional[str]:
+    """Resolve Anthropic token with Hermes credential_pool before Claude Code.
+
+    This is intentionally separate from ``resolve_anthropic_token()`` so normal
+    Anthropic compatibility keeps its historical Claude Code preference while
+    scoped callers such as ``/fable`` can pin to Hermes-managed OAuth first.
+
+    Keep ANTHROPIC_TOKEN as an explicit operator override, but put the Hermes
+    pool before Claude Code's env/file credentials so auto-detected Claude CLI
+    state cannot steal scoped /fable execution from Hermes auth setup.
+    """
+    creds = read_claude_code_credentials()
+
+    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    if token:
+        return token
+
+    resolved_pool_token = _resolve_anthropic_pool_token()
+    if resolved_pool_token:
+        return resolved_pool_token
+
+    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if cc_token:
+        return cc_token
+
+    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+    if resolved_claude_token:
+        return resolved_claude_token
+
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        return api_key
+
+    return None
+
+
 def run_oauth_setup_token() -> Optional[str]:
     """Run 'claude setup-token' interactively and return the resulting token.
 
