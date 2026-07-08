@@ -11976,6 +11976,7 @@ class GatewayRunner:
                 project_summary=getattr(event, "project_summary", None),
                 fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
                 fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
+                fable_transcript_user_message=getattr(event, "fable_transcript_user_message", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -12021,6 +12022,17 @@ class GatewayRunner:
                         "Resolved unexpected route "
                         f"provider={actual_provider!r} model={actual_model!r}; refusing fallback result."
                     )
+                transcript_user_message = str(
+                    getattr(event, "fable_transcript_user_message", "") or ""
+                ).strip()
+                if transcript_user_message:
+                    original_message_text = message_text
+                    message_text = transcript_user_message
+                    logger.debug(
+                        "Persisting /fable command text for session %s instead of plan-only skill payload (%d chars elided)",
+                        session_key,
+                        len(original_message_text or ""),
+                    )
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -12034,6 +12046,21 @@ class GatewayRunner:
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
+            fable_transcript_user_message = str(
+                getattr(event, "fable_transcript_user_message", "") or ""
+            ).strip()
+            if fable_plan_metadata and fable_transcript_user_message:
+                try:
+                    history_offset = agent_result.get("history_offset", len(history))
+                    agent_messages = list(agent_messages or [])
+                    if len(agent_messages) > history_offset:
+                        first_new = agent_messages[history_offset]
+                        if isinstance(first_new, dict) and first_new.get("role") == "user":
+                            patched_first_new = dict(first_new)
+                            patched_first_new["content"] = fable_transcript_user_message
+                            agent_messages[history_offset] = patched_first_new
+                except Exception:
+                    agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
@@ -17627,6 +17654,7 @@ class GatewayRunner:
                 "source_message_id": str(event.message_id or ""),
             }
             event.fable_enabled_toolsets = fable_enabled_toolsets(cfg)
+            event.fable_transcript_user_message = f"/fable {args}".strip()
         except Exception:
             pass
 
@@ -20036,6 +20064,7 @@ class GatewayRunner:
         project_summary: Optional[Dict[str, Any]] = None,
         fable_plan_metadata: Optional[Dict[str, Any]] = None,
         fable_toolsets: Optional[List[str]] = None,
+        fable_transcript_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -21396,8 +21425,15 @@ class GatewayRunner:
                     "conversation_history": agent_history,
                     "task_id": session_id,
                 }
+                _persist_user_message = (
+                    str(fable_transcript_user_message or "").strip()
+                    if fable_plan_metadata
+                    else ""
+                )
                 if observed_group_context:
-                    _conversation_kwargs["persist_user_message"] = message
+                    _conversation_kwargs["persist_user_message"] = _persist_user_message or message
+                elif _persist_user_message:
+                    _conversation_kwargs["persist_user_message"] = _persist_user_message
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)

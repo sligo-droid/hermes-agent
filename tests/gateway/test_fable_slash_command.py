@@ -110,6 +110,7 @@ async def test_fable_command_routes_through_normal_agent_with_fable_override(mon
     assert agent_event.text == "PLAN SKILL: build X"
     assert agent_event.invoked_skill_command == "fable"
     assert agent_event.fable_enabled_toolsets == ["file", "terminal", "web", "browser", "discord"]
+    assert agent_event.fable_transcript_user_message == "/fable build X"
     assert build_session_key(agent_event.source) not in runner._session_model_overrides
 
 
@@ -380,6 +381,89 @@ def test_fable_run_agent_refuses_non_fable_model_result(monkeypatch):
 
     assert "will not fall back to another model or provider" in result
     assert "gpt-5.5" in result
+
+
+def test_fable_turn_persists_slash_command_not_plan_skill_payload(monkeypatch):
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    import gateway.run as gateway_run
+
+    class CapturingAgent:
+        last_conversation_kwargs = None
+
+        def __init__(self, **_kwargs):
+            self.tools = []
+
+        def run_conversation(self, user_message, **kwargs):
+            CapturingAgent.last_conversation_kwargs = kwargs
+            persisted_user_message = kwargs.get("persist_user_message", user_message)
+            return {
+                "final_response": "fable ok",
+                "messages": [
+                    {"role": "user", "content": persisted_user_message},
+                    {"role": "assistant", "content": "fable ok"},
+                ],
+                "history_offset": 0,
+                "api_calls": 1,
+                "model": "claude-fable-5",
+                "provider": "anthropic",
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    GatewayRunner = gateway_run.GatewayRunner
+
+    runner = _make_runner()
+    runner._handle_message_with_agent = GatewayRunner._handle_message_with_agent.__get__(runner, GatewayRunner)
+    runner._run_agent = GatewayRunner._run_agent.__get__(runner, GatewayRunner)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: ("claude-fable-5", _fable_override())
+    runner._agent_cache_lock = threading.Lock()
+    runner._fallback_model = None
+    runner._provider_routing = {}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._voice_mode = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._show_reasoning = False
+    runner._service_tier = None
+    runner._session_db = None
+    runner._background_tasks = set()
+    runner.adapters = {}
+    event = _make_event()
+    event.text = "PLAN SKILL PAYLOAD WITH FABLE RUNTIME NOTE"
+    event.fable_plan_metadata = {"command": "fable"}
+    event.fable_transcript_user_message = "/fable build X"
+    session_entry = _session_entry_for_event(event)
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.update_session = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.has_any_sessions.return_value = True
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(
+            event,
+            event.source,
+            build_session_key(event.source),
+            1,
+        )
+    )
+
+    assert result == "fable ok"
+    assert CapturingAgent.last_conversation_kwargs is not None
+    assert CapturingAgent.last_conversation_kwargs["persist_user_message"] == "/fable build X"
+    transcript_entries = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    user_entries = [entry for entry in transcript_entries if entry.get("role") == "user"]
+    assert user_entries
+    assert user_entries[0]["content"] == "/fable build X"
+    assert "FABLE RUNTIME NOTE" not in user_entries[0]["content"]
 
 
 @pytest.mark.asyncio
