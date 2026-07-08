@@ -4,14 +4,57 @@ name: Typecheck
 on:
   push:
     branches: [main]
-  # No paths filter — the job must always run so the required check
-  # reports a status (path-gated workflows leave checks "pending" forever
-  # when no matching files change, which blocks merge).
+  # Gating happens in `changes`: non-matching pushes/PRs skip via a completed
+  # SKIPPED conclusion. Main has no branch protection rules, and agent watch
+  # loops treat SKIPPED as done, so checks no longer stay pending.
   pull_request:
     branches: [main]
 
+concurrency:
+  group: typecheck-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      ts: ${{ steps.filter.outputs.ts }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Check for TS-relevant file changes
+        id: filter
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          fi
+
+          if [[ "$BASE" == "0000000000000000000000000000000000000000" ]] \
+            || ! git cat-file -e "$BASE"^{commit} \
+            || ! git cat-file -e "$HEAD"^{commit}; then
+            echo "ts=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED_FILES=$(git diff --name-only "$BASE"..."$HEAD" -- \
+            'ui-tui/**' 'web/**' 'apps/**' \
+            'package.json' 'package-lock.json' 'tsconfig*' '.github/workflows/typecheck.yml' || true)
+          if [[ -n "$CHANGED_FILES" ]]; then
+            echo "ts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ts=false" >> "$GITHUB_OUTPUT"
+          fi
+
   typecheck:
+    needs: changes
+    if: needs.changes.outputs.ts == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -44,6 +87,8 @@ jobs:
   # users build apps/desktop from source on install/update. Run the real
   # `vite build` here so that class of break fails in CI instead.
   desktop-build:
+    needs: changes
+    if: needs.changes.outputs.ts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

@@ -4,12 +4,22 @@ on:
   push:
     branches: [main]
     paths-ignore:
+      - '.gitignore'
+      - 'LICENSE'
+      - 'assets/**'
+      - 'infographic/**'
+      - 'locales/**'
       - '**/*.md'
       - 'docs/**'
       - 'website/**'
   pull_request:
     branches: [main]
     paths-ignore:
+      - '.gitignore'
+      - 'LICENSE'
+      - 'assets/**'
+      - 'infographic/**'
+      - 'locales/**'
       - '**/*.md'
       - 'docs/**'
       - 'website/**'

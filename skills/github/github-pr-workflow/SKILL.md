@@ -179,15 +179,18 @@ To create as a draft, add `"draft": true` to the JSON body.
 
 ### Check CI Status
 
+Start the CI watch immediately after `gh pr create` (or equivalent API flow): SKIPPED conclusions count as complete, and the loop is done when no check is pending.
+
 **With gh:**
 
 ```bash
 # One-shot check
-gh pr checks
+gh pr checks <number>
 
-# Watch until all checks finish (polls every 10s)
-gh pr checks --watch
+# Watch until checks finish (polls every 10s; SKIPPED counts as completed)
+gh pr checks <number> --watch -i 10
 ```
+If checks are still running after ~5 minutes, stop watching and report `CI-still-running` with the PR URL; avoid fixed sleeps and do not re-list checks after watch exits.
 
 **With git + curl:**
 
@@ -220,9 +223,9 @@ for cr in data.get('check_runs', []):
 ### Poll Until Complete (git + curl)
 
 ```bash
-# Simple polling loop — check every 30 seconds, up to 10 minutes
+# Simple polling loop — check every 10 seconds, up to ~5 minutes
 SHA=$(git rev-parse HEAD)
-for i in $(seq 1 20); do
+for i in $(seq 1 30); do
   STATUS=$(curl -s \
     -H "Authorization: token $GITHUB_TOKEN" \
     https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
@@ -231,8 +234,11 @@ for i in $(seq 1 20); do
   if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
     break
   fi
-  sleep 30
+  sleep 10
 done
+if [ "$STATUS" != "success" ] && [ "$STATUS" != "failure" ] && [ "$STATUS" != "error" ]; then
+  echo "CI still running for PR: https://github.com/$OWNER/$REPO/pull/<number>"
+fi
 ```
 
 ## 5. Auto-Fixing CI Failures
