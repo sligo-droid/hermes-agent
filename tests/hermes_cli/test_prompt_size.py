@@ -112,6 +112,28 @@ def test_render_breakdown_is_plain_text(isolated_home):
     assert not out.strip().startswith("{")
 
 
+def test_render_breakdown_includes_skill_index_focus_report(isolated_home):
+    workspace = isolated_home.parent
+    (workspace / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (isolated_home / "config.yaml").write_text(
+        "agent:\n  coding_context: focus\n",
+        encoding="utf-8",
+    )
+    skill_dir = isolated_home / "skills" / "media" / "video-edit"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: video-edit\ndescription: Edit video clips\n---\n",
+        encoding="utf-8",
+    )
+
+    data = compute_prompt_breakdown("cli")
+    out = render_breakdown(data)
+
+    assert "demoted categories" in out
+    assert "names-only skills" in out
+    assert "B saved" in out
+
+
 def test_json_serializable(isolated_home):
     data = compute_prompt_breakdown("cli")
     # Round-trips cleanly for ``--json`` output.

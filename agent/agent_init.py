@@ -140,6 +140,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     verify_on_stop: bool | str | None = None,
+    session_role: str = "operator",
 ):
     """
     Initialize the AI Agent.
@@ -222,6 +223,7 @@ def init_agent(
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent.session_role = str(session_role or "operator")
     agent.memory_read_only = bool(memory_read_only)
     agent.pass_session_id = pass_session_id
     agent.verify_on_stop = verify_on_stop

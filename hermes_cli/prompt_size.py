@@ -57,6 +57,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     of (label, chars, bytes) for the three prompt tiers).
     """
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+    from agent.prompt_builder import get_last_skills_index_report
 
     agent = _build_inspection_agent(platform)
 
@@ -102,6 +103,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "model": getattr(agent, "model", "") or "",
         "system_prompt": {"chars": len(full), "bytes": _bytes(full)},
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
+        "skills_index_report": get_last_skills_index_report(),
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
         "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
@@ -126,6 +128,21 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     mem = data["memory"]
     up = data["user_profile"]
     lines.append(f"    skills index       : {si['bytes']:>8,} B  ({_fmt_kb(si['bytes'])})")
+    report = data.get("skills_index_report")
+    if report:
+        categories = report.get("categories") or {}
+        demoted = [
+            info for info in categories.values()
+            if isinstance(info, dict) and info.get("tier") == "names-only"
+        ]
+        names_only_skills = sum(int(info.get("skills", 0)) for info in demoted)
+        saved = int(report.get("bytes_full_equivalent", 0)) - int(
+            report.get("bytes_rendered", 0)
+        )
+        lines.append(
+            f"    skills index focus : {len(demoted):>8,} demoted categories, "
+            f"{names_only_skills:,} names-only skills, ~{max(saved, 0):,} B saved"
+        )
     lines.append(f"    memory             : {mem['bytes']:>8,} B  ({_fmt_kb(mem['bytes'])})")
     lines.append(f"    user profile       : {up['bytes']:>8,} B  ({_fmt_kb(up['bytes'])})")
     lines.append("")
