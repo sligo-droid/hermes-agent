@@ -655,6 +655,25 @@ def coding_compact_skill_categories(
     ).compact_skill_categories()
 
 
+def worker_compact_skill_categories(
+    config: Optional[dict[str, Any]] = None,
+) -> frozenset[str]:
+    """Worker-only index demotion, gated by ``skills.index.workers: focus``."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+    skills_cfg = (config or {}).get("skills", {}) if isinstance(config, dict) else {}
+    index_cfg = skills_cfg.get("index", {}) if isinstance(skills_cfg, dict) else {}
+    raw = index_cfg.get("workers", "full") if isinstance(index_cfg, dict) else "full"
+    if str(raw).strip().lower() != "focus":
+        return frozenset()
+    return frozenset(CODING_PROFILE.compact_skill_categories)
+
+
 def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
     """Names of MCP servers the user has enabled — kept in the coding posture.
 

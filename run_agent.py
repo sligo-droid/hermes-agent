@@ -416,6 +416,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         verify_on_stop: bool | str | None = None,
+        session_role: str = "operator",
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -491,6 +492,7 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
             verify_on_stop=verify_on_stop,
+            session_role=session_role,
         )
         self._session_log_written_count: int = -1
         self._session_log_written_path: Optional[Path] = None

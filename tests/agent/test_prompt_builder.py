@@ -293,6 +293,22 @@ class TestBuildSkillsSystemPrompt:
         assert "only when the task needs that skill's detailed procedure" in result
         assert "routine coding work" in result
 
+    def test_empty_compact_categories_matches_default_output(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        default_result = build_skills_system_prompt(compact_categories=None)
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=False)
+        empty_result = build_skills_system_prompt(compact_categories=frozenset())
+
+        assert default_result == empty_result
+
     def test_builds_index_with_inherited_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         local_skill = tmp_path / "profile" / "skills" / "general-coding"

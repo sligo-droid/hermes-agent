@@ -12,7 +12,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from typing import Any, Optional
 
 from agent.skill_utils import (
     extract_skill_conditions,
@@ -913,9 +913,17 @@ CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 # =========================================================================
 
 _SKILLS_PROMPT_CACHE_MAX = 8
-_SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
+_SKILLS_PROMPT_CACHE: OrderedDict[
+    tuple,
+    tuple[str, dict[str, Any] | None],
+] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 _SKILLS_SNAPSHOT_VERSION = 1
+_LAST_INDEX_REPORT: dict[str, Any] | None = None
+_SKILLS_INDEX_COMPACT_NOTICE = (
+    "Note: some categories above are listed name-only to save context; "
+    "skills_list shows full descriptions and skill_view(name) loads any skill."
+)
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -924,13 +932,32 @@ def _skills_prompt_snapshot_path() -> Path:
 
 def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
+    global _LAST_INDEX_REPORT
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE.clear()
+        _LAST_INDEX_REPORT = None
     if clear_snapshot:
         try:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
         except OSError as e:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
+
+
+def get_last_skills_index_report() -> dict[str, Any] | None:
+    """Return diagnostics for the most recent skills-index render."""
+    with _SKILLS_PROMPT_CACHE_LOCK:
+        if _LAST_INDEX_REPORT is None:
+            return None
+        return {
+            **_LAST_INDEX_REPORT,
+            "compact_categories": list(
+                _LAST_INDEX_REPORT.get("compact_categories", [])
+            ),
+            "categories": {
+                str(cat): dict(info)
+                for cat, info in (_LAST_INDEX_REPORT.get("categories") or {}).items()
+            },
+        }
 
 
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
@@ -1067,14 +1094,156 @@ def _skill_should_show(
     return True
 
 
+def _normalized_compact_categories(
+    compact_categories: "frozenset[str] | None",
+) -> frozenset[str]:
+    if not compact_categories:
+        return frozenset()
+    return frozenset(
+        str(category).strip()
+        for category in compact_categories
+        if str(category).strip()
+    )
+
+
+def _category_is_compact(category: str, compact_categories: frozenset[str]) -> bool:
+    if category in compact_categories:
+        return True
+    return any(category.startswith(f"{parent}/") for parent in compact_categories)
+
+
+def _dedup_sorted_skills(skills: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    deduped: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, desc in sorted(skills, key=lambda item: item[0]):
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append((name, desc))
+    return deduped
+
+
+def _render_skills_index_lines(
+    skills_by_category: dict[str, list[tuple[str, str]]],
+    category_descriptions: dict[str, str],
+    compact_categories: frozenset[str],
+) -> tuple[list[str], dict[str, dict[str, Any]], set[str]]:
+    index_lines: list[str] = []
+    category_report: dict[str, dict[str, Any]] = {}
+    demoted_categories: set[str] = set()
+    for category in sorted(skills_by_category.keys()):
+        cat_desc = category_descriptions.get(category, "")
+        if cat_desc:
+            index_lines.append(f"  {category}: {cat_desc}")
+        else:
+            index_lines.append(f"  {category}:")
+
+        deduped = _dedup_sorted_skills(skills_by_category[category])
+        names_only = _category_is_compact(category, compact_categories)
+        tier = "names-only" if names_only else "full"
+        category_report[category] = {"skills": len(deduped), "tier": tier}
+        if names_only:
+            demoted_categories.add(category)
+            index_lines.append(
+                f"    - names: {', '.join(name for name, _desc in deduped)}"
+            )
+            continue
+
+        for name, desc in deduped:
+            if desc:
+                index_lines.append(f"    - {name}: {desc}")
+            else:
+                index_lines.append(f"    - {name}")
+    return index_lines, category_report, demoted_categories
+
+
+def _format_skills_system_prompt(index_lines: list[str], *, include_notice: bool) -> str:
+    notice = f"{_SKILLS_INDEX_COMPACT_NOTICE}\n" if include_notice else ""
+    return (
+        "## Skills (summary index)\n"
+        "Before replying, scan the skill summaries below. Treat them as routing hints, "
+        "not automatic full-context injections. Load a full skill with skill_view(name) "
+        "only when the task needs that skill's detailed procedure, commands, API facts, "
+        "pitfalls, templates, or verification checklist. For routine coding work where "
+        "the repo instructions and local evidence are sufficient, continue without "
+        "loading extra skill bodies. If the task reaches a phase covered by a specific "
+        "skill, such as opening or merging a PR, load that skill at the phase boundary. "
+        "Skills encode the user's preferred approach and quality standards, so do not "
+        "skip a skill whose detailed workflow is necessary to act correctly.\n"
+        "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+        "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+        "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+        "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+        "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+        "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        "If a skill you loaded was missing steps, had wrong commands, or needed "
+        "pitfalls you discovered, update it before finishing.\n"
+        "\n"
+        "<available_skills>\n"
+        + "\n".join(index_lines) + "\n"
+        "</available_skills>\n"
+        + notice
+        + "\n"
+        "Proceed without loading a full skill when summaries are enough for the current phase."
+    )
+
+
+def _skills_index_debug_enabled() -> bool:
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        return bool(cfg_get(load_config(), "skills", "index", "debug", default=False))
+    except Exception:
+        return False
+
+
+def _build_skills_index_report(
+    *,
+    compact_categories: frozenset[str],
+    category_report: dict[str, dict[str, Any]],
+    full_equivalent: str,
+    rendered: str,
+) -> dict[str, Any] | None:
+    try:
+        report = {
+            "mode": "compact" if compact_categories else "full",
+            "compact_categories": sorted(compact_categories),
+            "categories": {
+                category: {
+                    "skills": int(info.get("skills", 0)),
+                    "tier": str(info.get("tier", "full")),
+                }
+                for category, info in sorted(category_report.items())
+            },
+            "bytes_full_equivalent": len(full_equivalent.encode("utf-8")),
+            "bytes_rendered": len(rendered.encode("utf-8")),
+        }
+        if _skills_index_debug_enabled():
+            demoted = [
+                category
+                for category, info in report["categories"].items()
+                if info.get("tier") == "names-only"
+            ]
+            saved = report["bytes_full_equivalent"] - report["bytes_rendered"]
+            logger.info(
+                "skills index: demoted_categories=%s bytes_saved=%s",
+                ",".join(demoted) or "-",
+                max(saved, 0),
+            )
+        return report
+    except Exception:
+        return None
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    compact_categories: "frozenset[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
     Two-layer cache:
-      1. In-process LRU dict keyed by (skills_dir, tools, toolsets)
+      1. In-process LRU dict keyed by (skills_dir, tools, toolsets, compaction)
       2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
          mtime/size manifest — survives process restarts
 
@@ -1086,10 +1255,15 @@ def build_skills_system_prompt(
     appear in the index but new skills are always created in the local dir.
     Local skills take precedence when names collide.
     """
+    global _LAST_INDEX_REPORT
+
+    compact_category_set = _normalized_compact_categories(compact_categories)
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
     if not skills_dir.exists() and not external_dirs:
+        with _SKILLS_PROMPT_CACHE_LOCK:
+            _LAST_INDEX_REPORT = None
         return ""
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
@@ -1109,12 +1283,15 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        tuple(sorted(compact_category_set)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
-            return cached
+            result, report = cached
+            _LAST_INDEX_REPORT = report
+            return result
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
@@ -1245,55 +1422,39 @@ def build_skills_system_prompt(
 
     if not skills_by_category:
         result = ""
+        report = None
+        with _SKILLS_PROMPT_CACHE_LOCK:
+            _LAST_INDEX_REPORT = None
     else:
-        index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
-                else:
-                    index_lines.append(f"    - {name}")
-
-        result = (
-            "## Skills (summary index)\n"
-            "Before replying, scan the skill summaries below. Treat them as routing hints, "
-            "not automatic full-context injections. Load a full skill with skill_view(name) "
-            "only when the task needs that skill's detailed procedure, commands, API facts, "
-            "pitfalls, templates, or verification checklist. For routine coding work where "
-            "the repo instructions and local evidence are sufficient, continue without "
-            "loading extra skill bodies. If the task reaches a phase covered by a specific "
-            "skill, such as opening or merging a PR, load that skill at the phase boundary. "
-            "Skills encode the user's preferred approach and quality standards, so do not "
-            "skip a skill whose detailed workflow is necessary to act correctly.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Proceed without loading a full skill when summaries are enough for the current phase."
+        index_lines, category_report, demoted_categories = _render_skills_index_lines(
+            skills_by_category,
+            category_descriptions,
+            compact_category_set,
+        )
+        full_index_lines, _full_report, _full_demoted = _render_skills_index_lines(
+            skills_by_category,
+            category_descriptions,
+            frozenset(),
+        )
+        full_equivalent = _format_skills_system_prompt(
+            full_index_lines,
+            include_notice=False,
+        )
+        result = _format_skills_system_prompt(
+            index_lines,
+            include_notice=bool(demoted_categories),
+        )
+        report = _build_skills_index_report(
+            compact_categories=compact_category_set,
+            category_report=category_report,
+            full_equivalent=full_equivalent,
+            rendered=result,
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:
-        _SKILLS_PROMPT_CACHE[cache_key] = result
+        _LAST_INDEX_REPORT = report
+        _SKILLS_PROMPT_CACHE[cache_key] = (result, report)
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
             _SKILLS_PROMPT_CACHE.popitem(last=False)

@@ -1876,6 +1876,10 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        "index": {
+            "workers": "full",  # full | focus
+            "debug": False,
+        },
     },
 
     # Curator — background skill maintenance.

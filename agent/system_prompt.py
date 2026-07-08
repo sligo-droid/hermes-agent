@@ -60,6 +60,36 @@ def _ra():
     return run_agent
 
 
+def _resolve_skills_index_compact_categories(agent: Any) -> frozenset[str]:
+    """Resolve index demotion once from session-static agent/config state."""
+    try:
+        if (
+            str(os.environ.get("HERMES_SKILLS_INDEX", "")).strip().lower()
+            == "full"
+        ):
+            return frozenset()
+        if getattr(agent, "session_role", "") == "worker":
+            from hermes_cli.config import cfg_get, load_config
+
+            config = load_config()
+            workers_mode = str(
+                cfg_get(config, "skills", "index", "workers", default="full")
+            ).strip().lower()
+            if workers_mode == "focus":
+                from agent.coding_context import worker_compact_skill_categories
+
+                return worker_compact_skill_categories(config)
+        from agent.coding_context import coding_compact_skill_categories
+
+        return coding_compact_skill_categories(
+            platform=getattr(agent, "platform", None),
+            cwd=None,
+            config=None,
+        )
+    except Exception:
+        return frozenset()
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered parts.
 
@@ -197,6 +227,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
+            compact_categories=_resolve_skills_index_compact_categories(agent),
         )
     else:
         skills_prompt = ""
