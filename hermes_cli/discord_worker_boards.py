@@ -784,6 +784,8 @@ def _terminal_worker_reaction_state(worker: dict[str, Any]) -> str:
     phase = str(worker.get("phase") or "").strip().lower()
     if worker.get("cancelled") or status == "cancelled":
         return "errored"
+    if _pr_finalizer_failure_is_pending_checks(worker):
+        return "running"
     if _terminal_worker_has_non_green_finalization(worker):
         return "blocked"
     if status == "blocked" and phase != "complete":
@@ -2962,6 +2964,7 @@ def board_thread_state(board: str) -> str:
     is_terminal = terminal_state in {"done", "blocked", "errored"}
     has_worker_blocker = (
         not stale_blocked_meta
+        and not _pr_finalizer_failure_is_pending_checks(worker)
         and (
             bool(str(worker.get("blocked_reason") or "").strip())
             or worker.get("goal_status") == "blocked"
@@ -2980,6 +2983,8 @@ def board_thread_state(board: str) -> str:
             return "blocked"
         if terminal_state in {"blocked", "errored"}:
             return terminal_state
+        if terminal_state == "running":
+            return "running"
         if is_terminal and all(task.status == "done" for task in tasks):
             return terminal_state or "done"
         if any(task.status == "running" for task in tasks):
@@ -2988,6 +2993,8 @@ def board_thread_state(board: str) -> str:
 
     if is_terminal:
         return terminal_state or "done"
+    if terminal_state == "running":
+        return "running"
     if has_worker_blocker:
         return "blocked"
     return "active"
@@ -6372,6 +6379,17 @@ def _pr_finalizer_failure_is_failed_checks(worker: dict[str, Any]) -> bool:
     checks_status = str(worker.get("pr_checks_status") or "").strip().lower()
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip().lower()
     return checks_status == "failed" or "checks failed" in blocker
+
+
+def _pr_finalizer_failure_is_pending_checks(worker: dict[str, Any]) -> bool:
+    blocked_reason = str(worker.get("blocked_reason") or "").strip().lower()
+    if blocked_reason != "approved reviewer pr finalization failed":
+        return False
+    checks_status = str(worker.get("pr_checks_status") or "").strip().lower()
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip().lower()
+    if checks_status not in {"pending", "not checked"}:
+        return False
+    return blocker in {"checks pending", "checks not checked"}
 
 
 def _pr_finalizer_failure_is_pr_body_check_only(worker: dict[str, Any]) -> bool:
