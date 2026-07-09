@@ -354,13 +354,14 @@ def test_discord_worker_dispatch_records_corrupt_open_once_then_skips(
         calls["connect"] += 1
         raise sqlite3.DatabaseError("file is not a database")
 
-    def record_incident(candidate, db_path_arg, reason, *, backup_path=None, fingerprint=None):
+    def record_incident(candidate, db_path_arg, reason, *, backup_path=None, fingerprint=None, error_class=None):
         calls["record"] += 1
         incident = {
             "pause_reason": "kanban_db_corruption",
             "db_path": str(db_path_arg),
             "fingerprint": fingerprint,
             "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "error_class": error_class,
             "reason": reason,
         }
         incidents[candidate] = incident
@@ -381,6 +382,7 @@ def test_discord_worker_dispatch_records_corrupt_open_once_then_skips(
     assert first == [(board, None)]
     assert second == [(board, None)]
     assert calls == {"connect": 1, "record": 1, "dispatch": 0}
+    assert incidents[board]["error_class"] == "DatabaseError"
     messages = [record.getMessage() for record in caplog.records]
     assert sum("Discord worker board discord-corrupt-dispatch database corruption incident" in msg for msg in messages) == 1
     assert any("paused for unchanged DB corruption" in msg for msg in messages)

@@ -160,6 +160,7 @@ def test_corrupt_board_quarantine_state_skips_until_retry_window(kanban_home, mo
 def test_corrupt_board_incident_dedupes_same_fingerprint_and_reason(kanban_home, monkeypatch):
     board = "quarantine-dedupe"
     db_path = kb.kanban_db_path(board)
+    backup_path = db_path.with_suffix(".first.bak")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db_path.write_bytes(b"not sqlite")
     fingerprint = kb._db_content_fingerprint(db_path)
@@ -169,19 +170,24 @@ def test_corrupt_board_incident_dedupes_same_fingerprint_and_reason(kanban_home,
         board,
         db_path,
         "sqlite refused to open file: file is not a database",
+        backup_path=backup_path,
         fingerprint=fingerprint,
+        error_class="DatabaseError",
     )
     monkeypatch.setattr(kb.time, "time", lambda: 1010)
     repeat = kb.record_corrupt_board_incident(
         board,
         db_path,
         "sqlite refused to open file: file is not a database",
+        backup_path=backup_path,
         fingerprint=fingerprint,
+        error_class="DatabaseError",
     )
 
     assert first is not None
     assert repeat is not None
     assert first["dedupe_key"] == repeat["dedupe_key"]
+    assert first["error_class"] == "DatabaseError"
     assert first["should_log"] is True
     assert repeat["should_log"] is False
     assert repeat["changed"] is False
@@ -196,42 +202,96 @@ def test_corrupt_board_incident_dedupes_same_fingerprint_and_reason(kanban_home,
 def test_corrupt_board_incident_changed_details_or_fingerprint_log_fresh(kanban_home, monkeypatch):
     board = "quarantine-dedupe-change"
     db_path = kb.kanban_db_path(board)
+    backup_path = db_path.with_suffix(".first.bak")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db_path.write_bytes(b"not sqlite")
     fingerprint = kb._db_content_fingerprint(db_path)
 
     monkeypatch.setattr(kb.time, "time", lambda: 2000)
-    first = kb.record_corrupt_board_incident(board, db_path, "file is not a database", fingerprint=fingerprint)
+    first = kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "file is not a database",
+        backup_path=backup_path,
+        fingerprint=fingerprint,
+        error_class="DatabaseError",
+    )
     monkeypatch.setattr(kb.time, "time", lambda: 2010)
     changed_reason = kb.record_corrupt_board_incident(
         board,
         db_path,
         "database disk image is malformed",
+        backup_path=backup_path,
         fingerprint=fingerprint,
+        error_class="DatabaseError",
+    )
+    monkeypatch.setattr(kb.time, "time", lambda: 2020)
+    changed_error_class = kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "database disk image is malformed",
+        backup_path=backup_path,
+        fingerprint=fingerprint,
+        error_class="OperationalError",
+    )
+    changed_backup_path = db_path.with_suffix(".second.bak")
+    monkeypatch.setattr(kb.time, "time", lambda: 2030)
+    changed_backup = kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "database disk image is malformed",
+        backup_path=changed_backup_path,
+        fingerprint=fingerprint,
+        error_class="OperationalError",
     )
     db_path.write_bytes(b"different corrupt bytes")
     changed_fingerprint_value = kb._db_content_fingerprint(db_path)
-    monkeypatch.setattr(kb.time, "time", lambda: 2020)
+    monkeypatch.setattr(kb.time, "time", lambda: 2040)
     changed_fingerprint = kb.record_corrupt_board_incident(
         board,
         db_path,
         "database disk image is malformed",
+        backup_path=changed_backup_path,
         fingerprint=changed_fingerprint_value,
+        error_class="OperationalError",
     )
 
     assert first is not None
     assert changed_reason is not None
+    assert changed_error_class is not None
+    assert changed_backup is not None
     assert changed_fingerprint is not None
     assert first["should_log"] is True
     assert changed_reason["should_log"] is True
     assert changed_reason["changed"] is True
     assert changed_reason["duplicate_count"] == 0
     assert changed_reason["first_seen"] == 2000
+    assert kb.should_log_corrupt_board_incident(changed_reason) is True
+    assert changed_error_class["should_log"] is True
+    assert changed_error_class["changed"] is True
+    assert changed_error_class["duplicate_count"] == 0
+    assert changed_error_class["first_seen"] == 2000
+    assert changed_error_class["error_class"] == "OperationalError"
+    assert kb.should_log_corrupt_board_incident(changed_error_class) is True
+    assert changed_backup["should_log"] is True
+    assert changed_backup["changed"] is True
+    assert changed_backup["duplicate_count"] == 0
+    assert changed_backup["first_seen"] == 2000
+    assert changed_backup["quarantine_path"] == str(changed_backup_path)
+    assert kb.should_log_corrupt_board_incident(changed_backup) is True
     assert changed_fingerprint["should_log"] is True
     assert changed_fingerprint["changed"] is True
     assert changed_fingerprint["duplicate_count"] == 0
-    assert changed_fingerprint["first_seen"] == 2020
-    assert len({first["dedupe_key"], changed_reason["dedupe_key"], changed_fingerprint["dedupe_key"]}) == 3
+    assert changed_fingerprint["first_seen"] == 2040
+    assert len(
+        {
+            first["dedupe_key"],
+            changed_reason["dedupe_key"],
+            changed_error_class["dedupe_key"],
+            changed_backup["dedupe_key"],
+            changed_fingerprint["dedupe_key"],
+        }
+    ) == 5
 
 
 def test_connect_skips_unchanged_paused_corrupt_board_before_sqlite_open(kanban_home, monkeypatch):

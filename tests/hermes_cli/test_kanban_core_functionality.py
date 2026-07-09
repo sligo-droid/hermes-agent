@@ -3815,13 +3815,14 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     monkeypatch.setattr(_kb, "connect", _connect)
     monkeypatch.setattr(_kb, "is_board_paused_for_corruption", lambda slug=None: incidents.get(slug))
 
-    def _record_incident(board, db_path, reason, *, backup_path=None, fingerprint=None):
+    def _record_incident(board, db_path, reason, *, backup_path=None, fingerprint=None, error_class=None):
         calls["record"] += 1
         incident = {
             "pause_reason": "kanban_db_corruption",
             "db_path": str(db_path),
             "fingerprint": fingerprint,
             "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "error_class": error_class,
             "reason": reason,
         }
         incidents[board] = incident
@@ -3851,6 +3852,8 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert not any(record.exc_info for record in caplog.records)
     assert calls["connect"] == 1
     assert calls["record"] == 1
+    expected_error_class = "KanbanDbCorruptError" if corrupt_exc == "guard" else "DatabaseError"
+    assert incidents[_kb.DEFAULT_BOARD]["error_class"] == expected_error_class
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_content_change(
@@ -3900,13 +3903,14 @@ def test_gateway_dispatcher_retries_corrupt_board_after_content_change(
         calls["connect"] += 1
         raise sqlite3.DatabaseError("file is not a database")
 
-    def _record_incident(board, db_path, reason, *, backup_path=None, fingerprint=None):
+    def _record_incident(board, db_path, reason, *, backup_path=None, fingerprint=None, error_class=None):
         calls["record"] += 1
         incident = {
             "pause_reason": "kanban_db_corruption",
             "db_path": str(db_path),
             "fingerprint": fingerprint,
             "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "error_class": error_class,
             "reason": reason,
         }
         incidents[board] = incident
@@ -3945,6 +3949,7 @@ def test_gateway_dispatcher_retries_corrupt_board_after_content_change(
     assert calls["tick"] == 3
     assert calls["connect"] == 3
     assert calls["record"] == 2
+    assert incidents[_kb.DEFAULT_BOARD]["error_class"] == "DatabaseError"
 
 
 def test_repair_corrupt_board_salvages_readable_task_tables(monkeypatch, tmp_path):

@@ -5901,6 +5901,7 @@ class GatewayRunner:
                             str(getattr(exc, "reason", None) or exc),
                             backup_path=getattr(exc, "backup_path", None),
                             fingerprint=fingerprint,
+                            error_class=exc.__class__.__name__,
                         )
 
                     def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
@@ -6708,6 +6709,7 @@ class GatewayRunner:
                     str(reason),
                     backup_path=backup_path,
                     fingerprint=fingerprint[1],
+                    error_class=exc.__class__.__name__,
                 )
             return incident
 

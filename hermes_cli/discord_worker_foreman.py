@@ -198,6 +198,7 @@ def _record_corrupt_board(board: str, exc: Exception) -> Optional[dict[str, Any]
         str(getattr(exc, "reason", None) or exc),
         backup_path=getattr(exc, "backup_path", None),
         fingerprint=fingerprint,
+        error_class=exc.__class__.__name__,
     )
 
 
