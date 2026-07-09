@@ -1088,6 +1088,49 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_board_thread_reaction_state_keeps_approved_pr_pending_checks_running(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="1524683222913384569",
+        chat_id="1504252294495998043",
+        guild_id="1502787243230756904",
+        goal="Dedupe Prompt Bot smoke intake and alert stale user-only zero-API sessions",
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            claimed = kanban_db.claim_task(conn, task.id)
+            assert claimed is not None
+            kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "kind": "discord_worker_board",
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "blocked_reason": "approved reviewer PR finalization failed",
+            "pr_url": "https://github.com/sligo-droid/hermes-agent/pull/658",
+            "pr_number": "658",
+            "pr_state": "OPEN",
+            "pr_merge_state": "UNSTABLE",
+            "pr_mergeable": "MERGEABLE",
+            "pr_checks_status": "pending",
+            "pr_checks_failed": [],
+            "pr_blocker": "checks pending",
+            "pr_error": "checks pending",
+        },
+    )
+
+    assert dwb.board_thread_state(board.slug) == "running"
+    assert dwb.board_thread_reaction_state(board.slug) == "running"
+
+
 def test_source_task_reaction_state_maps_default_task_lifecycle(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
