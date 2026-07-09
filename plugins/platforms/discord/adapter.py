@@ -4640,18 +4640,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         await self._mark_feature_summary_running(event)
         messages = await self._processing_reaction_messages(event)
-        feature_summary = getattr(event, "feature_summary", None)
-        has_feature_summary = feature_summary is not None
-        has_kanban_board = self._feature_summary_uses_kanban_reactions(feature_summary)
-        is_fable_event = self._is_fable_event(event)
         for message in messages:
             if not hasattr(message, "add_reaction"):
-                continue
-            if has_kanban_board and not is_fable_event:
-                await self._set_message_reaction_state(message, "👀")
-                continue
-            if has_feature_summary:
-                await self._set_message_reaction_state(message, "⏳")
                 continue
             await self._set_message_reaction_state(message, "⏳")
 
