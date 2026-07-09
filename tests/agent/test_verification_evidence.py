@@ -212,6 +212,35 @@ def test_final_response_downgrade_skips_later_success():
     assert downgraded == text
 
 
+def test_pr_merge_downgrade_line_does_not_create_pr_success_claim():
+    evidence = [
+        {
+            "surface": "pr",
+            "check_name": (
+                "git -C /home/droid/workspaces/PID-airflow-runtime status --short --branch && "
+                "git -C /home/droid/workspaces/PID-airflow-runtime pull --ff-only origin main && git"
+            ),
+            "status": "failure",
+            "order": 1,
+        }
+    ]
+    final_text = (
+        "Task list is fully complete: 5/5.\n"
+        "Direct worker enabled and healthy/current.\n"
+        "Production API direct path is live.\n"
+        "Request generated via direct_worker.\n"
+        "Focused route test passed 7/7.\n\n"
+        "Verification downgrade: PR/merge verification is not verified: latest check "
+        "`git -C /home/droid/workspaces/PID-airflow-runtime status --short --branch && "
+        "git -C /home/droid/workspaces/PID-airflow-runtime pull --ff-only origin main && git` failure."
+    )
+
+    constraints = claim_constraints_for_text(final_text, evidence)
+
+    assert constraints["allowed"] is True
+    assert constraints["blocked_surfaces"] == []
+
+
 def test_final_response_downgrade_keeps_independent_deployed_claim_separate():
     text = "Deployment completed and CI passed. Production browser modal verified visible."
     evidence = [

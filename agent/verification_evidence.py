@@ -774,9 +774,13 @@ def verification_status(
 
 
 def _surface_claimed(text: str, surface: str) -> bool:
-    relevant_text = text
+    relevant_text = "\n".join(
+        line for line in str(text or "").splitlines() if "verification downgrade" not in line.lower()
+    )
+    if not relevant_text.strip():
+        return False
     if surface in {"browser", "production", "production_browser", "deployment"}:
-        sentences = [part for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()]
+        sentences = [part for part in _SENTENCE_SPLIT_RE.split(relevant_text) if part.strip()]
         relevant = [part for part in sentences if _surface_terms_present(part, surface)]
         if relevant:
             relevant_text = " ".join(relevant)

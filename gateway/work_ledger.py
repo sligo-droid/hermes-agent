@@ -222,9 +222,16 @@ def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def _without_verification_downgrade_lines(text: str) -> str:
+    return "\n".join(
+        line for line in str(text or "").splitlines() if "verification downgrade" not in line.lower()
+    )
+
+
 def _incomplete_final_markers(text: str) -> list[str]:
     """Return incomplete-delivery markers while filtering known summary noise."""
 
+    text = _without_verification_downgrade_lines(text)
     markers: list[str] = []
     for reason, pattern in _INCOMPLETE_FINAL_PATTERNS:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):

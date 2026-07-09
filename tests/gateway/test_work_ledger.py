@@ -679,6 +679,50 @@ def test_rewritten_downgraded_final_response_allows_operator_summary_with_blocke
     assert stored["summary_status"] == "Complete"
 
 
+def test_successful_action_request_not_blocked_by_pr_merge_downgrade_line(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Enable the production direct worker and verify the route")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "Task list is fully complete: 5/5.\n"
+            "Direct worker enabled and healthy/current.\n"
+            "Production API direct path is live.\n"
+            "Request generated via direct_worker.\n"
+            "Focused route test passed 7/7.\n\n"
+            "Verification downgrade: PR/merge verification is not verified: latest check "
+            "`git -C /home/droid/workspaces/PID-airflow-runtime status --short --branch && "
+            "git -C /home/droid/workspaces/PID-airflow-runtime pull --ff-only origin main && git` failure."
+        ),
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "pr",
+                    "check_name": (
+                        "git -C /home/droid/workspaces/PID-airflow-runtime status --short --branch && "
+                        "git -C /home/droid/workspaces/PID-airflow-runtime pull --ff-only origin main && git"
+                    ),
+                    "status": "failure",
+                    "order": 1,
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["summary_status"] == "Complete"
+
+
 def test_later_successful_production_browser_check_allows_verified_claim(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Ship the production modal")
