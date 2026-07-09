@@ -473,6 +473,31 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_processing_start_uses_running_reaction_for_kanban_backed_action_request(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("1524608039204950268", raw_message)
+    event.source.chat_type = "thread"
+    event.source.chat_id = "1524513305559961600"
+    event.source.thread_id = "1524513305559961600"
+    event.feature_summary = {
+        "thread_id": "1524513305559961600",
+        "message_id": "1524608039204950268",
+        "kanban_board": {"slug": "discord-rollout-action"},
+    }
+
+    await adapter.on_processing_start(event)
+
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
+    raw_message.add_reaction.assert_awaited_once_with("⏳")
+
+
+@pytest.mark.asyncio
 async def test_fable_feature_summary_reactions_ignore_kanban_state(adapter, monkeypatch):
     raw_message = SimpleNamespace(
         add_reaction=AsyncMock(),
