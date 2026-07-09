@@ -1765,6 +1765,11 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
     return cleaned.rstrip("/")
 
 
+def _nous_inference_env_override() -> Optional[str]:
+    """Return the runtime-only Nous inference base URL override, if set."""
+    return _optional_base_url(os.getenv("NOUS_INFERENCE_BASE_URL"))
+
+
 def _decode_jwt_claims(token: Any) -> Dict[str, Any]:
     if not isinstance(token, str) or token.count(".") != 2:
         return {}
