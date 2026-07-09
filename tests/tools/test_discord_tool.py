@@ -51,10 +51,12 @@ def _mock_urlopen(response_data, status=200):
 class TestCheckRequirements:
     def test_no_token(self, monkeypatch):
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("DISCORD_TOKEN", raising=False)
         assert check_discord_tool_requirements() is False
 
     def test_empty_token(self, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "")
+        monkeypatch.delenv("DISCORD_TOKEN", raising=False)
         assert check_discord_tool_requirements() is False
 
     def test_valid_token(self, monkeypatch):
@@ -65,17 +67,31 @@ class TestCheckRequirements:
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "  my-token  ")
         assert _get_bot_token() == "my-token"
 
+    def test_get_bot_token_from_discord_token_env_fallback(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.setenv("DISCORD_TOKEN", "  fallback-token  ")
+        assert _get_bot_token() == "fallback-token"
+
     def test_get_bot_token_missing(self, monkeypatch):
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("DISCORD_TOKEN", raising=False)
         assert _get_bot_token() is None
 
     def test_get_bot_token_from_hermes_env_file(self, monkeypatch):
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("DISCORD_TOKEN", raising=False)
         monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "env-file-token" if key == "DISCORD_BOT_TOKEN" else None)
+        assert _get_bot_token() == "env-file-token"
+
+    def test_get_bot_token_from_hermes_env_file_fallback_name(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("DISCORD_TOKEN", raising=False)
+        monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "env-file-token" if key == "DISCORD_TOKEN" else None)
         assert _get_bot_token() == "env-file-token"
 
     def test_get_bot_token_from_gateway_config(self, monkeypatch):
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("DISCORD_TOKEN", raising=False)
         from gateway.config import Platform
 
         config = SimpleNamespace(
@@ -606,6 +622,96 @@ class TestPinUnpinDelete:
 
 
 # ---------------------------------------------------------------------------
+# Actions: scoped write helpers
+# ---------------------------------------------------------------------------
+
+class TestScopedWriteHelpers:
+    @patch("tools.discord_tool._discord_request")
+    def test_add_reaction_endpoint_encodes_emoji(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = None
+        result = json.loads(discord_core(
+            action="add_reaction",
+            channel_id="11",
+            message_id="500",
+            emoji="👍",
+        ))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "PUT",
+            "/channels/11/messages/500/reactions/%F0%9F%91%8D/@me",
+            "test-token",
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_remove_reaction_endpoint_encodes_custom_emoji(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = None
+        result = json.loads(discord_core(
+            action="remove_reaction",
+            channel_id="11",
+            message_id="500",
+            emoji="party:12345",
+        ))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "DELETE",
+            "/channels/11/messages/500/reactions/party%3A12345/@me",
+            "test-token",
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_disables_mentions_and_supports_reply(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "900",
+            "channel_id": "11",
+            "content": "hello",
+            "author": {"id": "bot", "username": "Hermes", "bot": True},
+        }
+        result = json.loads(discord_core(
+            action="send_message",
+            channel_id="11",
+            content="hello",
+            reply_to_message_id="500",
+        ))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "POST",
+            "/channels/11/messages",
+            "test-token",
+            body={
+                "content": "hello",
+                "allowed_mentions": {"parse": []},
+                "message_reference": {"message_id": "500", "fail_if_not_exists": True},
+            },
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_edit_message_disables_mentions(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "900",
+            "channel_id": "11",
+            "content": "updated",
+            "author": {"id": "bot", "username": "Hermes", "bot": True},
+        }
+        result = json.loads(discord_core(
+            action="edit_message",
+            channel_id="11",
+            message_id="900",
+            content="updated",
+        ))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "PATCH",
+            "/channels/11/messages/900",
+            "test-token",
+            body={"content": "updated", "allowed_mentions": {"parse": []}},
+        )
+
+
+# ---------------------------------------------------------------------------
 # Action: create_thread
 # ---------------------------------------------------------------------------
 
@@ -717,7 +823,7 @@ class TestRegistration:
         assert entry.check_fn is not None
         assert entry.requires_env == ["DISCORD_BOT_TOKEN"]
 
-    def test_first_class_read_tools_registered(self):
+    def test_first_class_discord_tools_registered(self):
         from tools.registry import registry
         expected = {
             "discord_list_guilds",
@@ -728,6 +834,10 @@ class TestRegistration:
             "discord_get_thread",
             "discord_search_messages",
             "discord_get_reactions",
+            "discord_add_reaction",
+            "discord_remove_reaction",
+            "discord_send_message",
+            "discord_edit_message",
         }
 
         for name in expected:
@@ -743,14 +853,17 @@ class TestRegistration:
         from tools.registry import registry
         entry = registry._tools["discord"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        assert actions == {"fetch_messages", "search_members", "create_thread"}
+        assert actions == {
+            "fetch_messages", "search_members", "create_thread",
+            "add_reaction", "remove_reaction", "send_message", "edit_message",
+        }
 
     def test_admin_schema_actions(self):
         """Admin static schema should list only admin actions."""
         from tools.registry import registry
         entry = registry._tools["discord_admin"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        expected_admin = set(_ACTIONS.keys()) - {"fetch_messages", "search_members", "create_thread"}
+        expected_admin = set(_ACTIONS.keys()) - set(_CORE_ACTIONS.keys())
         assert actions == expected_admin
 
     def test_all_actions_covered(self):
@@ -774,6 +887,8 @@ class TestRegistration:
         assert "fetch_messages(channel_id)" in desc
         assert "search_members(guild_id, query)" in desc
         assert "create_thread(channel_id, name)" in desc
+        assert "add_reaction(channel_id, message_id, emoji)" in desc
+        assert "send_message(channel_id, content)" in desc
         # Admin actions should NOT be in core description
         assert "list_guilds()" not in desc
         assert "add_role(" not in desc
@@ -809,19 +924,26 @@ class TestToolsetInclusion:
         assert "discord_admin" in TOOLSETS["hermes-discord"]["tools"]
         assert "discord_list_recent" in TOOLSETS["hermes-discord"]["tools"]
         assert "discord_search_messages" in TOOLSETS["hermes-discord"]["tools"]
+        assert "discord_add_reaction" in TOOLSETS["hermes-discord"]["tools"]
+        assert "discord_send_message" in TOOLSETS["hermes-discord"]["tools"]
 
-    def test_first_class_read_tools_in_discord_toolset(self):
+    def test_first_class_discord_tools_in_discord_toolset(self):
         from toolsets import TOOLSETS
         tools = set(TOOLSETS["discord"]["tools"])
         assert "discord_list_guilds" in tools
         assert "discord_get_message" in tools
         assert "discord_get_reactions" in tools
+        assert "discord_add_reaction" in tools
+        assert "discord_remove_reaction" in tools
+        assert "discord_send_message" in tools
+        assert "discord_edit_message" in tools
 
     def test_discord_tools_not_in_core_tools(self):
         from toolsets import _HERMES_CORE_TOOLS
         assert "discord" not in _HERMES_CORE_TOOLS
         assert "discord_admin" not in _HERMES_CORE_TOOLS
         assert "discord_list_recent" not in _HERMES_CORE_TOOLS
+        assert "discord_send_message" not in _HERMES_CORE_TOOLS
 
     def test_discord_tools_not_in_other_toolsets(self):
         from toolsets import TOOLSETS
@@ -1318,6 +1440,8 @@ class TestModelToolsIntegration:
         assert "discord_list_recent" in names
         assert "discord_search_messages" in names
         assert "discord_get_reactions" in names
+        assert "discord_add_reaction" in names
+        assert "discord_send_message" in names
 
     @patch("tools.discord_tool._discord_request")
     def test_first_class_discord_schemas_follow_action_allowlist(
@@ -1341,6 +1465,7 @@ class TestModelToolsIntegration:
         assert "discord_list_guilds" in names
         assert "discord_list_channels" not in names
         assert "discord_list_recent" not in names
+        assert "discord_send_message" not in names
 
     @patch("tools.discord_tool._discord_request")
     def test_discord_admin_schema_rebuilt_by_get_tool_definitions(
