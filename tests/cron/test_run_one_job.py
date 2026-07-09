@@ -182,6 +182,48 @@ def test_run_one_job_malformed_self_improvement_ingestion_records_health(monkeyp
     }
 
 
+def test_run_one_job_auth_blocked_records_health_without_ingesting_output(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        output="failure output",
+        final="",
+        error="RuntimeError: OpenAICodex upstream HTTP 401 token_invalidated",
+    )
+    seen_health_details = []
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
+        calls.append(("mark", jid, ok))
+        seen_health_details.append(health_details)
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setattr(
+        s,
+        "_ingest_self_improvement_proposal_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not ingest failed output")),
+    )
+    monkeypatch.setattr(
+        s,
+        "_record_self_improvement_auth_blocked_run",
+        lambda job, output_file, failure: {
+            "status": "auth_blocked",
+            "card_count": 0,
+            "parse_error": failure.summary,
+            "source_key": "cron:j-auth:j-auth.txt",
+            "run_id": 19,
+        },
+    )
+
+    ok = s.run_one_job({"id": "j-auth", "name": "t", "self_improvement_proposal": {"project": "p", "prong": "q"}})
+
+    assert ok is False
+    detail = seen_health_details[0]["self_improvement_proposal_ingestion"]
+    assert detail["status"] == "auth_blocked"
+    assert detail["card_count"] == 0
+    assert detail["provider_class"] == "OpenAICodex"
+    assert detail["failure_code"] == "token_invalidated"
+
+
 def test_run_one_job_non_self_improvement_has_no_ingestion_health(monkeypatch):
     calls = _patch_pipeline(monkeypatch)
     seen_health_details = []
@@ -195,4 +237,31 @@ def test_run_one_job_non_self_improvement_has_no_ingestion_health(monkeypatch):
     ok = s.run_one_job({"id": "j9", "name": "t"})
 
     assert ok is True
+    assert seen_health_details == [None]
+
+
+def test_run_one_job_non_self_improvement_auth_failure_has_no_ingestion_health(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        output="failure output",
+        final="",
+        error="RuntimeError: OpenAICodex upstream HTTP 401 token_invalidated",
+    )
+    seen_health_details = []
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
+        calls.append(("mark", jid, ok))
+        seen_health_details.append(health_details)
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setattr(
+        s,
+        "_record_self_improvement_auth_blocked_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not record proposal status")),
+    )
+
+    ok = s.run_one_job({"id": "j-non-proposal", "name": "t"})
+
+    assert ok is False
     assert seen_health_details == [None]

@@ -11,7 +11,7 @@ from typing import Any, Iterable
 PROVIDER_ROUTE = "openai-codex"
 INCIDENT_TYPE = "credential_invalidation"
 
-_AUTH_RE = re.compile(r"(?i)(token_invalidated|authenticationerror|auth(?:entication)?\s+failed|\b401\b)")
+_AUTH_RE = re.compile(r"(?i)(token_revoked|token_invalidated|authenticationerror|auth(?:entication)?\s+failed|\b401\b)")
 _ROUTE_RE = re.compile(r"(?i)(openai[-_/ ]?codex|codex|hermes_cli\.proxy\.adapters\.openai_codex)")
 _SECRET_PATTERNS = [
     re.compile(r"(?i)\b(authorization)\b\s*[:=]\s*bearer\s+[^\s,;}\]]+"),

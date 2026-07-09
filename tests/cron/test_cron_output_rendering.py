@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from cron.jobs import save_job_output, update_job_output
 from cron.scheduler import (
+    _classify_cron_auth_blocked_failure,
     _ingest_self_improvement_proposal_output,
     _render_job_output,
     _render_job_status_stub,
@@ -125,6 +126,47 @@ def test_failure_output_artifact_adds_codex_auth_incident_summary():
     assert "access_token=<redacted>" in output
     assert "secret-token" not in output
     assert "RuntimeError: openai-codex upstream 401 token_invalidated access_token=<redacted>" in output
+
+
+def test_auth_blocked_classifier_is_conservative_and_safe():
+    revoked = _classify_cron_auth_blocked_failure(
+        "RuntimeError: OpenAICodex upstream HTTP 401 token_revoked access_token=secret-token"
+    )
+    invalidated = _classify_cron_auth_blocked_failure(
+        "AuthenticationError: hermes_cli.proxy.adapters.openai_codex returned 401 token_invalidated"
+    )
+
+    assert revoked is not None
+    assert revoked.status == "auth_blocked"
+    assert revoked.provider_class == "OpenAICodex"
+    assert revoked.failure_code == "token_revoked"
+    assert "secret-token" not in revoked.summary
+    assert invalidated is not None
+    assert invalidated.failure_code == "token_invalidated"
+    assert _classify_cron_auth_blocked_failure("TimeoutError: request timed out talking to openai-codex") is None
+    assert _classify_cron_auth_blocked_failure("RuntimeError: openai-codex quota exceeded") is None
+
+
+def test_auth_blocked_failure_output_includes_rerun_guidance_and_redacts_secrets():
+    output = _render_job_output(
+        {
+            "id": "proposal-auth-job",
+            "name": "Proposal auth job",
+            "schedule_display": "daily",
+            "self_improvement_proposal": {"project": "hermes", "prong": "daily-retrospective"},
+        },
+        "prompt context",
+        status="failed",
+        error_text="RuntimeError: OpenAICodex upstream HTTP 401 token_revoked access_token=secret-token",
+        run_time="2026-07-07 06:00:21",
+    )
+
+    assert "did not produce proposals because credentials were invalid" in output
+    assert "OpenAICodex" in output
+    assert "token_revoked" in output
+    assert "Refresh or reauthenticate credentials, then rerun the cron job." in output
+    assert "access_token=<redacted>" in output
+    assert "secret-token" not in output
 
 
 def test_saved_temp_output_artifact_keeps_final_first_rendering(tmp_path, monkeypatch):

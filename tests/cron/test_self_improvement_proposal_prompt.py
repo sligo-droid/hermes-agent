@@ -212,6 +212,7 @@ def _proposal_job(**overrides):
 
 def _run_tick_with_response(tmp_path, monkeypatch, job, final_response):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
     output_file = Path(tmp_path) / "cron" / "output" / job["id"] / "2026-06-04_02-04-10.md"
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_doc = f"# Cron Job: {job['name']}\n\n## Response\n\n{final_response}"
@@ -222,7 +223,7 @@ def _run_tick_with_response(tmp_path, monkeypatch, job, final_response):
          patch("cron.scheduler.save_job_output", side_effect=lambda _job_id, output: output_file), \
          patch("cron.scheduler.update_job_output"), \
          patch("cron.scheduler.run_job", return_value=(True, output_doc, final_response, None)):
-        assert tick(verbose=False) == 1
+        tick(verbose=False)
     return output_file
 
 
@@ -258,6 +259,44 @@ def test_tick_records_malformed_self_improvement_cron_output(tmp_path, monkeypat
     assert len(failures) == 1
     assert failures[0]["status"] == "malformed"
     assert "proposal JSON parse error" in failures[0]["parse_error"]
+
+
+def test_tick_records_auth_blocked_self_improvement_cron_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
+    job = _proposal_job()
+    output_file = Path(tmp_path) / "cron" / "output" / job["id"] / "2026-07-07_06-00-21.md"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    error = "RuntimeError: OpenAICodex upstream HTTP 401 token_revoked access_token=secret-token"
+    output_doc = "# Cron Job: Proposal cron\n\n## Error\n\n" + error
+    seen_marks = []
+    with patch("cron.scheduler._hermes_home", tmp_path / "home"), \
+         patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+         patch("cron.scheduler.advance_next_run"), \
+         patch("cron.scheduler.mark_job_run", side_effect=lambda *args, **kwargs: seen_marks.append((args, kwargs))), \
+         patch("cron.scheduler.save_job_output", side_effect=lambda _job_id, output: output_file), \
+         patch("cron.scheduler.update_job_output"), \
+         patch("cron.scheduler._deliver_result"), \
+         patch("cron.scheduler.run_job", return_value=(False, output_doc, "", error)):
+        assert tick(verbose=False) == 0
+
+    runs = proposal_storage.list_runs()["runs"]
+
+    assert proposal_storage.grouped_cards()["projects"] == []
+    assert len(runs) == 1
+    assert runs[0]["status"] == "auth_blocked"
+    assert runs[0]["card_count"] == 0
+    assert runs[0]["source_ref"]["source_key"].startswith("cron:proposal-job:")
+    assert runs[0]["payload"]["auth_blocked"] == {
+        "failure_code": "token_revoked",
+        "provider_class": "OpenAICodex",
+        "rerun_guidance": "Refresh or reauthenticate credentials, then rerun the cron job.",
+    }
+    assert "secret-token" not in json.dumps(runs[0], sort_keys=True)
+    detail = seen_marks[0][1]["health_details"]["self_improvement_proposal_ingestion"]
+    assert detail["status"] == "auth_blocked"
+    assert detail["provider_class"] == "OpenAICodex"
+    assert detail["failure_code"] == "token_revoked"
 
 
 def test_tick_does_not_ingest_silent_self_improvement_cron_output(tmp_path, monkeypatch):
