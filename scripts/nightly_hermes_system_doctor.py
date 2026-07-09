@@ -72,7 +72,7 @@ def coding_worker_backend() -> str:
 
 def clean(text: str, limit: int = 4000) -> str:
     text = ANSI_RE.sub("", text or "")
-    text = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+", r"\1=<redacted>", text)
+    text = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;}\]\)\"']+", r"\1=<redacted>", text)
     if len(text) > limit:
         return text[:limit] + "…<truncated>"
     return text
@@ -403,6 +403,79 @@ def extract_compression_routes(stdout: str) -> list[dict[str, Any]]:
     return route_results
 
 
+def sanitize_compression_route_item(item: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in item.items():
+        if isinstance(value, str):
+            sanitized[key] = clean(value, 1200)
+        elif isinstance(value, dict):
+            sanitized[key] = sanitize_compression_route_item(value)
+        elif isinstance(value, list):
+            sanitized[key] = [
+                sanitize_compression_route_item(v) if isinstance(v, dict) else clean(v, 1200) if isinstance(v, str) else v
+                for v in value
+            ]
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
+def compression_route_failure_class(item: dict[str, Any]) -> str:
+    credential_status = item.get("credential_status")
+    if credential_status == "missing":
+        return "missing_credential"
+    if credential_status == "exhausted":
+        return "credential_rate_limited_or_quarantined"
+    if credential_status == "dead":
+        return "credential_terminal_auth_failure"
+    if credential_status in {"unavailable", "unknown_provider"}:
+        return "credential_status_unavailable"
+    return "route_failed"
+
+
+def compression_route_next_action(item: dict[str, Any]) -> str:
+    failure_class = item.get("failure_class") or compression_route_failure_class(item)
+    if failure_class == "missing_credential":
+        return f"Add or configure credentials for {item.get('provider') or 'the provider'}."
+    if failure_class == "credential_rate_limited_or_quarantined":
+        reset_at = item.get("credential_last_error_reset_at")
+        if reset_at:
+            return f"Wait for credential cooldown to expire at {reset_at}, then rerun the doctor."
+        seconds = item.get("credential_cooldown_seconds_remaining")
+        if seconds is not None:
+            return f"Wait about {seconds} seconds for credential cooldown to expire, then rerun the doctor."
+        return "Wait for credential cooldown/quarantine to expire, then rerun the doctor."
+    if failure_class == "credential_terminal_auth_failure":
+        return f"Re-authenticate or refresh credentials for {item.get('provider') or 'the provider'}."
+    return "Inspect sanitized route error; if this route should remain primary, repair it before relying on fallback."
+
+
+def annotate_compression_route_results(route_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fallback_results = [item for item in route_results if str(item.get("label") or "").startswith("fallback_chain[")]
+    fallback_success = any(item.get("exit") == 0 for item in fallback_results)
+    fallback_failed = bool(fallback_results) and not fallback_success
+    fallback_status = "healthy" if fallback_success else "failed" if fallback_failed else "not_configured"
+    annotated: list[dict[str, Any]] = []
+    for item in route_results:
+        annotated_item = dict(item)
+        annotated_item.setdefault("fallback_status", fallback_status)
+        annotated_item.setdefault("fallback_chain_healthy", fallback_success)
+        if annotated_item.get("exit") == 0:
+            annotated_item.setdefault("failure_class", "healthy")
+            annotated_item.setdefault("impact", "primary route healthy" if annotated_item.get("label") == "primary" else "fallback route healthy")
+            annotated.append(annotated_item)
+            continue
+        failure_class = compression_route_failure_class(annotated_item)
+        annotated_item["failure_class"] = failure_class
+        if fallback_success:
+            annotated_item["impact"] = "configured primary route degraded; fallback chain is healthy"
+        else:
+            annotated_item["impact"] = "compression route unavailable; fallback chain is not healthy"
+        annotated_item["next_action"] = compression_route_next_action(annotated_item)
+        annotated.append(annotated_item)
+    return annotated
+
+
 def record_compression_route_results(
     routes: dict[str, Any],
     issues: list[dict[str, str]],
@@ -411,7 +484,9 @@ def record_compression_route_results(
     output = str(routes.get("output") or "")
     facts["compression_routes_exit"] = routes.get("exit")
     facts["compression_routes_output"] = output
-    route_results = extract_compression_routes(output)
+    route_results = annotate_compression_route_results([
+        sanitize_compression_route_item(item) for item in extract_compression_routes(output)
+    ])
     facts["compression_route_results"] = route_results
     if not route_results:
         add_issue(
@@ -583,6 +658,11 @@ import sys
 from agent.auxiliary_client import call_llm
 
 try:
+    from agent.credential_pool import describe_provider_credential_availability
+except Exception:  # noqa: BLE001 - keep route smoke usable if helper import fails
+    describe_provider_credential_availability = None
+
+try:
     from hermes_cli.config import load_config_readonly
 except ImportError:
     from hermes_cli.config import load_config as load_config_readonly
@@ -594,6 +674,21 @@ def scrub(value):
         return None
     text = SECRET_RE.sub(r"\1=<redacted>", str(value))
     return text[-1200:]
+
+def credential_diagnostics(provider):
+    if describe_provider_credential_availability is None:
+        return {"credential_status": "unavailable"}
+    diag = describe_provider_credential_availability(provider)
+    first_unavailable = (diag.get("unavailable_entries") or [{}])[0]
+    result = {
+        "credential_status": diag.get("credential_status"),
+        "credential_has_credentials": diag.get("has_credentials"),
+        "credential_has_available": diag.get("has_available"),
+    }
+    for key in ("last_error_code", "last_error_reason", "last_error_message", "last_error_reset_at", "cooldown_seconds_remaining"):
+        if first_unavailable.get(key) is not None:
+            result[f"credential_{key}"] = first_unavailable.get(key)
+    return result
 
 def route_from(label, item, default_timeout=None):
     if not isinstance(item, dict):
@@ -633,6 +728,7 @@ for index, route in enumerate(routes):
         "exit": 1,
         "output": "",
     }
+    result.update(credential_diagnostics(route.get("provider")))
     try:
         resp = call_llm(
             provider=route.get("provider"),
