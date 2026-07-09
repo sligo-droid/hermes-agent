@@ -13,7 +13,7 @@ from argparse import Namespace
 import pytest
 
 from cron.lifecycle_guard import contains_gateway_lifecycle_command
-from hermes_cli.cron import cron_command
+from hermes_cli.cron import _contains_gateway_lifecycle_command, cron_command
 
 
 # ---------------------------------------------------------------------------
@@ -22,6 +22,9 @@ from hermes_cli.cron import cron_command
 
 class TestGatewayLifecyclePattern:
     """Verify the regex catches gateway lifecycle commands."""
+
+    def test_legacy_cli_import_uses_canonical_guard(self):
+        assert _contains_gateway_lifecycle_command is contains_gateway_lifecycle_command
 
     @pytest.mark.parametrize("text", [
         "hermes gateway restart",

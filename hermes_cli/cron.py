@@ -14,6 +14,11 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli.colors import Colors, color
+from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+# Compatibility for older callers that imported the pre-canonical private
+# helper from this CLI module. The source of truth lives in cron.lifecycle_guard.
+_contains_gateway_lifecycle_command = contains_gateway_lifecycle_command
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
