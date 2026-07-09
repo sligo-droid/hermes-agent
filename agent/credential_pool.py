@@ -347,6 +347,104 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     return None
 
 
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|authorization)"
+    r"\s*[:=]\s*[^\s,;}]+"
+)
+
+
+def _sanitize_diagnostic_text(value: Any, limit: int = 240) -> Optional[str]:
+    if value is None:
+        return None
+    text = _DIAGNOSTIC_SECRET_RE.sub(r"\1=<redacted>", str(value))
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._~+/-]+", "Bearer <redacted>", text, flags=re.IGNORECASE)
+    text = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-<redacted>", text)
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) > limit:
+        return text[:limit] + "...<truncated>"
+    return text
+
+
+def describe_provider_credential_availability(provider: str) -> Dict[str, Any]:
+    """Return non-secret provider credential-pool availability diagnostics.
+
+    This is intentionally read-only from the pool's in-memory entries: it does
+    not select, refresh, or clear cooldown state. The result is safe for doctor
+    state files and issue details.
+    """
+    normalized_provider = (provider or "").strip().lower()
+    result: Dict[str, Any] = {
+        "provider": normalized_provider,
+        "has_credentials": False,
+        "has_available": False,
+        "credential_status": "missing",
+        "credential_count": 0,
+    }
+    if not normalized_provider:
+        result["credential_status"] = "unknown_provider"
+        return result
+    try:
+        pool = load_pool(normalized_provider)
+        entries = pool.entries()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not crash smoke
+        result.update(
+            {
+                "credential_status": "unavailable",
+                "error": _sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}"),
+            }
+        )
+        return result
+
+    result["credential_count"] = len(entries)
+    result["has_credentials"] = bool(entries)
+    if not entries:
+        return result
+
+    now = time.time()
+    status_counts: Dict[str, int] = {}
+    unavailable_entries: List[Dict[str, Any]] = []
+    has_available = False
+    for entry in entries:
+        status = entry.last_status or STATUS_OK
+        status_counts[status] = status_counts.get(status, 0) + 1
+        unavailable: Optional[Dict[str, Any]] = None
+        if status == STATUS_DEAD:
+            unavailable = {"status": STATUS_DEAD}
+        elif status == STATUS_EXHAUSTED:
+            reset_at = _exhausted_until(entry)
+            if reset_at is not None and now < reset_at:
+                unavailable = {
+                    "status": STATUS_EXHAUSTED,
+                    "cooldown_seconds_remaining": max(0, int(reset_at - now)),
+                    "last_error_reset_at": datetime.fromtimestamp(reset_at, timezone.utc).isoformat(),
+                }
+        if unavailable is None:
+            has_available = True
+            continue
+        unavailable["auth_type"] = entry.auth_type
+        unavailable["source"] = entry.source
+        unavailable["last_error_code"] = entry.last_error_code
+        unavailable["last_error_reason"] = _sanitize_diagnostic_text(entry.last_error_reason)
+        unavailable["last_error_message"] = _sanitize_diagnostic_text(entry.last_error_message)
+        unavailable_entries.append({k: v for k, v in unavailable.items() if v is not None})
+
+    result["has_available"] = has_available
+    result["status_counts"] = status_counts
+    if has_available:
+        result["credential_status"] = "available"
+    elif unavailable_entries and all(item.get("status") == STATUS_DEAD for item in unavailable_entries):
+        result["credential_status"] = "dead"
+    elif unavailable_entries and any(item.get("status") == STATUS_EXHAUSTED for item in unavailable_entries):
+        result["credential_status"] = "exhausted"
+    else:
+        result["credential_status"] = "unavailable"
+    if unavailable_entries:
+        result["unavailable_entries"] = unavailable_entries[:3]
+    return result
+
+
 def _normalize_custom_pool_name(name: str) -> str:
     """Normalize a custom provider name for use as a pool key suffix."""
     return name.strip().lower().replace(" ", "-")

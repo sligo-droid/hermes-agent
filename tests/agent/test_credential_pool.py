@@ -102,6 +102,69 @@ def test_select_clears_expired_exhaustion(tmp_path, monkeypatch):
     assert entry.last_status == "ok"
 
 
+def test_describe_provider_credential_availability_reports_exhausted_without_secrets(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    reset_at = time.time() + 600
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "secret-access-token",
+                        "refresh_token": "secret-refresh-token",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reason": "rate_limit",
+                        "last_error_message": "token=secret-token resets in 10 min",
+                        "last_error_reset_at": reset_at,
+                        "account_id": "acct-secret",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import describe_provider_credential_availability
+
+    diag = describe_provider_credential_availability("anthropic")
+
+    assert diag["credential_status"] == "exhausted"
+    assert diag["has_credentials"] is True
+    assert diag["has_available"] is False
+    entry = diag["unavailable_entries"][0]
+    assert entry["last_error_code"] == 429
+    assert entry["cooldown_seconds_remaining"] > 0
+    assert "last_error_reset_at" in entry
+    rendered = json.dumps(diag, sort_keys=True)
+    assert "secret-token" not in rendered
+    assert "secret-access-token" not in rendered
+    assert "secret-refresh-token" not in rendered
+    assert "acct-secret" not in rendered
+    assert "token=<redacted>" in rendered
+
+
+def test_describe_provider_credential_availability_reports_missing_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+
+    from agent.credential_pool import describe_provider_credential_availability
+
+    diag = describe_provider_credential_availability("anthropic")
+
+    assert diag["credential_status"] == "missing"
+    assert diag["has_credentials"] is False
+    assert diag["has_available"] is False
+    assert diag["credential_count"] == 0
+
+
 def test_round_robin_strategy_rotates_priorities(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(

@@ -91,6 +91,9 @@ def test_record_compression_route_results_reports_failing_routes_only():
 
     assert facts["compression_routes_output"] == output
     assert facts["compression_route_results"] == results
+    assert results[0]["failure_class"] == "route_failed"
+    assert results[0]["fallback_status"] == "healthy"
+    assert results[0]["impact"] == "configured primary route degraded; fallback chain is healthy"
     assert results[1]["output"] == "HERMES_COMPRESSION_ROUTE_OK_1"
     assert [issue["name"] for issue in issues] == [
         "compression configured provider route failed: primary anthropic/claude-sonnet-4.6"
@@ -100,6 +103,137 @@ def test_record_compression_route_results_reports_failing_routes_only():
     assert "secret-token" not in issues[0]["detail"]
     assert "api_key=<redacted>" in issues[0]["detail"]
     assert "token=<redacted>" in issues[0]["detail"]
+
+
+def _record_routes(route_payload):
+    facts = {}
+    issues = []
+    results = doctor.record_compression_route_results(
+        {"exit": 1, "output": json.dumps({"routes": route_payload}, sort_keys=True)},
+        issues,
+        facts,
+    )
+    return results, issues, facts
+
+
+def test_record_compression_route_results_classifies_exhausted_primary_with_healthy_fallback():
+    results, issues, facts = _record_routes(
+        [
+            {
+                "label": "primary",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4.6",
+                "exit": 1,
+                "credential_status": "exhausted",
+                "credential_last_error_code": 429,
+                "credential_last_error_reason": "rate_limit",
+                "credential_last_error_message": "token=secret-token resets in 4 min",
+                "credential_last_error_reset_at": "2026-07-09T12:00:00+00:00",
+                "error": "RuntimeError: Anthropic OAuth credential unavailable",
+            },
+            {
+                "label": "fallback_chain[0]",
+                "provider": "openai-codex",
+                "model": "gpt-5.4-mini",
+                "exit": 0,
+                "output": "HERMES_COMPRESSION_ROUTE_OK_1",
+            },
+        ]
+    )
+
+    assert facts["compression_route_results"] == results
+    assert results[0]["failure_class"] == "credential_rate_limited_or_quarantined"
+    assert results[0]["fallback_status"] == "healthy"
+    assert results[0]["fallback_chain_healthy"] is True
+    assert results[0]["impact"] == "configured primary route degraded; fallback chain is healthy"
+    assert "Wait for credential cooldown" in results[0]["next_action"]
+    assert [issue["name"] for issue in issues] == [
+        "compression configured provider route failed: primary anthropic/claude-sonnet-4.6"
+    ]
+    detail = issues[0]["detail"]
+    assert "credential_rate_limited_or_quarantined" in detail
+    assert "configured primary route degraded" in detail
+    assert "secret-token" not in detail
+    assert "token=<redacted>" in detail
+
+
+def test_record_compression_route_results_classifies_missing_primary_with_healthy_fallback():
+    results, issues, _facts = _record_routes(
+        [
+            {
+                "label": "primary",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4.6",
+                "exit": 1,
+                "credential_status": "missing",
+                "error": "RuntimeError: Anthropic credentials unavailable",
+            },
+            {
+                "label": "fallback_chain[0]",
+                "provider": "openai-codex",
+                "model": "gpt-5.4-mini",
+                "exit": 0,
+            },
+        ]
+    )
+
+    assert results[0]["failure_class"] == "missing_credential"
+    assert results[0]["fallback_status"] == "healthy"
+    assert "Add or configure credentials for anthropic" in results[0]["next_action"]
+    assert issues[0]["severity"] == "critical"
+
+
+def test_record_compression_route_results_keeps_hard_critical_when_primary_and_fallback_fail():
+    results, issues, _facts = _record_routes(
+        [
+            {
+                "label": "primary",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4.6",
+                "exit": 1,
+                "credential_status": "exhausted",
+                "credential_cooldown_seconds_remaining": 240,
+            },
+            {
+                "label": "fallback_chain[0]",
+                "provider": "openai-codex",
+                "model": "gpt-5.4-mini",
+                "exit": 1,
+                "credential_status": "available",
+                "error": "RuntimeError: fallback failed",
+            },
+        ]
+    )
+
+    assert results[0]["fallback_status"] == "failed"
+    assert results[0]["impact"] == "compression route unavailable; fallback chain is not healthy"
+    assert len(issues) == 2
+    assert all(issue["severity"] == "critical" for issue in issues)
+
+
+def test_record_compression_route_results_primary_success_has_no_issue():
+    results, issues, _facts = _record_routes(
+        [
+            {
+                "label": "primary",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4.6",
+                "exit": 0,
+                "credential_status": "available",
+                "output": "HERMES_COMPRESSION_ROUTE_OK_0",
+            },
+            {
+                "label": "fallback_chain[0]",
+                "provider": "openai-codex",
+                "model": "gpt-5.4-mini",
+                "exit": 0,
+            },
+        ]
+    )
+
+    assert results[0]["failure_class"] == "healthy"
+    assert results[0]["impact"] == "primary route healthy"
+    assert issues == []
 
 
 def test_record_compression_route_results_reports_missing_only_without_routes():
