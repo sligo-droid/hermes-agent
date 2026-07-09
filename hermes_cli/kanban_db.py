@@ -1378,6 +1378,36 @@ class KanbanDbCorruptError(RuntimeError):
 CORRUPT_BOARD_RETRY_SECONDS = 300
 
 
+def _corrupt_board_incident_key(
+    board: str,
+    fingerprint: Optional[str],
+    reason: str,
+    *,
+    error_class: Optional[str] = None,
+    quarantine_path: Optional[Path | str] = None,
+) -> str:
+    """Stable identity for deciding whether a corruption incident is new."""
+    digest = hashlib.sha256()
+    parts = (
+        str(board),
+        str(fingerprint or "<unknown>"),
+        str(error_class or "<unknown>").strip(),
+        str(reason).strip(),
+        str(quarantine_path or "<unavailable>"),
+    )
+    for part in parts:
+        digest.update(part.encode("utf-8", "replace"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def should_log_corrupt_board_incident(incident: Optional[dict[str, Any]]) -> bool:
+    """Return whether a caller should emit the primary corruption error log."""
+    if not isinstance(incident, dict):
+        return True
+    return incident.get("should_log") is not False
+
+
 def _db_content_fingerprint(path: Path) -> Optional[str]:
     digest = hashlib.sha256()
     try:
@@ -1599,6 +1629,7 @@ def record_corrupt_board_incident(
     *,
     backup_path: Optional[Path] = None,
     fingerprint: Optional[str] = None,
+    error_class: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Persist a board-scoped corruption pause readable without opening SQLite."""
     slug = _board_for_db_path(db_path, board)
@@ -1612,13 +1643,40 @@ def record_corrupt_board_incident(
     now = int(time.time())
     meta = read_board_metadata(slug)
     previous = meta.get("corruption_incident")
+    reason = str(reason)
+    error_class = str(error_class or "").strip() or None
     first_seen = now
+    duplicate_count = 0
+    should_log = True
+    changed = True
     if isinstance(previous, dict) and previous.get("fingerprint") == fingerprint:
         first_seen = int(previous.get("first_seen") or now)
         backup_path = backup_path or (
             Path(str(previous["quarantine_path"]))
             if previous.get("quarantine_path") else None
         )
+    incident_key = _corrupt_board_incident_key(
+        slug,
+        fingerprint,
+        reason,
+        error_class=error_class,
+        quarantine_path=backup_path,
+    )
+    if isinstance(previous, dict) and previous.get("fingerprint") == fingerprint:
+        previous_key = _corrupt_board_incident_key(
+            slug,
+            previous.get("fingerprint"),
+            str(previous.get("reason") or ""),
+            error_class=previous.get("error_class"),
+            quarantine_path=previous.get("quarantine_path"),
+        )
+        if previous_key == incident_key:
+            should_log = False
+            changed = False
+            try:
+                duplicate_count = int(previous.get("duplicate_count") or 0) + 1
+            except (TypeError, ValueError):
+                duplicate_count = 1
     next_retry = now + CORRUPT_BOARD_RETRY_SECONDS
     incident = {
         "status": "paused",
@@ -1627,10 +1685,15 @@ def record_corrupt_board_incident(
         "db_path": str(resolved),
         "fingerprint": fingerprint,
         "quarantine_path": str(backup_path) if backup_path is not None else None,
-        "reason": str(reason),
+        "error_class": error_class,
+        "reason": reason,
+        "dedupe_key": incident_key,
+        "duplicate_count": duplicate_count,
         "first_seen": first_seen,
         "last_seen": now,
         "next_retry": next_retry,
+        "changed": changed,
+        "should_log": should_log,
     }
     if slug == _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY:
         incident["recovery_note"] = (
@@ -1679,6 +1742,7 @@ def board_schema_ready(
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     tables = tuple(str(table).strip() for table in required_tables if str(table).strip())
+    error_class: Optional[str] = None
     try:
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -1686,6 +1750,7 @@ def board_schema_ready(
         present = {str(row[0]) for row in rows}
     except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
         reason = f"schema readiness probe failed for {operation}: {exc}"
+        error_class = exc.__class__.__name__
     else:
         missing = [table for table in tables if table not in present]
         if not missing:
@@ -1708,6 +1773,7 @@ def board_schema_ready(
         resolved,
         reason,
         fingerprint=fingerprint,
+        error_class=error_class,
     )
     return False, incident
 
@@ -1865,6 +1931,7 @@ def _raise_corrupt_existing_db(
         reason,
         backup_path=backup,
         fingerprint=fingerprint,
+        error_class=KanbanDbCorruptError.__name__,
     )
     raise KanbanDbCorruptError(resolved, backup, reason, incident=incident)
 
@@ -2047,6 +2114,7 @@ def _quarantine_task_row_read_corruption(
         reason,
         backup_path=backup,
         fingerprint=fingerprint,
+        error_class=exc.__class__.__name__,
     )
     raise KanbanDbCorruptError(resolved, backup, reason, incident=incident) from exc
 

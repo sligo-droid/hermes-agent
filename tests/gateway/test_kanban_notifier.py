@@ -623,13 +623,14 @@ def test_kanban_notifier_records_corrupt_open_once_then_skips(tmp_path, monkeypa
         calls["connect"] += 1
         raise sqlite3.DatabaseError("file is not a database")
 
-    def record_incident(board, db_path_arg, reason, *, backup_path=None, fingerprint=None):
+    def record_incident(board, db_path_arg, reason, *, backup_path=None, fingerprint=None, error_class=None):
         calls["record"] += 1
         incident = {
             "pause_reason": "kanban_db_corruption",
             "db_path": str(db_path_arg),
             "fingerprint": fingerprint,
             "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "error_class": error_class,
             "reason": reason,
         }
         incidents[board] = incident
@@ -657,6 +658,7 @@ def test_kanban_notifier_records_corrupt_open_once_then_skips(tmp_path, monkeypa
     assert not any("cannot open board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
     assert calls == {"connect": 1, "record": 1}
+    assert incidents["bad-board"]["error_class"] == "DatabaseError"
 
 
 def test_kanban_notifier_quarantines_invalid_header_open_then_skips(tmp_path, monkeypatch, caplog):

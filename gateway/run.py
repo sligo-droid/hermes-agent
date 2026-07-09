@@ -5901,9 +5901,12 @@ class GatewayRunner:
                             str(getattr(exc, "reason", None) or exc),
                             backup_path=getattr(exc, "backup_path", None),
                             fingerprint=fingerprint,
+                            error_class=exc.__class__.__name__,
                         )
 
                     def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
+                        if not _kb.should_log_corrupt_board_incident(incident):
+                            return
                         incident = incident or {}
                         logger.error(
                             "kanban notifier: board %s database corruption incident; "
@@ -6706,10 +6709,13 @@ class GatewayRunner:
                     str(reason),
                     backup_path=backup_path,
                     fingerprint=fingerprint[1],
+                    error_class=exc.__class__.__name__,
                 )
             return incident
 
         def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
+            if not _kb.should_log_corrupt_board_incident(incident):
+                return
             incident = incident or {}
             logger.error(
                 "kanban dispatcher: board %s database corruption incident; "
