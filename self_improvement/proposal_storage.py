@@ -443,6 +443,86 @@ def ingest_proposal_output(
         conn.close()
 
 
+def record_proposal_run_status(
+    *,
+    status: str,
+    source: dict[str, Any],
+    payload: dict[str, Any] | None = None,
+    parse_error: str | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Persist a non-card proposal cron run status idempotently."""
+
+    init_db(db_path)
+    source = dict(source or {})
+    key = _source_key(None, _json_dumps({"status": status, "source": source}), source)
+    now = utc_now()
+    payload = dict(payload or {})
+    run_payload = payload.get("run") if isinstance(payload.get("run"), dict) else {}
+
+    conn = connect(db_path)
+    try:
+        with conn:
+            existing = conn.execute("SELECT id, ingested_at FROM proposal_runs WHERE source_key = ?", (key,)).fetchone()
+            ingested_at = existing["ingested_at"] if existing else now
+            conn.execute(
+                """
+                INSERT INTO proposal_runs(
+                    source_key, contract_version, project, prong, run_id, cron_job_id,
+                    cron_job_name, cron_output_path, source_url, generated_at, created_at,
+                    completed_at, status, card_count, parse_error, payload_json,
+                    human_markdown, source_markdown, source_ref_json, ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '', '', ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    contract_version=excluded.contract_version,
+                    project=excluded.project,
+                    prong=excluded.prong,
+                    run_id=excluded.run_id,
+                    cron_job_id=excluded.cron_job_id,
+                    cron_job_name=excluded.cron_job_name,
+                    cron_output_path=excluded.cron_output_path,
+                    source_url=excluded.source_url,
+                    generated_at=excluded.generated_at,
+                    created_at=excluded.created_at,
+                    completed_at=excluded.completed_at,
+                    status=excluded.status,
+                    card_count=0,
+                    parse_error=excluded.parse_error,
+                    payload_json=excluded.payload_json,
+                    human_markdown='',
+                    source_markdown='',
+                    source_ref_json=excluded.source_ref_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    key,
+                    payload.get("contract_version"),
+                    source.get("project") or payload.get("project"),
+                    source.get("prong") or payload.get("prong"),
+                    run_payload.get("run_id") or source.get("run_id"),
+                    run_payload.get("cron_job_id") or source.get("cron_job_id"),
+                    run_payload.get("cron_job_name") or source.get("cron_job_name"),
+                    run_payload.get("cron_output_path") or source.get("cron_output_path"),
+                    run_payload.get("source_url") or source.get("source_url"),
+                    payload.get("generated_at"),
+                    run_payload.get("created_at") or source.get("created_at"),
+                    run_payload.get("completed_at") or source.get("completed_at"),
+                    status,
+                    parse_error,
+                    _json_dumps(payload),
+                    _json_dumps(source),
+                    ingested_at,
+                    now,
+                ),
+            )
+            conn.execute("DELETE FROM proposal_cards WHERE run_db_id = (SELECT id FROM proposal_runs WHERE source_key = ?)", (key,))
+            row = conn.execute("SELECT id FROM proposal_runs WHERE source_key = ?", (key,)).fetchone()
+            run_db_id = int(row["id"])
+        return {"run_id": run_db_id, "source_key": key, "status": status, "card_count": 0, "parse_error": parse_error}
+    finally:
+        conn.close()
+
+
 def _row_to_run(row: sqlite3.Row, *, include_source: bool = False) -> dict[str, Any]:
     data = dict(row)
     data["source_ref"] = json.loads(data.pop("source_ref_json") or "{}")

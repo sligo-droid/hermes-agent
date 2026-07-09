@@ -151,6 +151,41 @@ def test_ingest_malformed_run_persists_parse_failure(tmp_path, monkeypatch):
     assert failures["failures"][0]["source_ref"]["cron_output_path"] == "/tmp/out.md"
 
 
+def test_record_proposal_run_status_persists_auth_blocked_without_cards(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    result = proposal_storage.record_proposal_run_status(
+        status="auth_blocked",
+        source={
+            "source_key": "cron:proposal-job:2026-07-07_06-00-21.md",
+            "project": "hermes",
+            "prong": "daily-retrospective",
+            "run_id": "2026-07-07_06-00-21",
+            "cron_job_id": "proposal-job",
+            "cron_job_name": "Hermes daily retrospective",
+            "cron_output_path": "/tmp/cron/output/proposal-job/2026-07-07_06-00-21.md",
+        },
+        payload={
+            "project": "hermes",
+            "prong": "daily-retrospective",
+            "status": "auth_blocked",
+            "auth_blocked": {"provider_class": "OpenAICodex", "failure_code": "token_revoked"},
+        },
+        parse_error="Credentials invalid for OpenAICodex (token_revoked).",
+    )
+
+    run = proposal_storage.get_run(result["run_id"])
+
+    assert result["status"] == "auth_blocked"
+    assert result["card_count"] == 0
+    assert run["status"] == "auth_blocked"
+    assert run["card_count"] == 0
+    assert run["cards"] == []
+    assert run["project"] == "hermes"
+    assert run["prong"] == "daily-retrospective"
+    assert run["payload"]["auth_blocked"] == {"provider_class": "OpenAICodex", "failure_code": "token_revoked"}
+
+
 def test_ingest_invalid_json_stays_malformed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 

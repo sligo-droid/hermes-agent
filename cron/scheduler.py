@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -47,6 +48,14 @@ from hermes_cli.codex_auth_incidents import summarize_failure_text
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CronAuthBlockedFailure:
+    status: str
+    provider_class: str
+    failure_code: str
+    summary: str
 
 _tick_state_lock = threading.Lock()
 _active_tick_count = 0
@@ -1299,6 +1308,11 @@ def _self_improvement_proposal_config(job: dict, config: dict | None = None) -> 
     return project, prong
 
 
+def _is_self_improvement_proposal_job(job: dict) -> bool:
+    proposal_cfg = job.get("self_improvement_proposal")
+    return isinstance(proposal_cfg, dict) and proposal_cfg.get("enabled", True) is not False
+
+
 def _ingest_self_improvement_proposal_output(
     job: dict,
     output: str,
@@ -1322,18 +1336,7 @@ def _ingest_self_improvement_proposal_output(
     from self_improvement import proposal_storage
 
     job_id = str(job.get("id") or "")
-    run_id = str(job.get("last_run_id") or output_file.stem)
-    source: dict = {
-        "source_key": f"cron:{job_id}:{output_file.name}",
-        "cron_job_id": job_id,
-        "run_id": run_id,
-        "cron_output_path": str(output_file),
-        "cron_job_name": str(job.get("name") or job.get("prompt") or job_id or "cron job"),
-    }
-    for key in ("source_url", "url"):
-        if job.get(key):
-            source["source_url"] = str(job[key])
-            break
+    source = _proposal_source_from_job(job, output_file)
 
     result = proposal_storage.ingest_proposal_output(
         response_text if response_text else output,
@@ -1344,6 +1347,101 @@ def _ingest_self_improvement_proposal_output(
         job_id,
         result.get("status"),
         result.get("card_count"),
+        result.get("run_id"),
+    )
+    return result
+
+
+_KNOWN_AUTH_FAILURE_CODES = ("token_revoked", "token_invalidated")
+_PROVIDER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("OpenAICodex", re.compile(r"(?i)(openai[-_/ ]?codex|hermes_cli\.proxy\.adapters\.openai_codex|\bcodex\b)")),
+)
+
+
+def _classify_cron_auth_blocked_failure(error_text: str) -> CronAuthBlockedFailure | None:
+    """Return safe auth-blocked metadata for known credential failures only."""
+
+    text = redact_auth_incident_text(str(error_text or ""))
+    lowered = text.lower()
+    failure_code = next((code for code in _KNOWN_AUTH_FAILURE_CODES if code in lowered), None)
+    if not failure_code or not re.search(r"(?i)(\b401\b|unauthorized|authenticationerror|auth(?:entication)?\s+failed)", text):
+        return None
+    provider_class = next((provider for provider, pattern in _PROVIDER_PATTERNS if pattern.search(text)), None)
+    if not provider_class:
+        return None
+    return CronAuthBlockedFailure(
+        status="auth_blocked",
+        provider_class=provider_class,
+        failure_code=failure_code,
+        summary=(
+            "Self-improvement proposal cron did not produce proposals because "
+            f"credentials were invalid for {provider_class} ({failure_code}). "
+            "Refresh or reauthenticate credentials, then rerun the cron job."
+        ),
+    )
+
+
+def _proposal_source_from_job(job: dict, output_file: Path) -> dict:
+    job_id = str(job.get("id") or "")
+    source: dict = {
+        "source_key": f"cron:{job_id}:{output_file.name}",
+        "cron_job_id": job_id,
+        "run_id": str(job.get("last_run_id") or output_file.stem),
+        "cron_output_path": str(output_file),
+        "cron_job_name": str(job.get("name") or job.get("prompt") or job_id or "cron job"),
+    }
+    proposal = _self_improvement_proposal_config(job)
+    if proposal is not None:
+        source["project"], source["prong"] = proposal
+    for key in ("source_url", "url"):
+        if job.get(key):
+            source["source_url"] = str(job[key])
+            break
+    return source
+
+
+def _record_self_improvement_auth_blocked_run(
+    job: dict,
+    output_file: Path,
+    failure: CronAuthBlockedFailure,
+) -> dict | None:
+    proposal = _self_improvement_proposal_config(job)
+    if proposal is None:
+        return None
+
+    from self_improvement import proposal_storage
+
+    project, prong = proposal
+    source = _proposal_source_from_job(job, output_file)
+    payload = {
+        "project": project,
+        "prong": prong,
+        "status": failure.status,
+        "auth_blocked": {
+            "provider_class": failure.provider_class,
+            "failure_code": failure.failure_code,
+            "rerun_guidance": "Refresh or reauthenticate credentials, then rerun the cron job.",
+        },
+        "run": {
+            "run_id": source.get("run_id"),
+            "cron_job_id": source.get("cron_job_id"),
+            "cron_job_name": source.get("cron_job_name"),
+            "cron_output_path": source.get("cron_output_path"),
+            "completed_at": _hermes_now().isoformat(),
+        },
+    }
+    result = proposal_storage.record_proposal_run_status(
+        status=failure.status,
+        source=source,
+        payload=payload,
+        parse_error=failure.summary,
+    )
+    logger.info(
+        "Job '%s': recorded self-improvement proposal run status=%s provider=%s code=%s run_id=%s",
+        job.get("id"),
+        failure.status,
+        failure.provider_class,
+        failure.failure_code,
         result.get("run_id"),
     )
     return result
@@ -1372,6 +1470,21 @@ def _self_improvement_ingestion_health(result: dict | None, output_file: Path) -
             "cron_output_path": str(output_file),
             "source_key": result.get("source_key"),
             "run_id": result.get("run_id"),
+        }
+    }
+
+
+def _auth_blocked_health_details(failure: CronAuthBlockedFailure, output_file: Path, result: dict | None) -> dict:
+    return {
+        "self_improvement_proposal_ingestion": {
+            "status": failure.status,
+            "card_count": 0,
+            "parse_error": failure.summary,
+            "cron_output_path": str(output_file),
+            "source_key": result.get("source_key") if result else None,
+            "run_id": result.get("run_id") if result else None,
+            "provider_class": failure.provider_class,
+            "failure_code": failure.failure_code,
         }
     }
 
@@ -1860,7 +1973,8 @@ def _render_job_output(
         result_body = final_response if final_response else "(No response generated)"
     else:
         result_heading = "## Error"
-        incident_summary = summarize_failure_text(error_text, job=job)
+        auth_blocked = _classify_cron_auth_blocked_failure(error_text) if _is_self_improvement_proposal_job(job) else None
+        incident_summary = auth_blocked.summary if auth_blocked else summarize_failure_text(error_text, job=job)
         error_block = f"```\n{redact_auth_incident_text(error_text)}\n```"
         result_body = f"{incident_summary}\n\n{error_block}" if incident_summary else error_block
 
@@ -2600,7 +2714,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) ->
             should_deliver = False
 
         ingestion_health_details = None
-        if should_deliver:
+        auth_blocked_failure = (
+            _classify_cron_auth_blocked_failure(error or "")
+            if not success and _is_self_improvement_proposal_job(job)
+            else None
+        )
+        if auth_blocked_failure is not None:
+            ingestion_result = _record_self_improvement_auth_blocked_run(job, Path(output_file), auth_blocked_failure)
+            ingestion_health_details = _auth_blocked_health_details(auth_blocked_failure, Path(output_file), ingestion_result)
+        elif should_deliver:
             ingestion_result = _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
             ingestion_health_details = _self_improvement_ingestion_health(ingestion_result, Path(output_file))
 
