@@ -101,6 +101,13 @@ _DISCORD_READ_TOOLS = [
     "discord_get_reactions",
 ]
 
+_DISCORD_WRITE_TOOLS = [
+    "discord_add_reaction",
+    "discord_remove_reaction",
+    "discord_send_message",
+    "discord_edit_message",
+]
+
 _DISCORD_ADMIN_TOOLS = ["discord_admin"]
 
 
@@ -291,8 +298,8 @@ TOOLSETS = {
     },
 
     "discord": {
-        "description": "Discord read/query tools plus legacy participate actions",
-        "tools": _DISCORD_READ_TOOLS,
+        "description": "Discord read/query tools plus scoped write actions",
+        "tools": _DISCORD_READ_TOOLS + _DISCORD_WRITE_TOOLS,
         "includes": [],
     },
 
@@ -466,7 +473,7 @@ TOOLSETS = {
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
-        "tools": _HERMES_CORE_TOOLS + _DISCORD_READ_TOOLS + _DISCORD_ADMIN_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + _DISCORD_READ_TOOLS + _DISCORD_WRITE_TOOLS + _DISCORD_ADMIN_TOOLS,
         "includes": []
     },
     

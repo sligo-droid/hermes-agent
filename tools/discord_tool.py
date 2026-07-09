@@ -65,17 +65,19 @@ _FLAG_GATEWAY_MESSAGE_CONTENT_LIMITED = 1 << 19
 
 def _get_bot_token() -> Optional[str]:
     """Resolve the Discord bot token from env/.env, then loaded gateway config."""
-    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-    if token:
-        return token
+    for key in ("DISCORD_BOT_TOKEN", "DISCORD_TOKEN"):
+        token = os.getenv(key, "").strip()
+        if token:
+            return token
 
     try:
         from hermes_cli.config import get_env_value
-        token = str(get_env_value("DISCORD_BOT_TOKEN") or "").strip()
-        if token:
-            return token
+        for key in ("DISCORD_BOT_TOKEN", "DISCORD_TOKEN"):
+            token = str(get_env_value(key) or "").strip()
+            if token:
+                return token
     except Exception as exc:
-        logger.debug("discord: could not read DISCORD_BOT_TOKEN from Hermes env: %s", exc)
+        logger.debug("discord: could not read Discord token from Hermes env: %s", exc)
 
     try:
         from gateway.config import Platform, load_gateway_config
@@ -727,6 +729,96 @@ def _get_reactions(token: str, channel_id: str, message_id: str) -> str:
     })
 
 
+def _add_reaction(token: str, channel_id: str, message_id: str, emoji: str, **_kwargs: Any) -> str:
+    """Add the bot user's reaction to a message."""
+    encoded_emoji = urllib.parse.quote(str(emoji or "").strip(), safe="")
+    _discord_request(
+        "PUT",
+        f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me",
+        token,
+    )
+    return json.dumps({
+        "success": True,
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "emoji": emoji,
+        "message": "Reaction added.",
+    })
+
+
+def _remove_reaction(token: str, channel_id: str, message_id: str, emoji: str, **_kwargs: Any) -> str:
+    """Remove the bot user's reaction from a message."""
+    encoded_emoji = urllib.parse.quote(str(emoji or "").strip(), safe="")
+    _discord_request(
+        "DELETE",
+        f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me",
+        token,
+    )
+    return json.dumps({
+        "success": True,
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "emoji": emoji,
+        "message": "Reaction removed.",
+    })
+
+
+def _message_body(
+    content: str,
+    *,
+    reply_to_message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "content": content,
+        # Default to no mentions for agent-originated messages unless a future
+        # explicit schema expands this safely.
+        "allowed_mentions": {"parse": []},
+    }
+    if reply_to_message_id:
+        body["message_reference"] = {"message_id": reply_to_message_id, "fail_if_not_exists": True}
+    return body
+
+
+def _send_message(
+    token: str,
+    channel_id: str,
+    content: str,
+    reply_to_message_id: Optional[str] = None,
+    **_kwargs: Any,
+) -> str:
+    """Send a bot message to a channel or thread."""
+    message = _discord_request(
+        "POST",
+        f"/channels/{channel_id}/messages",
+        token,
+        body=_message_body(content, reply_to_message_id=reply_to_message_id),
+    )
+    return json.dumps({
+        "success": True,
+        "message": _format_message(message),
+    })
+
+
+def _edit_message(
+    token: str,
+    channel_id: str,
+    message_id: str,
+    content: str,
+    **_kwargs: Any,
+) -> str:
+    """Edit a message authored by the bot user."""
+    message = _discord_request(
+        "PATCH",
+        f"/channels/{channel_id}/messages/{message_id}",
+        token,
+        body=_message_body(content),
+    )
+    return json.dumps({
+        "success": True,
+        "message": _format_message(message),
+    })
+
+
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
     """Add a role to a guild member."""
     _discord_request("PUT", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}", token)
@@ -757,11 +849,18 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "add_reaction": _add_reaction,
+    "remove_reaction": _remove_reaction,
+    "send_message": _send_message,
+    "edit_message": _edit_message,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({
+    "fetch_messages", "search_members", "create_thread",
+    "add_reaction", "remove_reaction", "send_message", "edit_message",
+})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -784,6 +883,10 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("add_reaction", "(channel_id, message_id, emoji)", "add the bot user's reaction to a message"),
+    ("remove_reaction", "(channel_id, message_id, emoji)", "remove the bot user's reaction from a message"),
+    ("send_message", "(channel_id, content)", "send a bot message with mentions disabled by default"),
+    ("edit_message", "(channel_id, message_id, content)", "edit a message authored by the bot"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -805,6 +908,10 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "add_reaction": ["channel_id", "message_id", "emoji"],
+    "remove_reaction": ["channel_id", "message_id", "emoji"],
+    "send_message": ["channel_id", "content"],
+    "edit_message": ["channel_id", "message_id", "content"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
@@ -978,6 +1085,18 @@ def _build_schema(
             "type": "string",
             "description": "Discord message ID.",
         },
+        "emoji": {
+            "type": "string",
+            "description": "Emoji for add_reaction/remove_reaction. Use a Unicode emoji or custom emoji form name:id.",
+        },
+        "content": {
+            "type": "string",
+            "description": "Message content for send_message/edit_message. Mentions are disabled by default.",
+        },
+        "reply_to_message_id": {
+            "type": "string",
+            "description": "Optional message ID to reply to when using send_message.",
+        },
         "query": {
             "type": "string",
             "description": "Member name prefix to search for (search_members).",
@@ -1126,6 +1245,9 @@ def _run_discord_action(
     user_id: str = "",
     role_id: str = "",
     message_id: str = "",
+    emoji: str = "",
+    content: str = "",
+    reply_to_message_id: str = "",
     query: str = "",
     name: str = "",
     limit: int = 50,
@@ -1158,6 +1280,9 @@ def _run_discord_action(
         "user_id": user_id,
         "role_id": role_id,
         "message_id": message_id,
+        "emoji": emoji,
+        "content": content,
+        "reply_to_message_id": reply_to_message_id,
         "query": query,
         "name": name,
     }
@@ -1176,6 +1301,9 @@ def _run_discord_action(
             user_id=user_id,
             role_id=role_id,
             message_id=message_id,
+            emoji=emoji,
+            content=content,
+            reply_to_message_id=reply_to_message_id or None,
             query=query,
             name=name,
             limit=limit,
@@ -1253,7 +1381,8 @@ def _make_first_class_handler(tool_label: str, action: str, required: List[str],
 
 _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
-    "role_id": "", "message_id": "", "query": "", "name": "",
+    "role_id": "", "message_id": "", "emoji": "", "content": "",
+    "reply_to_message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
 }
 
@@ -1311,6 +1440,18 @@ _PROP_BEFORE = {
 _PROP_AFTER = {
     "type": "string",
     "description": "Return messages after this Discord snowflake ID.",
+}
+_PROP_MESSAGE_ID = {
+    "type": "string",
+    "description": "Discord message ID.",
+}
+_PROP_EMOJI = {
+    "type": "string",
+    "description": "Emoji to add/remove. Use a Unicode emoji or custom emoji form name:id.",
+}
+_PROP_CONTENT = {
+    "type": "string",
+    "description": "Message content. Mentions are disabled by default for safety.",
 }
 
 
@@ -1420,6 +1561,53 @@ DISCORD_GET_REACTIONS_SCHEMA = _single_schema(
     ["channel_id", "message_id"],
 )
 
+DISCORD_ADD_REACTION_SCHEMA = _single_schema(
+    "discord_add_reaction",
+    "Add the configured bot user's reaction to a Discord message. Mutates live Discord state; only use when explicitly requested.",
+    {
+        "channel_id": _PROP_CHANNEL_ID,
+        "message_id": _PROP_MESSAGE_ID,
+        "emoji": _PROP_EMOJI,
+    },
+    ["channel_id", "message_id", "emoji"],
+)
+
+DISCORD_REMOVE_REACTION_SCHEMA = _single_schema(
+    "discord_remove_reaction",
+    "Remove the configured bot user's reaction from a Discord message. Mutates live Discord state; only use when explicitly requested.",
+    {
+        "channel_id": _PROP_CHANNEL_ID,
+        "message_id": _PROP_MESSAGE_ID,
+        "emoji": _PROP_EMOJI,
+    },
+    ["channel_id", "message_id", "emoji"],
+)
+
+DISCORD_SEND_MESSAGE_SCHEMA = _single_schema(
+    "discord_send_message",
+    "Send a Discord message as the configured bot. Mutates live Discord state; mentions are disabled by default.",
+    {
+        "channel_id": _PROP_CHANNEL_ID,
+        "content": _PROP_CONTENT,
+        "reply_to_message_id": {
+            "type": "string",
+            "description": "Optional message ID to reply to.",
+        },
+    },
+    ["channel_id", "content"],
+)
+
+DISCORD_EDIT_MESSAGE_SCHEMA = _single_schema(
+    "discord_edit_message",
+    "Edit a Discord message authored by the configured bot. Mutates live Discord state; mentions are disabled by default.",
+    {
+        "channel_id": _PROP_CHANNEL_ID,
+        "message_id": _PROP_MESSAGE_ID,
+        "content": _PROP_CONTENT,
+    },
+    ["channel_id", "message_id", "content"],
+)
+
 
 _FIRST_CLASS_DISCORD_TOOLS = [
     (
@@ -1503,6 +1691,54 @@ _FIRST_CLASS_DISCORD_TOOLS = [
             token,
             channel_id=args.get("channel_id", ""),
             message_id=args.get("message_id", ""),
+        ),
+    ),
+    (
+        "discord_add_reaction",
+        DISCORD_ADD_REACTION_SCHEMA,
+        "add_reaction",
+        ["channel_id", "message_id", "emoji"],
+        lambda token, args: _add_reaction(
+            token,
+            channel_id=args.get("channel_id", ""),
+            message_id=args.get("message_id", ""),
+            emoji=args.get("emoji", ""),
+        ),
+    ),
+    (
+        "discord_remove_reaction",
+        DISCORD_REMOVE_REACTION_SCHEMA,
+        "remove_reaction",
+        ["channel_id", "message_id", "emoji"],
+        lambda token, args: _remove_reaction(
+            token,
+            channel_id=args.get("channel_id", ""),
+            message_id=args.get("message_id", ""),
+            emoji=args.get("emoji", ""),
+        ),
+    ),
+    (
+        "discord_send_message",
+        DISCORD_SEND_MESSAGE_SCHEMA,
+        "send_message",
+        ["channel_id", "content"],
+        lambda token, args: _send_message(
+            token,
+            channel_id=args.get("channel_id", ""),
+            content=args.get("content", ""),
+            reply_to_message_id=args.get("reply_to_message_id") or None,
+        ),
+    ),
+    (
+        "discord_edit_message",
+        DISCORD_EDIT_MESSAGE_SCHEMA,
+        "edit_message",
+        ["channel_id", "message_id", "content"],
+        lambda token, args: _edit_message(
+            token,
+            channel_id=args.get("channel_id", ""),
+            message_id=args.get("message_id", ""),
+            content=args.get("content", ""),
         ),
     ),
 ]
