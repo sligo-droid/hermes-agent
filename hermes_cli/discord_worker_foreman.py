@@ -206,6 +206,8 @@ def _log_corrupt_board_incident(
     incident: Optional[dict[str, Any]],
     exc: Exception,
 ) -> None:
+    if not kanban_db.should_log_corrupt_board_incident(incident):
+        return
     incident = incident or {}
     logger.error(
         "discord foreman: board %s database corruption incident; "

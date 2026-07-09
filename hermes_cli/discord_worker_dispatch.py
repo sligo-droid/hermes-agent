@@ -52,6 +52,8 @@ def _record_corrupt_board(board: str, exc: Exception) -> Optional[dict]:
 
 
 def _log_corrupt_board_incident(board: str, incident: Optional[dict], exc: Exception) -> None:
+    if not kanban_db.should_log_corrupt_board_incident(incident):
+        return
     incident = incident or {}
     logger.error(
         "kanban dispatcher: Discord worker board %s database corruption incident; "

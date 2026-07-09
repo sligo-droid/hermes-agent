@@ -1378,6 +1378,28 @@ class KanbanDbCorruptError(RuntimeError):
 CORRUPT_BOARD_RETRY_SECONDS = 300
 
 
+def _corrupt_board_incident_key(
+    board: str,
+    fingerprint: Optional[str],
+    reason: str,
+) -> str:
+    """Stable identity for deciding whether a corruption incident is new."""
+    digest = hashlib.sha256()
+    digest.update(str(board).encode("utf-8", "replace"))
+    digest.update(b"\0")
+    digest.update(str(fingerprint or "<unknown>").encode("utf-8", "replace"))
+    digest.update(b"\0")
+    digest.update(str(reason).strip().encode("utf-8", "replace"))
+    return digest.hexdigest()
+
+
+def should_log_corrupt_board_incident(incident: Optional[dict[str, Any]]) -> bool:
+    """Return whether a caller should emit the primary corruption error log."""
+    if not isinstance(incident, dict):
+        return True
+    return incident.get("should_log") is not False
+
+
 def _db_content_fingerprint(path: Path) -> Optional[str]:
     digest = hashlib.sha256()
     try:
@@ -1612,13 +1634,30 @@ def record_corrupt_board_incident(
     now = int(time.time())
     meta = read_board_metadata(slug)
     previous = meta.get("corruption_incident")
+    reason = str(reason)
+    incident_key = _corrupt_board_incident_key(slug, fingerprint, reason)
     first_seen = now
+    duplicate_count = 0
+    should_log = True
+    changed = True
     if isinstance(previous, dict) and previous.get("fingerprint") == fingerprint:
         first_seen = int(previous.get("first_seen") or now)
         backup_path = backup_path or (
             Path(str(previous["quarantine_path"]))
             if previous.get("quarantine_path") else None
         )
+        previous_key = previous.get("dedupe_key") or _corrupt_board_incident_key(
+            slug,
+            previous.get("fingerprint"),
+            str(previous.get("reason") or ""),
+        )
+        if previous_key == incident_key:
+            should_log = False
+            changed = False
+            try:
+                duplicate_count = int(previous.get("duplicate_count") or 0) + 1
+            except (TypeError, ValueError):
+                duplicate_count = 1
     next_retry = now + CORRUPT_BOARD_RETRY_SECONDS
     incident = {
         "status": "paused",
@@ -1627,10 +1666,14 @@ def record_corrupt_board_incident(
         "db_path": str(resolved),
         "fingerprint": fingerprint,
         "quarantine_path": str(backup_path) if backup_path is not None else None,
-        "reason": str(reason),
+        "reason": reason,
+        "dedupe_key": incident_key,
+        "duplicate_count": duplicate_count,
         "first_seen": first_seen,
         "last_seen": now,
         "next_retry": next_retry,
+        "changed": changed,
+        "should_log": should_log,
     }
     if slug == _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY:
         incident["recovery_note"] = (

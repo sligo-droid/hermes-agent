@@ -5904,6 +5904,8 @@ class GatewayRunner:
                         )
 
                     def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
+                        if not _kb.should_log_corrupt_board_incident(incident):
+                            return
                         incident = incident or {}
                         logger.error(
                             "kanban notifier: board %s database corruption incident; "
@@ -6710,6 +6712,8 @@ class GatewayRunner:
             return incident
 
         def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
+            if not _kb.should_log_corrupt_board_incident(incident):
+                return
             incident = incident or {}
             logger.error(
                 "kanban dispatcher: board %s database corruption incident; "
