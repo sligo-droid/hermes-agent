@@ -57,6 +57,12 @@ def test_get_adapter_unknown_provider_raises():
         get_adapter("anthropic")  # not yet implemented
 
 
+def test_nous_adapter_auth_helper_import_smoke():
+    from hermes_cli.auth import _nous_inference_env_override
+
+    assert _nous_inference_env_override() is None
+
+
 # ---------------------------------------------------------------------------
 # OpenAICodexAdapter
 # ---------------------------------------------------------------------------
@@ -80,6 +86,37 @@ def test_codex_adapter_not_authenticated_when_credentials_missing(monkeypatch):
         MagicMock(side_effect=RuntimeError("missing")),
     )
     assert not OpenAICodexAdapter().is_authenticated()
+
+
+def test_nous_adapter_honors_inference_env_override(
+    tmp_path,
+    monkeypatch,
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "nous": {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+            },
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("NOUS_INFERENCE_BASE_URL", "https://staging.example.test/v1/")
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.nous_portal.resolve_nous_runtime_credentials",
+        MagicMock(return_value={
+            "api_key": "invoke-jwt",
+            "base_url": "https://inference-api.nousresearch.com/v1",
+        }),
+    )
+
+    cred = NousPortalAdapter().get_credential()
+
+    assert cred.bearer == "invoke-jwt"
+    assert cred.base_url == "https://staging.example.test/v1"
 
 
 def test_codex_adapter_uses_pooled_credentials_before_legacy(monkeypatch):
