@@ -79,6 +79,9 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
 _MEETING_AUTO_GOAL_TEXT = "Follow up on the todos from this meeting."
+_DISCORD_PROMPT_BOT_SMOKE_TTL_SECS = 120.0
+_DISCORD_PROMPT_BOT_SMOKE_STALE_SLA_SECS = 60.0
+_DISCORD_PROMPT_BOT_SMOKE_MARKER_MAX = 48
 _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "Discord action-request thread guidance: treat the latest user message as "
     "the authoritative task. Earlier transcript, [Recent channel messages], and "
@@ -119,6 +122,41 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "state the assumption and continue."
 )
 _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT
+
+
+def _safe_prompt_bot_smoke_marker(event: Any, source: Any) -> str | None:
+    """Return a low-cardinality marker for automated Discord smoke prompts."""
+    if getattr(source, "platform", None) != Platform.DISCORD:
+        return None
+    if not bool(getattr(source, "is_bot", False)):
+        return None
+
+    text = str(getattr(event, "text", "") or "")
+    normalized = re.sub(r"<@!?\d+>", " @bot ", text.lower())
+    normalized = re.sub(r"https?://\S+", " url ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    author = str(getattr(source, "user_name", "") or "").lower()
+    author_is_prompt_bot = "prompt" in author and "bot" in author
+    text_mentions_prompt_bot = "prompt bot" in normalized or "prompt-bot" in normalized
+    if not (author_is_prompt_bot or text_mentions_prompt_bot):
+        return None
+    if "smoke" not in normalized:
+        return None
+    smoke_terms = []
+    for label, pattern in (
+        ("daily", r"\bdaily\b"),
+        ("dev-loop", r"\bdev[-\s]?loop\b"),
+        ("fable", r"\bfable\b"),
+        ("noop", r"\bno[-\s]?op\b"),
+        ("test", r"\btest\b"),
+    ):
+        if re.search(pattern, normalized):
+            smoke_terms.append(label)
+    if not smoke_terms:
+        return None
+    digest = hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    marker = "prompt-bot-smoke:" + "+".join(smoke_terms[:3]) + f":{digest}"
+    return marker[:_DISCORD_PROMPT_BOT_SMOKE_MARKER_MAX]
 
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
     """Return whether a board should count toward dispatcher stuck health.
@@ -2403,6 +2441,8 @@ class GatewayRunner:
         # preserve the queue.
         self._queued_events: Dict[str, List[MessageEvent]] = {}
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
+        self._discord_prompt_bot_smoke_seen: "OrderedDict[str, float]" = OrderedDict()
+        self._discord_prompt_bot_smoke_stale_tasks: Dict[str, asyncio.Task] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
         # LRU cache of live SessionSources keyed by session_key. Used by
@@ -9812,6 +9852,12 @@ class GatewayRunner:
                 _work_item.get("status"),
             )
             return None
+        _prompt_bot_smoke_accepted, _ = self._accept_discord_prompt_bot_smoke(
+            event,
+            source,
+        )
+        if not _prompt_bot_smoke_accepted:
+            return None
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -11261,6 +11307,138 @@ class GatewayRunner:
                 pass
         return source
 
+    def _discord_prompt_bot_smoke_key(self, event: MessageEvent, source: SessionSource) -> tuple[str, str] | None:
+        marker = _safe_prompt_bot_smoke_marker(event, source)
+        if not marker:
+            return None
+        channel = str(getattr(source, "thread_id", None) or getattr(source, "chat_id", "") or "")
+        if not channel:
+            return None
+        author = str(getattr(source, "user_id", "") or "bot")
+        return "|".join(("discord", channel, author, marker)), marker
+
+    def _accept_discord_prompt_bot_smoke(self, event: MessageEvent, source: SessionSource) -> tuple[bool, str | None]:
+        result = self._discord_prompt_bot_smoke_key(event, source)
+        if not result:
+            return True, None
+        key, marker = result
+        now = time.time()
+        seen = getattr(self, "_discord_prompt_bot_smoke_seen", None)
+        if seen is None:
+            seen = OrderedDict()
+            self._discord_prompt_bot_smoke_seen = seen
+        ttl = _DISCORD_PROMPT_BOT_SMOKE_TTL_SECS
+        for old_key, old_ts in list(seen.items()):
+            if now - old_ts > ttl:
+                seen.pop(old_key, None)
+            else:
+                break
+        last_seen = seen.get(key)
+        if last_seen is not None and now - last_seen <= ttl:
+            try:
+                seen.move_to_end(key)
+            except Exception:
+                pass
+            logger.warning(
+                "discord_prompt_bot_smoke_duplicate_dropped channel=%s author=%s marker=%s message_id=%s",
+                getattr(source, "thread_id", None) or getattr(source, "chat_id", "") or "unknown",
+                getattr(source, "user_id", "") or "unknown",
+                marker,
+                getattr(event, "message_id", None) or getattr(source, "message_id", None) or "",
+            )
+            return False, marker
+        seen[key] = now
+        try:
+            seen.move_to_end(key)
+            while len(seen) > 256:
+                seen.popitem(last=False)
+        except Exception:
+            pass
+        return True, marker
+
+    def _schedule_discord_prompt_bot_smoke_stale_watch(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        source: SessionSource,
+        marker: str | None,
+        message_id: str | None,
+    ) -> None:
+        if not session_id or not marker:
+            return
+        task_key = f"{session_id}:{message_id or marker}"
+        tasks = getattr(self, "_discord_prompt_bot_smoke_stale_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._discord_prompt_bot_smoke_stale_tasks = tasks
+        prior = tasks.get(task_key)
+        if prior and not prior.done():
+            return
+
+        async def _watch() -> None:
+            try:
+                await asyncio.sleep(_DISCORD_PROMPT_BOT_SMOKE_STALE_SLA_SECS)
+                self._warn_if_discord_prompt_bot_smoke_stale(
+                    session_id=session_id,
+                    session_key=session_key,
+                    source=source,
+                    marker=marker,
+                    message_id=message_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("discord prompt-bot smoke stale watch failed", exc_info=True)
+            finally:
+                tasks.pop(task_key, None)
+
+        try:
+            task = asyncio.create_task(_watch())
+        except RuntimeError:
+            return
+        tasks[task_key] = task
+
+    def _warn_if_discord_prompt_bot_smoke_stale(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        source: SessionSource,
+        marker: str,
+        message_id: str | None,
+    ) -> None:
+        db = getattr(self, "_session_db", None)
+        row = None
+        if db is not None:
+            try:
+                row = db.get_session(session_id)
+            except Exception:
+                row = None
+        if row is None:
+            try:
+                row = self.session_store._db.get_session(session_id) if self.session_store._db else None
+            except Exception:
+                row = None
+        if not row:
+            return
+        message_count = int(row.get("message_count") or 0)
+        api_call_count = int(row.get("api_call_count") or 0)
+        output_tokens = int(row.get("output_tokens") or 0)
+        if message_count > 0 and api_call_count == 0 and output_tokens == 0:
+            logger.warning(
+                "discord_prompt_bot_smoke_stale_zero_api session_id=%s session_key=%s channel=%s author=%s marker=%s message_id=%s message_count=%d api_call_count=%d output_tokens=%d",
+                session_id,
+                session_key,
+                getattr(source, "thread_id", None) or getattr(source, "chat_id", "") or "unknown",
+                getattr(source, "user_id", "") or "unknown",
+                marker,
+                message_id or "",
+                message_count,
+                api_call_count,
+                output_tokens,
+            )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -11291,6 +11469,15 @@ class GatewayRunner:
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
+        _prompt_bot_smoke_marker = _safe_prompt_bot_smoke_marker(event, source)
+        if _prompt_bot_smoke_marker:
+            self._schedule_discord_prompt_bot_smoke_stale_watch(
+                session_id=session_entry.session_id,
+                session_key=session_key,
+                source=source,
+                marker=_prompt_bot_smoke_marker,
+                message_id=getattr(event, "message_id", None) or getattr(source, "message_id", None),
+            )
         if self._is_telegram_topic_lane(source):
             try:
                 binding = self._session_db.get_telegram_topic_binding(
