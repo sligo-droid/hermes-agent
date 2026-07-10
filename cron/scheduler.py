@@ -2696,20 +2696,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) ->
                 ),
             )
         output_file = save_job_output(job["id"], output)
-        if manual_run_id:
-            mark_manual_run_finished(
-                job["id"],
-                manual_run_id,
-                success=success,
-                output_path=str(output_file),
-                error=error,
-            )
         if verbose:
             logger.info("Output saved to: %s", output_file)
 
-        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-        should_deliver = bool(deliver_content.strip())
-        if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+        should_deliver = bool(final_response.strip()) if success else True
+        if should_deliver and success and SILENT_MARKER in final_response.strip().upper():
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
             should_deliver = False
 
@@ -2725,7 +2716,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) ->
         elif should_deliver:
             ingestion_result = _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
             ingestion_health_details = _self_improvement_ingestion_health(ingestion_result, Path(output_file))
+            if ingestion_result and ingestion_result.get("status") == "malformed":
+                success = False
+                parse_error = " ".join(str(ingestion_result.get("parse_error") or "malformed proposal output").split())
+                error = f"Self-improvement proposal ingestion failed: {parse_error}"
 
+        if success and not final_response.strip():
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        if manual_run_id:
+            mark_manual_run_finished(
+                job["id"],
+                manual_run_id,
+                success=success,
+                output_path=str(output_file),
+                error=error,
+            )
+
+        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
         delivery_error = None
         if should_deliver:
             try:
@@ -2738,10 +2747,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) ->
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         terminal_success_reason = _terminal_success_reason(job, success, final_response)
         mark_job_run(
