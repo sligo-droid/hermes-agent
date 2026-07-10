@@ -23,6 +23,21 @@ hermes honcho embeddings start --docker
 hermes honcho embeddings tune
 ```
 
+Docker starts use `restart=unless-stopped`, so an embeddings container created
+by Hermes returns after ordinary Docker or host restarts. Auto-repair also adds
+that policy to an existing stopped container before starting it. If Honcho
+itself runs in Docker, attach `hermes-honcho-embeddings` to the Honcho network
+and set the base URL to `http://hermes-honcho-embeddings:8080/v1`; a host
+`127.0.0.1` URL addresses the Honcho container itself, not the host. Status
+checks validate OpenAI endpoint semantics from the host. For a Docker-only
+route, Hermes discovers the exact label- and image-validated Honcho Compose API
+container and probes from that container. Missing or ambiguous identity, or an
+unavailable Python probe, is reported as unverified and never triggers repair.
+
+```bash
+hermes honcho embeddings start --docker --network honcho_default --no-publish
+```
+
 Or manually:
 ```bash
 hermes config set memory.provider honcho
@@ -71,6 +86,9 @@ EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY_ENV=EMBEDDING_OPENAI_API_KEY
 EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE=always
 EMBEDDING_OPENAI_API_KEY=not-needed
 ```
+
+The `127.0.0.1` value above is for a host-run Honcho server. For Dockerized
+Honcho, use the shared-network container URL described above instead.
 
 Honcho pins pgvector dimensions at bootstrap. `Qwen/Qwen3-Embedding-8B-GGUF` is 4096 dim and higher quality, but too heavy for the default memory read-path latency/resource budget. If you switch to it, run Honcho's embedding bootstrap/configure step on an empty database before storing messages.
 

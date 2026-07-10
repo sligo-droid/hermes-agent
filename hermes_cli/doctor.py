@@ -2504,6 +2504,7 @@ def run_doctor(args):
                         or "docker ps failed:" in fact
                         or "container hermes-honcho-embeddings not found" in fact
                         or "Repair skipped: container is not in the stopped/exited state" in fact
+                        or "Repair blocked:" in fact
                         for fact in repair_facts
                     )
 
