@@ -10,6 +10,8 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+from pathlib import Path
+
 import cron.scheduler as s
 
 
@@ -81,11 +83,43 @@ def test_run_one_job_silent_skips_delivery(monkeypatch):
 def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     """An empty final response marks the run as NOT ok (issue #8585)."""
     calls = _patch_pipeline(monkeypatch, final="   ")
+    manual_finishes = []
+    job_marks = []
+    empty_response_error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+    monkeypatch.setattr(s, "mark_manual_run_started", lambda *args: None)
+    monkeypatch.setattr(
+        s,
+        "mark_manual_run_finished",
+        lambda jid, run_id, **kwargs: manual_finishes.append((jid, run_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None, health_details=None: job_marks.append(
+            (jid, ok, err, delivery_error, health_details)
+        ),
+    )
 
-    s.run_one_job({"id": "j4", "name": "t"})
+    ok = s.run_one_job({
+        "id": "j4",
+        "name": "t",
+        "manual_run": {"run_id": "manual-4", "state": "queued"},
+    })
 
-    mark = [c for c in calls if c[0] == "mark"][0]
-    assert mark == ("mark", "j4", False)
+    assert ok is False
+    assert "deliver" not in [call[0] for call in calls]
+    assert manual_finishes == [
+        (
+            "j4",
+            "manual-4",
+            {
+                "success": False,
+                "output_path": "/tmp/j4.txt",
+                "error": empty_response_error,
+            },
+        )
+    ]
+    assert job_marks == [("j4", False, empty_response_error, None, None)]
 
 
 def test_run_one_job_failed_job_delivers_error(monkeypatch):
@@ -146,15 +180,30 @@ def test_run_one_job_valid_self_improvement_ingestion_keeps_health_ok(monkeypatc
     assert seen_health_details == [None]
 
 
-def test_run_one_job_malformed_self_improvement_ingestion_records_health(monkeypatch):
+def test_run_one_job_malformed_self_improvement_ingestion_marks_failure(monkeypatch):
     calls = _patch_pipeline(monkeypatch)
+    deliveries = []
+    manual_finishes = []
     seen_health_details = []
+    seen_errors = []
 
     def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
         calls.append(("mark", jid, ok))
+        seen_errors.append(err)
         seen_health_details.append(health_details)
 
     parse_error = "proposal JSON parse error at line 1, column 2: no secret payload"
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, adapters=None, loop=None: deliveries.append(content),
+    )
+    monkeypatch.setattr(s, "mark_manual_run_started", lambda *args: None)
+    monkeypatch.setattr(
+        s,
+        "mark_manual_run_finished",
+        lambda jid, run_id, **kwargs: manual_finishes.append((jid, run_id, kwargs)),
+    )
     monkeypatch.setattr(s, "mark_job_run", fake_mark)
     monkeypatch.setattr(
         s,
@@ -168,9 +217,28 @@ def test_run_one_job_malformed_self_improvement_ingestion_records_health(monkeyp
         },
     )
 
-    ok = s.run_one_job({"id": "j8", "name": "t", "self_improvement_proposal": {"project": "p", "prong": "q"}})
+    ok = s.run_one_job({
+        "id": "j8",
+        "name": "t",
+        "manual_run": {"run_id": "manual-8", "state": "queued"},
+        "self_improvement_proposal": {"project": "p", "prong": "q"},
+    })
 
-    assert ok is True
+    assert ok is False
+    assert calls[-1] == ("mark", "j8", False)
+    assert seen_errors == [f"Self-improvement proposal ingestion failed: {parse_error}"]
+    assert deliveries == [f"⚠️ Cron job 't' failed:\nSelf-improvement proposal ingestion failed: {parse_error}"]
+    assert manual_finishes == [
+        (
+            "j8",
+            "manual-8",
+            {
+                "success": False,
+                "output_path": "/tmp/j8.txt",
+                "error": f"Self-improvement proposal ingestion failed: {parse_error}",
+            },
+        )
+    ]
     detail = seen_health_details[0]["self_improvement_proposal_ingestion"]
     assert detail == {
         "status": "malformed",
@@ -180,6 +248,33 @@ def test_run_one_job_malformed_self_improvement_ingestion_records_health(monkeyp
         "source_key": "cron:j8:j8.txt",
         "run_id": 18,
     }
+
+
+def test_run_one_job_valid_zero_card_self_improvement_ingestion_keeps_health_ok(monkeypatch, tmp_path):
+    empty_proposal = (
+        Path(__file__).parents[1] / "fixtures" / "self_improvement" / "proposal_run_pid_empty.json"
+    ).read_text(encoding="utf-8")
+    calls = _patch_pipeline(monkeypatch, output=empty_proposal, final=empty_proposal)
+    seen_health_details = []
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
+        calls.append(("mark", jid, ok))
+        seen_health_details.append(health_details)
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    ok = s.run_one_job(
+        {
+            "id": "j-empty",
+            "name": "t",
+            "self_improvement_proposal": {"project": "pid", "prong": "visible_ui_ux_recommendations"},
+        }
+    )
+
+    assert ok is True
+    assert calls[-1] == ("mark", "j-empty", True)
+    assert seen_health_details[0]["self_improvement_proposal_ingestion"]["status"] == "empty"
 
 
 def test_run_one_job_auth_blocked_records_health_without_ingesting_output(monkeypatch):
