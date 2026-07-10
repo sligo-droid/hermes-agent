@@ -1,7 +1,10 @@
 """Tests for plugins/memory/honcho/cli.py."""
 
+import argparse
 from types import SimpleNamespace
 import json
+
+import pytest
 
 
 class FakeCompletedProcess:
@@ -405,11 +408,79 @@ class TestEmbeddingsCommand:
 
         assert cmd[:4] == ["docker", "run", "--detach", "--name"]
         assert "hermes-honcho-embeddings" in cmd
+        assert cmd[cmd.index("--restart") + 1] == "unless-stopped"
+        assert "hermes-agent=1" in cmd
+        assert "hermes-agent.component=honcho-embeddings" in cmd
         assert "127.0.0.1:8080:8080" in cmd
         assert "ghcr.io/ggml-org/llama.cpp:server" in cmd
         assert "--embedding" in cmd
         assert "-hf" in cmd
         assert "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0" in cmd
+
+    def test_build_llamacpp_docker_command_supports_network_without_publish(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cmd = honcho_cli.build_llamacpp_embedding_docker_command(
+            network="honcho_default",
+            publish=False,
+        )
+
+        assert cmd[cmd.index("--network") + 1] == "honcho_default"
+        assert "--publish" not in cmd
+        assert cmd[cmd.index("--restart") + 1] == "unless-stopped"
+
+    def test_embeddings_parser_accepts_plain_network_and_no_publish(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        parser = argparse.ArgumentParser()
+        honcho_parser = parser.add_subparsers(dest="command").add_parser("honcho")
+        honcho_cli.register_cli(honcho_parser)
+
+        args = parser.parse_args([
+            "honcho", "embeddings", "start", "--docker",
+            "--network", "honcho_default", "--no-publish",
+        ])
+
+        assert args.network == "honcho_default"
+        assert args.no_publish is True
+
+    def test_embeddings_parser_rejects_network_that_looks_like_an_option(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        for value in ("bad network", "honcho;rm"):
+            try:
+                honcho_cli._docker_network_arg(value)
+            except argparse.ArgumentTypeError:
+                pass
+            else:
+                raise AssertionError(f"accepted unsafe Docker network argument: {value}")
+
+    def test_docker_start_path_passes_network_and_no_publish(self, monkeypatch, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[1] == "ps":
+                return FakeCompletedProcess()
+            if cmd[1:3] == ["rm", "-f"]:
+                return FakeCompletedProcess()
+            if cmd[1] == "run":
+                return FakeCompletedProcess(stdout="abcdef1234567890\n")
+            raise AssertionError(cmd)
+
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(honcho_cli.subprocess, "run", fake_run)
+
+        honcho_cli.cmd_embeddings(SimpleNamespace(
+            action="start", docker=True, network="honcho_default", no_publish=True,
+        ))
+
+        run_cmd = next(cmd for cmd in calls if cmd[1] == "run")
+        assert run_cmd[run_cmd.index("--network") + 1] == "honcho_default"
+        assert "--publish" not in run_cmd
+        assert "Started Docker llama.cpp embeddings" in capsys.readouterr().out
 
     def test_embedding_dimension_report_accepts_expected_vector(self, monkeypatch):
         import plugins.memory.honcho.cli as honcho_cli
@@ -476,7 +547,8 @@ class TestEmbeddingsCommand:
                     "EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE": "always",
                     "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL": "http://127.0.0.1:9090/v1",
                 },
-                "Docker container honcho-api",
+                "process env",
+                None,
             ),
         )
 
@@ -489,7 +561,211 @@ class TestEmbeddingsCommand:
         assert cfg["dimensions"] == 2000
         assert cfg["port"] == 9090
         assert cfg["dimensions_mode"] == "always"
-        assert cfg["source"] == "Docker container honcho-api"
+        assert cfg["source"] == "process env"
+        assert cfg["base_url"] == "http://127.0.0.1:9090/v1"
+
+    def test_embedding_env_discovery_uses_only_label_constrained_inspect(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        for key in honcho_cli._EMBEDDING_RUNTIME_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+        docker_calls = []
+
+        def fake_run(cmd, **kwargs):
+            docker_calls.append(cmd)
+            if cmd[1] == "ps":
+                return FakeCompletedProcess(stdout="validated-id\n")
+            if cmd[1:4] == ["inspect", "--format", "{{json .Config.Labels}}\t{{json .Config.Image}}"]:
+                return FakeCompletedProcess(stdout='{"com.docker.compose.project":"honcho","com.docker.compose.service":"api"}\t"ghcr.io/plastic-labs/honcho:latest"\n')
+            if cmd[1] == "inspect":
+                key = next((key for key in honcho_cli._EMBEDDING_RUNTIME_ENV_KEYS if key in cmd[3]), None)
+                value = "http://embeddings:8080/v1" if key == "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL" else ""
+                return FakeCompletedProcess(stdout=json.dumps(f"{key}={value}") + "\n" if value else "")
+            raise AssertionError(cmd)
+
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: "/usr/bin/docker")
+        monkeypatch.setattr(honcho_cli.subprocess, "run", fake_run)
+
+        env, source, container_id = honcho_cli._discover_honcho_embedding_env()
+
+        assert env["EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL"] == "http://embeddings:8080/v1"
+        assert "Docker Compose project honcho api" in source
+        assert container_id == "validated-id"
+        assert docker_calls[0] == [
+            "/usr/bin/docker", "ps",
+            "--filter", "label=com.docker.compose.service=api",
+            "--filter", "label=com.docker.compose.project=honcho",
+            "--format", "{{.ID}}",
+        ]
+        assert all(call[-1] == "validated-id" for call in docker_calls[1:])
+        assert all(call[1] != "exec" for call in docker_calls)
+
+    def test_embedding_env_discovery_ignores_unrelated_name_match(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        for key in honcho_cli._EMBEDDING_RUNTIME_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeCompletedProcess(stdout="")
+
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: "/usr/bin/docker")
+        monkeypatch.setattr(honcho_cli.subprocess, "run", fake_run)
+
+        assert honcho_cli._discover_honcho_embedding_env() == ({}, "", None)
+        assert len(calls) == 1
+        assert "name=" not in " ".join(calls[0])
+
+    def test_embedding_env_discovery_does_not_guess_between_valid_candidates(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        for key in honcho_cli._EMBEDDING_RUNTIME_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[1] == "ps":
+                return FakeCompletedProcess(stdout="id-b\nid-a\n")
+            if ".Config.Labels" in cmd[3]:
+                return FakeCompletedProcess(stdout='{"com.docker.compose.project":"honcho","com.docker.compose.service":"api"}\t"honcho:latest"\n')
+            key = next((key for key in honcho_cli._EMBEDDING_RUNTIME_ENV_KEYS if key in cmd[3]), None)
+            value = "http://embeddings:8080/v1" if key == "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL" else ""
+            return FakeCompletedProcess(stdout=json.dumps(f"{key}={value}") + "\n" if value else "")
+
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: "/usr/bin/docker")
+        monkeypatch.setattr(honcho_cli.subprocess, "run", fake_run)
+
+        env, source, container_id = honcho_cli._discover_honcho_embedding_env()
+
+        assert env == {}
+        assert "ambiguous" in source.lower()
+        assert container_id is None
+
+    def test_embedding_endpoint_report_rejects_unrelated_health_listener(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        requested = []
+
+        def fake_get(url):
+            requested.append(url)
+            return False, "HTTP 404: Not Found"
+
+        def fake_post(url, payload):
+            requested.append(url)
+            return False, "HTTP 404: Not Found"
+
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+        monkeypatch.setattr(honcho_cli, "_http_get_json", fake_get)
+        monkeypatch.setattr(honcho_cli, "_http_post_json", fake_post)
+
+        ok, lines = honcho_cli._embedding_endpoint_report(
+            base_url="http://127.0.0.1:8080/v1",
+        )
+
+        assert ok is False
+        assert requested == [
+            "http://127.0.0.1:8080/v1/models",
+            "http://127.0.0.1:8080/v1/embeddings",
+        ]
+        assert any("port ownership/collision at 127.0.0.1:8080" in line for line in lines)
+
+    def test_embedding_endpoint_report_probes_configured_consumer_route(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            result = {"data": [{"id": honcho_cli.LOCAL_EMBEDDING_MODEL}]}
+            if cmd[-3] == "POST":
+                result = {"data": [{"embedding": [0.0] * honcho_cli.LOCAL_EMBEDDING_DIMENSIONS}]}
+            return FakeCompletedProcess(stdout=json.dumps({"ok": True, "result": result}))
+
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+        monkeypatch.setattr(honcho_cli.subprocess, "run", fake_run)
+
+        ok, _lines = honcho_cli._embedding_endpoint_report(
+            base_url="http://hermes-honcho-embeddings:8080/v1",
+            consumer_container_id="validated-full-id",
+        )
+
+        assert ok is True
+        assert len(calls) == 2
+        assert all(call[0][:3] == ["/usr/bin/docker", "exec", "validated-full-id"] for call in calls)
+        assert all(call[0][3:5] == ["python", "-c"] for call in calls)
+        assert all("shell" not in call[1] for call in calls)
+        assert calls[0][0][-3:] == ["GET", "http://hermes-honcho-embeddings:8080/v1/models", "{}"]
+
+    def test_embedding_endpoint_report_marks_docker_only_route_unverified(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        calls = []
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+        monkeypatch.setattr(honcho_cli.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+
+        ok, lines = honcho_cli._embedding_endpoint_report(
+            base_url="http://hermes-honcho-embeddings:8080/v1",
+        )
+
+        assert ok is False
+        assert calls == []
+        assert any("UNVERIFIED" in line for line in lines)
+
+    def test_embedding_endpoint_report_exec_failure_is_unverified(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeCompletedProcess(returncode=127, stderr="python: not found")
+
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+        monkeypatch.setattr(honcho_cli.subprocess, "run", fake_run)
+
+        ok, lines = honcho_cli._embedding_endpoint_report(
+            base_url="http://embeddings:8080/v1",
+            consumer_container_id="validated-id",
+        )
+
+        assert ok is False
+        assert len(calls) == 1
+        assert all(cmd[2] == "validated-id" for cmd in calls)
+        assert any("UNVERIFIED" in line and "python: not found" in line for line in lines)
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://user:secret@embeddings:8080/v1",
+            "http://embeddings:8080/v1?token=secret",
+            "http://embeddings:8080/v1#secret",
+        ],
+    )
+    def test_embedding_endpoint_report_rejects_sensitive_docker_probe_url(
+        self, monkeypatch, base_url,
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        calls = []
+        monkeypatch.setattr(
+            honcho_cli.shutil,
+            "which",
+            lambda name: "/usr/bin/docker" if name == "docker" else None,
+        )
+        monkeypatch.setattr(honcho_cli.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+
+        ok, lines = honcho_cli._embedding_endpoint_report(
+            base_url=base_url,
+            consumer_container_id="validated-id",
+        )
+
+        assert ok is False
+        assert calls == []
+        diagnostics = "\n".join(lines)
+        assert base_url not in diagnostics
+        assert "secret" not in diagnostics
+        assert "UNVERIFIED" in diagnostics
 
     def test_embedding_endpoint_report_accepts_docker_backed_endpoint(self, monkeypatch):
         import plugins.memory.honcho.cli as honcho_cli
@@ -564,16 +840,30 @@ class TestEmbeddingsCommand:
 
 
 class TestHonchoEmbeddingsAutoRepair:
-    def _repair(self, honcho_cli, *, health, ps_stdout, start=None, exec_result=None):
+    def _repair(
+        self, honcho_cli, *, health, ps_stdout, start=None, exec_result=None,
+        inspect_result=None,
+    ):
         calls = []
 
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
             if cmd[1:3] == ["ps", "-a"]:
                 return FakeCompletedProcess(stdout=ps_stdout)
-            if cmd[1:3] == ["start", honcho_cli.LOCAL_EMBEDDING_CONTAINER]:
+            if cmd[1] == "inspect":
+                return inspect_result or FakeCompletedProcess(
+                    stdout=(
+                        '"abcdef1234567890"\t"/hermes-honcho-embeddings"\t'
+                        '"ghcr.io/ggml-org/llama.cpp:server"\t{}\t'
+                        '["/app/llama-server"]\t'
+                        '["--embedding","--host","0.0.0.0","--port","8080"]\n'
+                    )
+                )
+            if cmd[1:4] == ["update", "--restart", "unless-stopped"]:
+                return FakeCompletedProcess(stdout=f"{honcho_cli.LOCAL_EMBEDDING_CONTAINER}\n")
+            if cmd[1:3] == ["start", "abcdef123456"]:
                 return start or FakeCompletedProcess(stdout=f"{honcho_cli.LOCAL_EMBEDDING_CONTAINER}\n")
-            if cmd[1:4] == ["exec", honcho_cli.LOCAL_EMBEDDING_CONTAINER, "test"]:
+            if cmd[1:4] == ["exec", "abcdef123456", "test"]:
                 return exec_result or FakeCompletedProcess()
             raise AssertionError(f"unexpected docker command: {cmd}")
 
@@ -598,12 +888,15 @@ class TestHonchoEmbeddingsAutoRepair:
         ok, facts, calls = self._repair(
             honcho_cli,
             health=[(True, {"status": "ok"})],
-            ps_stdout="hermes-honcho-embeddings\texited\tExited (0) 2 hours ago\n",
+            ps_stdout="abcdef123456\thermes-honcho-embeddings\texited\tExited (0) 2 hours ago\n",
         )
 
         assert ok is True
-        assert ["/usr/bin/docker", "start", "hermes-honcho-embeddings"] in calls
-        assert ["/usr/bin/docker", "exec", "hermes-honcho-embeddings", "test", "-x", "/app/llama-server"] in calls
+        assert ["/usr/bin/docker", "start", "abcdef123456"] in calls
+        assert [
+            "/usr/bin/docker", "update", "--restart", "unless-stopped", "abcdef123456"
+        ] in calls
+        assert ["/usr/bin/docker", "exec", "abcdef123456", "test", "-x", "/app/llama-server"] in calls
         assert any("Repair complete" in fact for fact in facts)
 
     def test_already_running_health_skips_repair(self):
@@ -635,7 +928,7 @@ class TestHonchoEmbeddingsAutoRepair:
         ok, facts, calls = self._repair(
             honcho_cli,
             health=[],
-            ps_stdout="hermes-honcho-embeddings\trunning\tUp 2 minutes\n",
+            ps_stdout="abcdef123456\thermes-honcho-embeddings\trunning\tUp 2 minutes\n",
         )
 
         assert ok is False
@@ -697,14 +990,62 @@ class TestHonchoEmbeddingsAutoRepair:
 
         from unittest.mock import patch
 
-        with patch.object(honcho_cli, "auto_repair_honcho_embeddings_container", fake_repair):
+        with patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (False, ["Route: FAILED (connection refused at 127.0.0.1:8080)"])), \
+             patch.object(honcho_cli, "auto_repair_honcho_embeddings_container", fake_repair):
             ok, facts = honcho_cli.repair_honcho_embeddings_for_local_base_url(
                 "http://127.0.0.1:8000",
             )
 
         assert ok is True
-        assert called == [{"port": honcho_cli.LOCAL_EMBEDDING_PORT}]
-        assert facts == ["Embeddings health failed at http://127.0.0.1:8080/health: connection refused"]
+        assert called == [{
+            "port": honcho_cli.LOCAL_EMBEDDING_PORT,
+            "health_detail": "connection refused",
+        }]
+        assert facts == ["Route: FAILED (connection refused at 127.0.0.1:8080)", "Embeddings health failed at http://127.0.0.1:8080/health: connection refused"]
+
+    def test_local_base_url_repair_stops_when_consumer_route_is_healthy(self):
+        import plugins.memory.honcho.cli as honcho_cli
+        from unittest.mock import patch
+
+        with patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (True, ["Route: OK"])), \
+             patch.object(honcho_cli, "auto_repair_honcho_embeddings_container") as repair:
+            ok, facts = honcho_cli.repair_honcho_embeddings_for_local_base_url(
+                "http://127.0.0.1:8000",
+            )
+
+        assert ok is False
+        assert facts == ["Honcho consumer embeddings route is healthy; no repair attempted", "Route: OK"]
+        repair.assert_not_called()
+
+    def test_local_base_url_repair_blocks_unverified_docker_route(self):
+        import plugins.memory.honcho.cli as honcho_cli
+        from unittest.mock import patch
+
+        config = {
+            "port": 8080, "dimensions": 1024, "model": honcho_cli.LOCAL_EMBEDDING_MODEL,
+            "dimensions_mode": "always", "base_url": "http://embeddings:8080/v1",
+            "consumer_container_id": "validated-id",
+        }
+        with patch.object(honcho_cli, "_embedding_status_config", lambda args: config), \
+             patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (False, ["Route: UNVERIFIED"])), \
+             patch.object(honcho_cli, "auto_repair_honcho_embeddings_container") as repair:
+            ok, facts = honcho_cli.repair_honcho_embeddings_for_local_base_url("http://127.0.0.1:8000")
+
+        assert ok is False
+        assert any("Repair suppressed" in fact for fact in facts)
+        repair.assert_not_called()
+
+    def test_local_base_url_repair_blocks_wrong_service_listener(self):
+        import plugins.memory.honcho.cli as honcho_cli
+        from unittest.mock import patch
+
+        with patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (False, ["Route: BLOCKED (port ownership/collision)"])), \
+             patch.object(honcho_cli, "auto_repair_honcho_embeddings_container") as repair:
+            ok, facts = honcho_cli.repair_honcho_embeddings_for_local_base_url("http://127.0.0.1:8000")
+
+        assert ok is False
+        assert any("listener collision" in fact for fact in facts)
+        repair.assert_not_called()
 
     def test_docker_start_failure_reports_exact_step(self):
         import plugins.memory.honcho.cli as honcho_cli
@@ -712,23 +1053,86 @@ class TestHonchoEmbeddingsAutoRepair:
         ok, facts, calls = self._repair(
             honcho_cli,
             health=[],
-            ps_stdout="hermes-honcho-embeddings\texited\tExited (1)\n",
+            ps_stdout="abcdef123456\thermes-honcho-embeddings\texited\tExited (1)\n",
             start=FakeCompletedProcess(returncode=1, stderr="daemon unavailable"),
         )
 
         assert ok is False
-        assert ["/usr/bin/docker", "start", "hermes-honcho-embeddings"] in calls
+        assert ["/usr/bin/docker", "start", "abcdef123456"] in calls
         assert any("docker start hermes-honcho-embeddings failed: daemon unavailable" in fact for fact in facts)
+
+    @pytest.mark.parametrize(
+        "image, command",
+        [
+            ("example.invalid/wrong:latest", '["--embedding","--host","0.0.0.0","--port","8080"]'),
+            ("ghcr.io/ggml-org/llama.cpp:server", '["--host","0.0.0.0","--port","8080"]'),
+        ],
+    )
+    def test_wrong_exact_name_container_is_never_mutated(self, image, command):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        inspect_result = FakeCompletedProcess(
+            stdout=(
+                f'"abcdef1234567890"\t"/hermes-honcho-embeddings"\t"{image}"\t'
+                f'{{}}\t["/app/llama-server"]\t{command}\n'
+            )
+        )
+        ok, facts, calls = self._repair(
+            honcho_cli,
+            health=[],
+            ps_stdout="abcdef123456\thermes-honcho-embeddings\texited\tExited (1)\n",
+            inspect_result=inspect_result,
+        )
+
+        assert ok is False
+        assert not any(cmd[1] in {"update", "start"} for cmd in calls)
+        assert any("not a validated Hermes embeddings producer" in fact for fact in facts)
+
+    def test_labeled_embeddings_container_is_accepted(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        inspect_result = FakeCompletedProcess(
+            stdout=(
+                '"abcdef1234567890"\t"/hermes-honcho-embeddings"\t"custom/image:local"\t'
+                '{"hermes-agent":"1","hermes-agent.component":"honcho-embeddings"}\t'
+                '["custom-server"]\t["serve"]\n'
+            )
+        )
+        ok, facts, calls = self._repair(
+            honcho_cli,
+            health=[(True, {"status": "ok"})],
+            ps_stdout="abcdef123456\thermes-honcho-embeddings\texited\tExited (0)\n",
+            inspect_result=inspect_result,
+        )
+
+        assert ok is True
+        assert any("validated by Hermes labels" in fact for fact in facts)
+        assert any(cmd[1] == "start" for cmd in calls)
 
     def test_health_timeout_reports_timeout(self):
         import plugins.memory.honcho.cli as honcho_cli
 
         ticks = iter([0, 0, 2])
+
+        def fake_run(cmd, **kwargs):
+            if cmd[1:3] == ["ps", "-a"]:
+                return FakeCompletedProcess(
+                    stdout="abcdef123456\thermes-honcho-embeddings\texited\tExited (0)\n"
+                )
+            if cmd[1] == "inspect":
+                return FakeCompletedProcess(
+                    stdout=(
+                        '"abcdef1234567890"\t"/hermes-honcho-embeddings"\t'
+                        '"ghcr.io/ggml-org/llama.cpp:server"\t{}\t'
+                        '["/app/llama-server"]\t'
+                        '["--embedding","--host","0.0.0.0","--port","8080"]\n'
+                    )
+                )
+            return FakeCompletedProcess()
+
         ok, facts = honcho_cli.auto_repair_honcho_embeddings_container(
             health_detail="connection refused",
-            run=lambda cmd, **kwargs: FakeCompletedProcess(
-                stdout="hermes-honcho-embeddings\texited\tExited (0)\n"
-            ) if cmd[1:3] == ["ps", "-a"] else FakeCompletedProcess(),
+            run=fake_run,
             which=lambda name: "/usr/bin/docker" if name == "docker" else None,
             http_get=lambda url: (False, "connection refused"),
             sleep=lambda seconds: None,
@@ -745,12 +1149,12 @@ class TestHonchoEmbeddingsAutoRepair:
         ok, facts, calls = self._repair(
             honcho_cli,
             health=[(True, {"status": "ok"})],
-            ps_stdout="hermes-honcho-embeddings\texited\tExited (0)\n",
+            ps_stdout="abcdef123456\thermes-honcho-embeddings\texited\tExited (0)\n",
             exec_result=FakeCompletedProcess(returncode=1, stderr="missing"),
         )
 
         assert ok is False
-        assert ["/usr/bin/docker", "exec", "hermes-honcho-embeddings", "test", "-x", "/app/llama-server"] in calls
+        assert ["/usr/bin/docker", "exec", "abcdef123456", "test", "-x", "/app/llama-server"] in calls
         assert any("/app/llama-server missing" in fact for fact in facts)
 
 

@@ -5,6 +5,7 @@ Handles: hermes honcho setup | status | sessions | map | peer
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -27,6 +28,7 @@ LOCAL_EMBEDDING_PORT = 8080
 LOCAL_EMBEDDING_BASE_URL = f"http://127.0.0.1:{LOCAL_EMBEDDING_PORT}/v1"
 LOCAL_EMBEDDING_CONTAINER = "hermes-honcho-embeddings"
 LOCAL_LLAMACPP_DOCKER_IMAGE = "ghcr.io/ggml-org/llama.cpp:server"
+LOCAL_EMBEDDING_COMPONENT_LABEL = "honcho-embeddings"
 LOCAL_HONCHO_BASE_URL = "http://127.0.0.1:8000"
 LOCAL_LLM_BASE_URL = "http://127.0.0.1:8645/v1"
 LOCAL_LLM_MODEL = "gpt-5.5"
@@ -38,6 +40,14 @@ _EMBEDDING_RUNTIME_ENV_KEYS = (
     "EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE",
     "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL",
 )
+
+
+def _docker_network_arg(value: str) -> str:
+    if not value or value.startswith("-") or any(char.isspace() for char in value):
+        raise argparse.ArgumentTypeError("network must be a plain Docker network name")
+    if any(not (char.isalnum() or char in "_.-") for char in value):
+        raise argparse.ArgumentTypeError("network may contain only letters, numbers, '.', '_', and '-'")
+    return value
 
 
 LOCAL_FIRST_HONCHO_ENV = {
@@ -125,21 +135,32 @@ def build_llamacpp_embedding_docker_command(
     ctx: int = LOCAL_EMBEDDING_CONTEXT,
     port: int = LOCAL_EMBEDDING_PORT,
     container_name: str = LOCAL_EMBEDDING_CONTAINER,
+    network: str | None = None,
+    publish: bool = True,
 ) -> list[str]:
     """Return a Docker-backed llama.cpp embedding server command."""
-    return [
+    cmd = [
         "docker",
         "run",
         "--detach",
         "--name", container_name,
-        "--publish", f"127.0.0.1:{port}:8080",
+        "--restart", "unless-stopped",
+        "--label", "hermes-agent=1",
+        "--label", f"hermes-agent.component={LOCAL_EMBEDDING_COMPONENT_LABEL}",
+    ]
+    if network:
+        cmd.extend(["--network", network])
+    if publish:
+        cmd.extend(["--publish", f"127.0.0.1:{port}:8080"])
+    cmd.extend([
         LOCAL_LLAMACPP_DOCKER_IMAGE,
         "--embedding",
         "--host", "0.0.0.0",
         "--port", "8080",
         "-c", str(ctx),
         "-hf", model,
-    ]
+    ])
+    return cmd
 
 
 def clone_honcho_for_profile(profile_name: str) -> bool:
@@ -483,76 +504,100 @@ def _embedding_port_from_base_url(base_url: str | None) -> int | None:
         return None
 
 
-def _env_list_to_dict(items: object) -> dict[str, str]:
-    env: dict[str, str] = {}
-    if not isinstance(items, list):
-        return env
-    for item in items:
-        if not isinstance(item, str) or "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        env[key] = value
-    return env
-
-
-def _discover_honcho_embedding_env() -> tuple[dict[str, str], str]:
+def _discover_honcho_embedding_env() -> tuple[dict[str, str], str, str | None]:
     process_env = {
         key: os.environ[key]
         for key in _EMBEDDING_RUNTIME_ENV_KEYS
         if os.environ.get(key)
     }
     if process_env:
-        return process_env, "process env"
+        return process_env, "process env", None
 
+    docker = shutil.which("docker")
+    if not docker:
+        return {}, "", None
+    filters = [
+        "--filter", "label=com.docker.compose.service=api",
+        "--filter", "label=com.docker.compose.project=honcho",
+    ]
     try:
-        import subprocess
-
         ps = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
+            [docker, "ps", *filters, "--format", "{{.ID}}"],
+            capture_output=True, text=True, timeout=5, check=False,
         )
     except Exception:
-        return {}, ""
+        return {}, "", None
     if ps.returncode != 0:
-        return {}, ""
+        return {}, "", None
 
-    names = [
-        line.strip()
-        for line in ps.stdout.splitlines()
-        if line.strip() and "honcho" in line.strip().lower()
-    ]
-    for name in names:
+    matches: list[tuple[str, dict[str, str], str]] = []
+    for container_id in sorted(set(ps.stdout.split())):
+        metadata_format = (
+            "{{json .Config.Labels}}\t{{json .Config.Image}}"
+        )
         try:
-            inspect = subprocess.run(
-                ["docker", "inspect", "--format", "{{json .Config.Env}}", name],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                check=False,
+            metadata = subprocess.run(
+                [docker, "inspect", "--format", metadata_format, container_id],
+                capture_output=True, text=True, timeout=5, check=False,
             )
         except Exception:
             continue
-        if inspect.returncode != 0:
+        if metadata.returncode != 0:
             continue
         try:
-            env = _env_list_to_dict(json.loads(inspect.stdout))
-        except Exception:
+            labels_raw, image_raw = metadata.stdout.strip().split("\t", 1)
+            labels = json.loads(labels_raw)
+            image = json.loads(image_raw)
+        except (ValueError, TypeError, json.JSONDecodeError):
             continue
-        embedding_env = {
-            key: env[key]
-            for key in _EMBEDDING_RUNTIME_ENV_KEYS
-            if env.get(key)
-        }
-        if embedding_env:
-            return embedding_env, f"Docker container {name}"
-    return {}, ""
+        project = labels.get("com.docker.compose.project", "") if isinstance(labels, dict) else ""
+        service = labels.get("com.docker.compose.service", "") if isinstance(labels, dict) else ""
+        image_path = str(image).split("@", 1)[0]
+        image_leaf = image_path.rsplit("/", 1)[-1].split(":", 1)[0].lower()
+        if service != "api" or project.lower() != "honcho" or image_leaf not in {"honcho", "honcho-api"}:
+            continue
+
+        env: dict[str, str] = {}
+        for key in _EMBEDDING_RUNTIME_ENV_KEYS:
+            env_format = (
+                "{{range .Config.Env}}{{if eq (index (split . \"=\") 0) "
+                f"{json.dumps(key)}"
+                "}}{{json .}}{{end}}{{end}}"
+            )
+            try:
+                inspected = subprocess.run(
+                    [docker, "inspect", "--format", env_format, container_id],
+                    capture_output=True, text=True, timeout=5, check=False,
+                )
+            except Exception:
+                env = {}
+                break
+            if inspected.returncode != 0:
+                env = {}
+                break
+            raw = inspected.stdout.strip()
+            if raw:
+                try:
+                    item = json.loads(raw)
+                    item_key, value = item.split("=", 1)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    env = {}
+                    break
+                if item_key == key and value:
+                    env[key] = value
+        if env.get("EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL"):
+            matches.append((container_id, env, project))
+
+    if len(matches) == 1:
+        container_id, env, project = matches[0]
+        return env, f"Docker Compose project {project} api ({container_id[:12]})", container_id
+    if len(matches) > 1:
+        return {}, "Docker discovery ambiguous: multiple label-validated Honcho api containers", None
+    return {}, "", None
 
 
 def _embedding_status_config(args) -> dict[str, object]:
-    env, source = _discover_honcho_embedding_env()
+    env, source, consumer_container_id = _discover_honcho_embedding_env()
     base_url = env.get("EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL")
     explicit_port = getattr(args, "port", None)
 
@@ -581,8 +626,10 @@ def _embedding_status_config(args) -> dict[str, object]:
         "ctx": ctx,
         "dimensions": dimensions,
         "port": port,
+        "base_url": base_url or f"http://127.0.0.1:{port}/v1",
         "dimensions_mode": env.get("EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE") or "",
         "source": source,
+        "consumer_container_id": consumer_container_id,
     }
 
 
@@ -611,43 +658,104 @@ def _docker_container_state(
     docker: str,
     *,
     run=subprocess.run,
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str | None, str]:
     """Return exact Docker state for the local embeddings container."""
     cmd = [
         docker,
         "ps",
         "-a",
         "--filter", f"name=^{LOCAL_EMBEDDING_CONTAINER}$",
-        "--format", "{{.Names}}\t{{.State}}\t{{.Status}}",
+        "--format", "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Status}}",
     ]
     try:
         proc = run(cmd, capture_output=True, text=True, timeout=5, check=False)
     except Exception as exc:
-        return None, f"docker ps failed: {exc}"
+        return None, None, f"docker ps failed: {exc}"
     if proc.returncode != 0:
-        return None, f"docker ps failed: {(proc.stderr or proc.stdout).strip()[:500]}"
+        return None, None, f"docker ps failed: {(proc.stderr or proc.stdout).strip()[:500]}"
 
     matches = []
     for raw in proc.stdout.splitlines():
-        parts = raw.split("\t", 2)
-        if len(parts) >= 2 and parts[0] == LOCAL_EMBEDDING_CONTAINER:
-            status = parts[2] if len(parts) > 2 else ""
-            matches.append((parts[1].strip().lower(), status.strip()))
+        parts = raw.split("\t", 3)
+        if len(parts) >= 3 and parts[1] == LOCAL_EMBEDDING_CONTAINER:
+            status = parts[3] if len(parts) > 3 else ""
+            matches.append((parts[0].strip(), parts[2].strip().lower(), status.strip()))
     if not matches:
-        return None, f"container {LOCAL_EMBEDDING_CONTAINER} not found"
-    state, status = matches[0]
-    detail = f"container {LOCAL_EMBEDDING_CONTAINER} state={state}"
+        return None, None, f"container {LOCAL_EMBEDDING_CONTAINER} not found"
+    container_id, state, status = matches[0]
+    detail = f"container {LOCAL_EMBEDDING_CONTAINER} id={container_id} state={state}"
     if status:
         detail += f" status={status}"
-    return state, detail
+    return container_id, state, detail
+
+
+def _validate_embeddings_container_identity(
+    docker: str,
+    container_id: str,
+    *,
+    run=subprocess.run,
+) -> tuple[bool, str]:
+    """Validate stopped-container metadata by the ID returned from exact-name lookup."""
+    metadata_format = (
+        "{{json .Id}}\t{{json .Name}}\t{{json .Config.Image}}\t"
+        "{{json .Config.Labels}}\t{{json .Config.Entrypoint}}\t{{json .Config.Cmd}}"
+    )
+    try:
+        proc = run(
+            [docker, "inspect", "--format", metadata_format, container_id],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"Repair blocked: container identity inspection failed: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:500]
+        return False, f"Repair blocked: container identity inspection failed: {detail}"
+    try:
+        raw_id, raw_name, raw_image, raw_labels, raw_entrypoint, raw_cmd = proc.stdout.strip().split("\t", 5)
+        inspected_id = json.loads(raw_id)
+        name = json.loads(raw_name)
+        image = json.loads(raw_image)
+        labels = json.loads(raw_labels) or {}
+        entrypoint = json.loads(raw_entrypoint) or []
+        command = json.loads(raw_cmd) or []
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return False, "Repair blocked: container identity inspection returned invalid metadata"
+
+    if not isinstance(inspected_id, str) or not inspected_id.startswith(container_id):
+        return False, "Repair blocked: inspected container ID does not match exact-name target"
+    if name != f"/{LOCAL_EMBEDDING_CONTAINER}":
+        return False, "Repair blocked: inspected container name does not match exact-name target"
+
+    is_labeled = (
+        isinstance(labels, dict)
+        and labels.get("hermes-agent") == "1"
+        and labels.get("hermes-agent.component") == LOCAL_EMBEDDING_COMPONENT_LABEL
+    )
+    argv = [str(arg) for arg in [*entrypoint, *command]]
+    has_embedding_contract = (
+        "--embedding" in argv
+        and "--host" in argv
+        and argv[argv.index("--host") + 1:argv.index("--host") + 2] == ["0.0.0.0"]
+        and "--port" in argv
+        and argv[argv.index("--port") + 1:argv.index("--port") + 2] == ["8080"]
+    )
+    is_legacy = image == LOCAL_LLAMACPP_DOCKER_IMAGE and has_embedding_contract
+    if not (is_labeled or is_legacy):
+        return False, "Repair blocked: exact-name container is not a validated Hermes embeddings producer"
+    identity = "Hermes labels" if is_labeled else "legacy image and embedding command"
+    return True, f"Container identity validated by {identity} (id={inspected_id[:12]})"
 
 
 def _verify_container_llama_server(
     docker: str,
+    container_id: str,
     *,
     run=subprocess.run,
 ) -> tuple[bool, str]:
-    cmd = [docker, "exec", LOCAL_EMBEDDING_CONTAINER, "test", "-x", "/app/llama-server"]
+    cmd = [docker, "exec", container_id, "test", "-x", "/app/llama-server"]
     try:
         proc = run(cmd, capture_output=True, text=True, timeout=10, check=False)
     except Exception as exc:
@@ -691,13 +799,34 @@ def auto_repair_honcho_embeddings_container(
         facts.append("Repair failed: docker not found")
         return False, facts
 
-    state, state_detail = _docker_container_state(docker, run=run)
+    container_id, state, state_detail = _docker_container_state(docker, run=run)
     facts.append(state_detail)
     if state not in {"exited", "stopped"}:
         facts.append("Repair skipped: container is not in the stopped/exited state")
         return False, facts
 
-    start_cmd = [docker, "start", LOCAL_EMBEDDING_CONTAINER]
+    identity_ok, identity_detail = _validate_embeddings_container_identity(
+        docker, container_id, run=run,
+    )
+    facts.append(identity_detail)
+    if not identity_ok:
+        return False, facts
+
+    update_cmd = [docker, "update", "--restart", "unless-stopped", container_id]
+    try:
+        update = run(update_cmd, capture_output=True, text=True, timeout=30, check=False)
+    except Exception as exc:
+        facts.append(f"Repair failed: Docker restart policy update failed: {exc}")
+        return False, facts
+    if update.returncode != 0:
+        facts.append(
+            "Repair failed: Docker restart policy update failed: "
+            f"{(update.stderr or update.stdout).strip()[:500]}"
+        )
+        return False, facts
+    facts.append("Repair persisted: Docker restart policy is unless-stopped")
+
+    start_cmd = [docker, "start", container_id]
     try:
         start = run(start_cmd, capture_output=True, text=True, timeout=30, check=False)
     except Exception as exc:
@@ -723,7 +852,7 @@ def auto_repair_honcho_embeddings_container(
             return False, facts
         sleep(poll_interval)
 
-    ok_llama, llama_detail = _verify_container_llama_server(docker, run=run)
+    ok_llama, llama_detail = _verify_container_llama_server(docker, container_id, run=run)
     facts.append(llama_detail)
     if not ok_llama:
         facts.append("Repair failed: container did not pass /app/llama-server verification")
@@ -765,9 +894,12 @@ def _embedding_dimension_report(
     expected_dimensions: int = LOCAL_EMBEDDING_DIMENSIONS,
     model: str = LOCAL_EMBEDDING_MODEL,
     dimensions_mode: str = "",
+    base_url: str | None = None,
+    http_post=None,
 ) -> tuple[bool, str]:
-    ok, result = _http_post_json(
-        _embedding_url(port, "/v1/embeddings"),
+    embeddings_url = (base_url or _embedding_url(port, "/v1")).rstrip("/") + "/embeddings"
+    ok, result = (http_post or _http_post_json)(
+        embeddings_url,
         {"model": model, "input": "Hermes local Honcho embedding dimension check"},
     )
     if not ok:
@@ -800,15 +932,73 @@ def _embedding_dimension_report(
     return True, f"OK ({actual})"
 
 
+_DOCKER_HTTP_PROBE_SCRIPT = """import json,sys,urllib.request
+method,url,payload=sys.argv[1:4]
+try:
+    data=None if method == "GET" else payload.encode("utf-8")
+    request=urllib.request.Request(url,data=data,headers={"Content-Type":"application/json"},method=method)
+    with urllib.request.urlopen(request,timeout=5) as response:
+        body=response.read().decode("utf-8",errors="replace")
+    print(json.dumps({"ok":True,"result":json.loads(body) if body else {}}))
+except Exception as exc:
+    print(json.dumps({"ok":False,"error":str(exc)}))
+"""
+
+
+def _docker_http_json(
+    docker: str,
+    container_id: str,
+    method: str,
+    url: str,
+    payload: dict | None = None,
+    *,
+    run=None,
+) -> tuple[str, object | str]:
+    """Probe HTTP from one previously validated container using fixed argv."""
+    parsed = urlparse(url)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return "unverified", "Docker consumer probe URL contains disallowed sensitive components"
+    cmd = [
+        docker,
+        "exec",
+        container_id,
+        "python",
+        "-c",
+        _DOCKER_HTTP_PROBE_SCRIPT,
+        method,
+        url,
+        json.dumps(payload or {}, separators=(",", ":")),
+    ]
+    try:
+        proc = (run or subprocess.run)(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception as exc:
+        return "unverified", f"Docker consumer probe could not execute: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:500]
+        return "unverified", f"Docker consumer probe unavailable: {detail or f'exit {proc.returncode}'}"
+    try:
+        result = json.loads(proc.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return "unverified", "Docker consumer probe returned invalid output"
+    if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+        return "unverified", "Docker consumer probe returned invalid output"
+    if result["ok"]:
+        return "ok", result.get("result", {})
+    return "failed", str(result.get("error") or "consumer request failed")
+
+
 def _embedding_endpoint_report(
     port: int = LOCAL_EMBEDDING_PORT,
     expected_dimensions: int = LOCAL_EMBEDDING_DIMENSIONS,
     model: str = LOCAL_EMBEDDING_MODEL,
     dimensions_mode: str = "",
+    base_url: str | None = None,
+    consumer_container_id: str | None = None,
 ) -> tuple[bool, list[str]]:
     lines = []
     try:
-        import shutil
         llama_server = shutil.which("llama-server")
         docker = shutil.which("docker")
     except Exception:
@@ -817,34 +1007,82 @@ def _embedding_endpoint_report(
     lines.append(f"  llama-server: {'OK (' + llama_server + ')' if llama_server else 'MISSING'}")
     lines.append(f"  Docker:      {'OK (' + docker + ')' if docker else 'MISSING'}")
 
-    ok_health, health = _http_get_json(_embedding_url(port, "/health"))
-    lines.append(f"  Health:     {'OK' if ok_health else 'FAILED'} ({health})")
+    consumer_base_url = (base_url or _embedding_url(port, "/v1")).rstrip("/")
+    probe_unverified = False
+    if _is_local_url(consumer_base_url):
+        ok_models_http, models = _http_get_json(consumer_base_url + "/models")
 
-    ok_models, models = _http_get_json(_embedding_url(port, "/v1/models"))
+        def http_post(url, payload):
+            return _http_post_json(url, payload)
+    elif docker and consumer_container_id:
+        models_status, models = _docker_http_json(
+            docker, consumer_container_id, "GET", consumer_base_url + "/models",
+        )
+        ok_models_http = models_status == "ok"
+        probe_unverified = models_status == "unverified"
+
+        def http_post(url, payload):
+            nonlocal probe_unverified
+            status, result = _docker_http_json(
+                docker, consumer_container_id, "POST", url, payload,
+            )
+            probe_unverified = probe_unverified or status == "unverified"
+            return status == "ok", result
+    else:
+        ok_models_http = False
+        models = "exact validated Docker consumer identity unavailable"
+        probe_unverified = True
+
+        def http_post(url, payload):
+            return False, "exact validated Docker consumer identity unavailable"
+    model_ids = []
+    if ok_models_http and isinstance(models, dict) and isinstance(models.get("data"), list):
+        for item in models["data"]:
+            if isinstance(item, dict) and item.get("id"):
+                model_ids.append(str(item["id"]))
+    ok_models = bool(model_ids)
     if ok_models:
-        model_ids = []
-        if isinstance(models, dict):
-            for item in models.get("data", []):
-                if isinstance(item, dict) and item.get("id"):
-                    model_ids.append(str(item["id"]))
-        model_text = ", ".join(model_ids) if model_ids else "available"
+        model_text = ", ".join(model_ids)
         lines.append(f"  Models:     OK ({model_text})")
     else:
-        lines.append(f"  Models:     FAILED ({models})")
+        detail = models if not ok_models_http else "response did not contain OpenAI model data"
+        lines.append(f"  Models:     FAILED ({detail})")
 
-    ok_dims = False
-    if ok_health:
+    if probe_unverified:
+        ok_dims = False
+        dim_detail = "skipped because Docker models probe was unverified"
+    else:
         ok_dims, dim_detail = _embedding_dimension_report(
             port=port,
             expected_dimensions=expected_dimensions,
             model=model,
             dimensions_mode=dimensions_mode,
+            base_url=consumer_base_url,
+            http_post=http_post,
         )
-        lines.append(f"  Dimensions: {'OK' if ok_dims else 'FAILED'} ({dim_detail})")
-    else:
-        lines.append("  Dimensions: SKIPPED (embedding endpoint is not healthy)")
+    lines.append(f"  Dimensions: {'OK' if ok_dims else 'FAILED'} ({dim_detail})")
+    route_ok = ok_models and ok_dims
+    if not route_ok and _is_local_url(consumer_base_url):
+        parsed = urlparse(consumer_base_url)
+        listener = f"{parsed.hostname}:{parsed.port or 80}"
+        if not ok_models_http and _is_connection_refused(models) and _is_connection_refused(dim_detail):
+            lines.append(f"  Route:      FAILED (connection refused at {listener})")
+        else:
+            lines.append(
+                f"  Route:      BLOCKED (port ownership/collision at {listener}; "
+                "a listener responded without the configured OpenAI "
+                "/v1/models and /v1/embeddings semantics)"
+            )
+    elif not route_ok:
+        if probe_unverified:
+            lines.append(f"  Route:      UNVERIFIED (Docker consumer probe unavailable: {models})")
+        else:
+            lines.append(
+                "  Route:      FAILED (validated Docker consumer could not reach "
+                "the configured OpenAI /v1/models and /v1/embeddings route)"
+            )
 
-    return ok_health and ok_models and ok_dims, lines
+    return route_ok, lines
 
 
 def _honcho_base_url_health(base_url: str) -> tuple[bool, str]:
@@ -879,8 +1117,28 @@ def repair_honcho_embeddings_for_local_base_url(
 ) -> tuple[bool, list[str]]:
     if not _is_local_url(base_url):
         return False, ["Repair skipped: Honcho base URL is not local"]
-    repaired, facts = auto_repair_honcho_embeddings_container(port=port)
-    return repaired, facts
+    config = _embedding_status_config(object())
+    route_ok, route_lines = _embedding_endpoint_report(
+        port=int(config["port"]),
+        expected_dimensions=int(config["dimensions"]),
+        model=str(config["model"]),
+        dimensions_mode=str(config["dimensions_mode"]),
+        base_url=str(config["base_url"]),
+        consumer_container_id=config.get("consumer_container_id"),
+    )
+    if route_ok:
+        return False, ["Honcho consumer embeddings route is healthy; no repair attempted", *route_lines]
+    configured_base_url = str(config["base_url"])
+    if not _is_local_url(configured_base_url):
+        return False, [*route_lines, "Repair suppressed: configured Docker-only route is healthy or unverified"]
+    if not any("connection refused at" in line for line in route_lines):
+        return False, [*route_lines, "Repair blocked: configured local embeddings port has a listener collision"]
+    configured_port = _embedding_port_from_base_url(configured_base_url) or port
+    repaired, facts = auto_repair_honcho_embeddings_container(
+        port=configured_port,
+        health_detail="connection refused",
+    )
+    return repaired, [*route_lines, *facts]
 
 
 def _embedding_pid_path() -> Path:
@@ -909,6 +1167,8 @@ def cmd_embeddings(args) -> None:
     batch_size = getattr(args, "batch_size", None)
     ubatch_size = getattr(args, "ubatch_size", None)
     use_docker = bool(getattr(args, "docker", False))
+    network = getattr(args, "network", None)
+    publish = not bool(getattr(args, "no_publish", False))
 
     if action == "config":
         print("\nHoncho llama.cpp embeddings config\n" + "-" * 40)
@@ -971,6 +1231,7 @@ def cmd_embeddings(args) -> None:
         dimensions = int(status_config["dimensions"])
         port = int(status_config["port"])
         dimensions_mode = str(status_config["dimensions_mode"])
+        base_url = str(status_config["base_url"])
         source = str(status_config["source"])
         print("\nHoncho llama.cpp embeddings status\n" + "-" * 40)
         print(f"  Expected:   {_embedding_url(port, '/v1')}")
@@ -985,6 +1246,8 @@ def cmd_embeddings(args) -> None:
             expected_dimensions=dimensions,
             model=model,
             dimensions_mode=dimensions_mode,
+            base_url=base_url,
+            consumer_container_id=status_config.get("consumer_container_id"),
         )
         for line in lines:
             print(line)
@@ -1042,7 +1305,13 @@ def cmd_embeddings(args) -> None:
 
             remove_cmd = [docker, "rm", "-f", LOCAL_EMBEDDING_CONTAINER]
             subprocess.run(remove_cmd, capture_output=True, text=True, timeout=30)
-            cmd = build_llamacpp_embedding_docker_command(model=model, ctx=ctx, port=port)
+            cmd = build_llamacpp_embedding_docker_command(
+                model=model,
+                ctx=ctx,
+                port=port,
+                network=network,
+                publish=publish,
+            )
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if proc.returncode != 0:
                 print("\nCannot start Docker llama.cpp embeddings")
@@ -2597,6 +2866,14 @@ def register_cli(subparser) -> None:
     embeddings_parser.add_argument(
         "--docker", action="store_true",
         help="Start embeddings with the official llama.cpp Docker image",
+    )
+    embeddings_parser.add_argument(
+        "--network", type=_docker_network_arg,
+        help="Attach the Docker embeddings container to this named network",
+    )
+    embeddings_parser.add_argument(
+        "--no-publish", action="store_true",
+        help="Do not publish host port 8080 (use with --network for Dockerized Honcho)",
     )
 
     subparser.set_defaults(func=honcho_command)
