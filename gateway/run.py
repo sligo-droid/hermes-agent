@@ -59,6 +59,7 @@ from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
+from hermes_cli.model_tiers import resolve_model_tier
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -178,8 +179,26 @@ def _is_standard_discord_feature_request(
     return _is_standard_discord_action_request(source, feature_summary)
 
 
+def _gateway_model_tier(config: Optional[dict]) -> Any:
+    """Return the named tier used by ordinary gateway sessions."""
+    cfg = config or {}
+    name = cfg_get(cfg, "gateway", "model_tier", default="basic")
+    return resolve_model_tier(cfg, name)
+
+
+def _discord_action_request_model_tier(config: Optional[dict]) -> Any:
+    """Return the named tier for ordinary Discord action-request threads."""
+    cfg = config or {}
+    name = cfg_get(cfg, "discord", "action_request_model_tier", default="intermediate")
+    return resolve_model_tier(cfg, name)
+
+
 def _discord_action_request_reasoning_config(config: Optional[dict]) -> dict | None:
     """Reasoning override for ordinary Discord action-request threads."""
+    model_tier = _discord_action_request_model_tier(config)
+    if model_tier is not None:
+        return model_tier.reasoning_config()
+
     from hermes_constants import parse_reasoning_effort
 
     raw = cfg_get(config or {}, "discord", "action_request_reasoning_effort", default=None)
@@ -2098,6 +2117,9 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     openai-codex.
     """
     cfg = config if config is not None else _load_gateway_config()
+    model_tier = _gateway_model_tier(cfg)
+    if model_tier is not None:
+        return model_tier.model
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
         return model_cfg
@@ -3103,6 +3125,7 @@ class GatewayRunner:
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        model_override: Optional[str] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -3117,7 +3140,7 @@ class GatewayRunner:
             except Exception:
                 resolved_session_key = None
 
-        model = _resolve_gateway_model(user_config)
+        model = str(model_override or "").strip() or _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -3633,6 +3656,9 @@ class GatewayRunner:
         """
         from hermes_constants import parse_reasoning_effort
         cfg = _load_gateway_runtime_config()
+        model_tier = _gateway_model_tier(cfg)
+        if model_tier is not None:
+            return model_tier.reasoning_config()
         effort = str(cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip()
         result = parse_reasoning_effort(effort)
         if effort and effort.strip() and result is None:
@@ -20808,10 +20834,16 @@ class GatewayRunner:
             _reload_runtime_env_preserving_config_authority()
 
             try:
+                action_request_tier = (
+                    _discord_action_request_model_tier(user_config)
+                    if standard_discord_action_request
+                    else None
+                )
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    model_override=action_request_tier.model if action_request_tier is not None else None,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",

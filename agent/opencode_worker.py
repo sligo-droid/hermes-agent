@@ -270,6 +270,35 @@ def load_coding_worker_backend(
     return BACKEND_OPENCODE
 
 
+def load_coding_worker_model_tier(
+    config: Optional[dict[str, Any]] = None,
+    *,
+    worker_config: Optional[dict[str, Any]] = None,
+) -> Any:
+    """Resolve the named tier for ordinary delegated coding work."""
+    cfg = config
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+    if not isinstance(cfg, dict):
+        return None
+
+    coding_cfg = cfg.get("coding_worker") if isinstance(cfg.get("coding_worker"), dict) else {}
+    tier_name = coding_cfg.get("model_tier")
+    if worker_config and "model_tier" in worker_config:
+        tier_name = worker_config.get("model_tier")
+    try:
+        from hermes_cli.model_tiers import resolve_model_tier
+
+        return resolve_model_tier(cfg, tier_name)
+    except Exception:
+        return None
+
+
 def load_coding_worker_pass_config(
     config: Optional[dict[str, Any]] = None,
     *,
@@ -287,6 +316,15 @@ def load_coding_worker_pass_config(
     coding_cfg: dict[str, Any] = {}
     if isinstance(cfg, dict) and isinstance(cfg.get("coding_worker"), dict):
         coding_cfg.update(cfg["coding_worker"])
+    model_tier = load_coding_worker_model_tier(cfg, worker_config=worker_config)
+    if model_tier is not None:
+        coding_cfg.update(
+            {
+                "simple_build_reasoning_level": model_tier.reasoning_effort,
+                "complex_plan_reasoning_level": model_tier.reasoning_effort,
+                "complex_build_reasoning_level": model_tier.reasoning_effort,
+            }
+        )
     if worker_config:
         for key in (
             "simple_build_reasoning_level",
@@ -328,6 +366,9 @@ def load_opencode_config(
         coding_cfg = cfg.get("coding_worker") if isinstance(cfg.get("coding_worker"), dict) else {}
         if isinstance(coding_cfg.get("opencode"), dict):
             opencode_cfg.update(coding_cfg["opencode"])
+    model_tier = load_coding_worker_model_tier(cfg, worker_config=worker_config)
+    if model_tier is not None:
+        opencode_cfg["model"] = model_tier.opencode_model
 
     if worker_config and isinstance(worker_config.get("opencode"), dict):
         opencode_cfg.update(worker_config["opencode"])

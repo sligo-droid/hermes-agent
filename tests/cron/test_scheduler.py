@@ -1655,9 +1655,14 @@ class TestRunJobConfigEnvVarExpansion:
     }
 
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
-        """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
-        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_MODEL}\n")
+        """${VAR} in a fallback model config is expanded after .env is loaded."""
+        (tmp_path / "config.yaml").write_text(
+            "cron:\n"
+            "  model_tier: \"\"\n"
+            "model: ${_HERMES_TEST_CRON_MODEL}\n"
+        )
         monkeypatch.setenv("_HERMES_TEST_CRON_MODEL", "gpt-4o-mini-cron-test")
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
 
         job = {"id": "env-job", "name": "env test", "prompt": "hi"}
         fake_db = MagicMock()
@@ -1717,8 +1722,13 @@ class TestRunJobConfigEnvVarExpansion:
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
-        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
+        (tmp_path / "config.yaml").write_text(
+            "cron:\n"
+            "  model_tier: \"\"\n"
+            "model: ${_HERMES_TEST_CRON_UNSET_VAR}\n"
+        )
         monkeypatch.delenv("_HERMES_TEST_CRON_UNSET_VAR", raising=False)
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
 
         job = {"id": "unset-job", "name": "unset var test", "prompt": "hi"}
         fake_db = MagicMock()

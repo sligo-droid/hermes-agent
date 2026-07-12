@@ -140,7 +140,9 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert FakeSession.instances[0].kwargs["scope_purpose"] == "Codex coding worker build pass"
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model_reasoning_effort="medium"',
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
     ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -356,7 +358,10 @@ def test_ui_opencode_route_uses_configured_backend_and_model(monkeypatch, tmp_pa
     assert route["backend"] == "opencode"
     assert route["selected_provider"] == "openrouter"
     assert route["selected_model"] == "z-ai/glm-5.2"
-    assert seen["worker_config"] == {"opencode": {"model": "openrouter/z-ai/glm-5.2"}}
+    assert seen["worker_config"] == {
+        "opencode": {"model": "openrouter/z-ai/glm-5.2"},
+        "model_tier": "",
+    }
     env = seen["env"]
     assert "OPENROUTER_API_KEY" not in env
     assert env["_HERMES_FORCE_OPENROUTER_API_KEY"] == "sk-or-test-secret"
@@ -842,7 +847,9 @@ def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monk
     assert "visual ui work" in route["advisory_reason"]
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model_reasoning_effort="medium"',
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
     ]
 
 
@@ -934,7 +941,9 @@ def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch,
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model_reasoning_effort="medium"',
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
     ]
 
 
@@ -997,7 +1006,9 @@ def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
     assert result["ui_work_route"]["matched"] is False
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model_reasoning_effort="medium"',
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
     ]
 
 
@@ -1400,11 +1411,15 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
     assert result["tool_iterations"] == 4
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model_reasoning_effort="xhigh"',
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model_reasoning_effort="medium"',
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
     ]
     assert "Do not edit repository files" in FakeSession.instances[0].run_calls[0]["user_input"]
     assert "Codex plan to follow:" in FakeSession.instances[1].run_calls[0]["user_input"]
@@ -1442,9 +1457,13 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
     assert result["success"] is True
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
+        'model="gpt-5.6-terra"',
+        "-c",
         'model_reasoning_effort="max"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
+        "-c",
+        'model="gpt-5.6-terra"',
         "-c",
         'model_reasoning_effort="high"',
     ]

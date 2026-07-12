@@ -1521,7 +1521,12 @@ def _run_opencode(
     os.environ.update(runtime_env)
     try:
         if role == ROLE_PLANNER:
-            cfg = load_opencode_config()
+            scheduled_worker_config = _scheduled_opencode_worker_config()
+            cfg = (
+                load_opencode_config(worker_config=scheduled_worker_config)
+                if scheduled_worker_config is not None
+                else load_opencode_config()
+            )
             result = run_opencode_single_pass(
                 prompt,
                 workspace,
@@ -1609,7 +1614,24 @@ def _scheduled_opencode_reasoning(default: str) -> str:
     return default
 
 
-def _scheduled_opencode_worker_config() -> Optional[dict[str, str]]:
+def _scheduled_opencode_worker_config() -> Optional[dict[str, Any]]:
+    model_tier = str(os.environ.get("HERMES_CODEX_WORKER_MODEL_TIER") or "").strip()
+    opencode_model = str(os.environ.get("HERMES_OPENCODE_WORKER_MODEL") or "").strip()
+    if model_tier:
+        effort = _scheduled_opencode_reasoning("")
+        worker_config: dict[str, Any] = {}
+        if opencode_model:
+            worker_config["opencode"] = {"model": opencode_model}
+        if effort:
+            worker_config.update(
+                {
+                    "simple_build_reasoning_level": effort,
+                    "complex_plan_reasoning_level": effort,
+                    "complex_build_reasoning_level": effort,
+                }
+            )
+        return worker_config or None
+
     if os.environ.get("HERMES_CODEX_WORKER_REASONING_SOURCE") != "adaptive":
         return None
     if _raw_opencode_pass_configured():
@@ -1648,10 +1670,15 @@ def _role_extra_args(role: str) -> list[str]:
     service_tier = _worker_service_tier()
     # Codex accepts arbitrary config overrides through -c. Unknown keys are
     # ignored by older versions, so this remains forward-compatible.
-    return [
+    args = []
+    model = str(os.environ.get("HERMES_CODEX_WORKER_MODEL") or "").strip()
+    if model:
+        args.extend(["-c", f'model={json.dumps(model)}'])
+    args.extend([
         "-c", f'model_reasoning_effort="{effort}"',
         "-c", f'service_tier="{service_tier}"',
-    ]
+    ])
+    return args
 
 
 def _worker_reasoning_effort(role: str) -> str:

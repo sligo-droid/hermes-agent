@@ -149,7 +149,8 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert init["tool_delay"] == 0.0
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
-    assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+    assert init["model"] == "gpt-5.6-terra"
+    assert init["reasoning_config"] == {"enabled": True, "effort": "max"}
     assert init.get("skip_memory", False) is False
     assert "Discord action-request thread guidance" in init["ephemeral_system_prompt"]
     assert "latest user message as the authoritative task" in init["ephemeral_system_prompt"]
@@ -202,7 +203,16 @@ async def test_discord_action_request_reasoning_override_is_configurable(monkeyp
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
-        lambda: {"discord": {"action_request_reasoning_effort": "low"}},
+        lambda: {
+            "discord": {"action_request_model_tier": "feature"},
+            "model_tiers": {
+                "feature": {
+                    "model": "custom/feature-model",
+                    "opencode_model": "custom/feature-worker",
+                    "reasoning_effort": "low",
+                }
+            },
+        },
     )
     monkeypatch.setattr(
         gateway_run.GatewayRunner,
@@ -232,6 +242,7 @@ async def test_discord_action_request_reasoning_override_is_configurable(monkeyp
         {"initial_request": "Build it", "message_id": "300", "kanban_board": None},
     )
 
+    assert _CapturingAgent.last_init["model"] == "custom/feature-model"
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
 
 
@@ -242,7 +253,12 @@ async def test_discord_feature_request_reasoning_override_remains_legacy_alias(m
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
-        lambda: {"discord": {"feature_request_reasoning_effort": "medium"}},
+        lambda: {
+            "discord": {
+                "action_request_model_tier": "",
+                "feature_request_reasoning_effort": "medium",
+            }
+        },
     )
     monkeypatch.setattr(
         gateway_run.GatewayRunner,

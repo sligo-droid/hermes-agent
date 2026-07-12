@@ -1140,6 +1140,55 @@ You can also change the reasoning effort at runtime with the `/reasoning` comman
 /reasoning hide      # Hide model thinking
 ```
 
+## Model Tiers
+
+Model tiers are reusable model-and-effort bundles for runtime routes. They are
+not Hermes runtime profiles: profiles isolate a `HERMES_HOME`, while tiers only
+choose a model and reasoning effort.
+
+| Tier | Model | Effort | Default routes |
+|------|-------|--------|----------------|
+| `trivial` | GPT-5.6 Luna | `xhigh` | Kanban `dev` |
+| `basic` | GPT-5.6 Luna | `max` | Gateway and unpinned cron jobs |
+| `intermediate` | GPT-5.6 Terra | `max` | Standard Discord action requests and coding workers |
+| `advanced` | GPT-5.6 Sol | `max` | Kanban `planner`, `reviewer`, and `foreman` |
+
+The defaults live under `model_tiers`; route settings reference a tier by name:
+
+```yaml
+model_tiers:
+  intermediate:
+    model: gpt-5.6-terra
+    opencode_model: hermes-codex/gpt-5.6-terra
+    reasoning_effort: max
+
+gateway:
+  model_tier: basic
+
+cron:
+  model_tier: basic
+
+discord:
+  action_request_model_tier: intermediate
+
+coding_worker:
+  model_tier: intermediate
+
+kanban:
+  discord_worker:
+    roles:
+      dev: {model_tier: trivial}
+      planner: {model_tier: advanced}
+      reviewer: {model_tier: advanced}
+      foreman: {model_tier: advanced}
+```
+
+Partial overrides of a built-in tier inherit its other fields. Set a route's
+`model_tier` to `""` to opt out and use that route's legacy model/reasoning
+configuration. A cron job's explicit `model`, `HERMES_MODEL`, and a gateway
+session's `/model` override take precedence over its route tier. The normal
+CLI/TUI default remains `model.default`.
+
 ## Tool-Use Enforcement
 
 Some models occasionally describe intended actions as text instead of making tool calls ("I would run the tests..." instead of actually calling the terminal). Tool-use enforcement injects system prompt guidance that steers the model back to actually calling tools.
