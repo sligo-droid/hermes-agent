@@ -40,7 +40,7 @@ _ROLE_DEFAULT_REASONING = {
     "foreman": "xhigh",
     "reviewer": "xhigh",
 }
-_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 _AUTO_RUNTIME = "auto"
 _WORKER_SCRIPT = Path("hermes_cli") / "kanban_codex_worker.py"
 _CONTAINER_WORKER_SCRIPT = "/hermes/hermes_cli/kanban_codex_worker.py"
