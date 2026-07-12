@@ -24,7 +24,7 @@ BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
 _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 0.0
-_DEFAULT_OPENCODE_MODEL = "openai/gpt-5.5"
+_DEFAULT_OPENCODE_MODEL = "hermes-codex/gpt-5.6-sol"
 
 
 @dataclass

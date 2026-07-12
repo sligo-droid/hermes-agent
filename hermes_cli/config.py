@@ -1592,7 +1592,7 @@ DEFAULT_CONFIG = {
         "complex_build_reasoning_level": "medium",
         "opencode": {
             "binary": "opencode",
-            "model": "openai/gpt-5.5",
+            "model": "hermes-codex/gpt-5.6-sol",
             "plan_agent": "plan",
             "build_agent": "build",
             "dangerously_skip_permissions": False,
