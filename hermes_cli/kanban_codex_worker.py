@@ -1656,7 +1656,7 @@ def _role_extra_args(role: str) -> list[str]:
 
 def _worker_reasoning_effort(role: str) -> str:
     effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
-    if effort in {"minimal", "low", "medium", "high", "xhigh"}:
+    if effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
         return effort
     if role in {ROLE_PLANNER, ROLE_REVIEWER, ROLE_FOREMAN}:
         return "xhigh"

@@ -16035,6 +16035,8 @@ class GatewayRunner:
         """
         import yaml
 
+        from hermes_constants import parse_reasoning_effort
+
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
         config_path = _hermes_home / "config.yaml"
@@ -16113,11 +16115,8 @@ class GatewayRunner:
             self._reasoning_config = self._load_reasoning_config()
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
-        if effort == "none":
-            parsed = {"enabled": False}
-        elif effort in {"minimal", "low", "medium", "high", "xhigh"}:
-            parsed = {"enabled": True, "effort": effort}
-        else:
+        parsed = parse_reasoning_effort(effort)
+        if parsed is None:
             return t(
                 "gateway.reasoning.unknown_arg",
                 arg=effort or raw_args.lower(),

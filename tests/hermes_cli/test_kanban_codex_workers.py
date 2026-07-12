@@ -3897,6 +3897,16 @@ def test_foreman_runtime_defaults_to_xhigh_normal():
     assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "xhigh"
 
 
+def test_native_codex_worker_accepts_max_reasoning_override(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "max")
+
+    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "max"
+    assert worker._role_extra_args(ROLE_FOREMAN)[1] == 'model_reasoning_effort="max"'
+
+
 def test_foreman_completed_output_completes_repair_task_without_dev_checkpoint(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import kanban_codex_worker as worker
