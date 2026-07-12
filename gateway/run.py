@@ -11982,6 +11982,7 @@ class GatewayRunner:
                 project_summary=getattr(event, "project_summary", None),
                 fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
                 fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
+                fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
                 fable_transcript_user_message=getattr(event, "fable_transcript_user_message", None),
             )
 
@@ -17632,6 +17633,7 @@ class GatewayRunner:
             build_fable_plan_invocation,
             fable_enabled_toolsets,
             fable_metadata,
+            fable_reasoning_config,
             fable_session_model_override,
         )
 
@@ -17660,6 +17662,7 @@ class GatewayRunner:
                 "source_message_id": str(event.message_id or ""),
             }
             event.fable_enabled_toolsets = fable_enabled_toolsets(cfg)
+            event.fable_reasoning_config = fable_reasoning_config(cfg)
             event.fable_transcript_user_message = f"/fable {args}".strip()
         except Exception:
             pass
@@ -20070,6 +20073,7 @@ class GatewayRunner:
         project_summary: Optional[Dict[str, Any]] = None,
         fable_plan_metadata: Optional[Dict[str, Any]] = None,
         fable_toolsets: Optional[List[str]] = None,
+        fable_reasoning_config: Optional[Dict[str, Any]] = None,
         fable_transcript_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -20827,7 +20831,14 @@ class GatewayRunner:
                 source=source,
                 session_key=session_key,
             )
-            if standard_discord_action_request:
+            if fable_plan_metadata:
+                resolved_fable_reasoning = fable_reasoning_config
+                if resolved_fable_reasoning is None:
+                    from hermes_cli.fable_planner import fable_reasoning_config as resolve_fable_reasoning_config
+
+                    resolved_fable_reasoning = resolve_fable_reasoning_config(user_config)
+                reasoning_config = dict(resolved_fable_reasoning)
+            elif standard_discord_action_request:
                 reasoning_config = _discord_action_request_reasoning_config(user_config)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -22319,6 +22330,7 @@ class GatewayRunner:
                     channel_prompt=next_channel_prompt,
                     feature_summary=next_feature_summary,
                     project_summary=next_project_summary,
+                    fable_reasoning_config=fable_reasoning_config,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

@@ -67,6 +67,42 @@ def fable_enabled_toolsets(config: dict[str, Any] | None = None) -> list[str]:
     return list(FABLE_DEFAULT_TOOLSETS)
 
 
+def fable_reasoning_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve Fable's reasoning level without inheriting the agent default.
+
+    Fable is a dedicated planning route. Its reasoning level follows the
+    Discord action/feature setting when one is configured, but an absent,
+    empty, or invalid value must not turn into ``None`` and later inherit the
+    global agent default (which may be ``medium``).
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+
+    discord_cfg = config.get("discord") if isinstance(config, dict) else {}
+    if not isinstance(discord_cfg, dict):
+        discord_cfg = {}
+
+    raw_effort = discord_cfg.get("action_request_reasoning_effort")
+    if raw_effort is None:
+        raw_effort = discord_cfg.get("feature_request_reasoning_effort")
+
+    if raw_effort is None or not str(raw_effort).strip():
+        return dict(FABLE_REASONING)
+
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(str(raw_effort))
+    except Exception:
+        parsed = None
+    return parsed or dict(FABLE_REASONING)
+
+
 def build_fable_user_instruction(request: FablePlanRequest) -> str:
     sections = [
         ("User Request", request.prompt.strip()),
