@@ -13,7 +13,10 @@ runs when the main provider has no working client.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 
@@ -195,6 +198,97 @@ class TestResolveAutoMainFirst:
 
         assert client is chain_client
 
+    @pytest.mark.parametrize(
+        ("winner", "expected_provider"),
+        [("openrouter", "openrouter"), ("nous", "nous"), ("custom", "custom")],
+    )
+    def test_step2_winner_keeps_provider_provenance(
+        self, monkeypatch, winner, expected_provider
+    ):
+        """The real auto resolver labels each Step-2 route before returning."""
+        from agent.auxiliary_client import _resolve_auto
+
+        client = SimpleNamespace()
+        routes = {
+            "openrouter": (client, "or-model") if winner == "openrouter" else (None, None),
+            "nous": (client, "nous-model") if winner == "nous" else (None, None),
+            "custom": (client, "custom-model") if winner == "custom" else (None, None),
+        }
+        with patch("agent.auxiliary_client._read_main_provider", return_value=""), patch(
+            "agent.auxiliary_client._read_main_model", return_value=""
+        ), patch(
+            "agent.auxiliary_client._try_openrouter", return_value=routes["openrouter"]
+        ), patch(
+            "agent.auxiliary_client._try_nous", return_value=routes["nous"]
+        ), patch(
+            "agent.auxiliary_client._try_custom_endpoint", return_value=routes["custom"]
+        ), patch(
+            "agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)
+        ):
+            resolved_client, _ = _resolve_auto(task="compression")
+
+        assert resolved_client is client
+        assert client._hermes_provider == expected_provider
+
+    def test_step2_api_key_winner_keeps_exact_provider_provenance(self):
+        """The generic api-key chain must retain the provider it selected."""
+        from agent.auxiliary_client import _resolve_auto
+
+        client = SimpleNamespace()
+        client._hermes_provider = "deepseek"
+        with patch("agent.auxiliary_client._read_main_provider", return_value=""), patch(
+            "agent.auxiliary_client._read_main_model", return_value=""
+        ), patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), patch(
+            "agent.auxiliary_client._try_nous", return_value=(None, None)
+        ), patch(
+            "agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)
+        ), patch(
+            "agent.auxiliary_client._resolve_api_key_provider",
+            return_value=(client, "deepseek-chat"),
+        ):
+            resolved_client, _ = _resolve_auto()
+
+        assert resolved_client is client
+        assert client._hermes_provider == "deepseek"
+
+    def test_cached_async_auto_step2_keeps_provider_provenance(self):
+        """Step-2 provenance survives async conversion and cache reuse."""
+        import asyncio
+
+        from agent.auxiliary_client import _get_cached_client
+
+        sync_client = SimpleNamespace(
+            api_key="or-key", base_url="https://openrouter.ai/api/v1"
+        )
+        async_client = SimpleNamespace()
+        loop = asyncio.new_event_loop()
+        try:
+            with patch("asyncio.get_event_loop", return_value=loop), patch(
+                "agent.auxiliary_client._client_cache", {}
+            ), patch(
+                "agent.auxiliary_client._read_main_provider", return_value=""
+            ), patch(
+                "agent.auxiliary_client._read_main_model", return_value=""
+            ), patch(
+                "agent.auxiliary_client._try_openrouter",
+                return_value=(sync_client, "or-model"),
+            ), patch(
+                "agent.auxiliary_client._to_async_client",
+                wraps=lambda client, model, is_vision=False: (
+                    setattr(async_client, "_hermes_provider", client._hermes_provider)
+                    or async_client,
+                    model,
+                ),
+            ):
+                first, _ = _get_cached_client("auto", async_mode=True, task="compression")
+                second, _ = _get_cached_client("auto", async_mode=True, task="compression")
+        finally:
+            loop.close()
+
+        assert first is async_client
+        assert second is first
+        assert second._hermes_provider == "openrouter"
+
     def test_runtime_override_wins_over_config(self, monkeypatch):
         """main_runtime kwarg overrides config-read main provider/model."""
         with patch(
@@ -220,6 +314,53 @@ class TestResolveAutoMainFirst:
         # Runtime override wins
         assert mock_resolve.call_args.args[0] == "anthropic"
         assert mock_resolve.call_args.args[1] == "runtime-model"
+
+    def test_auto_named_custom_codex_transport_keeps_provider_provenance(self):
+        """Responses transport must not reclassify a named custom provider."""
+        from agent.auxiliary_client import CodexAuxiliaryClient, _resolve_auto
+
+        real_client = MagicMock()
+        wrapped_client = CodexAuxiliaryClient(real_client, "custom-model")
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(wrapped_client, "custom-model"),
+        ) as mock_resolve:
+            client, model = _resolve_auto(
+                main_runtime={
+                    "provider": "custom:named-custom",
+                    "model": "custom-model",
+                    "base_url": "https://custom.example/v1",
+                    "api_key": "custom-secret",
+                    "api_mode": "codex_responses",
+                },
+                task="compression",
+            )
+
+        assert client is wrapped_client
+        assert model == "custom-model"
+        assert client._hermes_provider == "named-custom"
+        assert mock_resolve.call_args.args[:2] == ("custom", "gpt-5.3-codex")
+        assert mock_resolve.call_args.kwargs["api_mode"] == "codex_responses"
+
+    def test_explicit_openai_keeps_provider_provenance(self):
+        from agent.auxiliary_client import _resolve_text_auxiliary_client
+
+        mock_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "gpt-4o-mini", "https://api.openai.com/v1", None, None),
+        ), patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"provider": "openai"},
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "gpt-4o-mini"),
+        ):
+            client, model = _resolve_text_auxiliary_client("compression")
+
+        assert client is mock_client
+        assert model == "gpt-4o-mini"
+        assert client._hermes_provider == "openai"
 
     def test_compression_on_codex_main_uses_codex_model_first(self):
         """Codex main compression uses a dedicated faster Codex model."""

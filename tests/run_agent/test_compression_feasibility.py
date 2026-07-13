@@ -12,8 +12,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import agent.auxiliary_client as auxiliary_client
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
+from agent.auxiliary_client import CodexAuxiliaryClient
 
 
 @pytest.fixture(autouse=True)
@@ -139,6 +141,135 @@ def test_no_warning_when_aux_context_sufficient(mock_get_client, mock_ctx_len):
 
     assert len(messages) == 0
     assert agent._compression_warning is None
+
+
+def test_fallback_client_uses_resolved_codex_provider_for_context_and_warning():
+    agent = _make_agent(main_context=544_000, threshold_percent=0.50)
+    agent.provider = "anthropic"
+    real_client = MagicMock()
+    real_client.base_url = "https://chatgpt.com/backend-api/codex"
+    real_client.api_key = "codex-token"
+    fallback_client = CodexAuxiliaryClient(real_client, "gpt-5.4-mini")
+    messages = []
+    agent._emit_status = messages.append
+
+    with patch(
+        "agent.auxiliary_client._resolve_task_provider_model",
+        return_value=("anthropic", "claude-sonnet-4.6", None, None, None),
+    ), patch(
+        "agent.auxiliary_client._get_auxiliary_task_config",
+        return_value={
+            "fallback_chain": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini"}
+            ]
+        },
+    ), patch(
+        "agent.auxiliary_client._try_configured_fallback_chain",
+        wraps=auxiliary_client._try_configured_fallback_chain,
+    ) as mock_fallback, patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        side_effect=[(None, None), (fallback_client, "gpt-5.4-mini")],
+    ), patch(
+        "agent.model_metadata.get_model_context_length", return_value=200_000
+    ) as mock_ctx_len:
+        agent._check_compression_model_feasibility()
+
+    mock_fallback.assert_called_once_with(
+        "compression", "anthropic", reason="provider unavailable"
+    )
+    assert isinstance(fallback_client, CodexAuxiliaryClient)
+    assert "gpt-5.4-mini (openai-codex)" in messages[0]
+    assert "gpt-5.4-mini (anthropic)" not in messages[0]
+    assert mock_ctx_len.call_args.kwargs["provider"] == "openai-codex"
+
+
+def test_primary_client_keeps_configured_provider_for_context_and_warning():
+    agent = _make_agent(main_context=400_000, threshold_percent=0.50)
+    agent.provider = "openrouter"
+    mock_client = MagicMock()
+    mock_client.base_url = "https://api.anthropic.com"
+    mock_client.api_key = "anthropic-key"
+    messages = []
+    agent._emit_status = messages.append
+
+    with patch(
+        "agent.auxiliary_client._resolve_task_provider_model",
+        return_value=("anthropic", "claude-sonnet-4.6", None, None, None),
+    ), patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        return_value=(mock_client, "claude-sonnet-4.6"),
+    ), patch(
+        "agent.model_metadata.get_model_context_length", return_value=128_000
+    ) as mock_ctx_len:
+        agent._check_compression_model_feasibility()
+
+    assert "claude-sonnet-4.6 (anthropic)" in messages[0]
+    assert mock_ctx_len.call_args.kwargs["provider"] == "anthropic"
+
+
+def test_untrusted_codex_like_hostname_does_not_override_configured_provider():
+    agent = _make_agent(main_context=400_000, threshold_percent=0.50)
+    mock_client = MagicMock()
+    mock_client.base_url = "https://evilchatgpt.com/backend-api/codex"
+    mock_client.api_key = "custom-secret"
+    messages = []
+    agent._emit_status = messages.append
+
+    with patch(
+        "agent.auxiliary_client._resolve_task_provider_model",
+        return_value=("named-custom", "custom-model", None, None, None),
+    ), patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(mock_client, "custom-model"),
+    ), patch(
+        "agent.model_metadata.get_model_context_length", return_value=128_000
+    ) as mock_ctx_len:
+        agent._check_compression_model_feasibility()
+
+    assert "custom-model (named-custom)" in messages[0]
+    assert mock_ctx_len.call_args.kwargs["provider"] == "named-custom"
+
+
+def test_auto_custom_codex_transport_uses_resolver_provider_for_metadata():
+    agent = _make_agent(main_context=400_000, threshold_percent=0.50)
+    agent.provider = "named-custom"
+    real_client = MagicMock()
+    real_client.base_url = "https://custom.example/v1"
+    real_client.api_key = "custom-secret"
+    custom_client = CodexAuxiliaryClient(real_client, "custom-model")
+
+    with patch(
+        "agent.auxiliary_client._resolve_task_provider_model",
+        return_value=("auto", None, None, None, None),
+    ), patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        side_effect=lambda *args, **kwargs: auxiliary_client._resolve_auto(
+            main_runtime=None, task="compression"
+        ),
+    ), patch(
+        "agent.auxiliary_client._read_main_provider", return_value="anthropic",
+    ), patch(
+        "agent.auxiliary_client._read_main_model", return_value="main-model",
+    ), patch(
+        "agent.auxiliary_client.resolve_provider_client", return_value=(None, None),
+    ), patch(
+        "agent.auxiliary_client._is_provider_unhealthy", return_value=False,
+    ), patch(
+        "agent.auxiliary_client._try_openrouter", return_value=(None, None),
+    ), patch(
+        "agent.auxiliary_client._try_nous", return_value=(None, None),
+    ), patch(
+        "agent.auxiliary_client._try_custom_endpoint",
+        return_value=(custom_client, "custom-model"),
+    ), patch(
+        "agent.model_metadata.get_model_context_length", return_value=128_000
+    ) as mock_ctx_len:
+        agent._check_compression_model_feasibility()
+
+    assert custom_client._hermes_provider == "custom"
+    assert mock_ctx_len.call_args.kwargs["provider"] == "custom"
+    assert mock_ctx_len.call_args.kwargs["provider"] != agent.provider
+    assert mock_ctx_len.call_args.kwargs["base_url"] == "https://custom.example/v1"
 
 
 def test_feasibility_check_passes_live_main_runtime():
@@ -294,9 +425,10 @@ def test_warns_when_no_auxiliary_provider(mock_get_client):
 def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
     """Primary compression provider can be down if configured fallback works."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.50)
-    fallback_client = MagicMock()
-    fallback_client.base_url = "https://chatgpt.com/backend-api/codex"
-    fallback_client.api_key = "codex-oauth-token"
+    real_client = MagicMock()
+    real_client.base_url = "https://chatgpt.com/backend-api/codex"
+    real_client.api_key = "codex-oauth-token"
+    fallback_client = CodexAuxiliaryClient(real_client, "gpt-5.4-mini")
 
     messages = []
     agent._emit_status = lambda msg: messages.append(msg)
@@ -305,12 +437,19 @@ def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
         "agent.auxiliary_client._resolve_task_provider_model",
         return_value=("ollama-cloud", "deepseek-v4-flash:cloud", None, None, None),
     ), patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(None, None),
+        "agent.auxiliary_client._get_auxiliary_task_config",
+        return_value={
+            "fallback_chain": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini"}
+            ]
+        },
     ), patch(
-        "agent.auxiliary_client._try_configured_fallback_for_unavailable_client",
-        return_value=(fallback_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)"),
+        "agent.auxiliary_client._try_configured_fallback_chain",
+        wraps=auxiliary_client._try_configured_fallback_chain,
     ) as mock_fallback, patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        side_effect=[(None, None), (fallback_client, "gpt-5.4-mini")],
+    ), patch(
         "agent.model_metadata.get_model_context_length",
         return_value=200_000,
     ) as mock_ctx_len:
@@ -318,7 +457,9 @@ def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
 
     assert messages == []
     assert agent._compression_warning is None
-    mock_fallback.assert_called_once_with("compression", "ollama-cloud")
+    mock_fallback.assert_called_once_with(
+        "compression", "ollama-cloud", reason="provider unavailable"
+    )
     mock_ctx_len.assert_called_once()
     assert mock_ctx_len.call_args.args == ("gpt-5.4-mini",)
     assert mock_ctx_len.call_args.kwargs["provider"] == "openai-codex"
