@@ -1728,13 +1728,24 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
 def _resolve_cron_agent_model(config: dict, job: dict) -> tuple[str, Any]:
     """Resolve cron's model default while preserving explicit overrides."""
     explicit_model = str(job.get("model") or os.getenv("HERMES_MODEL") or "").strip()
-    if explicit_model:
+    has_raw_job_override = any(
+        str(job.get(field) or "").strip()
+        for field in ("model", "provider", "reasoning_effort", "reasoning")
+    )
+    if explicit_model or has_raw_job_override:
+        if not explicit_model:
+            model_cfg = config.get("model", {})
+            if isinstance(model_cfg, str):
+                explicit_model = model_cfg.strip()
+            elif isinstance(model_cfg, dict):
+                explicit_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
         return explicit_model, None
 
     from hermes_cli.model_tiers import resolve_model_tier
 
     cron_cfg = config.get("cron") if isinstance(config.get("cron"), dict) else {}
-    model_tier = resolve_model_tier(config, cron_cfg.get("model_tier", "basic"))
+    tier_name = job.get("model_tier") or cron_cfg.get("model_tier", "trivial")
+    model_tier = resolve_model_tier(config, tier_name)
     if model_tier is not None:
         return model_tier.model, model_tier
 
@@ -2350,7 +2361,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         if model_tier is not None:
             reasoning_config = model_tier.reasoning_config()
         else:
-            effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
+            effort = str(
+                job.get("reasoning_effort")
+                or job.get("reasoning")
+                or _cfg.get("agent", {}).get("reasoning_effort", "")
+            ).strip()
             reasoning_config = parse_reasoning_effort(effort)
 
         # Prefill messages from env or config.yaml

@@ -8,6 +8,7 @@ instances) and can be referenced by gateway, cron, and Kanban role settings.
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -38,6 +39,66 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     },
 }
 
+_SIMPLE_TASK_SIGNALS = (
+    "typo",
+    "comment",
+    "formatting",
+    "small docs",
+    "documentation",
+    "readme",
+    "changelog",
+    "one-line",
+    "one line",
+    "trivial",
+    "mechanical",
+)
+
+_COMPLEX_OR_RISKY_TASK_SIGNALS = (
+    "security",
+    "auth",
+    "permission",
+    "sandbox",
+    "secret",
+    "credential",
+    "payment",
+    "wallet",
+    "signing",
+    "race",
+    "deadlock",
+    "concurrency",
+    "data loss",
+    "migration",
+    "schema migration",
+    "breaking change",
+    "architecture",
+    "design review",
+    "audit",
+    "incident",
+    "production",
+    "unsafe",
+    "dangerous",
+    "rewrite",
+    "upgrade",
+    "rebase",
+    "merge conflict",
+    "flaky",
+    "intermittent",
+    "root cause",
+    "state machine",
+    "async",
+    "cache",
+    "performance",
+)
+
+_EXPLICIT_PLANNING_SIGNALS = (
+    "plan first",
+    "first plan",
+    "planning pass",
+    "two phase",
+    "two-phase",
+    "design before",
+)
+
 
 @dataclass(frozen=True)
 class ModelTier:
@@ -55,6 +116,31 @@ class ModelTier:
 
 def _normalized_name(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _contains_task_signal(text: str, signal: str) -> bool:
+    if " " in signal or "-" in signal:
+        return signal in text
+    return bool(re.search(rf"\b{re.escape(signal)}\b", text))
+
+
+def classify_task_complexity(task: Any, context: Any = "") -> str:
+    """Classify task text as ``simple``, ``ordinary``, or ``complex``.
+
+    This deterministic policy is shared by named-tier routes and coding-worker
+    plan selection so their signals cannot drift into duplicate keyword lists.
+    Risk and explicit planning always win over simple wording.
+    """
+    text = f"{task or ''}\n{context or ''}".lower()
+    if not text.strip():
+        return "ordinary"
+    if any(signal in text for signal in _EXPLICIT_PLANNING_SIGNALS):
+        return "complex"
+    if any(_contains_task_signal(text, signal) for signal in _COMPLEX_OR_RISKY_TASK_SIGNALS):
+        return "complex"
+    if any(_contains_task_signal(text, signal) for signal in _SIMPLE_TASK_SIGNALS):
+        return "simple"
+    return "ordinary"
 
 
 def _merged_model_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:

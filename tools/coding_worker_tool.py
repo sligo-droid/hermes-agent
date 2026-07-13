@@ -10,6 +10,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -515,6 +516,79 @@ def _allow_ui_route_provider_env(env: dict[str, str], ui_route: Any) -> None:
     if not key:
         return
     env["_HERMES_FORCE_OPENROUTER_API_KEY"] = key
+
+
+def _run_ui_specialist(
+    *,
+    prompt: str,
+    workdir: str,
+    timeout: float,
+    parent_agent: Any,
+    route_metadata: dict[str, Any],
+) -> str:
+    """Run UI implementation through its independent Claude Code backend."""
+    started = time.monotonic()
+    try:
+        from hermes_cli.fable_planner import fable_claude_code_env
+        from hermes_cli.ui_work_routing import resolve_ui_specialist_runtime
+
+        runtime = resolve_ui_specialist_runtime()
+        if runtime["backend"] != "claude_code":
+            raise RuntimeError(f"Unsupported UI specialist backend: {runtime['backend']}")
+        binary = shutil.which(runtime["binary"])
+        if not binary:
+            raise RuntimeError(f"Claude Code CLI not found in PATH: {runtime['binary']}")
+        proc = subprocess.run(
+            [
+                binary,
+                "--print",
+                "--output-format",
+                "text",
+                "--model",
+                runtime["model"],
+                "--effort",
+                runtime["reasoning_effort"],
+                "--permission-mode",
+                "acceptEdits",
+                "--no-session-persistence",
+                prompt,
+            ],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+            env=fable_claude_code_env(),
+        )
+        final_text = proc.stdout.strip()
+        error = proc.stderr.strip() if proc.returncode else ""
+        success = proc.returncode == 0 and bool(final_text)
+    except Exception as exc:
+        final_text = ""
+        error = str(exc)
+        success = False
+
+    actual_route = dict(route_metadata)
+    actual_route["actual_provider"] = "anthropic"
+    actual_route["actual_model"] = "claude-fable-5"
+    actual_route["actual_reasoning_effort"] = "medium"
+    return json.dumps(
+        {
+            "success": success,
+            "status": "completed" if success else "error",
+            "summary": final_text,
+            "error": error,
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "cwd": workdir,
+            "backend": "claude_code",
+            "agents": ["ui_visual_specialist"],
+            "plan_used": False,
+            "ui_work_route": actual_route,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _trusted_git_pr_lifecycle_enabled(
@@ -1208,6 +1282,24 @@ def delegate_coding_task(
             ]
         )
     worker_prompt = "\n".join(worker_prompt_parts)
+
+    if (
+        ui_route is not None
+        and ui_route.matched
+        and ui_route.enabled
+        and ui_route.selected_route == "ui_visual_specialist"
+    ):
+        specialist_result = json.loads(_run_ui_specialist(
+            prompt=worker_prompt,
+            workdir=workdir,
+            timeout=timeout,
+            parent_agent=parent_agent,
+            route_metadata=ui_route_metadata,
+        ))
+        specialist_result["task_inferred_from_context"] = task_inferred_from_context
+        if cwd_fallback_metadata is not None:
+            specialist_result["cwd_fallback"] = cwd_fallback_metadata
+        return json.dumps(specialist_result, ensure_ascii=False)
 
     classification_context = f"{task_text}\n{context_text}"
     worker_env = (

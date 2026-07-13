@@ -34,6 +34,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "prompt", nargs="?", help="Optional self-contained prompt or task instruction"
     )
     cron_create.add_argument("--name", help="Optional human-friendly job name")
+    cron_create.add_argument("--model-tier", help="Named model tier for this job")
+    cron_create.add_argument("--model", help="Raw per-job model override")
+    cron_create.add_argument("--provider", help="Raw per-job provider override")
+    cron_create.add_argument("--reasoning-effort", help="Raw per-job reasoning override")
     cron_create.add_argument(
         "--deliver",
         help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id",
@@ -79,6 +83,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--schedule", help="New schedule")
     cron_edit.add_argument("--prompt", help="New prompt/task instruction")
     cron_edit.add_argument("--name", help="New job name")
+    cron_edit.add_argument("--model-tier", help="New model tier; pass empty string to clear")
+    cron_edit.add_argument("--model", help="New raw model override; pass empty string to clear")
+    cron_edit.add_argument("--provider", help="New raw provider override; pass empty string to clear")
+    cron_edit.add_argument("--reasoning-effort", help="New raw reasoning override; pass empty string to clear")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
     cron_edit.add_argument(

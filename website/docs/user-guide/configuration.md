@@ -1176,10 +1176,13 @@ coding_worker:
   complex_plan_model_tier: advanced
   complex_build_model_tier: basic
 
+delegation:
+  model_tier_routing: auto
+
 kanban:
   discord_worker:
     roles:
-      dev: {model_tier: trivial}
+      dev: {model_tier: basic}
       planner: {model_tier: advanced}
       reviewer: {model_tier: advanced}
       foreman: {model_tier: advanced}
@@ -1193,14 +1196,29 @@ per-worker pass tier overrides the configured pass tier. The compatibility
 `coding_worker.model_tier` field overrides all three pass tiers when non-empty.
 Set it to `disabled` to turn off tier routing globally and use the legacy raw
 OpenCode model and per-pass reasoning fields. The UI visual specialist remains
-an independent provider/model route and does not inherit coding-worker tiers.
+an independent Claude Code route pinned to Claude Fable 5 at medium effort. It
+uses Claude Code's supported Anthropic OAuth login and does not inherit
+coding-worker tiers or `/fable`'s plan-only contract.
 OpenCode's `max` variant is forwarded literally as `reasoning.effort=max`; it is
 not normalized or aliased to `xhigh`.
 
+`delegate_task` classifies each child independently: simple/mechanical work uses
+`basic`, ordinary work uses `intermediate`, and complex or risky work uses
+`advanced`. A child requested with `role: orchestrator` always uses `advanced`.
+The selected tier supplies its model and reasoning effort atomically. Explicit
+`delegation.provider`, `delegation.base_url`, `delegation.model`, or
+`delegation.reasoning_effort` settings bypass automatic tier routing as a unit,
+so Hermes never combines a tier model with an incompatible explicit provider or
+a partial reasoning override. Set `delegation.model_tier_routing` to `off` or
+`disabled` to restore parent model and reasoning inheritance.
+
 Partial overrides of a built-in tier inherit its other fields. Set a route's
 `model_tier` to `""` to opt out and use that route's legacy model/reasoning
-configuration. A cron job's explicit `model`, `HERMES_MODEL`, and a gateway
-session's `/model` override take precedence over its route tier. The normal
+configuration. Cron inference precedence is a raw per-job `model`, `provider`,
+or `reasoning_effort` override, then per-job `model_tier`, then the global
+`cron.model_tier` (default `trivial`). `HERMES_MODEL` remains an explicit runtime
+override. Script-only `no_agent` jobs do not consume a model tier. A gateway
+session's `/model` override takes precedence over its route tier. The normal
 CLI/TUI default remains `model.default`.
 
 ## Tool-Use Enforcement
@@ -1785,6 +1803,7 @@ Configure subagent behavior for the delegate tool:
 
 ```yaml
 delegation:
+  model_tier_routing: auto                    # Default: simple -> basic, ordinary -> intermediate, complex/risky -> advanced; orchestrator -> advanced
   # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
   # provider: "openrouter"                  # Override provider (empty = inherit parent)
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
@@ -1795,7 +1814,9 @@ delegation:
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
 ```
 
-**Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+**Automatic named-tier routing:** By default, `delegate_task` selects `basic` for simple work, `intermediate` for ordinary work, and `advanced` for complex/risky work or orchestrators. Model and reasoning effort come from the tier together. Set `model_tier_routing: off` (or `disabled`) to turn this off; children then inherit the parent model and reasoning unless the raw overrides below are set.
+
+**Subagent provider:model override:** Explicit delegation provider/model/reasoning settings take precedence over automatic routing. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
 
 **Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only.
 
@@ -1803,7 +1824,7 @@ delegation:
 
 The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
 
-**Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
+**Precedence:** explicit `delegation.base_url` / `provider` / `model` / `reasoning_effort` settings → automatic named tier → parent inheritance when tier routing is off. `delegation.base_url` takes precedence over `delegation.provider`. Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter). Any explicit raw runtime override bypasses the automatic tier atomically, preventing a tier model from leaking into an explicitly selected provider route.
 
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 

@@ -448,8 +448,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "skill": skills[0] if skills else None,
         "skills": skills,
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
+        "model_tier": job.get("model_tier"),
         "model": job.get("model"),
         "provider": job.get("provider"),
+        "reasoning_effort": job.get("reasoning_effort"),
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
@@ -545,6 +547,8 @@ def cronjob(
     profile: Optional[str] = None,
     no_agent: Optional[bool] = None,
     disable_on_terminal_success: Optional[bool] = None,
+    model_tier: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -603,8 +607,10 @@ def cronjob(
                 deliver=_normalize_deliver_param(deliver),
                 origin=_origin_from_env(),
                 skills=canonical_skills,
+                model_tier=_normalize_optional_job_value(model_tier),
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
+                reasoning_effort=_normalize_optional_job_value(reasoning_effort),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
                 context_from=context_from,
@@ -732,6 +738,10 @@ def cronjob(
                 updates["model"] = _normalize_optional_job_value(model)
             if provider is not None:
                 updates["provider"] = _normalize_optional_job_value(provider)
+            if model_tier is not None:
+                updates["model_tier"] = _normalize_optional_job_value(model_tier)
+            if reasoning_effort is not None:
+                updates["reasoning_effort"] = _normalize_optional_job_value(reasoning_effort)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
             if script is not None:
@@ -881,6 +891,15 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 },
                 "required": ["model"]
             },
+            "model_tier": {
+                "type": "string",
+                "description": "Optional named model tier for this job. Used only when model, provider, and reasoning_effort are all unset; otherwise those raw overrides are authoritative. Omit to use cron.model_tier. On update, pass an empty string to clear."
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "description": "Optional raw per-job reasoning override. Setting it makes raw job overrides authoritative over model_tier."
+            },
             "script": {
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
@@ -976,8 +995,10 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
+        model_tier=args.get("model_tier"),
         model=_mo[1],
         provider=_mo[0] or args.get("provider"),
+        reasoning_effort=args.get("reasoning_effort"),
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),

@@ -1541,11 +1541,13 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
-    # Subagent delegation — override the provider:model used by delegate_task
-    # so child agents can run on a different (cheaper/faster) provider and model.
-    # Uses the same runtime provider resolution as CLI/gateway startup, so all
-    # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
+    # Subagent delegation. Named-tier routing classifies each delegate_task goal
+    # as simple -> basic, ordinary -> intermediate, or complex/risky -> advanced;
+    # orchestrators always use advanced. A tier is an atomic model+reasoning
+    # choice. Explicit delegation provider/model/reasoning settings win. Set
+    # model_tier_routing to disabled/off to preserve parent inheritance.
     "delegation": {
+        "model_tier_routing": "auto",
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
@@ -1619,8 +1621,14 @@ DEFAULT_CONFIG = {
     # retained as advisory metadata/default guardrail evidence.
     "ui_work": {
         "enabled": True,
-        "provider": "openrouter",
-        "model": "z-ai/glm-5.2",
+        "specialist_backend": "claude_code",
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "route": "anthropic_oauth",
+        "reasoning_effort": "medium",
+        "claude_code": {
+            "binary": "claude",
+        },
         "codex": {
             "provider_config_key": "model_provider",
             "model_config_key": "model",
@@ -2117,9 +2125,9 @@ DEFAULT_CONFIG = {
     "cron": {
         # Scheduler provider plugin. Empty = built-in in-process ticker.
         "provider": "",
-        # Unpinned cron jobs use Luna/max. Explicit job and HERMES_MODEL
-        # overrides continue to take precedence over this route default.
-        "model_tier": "basic",
+        # Unpinned cron jobs use the trivial tier. Raw per-job inference fields
+        # and HERMES_MODEL continue to take precedence over this route default.
+        "model_tier": "trivial",
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
@@ -2275,7 +2283,7 @@ DEFAULT_CONFIG = {
             },
             "roles": {
                 "planner": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
-                "dev": {"model_tier": "trivial", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
+                "dev": {"model_tier": "basic", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
                 "foreman": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
                 "reviewer": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
             },

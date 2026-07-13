@@ -121,6 +121,8 @@ async def test_create_cron_job_normalizes_representative_core_fields(
             prompt="summarize upstream status",
             schedule="every 1h",
             name="full-core-mapping",
+            model_tier="advanced",
+            reasoning_effort="max",
             base_url="https://example.invalid/v1/",
             script=str(scripts_dir / "collect-status.py"),
             no_agent=True,
@@ -129,9 +131,22 @@ async def test_create_cron_job_normalizes_representative_core_fields(
     )
 
     assert job["name"] == "full-core-mapping"
+    assert job["model_tier"] == "advanced"
+    assert job["reasoning_effort"] == "max"
     assert job["base_url"] == "https://example.invalid/v1"
-    assert job["script"] == "collect-status.py"
+    assert job["script"] == str(scripts_dir / "collect-status.py")
     assert job["no_agent"] is True
+
+
+def test_cron_job_create_skills_default_is_not_shared():
+    from hermes_cli import web_server
+
+    first = web_server.CronJobCreate(schedule="every 1h")
+    second = web_server.CronJobCreate(schedule="every 2h")
+
+    first.skills.append("first-only")
+
+    assert second.skills == []
 
 
 @pytest.mark.asyncio
