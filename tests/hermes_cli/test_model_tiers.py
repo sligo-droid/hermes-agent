@@ -27,7 +27,7 @@ def test_default_routes_reference_resolvable_tiers():
         "coding_worker_complex_plan": "advanced",
         "coding_worker_complex_build": "intermediate",
         "planner": "advanced",
-        "dev": "basic",
+        "dev": "intermediate",
         "foreman": "advanced",
         "reviewer": "advanced",
     }
@@ -40,6 +40,18 @@ def test_default_routes_reference_resolvable_tiers():
             "enabled": True,
             "effort": resolved.reasoning_effort,
         }
+
+    assert {
+        name: resolve_model_tier({"model_tiers": tiers}, name).reasoning_effort
+        for name in ("trivial", "basic", "intermediate", "advanced")
+    } == {
+        "trivial": "low",
+        "basic": "medium",
+        "intermediate": "high",
+        "advanced": "high",
+    }
+    for role in ("planner", "dev", "foreman", "reviewer"):
+        assert "reasoning" not in DEFAULT_CONFIG["kanban"]["discord_worker"]["roles"][role]
 
 
 def test_partial_custom_tier_override_keeps_required_default_fields():

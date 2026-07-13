@@ -200,6 +200,43 @@ def _discord_action_request_model_tier(config: Optional[dict]) -> Any:
     return resolve_model_tier(cfg, name)
 
 
+def _set_gateway_runtime_audit(
+    agent: Any,
+    *,
+    model: str,
+    model_tier: Any = None,
+    runtime_route: str,
+    runtime_role: str,
+    reasoning_source: str,
+    model_override_source: str = "",
+) -> None:
+    """Attach the effective gateway route without logging request metadata."""
+    from agent.runtime_audit import set_runtime_audit_context
+
+    tier_applied = (
+        model_tier is not None
+        and not model_override_source
+        and str(model or "").strip() == str(model_tier.model or "").strip()
+    )
+    if tier_applied:
+        resolved_tier_source = "route"
+    elif model_override_source:
+        resolved_tier_source = model_override_source
+    elif model_tier is not None:
+        resolved_tier_source = "model_override"
+    else:
+        resolved_tier_source = "none"
+    set_runtime_audit_context(
+        agent,
+        model_tier=model_tier.name if tier_applied else "",
+        model_tier_source=resolved_tier_source,
+        runtime_route=runtime_route,
+        runtime_role=runtime_role,
+        reasoning_source=reasoning_source,
+        service_tier_source="gateway_disabled",
+    )
+
+
 def _discord_action_request_reasoning_config(config: Optional[dict]) -> dict | None:
     """Reasoning override for ordinary Discord action-request threads."""
     model_tier = _discord_action_request_model_tier(config)
@@ -16008,6 +16045,10 @@ class GatewayRunner:
 
         try:
             user_config = _load_gateway_config()
+            try:
+                background_session_key = self._session_key_for_source(source)
+            except Exception:
+                background_session_key = ""
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
@@ -16032,6 +16073,18 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
+            gateway_tier = _gateway_model_tier(user_config)
+            background_model_override = bool(
+                background_session_key
+                and (getattr(self, "_session_model_overrides", {}) or {}).get(
+                    background_session_key
+                )
+            )
+            background_reasoning_override = bool(
+                background_session_key
+                and background_session_key
+                in (getattr(self, "_session_reasoning_overrides", {}) or {})
+            )
             turn_route = self._resolve_turn_agent_config(
                 prompt, model, runtime_kwargs, user_config=user_config
             )
@@ -16085,6 +16138,25 @@ class GatewayRunner:
                 )
                 agent.max_iterations_source = max_iterations_source
                 agent.max_iterations_route = f"gateway/background:{platform_key}"
+                _set_gateway_runtime_audit(
+                    agent,
+                    model=turn_route["model"],
+                    model_tier=gateway_tier,
+                    runtime_route="gateway_background",
+                    runtime_role="background",
+                    reasoning_source=(
+                        "session_override"
+                        if background_reasoning_override
+                        else "model_tier"
+                        if gateway_tier is not None
+                        else "agent_config"
+                        if reasoning_config is not None
+                        else "default"
+                    ),
+                    model_override_source=(
+                        "session_override" if background_model_override else ""
+                    ),
+                )
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -21236,6 +21308,47 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.session_cwd = session_cwd
             agent.terminal_cwd = session_cwd
+            session_model_override = bool(
+                (getattr(self, "_session_model_overrides", {}) or {}).get(session_key)
+            )
+            session_reasoning_override = bool(
+                session_key
+                in (getattr(self, "_session_reasoning_overrides", {}) or {})
+            )
+            active_tier = None
+            runtime_route = "gateway"
+            model_override_source = "session_override" if session_model_override else ""
+            if fable_plan_metadata:
+                runtime_route = "gateway_fable"
+                model_override_source = "fable"
+            elif standard_discord_action_request:
+                runtime_route = "discord_action_request"
+                active_tier = action_request_tier
+            else:
+                active_tier = _gateway_model_tier(user_config)
+            _set_gateway_runtime_audit(
+                agent,
+                model=turn_route["model"],
+                model_tier=active_tier,
+                runtime_route=runtime_route,
+                runtime_role="interactive",
+                reasoning_source=(
+                    "fable"
+                    if fable_plan_metadata
+                    else "model_tier"
+                    if standard_discord_action_request and active_tier is not None
+                    else "discord_config"
+                    if standard_discord_action_request and reasoning_config is not None
+                    else "session_override"
+                    if session_reasoning_override
+                    else "model_tier"
+                    if active_tier is not None
+                    else "agent_config"
+                    if reasoning_config is not None
+                    else "default"
+                ),
+                model_override_source=model_override_source,
+            )
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

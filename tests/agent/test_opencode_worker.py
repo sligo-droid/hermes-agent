@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -29,7 +30,7 @@ def _configured_hermes_provider(monkeypatch):
                     "reasoning": True,
                     "variants": {
                         level: {"reasoningEffort": level}
-                        for level in ("medium", "xhigh", "max")
+                        for level in ("medium", "high", "xhigh", "max")
                     },
                 }
             },
@@ -43,7 +44,7 @@ def _cfg(**coding_overrides):
         "opencode": opencode_cfg,
         "simple_build_model_tier": "intermediate",
         "complex_plan_model_tier": "advanced",
-        "complex_build_model_tier": "basic",
+        "complex_build_model_tier": "intermediate",
     }
     coding_cfg.update(coding_overrides)
     return {"coding_worker": coding_cfg}
@@ -104,7 +105,7 @@ def _write_session_metadata(
         conn.close()
 
 
-def test_simple_task_runs_build_only(monkeypatch, tmp_path):
+def test_simple_task_runs_build_only(monkeypatch, tmp_path, caplog):
     calls = []
     process_envs = []
 
@@ -122,28 +123,38 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
-    result = ow.run_opencode_task(
-        "fix typo in README",
-        str(tmp_path),
-        timeout=60,
-        config=_cfg(),
-    )
+    with caplog.at_level(logging.INFO, logger="agent.opencode_worker"):
+        result = ow.run_opencode_task(
+            "fix typo in README",
+            str(tmp_path),
+            timeout=60,
+            config=_cfg(),
+        )
 
     assert result.error is None
     assert result.final_text == "done"
     assert result.agents == ["build"]
+    audit_record = next(
+        record
+        for record in caplog.records
+        if record.message.startswith("coding_worker_runtime ")
+    )
+    audit = json.loads(audit_record.message.split("coding_worker_runtime ", 1)[1])
+    assert audit["runtime_route"] == "coding_worker"
+    assert audit["passes"][0]["model_tier"] == "intermediate"
+    assert audit["passes"][0]["reasoning"] == "high"
     assert result.run_profile == {
         "kind": "one_pass_simple_build",
         "label": "1-pass simple build",
         "pass_count": 1,
         "plan_used": False,
         "passes": [{
-            "name": "build", "agent": "build", "reasoning": "max",
+            "name": "build", "agent": "build", "reasoning": "high",
             "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate",
         }],
     }
     assert _option(calls[0], "--agent") == "build"
-    assert _option(calls[0], "--variant") == "max"
+    assert _option(calls[0], "--variant") == "high"
     assert _option(calls[0], "--model") == "hermes-codex/gpt-5.6-terra"
     assert "--pure" in calls[0]
     assert "Hermes worker brief:\nfix typo in README" in calls[0][3]
@@ -193,8 +204,8 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     assert seen_payload["mcp"] == {}
     models = seen_payload["provider"]["hermes-codex"]["models"]
     assert {"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"} <= set(models)
-    assert models["gpt-5.6-terra"]["variants"]["max"] == {
-        "reasoningEffort": "max"
+    assert models["gpt-5.6-terra"]["variants"]["high"] == {
+        "reasoningEffort": "high"
     }
     assert seen_config_home is not None
     assert not seen_config_home.exists()
@@ -507,14 +518,14 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "pass_count": 2,
         "plan_used": True,
         "passes": [
-            {"name": "plan", "agent": "plan", "reasoning": "max", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
-            {"name": "build", "agent": "build", "reasoning": "max", "model": "hermes-codex/gpt-5.6-luna", "model_tier": "basic"},
+            {"name": "plan", "agent": "plan", "reasoning": "high", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
+            {"name": "build", "agent": "build", "reasoning": "high", "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate"},
         ],
     }
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["max", "max"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["high", "high"]
     assert [_option(cmd, "--model") for cmd in calls] == [
-        "hermes-codex/gpt-5.6-sol", "hermes-codex/gpt-5.6-luna"
+        "hermes-codex/gpt-5.6-sol", "hermes-codex/gpt-5.6-terra"
     ]
     assert "OpenCode plan to follow:" in briefs[1]
 
@@ -866,7 +877,7 @@ def test_explicit_pass_tier_and_raw_worker_overrides_take_precedence():
         "reasoning_level": "high",
     }
     assert profiles["complex_plan"]["codex_model"] == "gpt-5.6-sol"
-    assert profiles["complex_build"]["codex_model"] == "gpt-5.6-luna"
+    assert profiles["complex_build"]["codex_model"] == "gpt-5.6-terra"
 
 
 def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
@@ -886,7 +897,7 @@ def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
         "model_tier": "intermediate",
         "model": "hermes-codex/gpt-5.6-terra",
         "codex_model": "gpt-5.6-terra",
-        "reasoning_level": "max",
+        "reasoning_level": "high",
     }
     assert disabled["simple_build"] == {
         "model_tier": "",

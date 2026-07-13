@@ -159,7 +159,7 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="high"',
     ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -833,7 +833,7 @@ def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monk
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="high"',
     ]
 
 
@@ -996,7 +996,7 @@ def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="high"',
     ]
 
 
@@ -1401,13 +1401,13 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="high"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="high"',
     ]
     assert "Do not edit repository files" in FakeSession.instances[0].run_calls[0]["user_input"]
     assert "Codex plan to follow:" in FakeSession.instances[1].run_calls[0]["user_input"]

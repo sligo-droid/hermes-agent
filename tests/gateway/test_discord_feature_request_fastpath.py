@@ -150,7 +150,13 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
     assert init["model"] == "gpt-5.6-terra"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "max"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
+    audit = cached_agent._runtime_audit_context
+    assert audit["model_tier"] == "intermediate"
+    assert audit["model_tier_source"] == "route"
+    assert audit["runtime_route"] == "discord_action_request"
+    assert audit["reasoning_source"] == "model_tier"
     assert init.get("skip_memory", False) is False
     assert "Discord action-request thread guidance" in init["ephemeral_system_prompt"]
     assert "latest user message as the authoritative task" in init["ephemeral_system_prompt"]

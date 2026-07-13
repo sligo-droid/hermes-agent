@@ -1318,6 +1318,17 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "max"})
         self.assertEqual(kwargs["provider"], parent.provider)
         self.assertEqual(kwargs["base_url"], parent.base_url)
+        self.assertEqual(
+            MockAgent.return_value._runtime_audit_context,
+            {
+                "model_tier": "advanced",
+                "model_tier_source": "classifier",
+                "runtime_route": "delegation",
+                "runtime_role": "leaf",
+                "runtime_pass": "complex",
+                "reasoning_source": "model_tier",
+            },
+        )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     @patch("tools.delegate_tool._run_single_child")

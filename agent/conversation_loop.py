@@ -59,6 +59,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.runtime_breakdown import build_turn_runtime_breakdown
 from agent.retry_utils import jittered_backoff
+from agent.runtime_audit import runtime_audit_fields
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.verification_evidence import downgrade_final_response_for_evidence
@@ -174,6 +175,7 @@ def _log_turn_runtime_summary(
             "last_prompt_tokens": int(stats.get("last_prompt_tokens") or 0),
             "top_tools": _top_turn_tools(stats),
         }
+        payload.update(runtime_audit_fields(agent))
         logger.info("turn_runtime_summary %s", json.dumps(payload, sort_keys=True))
     except Exception:
         logger.debug("turn runtime summary log failed", exc_info=True)

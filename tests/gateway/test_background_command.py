@@ -264,6 +264,8 @@ class TestRunBackgroundTask:
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Background task complete" in content
         assert "Hello from background!" in content
+        assert mock_agent_instance._runtime_audit_context["runtime_route"] == "gateway_background"
+        assert mock_agent_instance._runtime_audit_context["runtime_role"] == "background"
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 

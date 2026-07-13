@@ -1007,6 +1007,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    runtime_audit_context: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1257,6 +1258,14 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    from agent.runtime_audit import set_runtime_audit_context
+
+    audit_context = dict(runtime_audit_context or {})
+    audit_context.update(
+        runtime_route="delegation",
+        runtime_role=effective_role,
+    )
+    set_runtime_audit_context(child, **audit_context)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
@@ -2222,6 +2231,40 @@ def delegate_task(
             model_tier = _resolve_delegation_model_tier(
                 cfg, t["goal"], t.get("context"), effective_role
             )
+            from hermes_cli.model_tiers import classify_task_complexity
+
+            task_complexity = classify_task_complexity(
+                t["goal"], t.get("context")
+            )
+            routing = str(cfg.get("model_tier_routing") or "auto").strip().lower()
+            explicit_runtime = any(
+                str(cfg.get(key) or "").strip()
+                for key in ("provider", "base_url", "model", "reasoning_effort")
+            )
+            raw_reasoning_effort = str(cfg.get("reasoning_effort") or "").strip()
+            if model_tier is not None:
+                model_tier_source = (
+                    "orchestrator" if effective_role == "orchestrator" else "classifier"
+                )
+                reasoning_source = "model_tier"
+            else:
+                model_tier_source = (
+                    "disabled"
+                    if routing in {"", "none", "off", "disabled", "false"}
+                    else "explicit_override"
+                    if explicit_runtime
+                    else "unresolved"
+                )
+                if raw_reasoning_effort:
+                    from hermes_constants import parse_reasoning_effort
+
+                    reasoning_source = (
+                        "delegation_config"
+                        if parse_reasoning_effort(raw_reasoning_effort) is not None
+                        else "parent"
+                    )
+                else:
+                    reasoning_source = "parent"
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2247,6 +2290,12 @@ def delegate_task(
                     model_tier.reasoning_config() if model_tier else None
                 ),
                 role=effective_role,
+                runtime_audit_context={
+                    "model_tier": model_tier.name if model_tier is not None else "",
+                    "model_tier_source": model_tier_source,
+                    "runtime_pass": task_complexity,
+                    "reasoning_source": reasoning_source,
+                },
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names

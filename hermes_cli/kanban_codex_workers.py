@@ -188,6 +188,7 @@ def _role_runtime_settings(
         "reasoning": reasoning,
         "reasoning_source": reasoning_source,
         "model_tier": model_tier.name if model_tier is not None else "",
+        "model_tier_source": "role" if model_tier is not None else "none",
         "model": model_tier.model if model_tier is not None else "",
         "opencode_model": model_tier.opencode_model if model_tier is not None else "",
         "service_tier": tier,
@@ -308,7 +309,7 @@ def _role_log_settings(
         pass_cfg = load_coding_worker_pass_config(worker_config=cfg)
     except Exception:
         return settings
-    if role == ROLE_PLANNER:
+    if role == ROLE_PLANNER or settings.get("model_tier"):
         reasoning = settings.get("reasoning") or pass_cfg["complex_plan_reasoning_level"]
     elif settings.get("reasoning_source") == "adaptive":
         reasoning = settings.get("reasoning", pass_cfg["simple_build_reasoning_level"])
@@ -319,6 +320,7 @@ def _role_log_settings(
             f"build={pass_cfg['complex_build_reasoning_level']}"
         )
     return {
+        **settings,
         "reasoning": reasoning,
         "service_tier": settings.get("service_tier", "normal"),
         "mode": settings.get("mode", "normal"),
@@ -519,6 +521,9 @@ def _spawn_host_worker(
             "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
             "HERMES_CODEX_WORKER_REASONING_SOURCE": settings["reasoning_source"],
             "HERMES_CODEX_WORKER_MODEL_TIER": settings["model_tier"],
+            "HERMES_CODEX_WORKER_MODEL_TIER_SOURCE": settings.get(
+                "model_tier_source", "none"
+            ),
             "HERMES_CODEX_WORKER_MODEL": settings["model"],
             "HERMES_OPENCODE_WORKER_MODEL": settings["opencode_model"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
@@ -590,6 +595,9 @@ def _spawn_docker_worker(
             "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
             "HERMES_CODEX_WORKER_REASONING_SOURCE": settings["reasoning_source"],
             "HERMES_CODEX_WORKER_MODEL_TIER": settings["model_tier"],
+            "HERMES_CODEX_WORKER_MODEL_TIER_SOURCE": settings.get(
+                "model_tier_source", "none"
+            ),
             "HERMES_CODEX_WORKER_MODEL": settings["model"],
             "HERMES_OPENCODE_WORKER_MODEL": settings["opencode_model"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
@@ -682,11 +690,19 @@ def _spawn_logged_process(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     role = str(getattr(task, "assignee", "") or "").strip().lower()
     label = "OpenCode" if backend == "opencode" else "Codex"
+    selected_model = (
+        settings.get("opencode_model") if backend == "opencode" else settings.get("model")
+    )
     kanban_db._append_worker_log_line(
         log_path,
         f"[kanban dispatcher] scheduled {label} role worker: "
         f"role={role or '-'} reasoning={settings['reasoning']} mode={settings['mode']} "
-        f"tier={settings.get('model_tier') or '-'}",
+        f"model={selected_model or '-'} "
+        f"tier={settings.get('model_tier') or '-'} "
+        f"tier_source={settings.get('model_tier_source') or 'none'} "
+        f"reasoning_source={settings.get('reasoning_source') or 'default'} "
+        f"service_tier={settings.get('service_tier') or settings.get('mode') or 'normal'} "
+        f"service_tier_source={settings.get('service_tier_source') or 'default'}",
     )
     kanban_db._append_worker_log_line(
         log_path,

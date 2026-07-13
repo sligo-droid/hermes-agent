@@ -1148,10 +1148,16 @@ choose a model and reasoning effort.
 
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
-| `trivial` | GPT-5.6 Luna | `xhigh` | Kanban `dev` |
-| `basic` | GPT-5.6 Luna | `max` | Gateway and unpinned cron jobs |
-| `intermediate` | GPT-5.6 Terra | `max` | Standard Discord action requests and simple coding-worker builds |
-| `advanced` | GPT-5.6 Sol | `max` | Kanban `planner`, `reviewer`, and `foreman` |
+| `trivial` | GPT-5.6 Luna | `low` | Unpinned cron jobs |
+| `basic` | GPT-5.6 Luna | `medium` | Ordinary gateway sessions |
+| `intermediate` | GPT-5.6 Terra | `high` | Discord action requests, coding-worker build passes, and Kanban `dev` |
+| `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
+
+These defaults are runtime-aware: routine routes use lower effort to avoid
+paying the latency cost of `xhigh` or `max` on every turn, while harder routes
+scale model capability before spending the maximum reasoning budget. Keep
+`xhigh` and `max` for explicit per-tier overrides or targeted escalation when a
+high-effort run is not sufficient.
 
 The defaults live under `model_tiers`; route settings reference a tier by name:
 
@@ -1160,13 +1166,13 @@ model_tiers:
   intermediate:
     model: gpt-5.6-terra
     opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: max
+    reasoning_effort: high
 
 gateway:
   model_tier: basic
 
 cron:
-  model_tier: basic
+  model_tier: trivial
 
 discord:
   action_request_model_tier: intermediate
@@ -1182,14 +1188,15 @@ delegation:
 kanban:
   discord_worker:
     roles:
-      dev: {model_tier: basic}
+      dev: {model_tier: intermediate}
       planner: {model_tier: advanced}
       reviewer: {model_tier: advanced}
       foreman: {model_tier: advanced}
 ```
 
 Coding workers use one `intermediate` build pass for simple work. Complex or
-risky work uses an `advanced` planning pass followed by a `basic` build pass.
+risky work uses an `advanced` planning pass followed by an `intermediate` build
+pass.
 Each tier supplies the model and reasoning effort atomically. Explicit worker
 raw model/reasoning values override the corresponding pass tier; an explicit
 per-worker pass tier overrides the configured pass tier. The compatibility
@@ -1201,6 +1208,12 @@ uses Claude Code's supported Anthropic OAuth login and does not inherit
 coding-worker tiers or `/fable`'s plan-only contract.
 OpenCode's `max` variant is forwarded literally as `reasoning.effort=max`; it is
 not normalized or aliased to `xhigh`.
+
+Kanban role tiers are also atomic and authoritative. When a role resolves a
+valid `model_tier`, that tier's model and effort override legacy per-role
+`reasoning` values, inherited coding-worker pass profiles, and the worker
+reasoning environment fallback. Legacy role reasoning is consulted only when
+the role tier is disabled or invalid.
 
 `delegate_task` classifies each child independently: simple/mechanical work uses
 `basic`, ordinary work uses `intermediate`, and complex or risky work uses
@@ -1220,6 +1233,13 @@ or `reasoning_effort` override, then per-job `model_tier`, then the global
 override. Script-only `no_agent` jobs do not consume a model tier. A gateway
 session's `/model` override takes precedence over its route tier. The normal
 CLI/TUI default remains `model.default`.
+
+Hermes writes the effective route to `turn_runtime_summary` log records. Audit
+fields include `model_tier`, `model_tier_source`, `runtime_route`,
+`runtime_role`, `runtime_pass`, effective reasoning effort/mode/source,
+service-tier value/source, and `api_mode`. Coding-worker and Kanban dispatcher
+logs record the same model-tier and reasoning choices for non-`AIAgent` worker
+processes.
 
 ## Tool-Use Enforcement
 

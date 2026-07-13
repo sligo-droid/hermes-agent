@@ -1790,7 +1790,7 @@ def test_codex_role_worker_does_not_copy_external_codex_home(monkeypatch, tmp_pa
     assert not (codex_home / "auth.json").exists()
 
 
-def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path):
+def test_role_worker_logs_named_tier_and_runtime_sources(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import kanban_db
@@ -1808,7 +1808,13 @@ def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path
         "_worker_config",
         lambda: {
             "codex_home_root": str(tmp_path / "homes"),
-            "roles": {"planner": {"reasoning": "xhigh", "service_tier": "fast"}},
+            "roles": {
+                "planner": {
+                    "model_tier": "advanced",
+                    "reasoning": "minimal",
+                    "service_tier": "fast",
+                }
+            },
         },
     )
     monkeypatch.setattr(ow, "check_opencode_binary", lambda: (True, "/bin/opencode"))
@@ -1819,7 +1825,13 @@ def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path
 
     log = kanban_db.read_worker_log(task.id, board=board.slug)
     assert log is not None
-    assert "[kanban dispatcher] scheduled OpenCode role worker: role=planner reasoning=xhigh mode=fast" in log
+    assert (
+        "[kanban dispatcher] scheduled OpenCode role worker: "
+        "role=planner reasoning=high mode=fast "
+        "model=hermes-codex/gpt-5.6-sol tier=advanced tier_source=role "
+        "reasoning_source=model_tier service_tier=fast "
+        "service_tier_source=explicit"
+    ) in log
 
 
 def test_planner_worker_env_carries_effective_opencode_backend(monkeypatch, tmp_path):
@@ -2500,7 +2512,12 @@ def test_scheduled_runtime_metadata_attaches_to_worker_result(monkeypatch):
 
     result = SimpleNamespace()
     monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "low")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING_SOURCE", "model_tier")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL_TIER", "intermediate")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL_TIER_SOURCE", "role")
     monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", "fast")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER_SOURCE", "explicit")
 
     worker._attach_scheduled_runtime(result, ROLE_DEV)
 
@@ -2511,7 +2528,19 @@ def test_scheduled_runtime_metadata_attaches_to_worker_result(monkeypatch):
         "label": "1-pass build",
         "pass_count": 1,
         "plan_used": False,
-        "passes": [{"name": "build", "agent": "dev", "reasoning": "low"}],
+        "passes": [
+            {
+                "name": "build",
+                "agent": "dev",
+                "reasoning": "low",
+                "reasoning_source": "model_tier",
+                "model": "gpt-5.6-terra",
+                "model_tier": "intermediate",
+                "model_tier_source": "role",
+                "service_tier": "fast",
+                "service_tier_source": "explicit",
+            }
+        ],
     }
 
 

@@ -984,14 +984,21 @@ class APIServerAdapter(BasePlatformAdapter):
         — matching the semantics of the native gateway's ``session_key``.
         """
         from run_agent import AIAgent
-        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
+        from gateway.run import (
+            GatewayRunner,
+            _gateway_model_tier,
+            _load_gateway_config,
+            _resolve_gateway_model,
+            _resolve_runtime_agent_kwargs,
+            _set_gateway_runtime_audit,
+        )
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
-
         user_config = _load_gateway_config()
+        model = _resolve_gateway_model()
+        model_tier = _gateway_model_tier(user_config)
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "1000"))
@@ -1018,6 +1025,20 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+        )
+        _set_gateway_runtime_audit(
+            agent,
+            model=model,
+            model_tier=model_tier,
+            runtime_route="gateway_api",
+            runtime_role="interactive",
+            reasoning_source=(
+                "model_tier"
+                if model_tier is not None and model == model_tier.model
+                else "agent_config"
+                if reasoning_config is not None
+                else "default"
+            ),
         )
         return agent
 

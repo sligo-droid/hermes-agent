@@ -981,6 +981,15 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    from agent.runtime_audit import set_runtime_audit_context
+
+    set_runtime_audit_context(
+        agent,
+        runtime_route=platform or "agent",
+        runtime_role=session_role or "operator",
+        reasoning_source="explicit" if reasoning_config else "default",
+        service_tier_source="explicit" if service_tier else "default",
+    )
     
     # In-memory todo list for task planning (one per agent/session)
     from tools.todo_tool import TodoStore

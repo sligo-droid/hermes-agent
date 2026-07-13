@@ -1011,7 +1011,8 @@ class TestRunJobSessionPersistence:
         }
         fake_db = MagicMock()
 
-        with patch("cron.scheduler._hermes_home", tmp_path), \
+        with patch.dict(os.environ, {"HERMES_MODEL": ""}), \
+             patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("dotenv.load_dotenv"), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
@@ -1040,6 +1041,14 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
         assert kwargs["session_id"].startswith("cron_test-job_")
+        assert mock_agent._runtime_audit_context == {
+            "model_tier": "trivial",
+            "model_tier_source": "route",
+            "runtime_route": "cron",
+            "runtime_role": "job",
+            "reasoning_source": "model_tier",
+            "service_tier_source": "default",
+        }
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")

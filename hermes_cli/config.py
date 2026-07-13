@@ -1966,7 +1966,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_model_tier": "intermediate", # Standard Discord action requests use Terra/max
+        "action_request_model_tier": "intermediate", # Standard Discord action requests use Terra/high
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
@@ -2285,10 +2285,13 @@ DEFAULT_CONFIG = {
                 "terminal_suppression_age_seconds": 7 * 24 * 3600,
             },
             "roles": {
-                "planner": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
-                "dev": {"model_tier": "basic", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
-                "foreman": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
-                "reviewer": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
+                # Named tiers are authoritative for model and reasoning. A
+                # legacy per-role reasoning value remains supported only when
+                # the role's tier is disabled or invalid.
+                "planner": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
+                "dev": {"model_tier": "intermediate", "service_tier": "auto", "max_runtime_seconds": 3600},
+                "foreman": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
+                "reviewer": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
             },
         },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
@@ -2427,7 +2430,7 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
-        # Gateway sessions use Luna/max independently of model.default, which
+        # Gateway sessions use Luna/medium independently of model.default, which
         # remains the normal CLI/TUI default.
         "model_tier": "basic",
         # When false (default), any file path the agent emits is delivered

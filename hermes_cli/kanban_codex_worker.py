@@ -1646,7 +1646,7 @@ def _scheduled_opencode_worker_config() -> Optional[dict[str, Any]]:
     opencode_model = str(os.environ.get("HERMES_OPENCODE_WORKER_MODEL") or "").strip()
     if model_tier:
         effort = _scheduled_opencode_reasoning("")
-        worker_config: dict[str, Any] = {}
+        worker_config: dict[str, Any] = {"model_tier": model_tier}
         if opencode_model:
             worker_config["opencode"] = {"model": opencode_model}
         if effort:
@@ -1724,6 +1724,17 @@ def _worker_service_tier() -> str:
 
 def _attach_scheduled_runtime(result: Any, role: str) -> None:
     service_tier = _worker_service_tier()
+    model = str(os.environ.get("HERMES_CODEX_WORKER_MODEL") or "").strip()
+    model_tier = str(os.environ.get("HERMES_CODEX_WORKER_MODEL_TIER") or "").strip()
+    model_tier_source = str(
+        os.environ.get("HERMES_CODEX_WORKER_MODEL_TIER_SOURCE") or "none"
+    ).strip()
+    reasoning_source = str(
+        os.environ.get("HERMES_CODEX_WORKER_REASONING_SOURCE") or "default"
+    ).strip()
+    service_tier_source = str(
+        os.environ.get("HERMES_CODEX_WORKER_SERVICE_TIER_SOURCE") or "default"
+    ).strip()
     try:
         setattr(result, "service_tier", service_tier)
         setattr(result, "fast_mode", service_tier == "fast")
@@ -1748,6 +1759,12 @@ def _attach_scheduled_runtime(result: Any, role: str) -> None:
                             "name": name,
                             "agent": role,
                             "reasoning": _worker_reasoning_effort(role),
+                            "reasoning_source": reasoning_source,
+                            "model": model,
+                            "model_tier": model_tier,
+                            "model_tier_source": model_tier_source,
+                            "service_tier": service_tier,
+                            "service_tier_source": service_tier_source,
                         }
                     ],
                 },

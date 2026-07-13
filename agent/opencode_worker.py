@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import queue
 import re
@@ -27,6 +28,8 @@ _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 0.0
 _DEFAULT_OPENCODE_MODEL = "hermes-codex/gpt-5.6-sol"
 _CODING_WORKER_PASS_NAMES = ("simple_build", "complex_plan", "complex_build")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -591,6 +594,18 @@ def run_opencode_task(
     events: list[dict[str, Any]] = []
     agents: list[str] = []
     run_profile = _task_run_profile(cfg, needs_plan)
+    logger.info(
+        "coding_worker_runtime %s",
+        json.dumps(
+            {
+                "backend": BACKEND_OPENCODE,
+                "runtime_route": "coding_worker",
+                "runtime_profile": run_profile["kind"],
+                "passes": run_profile["passes"],
+            },
+            sort_keys=True,
+        ),
+    )
     worker_prompt = _prompt_with_repo_state_preflight(prompt, workspace)
     git_before = _git_artifact_snapshot(workspace)
 

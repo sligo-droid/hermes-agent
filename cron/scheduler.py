@@ -1757,6 +1757,48 @@ def _resolve_cron_agent_model(config: dict, job: dict) -> tuple[str, Any]:
     return "", None
 
 
+def _set_cron_runtime_audit(
+    agent: Any,
+    *,
+    config: dict,
+    job: dict,
+    model_tier: Any,
+    reasoning_config: Any,
+) -> None:
+    """Attach low-cardinality cron routing details to the scheduled agent."""
+    from agent.runtime_audit import set_runtime_audit_context
+
+    has_explicit_runtime = bool(
+        os.getenv("HERMES_MODEL")
+        or any(
+            str(job.get(field) or "").strip()
+            for field in ("model", "provider", "reasoning_effort", "reasoning")
+        )
+    )
+    if model_tier is not None:
+        model_tier_source = (
+            "job" if str(job.get("model_tier") or "").strip() else "route"
+        )
+        reasoning_source = "model_tier"
+    else:
+        model_tier_source = "explicit_override" if has_explicit_runtime else "none"
+        if str(job.get("reasoning_effort") or job.get("reasoning") or "").strip():
+            reasoning_source = "job"
+        elif str((config.get("agent") or {}).get("reasoning_effort") or "").strip():
+            reasoning_source = "agent_config"
+        else:
+            reasoning_source = "explicit" if reasoning_config is not None else "default"
+    set_runtime_audit_context(
+        agent,
+        model_tier=model_tier.name if model_tier is not None else "",
+        model_tier_source=model_tier_source,
+        runtime_route="cron",
+        runtime_role="job",
+        reasoning_source=reasoning_source,
+        service_tier_source="default",
+    )
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
@@ -2507,6 +2549,13 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+        )
+        _set_cron_runtime_audit(
+            agent,
+            config=_cfg,
+            job=job,
+            model_tier=model_tier,
+            reasoning_config=reasoning_config,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
