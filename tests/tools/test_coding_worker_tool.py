@@ -360,7 +360,7 @@ def test_ui_opencode_route_uses_configured_backend_and_model(monkeypatch, tmp_pa
     assert route["selected_model"] == "z-ai/glm-5.2"
     assert seen["worker_config"] == {
         "opencode": {"model": "openrouter/z-ai/glm-5.2"},
-        "model_tier": "",
+        "model_tier": "disabled",
     }
     env = seen["env"]
     assert "OPENROUTER_API_KEY" not in env
@@ -1411,13 +1411,13 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
     assert result["tool_iterations"] == 4
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="max"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-luna"',
         "-c",
         'model_reasoning_effort="max"',
     ]
@@ -1457,13 +1457,13 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
     assert result["success"] is True
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="max"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-luna"',
         "-c",
         'model_reasoning_effort="high"',
     ]

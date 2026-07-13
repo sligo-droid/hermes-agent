@@ -9,12 +9,42 @@ import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent import opencode_worker as ow
+
+_ORIGINAL_PROVIDER_CONFIG = ow._opencode_provider_config_for_model
+
+
+@pytest.fixture(autouse=True)
+def _configured_hermes_provider(monkeypatch):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda model: {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {"baseURL": "http://127.0.0.1:8645/v1"},
+            "models": {
+                "gpt-5.5": {
+                    "reasoning": True,
+                    "variants": {
+                        level: {"reasoningEffort": level}
+                        for level in ("medium", "xhigh", "max")
+                    },
+                }
+            },
+        },
+    )
 
 
 def _cfg(**coding_overrides):
     opencode_cfg = {"binary": "opencode"}
-    coding_cfg = {"opencode": opencode_cfg}
+    coding_cfg = {
+        "opencode": opencode_cfg,
+        "simple_build_model_tier": "intermediate",
+        "complex_plan_model_tier": "advanced",
+        "complex_build_model_tier": "basic",
+    }
     coding_cfg.update(coding_overrides)
     return {"coding_worker": coding_cfg}
 
@@ -107,11 +137,14 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
         "label": "1-pass simple build",
         "pass_count": 1,
         "plan_used": False,
-        "passes": [{"name": "build", "agent": "build", "reasoning": "medium"}],
+        "passes": [{
+            "name": "build", "agent": "build", "reasoning": "max",
+            "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate",
+        }],
     }
     assert _option(calls[0], "--agent") == "build"
-    assert _option(calls[0], "--variant") == "medium"
-    assert _option(calls[0], "--model") == "hermes-codex/gpt-5.6-sol"
+    assert _option(calls[0], "--variant") == "max"
+    assert _option(calls[0], "--model") == "hermes-codex/gpt-5.6-terra"
     assert "--pure" in calls[0]
     assert "Hermes worker brief:\nfix typo in README" in calls[0][3]
     assert "--file" not in calls[0]
@@ -125,7 +158,14 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     seen_payload = None
 
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
-    monkeypatch.setattr(ow, "_opencode_provider_config_for_model", lambda model: {})
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda model: {
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {},
+        },
+    )
 
     def fake_run(_cmd, **kwargs):
         nonlocal seen_config_home, seen_payload
@@ -149,12 +189,12 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     )
 
     assert result.error is None
-    assert seen_payload == {
-        "$schema": "https://opencode.ai/config.json",
-        "plugin": [],
-        "permission": "allow",
-        "mcp": {},
-        "model": "hermes-codex/gpt-5.6-sol",
+    assert seen_payload["model"] == "hermes-codex/gpt-5.6-terra"
+    assert seen_payload["mcp"] == {}
+    models = seen_payload["provider"]["hermes-codex"]["models"]
+    assert {"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"} <= set(models)
+    assert models["gpt-5.6-terra"]["variants"]["max"] == {
+        "reasoningEffort": "max"
     }
     assert seen_config_home is not None
     assert not seen_config_home.exists()
@@ -215,7 +255,11 @@ def test_hermes_codex_model_inlines_worker_brief(monkeypatch, tmp_path):
                         "npm": "@ai-sdk/openai-compatible",
                         "name": "Hermes Codex Proxy",
                         "options": {"baseURL": "http://127.0.0.1:9999/v1"},
-                        "models": {"gpt-5.5": {}},
+                        "models": {
+                            "gpt-5.5": {
+                                "variants": {"medium": {"reasoningEffort": "medium"}}
+                            }
+                        },
                     }
                 },
                 "model": "hermes-codex/gpt-5.5",
@@ -226,6 +270,7 @@ def test_hermes_codex_model_inlines_worker_brief(monkeypatch, tmp_path):
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(ow, "_opencode_provider_config_for_model", _ORIGINAL_PROVIDER_CONFIG)
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
     def fake_run(cmd, **kwargs):
@@ -246,7 +291,7 @@ def test_hermes_codex_model_inlines_worker_brief(monkeypatch, tmp_path):
         "fix typo in README",
         str(workspace),
         timeout=60,
-        config=_cfg(opencode={"model": "hermes-codex/gpt-5.5"}),
+        config=_cfg(model_tier="disabled", opencode={"model": "hermes-codex/gpt-5.5"}),
     )
 
     assert result.error is None
@@ -289,6 +334,7 @@ def test_opencode_jsonc_user_config_allows_comments_and_trailing_commas(monkeypa
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(ow, "_opencode_provider_config_for_model", _ORIGINAL_PROVIDER_CONFIG)
 
     assert ow._opencode_provider_config_for_model("hermes-codex/gpt-5.5") == {
         "npm": "@ai-sdk/openai-compatible",
@@ -378,7 +424,7 @@ def test_worker_brief_is_workspace_scoped_and_cleaned(monkeypatch, tmp_path):
         "fix typo in README",
         str(tmp_path),
         timeout=60,
-        config=_cfg(opencode={"model": "openai/gpt-5.5"}),
+        config=_cfg(model_tier="disabled", opencode={"model": "openai/gpt-5.5", "isolated_config": False}),
     )
 
     assert result.error is None
@@ -412,7 +458,7 @@ def test_worker_prompt_includes_dirty_repo_preflight(monkeypatch, tmp_path):
         "fix typo in README",
         str(tmp_path),
         timeout=60,
-        config=_cfg(opencode={"model": "openai/gpt-5.5"}),
+        config=_cfg(model_tier="disabled", opencode={"model": "openai/gpt-5.5", "isolated_config": False}),
     )
 
     assert result.error is None
@@ -431,8 +477,7 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
 
     def fake_run(cmd, **_kwargs):
         calls.append(cmd)
-        brief = cmd[cmd.index("--file") + 1]
-        briefs.append(open(brief, encoding="utf-8").read())
+        briefs.append(cmd[3])
         agent = cmd[cmd.index("--agent") + 1]
         if agent == "plan":
             text = "Plan: update auth boundary, add regression tests."
@@ -450,7 +495,7 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "fix auth credential handling",
         str(tmp_path),
         timeout=60,
-        config=_cfg(opencode={"model": "openai/gpt-5.5"}),
+        config=_cfg(),
     )
 
     assert result.error is None
@@ -462,12 +507,15 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "pass_count": 2,
         "plan_used": True,
         "passes": [
-            {"name": "plan", "agent": "plan", "reasoning": "xhigh"},
-            {"name": "build", "agent": "build", "reasoning": "medium"},
+            {"name": "plan", "agent": "plan", "reasoning": "max", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
+            {"name": "build", "agent": "build", "reasoning": "max", "model": "hermes-codex/gpt-5.6-luna", "model_tier": "basic"},
         ],
     }
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "medium"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["max", "max"]
+    assert [_option(cmd, "--model") for cmd in calls] == [
+        "hermes-codex/gpt-5.6-sol", "hermes-codex/gpt-5.6-luna"
+    ]
     assert "OpenCode plan to follow:" in briefs[1]
 
 
@@ -509,7 +557,7 @@ def test_nested_text_part_is_used_as_final_text(monkeypatch, tmp_path):
         "label": "1-pass plan",
         "pass_count": 1,
         "plan_used": False,
-        "passes": [{"name": "plan", "agent": "plan", "reasoning": "xhigh"}],
+        "passes": [{"name": "plan", "agent": "plan", "reasoning": "xhigh", "model": "hermes-codex/gpt-5.6-sol"}],
     }
 
 
@@ -762,6 +810,7 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
     monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     cfg = _cfg(
+        model_tier="disabled",
         simple_build_reasoning_level="medium",
         complex_plan_reasoning_level="max",
         complex_build_reasoning_level="low",
@@ -776,7 +825,7 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
 
     assert simple.error is None
     assert simple.run_profile["passes"] == [
-        {"name": "build", "agent": "build", "reasoning": "medium"}
+        {"name": "build", "agent": "build", "reasoning": "medium", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""}
     ]
     assert [_option(cmd, "--agent") for cmd in calls] == ["build"]
     assert [_option(cmd, "--variant") for cmd in calls] == ["medium"]
@@ -792,11 +841,105 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
 
     assert complex_result.error is None
     assert complex_result.run_profile["passes"] == [
-        {"name": "plan", "agent": "plan", "reasoning": "max"},
-        {"name": "build", "agent": "build", "reasoning": "low"},
+        {"name": "plan", "agent": "plan", "reasoning": "max", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
+        {"name": "build", "agent": "build", "reasoning": "low", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
     ]
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
     assert [_option(cmd, "--variant") for cmd in calls] == ["max", "low"]
+
+
+def test_explicit_pass_tier_and_raw_worker_overrides_take_precedence():
+    config = _cfg(simple_build_model_tier="advanced")
+    profiles = ow.load_coding_worker_pass_profiles(
+        config,
+        worker_config={
+            "simple_build_model_tier": "basic",
+            "simple_build_reasoning_level": "high",
+            "opencode": {"model": "hermes-codex/custom-worker"},
+        },
+    )
+
+    assert profiles["simple_build"] == {
+        "model_tier": "basic",
+        "model": "hermes-codex/custom-worker",
+        "codex_model": "gpt-5.6-luna",
+        "reasoning_level": "high",
+    }
+    assert profiles["complex_plan"]["codex_model"] == "gpt-5.6-sol"
+    assert profiles["complex_build"]["codex_model"] == "gpt-5.6-luna"
+
+
+def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
+    config = _cfg(
+        model_tier="",
+        opencode={"model": "hermes-codex/legacy"},
+        simple_build_reasoning_level="low",
+    )
+
+    tiered = ow.load_coding_worker_pass_profiles(config)
+    disabled = ow.load_coding_worker_pass_profiles(
+        config,
+        worker_config={"model_tier": "off", "simple_build_reasoning_level": "high"},
+    )
+
+    assert tiered["simple_build"] == {
+        "model_tier": "intermediate",
+        "model": "hermes-codex/gpt-5.6-terra",
+        "codex_model": "gpt-5.6-terra",
+        "reasoning_level": "max",
+    }
+    assert disabled["simple_build"] == {
+        "model_tier": "",
+        "model": "hermes-codex/legacy",
+        "codex_model": "",
+        "reasoning_level": "high",
+    }
+
+
+def test_generated_max_variant_is_never_rewritten_or_normalized(monkeypatch):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda model: {
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {
+                "gpt-5.6-terra": {
+                    "reasoning": True,
+                    "variants": {"max": {"reasoningEffort": "xhigh"}},
+                }
+            },
+        },
+    )
+
+    _, provider = ow._worker_provider_config("hermes-codex/gpt-5.6-terra", "max")
+
+    assert provider["models"]["gpt-5.6-terra"]["variants"]["max"] == {
+        "reasoningEffort": "max"
+    }
+
+
+def test_unrepresentable_isolated_variant_fails_before_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda model: {"npm": "@ai-sdk/openai-compatible", "models": {"custom": {}}},
+    )
+    called = False
+
+    def fake_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return _process_result()
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+    result = ow.run_opencode_single_pass(
+        "inspect only", str(tmp_path), timeout=60, agent="build", reasoning_level="max",
+        config=_cfg(model_tier="disabled", opencode={"model": "hermes-codex/custom"}),
+    )
+
+    assert called is False
+    assert "cannot represent variant 'max'" in (result.error or "")
 
 
 def test_auth_error_is_classified(monkeypatch, tmp_path):
