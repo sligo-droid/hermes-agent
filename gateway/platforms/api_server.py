@@ -3147,6 +3147,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            for field in ("model_tier", "model", "provider", "reasoning_effort"):
+                if field in body:
+                    kwargs[field] = body.get(field)
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})

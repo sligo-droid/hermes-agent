@@ -33,6 +33,7 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
+    _resolve_delegation_model_tier,
 )
 
 
@@ -1234,7 +1235,7 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
 
 
-class TestDelegationCredentialResolution(unittest.TestCase):
+class TestDelegationCredentialInheritance(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
 
     def test_no_provider_returns_none_credentials(self):
@@ -1247,6 +1248,119 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["api_key"])
         self.assertIsNone(creds["api_mode"])
         self.assertIsNone(creds["model"])
+
+
+class TestDelegationModelTierRouting(unittest.TestCase):
+    def _tier_config(self, **delegation):
+        return {
+            "model_tier_routing": "auto",
+            "model_tiers": {
+                "basic": {"model": "route/basic", "reasoning_effort": "low"},
+                "intermediate": {"model": "route/intermediate", "reasoning_effort": "high"},
+                "advanced": {"model": "route/advanced", "reasoning_effort": "max"},
+            },
+            **delegation,
+        }
+
+    def test_classifier_routes_named_tiers_and_orchestrator_is_advanced(self):
+        cfg = self._tier_config()
+
+        assert _resolve_delegation_model_tier(cfg, "Fix a typo", None, "leaf").name == "basic"
+        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "leaf").name == "intermediate"
+        assert _resolve_delegation_model_tier(cfg, "Audit auth migration", None, "leaf").name == "advanced"
+        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").name == "advanced"
+
+    def test_explicit_runtime_fields_bypass_tier_atomically(self):
+        for key, value in (
+            ("provider", "openrouter"),
+            ("base_url", "https://example.test/v1"),
+            ("model", "explicit/model"),
+            ("reasoning_effort", "max"),
+        ):
+            with self.subTest(key=key):
+                assert _resolve_delegation_model_tier(
+                    self._tier_config(**{key: value}), "Fix a typo", None, "leaf"
+                ) is None
+
+    def test_disabled_routing_preserves_parent_model_and_reasoning(self):
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config(model_tier_routing="off")), \
+             patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(0, "Fix a typo", None, None, None, 10, 1, parent)
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["model"], parent.model)
+        self.assertIs(kwargs["reasoning_config"], parent.reasoning_config)
+        self.assertEqual(kwargs["provider"], parent.provider)
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_each_task_reaches_aiagent_with_atomic_tier(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "minimal"}
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            delegate_task(goal="Investigate the auth race", parent_agent=parent)
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["model"], "route/advanced")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "max"})
+        self.assertEqual(kwargs["provider"], parent.provider)
+        self.assertEqual(kwargs["base_url"], parent.base_url)
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_explicit_provider_keeps_compatible_runtime_model(self, mock_run, mock_resolve):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+        mock_resolve.return_value = {
+            "provider": "anthropic",
+            "model": "claude-compatible",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "provider-key",
+            "api_mode": "anthropic_messages",
+        }
+        cfg = self._tier_config(provider="anthropic")
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+             patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            delegate_task(goal="Audit auth migration", parent_agent=parent)
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "anthropic")
+        self.assertEqual(kwargs["model"], "claude-compatible")
+        self.assertEqual(kwargs["api_mode"], "anthropic_messages")
+        self.assertNotEqual(kwargs["model"], "route/advanced")
+
+    def test_default_does_not_leak_to_unrelated_routes(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        self.assertEqual(DEFAULT_CONFIG["delegation"]["model_tier_routing"], "auto")
+        self.assertNotIn("model_tier_routing", DEFAULT_CONFIG["cron"])
+        self.assertNotIn("model_tier_routing", DEFAULT_CONFIG["kanban"])
+        self.assertNotIn("model_tier_routing", DEFAULT_CONFIG.get("ui_work", {}))
+
+
+class TestDelegationCredentialResolution(unittest.TestCase):
+    """Tests for provider:model credential resolution in delegation config."""
 
     def test_model_only_no_provider(self):
         """When only model is set (no provider), model is returned but credentials are None."""

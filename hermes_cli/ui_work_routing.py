@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 
 _OPENROUTER_PROVIDER_CONFIG_ARGS = {
@@ -227,6 +227,11 @@ class _RouteDecisionInput:
 
 _DEFAULT_ROUTE = "default_coding_worker"
 _UI_SPECIALIST_ROUTE = "ui_visual_specialist"
+UI_SPECIALIST_PROVIDER = "anthropic"
+UI_SPECIALIST_MODEL = "claude-fable-5"
+UI_SPECIALIST_AUTH_ROUTE = "anthropic_oauth"
+UI_SPECIALIST_REASONING_EFFORT = "medium"
+UI_SPECIALIST_BACKEND = "claude_code"
 UI_SPECIALIST_SKILLS = ("taste-skill", "claude-design", "popular-web-designs")
 _NO_WORKER_ROUTES = {"review_only_no_worker", "ask_human"}
 _ROUTE_ALIASES = {
@@ -534,37 +539,33 @@ def resolve_ui_work_route(
             **base_fields,
         )
 
-    backend_cfg = _as_dict(ui_cfg.get(normalized_backend))
-    if normalized_backend == "codex":
-        provider_key = str(backend_cfg.get("provider_config_key") or "model_provider").strip()
-        model_key = str(backend_cfg.get("model_config_key") or "model").strip()
-        if not provider_key or not model_key:
-            error = "ui_work routing matched but ui_work.codex provider/model config keys are incomplete"
-            if fallback_allowed:
-                return UIWorkRouteDecision(
-                    matched=True,
-                    enabled=True,
-                    reason="incomplete codex config; falling back to default worker",
-                    selected_route=_DEFAULT_ROUTE,
-                    fallback_used=True,
-                    fallback_reason="ui_work.codex provider/model config keys are incomplete",
-                    **base_fields,
-                )
-            return UIWorkRouteDecision(
-                matched=True,
-                enabled=True,
-                reason="incomplete codex config",
-                selected_route=_UI_SPECIALIST_ROUTE,
-                error=error,
-                **base_fields,
-            )
-        route_backend_config = {
-            "provider_config_key": provider_key,
-            "model_config_key": model_key,
-            "extra_args": _as_list(backend_cfg.get("extra_args")),
-        }
-    else:
-        route_backend_config = _as_dict(backend_cfg)
+    route = str(ui_cfg.get("route") or "").strip().lower()
+    reasoning_effort = str(ui_cfg.get("reasoning_effort") or "").strip().lower()
+    specialist_backend = str(ui_cfg.get("specialist_backend") or "").strip().lower()
+    if (
+        provider.lower() != UI_SPECIALIST_PROVIDER
+        or model != UI_SPECIALIST_MODEL
+        or route != UI_SPECIALIST_AUTH_ROUTE
+        or reasoning_effort != UI_SPECIALIST_REASONING_EFFORT
+        or specialist_backend != UI_SPECIALIST_BACKEND
+    ):
+        error = (
+            "ui_work specialist must use Claude Code with Anthropic OAuth, "
+            "provider=anthropic, model=claude-fable-5, and reasoning_effort=medium"
+        )
+        return UIWorkRouteDecision(
+            matched=True,
+            enabled=True,
+            reason="invalid ui specialist runtime",
+            selected_route=_UI_SPECIALIST_ROUTE,
+            error=error,
+            **base_fields,
+        )
+
+    route_backend_config = {
+        "specialist_backend": specialist_backend,
+        **_as_dict(ui_cfg.get(specialist_backend)),
+    }
 
     return UIWorkRouteDecision(
         matched=True,
@@ -610,3 +611,21 @@ def opencode_ui_work_worker_config(decision: UIWorkRouteDecision) -> dict[str, A
     if not provider or not model:
         return {}
     return {"opencode": {"model": f"{provider}/{model}"}}
+
+
+def resolve_ui_specialist_runtime(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve the pinned specialist's independent Claude Code backend."""
+    if config is None:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    ui_cfg = _as_dict(config.get("ui_work") if isinstance(config, Mapping) else None)
+    backend = str(ui_cfg.get("specialist_backend") or UI_SPECIALIST_BACKEND).strip().lower()
+    backend_cfg = _as_dict(ui_cfg.get(backend))
+    return {
+        "backend": backend,
+        "binary": str(backend_cfg.get("binary") or "claude").strip(),
+        "provider": UI_SPECIALIST_PROVIDER,
+        "model": UI_SPECIALIST_MODEL,
+        "reasoning_effort": UI_SPECIALIST_REASONING_EFFORT,
+    }

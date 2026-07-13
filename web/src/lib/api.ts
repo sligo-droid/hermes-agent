@@ -2093,8 +2093,10 @@ export interface CronJobMutation {
   schedule?: string;
   deliver?: string;
   skills?: string[];
+  model_tier?: string | null;
   provider?: string | null;
   model?: string | null;
+  reasoning_effort?: string | null;
   base_url?: string | null;
   script?: string | null;
   no_agent?: boolean;
@@ -2119,8 +2121,10 @@ export interface CronJob {
   enabled: boolean;
   state?: string | null;
   deliver?: string | null;
+  model_tier?: string | null;
   model?: string | null;
   provider?: string | null;
+  reasoning_effort?: string | null;
   base_url?: string | null;
   no_agent?: boolean | null;
   context_from?: string[] | string | null;

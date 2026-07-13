@@ -924,6 +924,8 @@ def create_job(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    model_tier: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
@@ -945,8 +947,10 @@ def create_job(
         origin: Source info where job was created (for "origin" delivery)
         skill: Optional legacy single skill name to load before running the prompt
         skills: Optional ordered list of skills to load before running the prompt
+        model_tier: Optional named model tier used when raw runtime overrides are absent
         model: Optional per-job model override
         provider: Optional per-job provider override
+        reasoning_effort: Optional per-job reasoning override
         base_url: Optional per-job base URL override
         script: Optional path to a script whose stdout feeds the job. With
                 ``no_agent=True`` the script IS the job — its stdout is
@@ -1004,11 +1008,15 @@ def create_job(
     now = _hermes_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
+    normalized_model_tier = str(model_tier).strip() if isinstance(model_tier, str) else None
     normalized_model = str(model).strip() if isinstance(model, str) else None
     normalized_provider = str(provider).strip() if isinstance(provider, str) else None
+    normalized_reasoning_effort = str(reasoning_effort).strip() if isinstance(reasoning_effort, str) else None
     normalized_base_url = str(base_url).strip().rstrip("/") if isinstance(base_url, str) else None
+    normalized_model_tier = normalized_model_tier or None
     normalized_model = normalized_model or None
     normalized_provider = normalized_provider or None
+    normalized_reasoning_effort = normalized_reasoning_effort or None
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
@@ -1044,8 +1052,10 @@ def create_job(
         "prompt": prompt_text,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
+        "model_tier": normalized_model_tier,
         "model": normalized_model,
         "provider": normalized_provider,
+        "reasoning_effort": normalized_reasoning_effort,
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
@@ -1170,6 +1180,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["profile"] = None
             else:
                 updates["profile"] = _normalize_profile(_profile)
+
+        for field in ("model_tier", "model", "provider", "reasoning_effort"):
+            if field in updates:
+                updates[field] = str(updates[field] or "").strip() or None
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

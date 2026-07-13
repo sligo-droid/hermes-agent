@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -14,6 +16,27 @@ FABLE_REASONING = {"enabled": True, "effort": "high"}
 FABLE_DEFAULT_TOOLSETS = ["file", "terminal", "web", "browser", "discord"]
 
 FABLE_RUNTIME_NOTE = """This is `/fable`: use Claude Fable 5, planning only, inspect repo with read-only tools as needed, save a plan artifact if the plan skill requires it, and do not implement. Do not edit files, create branches, open pull requests, deploy, or claim that implementation, tests, commits, PRs, or deployment happened. Generate a concrete Markdown implementation plan only. Your final answer must contain the full plan markdown, plus the saved path if you wrote one; do not answer with only a brief path/status note. Hermes/gateway will handle Discord delivery, threading, and artifact indexing outside the Fable turn, so do not describe or perform those operational steps."""
+
+
+def fable_claude_code_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a scrubbed Claude Code environment pinned to interactive OAuth."""
+    from hermes_constants import _process_user_home
+    from tools.environments.local import _sanitize_subprocess_env
+
+    env = _sanitize_subprocess_env(os.environ if base_env is None else base_env)
+    for key in tuple(env):
+        if key.startswith("ANTHROPIC_") or key == "CLAUDE_CODE_OAUTH_TOKEN":
+            env.pop(key, None)
+
+    account_home = _process_user_home() or Path.home()
+    claude_config_dir = account_home / ".claude"
+    if not (claude_config_dir / ".credentials.json").is_file():
+        raise RuntimeError(
+            "Claude Code OAuth credentials are unavailable for the Fable route; "
+            "run `claude login` for this OS account before using the UI specialist."
+        )
+    env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
+    return env
 
 
 @dataclass(frozen=True)

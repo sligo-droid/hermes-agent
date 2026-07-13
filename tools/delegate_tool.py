@@ -396,6 +396,45 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _inherit_parent_base_url(parent_agent: Any, fallback: Optional[str]) -> Optional[str]:
+    """Prefer the endpoint used by the active parent client over stale metadata."""
+    client_kwargs = getattr(parent_agent, "_client_kwargs", None)
+    if isinstance(client_kwargs, dict) and client_kwargs.get("base_url"):
+        return client_kwargs["base_url"]
+    return fallback
+
+
+def _resolve_delegation_model_tier(
+    cfg: Dict[str, Any], goal: str, context: Optional[str], role: str
+):
+    """Resolve the atomic model/reasoning tier for one delegated task.
+
+    Raw delegation runtime settings are an explicit route and therefore bypass
+    the tier as a unit. This avoids combining a tier model with explicit
+    reasoning or an explicitly selected provider that may not serve that model.
+    """
+    routing = str(cfg.get("model_tier_routing") or "auto").strip().lower()
+    if routing in {"", "none", "off", "disabled", "false"}:
+        return None
+    if any(
+        str(cfg.get(key) or "").strip()
+        for key in ("provider", "base_url", "model", "reasoning_effort")
+    ):
+        return None
+
+    from hermes_cli.model_tiers import classify_task_complexity, resolve_model_tier
+
+    if role == "orchestrator":
+        tier_name = "advanced"
+    else:
+        tier_name = {
+            "simple": "basic",
+            "ordinary": "intermediate",
+            "complex": "advanced",
+        }[classify_task_complexity(goal, context)]
+    return resolve_model_tier({"model_tiers": cfg.get("model_tiers") or {}}, tier_name)
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
@@ -963,6 +1002,7 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1099,7 +1139,9 @@ def _build_child_agent(
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
+    effective_base_url = override_base_url or _inherit_parent_base_url(
+        parent_agent, parent_agent.base_url
+    )
     effective_api_key = override_api_key or parent_api_key
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
@@ -1136,9 +1178,9 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: explicit delegation override > routed tier > parent.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
+    child_reasoning = override_reasoning_config or parent_reasoning
     try:
         delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
         if delegation_effort:
@@ -2177,12 +2219,15 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            model_tier = _resolve_delegation_model_tier(
+                cfg, t["goal"], t.get("context"), effective_role
+            )
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=creds["model"] or (model_tier.model if model_tier else None),
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -2197,6 +2242,9 @@ def delegate_task(
                     task_acp_args
                     if task_acp_args is not None
                     else (acp_args if acp_args is not None else creds.get("args"))
+                ),
+                override_reasoning_config=(
+                    model_tier.reasoning_config() if model_tier else None
                 ),
                 role=effective_role,
             )
@@ -2599,14 +2647,18 @@ def _load_config() -> dict:
 
         cfg = CLI_CONFIG.get("delegation") or {}
         if cfg:
-            return cfg
+            result = dict(cfg)
+            result["model_tiers"] = CLI_CONFIG.get("model_tiers") or {}
+            return result
     except Exception:
         pass
     try:
         from hermes_cli.config import load_config
 
         full = load_config()
-        return full.get("delegation") or {}
+        result = dict(full.get("delegation") or {})
+        result["model_tiers"] = full.get("model_tiers") or {}
+        return result
     except Exception:
         return {}
 

@@ -1,7 +1,7 @@
 """Focused contract tests for reusable model-tier configuration."""
 
 from hermes_cli.config import DEFAULT_CONFIG
-from hermes_cli.model_tiers import resolve_model_tier
+from hermes_cli.model_tiers import classify_task_complexity, resolve_model_tier
 
 
 def test_default_routes_reference_resolvable_tiers():
@@ -18,10 +18,10 @@ def test_default_routes_reference_resolvable_tiers():
 
     assert route_names == {
         "gateway": "basic",
-        "cron": "basic",
+        "cron": "trivial",
         "discord_action_request": "intermediate",
         "planner": "advanced",
-        "dev": "trivial",
+        "dev": "basic",
         "foreman": "advanced",
         "reviewer": "advanced",
     }
@@ -60,6 +60,12 @@ def test_invalid_tier_is_rejected_without_leaking_into_runtime():
         {"model_tiers": {"broken": {"model": "x", "reasoning_effort": "ultra"}}},
         "broken",
     ) is None
+
+
+def test_delegation_classifier_is_deterministic_and_risk_wins_over_simple_text():
+    assert classify_task_complexity("Fix a typo in README") == "simple"
+    assert classify_task_complexity("Summarize the release behavior") == "ordinary"
+    assert classify_task_complexity("Fix a typo in the auth migration") == "complex"
 
 
 def test_standalone_coding_worker_uses_its_named_tier():

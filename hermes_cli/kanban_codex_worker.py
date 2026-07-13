@@ -1313,6 +1313,33 @@ def _run_role_backend(
     if route_prompt:
         prompt = f"{prompt.rstrip()}\n\n{route_prompt}"
     _record_ui_work_route(task_id, board=board, decision=ui_work_route)
+    if (
+        ui_work_route is not None
+        and ui_work_route.matched
+        and ui_work_route.enabled
+        and ui_work_route.selected_route == "ui_visual_specialist"
+    ):
+        from tools.coding_worker_tool import _run_ui_specialist
+
+        payload = json.loads(
+            _run_ui_specialist(
+                prompt=prompt,
+                workdir=workspace,
+                timeout=_role_timeout(role),
+                parent_agent=None,
+                route_metadata=ui_work_route.metadata(),
+            )
+        )
+        result = SimpleNamespace(
+            final_text=payload.get("summary", ""),
+            error=payload.get("error") or None,
+            ui_work_route=payload.get("ui_work_route"),
+        )
+        try:
+            record_codex_worker_result(task_id, board=board, result=result)
+        except Exception:
+            pass
+        return result
     if uses_opencode:
         return _run_opencode(
             prompt,

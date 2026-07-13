@@ -50,6 +50,7 @@ def test_cron_create_options():
         "cron", "create", "0 9 * * *", "daily task prompt",
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
+        "--model-tier", "advanced", "--reasoning-effort", "max",
         "--workdir", "/tmp/x",
     ])
     assert ns.schedule == "0 9 * * *"
@@ -59,6 +60,8 @@ def test_cron_create_options():
     assert ns.repeat == 3
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
+    assert ns.model_tier == "advanced"
+    assert ns.reasoning_effort == "max"
     assert ns.workdir == "/tmp/x"
 
 
