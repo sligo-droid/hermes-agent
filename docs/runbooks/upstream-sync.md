@@ -11,7 +11,7 @@ Use this when pulling `NousResearch/hermes-agent` `upstream/main` into the Sligo
 
 ## Procedure
 
-1. Inspect state from the canonical checkout: `git status --short --branch`, `git remote -v`, `git worktree list`, and `docs/project-state.md`.
+1. Inspect state from the canonical checkout with `python -m hermes_cli.pr_workflow_preflight` and `docs/project-state.md`. The preflight command reports the current checkout, relevant remotes, and decision-relevant worktrees in a bounded summary; use raw `git worktree list --porcelain` only for an explicit repair/audit outside the active model context.
 2. Fetch both remotes: `git fetch origin --prune` and `git fetch upstream --prune`.
 3. Measure divergence: `git rev-list --left-right --count origin/main...upstream/main` and inspect `git log --oneline origin/main..upstream/main`.
 4. Create a worktree under `/home/droid/workspaces/` from `origin/main`, for example `git worktree add -b merge/upstream-main-YYYY-MM-DD /home/droid/workspaces/hermes-upstream-main-YYYYMMDD origin/main`.

@@ -385,7 +385,7 @@ def _background_review_read_before_write_guard(
         "error": (
             f"Refusing background curator {action} for skill '{name}': "
             f"the current {file_label} content has not been loaded in this "
-            "review turn. Call skill_view(name) for SKILL.md, or "
+            "review turn. Call skill_view(name, full_content=true) for the complete SKILL.md, or "
             "skill_view(name, file_path=...) for a supporting file, then "
             "retry the write using the content just returned."
         ),
@@ -1431,7 +1431,8 @@ SKILL_MANAGE_SCHEMA = {
         "After difficult/iterative tasks, offer to save as a skill. "
         "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
-        "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
+        "pitfalls section, verification steps. Use skill_view(name, full_content=true) "
+        "to see format examples.\n\n"
         "Pinned skills are protected from deletion only — skill_manage(action='delete') "
         "will refuse with a message pointing the user to `hermes curator unpin <name>`. "
         "Patches and edits go through on pinned skills so you can still improve them as "
@@ -1457,7 +1458,7 @@ SKILL_MANAGE_SCHEMA = {
                 "description": (
                     "Full SKILL.md content (YAML frontmatter + markdown body). "
                     "Required for 'create' and 'edit'. For 'edit', read the skill "
-                    "first with skill_view() and provide the complete updated text."
+                    "first with skill_view(name, full_content=true) and provide the complete updated text."
                 )
             },
             "old_string": {

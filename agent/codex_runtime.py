@@ -152,7 +152,7 @@ def _codex_kanban_worker_bootstrap() -> str:
         "Required startup:\n"
         "1. Call `kanban_show()` first and treat its `worker_context` as the task truth.\n"
         "2. For ordinary coding, repo editing, debugging, or tests, call "
-        "`skill_view(name=\"general-coding\")` before implementing. This is the "
+        "`skill_view(name=\"general-coding\", full_content=true)` before implementing. This is the "
         "same content as `~/AGENTS.md`.\n"
         "3. Load only the specific `software-development/*` skills that match "
         "the task, for example debugging, test-driven development, planning, "

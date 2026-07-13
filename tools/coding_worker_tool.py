@@ -635,7 +635,13 @@ def _load_general_coding_skill() -> _SkillBlock | None:
     try:
         from tools.skills_tool import skill_view
 
-        loaded = json.loads(skill_view(_ALWAYS_FULL_WORKER_SKILL, preprocess=False))
+        loaded = json.loads(
+            skill_view(
+                _ALWAYS_FULL_WORKER_SKILL,
+                preprocess=False,
+                full_content=True,
+            )
+        )
     except Exception:
         return None
     if not loaded.get("success"):

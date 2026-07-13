@@ -922,7 +922,8 @@ _SKILLS_SNAPSHOT_VERSION = 1
 _LAST_INDEX_REPORT: dict[str, Any] | None = None
 _SKILLS_INDEX_COMPACT_NOTICE = (
     "Note: some categories above are listed name-only to save context; "
-    "skills_list shows full descriptions and skill_view(name) loads any skill."
+    "skills_list shows full descriptions and skill_view(name) loads a bounded overview; "
+    "use full_content=true when the complete skill body is needed."
 )
 
 
@@ -1162,9 +1163,11 @@ def _format_skills_system_prompt(index_lines: list[str], *, include_notice: bool
     return (
         "## Skills (summary index)\n"
         "Before replying, scan the skill summaries below. Treat them as routing hints, "
-        "not automatic full-context injections. Load a full skill with skill_view(name) "
+        "not automatic full-context injections. Load a bounded overview with skill_view(name); "
         "only when the task needs that skill's detailed procedure, commands, API facts, "
-        "pitfalls, templates, or verification checklist. For routine coding work where "
+        "pitfalls, templates, or verification checklist, request "
+        "skill_view(name, full_content=true). "
+        "For routine coding work where "
         "the repo instructions and local evidence are sufficient, continue without "
         "loading extra skill bodies. If the task reaches a phase covered by a specific "
         "skill, such as opening or merging a PR, load that skill at the phase boundary. "

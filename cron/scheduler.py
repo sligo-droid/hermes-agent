@@ -1631,7 +1631,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 skipped.extend(missing)
                 continue
         try:
-            loaded = json.loads(skill_view(skill_name))
+            loaded = json.loads(skill_view(skill_name, full_content=True))
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)

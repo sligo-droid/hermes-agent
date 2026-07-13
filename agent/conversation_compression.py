@@ -247,12 +247,12 @@ def check_compression_model_feasibility(agent: Any) -> None:
             )
             _aux_label = f"{aux_model} ({_aux_provider_label})"
             msg = (
-                f"⚠ Compression model {_aux_label} context is "
-                f"{aux_context:,} tokens, but the main model "
-                f"{_main_label}'s compression threshold was "
+                f"ℹ Compression model {_aux_label} supports "
+                f"{aux_context:,} tokens, while the main model "
+                f"{_main_label}'s configured compression threshold was "
                 f"{old_threshold:,} tokens. "
                 f"Auto-lowered this session's threshold to "
-                f"{new_threshold:,} tokens so compression can run.\n"
+                f"{new_threshold:,} tokens so each summary request fits safely.\n"
                 f"  To make this permanent, edit config.yaml — either:\n"
                 f"  1. Use a larger compression model:\n"
                 f"       auxiliary:\n"

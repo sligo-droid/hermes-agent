@@ -360,7 +360,9 @@ def _summarize_skill_view_result(tool_args: str, tool_content: str) -> str | Non
 
     recovery_lines = [linked_fetch]
     if not file_path:
-        recovery_lines.append(f"Fetch full skill content again: skill_view(\"{name}\").")
+        recovery_lines.append(
+            f"Fetch full skill content again: skill_view(\"{name}\", full_content=true)."
+        )
 
     required_text = "\n".join(required_lines + recovery_lines)
     remaining = _SKILL_VIEW_SUMMARY_MAX_CHARS - len(required_text) - 4
@@ -762,7 +764,7 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
         if summary:
             return summary
         name = args.get("name", "?")
-        return f"[skill_view] name={name} ({content_len:,} chars); fetch again with skill_view(name) or skill_view(name, file_path)"
+        return f"[skill_view] name={name} ({content_len:,} chars); fetch again with skill_view(name, full_content=true) or skill_view(name, file_path)"
 
     if tool_name in {"skills_list", "skill_manage"}:
         name = args.get("name", "?")

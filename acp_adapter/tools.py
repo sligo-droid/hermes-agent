@@ -415,7 +415,16 @@ def _format_skill_view_result(result: Optional[str]) -> Optional[str]:
     if description:
         lines.append(f"- **Description:** {description}")
     if content:
-        lines.append(f"- **Content:** {len(content):,} chars loaded into agent context")
+        if data.get("content_truncated"):
+            total = data.get("content_total_chars") or len(content)
+            lines.append(
+                f"- **Content:** bounded overview ({len(content):,} of {total:,} chars)"
+            )
+            hint = data.get("full_content_hint")
+            if hint:
+                lines.append(f"- **Next:** {hint}")
+        else:
+            lines.append(f"- **Content:** {len(content):,} chars loaded into agent context")
     if linked:
         linked_count = sum(len(v) for v in linked.values() if isinstance(v, list))
         lines.append(f"- **Linked files:** {linked_count}")
@@ -427,7 +436,9 @@ def _format_skill_view_result(result: Optional[str]) -> Optional[str]:
 
     lines.extend([
         "",
-        "_Full skill content is available to the agent but hidden here to keep ACP readable._",
+        "_Full skill content is available to the agent but hidden here to keep ACP readable._"
+        if not data.get("content_truncated")
+        else "_Only a bounded overview is loaded; request full_content=true for the complete SKILL.md._",
     ])
     return "\n".join(lines)
 

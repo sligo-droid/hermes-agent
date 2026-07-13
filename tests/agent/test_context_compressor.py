@@ -352,7 +352,7 @@ Check the summary.
         assert "references/second-recovery.md" in compacted
         assert "additional linked files omitted" in compacted
         assert "skill_view(name, file_path)" in compacted
-        assert "Fetch full skill content again: skill_view(\"recovery-heavy\")" in compacted
+        assert "Fetch full skill content again: skill_view(\"recovery-heavy\", full_content=true)" in compacted
         assert result[-1] == msgs[-1]
 
     def test_prune_compacts_skill_view_result_with_top_level_tool_name_without_tool_call_mapping(self, compressor):

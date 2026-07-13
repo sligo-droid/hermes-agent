@@ -18,6 +18,8 @@ from tools.skills_tool import (
     skills_list,
     skill_view,
     MAX_DESCRIPTION_LENGTH,
+    SKILL_VIEW_RESPONSE_MAX_CHARS,
+    SKILL_VIEW_SCHEMA,
 )
 
 
@@ -372,6 +374,27 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "my-skill"
         assert "Step 1" in result["content"]
+        assert result["content_truncated"] is False
+
+    def test_oversized_root_is_bounded_with_explicit_full_load(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "large-skill", body="x" * 20_000)
+            expected = (skill_dir / "SKILL.md").read_text()
+
+            raw = skill_view("large-skill")
+            result = json.loads(raw)
+            full = json.loads(skill_view("large-skill", full_content=True))
+
+        assert len(raw) <= SKILL_VIEW_RESPONSE_MAX_CHARS
+        assert result["content_truncated"] is True
+        assert result["content_total_chars"] == len(expected)
+        assert "full_content=true" in result["full_content_hint"]
+        assert full["content"] == expected
+        assert full["content_truncated"] is False
+
+    def test_skill_view_schema_exposes_full_content_option(self):
+        properties = SKILL_VIEW_SCHEMA["parameters"]["properties"]
+        assert properties["full_content"]["type"] == "boolean"
 
     def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
         # The on-disk directory ("alias-dir") differs from the skill's

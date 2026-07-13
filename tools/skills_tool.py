@@ -51,7 +51,7 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
 
 Available tools:
 - skills_list: List skills with metadata (progressive disclosure tier 1)
-- skill_view: Load full skill content (progressive disclosure tier 2-3)
+- skill_view: Load a bounded skill overview, or the full body on request
 
 Usage:
     from tools.skills_tool import skills_list, skill_view, check_skills_requirements
@@ -59,7 +59,7 @@ Usage:
     # List all skills (returns metadata only - token efficient)
     result = skills_list()
 
-    # View a skill's main content (loads full instructions)
+    # View a bounded overview; request full_content=True for full instructions.
     content = skill_view("axolotl")
 
     # View a reference file within a skill (loads linked file)
@@ -94,6 +94,10 @@ SKILLS_DIR = HERMES_HOME / "skills"
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+# Keep routine skill discovery from placing a large SKILL.md directly into the
+# conversation. Explicit full_content=True remains available for callers that
+# are about to execute the procedure or edit the skill.
+SKILL_VIEW_RESPONSE_MAX_CHARS = 8_000
 
 # Platform identifiers for the 'platforms' frontmatter field.
 # Maps user-friendly names to sys.platform prefixes.
@@ -674,12 +678,166 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
+def _skill_view_json_size(payload: Dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False))
+
+
+def _skill_view_preview(content: str, max_chars: int) -> str:
+    """Keep the beginning and end of a skill body for a bounded overview."""
+    if len(content) <= max_chars:
+        return content
+    marker = "\n\n[… skill overview truncated; request full_content=true …]\n\n"
+    available = max(0, max_chars - len(marker))
+    head = int(available * 0.72)
+    tail = available - head
+    return content[:head] + marker + (content[-tail:] if tail else "")
+
+
+def _bound_linked_files(
+    linked_files: Any,
+    *,
+    max_chars: int = 1_400,
+) -> Tuple[Any, bool]:
+    """Keep a deterministic, small manifest of linked skill files."""
+    if not isinstance(linked_files, dict):
+        return linked_files, False
+
+    bounded: Dict[str, list[str]] = {}
+    truncated = False
+    for category, entries in linked_files.items():
+        if not isinstance(entries, list):
+            continue
+        kept: list[str] = []
+        for entry in entries:
+            candidate = str(entry)
+            trial = dict(bounded)
+            trial[category] = [*kept, candidate]
+            if _skill_view_json_size({"linked_files": trial}) <= max_chars:
+                kept.append(candidate)
+                continue
+            omitted = len(entries) - len(kept)
+            kept.append(f"… ({omitted} more {category} file(s))")
+            truncated = True
+            break
+        if kept:
+            bounded[str(category)] = kept
+        if len(kept) < len(entries):
+            truncated = True
+    return bounded, truncated
+
+
+def _bound_skill_view_payload(
+    payload: Dict[str, Any],
+    *,
+    full_content: bool,
+) -> Tuple[Dict[str, Any], bool]:
+    """Bound the default root-skill response without limiting explicit loads.
+
+    The result stays structurally useful: metadata, setup/readiness information,
+    and a bounded linked-file manifest survive, while the body becomes a
+    head/tail overview. The final fit protects the serialized response even
+    when frontmatter or file paths are unusually large.
+    """
+    result = dict(payload)
+    content = str(result.get("content") or "")
+    result["content_total_chars"] = len(content)
+    result["content_truncated"] = False
+    if full_content:
+        return result, False
+
+    if _skill_view_json_size(result) <= SKILL_VIEW_RESPONSE_MAX_CHARS:
+        return result, False
+
+    result["content_truncated"] = True
+    name = str(result.get("name") or "skill")
+    result["full_content_hint"] = (
+        f'Call skill_view(name="{name}", full_content=true) to load the '
+        "complete SKILL.md before following or editing it."
+    )
+    result["content"] = _skill_view_preview(content, 5_200)
+
+    bounded_files, linked_truncated = _bound_linked_files(
+        result.get("linked_files"), max_chars=1_400
+    )
+    result["linked_files"] = bounded_files
+    if linked_truncated:
+        result["linked_files_truncated"] = True
+
+    # These fields are useful for explicit full loads but can contain arbitrary
+    # user-authored metadata. Drop them only from an oversized overview.
+    for key in ("metadata", "gateway_setup_hint", "setup_help"):
+        result.pop(key, None)
+
+    # Trim the preview until the common case fits, then fall back to an
+    # essential payload for pathological metadata.
+    while (
+        _skill_view_json_size(result) > SKILL_VIEW_RESPONSE_MAX_CHARS
+        and len(result["content"]) > 240
+    ):
+        result["content"] = _skill_view_preview(
+            content, max(240, len(result["content"]) - 400)
+        )
+
+    if _skill_view_json_size(result) > SKILL_VIEW_RESPONSE_MAX_CHARS:
+        essential_keys = {
+            "success",
+            "name",
+            "description",
+            "content",
+            "content_total_chars",
+            "content_truncated",
+            "full_content_hint",
+            "path",
+            "skill_dir",
+            "linked_files",
+            "linked_files_truncated",
+            "setup_needed",
+            "readiness_status",
+        }
+        result = {key: value for key, value in result.items() if key in essential_keys}
+        result["description"] = _skill_view_preview(str(result.get("description") or ""), 500)
+        result["path"] = _skill_view_preview(str(result.get("path") or ""), 500)
+        result["skill_dir"] = _skill_view_preview(str(result.get("skill_dir") or ""), 700)
+        result["linked_files"], _ = _bound_linked_files(
+            result.get("linked_files"), max_chars=700
+        )
+
+    if _skill_view_json_size(result) > SKILL_VIEW_RESPONSE_MAX_CHARS:
+        # Keep the useful fields and fit only the content field exactly. This
+        # path is intentionally defensive; normal skills stop above.
+        result["linked_files"] = None
+        for key in ("path", "skill_dir", "description"):
+            if key in result:
+                result[key] = _skill_view_preview(str(result[key] or ""), 240)
+        base = dict(result)
+        base["content"] = ""
+        available = max(0, SKILL_VIEW_RESPONSE_MAX_CHARS - _skill_view_json_size(base) - 2)
+        low, high = 0, min(len(content), available)
+        best = ""
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = _skill_view_preview(content, mid)
+            base["content"] = candidate
+            if _skill_view_json_size(base) <= SKILL_VIEW_RESPONSE_MAX_CHARS:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        result["content"] = best
+
+    content_truncated = len(str(result.get("content") or "")) < len(content)
+    result["content_truncated"] = content_truncated
+    if not content_truncated:
+        result.pop("full_content_hint", None)
+    return result, content_truncated
+
+
 def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
-    Returns only name + description to minimize token usage. Use skill_view() to
-    load full content, tags, related files, etc.
+    Returns only name + description to minimize token usage. Use skill_view()
+    for a bounded overview, then full_content=True for a complete root body.
 
     Args:
         category: Optional category filter (e.g., "mlops")
@@ -733,7 +891,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                "hint": "Use skill_view(name) for a bounded overview; pass full_content=true for the complete root body",
             },
             ensure_ascii=False,
         )
@@ -752,6 +910,7 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    full_content: bool = False,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -836,7 +995,7 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
-    return json.dumps(
+    payload, _ = _bound_skill_view_payload(
         {
             "success": True,
             "name": f"{namespace}:{bare}",
@@ -845,8 +1004,9 @@ def _serve_plugin_skill(
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
-        ensure_ascii=False,
+        full_content=full_content,
     )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def skill_view(
@@ -854,9 +1014,12 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    full_content: bool = False,
 ) -> str:
     """
-    View the content of a skill or a specific file within a skill directory.
+    View a bounded overview of a skill or a specific file within a skill
+    directory. Use full_content=True when the complete root SKILL.md is
+    required for execution or editing; file_path reads remain complete.
 
     Args:
         name: Name or path of the skill (e.g., "axolotl" or "03-fine-tuning/axolotl").
@@ -866,6 +1029,8 @@ def skill_view(
         preprocess: Apply configured SKILL.md template and inline shell rendering
             to main skill content. Internal slash/preload callers disable this
             because they render the skill message themselves.
+        full_content: Return the complete root SKILL.md instead of the bounded
+            default overview. Ignored for file_path reads, which are complete.
 
     Returns:
         JSON string with skill content or error message
@@ -918,6 +1083,7 @@ def skill_view(
                     bare,
                     preprocess=preprocess,
                     session_id=task_id,
+                    full_content=full_content,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1423,9 +1589,9 @@ def skill_view(
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
             "linked_files": linked_files if linked_files else None,
-            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
+            "usage_hint": "Default skill_view(name) returns a bounded overview. Use skill_view(name, full_content=true) for the complete SKILL.md; use skill_view(name, file_path=...) for a complete linked file (e.g. 'references/api.md' or 'assets/config.yaml')."
             if linked_files
-            else None,
+            else "Default skill_view(name) returns a bounded overview. Use skill_view(name, full_content=true) for the complete SKILL.md.",
             "required_environment_variables": required_env_vars,
             "required_commands": [],
             "missing_required_environment_variables": remaining_missing_required_envs,
@@ -1444,17 +1610,6 @@ def skill_view(
 
         if capture_result["gateway_setup_hint"]:
             result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
-
-        try:
-            from tools.skill_manager_tool import mark_background_review_skill_read
-
-            mark_background_review_skill_read(skill_md)
-        except Exception:
-            logger.debug(
-                "Could not record background-review skill read for %s",
-                skill_md,
-                exc_info=True,
-            )
 
         if setup_needed:
             missing_items = [
@@ -1477,6 +1632,25 @@ def skill_view(
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
+
+        result, content_truncated = _bound_skill_view_payload(
+            result,
+            full_content=full_content,
+        )
+
+        try:
+            from tools.skill_manager_tool import mark_background_review_skill_read
+
+            # A bounded overview is not a read-before-write of the complete
+            # SKILL.md. Supporting-file reads above remain exact and complete.
+            if not content_truncated:
+                mark_background_review_skill_read(skill_md)
+        except Exception:
+            logger.debug(
+                "Could not record background-review skill read for %s",
+                skill_md,
+                exc_info=True,
+            )
 
         return json.dumps(result, ensure_ascii=False)
 
@@ -1535,7 +1709,7 @@ if __name__ == "__main__":
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": "List available skills (name + description). Use skill_view(name) for a bounded overview, then skill_view(name, full_content=true) when the complete SKILL.md is needed.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1550,7 +1724,7 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "Skills provide task workflows, scripts, and templates. By default, skill_view returns a bounded SKILL.md overview plus a linked_files manifest. Use full_content=true when you need the complete root SKILL.md; use file_path for a complete linked reference/template/script.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1561,6 +1735,10 @@ SKILL_VIEW_SCHEMA = {
             "file_path": {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
+            },
+            "full_content": {
+                "type": "boolean",
+                "description": "OPTIONAL: Return the complete root SKILL.md. Use this when following or editing the skill; the default is a bounded overview.",
             },
         },
         "required": ["name"],
@@ -1582,7 +1760,10 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name,
+        file_path=args.get("file_path"),
+        task_id=kw.get("task_id"),
+        full_content=bool(args.get("full_content", False)),
     )
     try:
         parsed = json.loads(result)

@@ -3007,25 +3007,6 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
             env=_github_cli_env(),
         )
 
-    def find_existing_branch_worktree() -> Optional[Path]:
-        try:
-            listed = run_git(["worktree", "list", "--porcelain"], timeout=20)
-        except Exception:
-            return None
-        if listed.returncode != 0:
-            return None
-        current_path: Optional[Path] = None
-        wanted_ref = f"refs/heads/{branch}"
-        for raw_line in (listed.stdout or "").splitlines():
-            line = raw_line.strip()
-            if line.startswith("worktree "):
-                current_path = Path(line.split(" ", 1)[1])
-                continue
-            if line.startswith("branch ") and line.split(" ", 1)[1] == wanted_ref:
-                if current_path and current_path.is_dir():
-                    return current_path
-        return None
-
     def verify_synced_checkout(sync_path: Path, *, state: str) -> bool:
         try:
             head = run_git(["rev-parse", "HEAD"], timeout=20, cwd=sync_path)
@@ -3105,7 +3086,13 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
             return fail(f"{message}: {exc}")
         if result.returncode != 0:
             if args[:1] == ["checkout"]:
-                existing = find_existing_branch_worktree()
+                from hermes_cli.pr_workflow_preflight import find_worktree_for_branch
+
+                existing = find_worktree_for_branch(
+                    branch,
+                    cwd=project_path,
+                    run_git=run_git,
+                )
                 if existing is not None:
                     return sync_existing_branch_worktree(existing)
             return fail(message, result)
