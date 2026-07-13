@@ -6,8 +6,10 @@ export interface CronJobFormState {
   schedule: string;
   deliver: string;
   skills: string[];
+  model_tier: string;
   provider: string;
   model: string;
+  reasoning_effort: string;
   base_url: string;
   script: string;
   no_agent: boolean;
@@ -55,8 +57,10 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     schedule: form.schedule.trim(),
     deliver: form.deliver.trim() || "local",
     skills: form.skills.filter(Boolean),
+    model_tier: optionalText(form.model_tier),
     provider: optionalText(form.provider),
     model: optionalText(form.model),
+    reasoning_effort: optionalText(form.reasoning_effort),
     base_url: optionalText(form.base_url, true),
     script: optionalText(form.script),
     no_agent: Boolean(form.no_agent),
@@ -83,8 +87,10 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
       asString(job.schedule_display),
     deliver: asString(job.deliver) || "local",
     skills: Array.isArray(job.skills) ? job.skills.filter(Boolean) : [],
+    model_tier: asString(job.model_tier),
     provider: asString(job.provider),
     model: asString(job.model),
+    reasoning_effort: asString(job.reasoning_effort),
     base_url: asString(job.base_url),
     script: asString(job.script),
     no_agent: Boolean(job.no_agent),

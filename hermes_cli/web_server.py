@@ -57,7 +57,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
     from fastapi.staticfiles import StaticFiles
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -69,7 +69,7 @@ except ImportError:
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
         from fastapi.staticfiles import StaticFiles
-        from pydantic import BaseModel
+        from pydantic import BaseModel, Field
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -3194,10 +3194,21 @@ async def get_logs(
 
 
 class CronJobCreate(BaseModel):
-    prompt: str
+    prompt: str = ""
     schedule: str
     name: str = ""
     deliver: str = "local"
+    skills: List[str] = Field(default_factory=list)
+    model_tier: Optional[str] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    base_url: Optional[str] = None
+    script: Optional[str] = None
+    no_agent: bool = False
+    context_from: Optional[List[str]] = None
+    enabled_toolsets: Optional[List[str]] = None
+    workdir: Optional[str] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -3323,6 +3334,17 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
             schedule=body.schedule,
             name=body.name,
             deliver=body.deliver,
+            skills=body.skills,
+            model_tier=body.model_tier,
+            model=body.model,
+            provider=body.provider,
+            reasoning_effort=body.reasoning_effort,
+            base_url=body.base_url,
+            script=body.script,
+            no_agent=body.no_agent,
+            context_from=body.context_from,
+            enabled_toolsets=body.enabled_toolsets,
+            workdir=body.workdir,
         )
     except Exception as e:
         _log.exception("POST /api/cron/jobs failed")

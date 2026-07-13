@@ -54,6 +54,23 @@ def _default_codex_backend(monkeypatch):
 
     monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: "codex")
 
+    def fake_specialist(**kwargs):
+        return json.dumps(
+            {
+                "success": True,
+                "status": "completed",
+                "summary": "Changed src/app.py and ran pytest.",
+                "error": "",
+                "cwd": kwargs["workdir"],
+                "backend": "claude_code",
+                "agents": ["ui_visual_specialist"],
+                "plan_used": False,
+                "ui_work_route": kwargs["route_metadata"],
+            }
+        )
+
+    monkeypatch.setattr(cwt, "_run_ui_specialist", fake_specialist)
+
 
 def _parent(tmp_path, api_mode="chat_completions"):
     return SimpleNamespace(
@@ -277,18 +294,12 @@ def test_delegate_preserves_json_route_decision_with_missing_cwd_fallback(monkey
     assert route["route_decision_confidence"] == 0.97
     assert route["route_decision_rationale"] == "Command Center UI task"
     assert route["selected_route"] == "ui_visual_specialist"
-    assert route["selected_provider"] == "openrouter"
-    assert route["selected_model"] == "z-ai/glm-5.2"
-    assert FakeSession.instances[0].kwargs["cwd"] == str(workspace.resolve())
-    assert FakeSession.instances[0].kwargs["extra_args"][:4] == [
-        "-c",
-        'model_provider="openrouter"',
-        "-c",
-        'model="z-ai/glm-5.2"',
-    ]
+    assert route["selected_provider"] == "anthropic"
+    assert route["selected_model"] == "claude-fable-5"
+    assert result["backend"] == "claude_code"
 
 
-def test_ui_codex_route_forces_openrouter_key_into_worker_env(monkeypatch, tmp_path):
+def test_ui_specialist_route_does_not_launch_codex(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -309,12 +320,11 @@ def test_ui_codex_route_forces_openrouter_key_into_worker_env(monkeypatch, tmp_p
     )
 
     assert result["success"] is True
-    env = FakeSession.instances[0].kwargs["env"]
-    assert "OPENROUTER_API_KEY" not in env
-    assert env["_HERMES_FORCE_OPENROUTER_API_KEY"] == "sk-or-test-secret"
+    assert result["backend"] == "claude_code"
+    assert FakeSession.instances == []
 
 
-def test_ui_opencode_route_uses_configured_backend_and_model(monkeypatch, tmp_path):
+def test_ui_opencode_route_uses_independent_specialist_backend(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -352,19 +362,13 @@ def test_ui_opencode_route_uses_configured_backend_and_model(monkeypatch, tmp_pa
     )
 
     assert result["success"] is True
-    assert result["backend"] == "opencode"
+    assert result["backend"] == "claude_code"
     route = result["ui_work_route"]
     assert route["matched"] is True
     assert route["backend"] == "opencode"
-    assert route["selected_provider"] == "openrouter"
-    assert route["selected_model"] == "z-ai/glm-5.2"
-    assert seen["worker_config"] == {
-        "opencode": {"model": "openrouter/z-ai/glm-5.2"},
-        "model_tier": "disabled",
-    }
-    env = seen["env"]
-    assert "OPENROUTER_API_KEY" not in env
-    assert env["_HERMES_FORCE_OPENROUTER_API_KEY"] == "sk-or-test-secret"
+    assert route["selected_provider"] == "anthropic"
+    assert route["selected_model"] == "claude-fable-5"
+    assert seen == {}
 
 
 def test_default_opencode_route_keeps_openrouter_key_scrubbed(monkeypatch, tmp_path):
@@ -734,8 +738,8 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
     assert route["matched"] is True
     assert route["enabled"] is True
     assert route["reason"] == "orchestrator route selected ui visual specialist"
-    assert route["provider"] == "openrouter"
-    assert route["model"] == "z-ai/glm-5.2"
+    assert route["provider"] == "anthropic"
+    assert route["model"] == "claude-fable-5"
     assert route["backend"] == "codex"
     assert route["fallback_allowed"] is True
     assert route["error"] == ""
@@ -744,8 +748,8 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
     assert route["route_decision_confidence"] == 0.86
     assert route["route_decision_rationale"] == "review feedback requires visual implementation"
     assert route["selected_route"] == "ui_visual_specialist"
-    assert route["selected_provider"] == "openrouter"
-    assert route["selected_model"] == "z-ai/glm-5.2"
+    assert route["selected_provider"] == "anthropic"
+    assert route["selected_model"] == "claude-fable-5"
     assert route["fallback_used"] is False
     assert route["fallback_reason"] == ""
     assert route["advisory_matched"] is False
@@ -755,23 +759,8 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
         "claude-design",
         "popular-web-designs",
     ]
-    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
-    assert "UI specialist skill loading" in prompt
-    assert "`taste-skill`" in prompt
-    assert FakeSession.instances[0].kwargs["extra_args"] == [
-        "-c",
-        'model_provider="openrouter"',
-        "-c",
-        'model="z-ai/glm-5.2"',
-        "-c",
-        'model_providers.openrouter.name="openrouter"',
-        "-c",
-        'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
-        "-c",
-        'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
-        "-c",
-        'model_reasoning_effort="medium"',
-    ]
+    assert result["backend"] == "claude_code"
+    assert FakeSession.instances == []
 
 
 def test_ui_work_smoke_title_uses_codex_model_overlay(monkeypatch, tmp_path):
@@ -798,16 +787,11 @@ def test_ui_work_smoke_title_uses_codex_model_overlay(monkeypatch, tmp_path):
     route = result["ui_work_route"]
     assert route["matched"] is True
     assert route["selected_route"] == "ui_visual_specialist"
-    assert route["selected_provider"] == "openrouter"
-    assert route["selected_model"] == "z-ai/glm-5.2"
+    assert route["selected_provider"] == "anthropic"
+    assert route["selected_model"] == "claude-fable-5"
     assert route["advisory_matched"] is True
     assert "visual ui work" in route["advisory_reason"]
-    assert FakeSession.instances[0].kwargs["extra_args"][:4] == [
-        "-c",
-        'model_provider="openrouter"',
-        "-c",
-        'model="z-ai/glm-5.2"',
-    ]
+    assert FakeSession.instances == []
 
 
 def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monkeypatch, tmp_path):
@@ -907,6 +891,20 @@ def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch,
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
     )
+    monkeypatch.setattr(
+        cwt,
+        "_run_ui_specialist",
+        lambda **kwargs: json.dumps(
+            {
+                "success": False,
+                "status": "error",
+                "summary": "",
+                "error": "Claude Code Fable capacity exhausted",
+                "backend": "claude_code",
+                "ui_work_route": kwargs["route_metadata"],
+            }
+        ),
+    )
 
     result = json.loads(
         cwt.delegate_coding_task(
@@ -917,34 +915,10 @@ def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch,
         )
     )
 
-    assert result["success"] is True
-    assert result["thread_id"] == "thread-default"
-    assert result["ui_work_route"]["fallback_used"] is True
-    assert "openrouter" in result["ui_work_route"]["fallback_reason"].lower()
-    assert result["ui_work_route"]["selected_route"] == "default_coding_worker"
-    assert result["ui_work_route"]["selected_provider"] == ""
-    assert result["ui_work_route"]["selected_model"] == ""
-    assert len(FakeSession.instances) == 2
-    assert FakeSession.instances[0].kwargs["extra_args"] == [
-        "-c",
-        'model_provider="openrouter"',
-        "-c",
-        'model="z-ai/glm-5.2"',
-        "-c",
-        'model_providers.openrouter.name="openrouter"',
-        "-c",
-        'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
-        "-c",
-        'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
-        "-c",
-        'model_reasoning_effort="medium"',
-    ]
-    assert FakeSession.instances[1].kwargs["extra_args"] == [
-        "-c",
-        'model="gpt-5.6-terra"',
-        "-c",
-        'model_reasoning_effort="max"',
-    ]
+    assert result["success"] is False
+    assert "capacity exhausted" in result["error"]
+    assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
+    assert FakeSession.instances == []
 
 
 def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monkeypatch, tmp_path):
@@ -969,6 +943,20 @@ def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monke
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", blocked_import)
+    monkeypatch.setattr(
+        cwt,
+        "_run_ui_specialist",
+        lambda **kwargs: json.dumps(
+            {
+                "success": False,
+                "status": "error",
+                "summary": "",
+                "error": "Claude Code unavailable",
+                "backend": "claude_code",
+                "ui_work_route": kwargs["route_metadata"],
+            }
+        ),
+    )
 
     result = json.loads(
         cwt.delegate_coding_task(
@@ -979,7 +967,7 @@ def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monke
     )
 
     assert result["error"]
-    assert "Codex route args could not be built" in result["error"]
+    assert "Claude Code unavailable" in result["error"]
     assert FakeSession.instances == []
 
 

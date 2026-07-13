@@ -16,8 +16,10 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     schedule: "every 1h",
     deliver: "local",
     skills: [],
+    model_tier: "",
     provider: "",
     model: "",
+    reasoning_effort: "",
     base_url: "",
     script: "",
     no_agent: false,
@@ -60,8 +62,10 @@ describe("buildCronJobPayload", () => {
 
     expect(payload).toMatchObject({
       schedule: "every 2h",
+      model_tier: null,
       provider: null,
       model: null,
+      reasoning_effort: null,
       base_url: null,
       script: null,
       no_agent: false,

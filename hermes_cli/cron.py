@@ -95,6 +95,14 @@ def cron_list(show_all: bool = False):
         print(f"    Deliver:   {deliver_str}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
+        if job.get("model_tier"):
+            print(f"    Model tier: {job['model_tier']}")
+        if job.get("model"):
+            print(f"    Model:     {job['model']}")
+        if job.get("provider"):
+            print(f"    Provider:  {job['provider']}")
+        if job.get("reasoning_effort"):
+            print(f"    Reasoning: {job['reasoning_effort']}")
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
@@ -294,6 +302,10 @@ def cron_create(args):
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
+        model_tier=getattr(args, "model_tier", None),
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
@@ -311,6 +323,8 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     job_data = result.get("job", {})
+    if job_data.get("model_tier"):
+        print(f"  Model tier: {job_data['model_tier']}")
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
     if job_data.get("no_agent"):
@@ -361,6 +375,10 @@ def cron_edit(args):
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
+        model_tier=getattr(args, "model_tier", None),
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         skills=final_skills,
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
@@ -380,6 +398,8 @@ def cron_edit(args):
         print(f"  Skills: {', '.join(updated['skills'])}")
     else:
         print("  Skills: none")
+    if updated.get("model_tier"):
+        print(f"  Model tier: {updated['model_tier']}")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
     if updated.get("no_agent"):

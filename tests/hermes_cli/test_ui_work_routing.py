@@ -44,8 +44,8 @@ def test_matches_new_visual_web_ui_development_and_overlay_args(task):
     assert decision.route_decision_confidence == 0.91
     assert decision.route_decision_rationale == "visual implementation"
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.selected_provider == "openrouter"
-    assert decision.selected_model == "z-ai/glm-5.2"
+    assert decision.selected_provider == "anthropic"
+    assert decision.selected_model == "claude-fable-5"
     assert decision.metadata()["recommended_skills"] == [
         "taste-skill",
         "claude-design",
@@ -53,20 +53,14 @@ def test_matches_new_visual_web_ui_development_and_overlay_args(task):
     ]
     assert decision.advisory_matched is True
     assert "visual ui work" in decision.advisory_reason
-    assert decision.provider == "openrouter"
-    assert decision.model == "z-ai/glm-5.2"
-    assert decision.backend_config["provider_config_key"] == "model_provider"
+    assert decision.provider == "anthropic"
+    assert decision.model == "claude-fable-5"
+    assert decision.backend_config == {
+        "specialist_backend": "claude_code",
+        "binary": "claude",
+    }
     assert codex_ui_work_extra_args(decision) == [
-        "-c",
-        'model_provider="openrouter"',
-        "-c",
-        'model="z-ai/glm-5.2"',
-        "-c",
-        'model_providers.openrouter.name="openrouter"',
-        "-c",
-        'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
-        "-c",
-        'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
+        "-c", 'model_provider="anthropic"', "-c", 'model="claude-fable-5"'
     ]
 
 
@@ -85,11 +79,11 @@ def test_visual_specialist_supports_opencode_backend_config():
     assert decision.matched is True
     assert decision.selected_route == "ui_visual_specialist"
     assert decision.backend == "opencode"
-    assert decision.selected_provider == "openrouter"
-    assert decision.selected_model == "z-ai/glm-5.2"
+    assert decision.selected_provider == "anthropic"
+    assert decision.selected_model == "claude-fable-5"
     assert codex_ui_work_extra_args(decision) == []
     assert opencode_ui_work_worker_config(decision) == {
-        "opencode": {"model": "openrouter/z-ai/glm-5.2"}
+        "opencode": {"model": "anthropic/claude-fable-5"}
     }
 
 
@@ -115,8 +109,8 @@ def test_visual_specialist_accepts_json_encoded_route_decision():
     assert decision.route_decision_confidence == 0.97
     assert decision.route_decision_rationale == "Command Center UI task"
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.selected_provider == "openrouter"
-    assert decision.selected_model == "z-ai/glm-5.2"
+    assert decision.selected_provider == "anthropic"
+    assert decision.selected_model == "claude-fable-5"
 
 
 def test_tui_terminal_rendering_work_does_not_route():
@@ -154,7 +148,7 @@ def test_explicit_ui_route_overrides_review_keyword_veto():
     assert decision.matched is True
     assert decision.enabled is True
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.selected_provider == "openrouter"
+    assert decision.selected_provider == "anthropic"
     assert decision.route_decision_source == "orchestrator"
     assert decision.route_decision_confidence == 0.8
     assert decision.route_decision_rationale == "review feedback requires visual implementation"
@@ -371,3 +365,23 @@ def test_missing_model_falls_back_when_fallback_allowed():
     assert decision.fallback_used is True
     assert decision.selected_route == "default_coding_worker"
     assert decision.backend_config == {}
+
+
+def test_stale_non_fable_ui_config_fails_closed_explicitly():
+    cfg = _cfg()
+    cfg["ui_work"]["provider"] = "openrouter"
+    cfg["ui_work"]["model"] = "anthropic/claude-sonnet-4.6"
+    cfg["ui_work"]["route"] = "api_key"
+
+    decision = resolve_ui_work_route(
+        cfg,
+        task="Polish frontend chart labels.",
+        route_decision="ui_visual_specialist",
+    )
+
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.error == (
+        "ui_work specialist must use Claude Code with Anthropic OAuth, "
+        "provider=anthropic, model=claude-fable-5, and reasoning_effort=medium"
+    )
+    assert decision.fallback_used is False

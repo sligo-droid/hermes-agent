@@ -376,6 +376,32 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["provider"] == "openrouter"
         assert updated["job"]["base_url"] is None
 
+    def test_model_tier_and_reasoning_round_trip_through_tool_storage(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                model_tier="advanced",
+            )
+        )
+        assert created["job"]["model_tier"] == "advanced"
+
+        listed = json.loads(cronjob(action="list"))
+        stored = next(job for job in listed["jobs"] if job["job_id"] == created["job_id"])
+        assert stored["model_tier"] == "advanced"
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                model_tier="",
+                reasoning_effort="max",
+            )
+        )
+        assert updated["job"]["model_tier"] is None
+        assert updated["job"]["reasoning_effort"] == "max"
+
     @staticmethod
     def _patch_named_legit(monkeypatch):
         import hermes_cli.runtime_provider as rp
