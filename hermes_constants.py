@@ -8,6 +8,7 @@ import os
 import sysconfig
 from contextvars import ContextVar, Token
 from pathlib import Path
+from typing import Any
 
 
 _profile_fallback_warned: bool = False
@@ -394,6 +395,7 @@ def agent_browser_runnable(path: str | None) -> bool:
 VALID_REASONING_EFFORTS = (
     "minimal", "low", "medium", "high", "xhigh", "max",
 )
+VALID_MODEL_VERBOSITIES = ("low", "medium", "high")
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:
@@ -412,6 +414,35 @@ def parse_reasoning_effort(effort: str) -> dict | None:
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
+
+
+def merge_model_verbosity_request_overrides(
+    request_overrides: dict[str, Any] | None,
+    *,
+    api_mode: str,
+    verbosity: Any,
+) -> dict[str, Any] | None:
+    """Merge configured Responses API text verbosity into request overrides.
+
+    Existing per-turn overrides remain authoritative, including an explicitly
+    supplied nested ``text.verbosity`` value.
+    """
+    overrides = (
+        dict(request_overrides) if isinstance(request_overrides, dict) else None
+    )
+    normalized = str(verbosity or "").strip().lower()
+    if api_mode != "codex_responses" or normalized not in VALID_MODEL_VERBOSITIES:
+        return overrides
+
+    if overrides is None:
+        overrides = {}
+    existing_text = overrides.get("text")
+    if existing_text is not None and not isinstance(existing_text, dict):
+        return overrides
+    text_config = dict(existing_text) if isinstance(existing_text, dict) else {}
+    text_config.setdefault("verbosity", normalized)
+    overrides["text"] = text_config
+    return overrides
 
 
 def is_termux() -> bool:

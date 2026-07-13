@@ -1174,7 +1174,7 @@ discord:
 coding_worker:
   simple_build_model_tier: intermediate
   complex_plan_model_tier: advanced
-  complex_build_model_tier: basic
+  complex_build_model_tier: intermediate
 
 delegation:
   model_tier_routing: auto

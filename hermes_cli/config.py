@@ -717,6 +717,9 @@ DEFAULT_CONFIG = {
         # available). 0 disables.
         "provider_no_progress_timeout": 900,
         "service_tier": "",
+        # OpenAI Responses API text verbosity: low, medium, or high. Empty
+        # omits the field and keeps the provider/model default.
+        "model_verbosity": "",
         # Optional replay budget for oversized tool outputs. Empty means
         # provider-aware defaults apply (Codex backends default to 10k tokens).
         "tool_output_token_limit": "",
@@ -1599,7 +1602,7 @@ DEFAULT_CONFIG = {
         "model_tier": "",
         "simple_build_model_tier": "intermediate",
         "complex_plan_model_tier": "advanced",
-        "complex_build_model_tier": "basic",
+        "complex_build_model_tier": "intermediate",
         "turn_timeout_seconds": 1800,  # 30 minutes
         "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",

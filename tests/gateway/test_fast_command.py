@@ -127,6 +127,56 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_turn_route_applies_low_verbosity_to_responses_only():
+    runner = _make_runner()
+    responses_runtime = {
+        "api_key": "***",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+    config = {"agent": {"model_verbosity": "low"}}
+
+    responses_route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner, "hi", "gpt-5.6-terra", responses_runtime, user_config=config
+    )
+    chat_route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner,
+        "hi",
+        "gpt-5.6-terra",
+        {**responses_runtime, "api_mode": "chat_completions"},
+        user_config=config,
+    )
+
+    assert responses_route["request_overrides"] == {"text": {"verbosity": "low"}}
+    assert chat_route["request_overrides"] == {}
+
+
+@pytest.mark.parametrize("verbosity", ["", "verbose", None])
+def test_turn_route_omits_invalid_or_empty_model_verbosity(verbosity):
+    runner = _make_runner()
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner,
+        "hi",
+        "gpt-5.6-terra",
+        {
+            "api_key": "***",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        },
+        user_config={"agent": {"model_verbosity": verbosity}},
+    )
+
+    assert route["request_overrides"] == {}
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_refuses_to_enable_gateway_fast_mode(monkeypatch, tmp_path):
     runner = _make_runner()

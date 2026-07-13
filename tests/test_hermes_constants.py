@@ -8,10 +8,12 @@ import pytest
 
 import hermes_constants
 from hermes_constants import (
+    VALID_MODEL_VERBOSITIES,
     VALID_REASONING_EFFORTS,
     agent_browser_runnable,
     get_default_hermes_root,
     is_container,
+    merge_model_verbosity_request_overrides,
     parse_reasoning_effort,
 )
 
@@ -201,3 +203,49 @@ class TestParseReasoningEffort:
         """
         documented = {"minimal", "low", "medium", "high", "xhigh", "max"}
         assert documented.issubset(set(VALID_REASONING_EFFORTS))
+
+
+class TestModelVerbosityRequestOverrides:
+    @pytest.mark.parametrize("verbosity", list(VALID_MODEL_VERBOSITIES))
+    def test_valid_responses_verbosity_is_added(self, verbosity):
+        assert merge_model_verbosity_request_overrides(
+            None,
+            api_mode="codex_responses",
+            verbosity=verbosity,
+        ) == {"text": {"verbosity": verbosity}}
+
+    def test_existing_nested_overrides_win_and_other_fields_survive(self):
+        assert merge_model_verbosity_request_overrides(
+            {
+                "service_tier": "priority",
+                "text": {"verbosity": "high", "format": {"type": "text"}},
+            },
+            api_mode="codex_responses",
+            verbosity="low",
+        ) == {
+            "service_tier": "priority",
+            "text": {"verbosity": "high", "format": {"type": "text"}},
+        }
+
+    def test_non_mapping_text_override_is_not_replaced(self):
+        assert merge_model_verbosity_request_overrides(
+            {"text": "caller-owned"},
+            api_mode="codex_responses",
+            verbosity="low",
+        ) == {"text": "caller-owned"}
+
+    @pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages", ""])
+    def test_non_responses_modes_are_unchanged(self, api_mode):
+        assert merge_model_verbosity_request_overrides(
+            None,
+            api_mode=api_mode,
+            verbosity="low",
+        ) is None
+
+    @pytest.mark.parametrize("verbosity", ["", "verbose", None])
+    def test_invalid_or_empty_verbosity_is_omitted(self, verbosity):
+        assert merge_model_verbosity_request_overrides(
+            None,
+            api_mode="codex_responses",
+            verbosity=verbosity,
+        ) is None

@@ -1026,6 +1026,7 @@ def _run_opencode_process(
     closed_streams: set[str] = set()
     timed_out = False
     startup_timed_out = False
+    terminal_auth_error_detected = False
 
     def _terminate() -> None:
         try:
@@ -1061,6 +1062,15 @@ def _run_opencode_process(
         elif name == "stderr":
             stderr_lines.append(line)
 
+        if (
+            line is not None
+            and not terminal_auth_error_detected
+            and proc.poll() is None
+            and _opencode_line_is_terminal_auth_error(name, line)
+        ):
+            terminal_auth_error_detected = True
+            _terminate()
+
         if proc.poll() is not None and len(closed_streams) >= 2:
             break
 
@@ -1075,6 +1085,29 @@ def _run_opencode_process(
         startup_timed_out=startup_timed_out,
         duration_seconds=round(time.monotonic() - started, 2),
     )
+
+
+def _opencode_line_is_terminal_auth_error(stream_name: str, line: str) -> bool:
+    """Return whether a live OpenCode output line is a terminal auth failure.
+
+    Stdout is JSONL, so only explicit error events are eligible. This avoids
+    aborting when normal assistant content merely mentions an older auth error.
+    Stderr is reserved for process errors and may contain a plain-text failure.
+    """
+    candidate = str(line or "").strip()
+    if not candidate:
+        return False
+    if stream_name == "stdout":
+        try:
+            event = json.loads(candidate)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(event, dict) or str(event.get("type") or "").lower() != "error":
+            return False
+        candidate = json.dumps(event, ensure_ascii=False)
+    elif stream_name != "stderr":
+        return False
+    return _classify_opencode_error(candidate).startswith("OpenCode authentication failed.")
 
 
 def _parse_opencode_output(

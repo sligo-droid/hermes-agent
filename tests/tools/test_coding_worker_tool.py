@@ -1405,7 +1405,7 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-luna"',
+        'model="gpt-5.6-terra"',
         "-c",
         'model_reasoning_effort="max"',
     ]
@@ -1451,7 +1451,7 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-luna"',
+        'model="gpt-5.6-terra"',
         "-c",
         'model_reasoning_effort="high"',
     ]

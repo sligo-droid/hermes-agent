@@ -83,6 +83,16 @@ class TestCodexBuildKwargs:
         )
         assert "reasoning" not in kw or kw.get("include") == []
 
+    def test_text_verbosity_request_override_is_forwarded(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-terra",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            request_overrides={"text": {"verbosity": "low"}},
+        )
+
+        assert kw["text"] == {"verbosity": "low"}
+
     def test_cache_key_is_content_addressed_not_session_id(self, transport):
         """prompt_cache_key is content-addressed from the static prefix
         (instructions + tools), not the session_id. This keeps recurring cron

@@ -4903,6 +4903,7 @@ class HermesCLI:
         API call is marked accordingly.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_constants import merge_model_verbosity_request_overrides
 
         runtime = {
             "api_key": self.api_key,
@@ -4926,16 +4927,25 @@ class HermesCLI:
             ),
         }
 
+        overrides = None
         service_tier = getattr(self, "service_tier", None)
-        if not service_tier:
-            route["request_overrides"] = None
-            return route
-
-        try:
-            overrides = resolve_fast_mode_overrides(route["model"])
-        except Exception:
-            overrides = None
-        route["request_overrides"] = overrides
+        if service_tier:
+            try:
+                overrides = resolve_fast_mode_overrides(route["model"])
+            except Exception:
+                overrides = None
+        config = getattr(self, "config", {}) or {}
+        agent_config = config.get("agent") if isinstance(config, dict) else {}
+        verbosity = (
+            agent_config.get("model_verbosity")
+            if isinstance(agent_config, dict)
+            else ""
+        )
+        route["request_overrides"] = merge_model_verbosity_request_overrides(
+            overrides,
+            api_mode=str(runtime.get("api_mode") or ""),
+            verbosity=verbosity,
+        )
         return route
 
     def _install_tool_callbacks(self) -> None:

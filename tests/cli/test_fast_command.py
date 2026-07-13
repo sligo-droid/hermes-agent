@@ -258,6 +258,25 @@ class TestFastModeRouting(unittest.TestCase):
         assert route["runtime"]["provider"] == "openrouter"
         assert route.get("request_overrides") is None
 
+    def test_turn_route_adds_responses_verbosity(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="gpt-5.6-terra",
+            api_key="primary-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex",
+            api_mode="codex_responses",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            config={"agent": {"model_verbosity": "low"}},
+        )
+
+        route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
+
+        assert route["request_overrides"] == {"text": {"verbosity": "low"}}
+
 
 class TestAnthropicFastMode(unittest.TestCase):
     """Verify Anthropic Fast Mode model support and override resolution."""

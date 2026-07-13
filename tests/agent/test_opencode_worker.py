@@ -1278,6 +1278,63 @@ def test_process_timeout_preserves_partial_stdout(monkeypatch, tmp_path):
     assert '"started"' in result.stdout
 
 
+def test_process_terminates_immediately_on_live_auth_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
+    auth_event = {
+        "type": "error",
+        "sessionID": "ses-auth-live",
+        "error": {
+            "name": "APIError",
+            "data": {
+                "message": "Your authentication token has been invalidated.",
+                "statusCode": 401,
+            },
+        },
+    }
+    result = ow._run_opencode_process(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, time; "
+                f"print(json.dumps({auth_event!r}), flush=True); "
+                "time.sleep(5)"
+            ),
+        ],
+        workdir=str(tmp_path),
+        timeout=5,
+        startup_timeout=2,
+    )
+
+    assert result.timed_out is False
+    assert result.startup_timed_out is False
+    assert result.duration_seconds < 2
+    assert "authentication token has been invalidated" in result.stdout
+
+
+def test_process_does_not_terminate_for_auth_text_in_normal_message(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
+    result = ow._run_opencode_process(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, time; "
+                "print(json.dumps({'type':'message','message':"
+                "'The previous authentication failed, but this run is healthy.'}), flush=True); "
+                "time.sleep(0.3)"
+            ),
+        ],
+        workdir=str(tmp_path),
+        timeout=2,
+        startup_timeout=1,
+    )
+
+    assert result.returncode == 0
+    assert result.timed_out is False
+    assert result.duration_seconds >= 0.2
+
+
 def test_missing_binary_becomes_worker_error(monkeypatch, tmp_path):
     monkeypatch.setattr(ow.shutil, "which", lambda name: None)
 

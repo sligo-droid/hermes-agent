@@ -113,7 +113,14 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "watch and use terminal(background=True, notify_on_complete=True) or cron for "
     "bounded pollers instead of foreground sleep/list-runs loops. Stop before PR "
     "lifecycle only when the user explicitly requested local-only work or a real "
-    "blocker prevents continuing. Do not suppress a necessary clarifying question: "
+    "blocker prevents continuing. Once the requested change is merged and required "
+    "pickup or production verification passes, stop and report; do not open extra "
+    "cleanup, credential, discoverability, or follow-up PRs unless they are required "
+    "to correct a regression introduced by this task or the user explicitly asks. "
+    "Record non-critical follow-ups instead of expanding the active turn. Prefer one "
+    "focused coding-worker attempt; if its backend fails, diagnose the failure and "
+    "continue inline or report the blocker instead of repeatedly retrying the same "
+    "backend in one turn. Do not suppress a necessary clarifying question: "
     "ask at most one concise question with a recommended default when the answer "
     "materially changes user-visible behavior, scope, irreversible/public/cost/"
     "security effects, or the definition of done. For low-stakes ambiguity, "
@@ -3228,12 +3235,18 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        user_config: Optional[dict] = None,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider. Gateway turns must
-        not inherit CLI/session fast mode, so request overrides are always
-        empty here.
+        not inherit CLI/session fast mode. Responses API text verbosity is
+        still applied from ``agent.model_verbosity`` when configured.
         """
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -3244,6 +3257,19 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
+        from hermes_constants import merge_model_verbosity_request_overrides
+
+        agent_config = (user_config or {}).get("agent")
+        verbosity = (
+            agent_config.get("model_verbosity")
+            if isinstance(agent_config, dict)
+            else ""
+        )
+        request_overrides = merge_model_verbosity_request_overrides(
+            {},
+            api_mode=str(runtime.get("api_mode") or ""),
+            verbosity=verbosity,
+        )
         route = {
             "model": model,
             "runtime": runtime,
@@ -3255,7 +3281,7 @@ class GatewayRunner:
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
-            "request_overrides": {},
+            "request_overrides": request_overrides or {},
         }
         return route
 
@@ -15927,7 +15953,9 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs, user_config=user_config
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -20985,7 +21013,9 @@ class GatewayRunner:
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message, model, runtime_kwargs, user_config=user_config
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
