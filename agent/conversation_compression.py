@@ -128,10 +128,9 @@ def check_compression_model_feasibility(agent: Any) -> None:
             "compression",
             main_runtime=agent._current_main_runtime(),
         )
-        # Best-effort aux provider label for the warning message. The
-        # configured provider may be "auto", in which case we fall back
-        # to the client's base_url hostname so the user can still tell
-        # where the compression model is actually being called.
+        # The client carries the provider selected by the auxiliary resolver.
+        # Never infer identity from its transport wrapper or endpoint: custom
+        # providers can intentionally use those same transports and hosts.
         try:
             _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
         except Exception:
@@ -164,6 +163,14 @@ def check_compression_model_feasibility(agent: Any) -> None:
             return
 
         aux_base_url = str(getattr(client, "base_url", ""))
+        _resolved_provider = getattr(client, "_hermes_provider", "")
+        aux_provider = _resolved_provider if isinstance(_resolved_provider, str) else ""
+        if not aux_provider:
+            aux_provider = (
+                _aux_cfg_provider
+                if _aux_cfg_provider and _aux_cfg_provider != "auto"
+                else getattr(agent, "provider", "")
+            )
         # ``client.api_key`` may be a callable (Azure Foundry Entra ID
         # bearer provider). The context-length resolver chain expects a
         # string, but it only needs a key for live catalogue probes
@@ -182,7 +189,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
             # Each model must be resolved with its own provider so that
             # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
             # are invoked for the correct client, not inherited from the main model.
-            provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")),
+            provider=aux_provider,
             custom_providers=agent._custom_providers,
         )
 
@@ -229,24 +236,10 @@ def check_compression_model_feasibility(agent: Any) -> None:
             safe_pct = int((aux_context / main_ctx) * 100) if main_ctx else 50
             # Build human-readable "model (provider)" labels for both
             # the main model and the compression model so users can
-            # tell at a glance which provider each side is actually
-            # using. When the configured provider is empty or "auto",
-            # fall back to the client's base_url hostname.
+            # tell at a glance which provider each side is actually using.
             _main_model = getattr(agent, "model", "") or "?"
             _main_provider = getattr(agent, "provider", "") or ""
-            _aux_provider_label = (
-                _aux_cfg_provider
-                if _aux_cfg_provider and _aux_cfg_provider != "auto"
-                else ""
-            )
-            if not _aux_provider_label:
-                try:
-                    from urllib.parse import urlparse
-                    _aux_provider_label = (
-                        urlparse(aux_base_url).hostname or aux_base_url
-                    )
-                except Exception:
-                    _aux_provider_label = aux_base_url or "auto"
+            _aux_provider_label = aux_provider or "auto"
             _main_label = (
                 f"{_main_model} ({_main_provider})"
                 if _main_provider
