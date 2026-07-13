@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from utils import base_url_host_matches
 
@@ -14,6 +16,8 @@ FABLE_PROVIDER = "anthropic"
 FABLE_MODEL = "claude-fable-5"
 FABLE_ROUTE = "anthropic_oauth"
 FABLE_TRANSPORT = "anthropic_oauth"
+FABLE_PROXY_ROUTE = "anthropic_proxy"
+FABLE_PROXY_TRANSPORT = "anthropic_proxy"
 FABLE_REASONING = {"enabled": True, "effort": "high"}
 FABLE_DEFAULT_TOOLSETS = ["file", "terminal", "web", "browser", "discord"]
 
@@ -63,13 +67,18 @@ class FablePlanResult:
     refusal: bool = False
 
 
-def fable_metadata(result: FablePlanResult | None = None) -> dict[str, Any]:
+def fable_metadata(
+    result: FablePlanResult | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    route = _fable_route(_fable_config(config))
     metadata = {
         "command": "fable",
         "plan_artifact_kind": "fable_plan",
         "response_kind": "fable_plan",
         "kind": "fable_plan",
-        "transport": FABLE_TRANSPORT,
+        "route": route,
+        "transport": _fable_transport(route),
         "provider": FABLE_PROVIDER,
         "model": FABLE_MODEL,
         "reply_to_mode": "all",
@@ -163,8 +172,15 @@ def fable_session_model_override(config: dict[str, Any] | None = None) -> tuple[
         return None, "/fable is pinned to provider=anthropic; configured provider is unsupported."
     if str(cfg.get("model") or FABLE_MODEL).strip() != FABLE_MODEL:
         return None, "/fable is pinned to model=claude-fable-5; configured model is unsupported."
-    if str(cfg.get("route") or FABLE_ROUTE).strip().lower() != FABLE_ROUTE:
-        return None, "/fable is pinned to route=anthropic_oauth; configured route is unsupported."
+    route = _fable_route(cfg)
+    if route not in {FABLE_ROUTE, FABLE_PROXY_ROUTE}:
+        return None, "/fable supports only route=anthropic_oauth or route=anthropic_proxy."
+    configured_api_mode = str(cfg.get("api_mode") or "").strip()
+    if configured_api_mode and configured_api_mode != "anthropic_messages":
+        return None, "/fable is pinned to api_mode=anthropic_messages; configured API mode is unsupported."
+
+    if route == FABLE_PROXY_ROUTE:
+        return _fable_proxy_session_model_override(cfg)
 
     preflight_error = _anthropic_budget_preflight_error()
     if preflight_error:
@@ -210,6 +226,43 @@ def fable_session_model_override(config: dict[str, Any] | None = None) -> tuple[
         "api_key": api_key,
         "base_url": base_url,
         "api_mode": api_mode,
+        "disable_fallback": "true",
+    }, ""
+
+
+def _fable_proxy_session_model_override(cfg: dict[str, Any]) -> tuple[dict[str, str] | None, str]:
+    """Resolve the explicit API-key proxy route without consulting OAuth/pools."""
+    key_env = str(cfg.get("key_env") or "").strip()
+    base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
+    if not key_env:
+        return None, "/fable Anthropic proxy route requires fable.key_env naming a profile secret."
+    if not _ENV_VAR_NAME_RE.fullmatch(key_env):
+        return None, "/fable Anthropic proxy route has an invalid fable.key_env name."
+    if not base_url:
+        return None, "/fable Anthropic proxy route requires fable.base_url."
+    if not _is_valid_fable_proxy_base_url(base_url):
+        return None, "/fable Anthropic proxy route has an invalid fable.base_url; use an absolute HTTP(S) proxy endpoint."
+    if base_url_host_matches(base_url, "api.anthropic.com"):
+        return None, (
+            "/fable Anthropic proxy route refuses api.anthropic.com API-key routing; "
+            "configure a non-public Anthropic-compatible proxy endpoint."
+        )
+
+    try:
+        from agent.secret_scope import get_secret
+
+        api_key = str(get_secret(key_env, "") or "").strip()
+    except Exception as exc:
+        return None, f"/fable Anthropic proxy route could not read fable.key_env safely: {exc}"
+    if not api_key:
+        return None, f"/fable Anthropic proxy route requires the configured secret {key_env}."
+
+    return {
+        "model": FABLE_MODEL,
+        "provider": FABLE_PROVIDER,
+        "api_key": api_key,
+        "base_url": base_url,
+        "api_mode": "anthropic_messages",
         "disable_fallback": "true",
     }, ""
 
@@ -333,6 +386,34 @@ def _fable_config(config: dict[str, Any] | None) -> dict[str, Any]:
             config = {}
     section = config.get("fable") if isinstance(config, dict) else {}
     return section if isinstance(section, dict) else {}
+
+
+_ENV_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _fable_route(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("route") or FABLE_ROUTE).strip().lower()
+
+
+def _fable_transport(route: str) -> str:
+    return FABLE_PROXY_TRANSPORT if route == FABLE_PROXY_ROUTE else FABLE_TRANSPORT
+
+
+def _is_valid_fable_proxy_base_url(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    try:
+        return parsed.port is None or 0 < parsed.port <= 65535
+    except ValueError:
+        return False
 
 
 def _error(message: str) -> FablePlanResult:
