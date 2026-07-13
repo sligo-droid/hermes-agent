@@ -64,6 +64,14 @@ def _fable_override():
     }
 
 
+def _fable_proxy_override():
+    return {
+        **_fable_override(),
+        "api_key": "cliproxy-key",
+        "base_url": "http://127.0.0.1:8317",
+    }
+
+
 def _make_event(text="/fable build X"):
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -133,6 +141,34 @@ async def test_fable_command_uses_configured_toolset_budget(monkeypatch):
     assert isinstance(result, MetadataReply)
     agent_event = runner._handle_message_with_agent.await_args.args[0]
     assert agent_event.fable_enabled_toolsets == ["file", "web"]
+
+
+@pytest.mark.asyncio
+async def test_fable_command_metadata_identifies_configured_proxy_route(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+    config = {
+        "fable": {
+            "route": "anthropic_proxy",
+            "key_env": "CLI_PROXY_API_KEY",
+            "base_url": "http://127.0.0.1:8317",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", lambda *_args, **_kwargs: "PLAN")
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (_fable_proxy_override(), ""),
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: config)
+
+    result = await GatewayRunner._handle_message(runner, _make_event())
+
+    assert isinstance(result, MetadataReply)
+    assert result.metadata["route"] == "anthropic_proxy"
+    assert result.metadata["transport"] == "anthropic_proxy"
+    assert result.metadata["provider"] == "anthropic"
+    assert result.metadata["model"] == "claude-fable-5"
 
 
 @pytest.mark.asyncio

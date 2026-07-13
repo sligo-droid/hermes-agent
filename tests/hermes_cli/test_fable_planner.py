@@ -168,6 +168,110 @@ def test_fable_session_model_override_accepts_proxy_managed_api_key(monkeypatch)
     assert override["disable_fallback"] == "true"
 
 
+def test_fable_session_model_override_uses_configured_proxy_secret(monkeypatch):
+    monkeypatch.setenv("CLI_PROXY_API_KEY", "cliproxy-key")
+
+    override, error = fable_session_model_override(
+        config={
+            "fable": {
+                "route": "anthropic_proxy",
+                "key_env": "CLI_PROXY_API_KEY",
+                "base_url": "http://127.0.0.1:8317/v1",
+            }
+        }
+    )
+
+    assert error == ""
+    assert override == {
+        "model": FABLE_MODEL,
+        "provider": "anthropic",
+        "api_key": "cliproxy-key",
+        "base_url": "http://127.0.0.1:8317/v1",
+        "api_mode": "anthropic_messages",
+        "disable_fallback": "true",
+    }
+
+
+def test_fable_proxy_route_rejects_incomplete_configuration(monkeypatch):
+    monkeypatch.setenv("CLI_PROXY_API_KEY", "cliproxy-key")
+
+    override, error = fable_session_model_override(
+        config={"fable": {"route": "anthropic_proxy", "key_env": "CLI_PROXY_API_KEY"}}
+    )
+
+    assert override is None
+    assert "fable.base_url" in error
+
+
+def test_fable_proxy_route_rejects_missing_key(monkeypatch):
+    monkeypatch.delenv("CLI_PROXY_API_KEY", raising=False)
+
+    override, error = fable_session_model_override(
+        config={
+            "fable": {
+                "route": "anthropic_proxy",
+                "key_env": "CLI_PROXY_API_KEY",
+                "base_url": "http://127.0.0.1:8317",
+            }
+        }
+    )
+
+    assert override is None
+    assert "CLI_PROXY_API_KEY" in error
+
+
+def test_fable_proxy_route_rejects_public_anthropic_endpoint(monkeypatch):
+    monkeypatch.setenv("CLI_PROXY_API_KEY", "cliproxy-key")
+
+    override, error = fable_session_model_override(
+        config={
+            "fable": {
+                "route": "anthropic_proxy",
+                "key_env": "CLI_PROXY_API_KEY",
+                "base_url": "https://api.anthropic.com",
+            }
+        }
+    )
+
+    assert override is None
+    assert "refuses api.anthropic.com" in error
+
+
+def test_fable_proxy_route_rejects_invalid_endpoint(monkeypatch):
+    monkeypatch.setenv("CLI_PROXY_API_KEY", "cliproxy-key")
+
+    override, error = fable_session_model_override(
+        config={
+            "fable": {
+                "route": "anthropic_proxy",
+                "key_env": "CLI_PROXY_API_KEY",
+                "base_url": "http://proxy.test:invalid",
+            }
+        }
+    )
+
+    assert override is None
+    assert "invalid fable.base_url" in error
+
+
+def test_fable_proxy_route_rejects_unsupported_api_mode(monkeypatch):
+    monkeypatch.setenv("CLI_PROXY_API_KEY", "cliproxy-key")
+
+    override, error = fable_session_model_override(
+        config={
+            "fable": {
+                "route": "anthropic_proxy",
+                "key_env": "CLI_PROXY_API_KEY",
+                "base_url": "http://127.0.0.1:8317",
+                "api_mode": "chat_completions",
+            }
+        }
+    )
+
+    assert override is None
+    assert "api_mode=anthropic_messages" in error
+
+
 def test_fable_config_fails_closed_for_wrong_model(monkeypatch):
     def fail_resolve(**_kwargs):
         raise AssertionError("route should not resolve for unsupported configured model")
@@ -256,3 +360,10 @@ def test_fable_metadata_for_artifact():
     assert metadata["plan_artifact_kind"] == "fable_plan"
     assert metadata["model"] == FABLE_MODEL
     assert metadata["reply_to_mode"] == "all"
+
+
+def test_fable_metadata_identifies_configured_proxy_route():
+    metadata = fable_metadata(config={"fable": {"route": "anthropic_proxy"}})
+
+    assert metadata["route"] == "anthropic_proxy"
+    assert metadata["transport"] == "anthropic_proxy"

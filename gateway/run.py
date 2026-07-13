@@ -259,9 +259,10 @@ def _discord_action_request_reasoning_config(config: Optional[dict]) -> dict | N
     return parse_reasoning_effort("xhigh")
 
 
-def _fable_fail_closed_error(detail: str = "") -> str:
+def _fable_fail_closed_error(detail: str = "", route: str = "") -> str:
+    route_label = "Anthropic proxy route" if route == "anthropic_proxy" else "Anthropic OAuth route"
     base = (
-        "⚠️ /fable is pinned to Claude Fable 5 via Hermes' Anthropic OAuth route "
+        f"⚠️ /fable is pinned to Claude Fable 5 via Hermes' {route_label} "
         "and will not fall back to another model or provider."
     )
     cleaned = " ".join(str(detail or "").split())[:500]
@@ -12193,7 +12194,7 @@ class GatewayRunner:
                 actual_provider = str(agent_result.get("provider") or "")
                 if agent_result.get("failed"):
                     detail = str(agent_result.get("error") or response or "Fable route unavailable.")
-                    return _fable_fail_closed_error(detail)
+                    return _fable_fail_closed_error(detail, str(fable_plan_metadata.get("route") or ""))
                 if actual_model != "claude-fable-5" or actual_provider != "anthropic":
                     logger.error(
                         "/fable resolved unexpected route provider=%r model=%r; refusing fallback result for session %s",
@@ -12203,7 +12204,8 @@ class GatewayRunner:
                     )
                     return _fable_fail_closed_error(
                         "Resolved unexpected route "
-                        f"provider={actual_provider!r} model={actual_model!r}; refusing fallback result."
+                        f"provider={actual_provider!r} model={actual_model!r}; refusing fallback result.",
+                        str(fable_plan_metadata.get("route") or ""),
                     )
                 transcript_user_message = str(
                     getattr(event, "fable_transcript_user_message", "") or ""
@@ -17869,7 +17871,7 @@ class GatewayRunner:
             event.invoked_skill_name = "plan"
             event.invoked_skill_command = "fable"
             event.fable_plan_metadata = {
-                **fable_metadata(),
+                **fable_metadata(config=cfg),
                 "session_id": session_key,
                 "source_message_id": str(event.message_id or ""),
             }

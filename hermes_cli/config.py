@@ -1046,6 +1046,9 @@ DEFAULT_CONFIG = {
         "provider": "anthropic",
         "model": "claude-fable-5",
         "route": "anthropic_oauth",
+        # To use an Anthropic-compatible proxy without copying its secret into
+        # ANTHROPIC_API_KEY, set route: anthropic_proxy plus key_env and base_url.
+        # The named credential remains in the active profile's .env.
         "enabled_toolsets": ["file", "terminal", "web", "browser", "discord"],
         "timeout_seconds": 300,
         "max_tokens": 12000,
