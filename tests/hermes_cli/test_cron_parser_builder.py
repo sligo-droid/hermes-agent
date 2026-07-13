@@ -8,6 +8,10 @@ god-file Phase 2 extraction.
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from hermes_cli.subcommands.cron import build_cron_parser
 
@@ -86,3 +90,20 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_real_cli_entry_point_exposes_cron_model_routing_flags():
+    hermes = Path(sys.executable).with_name("hermes")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    for action in ("create", "edit"):
+        result = subprocess.run(
+            [str(hermes), "cron", action, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        for flag in ("--model-tier", "--model", "--provider", "--reasoning-effort"):
+            assert flag in result.stdout
