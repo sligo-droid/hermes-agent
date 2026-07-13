@@ -71,8 +71,18 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--disable-on-terminal-success",
+        action="store_true",
+        default=False,
+        help="For no-agent finite executor jobs, pause after successful output begins with DONE: or ends with terminal_success JSON.",
+    )
+    cron_create.add_argument(
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
+    )
+    cron_create.add_argument(
+        "--profile",
+        help="Hermes profile name to run the job under. Use 'default' for the root profile. Named profiles must already exist. Omit to preserve the scheduler's existing profile.",
     )
 
     # cron edit
@@ -139,8 +149,27 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Disable no-agent mode on this job (reverts to LLM-driven execution).",
     )
     cron_edit.add_argument(
+        "--disable-on-terminal-success",
+        dest="disable_on_terminal_success",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable terminal-success auto-pause for this no-agent job.",
+    )
+    cron_edit.add_argument(
+        "--keep-recurring-on-terminal-success",
+        dest="disable_on_terminal_success",
+        action="store_const",
+        const=False,
+        help="Disable terminal-success auto-pause for this job.",
+    )
+    cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--profile",
+        help="Hermes profile name to run the job under. Use 'default' for the root profile. Pass empty string to clear.",
     )
 
     # lifecycle actions
