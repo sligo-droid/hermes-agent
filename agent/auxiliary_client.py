@@ -183,6 +183,39 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
     return _PROVIDER_ALIASES.get(normalized, normalized)
 
 
+def _annotate_resolved_provider(client: Optional[Any], provider: Optional[str]) -> Optional[Any]:
+    """Attach resolver provenance without changing public return shapes."""
+    if client is None:
+        return None
+    resolved = (provider or "").strip().lower()
+    if resolved.startswith("custom:"):
+        resolved = resolved.split(":", 1)[1].strip() or "custom"
+    if not resolved:
+        return client
+    try:
+        client._hermes_provider = resolved
+    except (AttributeError, TypeError):
+        pass
+    return client
+
+
+def _provider_chain_provenance(client: Any, label: str) -> str:
+    """Return the exact provider selected by an auto Step-2 chain entry."""
+    annotated = getattr(client, "_hermes_provider", "")
+    if isinstance(annotated, str) and annotated.strip():
+        return annotated
+    return "custom" if label == "local/custom" else label
+
+
+def _task_provider_provenance(task: str, resolved_provider: Optional[str]) -> str:
+    """Recover an explicit task provider that resolution mapped to a transport."""
+    if task:
+        configured = str(_get_auxiliary_task_config(task).get("provider", "")).strip().lower()
+        if configured and configured not in {"auto", "main"}:
+            return configured
+    return str(resolved_provider or "").strip().lower()
+
+
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
 # strip the ``temperature`` key from API kwargs entirely so the provider's
 # server-side default applies.  Kimi/Moonshot models manage temperature
@@ -956,6 +989,8 @@ class AsyncCodexAuxiliaryClient:
         self.chat = _AsyncCodexChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+        if hasattr(sync_wrapper, "_hermes_provider"):
+            self._hermes_provider = sync_wrapper._hermes_provider
         # Mirror the sync wrapper's _real_client so cache eviction by leaf
         # OpenAI client (e.g. _close_client_on_timeout in #23482) drops
         # this async entry too. Without this, sync and async cache entries
@@ -1104,6 +1139,8 @@ class AsyncAnthropicAuxiliaryClient:
         self.chat = _AsyncAnthropicChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+        if hasattr(sync_wrapper, "_hermes_provider"):
+            self._hermes_provider = sync_wrapper._hermes_provider
         # See AsyncCodexAuxiliaryClient: mirror _real_client so cache
         # eviction on a poisoned underlying client also drops this entry.
         self._real_client = sync_wrapper._real_client
@@ -1434,7 +1471,9 @@ def _resolve_api_key_provider(*, task: Optional[str] = None) -> Tuple[Optional[O
                     continue
             except ImportError:
                 pass
-            return _try_anthropic()
+            client, model = _try_anthropic()
+            _annotate_resolved_provider(client, provider_id)
+            return client, model
 
         pool_present, entry = _select_pool_entry(provider_id)
         if pool_present:
@@ -1452,7 +1491,9 @@ def _resolve_api_key_provider(*, task: Optional[str] = None) -> Tuple[Optional[O
                 from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
                 if is_native_gemini_base_url(base_url):
-                    return GeminiNativeClient(api_key=api_key, base_url=base_url), model
+                    client = GeminiNativeClient(api_key=api_key, base_url=base_url)
+                    _annotate_resolved_provider(client, provider_id)
+                    return client, model
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
@@ -1472,6 +1513,7 @@ def _resolve_api_key_provider(*, task: Optional[str] = None) -> Tuple[Optional[O
                     pass
             _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
             _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
+            _annotate_resolved_provider(_client, provider_id)
             return _client, model
 
         creds = resolve_api_key_provider_credentials(provider_id)
@@ -1489,7 +1531,9 @@ def _resolve_api_key_provider(*, task: Optional[str] = None) -> Tuple[Optional[O
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             if is_native_gemini_base_url(base_url):
-                return GeminiNativeClient(api_key=api_key, base_url=base_url), model
+                client = GeminiNativeClient(api_key=api_key, base_url=base_url)
+                _annotate_resolved_provider(client, provider_id)
+                return client, model
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
             extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
@@ -1509,6 +1553,7 @@ def _resolve_api_key_provider(*, task: Optional[str] = None) -> Tuple[Optional[O
                 pass
         _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
         _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
+        _annotate_resolved_provider(_client, provider_id)
         return _client, model
 
     return None, None
@@ -1539,7 +1584,7 @@ def _try_openrouter(
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                      default_headers=build_or_headers()), model or _OPENROUTER_MODEL
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
@@ -1553,7 +1598,7 @@ def _try_openrouter(
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                  default_headers=build_or_headers()), model or _OPENROUTER_MODEL
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -1919,10 +1964,10 @@ def _try_custom_endpoint(*, task: Optional[str] = None) -> Tuple[Optional[Any], 
                 "anthropic SDK is not installed — falling back to OpenAI-wire."
             )
             return OpenAI(api_key=custom_key, base_url=_clean_base, **_extra), model
-        return (
-            AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base, is_oauth=False),
-            model,
+        client = AnthropicAuxiliaryClient(
+            real_client, model, custom_key, custom_base, is_oauth=False
         )
+        return client, model
     # URL-based anthropic detection for custom endpoints that didn't set
     # api_mode explicitly (e.g. kimi.com/coding reached via custom config).
     _fallback_client = OpenAI(api_key=custom_key, base_url=_clean_base, **_extra)
@@ -3110,6 +3155,7 @@ def _try_main_agent_model_fallback(
     if client is None:
         return None, None, ""
 
+    _annotate_resolved_provider(client, main_provider)
     label = f"main-agent({main_provider})"
     logger.info(
         "Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
@@ -3189,12 +3235,14 @@ def _resolve_single_provider(
     Uses the existing provider resolution infrastructure where possible.
     """
     # Reuse resolve_provider_client which handles provider→client mapping.
-    return resolve_provider_client(
+    client, resolved_model = resolve_provider_client(
         provider=provider,
         model=model or "",
         explicit_base_url=base_url or "",
         explicit_api_key=api_key or "",
     )
+    _annotate_resolved_provider(client, provider)
+    return client, resolved_model
 
 
 def _resolve_auto(
@@ -3278,6 +3326,20 @@ def _resolve_auto(
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
+    if main_provider == "moa":
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.moa_config import resolve_moa_preset
+
+            preset = resolve_moa_preset((load_config().get("moa") or {}), main_model)
+            aggregator = preset.get("aggregator") or {}
+            main_provider = str(aggregator.get("provider") or "")
+            main_model = str(aggregator.get("model") or "")
+            runtime_base_url = ""
+            runtime_api_key = ""
+            runtime_api_mode = str(aggregator.get("api_mode") or "")
+        except (KeyError, TypeError, ValueError):
+            pass
     use_codex_compression_model = (
         task == "compression"
         and main_provider
@@ -3316,6 +3378,9 @@ def _resolve_auto(
                 api_mode=runtime_api_mode or None,
             )
             if client is not None:
+                # resolved_provider may be the generic transport route
+                # ("custom"); main_provider is the resolver provenance.
+                _annotate_resolved_provider(client, main_provider)
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or resolved_model)
                 _restore_route_probe()
@@ -3333,6 +3398,9 @@ def _resolve_auto(
         except TypeError:
             client, model = try_fn()
         if client is not None:
+            _annotate_resolved_provider(
+                client, _provider_chain_provenance(client, label)
+            )
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
                             label, model or "default", ", ".join(tried))
@@ -3449,7 +3517,11 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
                     async_kwargs["default_headers"] = dict(_ph_async.default_headers)
         except Exception:
             pass
-    return AsyncOpenAI(**async_kwargs), model
+    async_client = AsyncOpenAI(**async_kwargs)
+    resolved_provider = getattr(sync_client, "_hermes_provider", None)
+    if isinstance(resolved_provider, str) and resolved_provider:
+        _annotate_resolved_provider(async_client, resolved_provider)
+    return async_client, model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -4133,6 +4205,8 @@ def _resolve_text_auxiliary_client(
         main_runtime=main_runtime,
         task=task or None,
     )
+    if client is not None and provider not in {"auto", "", None}:
+        _annotate_resolved_provider(client, _task_provider_provenance(task, provider))
     if client is not None or not task or provider in {"auto", "", None}:
         return client, resolved_model
 
@@ -4335,6 +4409,15 @@ def resolve_vision_provider_client(
         main_provider = _read_main_provider()
         main_model = _read_main_model()
         if main_provider and main_provider not in {"auto", ""}:
+            runtime_base_url = ""
+            runtime_api_key = ""
+            runtime_api_mode = resolved_api_mode
+            if main_provider == "custom" or main_provider.startswith("custom:"):
+                runtime_base_url = _RUNTIME_MAIN_BASE_URL
+                runtime_api_key = _RUNTIME_MAIN_API_KEY
+                runtime_api_mode = _RUNTIME_MAIN_API_MODE or resolved_api_mode
+                if not runtime_base_url:
+                    runtime_base_url, runtime_api_key, runtime_api_mode = _resolve_custom_runtime()
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
             if main_provider == "nous":
                 sync_client, default_model = _resolve_strict_vision_backend(
@@ -4379,7 +4462,9 @@ def resolve_vision_provider_client(
             else:
                 rpc_client, rpc_model = resolve_provider_client(
                     main_provider, vision_model,
-                    api_mode=resolved_api_mode,
+                    explicit_base_url=runtime_base_url or None,
+                    explicit_api_key=runtime_api_key or None,
+                    api_mode=runtime_api_mode,
                     is_vision=True)
                 if rpc_client is not None:
                     logger.info(

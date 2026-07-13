@@ -458,6 +458,24 @@ class TestCustomProviderAliasCollision:
         assert client.api_key == "my-kimi-key"
         assert model == "my-kimi-model"
 
+    def test_custom_named_kimi_keeps_exact_provenance(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"provider": "openrouter", "default": "main-model"},
+            "custom_providers": [{
+                "name": "kimi",
+                "base_url": "https://my-custom-kimi.example.com/v1",
+                "api_key": "my-kimi-key",
+            }],
+            "auxiliary": {
+                "compression": {"provider": "kimi", "model": "my-kimi-model"},
+            },
+        })
+        from agent.auxiliary_client import get_text_auxiliary_client
+
+        client, _ = get_text_auxiliary_client("compression")
+
+        assert client._hermes_provider == "kimi"
+
     def test_bare_kimi_without_custom_still_routes_to_builtin(self, tmp_path, monkeypatch):
         """Regression guard: bare 'kimi' with no custom entry must still
         reach the built-in kimi-coding provider."""
