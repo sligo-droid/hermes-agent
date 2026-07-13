@@ -2717,9 +2717,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) ->
             ingestion_result = _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
             ingestion_health_details = _self_improvement_ingestion_health(ingestion_result, Path(output_file))
             if ingestion_result and ingestion_result.get("status") == "malformed":
-                success = False
-                parse_error = " ".join(str(ingestion_result.get("parse_error") or "malformed proposal output").split())
-                error = f"Self-improvement proposal ingestion failed: {parse_error}"
+                logger.error(
+                    "Job '%s': agent completed but self-improvement proposal ingestion failed: %s",
+                    job["id"],
+                    ingestion_result.get("parse_error") or "malformed proposal output",
+                )
 
         if success and not final_response.strip():
             success = False

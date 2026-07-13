@@ -199,6 +199,34 @@ def test_ingest_invalid_json_stays_malformed(tmp_path, monkeypatch):
     assert result["card_count"] == 0
 
 
+def test_ingest_extra_closing_brace_preserves_malformed_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    source_markdown = (
+        "Doctor completed and found one issue.\n"
+        "```json\n"
+        '{"contract_version":"self_improvement.proposal_run.v1","cards":[]}\n'
+        "}\n"
+        "```"
+    )
+
+    result = proposal_storage.ingest_proposal_output(
+        source_markdown,
+        source={"run_id": "doctor-extra-brace", "cron_output_path": "/tmp/doctor.md"},
+    )
+    failures = proposal_storage.list_parse_failures()
+
+    assert result["status"] == "malformed"
+    assert result["card_count"] == 0
+    assert "proposal JSON parse error" in result["parse_error"]
+    assert failures["failures"][0]["source_ref"]["cron_output_path"] == "/tmp/doctor.md"
+    with proposal_storage.connect() as conn:
+        row = conn.execute(
+            "SELECT source_markdown FROM proposal_runs WHERE source_key = ?",
+            (result["source_key"],),
+        ).fetchone()
+    assert row["source_markdown"] == source_markdown
+
+
 def test_ingest_overlong_card_body_persists_field_diagnostics(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     payload = _valid_payload()
