@@ -13594,6 +13594,7 @@ class GatewayRunner:
         import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
+            resolve_persist_behavior,
             list_authenticated_providers,
             list_picker_providers,
         )
@@ -13602,7 +13603,14 @@ class GatewayRunner:
         raw_args = event.get_command_args().strip()
 
         # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        (
+            model_input,
+            explicit_provider,
+            is_global_flag,
+            force_refresh,
+            is_session,
+        ) = parse_model_flags(raw_args)
+        persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:

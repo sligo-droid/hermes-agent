@@ -180,7 +180,7 @@ def test_run_one_job_valid_self_improvement_ingestion_keeps_health_ok(monkeypatc
     assert seen_health_details == [None]
 
 
-def test_run_one_job_malformed_self_improvement_ingestion_marks_failure(monkeypatch):
+def test_run_one_job_malformed_self_improvement_ingestion_preserves_doctor_success(monkeypatch):
     calls = _patch_pipeline(monkeypatch)
     deliveries = []
     manual_finishes = []
@@ -224,18 +224,18 @@ def test_run_one_job_malformed_self_improvement_ingestion_marks_failure(monkeypa
         "self_improvement_proposal": {"project": "p", "prong": "q"},
     })
 
-    assert ok is False
-    assert calls[-1] == ("mark", "j8", False)
-    assert seen_errors == [f"Self-improvement proposal ingestion failed: {parse_error}"]
-    assert deliveries == [f"⚠️ Cron job 't' failed:\nSelf-improvement proposal ingestion failed: {parse_error}"]
+    assert ok is True
+    assert calls[-1] == ("mark", "j8", True)
+    assert seen_errors == [None]
+    assert deliveries == ["final response"]
     assert manual_finishes == [
         (
             "j8",
             "manual-8",
             {
-                "success": False,
+                "success": True,
                 "output_path": "/tmp/j8.txt",
-                "error": f"Self-improvement proposal ingestion failed: {parse_error}",
+                "error": None,
             },
         )
     ]
