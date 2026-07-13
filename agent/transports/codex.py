@@ -164,6 +164,11 @@ class ResponsesApiTransport(ProviderTransport):
                 reasoning_effort = reasoning_config["effort"]
 
         _effort_clamp = {"minimal": "low"}
+        # chatgpt.com/backend-api/codex accepts reasoning effort through
+        # ``xhigh`` only. Keep ``max`` for other Responses providers that
+        # support it, including tier-routed delegated workers.
+        if is_codex_backend:
+            _effort_clamp["max"] = "xhigh"
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
