@@ -1246,7 +1246,7 @@ def delegate_coding_task(
                 # The visual specialist is an explicit independent route, not
                 # an ordinary feature-worker tier. Preserve its own pass
                 # configuration while its model override is active.
-                ui_opencode_config["model_tier"] = ""
+                ui_opencode_config["model_tier"] = "disabled"
                 opencode_kwargs["worker_config"] = ui_opencode_config
         if allow_git_pr_lifecycle:
             opencode_kwargs["env"] = worker_env
@@ -1290,7 +1290,7 @@ def delegate_coding_task(
     try:
         from agent.opencode_worker import (
             _plan_prompt,
-            load_coding_worker_model_tier,
+            load_coding_worker_pass_profiles,
             load_coding_worker_pass_config,
             looks_complex_or_risky,
         )
@@ -1357,10 +1357,7 @@ def delegate_coding_task(
         if codex_ui_work_extra_args is not None and ui_route is not None
         else []
     )
-    worker_model_tier = load_coding_worker_model_tier()
-    default_codex_args = _codex_model_args(
-        worker_model_tier.model if worker_model_tier is not None else ""
-    )
+    default_profiles = load_coding_worker_pass_profiles()
     turn = None
     if (
         ui_route is not None
@@ -1378,7 +1375,7 @@ def delegate_coding_task(
     try:
         default_pass_cfg = load_coding_worker_pass_config()
         ui_worker_config = (
-            {"model_tier": ""}
+            {"model_tier": "disabled"}
             if ui_route is not None
             and ui_route.matched
             and ui_route.enabled
@@ -1391,9 +1388,9 @@ def delegate_coding_task(
             else default_pass_cfg
         )
         route_attempts = [
-            (ui_codex_args, ui_pass_cfg)
+            (ui_codex_args, ui_pass_cfg, None)
             if ui_codex_args
-            else (default_codex_args, default_pass_cfg)
+            else ([], default_pass_cfg, default_profiles)
         ]
         if (
             ui_codex_args
@@ -1403,7 +1400,7 @@ def delegate_coding_task(
             and ui_route.backend == "codex"
             and ui_route.fallback_allowed
         ):
-            route_attempts.append((default_codex_args, default_pass_cfg))
+            route_attempts.append(([], default_pass_cfg, default_profiles))
         if (
             not ui_codex_args
             and ui_route is not None
@@ -1417,7 +1414,7 @@ def delegate_coding_task(
                 ui_route.reason,
             )
 
-        for attempt_index, (active_ui_codex_args, pass_cfg) in enumerate(route_attempts):
+        for attempt_index, (active_ui_codex_args, pass_cfg, pass_profiles) in enumerate(route_attempts):
             agents = []
             turns = []
             plan_text = ""
@@ -1427,7 +1424,9 @@ def delegate_coding_task(
                 with CodexAppServerSession(
                     cwd=workdir,
                     codex_home=str(codex_home) if codex_home is not None else None,
-                    extra_args=active_ui_codex_args + _codex_reasoning_args(
+                    extra_args=active_ui_codex_args + _codex_model_args(
+                        pass_profiles["complex_plan"]["codex_model"] if pass_profiles else ""
+                    ) + _codex_reasoning_args(
                         pass_cfg["complex_plan_reasoning_level"]
                     ),
                     approval_callback=approval_callback,
@@ -1493,7 +1492,10 @@ def delegate_coding_task(
             with CodexAppServerSession(
                 cwd=workdir,
                 codex_home=str(codex_home) if codex_home is not None else None,
-                extra_args=active_ui_codex_args + _codex_reasoning_args(reasoning_level),
+                extra_args=active_ui_codex_args + _codex_model_args(
+                    pass_profiles["complex_build" if needs_plan else "simple_build"]["codex_model"]
+                    if pass_profiles else ""
+                ) + _codex_reasoning_args(reasoning_level),
                 approval_callback=approval_callback,
                 on_event=_touch_codex_activity,
                 env=worker_env,

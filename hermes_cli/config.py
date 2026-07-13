@@ -1591,9 +1591,13 @@ DEFAULT_CONFIG = {
     "coding_worker": {
         "enabled": True,
         "backend": "opencode",  # opencode | codex
-        # Ordinary delegated feature work uses Terra/max. Kanban role workers
-        # may supply a more-specific tier through their role configuration.
-        "model_tier": "intermediate",
+        # Pass tiers are atomic model/reasoning bundles. model_tier is an
+        # optional compatibility-wide override; "disabled" temporarily turns
+        # off all pass-tier routing and restores the legacy raw settings below.
+        "model_tier": "",
+        "simple_build_model_tier": "intermediate",
+        "complex_plan_model_tier": "advanced",
+        "complex_build_model_tier": "basic",
         "turn_timeout_seconds": 1800,  # 30 minutes
         "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",

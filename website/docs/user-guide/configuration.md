@@ -1150,7 +1150,7 @@ choose a model and reasoning effort.
 |------|-------|--------|----------------|
 | `trivial` | GPT-5.6 Luna | `xhigh` | Kanban `dev` |
 | `basic` | GPT-5.6 Luna | `max` | Gateway and unpinned cron jobs |
-| `intermediate` | GPT-5.6 Terra | `max` | Standard Discord action requests and coding workers |
+| `intermediate` | GPT-5.6 Terra | `max` | Standard Discord action requests and simple coding-worker builds |
 | `advanced` | GPT-5.6 Sol | `max` | Kanban `planner`, `reviewer`, and `foreman` |
 
 The defaults live under `model_tiers`; route settings reference a tier by name:
@@ -1172,7 +1172,9 @@ discord:
   action_request_model_tier: intermediate
 
 coding_worker:
-  model_tier: intermediate
+  simple_build_model_tier: intermediate
+  complex_plan_model_tier: advanced
+  complex_build_model_tier: basic
 
 kanban:
   discord_worker:
@@ -1182,6 +1184,18 @@ kanban:
       reviewer: {model_tier: advanced}
       foreman: {model_tier: advanced}
 ```
+
+Coding workers use one `intermediate` build pass for simple work. Complex or
+risky work uses an `advanced` planning pass followed by a `basic` build pass.
+Each tier supplies the model and reasoning effort atomically. Explicit worker
+raw model/reasoning values override the corresponding pass tier; an explicit
+per-worker pass tier overrides the configured pass tier. The compatibility
+`coding_worker.model_tier` field overrides all three pass tiers when non-empty.
+Set it to `disabled` to turn off tier routing globally and use the legacy raw
+OpenCode model and per-pass reasoning fields. The UI visual specialist remains
+an independent provider/model route and does not inherit coding-worker tiers.
+OpenCode's `max` variant is forwarded literally as `reasoning.effort=max`; it is
+not normalized or aliased to `xhigh`.
 
 Partial overrides of a built-in tier inherit its other fields. Set a route's
 `model_tier` to `""` to opt out and use that route's legacy model/reasoning
