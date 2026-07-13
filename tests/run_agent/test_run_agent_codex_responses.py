@@ -1341,6 +1341,28 @@ def test_preflight_codex_api_kwargs_allows_reasoning_and_temperature(monkeypatch
     assert result["max_output_tokens"] == 4096
 
 
+def test_preflight_codex_api_kwargs_allows_text_verbosity(monkeypatch):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = {"verbosity": "low"}
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+
+    assert result["text"] == {"verbosity": "low"}
+
+
+@pytest.mark.parametrize("text", ["low", {}, {"verbosity": "max"}])
+def test_preflight_codex_api_kwargs_rejects_invalid_text_verbosity(monkeypatch, text):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = text
+
+    with pytest.raises(ValueError, match="text"):
+        from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+        _preflight_codex_api_kwargs(kwargs)
+
+
 def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
     agent = _build_agent(monkeypatch)
     kwargs = _codex_request_kwargs()
