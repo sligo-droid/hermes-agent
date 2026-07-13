@@ -48,6 +48,7 @@ _REASONING_EFFORTS: FrozenSet[str] = frozenset({
     "medium",
     "high",
     "xhigh",
+    "max",
 })
 _SERVICE_TIERS: FrozenSet[str] = frozenset({
     "auto",

@@ -208,10 +208,10 @@ async def test_run_agent_ignores_fast_config_for_gateway_agent(monkeypatch, tmp_
     assert _CapturingAgent.last_init is not None
     assert _CapturingAgent.last_init["service_tier"] is None
     assert _CapturingAgent.last_init["request_overrides"] == {}
-    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "max"}
 
 
-def test_gateway_reasoning_level_inherits_cli_default_but_display_stays_hidden(monkeypatch, tmp_path):
+def test_gateway_reasoning_level_uses_basic_tier_but_display_stays_hidden(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text(
         "agent:\n  reasoning_effort: high\n"
@@ -219,5 +219,5 @@ def test_gateway_reasoning_level_inherits_cli_default_but_display_stays_hidden(m
         encoding="utf-8",
     )
 
-    assert gateway_run.GatewayRunner._load_reasoning_config() == {"enabled": True, "effort": "high"}
+    assert gateway_run.GatewayRunner._load_reasoning_config() == {"enabled": True, "effort": "max"}
     assert gateway_run.GatewayRunner._load_show_reasoning() is False

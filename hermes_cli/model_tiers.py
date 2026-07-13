@@ -1,0 +1,113 @@
+"""Shared named model tiers for Hermes runtime routes.
+
+The tiers intentionally describe a model together with its reasoning effort.
+They are distinct from Hermes runtime *profiles* (separate ``HERMES_HOME``
+instances) and can be referenced by gateway, cron, and Kanban role settings.
+"""
+
+from __future__ import annotations
+
+import copy
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+
+
+DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
+    "trivial": {
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
+    },
+    "basic": {
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "max",
+    },
+    "intermediate": {
+        "model": "gpt-5.6-terra",
+        "opencode_model": "hermes-codex/gpt-5.6-terra",
+        "reasoning_effort": "max",
+    },
+    "advanced": {
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "max",
+    },
+}
+
+
+@dataclass(frozen=True)
+class ModelTier:
+    """A validated model-and-effort pair resolved from ``model_tiers``."""
+
+    name: str
+    model: str
+    opencode_model: str
+    reasoning_effort: str
+
+    def reasoning_config(self) -> dict[str, Any] | None:
+        """Return the OpenAI-compatible reasoning payload for this tier."""
+        return parse_reasoning_effort(self.reasoning_effort)
+
+
+def _normalized_name(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _merged_model_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Merge partial user tier overrides onto the built-in catalog.
+
+    Gateway and cron deliberately use raw config reads, so this merge must not
+    rely on ``load_config()`` having already deep-merged ``DEFAULT_CONFIG``.
+    """
+    tiers: dict[str, Any] = copy.deepcopy(DEFAULT_MODEL_TIERS)
+    configured = config.get("model_tiers") if isinstance(config, Mapping) else None
+    if not isinstance(configured, Mapping):
+        return tiers
+
+    for raw_name, raw_tier in configured.items():
+        name = _normalized_name(raw_name)
+        if not name:
+            continue
+        if not isinstance(raw_tier, Mapping):
+            tiers[name] = raw_tier
+            continue
+        inherited = tiers.get(name)
+        if isinstance(inherited, Mapping):
+            merged = dict(inherited)
+            merged.update(raw_tier)
+            # A tier is an atomic model/effort choice. If a user changes only
+            # its runtime model, do not silently keep the old worker model.
+            if "model" in raw_tier and "opencode_model" not in raw_tier:
+                merged["opencode_model"] = raw_tier["model"]
+            tiers[name] = merged
+        else:
+            tiers[name] = dict(raw_tier)
+    return tiers
+
+
+def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier | None:
+    """Resolve a configured tier, returning ``None`` for blank or invalid input."""
+    normalized = _normalized_name(name)
+    if not normalized or normalized in {"none", "off", "disabled"}:
+        return None
+
+    raw_tier = _merged_model_tiers(config).get(normalized)
+    if not isinstance(raw_tier, Mapping):
+        return None
+
+    model = str(raw_tier.get("model") or "").strip()
+    opencode_model = str(raw_tier.get("opencode_model") or model).strip()
+    reasoning_effort = _normalized_name(raw_tier.get("reasoning_effort"))
+    if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
+        return None
+
+    return ModelTier(
+        name=normalized,
+        model=model,
+        opencode_model=opencode_model,
+        reasoning_effort=reasoning_effort,
+    )

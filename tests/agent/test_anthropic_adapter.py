@@ -1605,6 +1605,18 @@ class TestBuildAnthropicKwargs:
         # 1M-context reasoning model → highest output ceiling.
         assert _get_anthropic_max_output("anthropic/claude-fable-5") == 128_000
 
+    def test_sonnet_5_medium_reasoning_uses_adaptive_effort(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "summarize"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "medium"}
+
     def test_legacy_claude_stays_on_manual_thinking(self):
         """Older Claude families keep the legacy manual-thinking contract."""
         from agent.anthropic_adapter import (

@@ -74,6 +74,11 @@ def _codex_reasoning_args(reasoning_level: str) -> list[str]:
     return ["-c", f'model_reasoning_effort="{level}"']
 
 
+def _codex_model_args(model: str) -> list[str]:
+    selected_model = str(model or "").strip()
+    return ["-c", f"model={json.dumps(selected_model)}"] if selected_model else []
+
+
 _UI_ROUTE_DEFAULT_FALLBACK_HINTS = (
     "model provider",
     "not found",
@@ -1238,6 +1243,10 @@ def delegate_coding_task(
         if opencode_ui_work_worker_config is not None and ui_route is not None:
             ui_opencode_config = opencode_ui_work_worker_config(ui_route)
             if ui_opencode_config:
+                # The visual specialist is an explicit independent route, not
+                # an ordinary feature-worker tier. Preserve its own pass
+                # configuration while its model override is active.
+                ui_opencode_config["model_tier"] = ""
                 opencode_kwargs["worker_config"] = ui_opencode_config
         if allow_git_pr_lifecycle:
             opencode_kwargs["env"] = worker_env
@@ -1281,6 +1290,7 @@ def delegate_coding_task(
     try:
         from agent.opencode_worker import (
             _plan_prompt,
+            load_coding_worker_model_tier,
             load_coding_worker_pass_config,
             looks_complex_or_risky,
         )
@@ -1347,6 +1357,10 @@ def delegate_coding_task(
         if codex_ui_work_extra_args is not None and ui_route is not None
         else []
     )
+    worker_model_tier = load_coding_worker_model_tier()
+    default_codex_args = _codex_model_args(
+        worker_model_tier.model if worker_model_tier is not None else ""
+    )
     turn = None
     if (
         ui_route is not None
@@ -1362,8 +1376,25 @@ def delegate_coding_task(
         )
 
     try:
-        pass_cfg = load_coding_worker_pass_config()
-        route_attempts = [ui_codex_args]
+        default_pass_cfg = load_coding_worker_pass_config()
+        ui_worker_config = (
+            {"model_tier": ""}
+            if ui_route is not None
+            and ui_route.matched
+            and ui_route.enabled
+            and ui_route.backend == "codex"
+            else None
+        )
+        ui_pass_cfg = (
+            load_coding_worker_pass_config(worker_config=ui_worker_config)
+            if ui_worker_config is not None
+            else default_pass_cfg
+        )
+        route_attempts = [
+            (ui_codex_args, ui_pass_cfg)
+            if ui_codex_args
+            else (default_codex_args, default_pass_cfg)
+        ]
         if (
             ui_codex_args
             and ui_route is not None
@@ -1372,7 +1403,7 @@ def delegate_coding_task(
             and ui_route.backend == "codex"
             and ui_route.fallback_allowed
         ):
-            route_attempts.append([])
+            route_attempts.append((default_codex_args, default_pass_cfg))
         if (
             not ui_codex_args
             and ui_route is not None
@@ -1386,7 +1417,7 @@ def delegate_coding_task(
                 ui_route.reason,
             )
 
-        for attempt_index, active_ui_codex_args in enumerate(route_attempts):
+        for attempt_index, (active_ui_codex_args, pass_cfg) in enumerate(route_attempts):
             agents = []
             turns = []
             plan_text = ""

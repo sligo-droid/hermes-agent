@@ -110,6 +110,7 @@ async def test_fable_command_routes_through_normal_agent_with_fable_override(mon
     assert agent_event.text == "PLAN SKILL: build X"
     assert agent_event.invoked_skill_command == "fable"
     assert agent_event.fable_enabled_toolsets == ["file", "terminal", "web", "browser", "discord"]
+    assert agent_event.fable_reasoning_config == {"enabled": True, "effort": "high"}
     assert agent_event.fable_transcript_user_message == "/fable build X"
     assert build_session_key(agent_event.source) not in runner._session_model_overrides
 
@@ -195,7 +196,14 @@ def test_fable_run_agent_disables_fallback_and_restricts_provider(monkeypatch):
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = CapturingAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "agent": {"reasoning_effort": "medium"},
+            "discord": {"feature_request_reasoning_effort": "high"},
+        },
+    )
     GatewayRunner = gateway_run.GatewayRunner
 
     runner = _make_runner()
@@ -239,6 +247,7 @@ def test_fable_run_agent_disables_fallback_and_restricts_provider(monkeypatch):
     assert captured["model"] == "claude-fable-5"
     assert captured["provider"] == "anthropic"
     assert captured["enabled_toolsets"] == ["file", "terminal", "web", "browser", "discord"]
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert captured["fallback_model"] is None
     assert captured["providers_allowed"] == ["anthropic"]
 

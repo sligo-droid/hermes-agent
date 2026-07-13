@@ -2066,6 +2066,19 @@ def test_planner_and_reviewer_auto_remain_xhigh(monkeypatch):
     assert workers._role_runtime_settings("reviewer", {}, task)["reasoning"] == "xhigh"
 
 
+def test_role_runtime_preserves_explicit_max_reasoning(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    settings = workers._role_runtime_settings(
+        "planner",
+        {"roles": {"planner": {"reasoning": "max", "service_tier": "normal"}}},
+    )
+
+    assert settings["reasoning"] == "max"
+    assert settings["reasoning_source"] == "explicit"
+
+
 def test_dispatch_recovers_recorded_role_result_before_dead_pid_crash(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -3895,6 +3908,16 @@ def test_foreman_runtime_defaults_to_xhigh_normal():
     assert settings["reasoning"] == "xhigh"
     assert settings["service_tier"] == "normal"
     assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "xhigh"
+
+
+def test_native_codex_worker_accepts_max_reasoning_override(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "max")
+
+    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "max"
+    assert worker._role_extra_args(ROLE_FOREMAN)[1] == 'model_reasoning_effort="max"'
 
 
 def test_foreman_completed_output_completes_repair_task_without_dev_checkpoint(monkeypatch, tmp_path):

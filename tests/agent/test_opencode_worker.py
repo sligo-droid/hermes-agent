@@ -111,10 +111,10 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     }
     assert _option(calls[0], "--agent") == "build"
     assert _option(calls[0], "--variant") == "medium"
-    assert _option(calls[0], "--model") == "openai/gpt-5.5"
+    assert _option(calls[0], "--model") == "hermes-codex/gpt-5.6-sol"
     assert "--pure" in calls[0]
-    assert calls[0][3] == "Read the attached Hermes worker brief and follow it exactly."
-    assert calls[0].index("--file") == len(calls[0]) - 2
+    assert "Hermes worker brief:\nfix typo in README" in calls[0][3]
+    assert "--file" not in calls[0]
     assert process_envs[0] is not None
     config_home = process_envs[0]["XDG_CONFIG_HOME"]
     assert not (ow.Path(config_home) / "opencode" / "opencode.json").exists()
@@ -125,6 +125,7 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     seen_payload = None
 
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+    monkeypatch.setattr(ow, "_opencode_provider_config_for_model", lambda model: {})
 
     def fake_run(_cmd, **kwargs):
         nonlocal seen_config_home, seen_payload
@@ -153,7 +154,7 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
         "plugin": [],
         "permission": "allow",
         "mcp": {},
-        "model": "openai/gpt-5.5",
+        "model": "hermes-codex/gpt-5.6-sol",
     }
     assert seen_config_home is not None
     assert not seen_config_home.exists()
@@ -377,7 +378,7 @@ def test_worker_brief_is_workspace_scoped_and_cleaned(monkeypatch, tmp_path):
         "fix typo in README",
         str(tmp_path),
         timeout=60,
-        config=_cfg(),
+        config=_cfg(opencode={"model": "openai/gpt-5.5"}),
     )
 
     assert result.error is None
@@ -411,7 +412,7 @@ def test_worker_prompt_includes_dirty_repo_preflight(monkeypatch, tmp_path):
         "fix typo in README",
         str(tmp_path),
         timeout=60,
-        config=_cfg(),
+        config=_cfg(opencode={"model": "openai/gpt-5.5"}),
     )
 
     assert result.error is None
@@ -449,7 +450,7 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "fix auth credential handling",
         str(tmp_path),
         timeout=60,
-        config=_cfg(),
+        config=_cfg(opencode={"model": "openai/gpt-5.5"}),
     )
 
     assert result.error is None

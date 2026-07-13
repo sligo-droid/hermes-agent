@@ -33,7 +33,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -1725,6 +1725,27 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
     return cleaned
 
 
+def _resolve_cron_agent_model(config: dict, job: dict) -> tuple[str, Any]:
+    """Resolve cron's model default while preserving explicit overrides."""
+    explicit_model = str(job.get("model") or os.getenv("HERMES_MODEL") or "").strip()
+    if explicit_model:
+        return explicit_model, None
+
+    from hermes_cli.model_tiers import resolve_model_tier
+
+    cron_cfg = config.get("cron") if isinstance(config.get("cron"), dict) else {}
+    model_tier = resolve_model_tier(config, cron_cfg.get("model_tier", "basic"))
+    if model_tier is not None:
+        return model_tier.model, model_tier
+
+    model_cfg = config.get("model", {})
+    if isinstance(model_cfg, str):
+        return model_cfg.strip(), None
+    if isinstance(model_cfg, dict):
+        return str(model_cfg.get("default") or model_cfg.get("model") or "").strip(), None
+    return "", None
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
@@ -2301,8 +2322,6 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 else str(delivery_target["thread_id"])
             )
 
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
-
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
         try:
@@ -2312,14 +2331,10 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
                 _cfg = _expand_env_vars(_cfg)
-                _model_cfg = _cfg.get("model", {})
-                if not job.get("model"):
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+
+        model, model_tier = _resolve_cron_agent_model(_cfg, job)
 
         # Apply IPv4 preference if configured.
         try:
@@ -2332,8 +2347,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Reasoning config from config.yaml
         from hermes_constants import parse_reasoning_effort
-        effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
-        reasoning_config = parse_reasoning_effort(effort)
+        if model_tier is not None:
+            reasoning_config = model_tier.reasoning_config()
+        else:
+            effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
+            reasoning_config = parse_reasoning_effort(effort)
 
         # Prefill messages from env or config.yaml
         prefill_messages = None

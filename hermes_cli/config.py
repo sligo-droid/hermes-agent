@@ -226,6 +226,7 @@ import yaml
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD
+from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS
 
 
 # =============================================================================
@@ -671,6 +672,10 @@ def _ensure_hermes_home_managed(home: Path):
 
 DEFAULT_CONFIG = {
     "model": "",
+    # Named model-and-effort bundles for runtime routes. These are not
+    # Hermes runtime profiles: a tier is reusable configuration, while a
+    # profile owns a separate HERMES_HOME/session/credential tree.
+    "model_tiers": copy.deepcopy(DEFAULT_MODEL_TIERS),
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
@@ -1561,7 +1566,7 @@ DEFAULT_CONFIG = {
                                        # no ceiling). High-reasoning models on large tasks
                                        # (e.g. gpt-5.5 xhigh, opus-4.6) need generous budgets;
                                        # raise if children time out before producing output.
-        "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
+        "reasoning_effort": "",  # subagent effort: "max", "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
@@ -1586,13 +1591,16 @@ DEFAULT_CONFIG = {
     "coding_worker": {
         "enabled": True,
         "backend": "opencode",  # opencode | codex
+        # Ordinary delegated feature work uses Terra/max. Kanban role workers
+        # may supply a more-specific tier through their role configuration.
+        "model_tier": "intermediate",
         "turn_timeout_seconds": 1800,  # 30 minutes
         "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",
         "complex_build_reasoning_level": "medium",
         "opencode": {
             "binary": "opencode",
-            "model": "openai/gpt-5.5",
+            "model": "hermes-codex/gpt-5.6-sol",
             "plan_agent": "plan",
             "build_agent": "build",
             "dangerously_skip_permissions": False,
@@ -1943,7 +1951,8 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_reasoning_effort": "xhigh", # Reasoning effort for non-Kanban Discord action requests
+        "action_request_model_tier": "intermediate", # Standard Discord action requests use Terra/max
+        "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
         "channel_cwds": {},            # Per-channel cwd overrides keyed by Discord channel ID
@@ -2104,6 +2113,9 @@ DEFAULT_CONFIG = {
     "cron": {
         # Scheduler provider plugin. Empty = built-in in-process ticker.
         "provider": "",
+        # Unpinned cron jobs use Luna/max. Explicit job and HERMES_MODEL
+        # overrides continue to take precedence over this route default.
+        "model_tier": "basic",
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
@@ -2258,10 +2270,10 @@ DEFAULT_CONFIG = {
                 "terminal_suppression_age_seconds": 7 * 24 * 3600,
             },
             "roles": {
-                "planner": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
-                "dev": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
-                "foreman": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
-                "reviewer": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
+                "planner": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
+                "dev": {"model_tier": "trivial", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
+                "foreman": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
+                "reviewer": {"model_tier": "advanced", "reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
             },
         },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
@@ -2400,6 +2412,9 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Gateway sessions use Luna/max independently of model.default, which
+        # remains the normal CLI/TUI default.
+        "model_tier": "basic",
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
         # system-path denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,

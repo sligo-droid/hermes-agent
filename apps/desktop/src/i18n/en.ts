@@ -1995,6 +1995,7 @@ export const en: Translations = {
       low: 'Low',
       medium: 'Medium',
       high: 'High',
+      xhigh: 'Extra High',
       max: 'Max',
       updateFailed: 'Model option update failed',
       fastFailed: 'Fast mode update failed'

@@ -10,6 +10,7 @@ from hermes_cli.fable_planner import (
     build_fable_user_instruction,
     fable_enabled_toolsets,
     fable_metadata,
+    fable_reasoning_config,
     fable_session_model_override,
 )
 
@@ -200,6 +201,29 @@ def test_fable_enabled_toolsets_defaults_to_compact_budget():
 
 def test_fable_enabled_toolsets_allows_config_override():
     assert fable_enabled_toolsets(config={"fable": {"enabled_toolsets": ["file", "web"]}}) == ["file", "web"]
+
+
+def test_fable_reasoning_config_uses_configured_discord_feature_effort():
+    assert fable_reasoning_config(
+        {
+            "agent": {"reasoning_effort": "medium"},
+            "discord": {"feature_request_reasoning_effort": "high"},
+        }
+    ) == {"enabled": True, "effort": "high"}
+
+
+def test_fable_reasoning_config_does_not_inherit_medium_when_unconfigured():
+    assert fable_reasoning_config({"agent": {"reasoning_effort": "medium"}}) == {
+        "enabled": True,
+        "effort": "high",
+    }
+
+
+def test_fable_reasoning_config_falls_back_high_for_invalid_config():
+    assert fable_reasoning_config({"discord": {"feature_request_reasoning_effort": "bogus"}}) == {
+        "enabled": True,
+        "effort": "high",
+    }
 
 
 def test_fable_metadata_for_artifact():

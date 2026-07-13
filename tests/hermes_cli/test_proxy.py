@@ -328,6 +328,10 @@ def test_codex_adapter_preserves_minimal_reasoning_effort():
         "effort": "low",
         "summary": "auto",
     }
+    assert OpenAICodexAdapter._responses_reasoning("max") == {
+        "effort": "max",
+        "summary": "auto",
+    }
     assert OpenAICodexAdapter._responses_reasoning("off") == {
         "effort": "none",
         "summary": "auto",
@@ -338,6 +342,8 @@ def test_codex_adapter_preserves_minimal_reasoning_effort():
 def test_codex_adapter_rejects_invalid_reasoning_effort():
     with pytest.raises(ValueError, match="Invalid reasoning_effort"):
         OpenAICodexAdapter._responses_reasoning("maximum")
+    with pytest.raises(ValueError, match="Invalid reasoning_effort"):
+        OpenAICodexAdapter._responses_reasoning("ultra")
 
 
 def test_codex_adapter_resolves_speed_and_service_tier():
