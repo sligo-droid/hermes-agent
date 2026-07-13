@@ -1162,6 +1162,28 @@ def _resolve_anthropic_runtime(
                 "config.yaml model section at a custom env var."
             )
     else:
+        # Scoped callers such as /fable must use the complete Hermes-managed
+        # credential, including its endpoint.  Resolving only the token below
+        # loses a pool entry's runtime_base_url and silently sends a proxy key
+        # to api.anthropic.com instead.
+        if credential_preference == "pool_first":
+            try:
+                pool = load_pool("anthropic")
+                entry = pool.select()
+            except Exception as exc:
+                logger.debug("Could not select an Anthropic pool credential: %s", exc)
+            else:
+                if entry is not None:
+                    runtime = _resolve_runtime_from_pool_entry(
+                        provider="anthropic",
+                        entry=entry,
+                        requested_provider=requested_provider,
+                        model_cfg=model_cfg,
+                        pool=pool,
+                    )
+                    if runtime.get("api_key"):
+                        return runtime
+
         from agent.anthropic_adapter import resolve_anthropic_token, resolve_anthropic_token_pool_first
 
         if credential_preference == "pool_first":

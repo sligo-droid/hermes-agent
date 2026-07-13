@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from utils import base_url_host_matches
+
 
 FABLE_PROVIDER = "anthropic"
 FABLE_MODEL = "claude-fable-5"
@@ -178,7 +180,7 @@ def fable_session_model_override(config: dict[str, Any] | None = None) -> tuple[
             credential_preference="pool_first",
         )
     except Exception as exc:
-        return None, f"Fable 5 is not configured through Hermes' Anthropic OAuth route: {exc}"
+        return None, f"Fable 5 is not configured through Hermes' Anthropic route: {exc}"
 
     api_key = str(runtime.get("api_key") or "")
     if not api_key:
@@ -186,20 +188,28 @@ def fable_session_model_override(config: dict[str, Any] | None = None) -> tuple[
         if route_error:
             return None, route_error
         return None, (
-            "Fable 5 is not configured through Hermes' Anthropic OAuth route. "
-            "Run `hermes auth add anthropic` or configure the Anthropic OAuth provider used by Hermes."
+            "Fable 5 is not configured through Hermes' Anthropic route. "
+            "Run `hermes auth add anthropic` or configure the Anthropic credential used by Hermes."
         )
     if str(runtime.get("provider") or "") != FABLE_PROVIDER:
         return None, f"Fable route resolved unexpected provider {runtime.get('provider')!r}; refusing to fall back."
-    if not _is_oauth_token(api_key):
-        return None, "/fable only supports Hermes' Anthropic OAuth route; Anthropic API-key credentials are not allowed."
+
+    base_url = str(runtime.get("base_url") or "https://api.anthropic.com")
+    api_mode = str(runtime.get("api_mode") or "")
+    if api_mode != "anthropic_messages":
+        return None, f"Fable route resolved unsupported API mode {api_mode!r}; refusing to fall back."
+    if not _is_oauth_token(api_key) and base_url_host_matches(base_url, "api.anthropic.com"):
+        return None, (
+            "/fable permits API-key credentials only through a configured Hermes Anthropic proxy; "
+            "direct api.anthropic.com requests require OAuth credentials."
+        )
 
     return {
         "model": FABLE_MODEL,
         "provider": FABLE_PROVIDER,
         "api_key": api_key,
-        "base_url": str(runtime.get("base_url") or "https://api.anthropic.com"),
-        "api_mode": str(runtime.get("api_mode") or "anthropic_messages"),
+        "base_url": base_url,
+        "api_mode": api_mode,
         "disable_fallback": "true",
     }, ""
 
@@ -251,7 +261,7 @@ def _is_fable_budget_error(exc: Exception) -> bool:
 
 def _fable_budget_error_message(detail: str = "") -> str:
     base = (
-        "Fable 5 budget/quota is expended on Hermes' Anthropic OAuth route; "
+        "Fable 5 budget/quota is expended on Hermes' configured Anthropic route; "
         "/fable is pinned to claude-fable-5 and will not fall back to another model or provider."
     )
     cleaned = " ".join(str(detail or "").split())[:500]

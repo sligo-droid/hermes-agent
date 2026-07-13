@@ -81,6 +81,7 @@ class TestOAuthFlagOnRefresh:
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
         agent._anthropic_api_key = "***"
+        agent._anthropic_base_url = "https://api.anthropic.com"
         agent._anthropic_client = MagicMock()
         agent._is_anthropic_oauth = False
 
@@ -94,6 +95,24 @@ class TestOAuthFlagOnRefresh:
 
         assert result is True
         assert agent._is_anthropic_oauth is True
+
+    def test_anthropic_proxy_refresh_is_noop(self, agent):
+        """A proxy-managed Anthropic key must not be replaced with a Claude token."""
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent._anthropic_api_key = "cliproxy-key"
+        agent._anthropic_base_url = "http://127.0.0.1:8317"
+        agent._anthropic_client = MagicMock()
+
+        with (
+            patch("agent.anthropic_adapter.resolve_anthropic_token") as resolve_token,
+            patch("agent.anthropic_adapter.build_anthropic_client") as build_client,
+        ):
+            result = agent._try_refresh_anthropic_client_credentials()
+
+        assert result is False
+        resolve_token.assert_not_called()
+        build_client.assert_not_called()
 
 
 class TestOAuthFlagOnCredentialSwap:

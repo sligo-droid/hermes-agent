@@ -91,7 +91,7 @@ def test_fable_session_model_override_errors_when_route_unavailable(monkeypatch)
     override, error = fable_session_model_override(config={})
 
     assert override is None
-    assert "Anthropic OAuth route" in error
+    assert "Anthropic route" in error
 
 
 def test_fable_session_model_override_fails_closed_when_anthropic_budget_already_exhausted(monkeypatch):
@@ -141,8 +141,31 @@ def test_fable_session_model_override_rejects_api_key_anthropic(monkeypatch):
     override, error = fable_session_model_override(config={})
 
     assert override is None
-    assert "Anthropic OAuth route" in error
-    assert "API-key credentials are not allowed" in error
+    assert "direct api.anthropic.com" in error
+
+
+def test_fable_session_model_override_accepts_proxy_managed_api_key(monkeypatch):
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: EmptyPool())
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+            "base_url": "http://127.0.0.1:8317",
+            "api_key": "cliproxy-key",
+        },
+    )
+
+    override, error = fable_session_model_override(config={})
+
+    assert error == ""
+    assert override is not None
+    assert override["provider"] == "anthropic"
+    assert override["model"] == FABLE_MODEL
+    assert override["base_url"] == "http://127.0.0.1:8317"
+    assert override["api_key"] == "cliproxy-key"
+    assert override["api_mode"] == "anthropic_messages"
+    assert override["disable_fallback"] == "true"
 
 
 def test_fable_config_fails_closed_for_wrong_model(monkeypatch):

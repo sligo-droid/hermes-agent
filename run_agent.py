@@ -3595,6 +3595,11 @@ class AIAgent:
         _base = getattr(self, "_anthropic_base_url", "") or ""
         if "azure.com" in _base:
             return False
+        # A Hermes Anthropic credential can target an Anthropic-compatible
+        # proxy. Its key belongs to that proxy, not to Claude Code, so never
+        # overwrite it with a direct Anthropic credential mid-turn.
+        if _base and not base_url_host_matches(_base, "api.anthropic.com"):
+            return False
 
         try:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
