@@ -233,6 +233,29 @@ class TestCodexBuildKwargs:
         # "minimal" should be clamped to "low"
         assert kw.get("reasoning", {}).get("effort") == "low"
 
+    def test_codex_backend_clamps_max_effort_to_xhigh(self, transport):
+        """ChatGPT Codex rejects ``max`` but accepts ``xhigh``."""
+        kw = transport.build_kwargs(
+            model="gpt-5.3-codex-spark",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"effort": "max"},
+            is_codex_backend=True,
+        )
+
+        assert kw["reasoning"]["effort"] == "xhigh"
+
+    def test_non_codex_responses_provider_keeps_max_effort(self, transport):
+        """The Codex compatibility clamp must not downgrade other providers."""
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"effort": "max"},
+        )
+
+        assert kw["reasoning"]["effort"] == "max"
+
     def test_xai_reasoning_effort_passed(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
