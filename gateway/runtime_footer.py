@@ -1,8 +1,8 @@
 """Gateway runtime-metadata footer.
 
 Renders a compact footer showing runtime state (model, context %, cwd) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+appends it to the final response of each completed agent turn when enabled.
+Off by default to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
 
@@ -16,11 +16,11 @@ Users can toggle the global setting with ``/footer on|off`` from both the CLI
 and any gateway platform.
 
 The footer is appended to the final response text in ``gateway/run.py`` right
-before returning the response to the adapter send path — so it only lands on
-the final message a user sees, not on tool-progress updates or streaming
-partials.  When streaming is on and the final text has already been delivered
-piecemeal, the footer is sent as a separate trailing message via
-``send_trailing_footer()``.
+before returning the response to the adapter send path — so it does not land
+on tool-progress updates or streaming partials. Queued turns use their own
+resolved model rather than a later follow-up's route. When streaming is on and
+the final text has already been delivered piecemeal, the footer is sent as a
+separate trailing adapter message.
 """
 
 from __future__ import annotations

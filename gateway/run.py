@@ -237,6 +237,38 @@ def _discord_feature_request_reasoning_config(config: Optional[dict]) -> dict | 
     return _discord_action_request_reasoning_config(config)
 
 
+def _runtime_footer_line_for_agent_result(
+    *,
+    user_config: Optional[dict],
+    source: Any,
+    agent_result: Any,
+    cwd: Optional[str] = None,
+) -> str:
+    """Build a footer from the route that produced this specific result."""
+    if not isinstance(agent_result, dict):
+        return ""
+    try:
+        from gateway.runtime_footer import build_footer_line
+
+        platform = getattr(source, "platform", None)
+        return build_footer_line(
+            user_config=user_config,
+            platform_key=_platform_config_key(platform) if platform else None,
+            model=agent_result.get("model"),
+            context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+            context_length=agent_result.get("context_length") or None,
+            cwd=cwd,
+        )
+    except Exception as exc:
+        logger.debug("runtime footer build failed: %s", exc)
+        return ""
+
+
+def _append_runtime_footer(response: str, footer_line: str) -> str:
+    """Append one footer to one response, preserving body-only replies."""
+    return f"{response}\n\n{footer_line}" if response and footer_line else response
+
+
 def _gateway_flow_telemetry_fields(
     *,
     route_type: str,
@@ -4653,6 +4685,9 @@ class GatewayRunner:
     def _hydrate_discord_resume_event_from_work_item(
         event: MessageEvent,
         item: Optional[Dict[str, Any]],
+        *,
+        preserve_message_id: bool = False,
+        preserve_event_context: bool = False,
     ) -> None:
         if not item:
             return
@@ -4662,14 +4697,28 @@ class GatewayRunner:
             event.work_replay = True
         feature_summary = item.get("feature_summary")
         project_summary = item.get("project_summary")
-        event.feature_summary = feature_summary if isinstance(feature_summary, dict) else None
-        event.project_summary = project_summary if isinstance(project_summary, dict) else None
-        event.channel_prompt = item.get("channel_prompt")
-        event.channel_context = item.get("channel_context")
-        event.goal_thread_context = item.get("goal_thread_context")
-        event.reply_to_message_id = item.get("reply_to_message_id")
-        event.reply_to_text = item.get("reply_to_text")
-        if item.get("message_id"):
+        if not preserve_event_context or not isinstance(
+            getattr(event, "feature_summary", None), dict
+        ):
+            event.feature_summary = (
+                feature_summary if isinstance(feature_summary, dict) else None
+            )
+        if not preserve_event_context or not isinstance(
+            getattr(event, "project_summary", None), dict
+        ):
+            event.project_summary = (
+                project_summary if isinstance(project_summary, dict) else None
+            )
+        for field in (
+            "channel_prompt",
+            "channel_context",
+            "goal_thread_context",
+            "reply_to_message_id",
+            "reply_to_text",
+        ):
+            if not preserve_event_context or getattr(event, field, None) is None:
+                setattr(event, field, item.get(field))
+        if item.get("message_id") and not preserve_message_id:
             event.message_id = str(item.get("message_id"))
             if getattr(event.source, "message_id", None) is None:
                 event.source.message_id = event.message_id
@@ -4691,6 +4740,44 @@ class GatewayRunner:
             return None
         self._hydrate_discord_resume_event_from_work_item(event, item)
         return str(item.get("id") or work_id or "") or None
+
+    def _hydrate_discord_continuation_event_from_work_item(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        allow_session_fallback: bool = False,
+    ) -> None:
+        """Restore durable metadata before a queued Discord continuation runs.
+
+        Normal Discord messages carry their feature-summary handle from the
+        adapter. Synthetic and command-created queued events do not, so they
+        would otherwise take the generic gateway route instead of the route
+        for the action thread that produced them.
+        """
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return
+        if isinstance(getattr(event, "feature_summary", None), dict):
+            return
+
+        item: Optional[Dict[str, Any]] = None
+        try:
+            work_item_id = self._discord_work_item_id_for_event(event, session_key)
+            if work_item_id:
+                item = self._ledger().get(str(work_item_id))
+        except Exception:
+            logger.debug("Discord continuation work-item lookup failed", exc_info=True)
+
+        if not isinstance(item, dict) and allow_session_fallback:
+            item = self._discord_resume_work_item_for_session(session_key)
+        if isinstance(item, dict):
+            self._hydrate_discord_resume_event_from_work_item(
+                event,
+                item,
+                preserve_message_id=bool(getattr(event, "message_id", None)),
+                preserve_event_context=True,
+            )
 
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -12202,22 +12289,14 @@ class GatewayRunner:
             # Off by default (display.runtime_footer.enabled=false).  When
             # streaming already delivered the body, we can't mutate the sent
             # text, so we fire a separate trailing send below.
-            _footer_line = ""
-            try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
-                    model=agent_result.get("model"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
-                    cwd=session_cwd,
-                )
-            except Exception as _footer_err:
-                logger.debug("runtime_footer build failed: %s", _footer_err)
-                _footer_line = ""
+            _footer_line = _runtime_footer_line_for_agent_result(
+                user_config=_load_gateway_config(),
+                source=source,
+                agent_result=agent_result,
+                cwd=session_cwd,
+            )
             if _footer_line and response and not agent_result.get("already_sent"):
-                response = f"{response}\n\n{_footer_line}"
+                response = _append_runtime_footer(response, _footer_line)
 
             work_item_id = self._discord_work_item_id_for_event(event, session_key)
             if work_item_id and source.platform == Platform.DISCORD:
@@ -12384,7 +12463,7 @@ class GatewayRunner:
                     {
                         "role": "session_meta",
                         "tools": tool_defs or [],
-                        "model": _resolve_gateway_model(),
+                        "model": agent_result.get("model") or _resolve_gateway_model(),
                         "platform": source.platform.value if source.platform else "",
                         "timestamp": ts,
                     }
@@ -19204,6 +19283,12 @@ class GatewayRunner:
                                 internal=True,
                                 message_id=message_id,
                             )
+                            if source.platform == Platform.DISCORD:
+                                self._hydrate_discord_continuation_event_from_work_item(
+                                    synth_event,
+                                    session_key,
+                                    allow_session_fallback=True,
+                                )
                             logger.info(
                                 "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
                                 session_id,
@@ -20117,6 +20202,37 @@ class GatewayRunner:
         }
 
     # ------------------------------------------------------------------
+
+    async def _deliver_queued_turn_response(
+        self,
+        *,
+        adapter: Any,
+        source: Any,
+        response: str,
+        agent_result: Dict[str, Any],
+        user_config: Optional[dict],
+        cwd: Optional[str],
+        metadata: Optional[dict],
+        already_delivered: bool,
+    ) -> None:
+        """Deliver a queued turn's result with that turn's own runtime footer."""
+        if not response:
+            return
+        footer_line = _runtime_footer_line_for_agent_result(
+            user_config=user_config,
+            source=source,
+            agent_result=agent_result,
+            cwd=cwd,
+        )
+        if already_delivered:
+            if footer_line:
+                await adapter.send(source.chat_id, footer_line, metadata=metadata)
+            return
+        await adapter.send(
+            source.chat_id,
+            _append_runtime_footer(response, footer_line),
+            metadata=metadata,
+        )
 
     async def _run_agent(
         self,
@@ -22305,18 +22421,36 @@ class GatewayRunner:
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
+                            await self._deliver_queued_turn_response(
+                                adapter=adapter,
+                                source=source,
+                                response=first_response,
+                                agent_result=result,
+                                user_config=user_config,
+                                cwd=session_cwd,
                                 metadata=_status_thread_metadata,
+                                already_delivered=False,
                             )
                         except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
+                            logger.warning("Failed to deliver queued response before pending message: %s", e)
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
+                        try:
+                            await self._deliver_queued_turn_response(
+                                adapter=adapter,
+                                source=source,
+                                response=first_response,
+                                agent_result=result,
+                                user_config=user_config,
+                                cwd=session_cwd,
+                                metadata=_status_thread_metadata,
+                                already_delivered=True,
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to deliver queued response footer: %s", e)
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
@@ -22350,11 +22484,21 @@ class GatewayRunner:
                 next_source = source
                 next_message = pending
                 next_message_id = None
-                next_channel_prompt = None
-                next_feature_summary = None
-                next_project_summary = None
+                # A raw continuation (an in-band steer or interrupt fallback)
+                # has no event object to carry metadata. It is still a turn in
+                # this same thread, so preserve the route context that selected
+                # this run's model instead of silently falling back to the
+                # generic gateway tier.
+                next_channel_prompt = channel_prompt
+                next_feature_summary = feature_summary
+                next_project_summary = project_summary
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    self._hydrate_discord_continuation_event_from_work_item(
+                        pending_event,
+                        session_key,
+                        allow_session_fallback=True,
+                    )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
