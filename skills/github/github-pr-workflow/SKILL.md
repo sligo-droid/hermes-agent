@@ -20,9 +20,23 @@ Complete guide for managing the PR lifecycle. Each section shows the `gh` way fi
 - Authenticated with GitHub (see `github-auth` skill)
 - Inside a git repository with a GitHub remote
 
+## Worker and Canonical Checkout Boundary
+
+Workers are implementation and review inputs. The Hermes orchestrator owns the
+PR lifecycle, including merge and post-merge finalization. A worker must not
+mutate the protected canonical checkout (for example with `git -C <canonical>
+checkout`, `pull`, `merge`, `reset`, or equivalent commands) to
+"finish" a task or bypass the canonical guard.
+
+After a verified merge, canonical synchronization is performed only through
+the narrowly scoped `sync_canonical_checkout` Hermes orchestrator tool, which
+preserves the canonical checkout guard. A synchronization failure is
+terminal/retryable work, not a successful completion; do not report the task
+complete until the orchestrator has verified the required sync.
+
 ## Default PR Merge Policy
 
-For Sligo Labs coding work, **opening a PR is not the stopping point**. Unless the user explicitly asks for review-only/draft-only behavior, or a repo/client policy truly blocks merging, the agent owns the full lifecycle: open the PR, merge it to the default branch as soon as GitHub says it is mergeable, and delete the feature branch.
+For orchestrator-led Sligo Labs coding work, **opening a PR is not the stopping point**. Unless the user explicitly asks for review-only/draft-only behavior, or a repo/client policy truly blocks merging, the orchestrator owns the full lifecycle: open the PR, merge it to the default branch as soon as GitHub says it is mergeable, and delete the feature branch. Workers should stop at their implementation/review handoff.
 
 Treat phrases like "open a PR," "make a PR," "ship this," "continue this work," and ordinary implementation requests as permission to merge the PR yourself once it has no merge conflicts. Do not wait for CI/status checks before merging; trust the worker or local verification already performed during implementation.
 

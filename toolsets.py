@@ -33,6 +33,9 @@ _HERMES_CORE_TOOLS = [
     "web_search", "web_extract",
     # Terminal + process management
     "terminal", "process",
+    # Trusted, post-merge-only fast-forward for protected canonical checkouts.
+    # The handler rejects delegated and dispatcher-scoped workers.
+    "sync_canonical_checkout",
     # Read the desktop GUI's embedded terminal pane, and close an agent's
     # read-only terminal tab (both gated on HERMES_DESKTOP via check_fn —
     # hidden outside the GUI).
