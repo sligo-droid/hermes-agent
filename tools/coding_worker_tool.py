@@ -951,16 +951,19 @@ def _pnpm_package_roots(workdir: Path, *, max_depth: int = 4) -> list[Path]:
 
 
 def _prepare_pnpm_dependency_links(workdir: str) -> list[str]:
-    """Reuse compatible pnpm node_modules trees across git worktrees.
+    """Optionally reuse compatible pnpm node_modules trees across worktrees.
 
     Git worktrees intentionally do not copy ignored dependency directories. For
     pnpm projects that means every fresh worktree often pays an install before
     basic checks can run. When another worktree of the same repo already has a
-    matching lockfile and `node_modules`, a symlink is safe enough and much
-    faster. Lockfile mismatch falls back to the worker's normal install.
+    matching lockfile and `node_modules`, an explicitly enabled symlink can
+    avoid that install. This is disabled by default because packaging tools may
+    otherwise resolve dependencies outside the active checkout. Set
+    ``HERMES_CODING_WORKER_PNPM_LINKS=1`` to opt in. Lockfile mismatch falls
+    back to the worker's normal install.
     """
-    disabled_values = {"0", "false", "no", "off"}
-    if os.getenv("HERMES_CODING_WORKER_PNPM_LINKS", "1").strip().lower() in disabled_values:
+    enabled_values = {"1", "true", "yes", "on"}
+    if os.getenv("HERMES_CODING_WORKER_PNPM_LINKS", "").strip().lower() not in enabled_values:
         return []
     try:
         root = Path(workdir).resolve()
