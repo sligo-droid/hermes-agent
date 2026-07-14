@@ -1798,6 +1798,15 @@ def _parse_json(text: str) -> dict[str, Any]:
     return data
 
 
+def _request_dispatch_reconciliation(board: Optional[str]) -> None:
+    if not board:
+        return
+    try:
+        mark_dispatch_dirty(board=board, reason="reviewer-approval-persisted")
+    except Exception:
+        pass
+
+
 def _apply_role_output(
     conn: Any,
     task_id: str,
@@ -1868,10 +1877,7 @@ def _apply_role_output(
             )
             if not completed:
                 return
-            if _ensure_pr(board, workspace):
-                _update_phase(board, "complete", goal_status="done")
-            else:
-                _update_phase(board, "blocked", goal_status="blocked")
+            _request_dispatch_reconciliation(board)
             return
         if status == "blocked":
             blocked = kanban_db.block_task(
@@ -1895,16 +1901,13 @@ def _apply_role_output(
             completed = _complete_role_task(
                 conn,
                 task_id,
-                summary=summary or "Reviewer found only PR lifecycle follow-up; finalizing PR.",
+                summary=summary or "Reviewer found only PR lifecycle follow-up; handing off finalization.",
                 metadata=metadata,
                 expected_run_id=expected_run_id,
             )
             if not completed:
                 return
-            if _ensure_pr(board, workspace):
-                _update_phase(board, "complete", goal_status="done")
-            else:
-                _update_phase(board, "blocked", goal_status="blocked")
+            _request_dispatch_reconciliation(board)
             return
         dev_round = active_dev_round_for_board(board)
         specs = _reviewer_dev_task_specs(filtered_new_tasks, dev_round=dev_round, workspace=workspace, board=board)
@@ -3011,148 +3014,52 @@ def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
 
 
 def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str) -> bool:
-    raw_project_path = str(worker.get("project_path") or "").strip()
-    project_path = Path(raw_project_path)
-    merge_commit = str(worker.get("pr_merge_commit") or "").strip()
+    """Sync the recorded canonical checkout from the trusted Hermes finalizer.
 
-    def fail(
-        message: str,
-        result: Optional[subprocess.CompletedProcess[str]] = None,
-        *,
-        sync_path: Optional[Path] = None,
-    ) -> bool:
-        """Record local canonical checkout sync failure without failing the merged PR."""
-        detail = ""
-        if result is not None:
-            detail = (result.stderr or result.stdout or "").strip()
-        effective_path = sync_path or project_path
-        worker["canonical_sync_state"] = "blocked"
-        worker["canonical_sync_path"] = str(effective_path)
-        worker["canonical_sync_branch"] = branch
-        worker["canonical_sync_merge_commit"] = merge_commit
-        worker["canonical_sync_error"] = f"{message}: {detail}" if detail else message
-        return False
+    This deterministic finalizer is called only by dispatcher reconciliation,
+    never by the delegated coding backend. It shares the same protected-root,
+    default-branch validation and bounded implementation as the explicit
+    orchestrator tool while keeping board metadata as the source of truth.
+    """
+    from hermes_cli.canonical_checkout_sync import sync_protected_canonical_checkout
 
-    if not raw_project_path or not project_path.is_dir():
-        return fail(f"Canonical checkout missing or invalid: {raw_project_path or '(missing)'}")
-
-    def run_git(
-        args: list[str],
-        *,
-        timeout: int = 60,
-        cwd: Optional[Path] = None,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *args],
-            cwd=cwd or project_path,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_github_cli_env(),
-        )
-
-    def verify_synced_checkout(sync_path: Path, *, state: str) -> bool:
-        try:
-            head = run_git(["rev-parse", "HEAD"], timeout=20, cwd=sync_path)
-        except Exception as exc:
-            return fail(f"Canonical checkout HEAD lookup failed: {exc}", sync_path=sync_path)
-        if head.returncode != 0:
-            return fail("Canonical checkout HEAD lookup failed", head, sync_path=sync_path)
-        canonical_head = (head.stdout or "").strip()
-
-        if merge_commit:
-            try:
-                ancestor = run_git(
-                    ["merge-base", "--is-ancestor", merge_commit, "HEAD"],
-                    timeout=20,
-                    cwd=sync_path,
-                )
-            except Exception as exc:
-                return fail(
-                    f"Canonical checkout merge commit verification failed: {exc}",
-                    sync_path=sync_path,
-                )
-            if ancestor.returncode != 0:
-                return fail(
-                    "Canonical checkout does not contain PR merge commit",
-                    ancestor,
-                    sync_path=sync_path,
-                )
-
-        worker["canonical_sync_state"] = state
-        worker["canonical_sync_error"] = ""
-        worker["canonical_sync_path"] = str(sync_path)
-        worker["canonical_sync_branch"] = branch
-        worker["canonical_sync_head"] = canonical_head
-        worker["canonical_sync_merge_commit"] = merge_commit
-        worker["canonical_synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        return True
-
-    def sync_existing_branch_worktree(sync_path: Path) -> bool:
-        try:
-            status = run_git(["status", "--porcelain"], timeout=20, cwd=sync_path)
-        except Exception as exc:
-            return fail(f"Existing branch worktree status failed: {exc}", sync_path=sync_path)
-        if status.returncode != 0:
-            return fail("Existing branch worktree status failed", status, sync_path=sync_path)
-        if (status.stdout or "").strip():
-            return fail("Existing branch worktree is dirty", sync_path=sync_path)
-
-        for args, message, timeout in (
-            (["fetch", "origin", "--prune"], "Existing branch worktree fetch failed", 120),
-            (["pull", "--ff-only", "origin", branch], "Existing branch worktree fast-forward pull failed", 120),
-        ):
-            try:
-                result = run_git(args, timeout=timeout, cwd=sync_path)
-            except Exception as exc:
-                return fail(f"{message}: {exc}", sync_path=sync_path)
-            if result.returncode != 0:
-                return fail(message, result, sync_path=sync_path)
-        return verify_synced_checkout(sync_path, state="synced_existing_worktree")
-
-    try:
-        status = run_git(["status", "--porcelain"], timeout=20)
-    except Exception as exc:
-        return fail(f"Canonical checkout status failed: {exc}")
-    if status.returncode != 0:
-        return fail("Canonical checkout status failed", status)
-    if (status.stdout or "").strip():
-        return fail("Canonical checkout is dirty")
-
-    for args, message, timeout in (
-        (["fetch", "origin", "--prune"], "Canonical checkout fetch failed", 120),
-        (["checkout", branch], "Canonical checkout branch checkout failed", 60),
-        (["pull", "--ff-only", "origin", branch], "Canonical checkout fast-forward pull failed", 120),
-    ):
-        try:
-            result = run_git(args, timeout=timeout)
-        except Exception as exc:
-            return fail(f"{message}: {exc}")
-        if result.returncode != 0:
-            if args[:1] == ["checkout"]:
-                from hermes_cli.pr_workflow_preflight import find_worktree_for_branch
-
-                existing = find_worktree_for_branch(
-                    branch,
-                    cwd=project_path,
-                    run_git=run_git,
-                )
-                if existing is not None:
-                    return sync_existing_branch_worktree(existing)
-            return fail(message, result)
-
-    return verify_synced_checkout(project_path, state="synced")
+    result = sync_protected_canonical_checkout(
+        str(worker.get("project_path") or "").strip(),
+        branch,
+        str(worker.get("pr_merge_commit") or "").strip(),
+    )
+    worker.update(result.as_worker_metadata())
+    return result.state.startswith("synced")
 
 
 def _ensure_pr(board: Optional[str], workspace: str) -> bool:
+    """Finalize a board PR only from trusted dispatcher/orchestrator context."""
+    role_worker_task = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not board:
-        return True
+        return not role_worker_task
     from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
     from hermes_cli.discord_worker_boards import effective_pr_policy_for_worker
     from hermes_cli.discord_worker_boards import _update_worker_meta
 
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if role_worker_task:
+        error = (
+            "Refusing PR finalization from a Kanban role-worker process; "
+            "dispatcher reconciliation must finalize approved reviewer work"
+        )
+        worker.update(
+            {
+                "pr_error": error,
+                "pr_blocker": error,
+                "pr_checks_status": "not checked",
+                "pr_merge_state": "not attempted",
+                "pr_finalizer_guard": "role_worker_context",
+            }
+        )
+        _update_worker_meta(board, worker)
+        return False
+    worker["pr_finalizer_guard"] = ""
     root = Path(workspace)
     branch = str(worker.get("worker_branch") or "").strip()
     base = str(worker.get("base_branch") or "main").strip() or "main"
@@ -3202,7 +3109,10 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 _refresh_pr_status(worker, root=root, repo=repo)
                 if policy == MERGE_POLICY_AUTO and _pr_is_merged(worker):
                     worker["pr_blocker"] = ""
-                    _sync_canonical_checkout_after_merge(worker, branch=base)
+                    if not _sync_canonical_checkout_after_merge(worker, branch=base):
+                        sync_error = str(worker.get("canonical_sync_error") or "Canonical checkout sync failed")
+                        worker["pr_error"] = sync_error
+                        worker["pr_blocker"] = sync_error
                     skip_pr_lifecycle = True
             if not skip_pr_lifecycle:
                 has_commits = _branch_has_commits(root, base=base, branch=branch)
@@ -3226,7 +3136,10 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                     )
                     if opened and policy == MERGE_POLICY_AUTO:
                         if _ensure_pr_merged(worker, root=root, repo=repo):
-                            _sync_canonical_checkout_after_merge(worker, branch=base)
+                            if not _sync_canonical_checkout_after_merge(worker, branch=base):
+                                sync_error = str(worker.get("canonical_sync_error") or "Canonical checkout sync failed")
+                                worker["pr_error"] = sync_error
+                                worker["pr_blocker"] = sync_error
                     elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
                         worker["pr_merge_skipped"] = True
                         worker["pr_merge_skipped_reason"] = policy
@@ -3278,6 +3191,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 "pr_amend_head_advanced",
                 "pr_amend_upstream_head_sha",
                 "pr_amend_trigger_head_sha",
+                "pr_finalizer_guard",
             )
             if key in worker
         },

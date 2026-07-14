@@ -82,6 +82,7 @@ _CODING_WORKER_BLOCKED_MUTATION_TOOLS = frozenset({
     "write_file",
     "patch",
     "execute_code",
+    "sync_canonical_checkout",
 })
 
 _TERMINAL_MUTATION_PATTERNS = re.compile(
@@ -1088,6 +1089,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+        elif function_name == "sync_canonical_checkout":
+            from tools.canonical_checkout_sync_tool import sync_canonical_checkout_tool
+
+            function_result = sync_canonical_checkout_tool(
+                project_path=function_args.get("project_path", ""),
+                branch=function_args.get("branch", ""),
+                merge_commit=function_args.get("merge_commit", ""),
+                parent_agent=agent,
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(
+                    f"  {_get_cute_tool_message_impl('sync_canonical_checkout', function_args, tool_duration, result=function_result)}"
+                )
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):

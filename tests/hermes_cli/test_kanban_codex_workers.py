@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -23,6 +24,32 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_WORKER_SYSTEMD", "0")
     return root
+
+
+@pytest.fixture(autouse=True)
+def _resolve_canonical_sync_in_worker_integration_tests(monkeypatch):
+    """Keep PR-finalizer integration fakes focused on lifecycle behavior.
+
+    Protected-root/default-branch validation is covered directly in
+    ``test_canonical_checkout_sync.py``. The historical finalizer tests below
+    mock only the bounded Git lifecycle, so give that helper a trusted root
+    and retain their explicit dirty/pull/ancestry assertions.
+    """
+    from hermes_cli import canonical_checkout_sync
+
+    monkeypatch.setattr(
+        canonical_checkout_sync,
+        "resolve_protected_canonical_checkout",
+        lambda project_path, _branch, **_kwargs: (Path(str(project_path)), None),
+    )
+    # Historical lifecycle fakes use ``abc123`` as a compact placeholder. The
+    # production authority boundary requires the real GitHub SHA length; this
+    # integration fixture deliberately bypasses that unrelated validation.
+    monkeypatch.setattr(
+        canonical_checkout_sync,
+        "_MERGE_COMMIT_RE",
+        re.compile(r"^[0-9a-fA-F]{4,64}$"),
+    )
 
 
 def _pr_view_json(
@@ -3405,7 +3432,7 @@ def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
     assert str(artifact_path) in dev_tasks[0].body
 
 
-def test_reviewer_pr_lifecycle_task_finalizes_without_dev_ticket(monkeypatch, tmp_path):
+def test_reviewer_pr_lifecycle_task_hands_off_without_dev_ticket(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_codex_worker as worker
@@ -3413,8 +3440,18 @@ def test_reviewer_pr_lifecycle_task_finalizes_without_dev_ticket(monkeypatch, tm
     from hermes_cli.discord_worker_boards import ROLE_REVIEWER
 
     board = dwb.start_direct_goal(thread_id="review-pr-chore", goal="Ship it")
-    calls = []
-    monkeypatch.setattr(worker, "_ensure_pr", lambda board, workspace: calls.append((board, workspace)) or True)
+    dwb._update_worker_meta(board.slug, {"phase": "reviewing", "goal_status": "active"})
+    dispatch_requests = []
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pr",
+        lambda *args, **kwargs: pytest.fail("role worker must not finalize the PR"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "mark_dispatch_dirty",
+        lambda **kwargs: dispatch_requests.append(kwargs),
+    )
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -3449,14 +3486,21 @@ def test_reviewer_pr_lifecycle_task_finalizes_without_dev_ticket(monkeypatch, tm
             item for item in kanban_db.list_tasks(conn, include_archived=False)
             if item.assignee == "dev"
         ]
+        reviewer = kanban_db.get_task(conn, reviewer_id)
+        runs = kanban_db.list_runs(conn, reviewer_id)
     finally:
         conn.close()
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert dev_tasks == []
-    assert calls == [(board.slug, str(tmp_path / "repo"))]
-    assert meta["phase"] == "complete"
-    assert meta["goal_status"] == "done"
+    assert reviewer is not None
+    assert reviewer.status == "done"
+    assert runs[-1].metadata["filtered_pr_lifecycle_tasks"]
+    assert dispatch_requests == [
+        {"board": board.slug, "reason": "reviewer-approval-persisted"}
+    ]
+    assert meta["phase"] == "reviewing"
+    assert meta["goal_status"] == "active"
 
 
 def test_reviewer_pr_lifecycle_filter_keeps_live_provenance_followup(monkeypatch, tmp_path):
@@ -3552,7 +3596,7 @@ def test_reviewer_pr_lifecycle_task_filter_keeps_real_code_followup(monkeypatch,
     assert [item.title for item in dev_tasks] == ["R1: Fix failing CI test"]
 
 
-def test_reviewer_approval_blocks_board_when_pr_publication_fails(monkeypatch, tmp_path):
+def test_reviewer_approval_hands_off_pr_finalization_to_dispatcher(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_codex_worker as worker
@@ -3560,6 +3604,8 @@ def test_reviewer_approval_blocks_board_when_pr_publication_fails(monkeypatch, t
     from hermes_cli.discord_worker_boards import ROLE_REVIEWER
 
     board = dwb.start_direct_goal(thread_id="review-pr-failed", goal="Ship it")
+    dwb._update_worker_meta(board.slug, {"phase": "reviewing", "goal_status": "active"})
+    dispatch_requests = []
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -3571,7 +3617,16 @@ def test_reviewer_approval_blocks_board_when_pr_publication_fails(monkeypatch, t
         )
         reviewer = kanban_db.claim_task(conn, reviewer_id)
         assert reviewer is not None
-        monkeypatch.setattr(worker, "_ensure_pr", lambda *args, **kwargs: False)
+        monkeypatch.setattr(
+            worker,
+            "_ensure_pr",
+            lambda *args, **kwargs: pytest.fail("role worker must not finalize the PR"),
+        )
+        monkeypatch.setattr(
+            worker,
+            "mark_dispatch_dirty",
+            lambda **kwargs: dispatch_requests.append(kwargs),
+        )
 
         worker._apply_role_output(
             conn,
@@ -3582,12 +3637,20 @@ def test_reviewer_approval_blocks_board_when_pr_publication_fails(monkeypatch, t
             workspace=str(tmp_path / "repo"),
             expected_run_id=reviewer.current_run_id,
         )
+        completed = kanban_db.get_task(conn, reviewer_id)
+        runs = kanban_db.list_runs(conn, reviewer_id)
     finally:
         conn.close()
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["phase"] == "blocked"
-    assert meta["goal_status"] == "blocked"
+    assert completed is not None
+    assert completed.status == "done"
+    assert runs[-1].summary == "Looks good."
+    assert dispatch_requests == [
+        {"board": board.slug, "reason": "reviewer-approval-persisted"}
+    ]
+    assert meta["phase"] == "reviewing"
+    assert meta["goal_status"] == "active"
 
 
 def test_dev_blocked_output_marks_discord_board_blocked(monkeypatch, tmp_path):
@@ -5052,7 +5115,7 @@ def test_ensure_pr_syncs_already_merged_pr(monkeypatch, tmp_path):
         ("ancestor", True, {"ancestor_failed": True}, "Canonical checkout does not contain PR merge commit"),
     ],
 )
-def test_ensure_pr_records_nonblocking_canonical_sync_failure_after_merge(
+def test_ensure_pr_blocks_terminal_completion_when_canonical_sync_fails_after_merge(
     monkeypatch, tmp_path, case, project_exists, sync_kwargs, expected
 ):
     _home(monkeypatch, tmp_path)
@@ -5091,14 +5154,14 @@ def test_ensure_pr_records_nonblocking_canonical_sync_failure_after_merge(
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_state"] == "MERGED"
-    assert meta.get("pr_error") in (None, "")
-    assert meta["pr_blocker"] == ""
     assert meta["canonical_sync_state"] == "blocked"
     assert expected in meta["canonical_sync_error"]
+    assert expected in meta["pr_error"]
+    assert expected in meta["pr_blocker"]
     if not project_exists:
         assert ["git", "status", "--porcelain"] not in calls
 
@@ -5768,6 +5831,37 @@ def test_ensure_pr_skips_foreman_no_change_branch(monkeypatch, tmp_path):
     assert not any(cmd[:3] == ["gh", "pr", "list"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
+
+
+def test_ensure_pr_rejects_kanban_role_worker_context(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+
+    board = dwb.start_direct_goal(
+        thread_id="role-worker-pr-guard",
+        goal="Finalize only from dispatcher",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "review-task")
+    monkeypatch.setattr(
+        worker.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("role-worker guard must run before git or gh"),
+    )
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
+
+    meta = kanban_db.read_board_metadata(board.slug)[DISCORD_WORKER_META_KEY]
+    assert meta["pr_finalizer_guard"] == "role_worker_context"
+    assert meta["pr_checks_status"] == "not checked"
+    assert meta["pr_merge_state"] == "not attempted"
+    assert "dispatcher reconciliation must finalize" in meta["pr_error"]
+    assert meta["pr_blocker"] == meta["pr_error"]
 
 
 def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path):

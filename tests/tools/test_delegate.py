@@ -2173,6 +2173,51 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             ["web", "browser"],
         )
 
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_hides_canonical_sync_from_child_schema(self, mock_cfg):
+        """Composite inherited toolsets must not advertise canonical sync to workers."""
+        import tools.canonical_checkout_sync_tool  # noqa: F401
+        from model_tools import get_tool_definitions
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["hermes-cli"]
+        parent.disabled_toolsets = []
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Implement the change",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        child_kwargs = MockAgent.call_args.kwargs
+        self.assertIn("canonical_sync", child_kwargs["disabled_toolsets"])
+
+        child_names = {
+            definition["function"]["name"]
+            for definition in get_tool_definitions(
+                enabled_toolsets=child_kwargs["enabled_toolsets"],
+                disabled_toolsets=child_kwargs["disabled_toolsets"],
+                quiet_mode=True,
+            )
+        }
+        top_level_names = {
+            definition["function"]["name"]
+            for definition in get_tool_definitions(
+                enabled_toolsets=["hermes-cli"],
+                quiet_mode=True,
+            )
+        }
+
+        self.assertNotIn("sync_canonical_checkout", child_names)
+        self.assertIn("sync_canonical_checkout", top_level_names)
+
 
 class TestChildCredentialLeasing(unittest.TestCase):
     def test_run_single_child_acquires_and_releases_lease(self):

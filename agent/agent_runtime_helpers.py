@@ -1715,6 +1715,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             count=function_args.get("count"),
             callback=getattr(agent, "read_terminal_callback", None),
         ))
+    elif function_name == "sync_canonical_checkout":
+        from tools.canonical_checkout_sync_tool import sync_canonical_checkout_tool
+
+        return _finish(sync_canonical_checkout_tool(
+            project_path=function_args.get("project_path", ""),
+            branch=function_args.get("branch", ""),
+            merge_commit=function_args.get("merge_commit", ""),
+            parent_agent=agent,
+        ))
     elif function_name == "delegate_task":
         return _finish(agent._dispatch_delegate_task(function_args))
     elif function_name == "delegate_coding_task":

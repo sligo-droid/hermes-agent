@@ -53,6 +53,12 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     ]
 )
 
+# Delegated workers must never be offered the post-merge canonical-checkout
+# capability.  It remains part of the top-level core schemas, but is registered
+# in this dedicated toolset so the normal enabled/disabled-toolset filtering can
+# remove it even when a child inherits a composite ``hermes-*`` toolset.
+_DELEGATE_DISABLED_TOOLSETS = frozenset({"canonical_sync"})
+
 
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
@@ -1087,6 +1093,15 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Preserve any restrictions already applied to the parent and add the
+    # worker-only canonical-sync restriction.  ``disabled_toolsets`` is applied
+    # after composite toolsets resolve, so this also covers inherited
+    # ``hermes-cli``/platform toolsets that contain the core sync tool.
+    parent_disabled_toolsets = getattr(parent_agent, "disabled_toolsets", None) or []
+    child_disabled_toolsets = list(
+        dict.fromkeys([*parent_disabled_toolsets, *_DELEGATE_DISABLED_TOOLSETS])
+    )
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
@@ -1239,6 +1254,7 @@ def _build_child_agent(
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
+        disabled_toolsets=child_disabled_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",

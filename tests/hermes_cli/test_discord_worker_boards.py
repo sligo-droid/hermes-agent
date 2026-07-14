@@ -4375,7 +4375,7 @@ def test_reconcile_board_retries_retryable_pr_amend_head_advance_blocker(monkeyp
     assert worker["pr_amend_head_advanced"] is True
 
 
-def test_reconcile_board_retries_operator_blocked_canonical_sync_after_merged_pr(monkeypatch, tmp_path):
+def test_reconcile_board_keeps_operator_blocked_canonical_sync_from_completing(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_codex_worker
@@ -4434,8 +4434,8 @@ def test_reconcile_board_retries_operator_blocked_canonical_sync_after_merged_pr
         dwb._update_worker_meta(
             board_arg,
             {
-                "pr_error": None,
-                "pr_blocker": "",
+                "pr_error": blocker,
+                "pr_blocker": blocker,
                 "pr_state": "MERGED",
                 "pr_merged_at": "2026-07-06T07:32:03Z",
                 "pr_merge_commit": "abc123",
@@ -4445,22 +4445,22 @@ def test_reconcile_board_retries_operator_blocked_canonical_sync_after_merged_pr
                 "canonical_sync_error": blocker,
             },
         )
-        return True
+        return False
 
     monkeypatch.setattr(kanban_codex_worker, "_ensure_pr", fake_ensure_pr)
 
-    assert dwb.reconcile_board(board.slug) == "approved_reviewer_finalized"
+    assert dwb.reconcile_board(board.slug) == "approved_reviewer_finalizer_manual_blocked"
 
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert calls == [(board.slug, str(worktree))]
-    assert worker["phase"] == "complete"
-    assert worker["goal_status"] == "done"
-    assert worker["blocked_reason"] == ""
-    assert worker["pr_error"] is None
-    assert worker["pr_blocker"] == ""
+    assert worker["phase"] == "blocked"
+    assert worker["goal_status"] == "blocked"
+    assert worker["blocked_reason"] == "approved reviewer PR finalization failed"
+    assert worker["pr_error"] == blocker
+    assert worker["pr_blocker"] == blocker
     assert worker["canonical_sync_state"] == "blocked"
     assert worker["canonical_sync_error"] == blocker
-    assert worker["terminal_completion_message_pending"] is True
+    assert "terminal_completion_message_pending" not in worker
 
 
 def test_ensure_pr_clears_stale_pr_amend_blocker_after_head_advances(monkeypatch, tmp_path):
