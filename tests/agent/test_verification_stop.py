@@ -10,6 +10,7 @@ from agent.verification_evidence import (
 )
 from agent.verification_stop import (
     build_verify_on_stop_nudge,
+    build_visual_qa_stop_nudge,
     verify_on_stop_enabled,
 )
 
@@ -181,6 +182,29 @@ def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
     )
 
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
+
+
+def test_visual_stop_nudge_is_independent_from_generic_messaging_default():
+    requirement = {
+        "level": "surface",
+        "target": "mobile-toolbar",
+        "assertions": ["toolbar has no horizontal overflow"],
+    }
+
+    nudge = build_visual_qa_stop_nudge(
+        requirement=requirement,
+        changed_paths=["src/toolbar.tsx"],
+        receipts=[],
+    )
+
+    assert nudge is not None
+    assert "visual_qa_receipt" in nudge
+    assert build_visual_qa_stop_nudge(
+        requirement=requirement,
+        changed_paths=["src/toolbar.tsx"],
+        receipts=[],
+        attempts=1,
+    ) is None
 
 
 def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):

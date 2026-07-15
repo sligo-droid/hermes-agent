@@ -19,6 +19,13 @@ from agent.verification_evidence import (
     downgrade_verified_metadata,
     evidence_from_runtime_breakdown,
 )
+from agent.visual_qa import (
+    classify_visual_requirement,
+    normalize_visual_qa_config,
+    normalize_visual_requirement,
+    sanitize_visual_receipt,
+    visual_receipt_completion,
+)
 
 
 INCOMPLETE_STATUSES = frozenset(
@@ -206,6 +213,178 @@ def _durable_metadata(value: Any) -> Any:
     return None if safe is _DROP else safe
 
 
+def _visual_qa_worker_route_for_event(event: Any) -> Any:
+    """Return advisory route metadata without making it durable request data."""
+
+    route = getattr(event, "worker_route", None)
+    if route:
+        return route
+    fable_metadata = getattr(event, "fable_plan_metadata", None)
+    if isinstance(fable_metadata, dict):
+        return fable_metadata.get("route")
+    return None
+
+
+def _visual_qa_requirement_for_event(event: Any) -> dict[str, Any]:
+    """Classify only the accepted request text into a bounded public shape."""
+
+    request_parts = [str(getattr(event, "text", "") or "")]
+    feature_summary = getattr(event, "feature_summary", None)
+    if isinstance(feature_summary, dict):
+        request_parts.append(str(feature_summary.get("initial_request") or ""))
+    request_text = "\n".join(part for part in request_parts if part.strip())
+    return classify_visual_requirement(
+        request_text,
+        worker_route=_visual_qa_worker_route_for_event(event),
+    )
+
+
+def _visual_qa_receipts(
+    receipts: Any,
+    requirement: Any,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep only explicit, requirement-matching, secret-safe receipts."""
+
+    safe: list[dict[str, Any]] = []
+    if not isinstance(receipts, list):
+        return safe
+    max_receipts = max(0, int(limit or 0))
+    if max_receipts <= 0:
+        return safe
+    for raw in receipts:
+        receipt = sanitize_visual_receipt(raw, requirement=requirement)
+        if receipt is not None:
+            safe.append(receipt)
+        if len(safe) >= max_receipts:
+            break
+    return safe
+
+
+def _visual_qa_state_for_item(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the normalized, persisted visual-QA contract for an item."""
+
+    config = normalize_visual_qa_config(item.get("visual_qa_config"))
+    requirement = normalize_visual_requirement(item.get("visual_qa_requirement"))
+    return config, requirement
+
+
+def _durable_runtime_breakdown(
+    runtime_breakdown: Any,
+    requirement: Any,
+    *,
+    receipt_limit: int,
+) -> Any:
+    """Persist runtime metrics without retaining unsafe raw visual receipt text."""
+
+    durable = _durable_metadata(runtime_breakdown)
+    if not isinstance(durable, dict):
+        return durable
+    durable["visual_qa_receipts"] = _visual_qa_receipts(
+        runtime_breakdown.get("visual_qa_receipts") if isinstance(runtime_breakdown, dict) else None,
+        requirement,
+        limit=receipt_limit,
+    )
+    return durable
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_visual_qa_completion(item: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
+    """Attach the bounded visual-QA result and enforce only proven post-edit work.
+
+    A requirement alone never blocks a Discord completion.  Enforcement needs
+    all three signals: an explicit visual request, ``enforce_explicit`` mode,
+    and a landed code mutation with a known subsequent tool-order boundary.
+    This keeps generic screenshots/navigation and incomplete runtime metadata
+    from turning into accidental delivery gates.
+    """
+
+    config, requirement = _visual_qa_state_for_item(item)
+    if requirement["level"] == "none":
+        return gate
+
+    visual: dict[str, Any] = {
+        "mode": config["mode"],
+        "requirement": requirement,
+        "code_mutation_observed": item.get("visual_qa_code_mutation_observed") is True,
+        "enforced": False,
+    }
+    if config["mode"] == "off":
+        visual.update({"status": "not_applicable", "reason": "mode_off"})
+        gate["visual_qa"] = visual
+        return gate
+
+    if not visual["code_mutation_observed"]:
+        visual.update({"status": "not_applicable", "reason": "no_code_mutation_observed"})
+        gate["visual_qa"] = visual
+        return gate
+
+    min_order = _positive_int(item.get("visual_qa_min_receipt_order"))
+    if min_order <= 0:
+        # A mutation is known, but no tool-order boundary exists to prove a
+        # receipt was captured afterward. Shadow mode records that gap; an
+        # explicit enforcement request must fail closed rather than accepting
+        # an earlier or unrelated receipt.
+        visual.update({"status": "missing", "reason": "mutation_order_unavailable"})
+        if config["mode"] == "shadow":
+            visual["shadow_report"] = "receipt_unverifiable"
+        else:
+            visual["enforced"] = True
+            if gate.get("allowed_to_complete"):
+                gate.update(
+                    {
+                        "allowed_to_complete": False,
+                        "summary_status": "Blocked",
+                        "terminal_status": "blocked",
+                        "reason": "visual_qa_receipt_unverifiable",
+                    }
+                )
+        gate["visual_qa"] = visual
+        return gate
+
+    receipts = _visual_qa_receipts(
+        item.get("visual_qa_receipts"),
+        requirement,
+        limit=config["max_receipts_per_turn"],
+    )
+    completion = visual_receipt_completion(requirement, receipts, min_order=min_order)
+    status = str(completion.get("status") or "missing")
+    visual.update(
+        {
+            "status": status,
+            "receipt": completion.get("receipt"),
+            "min_receipt_order": min_order,
+        }
+    )
+    if config["mode"] == "shadow":
+        if status != "passed":
+            # This is durable reporting only. Shadow mode never changes the
+            # primary delivery decision or user-visible final response.
+            visual["shadow_report"] = f"receipt_{status}"
+        gate["visual_qa"] = visual
+        return gate
+
+    visual["enforced"] = True
+    gate["visual_qa"] = visual
+    if status != "passed" and gate.get("allowed_to_complete"):
+        gate.update(
+            {
+                "allowed_to_complete": False,
+                "summary_status": "Blocked",
+                "terminal_status": "blocked",
+                "reason": f"visual_qa_receipt_{status}",
+            }
+        )
+    return gate
+
+
 def _has_any_key(mapping: Any, keys: frozenset[str]) -> bool:
     if not isinstance(mapping, dict):
         return False
@@ -332,7 +511,7 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
         "repo_backed": repo_backed,
     }
     if not repo_backed:
-        return gate
+        return _apply_visual_qa_completion(item, gate)
 
     evidence = evidence_from_runtime_breakdown(item.get("runtime_breakdown"))
     constraints = claim_constraints_for_text(final_text, evidence)
@@ -346,7 +525,7 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
                 "verification_constraints": constraints,
             }
         )
-        return gate
+        return _apply_visual_qa_completion(item, gate)
 
     matched = _incomplete_final_markers(final_text)
     runtime_handoff_missing = _deferred_runtime_watch_missing_markers(final_text) if intent == "full_lifecycle" else []
@@ -361,20 +540,20 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
                     "matched_markers": runtime_handoff_missing,
                 }
             )
-        return gate
+        return _apply_visual_qa_completion(item, gate)
 
     narrow_intent = intent in {"pr_only", "review_only", "draft_pr", "no_merge"}
     only_narrow_lifecycle_markers = set(matched) <= {"not_merged", "no_deploy"}
     if intent == "review_only" and "not_done_yet" not in matched and _matches_any(final_text, _REVIEW_ONLY_FINAL_PATTERNS):
         gate["reason"] = "intentional_review_only_terminal"
         gate["matched_markers"] = matched
-        return gate
+        return _apply_visual_qa_completion(item, gate)
     if narrow_intent and only_narrow_lifecycle_markers and (
         _matches_any(final_text, _PR_ONLY_FINAL_PATTERNS) or _matches_any(final_text, _INTENTIONAL_UNMERGED_PATTERNS)
     ):
         gate["reason"] = "intentional_narrow_scope_terminal"
         gate["matched_markers"] = matched
-        return gate
+        return _apply_visual_qa_completion(item, gate)
 
     gate.update(
         {
@@ -385,7 +564,7 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
             "matched_markers": matched,
         }
     )
-    return gate
+    return _apply_visual_qa_completion(item, gate)
 
 
 def _discord_board_slug_for_item(item: dict[str, Any]) -> str:
@@ -529,6 +708,7 @@ class GatewayWorkLedger:
         session_key: str,
         freshness_seconds: float,
         status: str = "accepted",
+        visual_qa_config: Any = None,
     ) -> dict[str, Any] | None:
         source = getattr(event, "source", None)
         work_id = self.id_for_event(event, session_key)
@@ -544,6 +724,8 @@ class GatewayWorkLedger:
             return copy
 
         message_type = getattr(getattr(event, "message_type", None), "value", None)
+        normalized_visual_config = normalize_visual_qa_config(visual_qa_config)
+        visual_requirement = _visual_qa_requirement_for_event(event)
         item = {
             "id": work_id,
             "status": status,
@@ -563,6 +745,13 @@ class GatewayWorkLedger:
             "goal_thread_context": getattr(event, "goal_thread_context", None),
             "feature_summary": _durable_metadata(getattr(event, "feature_summary", None)),
             "project_summary": _durable_metadata(getattr(event, "project_summary", None)),
+            # These are deliberately normalized before persistence.  The
+            # request requirement contains only bounded plain text, config
+            # retains no unknown keys, and receipts are sanitized separately
+            # when a turn ends.
+            "visual_qa_config": normalized_visual_config,
+            "visual_qa_requirement": visual_requirement,
+            "visual_qa_receipts": [],
             "claim_pid": None,
             "lease_until": None,
             "result_message_id": None,
@@ -606,8 +795,20 @@ class GatewayWorkLedger:
             "result_message_id",
             "summary_status",
             "summary_updated_at",
+            "visual_qa_code_mutation_observed",
+            "visual_qa_min_receipt_order",
         ):
             item.pop(key, None)
+        # Tool order restarts on a retried agent turn. Keep the durable
+        # requirement/config, but never let a receipt from an earlier turn
+        # satisfy a fresh post-edit boundary.
+        item["visual_qa_receipts"] = []
+        runtime_breakdown = item.get("runtime_breakdown")
+        if isinstance(runtime_breakdown, dict) and "visual_qa_receipts" in runtime_breakdown:
+            item["runtime_breakdown"] = {
+                **runtime_breakdown,
+                "visual_qa_receipts": [],
+            }
         if session_id:
             item["session_id"] = str(session_id)
         _record_provider_progress(item, "ledger_status_agent_running", status="agent_running")
@@ -626,6 +827,9 @@ class GatewayWorkLedger:
         project_summary: dict[str, Any] | None = None,
         runtime_breakdown: dict[str, Any] | None = None,
         provider_no_progress: dict[str, Any] | None = None,
+        visual_qa_receipts: list[dict[str, Any]] | None = None,
+        visual_qa_code_mutation_observed: bool | None = None,
+        visual_qa_min_receipt_order: int | None = None,
         already_delivered: bool = False,
     ) -> bool:
         data = self._read()
@@ -647,10 +851,29 @@ class GatewayWorkLedger:
             item["feature_summary"] = _durable_metadata(feature_summary)
         if project_summary is not None:
             item["project_summary"] = _durable_metadata(project_summary)
+        visual_config, visual_requirement = _visual_qa_state_for_item(item)
         if runtime_breakdown is not None:
-            item["runtime_breakdown"] = _durable_metadata(runtime_breakdown)
+            item["runtime_breakdown"] = _durable_runtime_breakdown(
+                runtime_breakdown,
+                visual_requirement,
+                receipt_limit=visual_config["max_receipts_per_turn"],
+            )
         if provider_no_progress is not None:
             item["provider_no_progress"] = _durable_metadata(provider_no_progress)
+        if visual_qa_receipts is not None:
+            item["visual_qa_receipts"] = _visual_qa_receipts(
+                visual_qa_receipts,
+                visual_requirement,
+                limit=visual_config["max_receipts_per_turn"],
+            )
+        if visual_qa_code_mutation_observed is not None:
+            item["visual_qa_code_mutation_observed"] = bool(visual_qa_code_mutation_observed)
+        if visual_qa_min_receipt_order is not None:
+            min_order = _positive_int(visual_qa_min_receipt_order)
+            if min_order:
+                item["visual_qa_min_receipt_order"] = min_order
+            else:
+                item.pop("visual_qa_min_receipt_order", None)
         _record_provider_progress(item, f"ledger_status_{item['status']}", status=str(item["status"]))
         gate = classify_delivery_completion(item)
         item["completion_gate"] = gate
@@ -812,4 +1035,6 @@ class GatewayWorkLedger:
         )
         event.work_item_id = item.get("id")
         event.work_replay = True
+        event.visual_qa_requirement = normalize_visual_requirement(item.get("visual_qa_requirement"))
+        event.visual_qa_config = normalize_visual_qa_config(item.get("visual_qa_config"))
         return event

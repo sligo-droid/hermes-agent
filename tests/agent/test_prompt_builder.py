@@ -69,6 +69,10 @@ class TestGuidanceConstants:
         assert "Simple UI fast lane" in text
         assert "sub-worker delegation" in text
         assert "rendered visual/browser check" in text
+        assert "assertion-driven rendered-check receipt" in text
+        assert "`visual_qa`" in text
+        assert "not_applicable" in text
+        assert "do not add visual tooling or latency" in text
         assert "phase_timing" in text
         assert "If staging or" in text
         assert "verification failed" in text
