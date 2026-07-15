@@ -409,3 +409,5 @@ def test_fable_metadata_identifies_configured_proxy_route():
 
     assert metadata["route"] == "anthropic_proxy"
     assert metadata["transport"] == "anthropic_proxy"
+    assert metadata["anthropic_oauth_tool_name_compat"] is True
+    assert fable_metadata()["anthropic_oauth_tool_name_compat"] is False

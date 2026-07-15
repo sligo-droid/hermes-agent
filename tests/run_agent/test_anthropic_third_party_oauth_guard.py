@@ -167,6 +167,43 @@ class TestOAuthFlagOnConstruction:
         assert agent._anthropic_api_key == "minimax-key-1234"
         assert agent._is_anthropic_oauth is False
 
+    def test_proxy_tool_name_compat_keeps_non_oauth_identity(self, agent):
+        """A trusted proxy gets OAuth-safe tool names without an OAuth key."""
+        from agent.chat_completion_helpers import build_api_kwargs
+
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.model = "claude-fable-5"
+        agent._anthropic_base_url = "http://127.0.0.1:8317"
+        agent._is_anthropic_oauth = False
+        agent._anthropic_oauth_tool_name_compat = True
+        agent.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "x",
+                    "parameters": {},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_supabase_get_logs",
+                    "description": "x",
+                    "parameters": {},
+                },
+            },
+        ]
+
+        kwargs = build_api_kwargs(agent, [{"role": "user", "content": "Hi"}])
+
+        assert agent._is_anthropic_oauth is False
+        assert [tool["name"] for tool in kwargs["tools"]] == [
+            "mcp__read_file",
+            "mcp__supabase_get_logs",
+        ]
+
 
 class TestOAuthFlagOnFallbackActivation:
     """Site 5 — _try_activate_fallback targeting a third-party Anthropic endpoint."""

@@ -20885,6 +20885,11 @@ class GatewayRunner:
         ).strip().lower() or "plan"
         fable_plan_only = bool(fable_plan_metadata) and fable_mode == "plan"
         fable_implementation = bool(fable_plan_metadata) and fable_mode == "implementation"
+        fable_oauth_tool_name_compat = bool(
+            (fable_plan_metadata or {}).get("anthropic_oauth_tool_name_compat", False)
+            if isinstance(fable_plan_metadata, dict)
+            else False
+        )
 
         from hermes_cli.tools_config import _get_platform_tools
         default_discord_kanban_intake = bool(
@@ -21763,6 +21768,7 @@ class GatewayRunner:
                         str(action_request_model_tier_override or "").strip()
                     ),
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
+                    "gateway.fable_oauth_tool_name_compat": fable_oauth_tool_name_compat,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
                     "gateway.tool_delay": 0.0 if standard_discord_action_request else None,
                     "gateway.verify_on_stop": True if standard_discord_action_request else None,
@@ -21853,6 +21859,11 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.session_cwd = session_cwd
             agent.terminal_cwd = session_cwd
+            # Fable proxy credentials are not OAuth tokens, but the trusted
+            # proxy route can terminate against Claude Code OAuth upstream.
+            # Reset this on every turn so a cached agent cannot leak the wire
+            # format into an unrelated non-Fable request.
+            agent._anthropic_oauth_tool_name_compat = fable_oauth_tool_name_compat
             # Fable implementation parents retain the normal Discord tool
             # surface for inspection/review, while tool execution blocks all
             # direct repository mutations in favor of the Codex worker.

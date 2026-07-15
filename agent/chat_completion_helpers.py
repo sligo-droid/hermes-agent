@@ -591,6 +591,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
+        _oauth_tool_name_compat = bool(
+            getattr(agent, "_anthropic_oauth_tool_name_compat", False)
+        )
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)
         ctx_len = ctx_len.context_length if ctx_len else None
@@ -604,6 +607,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
             reasoning_config=agent.reasoning_config,
             is_oauth=agent._is_anthropic_oauth,
+            oauth_tool_name_compat=_oauth_tool_name_compat,
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
             base_url=getattr(agent, "_anthropic_base_url", None),
@@ -1533,12 +1537,19 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
+                _oauth_tool_name_compat = bool(
+                    getattr(agent, "_anthropic_oauth_tool_name_compat", False)
+                )
                 _ant_kw = _tsum.build_kwargs(model=agent.model, messages=api_messages, tools=None,
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
+                               oauth_tool_name_compat=_oauth_tool_name_compat,
                                preserve_dots=agent._anthropic_preserve_dots())
                 summary_response = agent._anthropic_messages_create(_ant_kw)
-                _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
+                _summary_result = _tsum.normalize_response(
+                    summary_response,
+                    strip_tool_prefix=(agent._is_anthropic_oauth or _oauth_tool_name_compat),
+                )
                 final_response = (_summary_result.content or "").strip()
             else:
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
@@ -1563,12 +1574,19 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = (_cnr_retry.content or "").strip()
             elif agent.api_mode == "anthropic_messages":
                 _tretry = agent._get_transport()
+                _oauth_tool_name_compat = bool(
+                    getattr(agent, "_anthropic_oauth_tool_name_compat", False)
+                )
                 _ant_kw2 = _tretry.build_kwargs(model=agent.model, messages=api_messages, tools=None,
                                 is_oauth=agent._is_anthropic_oauth,
+                                oauth_tool_name_compat=_oauth_tool_name_compat,
                                 max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                 preserve_dots=agent._anthropic_preserve_dots())
                 retry_response = agent._anthropic_messages_create(_ant_kw2)
-                _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
+                _retry_result = _tretry.normalize_response(
+                    retry_response,
+                    strip_tool_prefix=(agent._is_anthropic_oauth or _oauth_tool_name_compat),
+                )
                 final_response = (_retry_result.content or "").strip()
             else:
                 summary_kwargs = {

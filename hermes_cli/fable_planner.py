@@ -103,6 +103,11 @@ def fable_metadata(
         "provider": FABLE_PROVIDER,
         "model": FABLE_MODEL,
         "reply_to_mode": "all",
+        # A proxy uses its own API key on the Hermes-facing hop, but may
+        # terminate through Claude Code OAuth upstream.  Keep credential
+        # identity separate from the tool-name compatibility that upstream
+        # OAuth requires (no single-underscore ``mcp_`` names on the wire).
+        "anthropic_oauth_tool_name_compat": route == FABLE_PROXY_ROUTE,
     }
     if normalized_mode == FABLE_PLAN_MODE:
         metadata.update(

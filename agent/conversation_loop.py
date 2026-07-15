@@ -2053,7 +2053,11 @@ def run_conversation(
                     _trunc_transport = agent._get_transport()
                     if agent.api_mode == "anthropic_messages":
                         _trunc_result = _trunc_transport.normalize_response(
-                            response, strip_tool_prefix=agent._is_anthropic_oauth
+                            response,
+                            strip_tool_prefix=(
+                                agent._is_anthropic_oauth
+                                or bool(getattr(agent, "_anthropic_oauth_tool_name_compat", False))
+                            ),
                         )
                     else:
                         _trunc_result = _trunc_transport.normalize_response(response)
@@ -4032,7 +4036,10 @@ def run_conversation(
             _transport = agent._get_transport()
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":
-                _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
+                _normalize_kwargs["strip_tool_prefix"] = (
+                    agent._is_anthropic_oauth
+                    or bool(getattr(agent, "_anthropic_oauth_tool_name_compat", False))
+                )
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
