@@ -1357,11 +1357,11 @@ DEFAULT_CONFIG = {
         "platforms": {},  # Per-platform display overrides: {"telegram": {"tool_progress": "all"}, "slack": {"tool_progress": "off"}}
         # Gateway runtime-metadata footer appended to the FINAL message of a turn
         # (disabled by default to keep replies minimal). When enabled, renders
-        # e.g. `model · 68% · ~/projects/hermes`. Per-platform overrides go under
-        # display.platforms.<platform>.runtime_footer.
+        # e.g. `model · xhigh · 68% · ~/projects/hermes`. Per-platform overrides
+        # go under display.platforms.<platform>.runtime_footer.
         "runtime_footer": {
             "enabled": False,
-            "fields": ["model", "context_pct", "cwd"],  # Order shown; drop any to hide
+            "fields": ["model", "reasoning", "context_pct", "cwd"],  # Order shown; drop any to hide
         },
         "copy_shortcut": "auto",  # "auto" (platform default) | "ctrl_c" | "ctrl_shift_c" | "disabled"
     },
@@ -2654,7 +2654,7 @@ DEFAULT_CONFIG = {
 
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 24,
+    "_config_version": 25,
 }
 
 # =============================================================================
@@ -4892,6 +4892,44 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         "  ✓ Seeded auxiliary.curator defaults in config.yaml: "
                         f"{', '.join(added_aux)}"
                     )
+
+    # ── Version 24 → 25: add reasoning to the legacy runtime footer default ──
+    # ``fields`` is an ordered list, so the normal default deep merge cannot
+    # add a new item to existing installs. Upgrade only the exact old default;
+    # any other list is an explicit user layout and must remain untouched.
+    if current_ver < 25:
+        config = read_raw_config()
+        display = config.get("display")
+        changed = False
+
+        def _upgrade_footer_fields(footer: Any) -> bool:
+            if not isinstance(footer, dict):
+                return False
+            if footer.get("fields") != ["model", "context_pct", "cwd"]:
+                return False
+            footer["fields"] = ["model", "reasoning", "context_pct", "cwd"]
+            return True
+
+        if isinstance(display, dict):
+            changed = _upgrade_footer_fields(display.get("runtime_footer"))
+            platforms = display.get("platforms")
+            if isinstance(platforms, dict):
+                for platform_cfg in platforms.values():
+                    if not isinstance(platform_cfg, dict):
+                        continue
+                    changed = (
+                        _upgrade_footer_fields(platform_cfg.get("runtime_footer"))
+                        or changed
+                    )
+
+        if changed:
+            config["display"] = display
+            save_config(config)
+            results["config_added"].append(
+                "display.runtime_footer.fields (added reasoning)"
+            )
+            if not quiet:
+                print("  ✓ Added reasoning to the runtime footer fields")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")

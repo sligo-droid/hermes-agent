@@ -1,6 +1,6 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
+Renders a compact footer showing runtime state (model, context %, cwd, reasoning)
 appends it to the final response of each completed agent turn when enabled.
 Off by default to keep replies minimal.
 
@@ -9,7 +9,7 @@ Config (``~/.hermes/config.yaml``)::
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
+        fields: [model, reasoning, context_pct, cwd]  # order shown; drop any to hide
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -28,7 +28,8 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
-_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
+_DEFAULT_FIELDS: tuple[str, ...] = ("model", "reasoning", "context_pct", "cwd")
+_LEGACY_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
 
@@ -53,6 +54,22 @@ def _model_short(model: Optional[str]) -> str:
     return model.rsplit("/", 1)[-1]
 
 
+def _footer_fields(fields: Iterable[Any]) -> list[str]:
+    """Return configured footer fields, upgrading only the old default list.
+
+    ``fields`` is persisted as a list, so changing the built-in default cannot
+    update installs that already wrote the prior default. Treat that exact
+    legacy list as inherited configuration so deployed gateways render the
+    reasoning effort immediately, even before ``hermes config migrate`` has
+    persisted the v25 schema update. Any other layout remains an explicit user
+    choice, including layouts that intentionally omit reasoning.
+    """
+    normalized = [str(field) for field in fields]
+    if tuple(normalized) == _LEGACY_DEFAULT_FIELDS:
+        return list(_DEFAULT_FIELDS)
+    return normalized
+
+
 def resolve_footer_config(
     user_config: dict[str, Any] | None,
     platform_key: str | None = None,
@@ -72,7 +89,7 @@ def resolve_footer_config(
         if "enabled" in global_cfg:
             resolved["enabled"] = bool(global_cfg.get("enabled"))
         if isinstance(global_cfg.get("fields"), list) and global_cfg["fields"]:
-            resolved["fields"] = [str(f) for f in global_cfg["fields"]]
+            resolved["fields"] = _footer_fields(global_cfg["fields"])
 
     if platform_key:
         platforms = cfg.get("platforms") or {}
@@ -83,7 +100,7 @@ def resolve_footer_config(
                 if "enabled" in plat_footer:
                     resolved["enabled"] = bool(plat_footer.get("enabled"))
                 if isinstance(plat_footer.get("fields"), list) and plat_footer["fields"]:
-                    resolved["fields"] = [str(f) for f in plat_footer["fields"]]
+                    resolved["fields"] = _footer_fields(plat_footer["fields"])
 
     return resolved
 
@@ -93,6 +110,7 @@ def format_runtime_footer(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    reasoning_effort: Optional[str] = None,
     cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
@@ -122,6 +140,10 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "reasoning":
+            effort = str(reasoning_effort or "").strip()
+            if effort:
+                parts.append(effort)
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -136,6 +158,7 @@ def build_footer_line(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    reasoning_effort: Optional[str] = None,
     cwd: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
@@ -152,5 +175,6 @@ def build_footer_line(
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
+        reasoning_effort=reasoning_effort,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

@@ -144,6 +144,7 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     )
 
     assert result["final_response"] == "ok"
+    assert result["reasoning_effort"] == "high"
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
