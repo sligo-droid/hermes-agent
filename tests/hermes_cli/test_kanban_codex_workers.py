@@ -1853,9 +1853,9 @@ def test_role_worker_logs_named_tier_and_runtime_sources(monkeypatch, tmp_path):
     log = kanban_db.read_worker_log(task.id, board=board.slug)
     assert log is not None
     assert (
-        "[kanban dispatcher] scheduled OpenCode role worker: "
-        "role=planner reasoning=high mode=fast "
-        "model=hermes-codex/gpt-5.6-sol tier=advanced tier_source=role "
+        "[kanban dispatcher] scheduled Codex role worker: "
+        "role=planner reasoning=xhigh mode=fast "
+        "model=gpt-5.6-sol tier=advanced tier_source=role "
         "reasoning_source=model_tier service_tier=fast "
         "service_tier_source=explicit"
     ) in log
@@ -1952,7 +1952,7 @@ def test_command_center_repair_foreman_uses_codex_with_codex_config(monkeypatch,
     assert "scheduled Codex role worker: role=foreman reasoning=xhigh mode=normal" in log
 
 
-def test_foreman_worker_env_defaults_to_opencode(monkeypatch, tmp_path):
+def test_foreman_worker_env_defaults_to_codex(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import kanban_db
     from agent import opencode_worker as ow
@@ -1993,11 +1993,11 @@ def test_foreman_worker_env_defaults_to_opencode(monkeypatch, tmp_path):
 
     workers.spawn_codex_worker(task, str(tmp_path), board=board)
 
-    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "opencode"
-    assert "CODEX_HOME" not in captured["env"]
+    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "codex"
+    assert captured["env"]["CODEX_HOME"].endswith(f"/{task.id}")
     log = kanban_db.read_worker_log(task.id, board=board)
     assert log is not None
-    assert "scheduled OpenCode role worker: role=foreman reasoning=xhigh mode=normal" in log
+    assert "scheduled Codex role worker: role=foreman reasoning=xhigh mode=normal" in log
 
 
 def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):

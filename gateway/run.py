@@ -59,7 +59,11 @@ from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
-from hermes_cli.model_tiers import resolve_model_tier
+from hermes_cli.model_tiers import (
+    MODEL_TIER_LADDER,
+    resolve_adjacent_model_tier,
+    resolve_model_tier,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -171,9 +175,13 @@ def _is_standard_discord_action_request(
     """True for ordinary Discord action-request threads, excluding /goal worker threads."""
     if getattr(source, "platform", None) != Platform.DISCORD:
         return False
+    if str(getattr(source, "chat_type", "") or "").strip().lower() != "thread":
+        return False
     if not isinstance(feature_summary, dict):
         return False
     initial_request = str(feature_summary.get("initial_request") or "").strip()
+    if not initial_request:
+        return False
     if re.match(r"^/goal(?:\s|$)", initial_request, flags=re.IGNORECASE):
         return False
     return not bool(feature_summary.get("kanban_board"))
@@ -215,11 +223,12 @@ def _set_gateway_runtime_audit(
 
     tier_applied = (
         model_tier is not None
-        and not model_override_source
         and str(model or "").strip() == str(model_tier.model or "").strip()
     )
     if tier_applied:
-        resolved_tier_source = "route"
+        resolved_tier_source = (
+            "per_turn" if model_override_source == "per_turn_tier" else "route"
+        )
     elif model_override_source:
         resolved_tier_source = model_override_source
     elif model_tier is not None:
@@ -237,9 +246,12 @@ def _set_gateway_runtime_audit(
     )
 
 
-def _discord_action_request_reasoning_config(config: Optional[dict]) -> dict | None:
+def _discord_action_request_reasoning_config(
+    config: Optional[dict],
+    model_tier: Any = None,
+) -> dict | None:
     """Reasoning override for ordinary Discord action-request threads."""
-    model_tier = _discord_action_request_model_tier(config)
+    model_tier = model_tier or _discord_action_request_model_tier(config)
     if model_tier is not None:
         return model_tier.reasoning_config()
 
@@ -3216,6 +3228,7 @@ class GatewayRunner:
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
         model_override: Optional[str] = None,
+        turn_model_override: Optional[str] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -3230,8 +3243,17 @@ class GatewayRunner:
             except Exception:
                 resolved_session_key = None
 
-        model = str(model_override or "").strip() or _resolve_gateway_model(user_config)
-        override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        forced_turn_model = str(turn_model_override or "").strip()
+        model = forced_turn_model or str(model_override or "").strip() or _resolve_gateway_model(user_config)
+        # A command-scoped tier must not inherit a persistent /model override.
+        # It uses the normal gateway runtime but never mutates session state.
+        override = (
+            None
+            if forced_turn_model
+            else self._session_model_overrides.get(resolved_session_key)
+            if resolved_session_key
+            else None
+        )
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -3262,13 +3284,19 @@ class GatewayRunner:
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
-        if runtime_model:
+        if runtime_model and not forced_turn_model:
             logger.info(
                 "Runtime provider supplied explicit model override: %s -> %s",
                 model,
                 runtime_model,
             )
             model = runtime_model
+        elif runtime_model:
+            logger.debug(
+                "Ignoring runtime model override %s for command-scoped model %s",
+                runtime_model,
+                forced_turn_model,
+            )
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -10693,6 +10721,17 @@ class GatewayRunner:
                 return fable_result
             command = None
             canonical = None
+
+        if canonical in {"dumb", "smart"}:
+            tier_result = await self._handle_action_request_tier_command(
+                event,
+                command=canonical,
+                direction=-1 if canonical == "dumb" else 1,
+            )
+            if tier_result is not None:
+                return tier_result
+            command = None
+            canonical = None
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -12175,6 +12214,12 @@ class GatewayRunner:
                 fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
                 fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
                 fable_transcript_user_message=getattr(event, "fable_transcript_user_message", None),
+                action_request_model_tier_override=getattr(
+                    event, "action_request_model_tier_override", None
+                ),
+                action_request_transcript_user_message=getattr(
+                    event, "action_request_transcript_user_message", None
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -12245,10 +12290,12 @@ class GatewayRunner:
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
-            fable_transcript_user_message = str(
-                getattr(event, "fable_transcript_user_message", "") or ""
+            transcript_user_message = str(
+                getattr(event, "fable_transcript_user_message", "")
+                or getattr(event, "action_request_transcript_user_message", "")
+                or ""
             ).strip()
-            if fable_plan_metadata and fable_transcript_user_message:
+            if transcript_user_message:
                 try:
                     history_offset = agent_result.get("history_offset", len(history))
                     agent_messages = list(agent_messages or [])
@@ -12256,10 +12303,11 @@ class GatewayRunner:
                         first_new = agent_messages[history_offset]
                         if isinstance(first_new, dict) and first_new.get("role") == "user":
                             patched_first_new = dict(first_new)
-                            patched_first_new["content"] = fable_transcript_user_message
+                            patched_first_new["content"] = transcript_user_message
                             agent_messages[history_offset] = patched_first_new
                 except Exception:
                     agent_messages = agent_result.get("messages", [])
+            persisted_message_text = transcript_user_message or message_text
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
@@ -12533,7 +12581,11 @@ class GatewayRunner:
                 # message so the next message can load a transcript that
                 # reflects what was said.  Skip the assistant error text since
                 # it's a gateway-generated hint, not model output. (#7100)
-                _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                _user_entry = {
+                    "role": "user",
+                    "content": persisted_message_text,
+                    "timestamp": ts,
+                }
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
                 self.session_store.append_to_transcript(
@@ -12546,7 +12598,11 @@ class GatewayRunner:
 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
-                    _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                    _user_entry = {
+                        "role": "user",
+                        "content": persisted_message_text,
+                        "timestamp": ts,
+                    }
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
                     self.session_store.append_to_transcript(
@@ -13693,9 +13749,14 @@ class GatewayRunner:
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from hermes_cli.commands import gateway_help_lines
+        platform_name = str(
+            getattr(getattr(event, "source", None), "platform", "") or ""
+        ).lower()
+        if platform_name.startswith("platform."):
+            platform_name = platform_name.rsplit(".", 1)[-1]
         lines = [
             t("gateway.help.header"),
-            *gateway_help_lines(),
+            *gateway_help_lines(platform_name),
         ]
         try:
             from agent.skill_commands import get_skill_commands
@@ -13728,7 +13789,10 @@ class GatewayRunner:
             requested_page = 1
 
         # Build combined entry list: built-in commands + skill commands
-        entries = list(gateway_help_lines())
+        platform_name = str(getattr(event.source, "platform", "") or "").lower()
+        if platform_name.startswith("platform."):
+            platform_name = platform_name.rsplit(".", 1)[-1]
+        entries = list(gateway_help_lines(platform_name))
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
@@ -17845,11 +17909,68 @@ class GatewayRunner:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
+    async def _handle_action_request_tier_command(
+        self,
+        event: MessageEvent,
+        *,
+        command: str,
+        direction: int,
+    ) -> Optional[str]:
+        """Rewrite Discord /dumb or /smart into one tier-scoped action turn."""
+        source = event.source
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return f"⚠️ /{command} is available only for Discord action requests."
+
+        request = event.get_command_args().strip()
+        if not request:
+            return f"Usage: /{command} <request>"
+
+        feature_summary = getattr(event, "feature_summary", None)
+        if not _is_standard_discord_action_request(source, feature_summary):
+            return (
+                f"⚠️ /{command} must be used in a normal non-Kanban Discord action-request "
+                "thread. Start or enter an action thread first."
+            )
+
+        try:
+            cfg = _load_gateway_runtime_config()
+        except Exception:
+            cfg = {}
+        configured_name = cfg_get(
+            cfg,
+            "discord",
+            "action_request_model_tier",
+            default="basic",
+        )
+        current_tier = resolve_model_tier(cfg, configured_name)
+        current_name = str(configured_name or "").strip().lower()
+        if current_tier is None or current_name not in MODEL_TIER_LADDER:
+            supported = ", ".join(f"`{name}`" for name in MODEL_TIER_LADDER)
+            return (
+                "⚠️ Discord action-request tier stepping requires "
+                f"`discord.action_request_model_tier` to be one of {supported}."
+            )
+
+        target_tier = resolve_adjacent_model_tier(cfg, current_name, direction)
+        if target_tier is None:
+            bound = "below `trivial`" if direction < 0 else "above `advanced`"
+            return f"⚠️ /{command} cannot move the action-request tier {bound}."
+
+        original_text = str(event.text or "").strip()
+        try:
+            event.text = request
+            event.action_request_model_tier_override = target_tier.name
+            event.action_request_tier_command = command
+            event.action_request_transcript_user_message = original_text
+        except Exception:
+            return f"⚠️ Could not prepare the /{command} action request."
+        return None
+
     async def _handle_fable_command(self, event: MessageEvent, session_key: str) -> Optional[str]:
-        """Rewrite /fable into a normal agent-loop plan-skill turn."""
-        args = event.get_command_args().strip()
-        if not args:
-            return "Usage: /fable <request>"
+        """Route Fable to plan-only or Discord implementation mode."""
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return "Usage: /fable <request> or /fable plan <request>"
 
         try:
             cfg = _load_gateway_runtime_config()
@@ -17861,24 +17982,53 @@ class GatewayRunner:
             session_cwd = ""
 
         from hermes_cli.fable_planner import (
+            FABLE_IMPLEMENTATION_MODE,
+            FABLE_PLAN_MODE,
             FablePlanRequest,
+            build_fable_implementation_instruction,
             build_fable_plan_invocation,
             fable_enabled_toolsets,
             fable_metadata,
             fable_reasoning_config,
             fable_session_model_override,
+            parse_fable_command_args,
         )
 
+        is_discord = getattr(event.source, "platform", None) == Platform.DISCORD
+        mode, prompt = (
+            parse_fable_command_args(raw_args)
+            if is_discord
+            else (FABLE_PLAN_MODE, raw_args)
+        )
+        if not prompt:
+            return (
+                "Usage: /fable plan <request>"
+                if mode == FABLE_PLAN_MODE
+                else "Usage: /fable <request>"
+            )
+        if mode == FABLE_IMPLEMENTATION_MODE and not _is_standard_discord_action_request(
+            event.source,
+            getattr(event, "feature_summary", None),
+        ):
+            return (
+                "⚠️ Discord `/fable <request>` must run in a normal non-Kanban "
+                "action-request thread. Use `/fable plan <request>` for a plan-only artifact."
+            )
+
+        original_text = str(event.text or "").strip()
         request = FablePlanRequest(
-            prompt=args,
+            prompt=prompt,
             session_id=session_key,
             workdir=session_cwd,
-            source_text=event.text or "",
+            source_text=original_text,
             platform=event.source.platform.value if event.source.platform else "",
         )
-        msg = build_fable_plan_invocation(request, task_id=session_key)
-        if not msg:
-            return "⚠️ /fable requires the `plan` skill, but it is not installed or could not be loaded."
+        if mode == FABLE_PLAN_MODE:
+            msg = build_fable_plan_invocation(request, task_id=session_key)
+            if not msg:
+                return "⚠️ /fable plan requires the `plan` skill, but it is not installed or could not be loaded."
+        else:
+            msg = build_fable_implementation_instruction(request)
 
         override, error = fable_session_model_override(cfg)
         if error or not override:
@@ -17886,16 +18036,18 @@ class GatewayRunner:
 
         try:
             event.text = msg
-            event.invoked_skill_name = "plan"
+            event.invoked_skill_name = "plan" if mode == FABLE_PLAN_MODE else "fable"
             event.invoked_skill_command = "fable"
             event.fable_plan_metadata = {
-                **fable_metadata(config=cfg),
+                **fable_metadata(config=cfg, mode=mode),
                 "session_id": session_key,
                 "source_message_id": str(event.message_id or ""),
             }
-            event.fable_enabled_toolsets = fable_enabled_toolsets(cfg)
+            if mode == FABLE_PLAN_MODE:
+                event.fable_enabled_toolsets = fable_enabled_toolsets(cfg)
             event.fable_reasoning_config = fable_reasoning_config(cfg)
-            event.fable_transcript_user_message = f"/fable {args}".strip()
+            event.fable_transcript_user_message = original_text
+            event.fable_implementation = mode == FABLE_IMPLEMENTATION_MODE
         except Exception:
             pass
 
@@ -20371,6 +20523,8 @@ class GatewayRunner:
         fable_toolsets: Optional[List[str]] = None,
         fable_reasoning_config: Optional[Dict[str, Any]] = None,
         fable_transcript_user_message: Optional[str] = None,
+        action_request_model_tier_override: Optional[str] = None,
+        action_request_transcript_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20412,6 +20566,13 @@ class GatewayRunner:
             source,
             feature_summary,
         )
+        fable_mode = str(
+            (fable_plan_metadata or {}).get("fable_mode", "")
+            if isinstance(fable_plan_metadata, dict)
+            else ""
+        ).strip().lower() or "plan"
+        fable_plan_only = bool(fable_plan_metadata) and fable_mode == "plan"
+        fable_implementation = bool(fable_plan_metadata) and fable_mode == "implementation"
 
         from hermes_cli.tools_config import _get_platform_tools
         default_discord_kanban_intake = bool(
@@ -20420,7 +20581,7 @@ class GatewayRunner:
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
             enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
-        if fable_plan_metadata:
+        if fable_plan_only:
             from hermes_cli.fable_planner import fable_enabled_toolsets
 
             enabled_toolsets = list(fable_toolsets or fable_enabled_toolsets(user_config))
@@ -21105,16 +21266,34 @@ class GatewayRunner:
             _reload_runtime_env_preserving_config_authority()
 
             try:
-                action_request_tier = (
-                    _discord_action_request_model_tier(user_config)
-                    if standard_discord_action_request
-                    else None
-                )
+                per_turn_tier_name = str(action_request_model_tier_override or "").strip()
+                action_request_tier = None
+                if standard_discord_action_request:
+                    action_request_tier = (
+                        resolve_model_tier(user_config, per_turn_tier_name)
+                        if per_turn_tier_name
+                        else _discord_action_request_model_tier(user_config)
+                    )
+                if per_turn_tier_name and action_request_tier is None:
+                    return {
+                        "final_response": (
+                            "⚠️ The requested Discord action-request tier is no longer valid; "
+                            "retry /dumb or /smart after fixing the configured tier."
+                        ),
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
                     model_override=action_request_tier.model if action_request_tier is not None else None,
+                    turn_model_override=(
+                        action_request_tier.model
+                        if per_turn_tier_name and action_request_tier is not None
+                        else None
+                    ),
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
@@ -21141,7 +21320,10 @@ class GatewayRunner:
                     resolved_fable_reasoning = resolve_fable_reasoning_config(user_config)
                 reasoning_config = dict(resolved_fable_reasoning)
             elif standard_discord_action_request:
-                reasoning_config = _discord_action_request_reasoning_config(user_config)
+                reasoning_config = _discord_action_request_reasoning_config(
+                    user_config,
+                    action_request_tier,
+                )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             # Set up stream consumer for token streaming or interim commentary.
@@ -21265,6 +21447,10 @@ class GatewayRunner:
                     "gateway.session_cwd": session_cwd,
                     "gateway.discord_action_request_fast_path": standard_discord_action_request,
                     "gateway.discord_feature_request_fast_path": standard_discord_action_request,
+                    "gateway.discord_action_request_tier_override": (
+                        str(action_request_model_tier_override or "").strip()
+                    ),
+                    "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
                     "gateway.tool_delay": 0.0 if standard_discord_action_request else None,
                     "gateway.verify_on_stop": True if standard_discord_action_request else None,
@@ -21355,6 +21541,10 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.session_cwd = session_cwd
             agent.terminal_cwd = session_cwd
+            # Fable implementation parents retain the normal Discord tool
+            # surface for inspection/review, while tool execution blocks all
+            # direct repository mutations in favor of the Codex worker.
+            agent._fable_implementation_turn = fable_implementation
             session_model_override = bool(
                 (getattr(self, "_session_model_overrides", {}) or {}).get(session_key)
             )
@@ -21369,8 +21559,14 @@ class GatewayRunner:
                 runtime_route = "gateway_fable"
                 model_override_source = "fable"
             elif standard_discord_action_request:
-                runtime_route = "discord_action_request"
+                runtime_route = (
+                    "discord_action_request_tier_command"
+                    if str(action_request_model_tier_override or "").strip()
+                    else "discord_action_request"
+                )
                 active_tier = action_request_tier
+                if str(action_request_model_tier_override or "").strip():
+                    model_override_source = "per_turn_tier"
             else:
                 active_tier = _gateway_model_tier(user_config)
             _set_gateway_runtime_audit(
@@ -21788,9 +21984,11 @@ class GatewayRunner:
                     "task_id": session_id,
                 }
                 _persist_user_message = (
-                    str(fable_transcript_user_message or "").strip()
-                    if fable_plan_metadata
-                    else ""
+                    str(
+                        fable_transcript_user_message
+                        or action_request_transcript_user_message
+                        or ""
+                    ).strip()
                 )
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message or message

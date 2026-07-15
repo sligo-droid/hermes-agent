@@ -1149,24 +1149,33 @@ choose a model and reasoning effort.
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
 | `trivial` | GPT-5.6 Luna | `low` | Unpinned cron jobs |
-| `basic` | GPT-5.6 Luna | `medium` | Ordinary gateway sessions |
-| `intermediate` | GPT-5.6 Terra | `high` | Discord action requests, coding-worker build passes, and Kanban `dev` |
-| `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
+| `basic` | GPT-5.6 Terra | `medium` | Ordinary gateway sessions and Discord action requests |
+| `intermediate` | GPT-5.6 Terra | `max` | Coding-worker build passes and Kanban `dev` |
+| `advanced` | GPT-5.6 Sol | `xhigh` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
-These defaults are runtime-aware: routine routes use lower effort to avoid
-paying the latency cost of `xhigh` or `max` on every turn, while harder routes
-scale model capability before spending the maximum reasoning budget. Keep
-`xhigh` and `max` for explicit per-tier overrides or targeted escalation when a
-high-effort run is not sufficient.
+These defaults are runtime-aware: routine routes use lower effort, build passes
+use Terra at `max`, and complex planning moves to Sol at `xhigh`.
 
 The defaults live under `model_tiers`; route settings reference a tier by name:
 
 ```yaml
 model_tiers:
+  trivial:
+    model: gpt-5.6-luna
+    opencode_model: hermes-codex/gpt-5.6-luna
+    reasoning_effort: low
+  basic:
+    model: gpt-5.6-terra
+    opencode_model: hermes-codex/gpt-5.6-terra
+    reasoning_effort: medium
   intermediate:
     model: gpt-5.6-terra
     opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: high
+    reasoning_effort: max
+  advanced:
+    model: gpt-5.6-sol
+    opencode_model: hermes-codex/gpt-5.6-sol
+    reasoning_effort: xhigh
 
 gateway:
   model_tier: basic
@@ -1175,9 +1184,10 @@ cron:
   model_tier: trivial
 
 discord:
-  action_request_model_tier: intermediate
+  action_request_model_tier: basic
 
 coding_worker:
+  backend: codex
   simple_build_model_tier: intermediate
   complex_plan_model_tier: advanced
   complex_build_model_tier: intermediate
@@ -1197,6 +1207,11 @@ kanban:
 Coding workers use one `intermediate` build pass for simple work. Complex or
 risky work uses an `advanced` planning pass followed by an `intermediate` build
 pass.
+
+In a normal non-Kanban Discord action thread, `/dumb <request>` runs that one
+request one tier below `discord.action_request_model_tier`, and `/smart
+<request>` runs it one tier above. These commands do not change the configured
+tier or the session's `/model` setting.
 Each tier supplies the model and reasoning effort atomically. Explicit worker
 raw model/reasoning values override the corresponding pass tier; an explicit
 per-worker pass tier overrides the configured pass tier. The compatibility

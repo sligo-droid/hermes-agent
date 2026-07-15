@@ -36,6 +36,15 @@ def test_should_persist_fable_command_even_when_shorter_than_generic_threshold()
     assert should_persist_discord_plan(text, metadata={"response_kind": "fable_plan"})
 
 
+def test_fable_implementation_is_not_persisted_as_a_plan_artifact():
+    text = "Implemented the requested feature."
+
+    assert not should_persist_discord_plan(
+        text,
+        metadata={"command": "fable", "fable_mode": "implementation"},
+    )
+
+
 def test_persist_and_lookup_discord_plan_artifact(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

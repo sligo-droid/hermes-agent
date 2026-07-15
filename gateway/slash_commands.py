@@ -1290,9 +1290,14 @@ class GatewaySlashCommandsMixin:
         """Handle /help command - list available commands."""
         from gateway.run import _telegramize_command_mentions
         from hermes_cli.commands import gateway_help_lines
+        platform_name = str(
+            getattr(getattr(event, "source", None), "platform", "") or ""
+        ).lower()
+        if platform_name.startswith("platform."):
+            platform_name = platform_name.rsplit(".", 1)[-1]
         lines = [
             t("gateway.help.header"),
-            *gateway_help_lines(),
+            *gateway_help_lines(platform_name),
         ]
         try:
             from agent.skill_commands import get_skill_commands
@@ -1326,7 +1331,10 @@ class GatewaySlashCommandsMixin:
             requested_page = 1
 
         # Build combined entry list: built-in commands + skill commands
-        entries = list(gateway_help_lines())
+        platform_name = str(getattr(event.source, "platform", "") or "").lower()
+        if platform_name.startswith("platform."):
+            platform_name = platform_name.rsplit(".", 1)[-1]
+        entries = list(gateway_help_lines(platform_name))
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()

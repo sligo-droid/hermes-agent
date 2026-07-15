@@ -1,4 +1,4 @@
-"""Plan-only Claude Fable 5 helpers for Hermes slash commands."""
+"""Claude Fable 5 helpers for Hermes slash commands."""
 
 from __future__ import annotations
 
@@ -20,8 +20,28 @@ FABLE_PROXY_ROUTE = "anthropic_proxy"
 FABLE_PROXY_TRANSPORT = "anthropic_proxy"
 FABLE_REASONING = {"enabled": True, "effort": "high"}
 FABLE_DEFAULT_TOOLSETS = ["file", "terminal", "web", "browser", "discord"]
+FABLE_PLAN_MODE = "plan"
+FABLE_IMPLEMENTATION_MODE = "implementation"
+
+# Bare Discord `/fable` normally starts an implementation turn.  Keep clear
+# natural-language requests for a plan on the safer plan-only route instead.
+_FABLE_NATURAL_PLAN_INTENT = re.compile(
+    r"""
+    ^(?:
+        (?:please\s+)?(?:make|create|write|draft)\s+(?:me\s+)?(?:an?\s+)?plan\b
+        | (?:please\s+)?(?:help|assist)(?:\s+me)?\s+
+          (?:(?:make|create|write|draft)\s+(?:me\s+)?(?:an?\s+)?plan|plan)\b
+        | (?:can|could|would)\s+you(?:\s+please)?\s+
+          (?:(?:make|create|write|draft)\s+(?:me\s+)?(?:an?\s+)?plan
+          |(?:help|assist)(?:\s+me)?\s+plan)\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
 
 FABLE_RUNTIME_NOTE = """This is `/fable`: use Claude Fable 5, planning only, inspect repo with read-only tools as needed, save a plan artifact if the plan skill requires it, and do not implement. Do not edit files, create branches, open pull requests, deploy, or claim that implementation, tests, commits, PRs, or deployment happened. Generate a concrete Markdown implementation plan only. Your final answer must contain the full plan markdown, plus the saved path if you wrote one; do not answer with only a brief path/status note. Hermes/gateway will handle Discord delivery, threading, and artifact indexing outside the Fable turn, so do not describe or perform those operational steps."""
+
+FABLE_IMPLEMENTATION_RUNTIME_NOTE = """This is Discord `/fable` implementation mode: use Claude Fable 5 to inspect, coordinate, and review the requested implementation in the normal Discord action-request flow. You may use read-only tools to investigate and review the resulting work. Every repository mutation — including file edits, generated files, dependency changes, tests that write, and git changes — must be performed through `delegate_coding_task` using the Codex coding worker in a mutable git worktree. Do not use write_file, patch, execute_code, or mutating terminal commands to edit the repository yourself. Do not fall back to OpenCode, Claude Code, or direct Fable edits. If Codex or a mutable worktree is unavailable, report that exact blocker clearly. After the worker returns, inspect and review its result, run only safe read-only verification yourself, and report the outcome concisely."""
 
 
 def fable_claude_code_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -70,19 +90,35 @@ class FablePlanResult:
 def fable_metadata(
     result: FablePlanResult | None = None,
     config: dict[str, Any] | None = None,
+    *,
+    mode: str = FABLE_PLAN_MODE,
 ) -> dict[str, Any]:
+    normalized_mode = normalize_fable_mode(mode)
     route = _fable_route(_fable_config(config))
     metadata = {
         "command": "fable",
-        "plan_artifact_kind": "fable_plan",
-        "response_kind": "fable_plan",
-        "kind": "fable_plan",
+        "fable_mode": normalized_mode,
         "route": route,
         "transport": _fable_transport(route),
         "provider": FABLE_PROVIDER,
         "model": FABLE_MODEL,
         "reply_to_mode": "all",
     }
+    if normalized_mode == FABLE_PLAN_MODE:
+        metadata.update(
+            {
+                "plan_artifact_kind": "fable_plan",
+                "response_kind": "fable_plan",
+                "kind": "fable_plan",
+            }
+        )
+    else:
+        metadata.update(
+            {
+                "response_kind": "fable_implementation",
+                "kind": "fable_implementation",
+            }
+        )
     if result is not None:
         metadata["transport"] = result.transport
         metadata["model"] = result.model
@@ -141,6 +177,46 @@ def build_fable_user_instruction(request: FablePlanRequest) -> str:
     sections = [
         ("User Request", request.prompt.strip()),
         ("Fable Plan-Only Contract", FABLE_RUNTIME_NOTE),
+        ("Session", request.session_id.strip()),
+        ("Platform", request.platform.strip()),
+        ("Workdir", request.workdir.strip()),
+        ("Source Text", request.source_text.strip()),
+    ]
+    rendered = [f"## {title}\n{value.strip()}" for title, value in sections if value]
+    return "\n\n".join(rendered).strip()
+
+
+def normalize_fable_mode(value: Any) -> str:
+    """Normalize a Fable execution mode, preserving plan-only as the safe default."""
+    raw = str(value or "").strip().lower()
+    return FABLE_IMPLEMENTATION_MODE if raw == FABLE_IMPLEMENTATION_MODE else FABLE_PLAN_MODE
+
+
+def parse_fable_command_args(args: str) -> tuple[str, str]:
+    """Return ``(mode, request)`` for a Discord ``/fable`` command payload.
+
+    The explicit ``plan`` subcommand and clear leading natural-language plan
+    requests are plan-only. A bare Discord ``/fable <request>`` otherwise
+    uses the implementation route; non-Discord callers decide their own mode
+    before using this parser. Natural-language requests retain their full
+    wording so the plan skill receives the user's intent unchanged.
+    """
+    request = str(args or "").strip()
+    if not request:
+        return FABLE_IMPLEMENTATION_MODE, ""
+    match = re.match(r"^plan(?:\s+(.*))?$", request, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return FABLE_PLAN_MODE, str(match.group(1) or "").strip()
+    if _FABLE_NATURAL_PLAN_INTENT.match(request):
+        return FABLE_PLAN_MODE, request
+    return FABLE_IMPLEMENTATION_MODE, request
+
+
+def build_fable_implementation_instruction(request: FablePlanRequest) -> str:
+    """Build the user-turn payload for Discord Fable implementation mode."""
+    sections = [
+        ("User Request", request.prompt.strip()),
+        ("Fable Implementation Contract", FABLE_IMPLEMENTATION_RUNTIME_NOTE),
         ("Session", request.session_id.strip()),
         ("Platform", request.platform.strip()),
         ("Workdir", request.workdir.strip()),

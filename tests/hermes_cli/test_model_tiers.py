@@ -1,7 +1,12 @@
 """Focused contract tests for reusable model-tier configuration."""
 
 from hermes_cli.config import DEFAULT_CONFIG
-from hermes_cli.model_tiers import classify_task_complexity, resolve_model_tier
+from hermes_cli.model_tiers import (
+    MODEL_TIER_LADDER,
+    classify_task_complexity,
+    resolve_adjacent_model_tier,
+    resolve_model_tier,
+)
 
 
 def test_default_routes_reference_resolvable_tiers():
@@ -45,9 +50,9 @@ def test_default_routes_reference_resolvable_tiers():
         name: resolve_model_tier({"model_tiers": tiers}, name).reasoning_effort
         for name in ("trivial", "basic", "intermediate", "advanced")
     } == {
-        "trivial": "medium",
+        "trivial": "low",
         "basic": "medium",
-        "intermediate": "medium",
+        "intermediate": "max",
         "advanced": "xhigh",
     }
     assert {
@@ -56,11 +61,23 @@ def test_default_routes_reference_resolvable_tiers():
     } == {
         "trivial": "gpt-5.6-luna",
         "basic": "gpt-5.6-terra",
-        "intermediate": "gpt-5.6-sol",
+        "intermediate": "gpt-5.6-terra",
         "advanced": "gpt-5.6-sol",
     }
     for role in ("planner", "dev", "foreman", "reviewer"):
         assert "reasoning" not in DEFAULT_CONFIG["kanban"]["discord_worker"]["roles"][role]
+
+
+def test_builtin_tier_ladder_steps_in_order_and_rejects_custom_or_edge_tiers():
+    assert MODEL_TIER_LADDER == ("trivial", "basic", "intermediate", "advanced")
+
+    assert resolve_adjacent_model_tier({}, "basic", -1).name == "trivial"
+    assert resolve_adjacent_model_tier({}, "basic", 1).name == "intermediate"
+    assert resolve_adjacent_model_tier({}, "intermediate", 1).name == "advanced"
+    assert resolve_adjacent_model_tier({}, "trivial", -1) is None
+    assert resolve_adjacent_model_tier({}, "advanced", 1) is None
+    assert resolve_adjacent_model_tier({}, "custom", 1) is None
+    assert resolve_adjacent_model_tier({}, "basic", 0) is None
 
 
 def test_partial_custom_tier_override_keeps_required_default_fields():

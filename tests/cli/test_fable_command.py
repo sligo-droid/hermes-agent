@@ -33,6 +33,23 @@ def test_cli_fable_enqueues_plan_skill_invocation(monkeypatch):
     assert pending_input.get_nowait() == "PLAN SKILL MESSAGE"
 
 
+def test_cli_bare_fable_remains_plan_only(monkeypatch):
+    import cli as cli_mod
+
+    def fake_build(request):
+        assert request.prompt == "build the work"
+        assert request.platform == "cli"
+        return "PLAN SKILL MESSAGE"
+
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", fake_build)
+    pending_input = SimpleQueue()
+    stub = SimpleNamespace(session_id="s1", _pending_input=pending_input)
+
+    cli_mod.HermesCLI._handle_fable_command(stub, "/fable build the work")
+
+    assert pending_input.get_nowait() == "PLAN SKILL MESSAGE"
+
+
 def test_cli_fable_prints_error_when_plan_skill_missing(monkeypatch):
     import cli as cli_mod
 

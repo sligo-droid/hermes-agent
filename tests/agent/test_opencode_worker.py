@@ -142,19 +142,19 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path, caplog):
     audit = json.loads(audit_record.message.split("coding_worker_runtime ", 1)[1])
     assert audit["runtime_route"] == "coding_worker"
     assert audit["passes"][0]["model_tier"] == "intermediate"
-    assert audit["passes"][0]["reasoning"] == "high"
+    assert audit["passes"][0]["reasoning"] == "max"
     assert result.run_profile == {
         "kind": "one_pass_simple_build",
         "label": "1-pass simple build",
         "pass_count": 1,
         "plan_used": False,
         "passes": [{
-            "name": "build", "agent": "build", "reasoning": "high",
+            "name": "build", "agent": "build", "reasoning": "max",
             "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate",
         }],
     }
     assert _option(calls[0], "--agent") == "build"
-    assert _option(calls[0], "--variant") == "high"
+    assert _option(calls[0], "--variant") == "max"
     assert _option(calls[0], "--model") == "hermes-codex/gpt-5.6-terra"
     assert "--pure" in calls[0]
     assert "Hermes worker brief:\nfix typo in README" in calls[0][3]
@@ -519,11 +519,11 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "plan_used": True,
         "passes": [
             {"name": "plan", "agent": "plan", "reasoning": "xhigh", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
-            {"name": "build", "agent": "build", "reasoning": "high", "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate"},
+            {"name": "build", "agent": "build", "reasoning": "max", "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate"},
         ],
     }
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "high"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "max"]
     assert [_option(cmd, "--model") for cmd in calls] == [
         "hermes-codex/gpt-5.6-sol", "hermes-codex/gpt-5.6-terra"
     ]
@@ -873,7 +873,7 @@ def test_explicit_pass_tier_and_raw_worker_overrides_take_precedence():
     assert profiles["simple_build"] == {
         "model_tier": "basic",
         "model": "hermes-codex/custom-worker",
-        "codex_model": "gpt-5.6-luna",
+        "codex_model": "gpt-5.6-terra",
         "reasoning_level": "high",
     }
     assert profiles["complex_plan"]["codex_model"] == "gpt-5.6-sol"
@@ -897,7 +897,7 @@ def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
         "model_tier": "intermediate",
         "model": "hermes-codex/gpt-5.6-terra",
         "codex_model": "gpt-5.6-terra",
-        "reasoning_level": "high",
+        "reasoning_level": "max",
     }
     assert disabled["simple_build"] == {
         "model_tier": "",
@@ -1364,13 +1364,13 @@ def test_backend_ignores_removed_codex_worker_config_key(monkeypatch):
     monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
     cfg = {"codex_worker": {"backend": "opencode"}}
 
-    assert ow.load_coding_worker_backend(cfg) == "opencode"
+    assert ow.load_coding_worker_backend(cfg) == "codex"
 
 
-def test_backend_defaults_to_opencode_for_missing_or_unknown_config(monkeypatch):
+def test_backend_defaults_to_codex_for_missing_or_unknown_config(monkeypatch):
     monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
 
-    assert ow.normalize_coding_worker_backend("") == "opencode"
-    assert ow.normalize_coding_worker_backend("unknown") == "opencode"
-    assert ow.load_coding_worker_backend({}) == "opencode"
+    assert ow.normalize_coding_worker_backend("") == "codex"
+    assert ow.normalize_coding_worker_backend("unknown") == "codex"
+    assert ow.load_coding_worker_backend({}) == "codex"
     assert ow.load_coding_worker_backend({"coding_worker": {"backend": "codex"}}) == "codex"

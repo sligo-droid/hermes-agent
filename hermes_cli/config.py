@@ -1598,7 +1598,7 @@ DEFAULT_CONFIG = {
     # the configured backend.
     "coding_worker": {
         "enabled": True,
-        "backend": "opencode",  # opencode | codex
+        "backend": "codex",  # opencode | codex
         # Pass tiers are atomic model/reasoning bundles. model_tier is an
         # optional compatibility-wide override; "disabled" temporarily turns
         # off all pass-tier routing and restores the legacy raw settings below.

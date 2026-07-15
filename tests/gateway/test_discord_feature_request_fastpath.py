@@ -22,11 +22,12 @@ class _CapturingAgent:
         type(self).last_init = dict(kwargs)
         self.tools = []
 
-    def run_conversation(self, user_message, conversation_history=None, task_id=None):
+    def run_conversation(self, user_message, conversation_history=None, task_id=None, **kwargs):
         type(self).last_run = {
             "user_message": user_message,
             "conversation_history": conversation_history,
             "task_id": task_id,
+            **kwargs,
         }
         return {
             "final_response": "ok",
@@ -256,6 +257,63 @@ async def test_discord_action_request_reasoning_override_is_configurable(monkeyp
 
     assert _CapturingAgent.last_init["model"] == "custom/feature-model"
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
+
+
+@pytest.mark.asyncio
+async def test_tier_command_uses_adjacent_tier_for_one_turn_and_preserves_slash_text(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+    session_key = "agent:main:discord:thread:thread-1"
+    runner._session_model_overrides[session_key] = {
+        "model": "session/model",
+        "provider": "openrouter",
+        "api_key": "session-key",
+        "base_url": "https://session.example/v1",
+        "api_mode": "chat_completions",
+    }
+    session_override = dict(runner._session_model_overrides[session_key])
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "model": "runtime/model",
+            "provider": "openrouter",
+            "api_key": "runtime-key",
+            "base_url": "https://runtime.example/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    _CapturingAgent.last_init = None
+    _CapturingAgent.last_run = None
+
+    result = await runner._run_agent(
+        message="implement the dashboard",
+        context_prompt="Context prompt",
+        history=[],
+        source=_make_discord_source(),
+        session_id="session-1",
+        session_key=session_key,
+        feature_summary={"initial_request": "Build it", "message_id": "300", "kanban_board": None},
+        action_request_model_tier_override="intermediate",
+        action_request_transcript_user_message="/smart implement the dashboard",
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["model"] == "gpt-5.6-terra"
+    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "max"}
+    assert _CapturingAgent.last_run["user_message"] == "implement the dashboard"
+    assert _CapturingAgent.last_run["persist_user_message"] == "/smart implement the dashboard"
+    assert runner._session_model_overrides[session_key] == session_override
+    cached_agent = runner._agent_cache[session_key][0]
+    assert cached_agent._runtime_audit_context["model_tier"] == "intermediate"
+    assert cached_agent._runtime_audit_context["model_tier_source"] == "per_turn"
+    assert cached_agent._runtime_audit_context["runtime_route"] == "discord_action_request_tier_command"
+    next_model, _next_runtime = runner._resolve_session_agent_runtime(
+        source=_make_discord_source(),
+        session_key=session_key,
+        user_config={},
+    )
+    assert next_model == "session/model"
 
 
 @pytest.mark.asyncio

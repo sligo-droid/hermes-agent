@@ -2954,7 +2954,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         command = match.group(1).lower()
         args = (match.group(2) or "").strip()
-        if command == "fable":
+        if command in {"fable", "dumb", "smart"}:
             return bool(args)
         if command != "goal":
             return False
@@ -2972,7 +2972,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not match:
             return False
         command = match.group(1).lower()
-        if command == "fable":
+        if command in {"fable", "dumb", "smart"}:
             return False
         return self._slash_command_starts_threaded_work(cleaned)
 
@@ -6305,6 +6305,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._is_fable_command_text(command_text):
             if not await self._route_fable_slash_to_thread(interaction, event, command_text):
                 return
+        elif self._is_action_request_tier_command_text(command_text):
+            if not await self._route_action_request_slash_to_thread(
+                interaction,
+                event,
+                command_text,
+            ):
+                return
         await self.handle_message(event)
         try:
             if followup_msg:
@@ -6319,6 +6326,22 @@ class DiscordAdapter(BasePlatformAdapter):
         return bool(re.match(r"^/fable(?:\s|$)", str(text or "").strip(), re.IGNORECASE))
 
     @staticmethod
+    def _is_action_request_tier_command_text(text: str) -> bool:
+        return bool(
+            re.match(r"^/(?:dumb|smart)(?:\s|$)", str(text or "").strip(), re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _action_request_tier_command_name(text: str) -> str:
+        match = re.match(r"^/(dumb|smart)(?:\s|$)", str(text or "").strip(), re.IGNORECASE)
+        return str(match.group(1) or "").lower() if match else ""
+
+    @staticmethod
+    def _command_request_text(text: str) -> str:
+        match = re.match(r"^/[^\s]+(?:\s+(.*))?$", str(text or "").strip(), re.DOTALL)
+        return str(match.group(1) or "").strip() if match else ""
+
+    @staticmethod
     def _fable_thread_name(command_text: str) -> str:
         content = re.sub(r"^/fable(?:\s+|$)", "", str(command_text or "").strip(), flags=re.IGNORECASE)
         content = re.sub(r"<@[!&]?\d+>", "", content)
@@ -6327,13 +6350,224 @@ class DiscordAdapter(BasePlatformAdapter):
         base = f"Fable plan — {content}" if content else "Fable plan"
         return base[:80] if len(base) <= 80 else base[:77].rstrip() + "..."
 
+    @staticmethod
+    def _action_request_thread_name(command_text: str, *, prefix: str = "Action") -> str:
+        content = re.sub(r"^/[^\s]+(?:\s+|$)", "", str(command_text or "").strip())
+        content = re.sub(r"<@[!&]?\d+>", "", content)
+        content = re.sub(r"<#\d+>", "", content)
+        content = re.sub(r"\s+", " ", content).strip()
+        base = f"{prefix} — {content}" if content else prefix
+        return base[:80] if len(base) <= 80 else base[:77].rstrip() + "..."
+
+    async def _action_thread_failure_notice(
+        self,
+        interaction: Any,
+        command: str,
+        error: str,
+    ) -> None:
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    f"⚠️ Failed to create a Discord action thread for `/{command}`, so I did not run it "
+                    f"in the top-level channel. {error}"
+                )
+            )
+        except Exception as exc:
+            logger.debug("Discord /%s action-thread failure notice failed: %s", command, exc)
+
+    async def _action_thread_rejection_notice(
+        self,
+        interaction: Any,
+        command: str,
+        reason: str,
+    ) -> None:
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    f"⚠️ /{command} must run in a normal non-Kanban Discord action-request "
+                    f"thread. {reason}"
+                )
+            )
+        except Exception as exc:
+            logger.debug("Discord /%s action-thread rejection notice failed: %s", command, exc)
+
+    @staticmethod
+    def _action_thread_rejection_reason(feature_summary: Any) -> str:
+        """Explain why an existing thread cannot host an action request."""
+        if not isinstance(feature_summary, dict):
+            return "The existing thread is not initialized as a normal action request."
+        if feature_summary.get("kanban_board"):
+            return "The existing thread belongs to a Kanban worker board."
+        initial_request = str(feature_summary.get("initial_request") or "").strip()
+        if not initial_request:
+            return "The existing thread has no action-request summary."
+        if re.match(r"^/goal(?:\s|$)", initial_request, flags=re.IGNORECASE):
+            return "The existing thread is a /goal worker thread."
+        return ""
+
+    async def _route_action_request_slash_to_thread(
+        self,
+        interaction: Any,
+        event: MessageEvent,
+        command_text: str,
+        *,
+        reason_command: str | None = None,
+        thread_prefix: str = "Action",
+    ) -> bool:
+        """Route a native command through a normal, non-Kanban action thread."""
+        source = getattr(event, "source", None)
+        command = reason_command or self._action_request_tier_command_name(command_text) or "action"
+        request = self._command_request_text(command_text)
+        if not request:
+            try:
+                await interaction.edit_original_response(content=f"Usage: /{command} <request>")
+            except Exception as exc:
+                logger.debug("Discord /%s usage notice failed: %s", command, exc)
+            return False
+        if source is None or getattr(source, "chat_type", "") == "dm":
+            try:
+                await interaction.edit_original_response(
+                    content=f"⚠️ /{command} requires a Discord server action-request thread."
+                )
+            except Exception as exc:
+                logger.debug("Discord /%s DM notice failed: %s", command, exc)
+            return False
+
+        thread_channel = getattr(interaction, "channel", None)
+        if getattr(source, "thread_id", None):
+            parent_channel = self._thread_parent_channel(thread_channel)
+            project_context = self._resolve_project_context_for_channel(parent_channel)
+            feature_summary = self._load_feature_summary_handle_for_thread(
+                thread_channel,
+                project_context=project_context,
+            )
+            if feature_summary is None:
+                feature_summary = await self.initialize_feature_summary(
+                    thread_channel,
+                    parent_channel=parent_channel,
+                    initial_request=command_text,
+                    project_context=project_context,
+                    source_message_id=str(getattr(interaction, "id", "") or "") or None,
+                )
+            if feature_summary is None:
+                await self._action_thread_failure_notice(
+                    interaction,
+                    command,
+                    "The existing thread could not be initialized as an action request.",
+                )
+                return False
+            rejection_reason = self._action_thread_rejection_reason(feature_summary)
+            if rejection_reason:
+                await self._action_thread_rejection_notice(
+                    interaction,
+                    command,
+                    rejection_reason,
+                )
+                return False
+            event.feature_summary = feature_summary
+            return True
+
+        result = await self._create_thread(
+            interaction,
+            name=self._action_request_thread_name(command_text, prefix=thread_prefix),
+            message="",
+            auto_archive_duration=1440,
+            reason_command=command,
+        )
+        if not result.get("success"):
+            error = str(result.get("error") or "unknown Discord thread creation failure")
+            logger.warning("[%s] /%s action-thread creation failed: %s", self.name, command, error)
+            await self._action_thread_failure_notice(interaction, command, error)
+            return False
+
+        thread_id = str(result.get("thread_id") or "").strip()
+        if not thread_id:
+            await self._action_thread_failure_notice(
+                interaction,
+                command,
+                "Discord did not return a thread id.",
+            )
+            return False
+        thread_channel = result.get("_thread") or await self._resolve_channel_by_id(thread_id)
+        if thread_channel is None:
+            await self._action_thread_failure_notice(
+                interaction,
+                command,
+                "The newly-created thread could not be resolved.",
+            )
+            return False
+
+        parent_channel = self._thread_parent_channel(thread_channel) or getattr(interaction, "channel", None)
+        project_context = self._resolve_project_context_for_channel(parent_channel)
+        feature_summary = await self.initialize_feature_summary(
+            thread_channel,
+            parent_channel=parent_channel,
+            initial_request=command_text,
+            project_context=project_context,
+            source_message_id=str(getattr(interaction, "id", "") or "") or None,
+        )
+        if feature_summary is None:
+            await self._action_thread_failure_notice(
+                interaction,
+                command,
+                "The newly-created thread could not be initialized as an action request.",
+            )
+            return False
+
+        parent_chat_id = str(
+            getattr(parent_channel, "id", "")
+            or getattr(interaction, "channel_id", "")
+            or getattr(source, "chat_id", "")
+            or ""
+        )
+        thread_name = str(result.get("thread_name") or getattr(thread_channel, "name", "") or "").strip()
+        source.parent_chat_id = parent_chat_id or None
+        source.chat_id = thread_id
+        source.thread_id = thread_id
+        source.chat_type = "thread"
+        if thread_name:
+            guild = getattr(interaction, "guild", None)
+            guild_name = str(getattr(guild, "name", "") or "").strip()
+            source.chat_name = f"{guild_name} / #{thread_name}" if guild_name else thread_name
+        event.feature_summary = feature_summary
+        event.channel_prompt = self._resolve_channel_prompt(thread_id, parent_chat_id or None)
+        self._threads.mark(thread_id)
+        return True
+
     async def _route_fable_slash_to_thread(
         self,
         interaction: Any,
         event: MessageEvent,
         command_text: str,
     ) -> bool:
-        """Ensure top-level Discord /fable slash commands run inside a fresh thread."""
+        """Route Fable plans or implementations to their appropriate Discord flow."""
+
+        try:
+            from hermes_cli.fable_planner import (
+                FABLE_IMPLEMENTATION_MODE,
+                parse_fable_command_args,
+            )
+
+            fable_mode, request = parse_fable_command_args(self._command_request_text(command_text))
+        except Exception:
+            FABLE_IMPLEMENTATION_MODE = "implementation"
+            fable_mode, request = "plan", self._command_request_text(command_text)
+        if not request:
+            try:
+                await interaction.edit_original_response(
+                    content="Usage: /fable <request> or /fable plan <request>"
+                )
+            except Exception as exc:
+                logger.debug("Discord /fable usage notice failed: %s", exc)
+            return False
+        if fable_mode == FABLE_IMPLEMENTATION_MODE:
+            return await self._route_action_request_slash_to_thread(
+                interaction,
+                event,
+                command_text,
+                reason_command="fable",
+                thread_prefix="Fable",
+            )
 
         source = getattr(event, "source", None)
         if source is None:
@@ -6590,7 +6824,7 @@ class DiscordAdapter(BasePlatformAdapter):
             for cmd_def in COMMAND_REGISTRY:
                 if len(already_registered) >= _DISCORD_MAX_APP_COMMANDS:
                     break
-                if not _is_gateway_available(cmd_def, config_overrides):
+                if not _is_gateway_available(cmd_def, config_overrides, "discord"):
                     continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
                 discord_name = cmd_def.name.lower()[:32]
@@ -8937,6 +9171,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "success": True,
                 "thread_id": str(thread.id),
                 "thread_name": getattr(thread, "name", None) or name,
+                "_thread": thread,
             }
         except Exception as direct_error:
             if not starter_message:
@@ -8957,6 +9192,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     "success": True,
                     "thread_id": str(thread.id),
                     "thread_name": getattr(thread, "name", None) or name,
+                    "_thread": thread,
                 }
             except Exception as fallback_error:
                 return {
@@ -9890,6 +10126,37 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_audio_attachment(att, message_is_voice=message_is_voice)
         ]
         is_slash_command_message = normalized_content.startswith("/")
+        is_action_request_tier_command = self._is_action_request_tier_command_text(
+            normalized_content
+        )
+        is_fable_implementation_command = False
+        if self._is_fable_command_text(normalized_content):
+            try:
+                from hermes_cli.fable_planner import (
+                    FABLE_IMPLEMENTATION_MODE,
+                    parse_fable_command_args,
+                )
+
+                fable_mode, fable_request = parse_fable_command_args(
+                    self._command_request_text(normalized_content)
+                )
+                is_fable_implementation_command = bool(
+                    fable_request and fable_mode == FABLE_IMPLEMENTATION_MODE
+                )
+            except Exception:
+                # Keep the safe legacy behavior if the Fable command parser
+                # is unavailable: only explicit `/fable plan` is plan-only.
+                is_fable_implementation_command = not bool(
+                    re.match(r"^/fable\s+plan(?:\s|$)", normalized_content, re.IGNORECASE)
+                )
+        # Tier commands deliberately accept one inline text request.  Do not
+        # reinterpret attachments as a second request or a feature intake.
+        if is_action_request_tier_command and all_attachments:
+            logger.debug(
+                "[%s] Ignoring attachment-bearing /dumb or /smart message; tier commands are text-only",
+                self.name,
+            )
+            return
         is_meeting_command_message = self._is_meeting_command_text(normalized_content)
         if (
             not is_meeting_command_message
@@ -9913,6 +10180,7 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         grill_me_trigger = detect_grill_me_trigger(normalized_content)
 
+        replies_to_self = False
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -9964,6 +10232,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
             replies_to_self = self._message_replies_to_self(message)
+
+            # Unlike ordinary chat in free-response channels, tier commands
+            # are an explicit action trigger. Keep their existing direct bot
+            # mention/reply admission boundary even when the channel itself is
+            # otherwise open.
+            if is_action_request_tier_command and not (mention_prefix or replies_to_self):
+                logger.debug(
+                    "[%s] Ignoring unaddressed Discord tier command in channel %s",
+                    self.name,
+                    current_channel_id,
+                )
+                return
 
             voice_auto_tag = self._discord_voice_auto_tag()
             meeting_audio_command = bool(is_meeting_command_message and all_audio_attachments)
@@ -10032,7 +10312,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_thread
                 and not skip_thread
                 and not is_voice_linked_channel
-                and not is_reply_message
+                and (not is_reply_message or is_action_request_tier_command)
                 and (not is_slash_command_message or slash_command_starts_threaded_work)
             )
             if should_consider_auto_thread:
@@ -10130,16 +10410,25 @@ class DiscordAdapter(BasePlatformAdapter):
             and not slash_goal_uses_attachment_body
             and (slash_command_starts_threaded_work or action_request_intent is True)
         ):
-            _stage_started = time.perf_counter()
-            feature_summary_handle = await self.initialize_feature_summary(
-                message.channel,
-                parent_channel=self._thread_parent_channel(message.channel),
-                initial_request=normalized_content,
-                project_context=project_context,
-                source_message_id=str(message.id),
-                reply_to_message=message,
-            )
-            self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
+            if is_action_request_tier_command or is_fable_implementation_command:
+                # These commands must operate on a pre-existing normal action
+                # thread. Do not replace a worker/non-action summary with a
+                # new one that would make the gateway misclassify the thread.
+                feature_summary_handle = self._load_feature_summary_handle_for_thread(
+                    message.channel,
+                    project_context=project_context,
+                )
+            else:
+                _stage_started = time.perf_counter()
+                feature_summary_handle = await self.initialize_feature_summary(
+                    message.channel,
+                    parent_channel=self._thread_parent_channel(message.channel),
+                    initial_request=normalized_content,
+                    project_context=project_context,
+                    source_message_id=str(message.id),
+                    reply_to_message=message,
+                )
+                self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         elif is_thread:
             feature_summary_handle = self._load_feature_summary_handle_for_thread(
                 message.channel,

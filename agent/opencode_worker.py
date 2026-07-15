@@ -67,7 +67,7 @@ class _OpenCodeProcessResult:
 
 def normalize_coding_worker_backend(value: Any) -> str:
     raw = str(value or "").strip().lower()
-    return raw if raw in _VALID_BACKENDS else BACKEND_OPENCODE
+    return raw if raw in _VALID_BACKENDS else BACKEND_CODEX
 
 
 def _positive_float(value: Any, default: float) -> float:
@@ -251,7 +251,7 @@ def load_coding_worker_backend(
       1. HERMES_CODING_WORKER_BACKEND
       2. kanban.discord_worker.backend (passed as worker_config)
       3. coding_worker.backend
-      4. opencode
+      4. codex
     """
     raw_env = os.getenv("HERMES_CODING_WORKER_BACKEND")
     if raw_env:
@@ -272,7 +272,7 @@ def load_coding_worker_backend(
         coding_cfg = cfg.get("coding_worker") if isinstance(cfg.get("coding_worker"), dict) else {}
         if coding_cfg.get("backend"):
             return normalize_coding_worker_backend(coding_cfg.get("backend"))
-    return BACKEND_OPENCODE
+    return BACKEND_CODEX
 
 
 def load_coding_worker_model_tier(

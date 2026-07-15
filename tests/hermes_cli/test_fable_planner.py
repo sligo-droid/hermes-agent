@@ -4,14 +4,18 @@ from types import SimpleNamespace
 
 from hermes_cli.fable_planner import (
     FABLE_DEFAULT_TOOLSETS,
+    FABLE_IMPLEMENTATION_MODE,
     FABLE_MODEL,
+    FABLE_PLAN_MODE,
     FablePlanRequest,
+    build_fable_implementation_instruction,
     build_fable_plan_invocation,
     build_fable_user_instruction,
     fable_enabled_toolsets,
     fable_metadata,
     fable_reasoning_config,
     fable_session_model_override,
+    parse_fable_command_args,
 )
 
 
@@ -293,6 +297,36 @@ def test_build_fable_user_instruction_contains_plan_only_contract():
     assert "discord" in packet
 
 
+def test_discord_fable_parser_routes_explicit_and_natural_plan_requests_plan_only():
+    assert parse_fable_command_args("implement the feature") == (
+        FABLE_IMPLEMENTATION_MODE,
+        "implement the feature",
+    )
+    assert parse_fable_command_args("plan implement the feature") == (
+        FABLE_PLAN_MODE,
+        "implement the feature",
+    )
+    assert parse_fable_command_args("PLAN") == (FABLE_PLAN_MODE, "")
+    for request in (
+        "make a plan for the feature",
+        "help me plan to ship the feature",
+        "create a plan for the migration",
+        "could you draft a plan for the rollout?",
+    ):
+        assert parse_fable_command_args(request) == (FABLE_PLAN_MODE, request)
+
+
+def test_build_fable_implementation_instruction_requires_codex_delegation():
+    packet = build_fable_implementation_instruction(
+        FablePlanRequest(prompt="add feature", platform="discord", session_id="s1")
+    )
+
+    assert "add feature" in packet
+    assert "delegate_coding_task" in packet
+    assert "Codex coding worker" in packet
+    assert "Do not fall back to OpenCode" in packet
+
+
 def test_build_fable_plan_invocation_uses_plan_skill(monkeypatch):
     calls = []
 
@@ -360,6 +394,14 @@ def test_fable_metadata_for_artifact():
     assert metadata["plan_artifact_kind"] == "fable_plan"
     assert metadata["model"] == FABLE_MODEL
     assert metadata["reply_to_mode"] == "all"
+
+
+def test_fable_implementation_metadata_is_not_a_plan_artifact():
+    metadata = fable_metadata(mode=FABLE_IMPLEMENTATION_MODE)
+
+    assert metadata["fable_mode"] == FABLE_IMPLEMENTATION_MODE
+    assert metadata["kind"] == "fable_implementation"
+    assert "plan_artifact_kind" not in metadata
 
 
 def test_fable_metadata_identifies_configured_proxy_route():

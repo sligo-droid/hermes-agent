@@ -75,17 +75,24 @@ def _fable_proxy_override():
 def _make_event(text="/fable build X"):
     source = SessionSource(
         platform=Platform.DISCORD,
-        chat_id="123",
-        chat_type="group",
+        chat_id="thread1",
+        chat_type="thread",
         user_id="user1",
         user_name="User",
         thread_id="thread1",
+        parent_chat_id="123",
     )
-    return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, message_id="msg1")
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg1",
+        feature_summary={"initial_request": "Build X", "kanban_board": None},
+    )
 
 
 @pytest.mark.asyncio
-async def test_fable_command_routes_through_normal_agent_with_fable_override(monkeypatch):
+async def test_fable_plan_command_routes_through_normal_agent_with_fable_override(monkeypatch):
     from gateway.run import GatewayRunner
 
     runner = _make_runner()
@@ -93,7 +100,7 @@ async def test_fable_command_routes_through_normal_agent_with_fable_override(mon
     def fake_build(request, task_id=None):
         assert request.prompt == "build X"
         assert request.platform == "discord"
-        assert task_id == build_session_key(_make_event().source)
+        assert task_id == build_session_key(_make_event("/fable plan build X").source)
         return "PLAN SKILL: build X"
 
     monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", fake_build)
@@ -103,7 +110,7 @@ async def test_fable_command_routes_through_normal_agent_with_fable_override(mon
     )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
 
-    result = await GatewayRunner._handle_message(runner, _make_event())
+    result = await GatewayRunner._handle_message(runner, _make_event("/fable plan build X"))
 
     assert isinstance(result, MetadataReply)
     assert result == "agent response"
@@ -119,8 +126,107 @@ async def test_fable_command_routes_through_normal_agent_with_fable_override(mon
     assert agent_event.invoked_skill_command == "fable"
     assert agent_event.fable_enabled_toolsets == ["file", "terminal", "web", "browser", "discord"]
     assert agent_event.fable_reasoning_config == {"enabled": True, "effort": "high"}
-    assert agent_event.fable_transcript_user_message == "/fable build X"
+    assert agent_event.fable_transcript_user_message == "/fable plan build X"
     assert build_session_key(agent_event.source) not in runner._session_model_overrides
+
+
+@pytest.mark.asyncio
+async def test_bare_discord_fable_routes_to_implementation_with_normal_tool_surface(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+
+    def fake_build(request):
+        assert request.prompt == "build X"
+        assert request.platform == "discord"
+        return "FABLE IMPLEMENTATION: build X"
+
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_implementation_instruction", fake_build)
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (_fable_override(), ""),
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
+
+    result = await GatewayRunner._handle_message(runner, _make_event())
+
+    assert isinstance(result, MetadataReply)
+    assert result == "agent response"
+    assert result.metadata["fable_mode"] == "implementation"
+    assert result.metadata["kind"] == "fable_implementation"
+    assert "plan_artifact_kind" not in result.metadata
+    agent_event = runner._handle_message_with_agent.await_args.args[0]
+    assert agent_event.text == "FABLE IMPLEMENTATION: build X"
+    assert agent_event.fable_implementation is True
+    assert not hasattr(agent_event, "fable_enabled_toolsets")
+
+
+@pytest.mark.asyncio
+async def test_natural_discord_fable_plan_is_plan_only_without_action_thread(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+    event = _make_event("/fable help me plan to build X")
+    event.source.chat_id = "123"
+    event.source.chat_type = "group"
+    event.source.thread_id = None
+    event.source.parent_chat_id = None
+    event.feature_summary = None
+
+    def fake_build(request, task_id=None):
+        assert request.prompt == "help me plan to build X"
+        assert request.platform == "discord"
+        assert task_id == build_session_key(event.source)
+        return "PLAN SKILL: help me plan to build X"
+
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", fake_build)
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (_fable_override(), ""),
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
+
+    result = await GatewayRunner._handle_message(runner, event)
+
+    assert isinstance(result, MetadataReply)
+    assert result.metadata["fable_mode"] == "plan"
+    assert result.metadata["kind"] == "fable_plan"
+    agent_event = runner._handle_message_with_agent.await_args.args[0]
+    assert agent_event.text == "PLAN SKILL: help me plan to build X"
+    assert agent_event.fable_implementation is False
+
+
+@pytest.mark.asyncio
+async def test_bare_non_discord_fable_remains_plan_only(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+    event = _make_event("/fable build X")
+    event.source.platform = Platform.TELEGRAM
+    event.source.chat_type = "group"
+    event.source.thread_id = None
+    event.source.parent_chat_id = None
+    event.feature_summary = None
+
+    def fake_build(request, task_id=None):
+        assert request.prompt == "build X"
+        assert request.platform == "telegram"
+        assert task_id
+        return "PLAN SKILL: build X"
+
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_plan_invocation", fake_build)
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (_fable_override(), ""),
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
+
+    result = await GatewayRunner._handle_message(runner, event)
+
+    assert isinstance(result, MetadataReply)
+    assert result.metadata["fable_mode"] == "plan"
+    agent_event = runner._handle_message_with_agent.await_args.args[0]
+    assert agent_event.text == "PLAN SKILL: build X"
 
 
 @pytest.mark.asyncio
@@ -136,7 +242,7 @@ async def test_fable_command_uses_configured_toolset_budget(monkeypatch):
     )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {"fable": {"enabled_toolsets": ["file", "web"]}})
 
-    result = await GatewayRunner._handle_message(runner, _make_event())
+    result = await GatewayRunner._handle_message(runner, _make_event("/fable plan build X"))
 
     assert isinstance(result, MetadataReply)
     agent_event = runner._handle_message_with_agent.await_args.args[0]
@@ -162,7 +268,7 @@ async def test_fable_command_metadata_identifies_configured_proxy_route(monkeypa
     )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: config)
 
-    result = await GatewayRunner._handle_message(runner, _make_event())
+    result = await GatewayRunner._handle_message(runner, _make_event("/fable plan build X"))
 
     assert isinstance(result, MetadataReply)
     assert result.metadata["route"] == "anthropic_proxy"
@@ -178,7 +284,7 @@ async def test_fable_command_usage_without_args(monkeypatch):
     runner = _make_runner()
     result = await GatewayRunner._handle_message(runner, _make_event("/fable"))
 
-    assert result == "Usage: /fable <request>"
+    assert result == "Usage: /fable <request> or /fable plan <request>"
     runner._handle_message_with_agent.assert_not_awaited()
 
 
@@ -198,7 +304,7 @@ async def test_fable_command_reports_failed_route_without_artifact_metadata(monk
     )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
 
-    result = await GatewayRunner._handle_message(runner, _make_event())
+    result = await GatewayRunner._handle_message(runner, _make_event("/fable plan build X"))
 
     assert isinstance(result, str)
     assert not isinstance(result, MetadataReply)
@@ -358,6 +464,86 @@ def test_fable_run_agent_uses_event_toolset_override(monkeypatch):
 
     assert result == "fable ok"
     assert captured["enabled_toolsets"] == ["file", "web"]
+
+
+def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    import gateway.run as gateway_run
+
+    captured = {}
+
+    class CapturingAgent:
+        instance = None
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.tools = []
+            type(self).instance = self
+
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
+            return {
+                "final_response": "fable implementation complete",
+                "messages": [],
+                "api_calls": 1,
+                "model": "claude-fable-5",
+                "provider": "anthropic",
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"tools": {"discord": {"enabled": ["all"]}}})
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda _config, _platform: {"core", "terminal"})
+    GatewayRunner = gateway_run.GatewayRunner
+    runner = _make_runner()
+    runner._handle_message_with_agent = GatewayRunner._handle_message_with_agent.__get__(runner, GatewayRunner)
+    runner._run_agent = GatewayRunner._run_agent.__get__(runner, GatewayRunner)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: ("claude-fable-5", _fable_override())
+    runner._agent_cache_lock = threading.Lock()
+    runner._fallback_model = {"provider": "openai-codex", "model": "gpt-5.5"}
+    runner._provider_routing = {}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._voice_mode = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._show_reasoning = False
+    runner._service_tier = None
+    runner._session_db = None
+    runner._background_tasks = set()
+    runner.adapters = {}
+    event = _make_event()
+    event.text = "FABLE IMPLEMENTATION PAYLOAD"
+    event.fable_plan_metadata = {"command": "fable", "fable_mode": "implementation"}
+    session_entry = _session_entry_for_event(event)
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.update_session = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.has_any_sessions.return_value = True
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(
+            event,
+            event.source,
+            build_session_key(event.source),
+            1,
+        )
+    )
+
+    assert result == "fable implementation complete"
+    assert captured["model"] == "claude-fable-5"
+    assert captured["enabled_toolsets"] == ["core", "terminal"]
+    assert captured["fallback_model"] is None
+    assert captured["providers_allowed"] == ["anthropic"]
+    assert CapturingAgent.instance._fable_implementation_turn is True
 
 
 def test_fable_run_agent_refuses_non_fable_model_result(monkeypatch):
@@ -524,7 +710,7 @@ async def test_fable_command_failure_is_not_plan_artifact_metadata(monkeypatch):
     )
     monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {})
 
-    result = await GatewayRunner._handle_message(runner, _make_event())
+    result = await GatewayRunner._handle_message(runner, _make_event("/fable plan build X"))
 
     assert isinstance(result, str)
     assert not isinstance(result, MetadataReply)

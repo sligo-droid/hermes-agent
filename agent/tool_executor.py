@@ -158,11 +158,22 @@ def _coding_worker_mutation_block(agent, function_name: str, function_args: Opti
     """Return a guardrail message when Hermes-codebase work skipped the worker."""
     if function_name == "delegate_coding_task":
         return None
+    if getattr(agent, "_fable_implementation_turn", False) and function_name == "delegate_task":
+        return (
+            "Discord /fable implementation must delegate repository work through "
+            "delegate_coding_task with the Codex coding worker, not delegate_task."
+        )
     function_args = function_args or {}
     mutation_tool = function_name in _CODING_WORKER_BLOCKED_MUTATION_TOOLS
     terminal_mutation = function_name == "terminal" and _terminal_command_may_mutate(function_args)
     if not mutation_tool and not terminal_mutation:
         return None
+    if getattr(agent, "_fable_implementation_turn", False):
+        return (
+            "Discord /fable implementation may inspect and review, but every repository "
+            "mutation must go through delegate_coding_task with the Codex coding worker. "
+            "Do not edit directly before or after the worker returns."
+        )
     if str(getattr(agent, "api_mode", "") or "").strip().lower() == "codex_app_server":
         return None
     if not getattr(agent, "_coding_worker_required_this_turn", False):

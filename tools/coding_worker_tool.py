@@ -299,6 +299,56 @@ def _mutable_worktree_for_canonical_cwd(workdir: str) -> str | None:
     return str(candidates[0]) if candidates else None
 
 
+def _is_fable_implementation_parent(parent_agent: Any) -> bool:
+    """Whether this delegated turn is a Discord Fable implementation parent."""
+    return bool(getattr(parent_agent, "_fable_implementation_turn", False))
+
+
+def _fable_mutable_worktree_error(workdir: str) -> str | None:
+    """Return a clear error unless *workdir* is an editable git worktree."""
+    try:
+        path = Path(str(workdir)).expanduser().resolve(strict=False)
+    except Exception:
+        path = Path(str(workdir))
+    if not path.is_dir():
+        return (
+            "Fable implementation requires a mutable git worktree, but the configured "
+            f"working directory does not exist: {workdir}."
+        )
+    if not os.access(path, os.W_OK):
+        return (
+            "Fable implementation requires a mutable git worktree, but the configured "
+            f"working directory is not writable: {path}."
+        )
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree", "--is-bare-repository"],
+            cwd=str(path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception as exc:
+        return (
+            "Fable implementation requires a mutable git worktree, but Git could not "
+            f"inspect {path}: {exc}."
+        )
+    values = [line.strip().lower() for line in str(proc.stdout or "").splitlines()]
+    if proc.returncode != 0 or not values or values[0] != "true":
+        return (
+            "Fable implementation requires a mutable git worktree; "
+            f"{path} is not inside a Git worktree."
+        )
+    if len(values) > 1 and values[1] == "true":
+        return (
+            "Fable implementation requires a mutable git worktree; "
+            f"{path} is a bare Git repository."
+        )
+    return None
+
+
 def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_agent: Any) -> DelegateCodingTaskPreflight:
     """Normalize/suppress malformed worker starts before visible execution."""
 
@@ -326,9 +376,20 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
         canonical_error = canonical_main_worker_violation(workdir)
     except Exception:
         canonical_error = None
+    worker_required = bool(
+        getattr(parent_agent, "_coding_worker_required_this_turn", False)
+        or _is_fable_implementation_parent(parent_agent)
+    )
     if not canonical_error:
+        if _is_fable_implementation_parent(parent_agent):
+            worktree_error = _fable_mutable_worktree_error(workdir)
+            if worktree_error:
+                return DelegateCodingTaskPreflight(
+                    args=args,
+                    suppressed_result=tool_error(worktree_error),
+                )
         return DelegateCodingTaskPreflight(args=args)
-    if not getattr(parent_agent, "_coding_worker_required_this_turn", False):
+    if not worker_required:
         return DelegateCodingTaskPreflight(args=args)
 
     repaired_cwd = _mutable_worktree_for_canonical_cwd(workdir)
@@ -342,6 +403,13 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
                 f"coding worker to mutable worktree {repaired_cwd} before launch."
             ),
         )
+        if _is_fable_implementation_parent(parent_agent):
+            worktree_error = _fable_mutable_worktree_error(repaired_cwd)
+            if worktree_error:
+                return DelegateCodingTaskPreflight(
+                    args=args,
+                    suppressed_result=tool_error(worktree_error),
+                )
         return DelegateCodingTaskPreflight(args=args)
 
     return DelegateCodingTaskPreflight(
@@ -1043,6 +1111,7 @@ def delegate_coding_task(
         trusted_allow_git_pr_lifecycle,
     )
 
+    fable_implementation = _is_fable_implementation_parent(parent_agent)
     workdir = _resolve_cwd(cwd, parent_agent)
     cwd_fallback_metadata: dict[str, str] | None = None
     if not Path(workdir).exists():
@@ -1067,7 +1136,21 @@ def delegate_coding_task(
     except Exception:
         canonical_error = None
     if canonical_error:
-        return tool_error(canonical_error)
+        if fable_implementation:
+            repaired_cwd = _mutable_worktree_for_canonical_cwd(workdir)
+            if repaired_cwd:
+                workdir = repaired_cwd
+            else:
+                return tool_error(
+                    "Fable implementation requires a mutable /home/droid/workspaces/ "
+                    f"worktree for protected canonical cwd {workdir}; refusing direct Fable edits."
+                )
+        else:
+            return tool_error(canonical_error)
+    if fable_implementation:
+        worktree_error = _fable_mutable_worktree_error(workdir)
+        if worktree_error:
+            return tool_error(worktree_error)
 
     try:
         from hermes_cli.config import load_config
@@ -1077,28 +1160,62 @@ def delegate_coding_task(
         loaded_config = {}
 
     try:
-        from agent.opencode_worker import BACKEND_OPENCODE, load_coding_worker_backend
+        from agent.opencode_worker import (
+            BACKEND_CODEX,
+            BACKEND_OPENCODE,
+            load_coding_worker_backend,
+        )
 
         try:
             backend = load_coding_worker_backend(config=loaded_config)
         except TypeError:
             backend = load_coding_worker_backend()
-    except Exception:
-        backend = "opencode"
+    except Exception as exc:
+        if fable_implementation:
+            return tool_error(
+                "Fable implementation requires the Codex coding worker, but Hermes could not "
+                f"load that backend: {exc}. Refusing to fall back to OpenCode."
+            )
+        BACKEND_CODEX = "codex"
+        BACKEND_OPENCODE = "opencode"
+        backend = "codex"
 
-    try:
-        from hermes_cli.ui_work_routing import resolve_ui_work_route
+    if fable_implementation:
+        if backend != BACKEND_CODEX:
+            return tool_error(
+                "Fable implementation requires coding_worker.backend=codex; "
+                "refusing to fall back to OpenCode or direct Fable edits."
+            )
+        try:
+            from agent.transports.codex_app_server import check_codex_binary
 
-        ui_route = resolve_ui_work_route(
-            loaded_config,
-            task=task_text,
-            context=context_text,
-            cwd=workdir,
-            backend=backend,
-            route_decision=route_decision,
-        )
-    except Exception:
+            codex_ok, codex_detail = check_codex_binary()
+        except Exception as exc:
+            codex_ok, codex_detail = False, str(exc)
+        if not codex_ok:
+            return tool_error(
+                "Fable implementation requires an available Codex coding worker; "
+                f"{codex_detail}. Refusing to fall back to OpenCode or direct Fable edits."
+            )
+
+    if fable_implementation:
+        # A Fable parent may review the Codex worker result, but must never
+        # route a mutation through the Claude Code visual-specialist path.
         ui_route = None
+    else:
+        try:
+            from hermes_cli.ui_work_routing import resolve_ui_work_route
+
+            ui_route = resolve_ui_work_route(
+                loaded_config,
+                task=task_text,
+                context=context_text,
+                cwd=workdir,
+                backend=backend,
+                route_decision=route_decision,
+            )
+        except Exception:
+            ui_route = None
     ui_route_metadata = (
         ui_route.metadata()
         if ui_route is not None

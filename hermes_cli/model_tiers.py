@@ -20,7 +20,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "trivial": {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
     },
     "basic": {
         "model": "gpt-5.6-terra",
@@ -28,9 +28,9 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "reasoning_effort": "medium",
     },
     "intermediate": {
-        "model": "gpt-5.6-sol",
-        "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "medium",
+        "model": "gpt-5.6-terra",
+        "opencode_model": "hermes-codex/gpt-5.6-terra",
+        "reasoning_effort": "max",
     },
     "advanced": {
         "model": "gpt-5.6-sol",
@@ -38,6 +38,15 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "reasoning_effort": "xhigh",
     },
 }
+
+# Ordered built-in execution tiers. Custom tier names remain valid for normal
+# routing, but cannot be stepped because their relative ordering is unknown.
+MODEL_TIER_LADDER: tuple[str, ...] = (
+    "trivial",
+    "basic",
+    "intermediate",
+    "advanced",
+)
 
 _SIMPLE_TASK_SIGNALS = (
     "typo",
@@ -197,3 +206,21 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
         opencode_model=opencode_model,
         reasoning_effort=reasoning_effort,
     )
+
+
+def resolve_adjacent_model_tier(
+    config: Mapping[str, Any] | None,
+    name: Any,
+    direction: int,
+) -> ModelTier | None:
+    """Resolve the adjacent built-in tier, or ``None`` at an invalid edge."""
+    if direction not in {-1, 1}:
+        return None
+    try:
+        index = MODEL_TIER_LADDER.index(_normalized_name(name))
+    except ValueError:
+        return None
+    target_index = index + direction
+    if target_index < 0 or target_index >= len(MODEL_TIER_LADDER):
+        return None
+    return resolve_model_tier(config, MODEL_TIER_LADDER[target_index])

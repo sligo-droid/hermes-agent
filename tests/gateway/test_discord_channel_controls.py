@@ -179,6 +179,106 @@ async def test_reply_to_bot_counts_as_mention(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tier_text_command_requires_a_direct_bot_mention_or_reply(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "*")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+
+    await adapter._handle_message(
+        make_message(
+            channel=FakeTextChannel(channel_id=700),
+            content="/smart implement the dashboard",
+        )
+    )
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_reply", [False, True])
+async def test_addressed_tier_text_command_auto_threads_as_non_kanban_action(
+    adapter,
+    monkeypatch,
+    via_reply,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    parent = FakeTextChannel(channel_id=700)
+    thread = FakeThread(channel_id=701, name="action", parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    adapter.initialize_project_summary = AsyncMock(return_value=None)
+    adapter.initialize_feature_summary = AsyncMock(
+        return_value={"initial_request": "/smart implement the dashboard", "kanban_board": None}
+    )
+    bot_user = adapter._client.user
+    content = "/smart implement the dashboard"
+    mentions = []
+    if not via_reply:
+        content = f"<@{bot_user.id}> {content}"
+        mentions = [bot_user]
+    message = make_message(channel=parent, content=content, mentions=mentions)
+    if via_reply:
+        message.reference = _reply_reference_to(bot_user)
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.initialize_feature_summary.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/smart implement the dashboard"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "701"
+    assert event.feature_summary["kanban_board"] is None
+
+
+@pytest.mark.asyncio
+async def test_tier_text_command_with_attachment_is_not_routed(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    message = make_message(
+        channel=FakeTextChannel(channel_id=700),
+        content="/dumb simplify the dashboard",
+    )
+    message.attachments = [SimpleNamespace(filename="request.md", content_type="text/markdown")]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/smart implement the dashboard", "/fable implement the dashboard"])
+async def test_action_commands_in_worker_thread_keep_existing_worker_summary(
+    adapter,
+    monkeypatch,
+    command,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    parent = FakeTextChannel(channel_id=700)
+    thread = FakeThread(channel_id=701, name="worker", parent=parent)
+    bot_user = adapter._client.user
+    adapter._load_feature_summary_handle_for_thread = MagicMock(
+        return_value={"initial_request": "/goal implement the dashboard", "kanban_board": {"slug": "worker"}}
+    )
+    adapter.initialize_feature_summary = AsyncMock()
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> {command}",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.initialize_feature_summary.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary["kanban_board"] == {"slug": "worker"}
+    assert event.feature_summary["initial_request"].startswith("/goal")
+
+
+@pytest.mark.asyncio
 async def test_ignored_channels_csv_parsing(adapter, monkeypatch):
     """Multiple channel IDs are parsed correctly from CSV."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")

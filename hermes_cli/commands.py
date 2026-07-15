@@ -55,6 +55,9 @@ class CommandDef:
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
+    # Empty means all gateway platforms; a non-empty tuple limits discovery
+    # and help/manifests to the named gateway platforms.
+    gateway_platforms: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +154,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status]",
                subcommands=("normal", "fast", "status", "on", "off")),
+    CommandDef("dumb", "Run a Discord action request one tier lower", "Configuration",
+               gateway_only=True, args_hint="<request>", gateway_platforms=("discord",)),
+    CommandDef("smart", "Run a Discord action request one tier higher", "Configuration",
+               gateway_only=True, args_hint="<request>", gateway_platforms=("discord",)),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -172,8 +179,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("search", "browse", "inspect", "install", "audit")),
     CommandDef("bundles", "List skill bundles (aliases /<name> for multiple skills)",
                "Tools & Skills"),
-    CommandDef("fable", "Generate a plan with Claude Fable 5 and persist a plan artifact",
-               "Tools & Skills", args_hint="<request>"),
+    CommandDef("fable", "Use Claude Fable 5 (Discord executes; /fable plan saves a plan artifact)",
+               "Tools & Skills", args_hint="[plan] <request>", subcommands=("plan",)),
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
@@ -412,7 +419,11 @@ def _resolve_config_gates() -> set[str]:
     return result
 
 
-def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
+def _is_gateway_available(
+    cmd: CommandDef,
+    config_overrides: set[str] | None = None,
+    platform: str | None = None,
+) -> bool:
     """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
 
     Unconditionally available when ``cli_only`` is False.  When ``cli_only``
@@ -420,6 +431,11 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
     when the config value is truthy.  Pass *config_overrides* (from
     ``_resolve_config_gates()``) to avoid re-reading config for every command.
     """
+    normalized_platform = str(platform or "").strip().lower()
+    if cmd.gateway_platforms and (
+        not normalized_platform or normalized_platform not in cmd.gateway_platforms
+    ):
+        return False
     if not cmd.cli_only:
         return True
     if cmd.gateway_config_gate:
@@ -433,12 +449,12 @@ def _requires_argument(args_hint: str) -> bool:
     return args_hint.strip().startswith("<")
 
 
-def gateway_help_lines() -> list[str]:
+def gateway_help_lines(platform: str | None = None) -> list[str]:
     """Generate gateway help text lines from the registry."""
     overrides = _resolve_config_gates()
     lines: list[str] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, platform):
             continue
         args = f" {cmd.args_hint}" if cmd.args_hint else ""
         alias_parts: list[str] = []
@@ -501,7 +517,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     overrides = _resolve_config_gates()
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, "telegram"):
             continue
         # Built-in arg-taking commands are included — their handlers show
         # usage text when invoked without arguments, and hiding them from
@@ -1017,13 +1033,13 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, "slack"):
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
     # Second pass: aliases.
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, "slack"):
             continue
         for alias in cmd.aliases:
             # Skip aliases that only differ from canonical by case/punctuation
@@ -1076,7 +1092,7 @@ def slack_subcommand_map() -> dict[str, str]:
     overrides = _resolve_config_gates()
     mapping: dict[str, str] = {}
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, "slack"):
             continue
         mapping[cmd.name] = f"/{cmd.name}"
         for alias in cmd.aliases:

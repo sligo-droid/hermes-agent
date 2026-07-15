@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,6 +80,12 @@ def _parent(tmp_path, api_mode="chat_completions"):
         session_key="discord:123",
         _touch_activity=lambda message: None,
     )
+
+
+def _fable_parent(tmp_path):
+    parent = _parent(tmp_path)
+    parent._fable_implementation_turn = True
+    return parent
 
 
 def _skill_block(name, body, directory=None, description=None):
@@ -159,7 +166,7 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="max"',
     ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -833,7 +840,7 @@ def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monk
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="max"',
     ]
 
 
@@ -996,7 +1003,7 @@ def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="max"',
     ]
 
 
@@ -1401,13 +1408,13 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="xhigh"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
         'model="gpt-5.6-terra"',
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="max"',
     ]
     assert "Do not edit repository files" in FakeSession.instances[0].run_calls[0]["user_input"]
     assert "Codex plan to follow:" in FakeSession.instances[1].run_calls[0]["user_input"]
@@ -1584,6 +1591,65 @@ def test_preflight_suppresses_missing_worktree_for_required_canonical_cwd(monkey
     result = json.loads(preflight.suppressed_result)
     assert "could not find a mutable" in result["error"]
     assert "BLOCKED:" not in result["error"]
+
+
+def test_fable_delegate_requires_a_mutable_git_worktree(tmp_path):
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the feature",
+            parent_agent=_fable_parent(tmp_path),
+        )
+    )
+
+    assert "Fable implementation requires a mutable git worktree" in result["error"]
+
+
+def test_fable_delegate_rejects_opencode_backend(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"coding_worker": {"backend": "opencode"}})
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the feature",
+            parent_agent=_fable_parent(tmp_path),
+        )
+    )
+
+    assert "coding_worker.backend=codex" in result["error"]
+    assert "OpenCode" in result["error"]
+
+
+def test_fable_delegate_fails_clearly_when_codex_is_unavailable(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"coding_worker": {"backend": "codex"}})
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_CODEX,
+    )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server.check_codex_binary",
+        lambda: (False, "codex CLI not found"),
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the feature",
+            parent_agent=_fable_parent(tmp_path),
+        )
+    )
+
+    assert "requires an available Codex coding worker" in result["error"]
+    assert "codex CLI not found" in result["error"]
 
 
 def test_delegate_opencode_omits_parent_scope_for_legacy_backend(monkeypatch, tmp_path):

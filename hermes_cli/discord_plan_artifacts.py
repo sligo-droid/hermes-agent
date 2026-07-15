@@ -105,6 +105,10 @@ def should_persist_discord_plan(
     meta = metadata if isinstance(metadata, dict) else {}
     command = str(meta.get("command") or meta.get("invoked_command") or "").strip().lower()
     kind = str(meta.get("kind") or meta.get("response_kind") or "").strip().lower()
+    if command in {"fable", "/fable"} and str(meta.get("fable_mode") or "").strip().lower() == "implementation":
+        # Discord `/fable <request>` is an implementation turn.  Only the
+        # explicit `/fable plan <request>` route owns plan artifacts.
+        return False
     if command in {"meeting", "/meeting", "goal", "/goal", "plan", "/plan", "fable", "/fable"}:
         return True
     if kind in {"meeting_plan", "implementation_plan", "discord_plan", "plan", "fable_plan"}:

@@ -63,6 +63,31 @@ def test_coding_worker_guardrail_allows_terminal_after_delegate():
     ) is None
 
 
+def test_fable_implementation_never_unblocks_direct_mutation_after_delegate():
+    agent = _agent(
+        _fable_implementation_turn=True,
+        _coding_worker_used_this_turn=True,
+    )
+
+    message = _coding_worker_mutation_block(
+        agent,
+        "terminal",
+        {"command": "git add . && git commit -m implementation"},
+    )
+
+    assert message is not None
+    assert "delegate_coding_task" in message
+    assert "Codex coding worker" in message
+    assert _coding_worker_mutation_block(
+        agent,
+        "terminal",
+        {"command": "git status --short"},
+    ) is None
+    delegation_message = _coding_worker_mutation_block(agent, "delegate_task", {})
+    assert delegation_message is not None
+    assert "delegate_coding_task" in delegation_message
+
+
 def test_coding_worker_guardrail_allows_user_systemd_service_write(monkeypatch, tmp_path):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
