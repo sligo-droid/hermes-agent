@@ -275,6 +275,18 @@ def _discord_feature_request_reasoning_config(config: Optional[dict]) -> dict | 
     return _discord_action_request_reasoning_config(config)
 
 
+def _reasoning_effort_footer_label(reasoning_config: Any) -> str:
+    """Return the effective reasoning label carried with a completed turn."""
+    if not isinstance(reasoning_config, dict):
+        return ""
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    if effort:
+        return effort
+    if reasoning_config.get("enabled") is False:
+        return "none"
+    return ""
+
+
 def _runtime_footer_line_for_agent_result(
     *,
     user_config: Optional[dict],
@@ -295,6 +307,7 @@ def _runtime_footer_line_for_agent_result(
             model=agent_result.get("model"),
             context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
             context_length=agent_result.get("context_length") or None,
+            reasoning_effort=agent_result.get("reasoning_effort"),
             cwd=cwd,
         )
     except Exception as exc:
@@ -21785,6 +21798,7 @@ class GatewayRunner:
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = (result.get("model") if isinstance(result, dict) else None) or (getattr(_agent, "model", None) if _agent else None)
             _resolved_provider = (result.get("provider") if isinstance(result, dict) else None) or (getattr(_agent, "provider", None) if _agent else None)
+            _reasoning_effort = _reasoning_effort_footer_label(reasoning_config)
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -21807,6 +21821,7 @@ class GatewayRunner:
                     "model": _resolved_model,
                     "provider": _resolved_provider,
                     "context_length": _context_length,
+                    "reasoning_effort": _reasoning_effort,
                     "runtime_breakdown": result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
                 }
             
@@ -22024,6 +22039,7 @@ class GatewayRunner:
                 "model": _resolved_model,
                 "provider": _resolved_provider,
                 "context_length": _context_length,
+                "reasoning_effort": _reasoning_effort,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),

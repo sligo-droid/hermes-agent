@@ -48,16 +48,17 @@ async def test_queued_response_footer_uses_its_completed_turn_model() -> None:
             "model": "gpt-5.6-terra",
             "last_prompt_tokens": 100,
             "context_length": 200,
+            "reasoning_effort": "xhigh",
         },
         user_config={
-            "display": {"runtime_footer": {"enabled": True, "fields": ["model"]}}
+            "display": {"runtime_footer": {"enabled": True, "fields": ["model", "reasoning"]}}
         },
         cwd="/tmp/project",
         metadata={"thread_id": "thread-1"},
         already_delivered=False,
     )
 
-    expected = "Terra completed the action." + chr(10) * 2 + "gpt-5.6-terra"
+    expected = "Terra completed the action." + chr(10) * 2 + "gpt-5.6-terra · xhigh"
     assert adapter.sent == [("thread-1", expected, {"thread_id": "thread-1"})]
 
 
@@ -70,16 +71,28 @@ async def test_streamed_queued_response_sends_its_own_trailing_footer() -> None:
         adapter=adapter,
         source=_discord_source(),
         response="Terra completed the action.",
-        agent_result={"model": "gpt-5.6-terra"},
+        agent_result={"model": "gpt-5.6-terra", "reasoning_effort": "none"},
         user_config={
-            "display": {"runtime_footer": {"enabled": True, "fields": ["model"]}}
+            "display": {"runtime_footer": {"enabled": True, "fields": ["model", "reasoning"]}}
         },
         cwd="/tmp/project",
         metadata={"thread_id": "thread-1"},
         already_delivered=True,
     )
 
-    assert adapter.sent == [("thread-1", "gpt-5.6-terra", {"thread_id": "thread-1"})]
+    assert adapter.sent == [("thread-1", "gpt-5.6-terra · none", {"thread_id": "thread-1"})]
+
+
+@pytest.mark.parametrize(
+    ("reasoning_config", "expected"),
+    [
+        ({"enabled": True, "effort": "high"}, "high"),
+        ({"enabled": False}, "none"),
+        (None, ""),
+    ],
+)
+def test_reasoning_effort_footer_label(reasoning_config, expected) -> None:
+    assert gateway_run._reasoning_effort_footer_label(reasoning_config) == expected
 
 
 class _ProcessRegistry:

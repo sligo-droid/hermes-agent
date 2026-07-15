@@ -65,9 +65,10 @@ def test_format_footer_all_fields(monkeypatch, tmp_path):
         context_tokens=68000,
         context_length=100000,
         cwd=None,  # falls back to TERMINAL_CWD env var
-        fields=("model", "context_pct", "cwd"),
+        reasoning_effort="xhigh",
+        fields=("model", "reasoning", "context_pct", "cwd"),
     )
-    assert out == "gpt-5.4 · 68% · ~/projects/hermes"
+    assert out == "gpt-5.4 · xhigh · 68% · ~/projects/hermes"
 
 
 def test_format_footer_skips_missing_context_length():
@@ -147,20 +148,32 @@ def test_format_footer_unknown_field_silently_ignored():
     assert out == "gpt-5.4 · 50%"
 
 
+def test_format_footer_includes_disabled_reasoning_level():
+    out = format_runtime_footer(
+        model="openai/gpt-5.6-luna",
+        context_tokens=17,
+        context_length=100,
+        cwd="/tmp/workspace",
+        reasoning_effort="none",
+        fields=("model", "reasoning", "context_pct", "cwd"),
+    )
+    assert out == "gpt-5.6-luna · none · 17% · /tmp/workspace"
+
+
 # ---------------------------------------------------------------------------
 # resolve_footer_config
 # ---------------------------------------------------------------------------
 
 def test_resolve_defaults_off_empty_config():
     cfg = resolve_footer_config({}, "telegram")
-    assert cfg == {"enabled": False, "fields": ["model", "context_pct", "cwd"]}
+    assert cfg == {"enabled": False, "fields": ["model", "reasoning", "context_pct", "cwd"]}
 
 
 def test_resolve_global_enable():
     user = {"display": {"runtime_footer": {"enabled": True}}}
     cfg = resolve_footer_config(user, "telegram")
     assert cfg["enabled"] is True
-    assert cfg["fields"] == ["model", "context_pct", "cwd"]
+    assert cfg["fields"] == ["model", "reasoning", "context_pct", "cwd"]
 
 
 def test_resolve_platform_override_wins():
@@ -189,10 +202,44 @@ def test_resolve_platform_can_add_fields_only():
     }
     tg = resolve_footer_config(user, "telegram")
     assert tg["enabled"] is True
-    assert tg["fields"] == ["model", "context_pct", "cwd"]
+    assert tg["fields"] == ["model", "reasoning", "context_pct", "cwd"]
     dc = resolve_footer_config(user, "discord")
     assert dc["enabled"] is True
     assert dc["fields"] == ["context_pct"]
+
+
+def test_resolve_legacy_default_fields_adds_reasoning_immediately():
+    user = {
+        "display": {
+            "runtime_footer": {
+                "enabled": True,
+                "fields": ["model", "context_pct", "cwd"],
+            },
+            "platforms": {
+                "discord": {
+                    "runtime_footer": {
+                        "fields": ["model", "context_pct", "cwd"],
+                    },
+                },
+            },
+        },
+    }
+
+    assert resolve_footer_config(user, "telegram")["fields"] == [
+        "model", "reasoning", "context_pct", "cwd",
+    ]
+    assert resolve_footer_config(user, "discord")["fields"] == [
+        "model", "reasoning", "context_pct", "cwd",
+    ]
+
+
+def test_resolve_preserves_intentional_custom_fields():
+    user = {
+        "display": {
+            "runtime_footer": {"enabled": True, "fields": ["model", "cwd"]},
+        },
+    }
+    assert resolve_footer_config(user, "telegram")["fields"] == ["model", "cwd"]
 
 
 def test_resolve_ignores_malformed_config():
@@ -224,10 +271,12 @@ def test_build_footer_returns_rendered_when_enabled(monkeypatch, tmp_path):
         platform_key="telegram",
         model="openai/gpt-5.4",
         context_tokens=25, context_length=100,
+        reasoning_effort="medium",
         cwd=str(tmp_path / "proj"),
     )
     (tmp_path / "proj").mkdir(exist_ok=True)
     assert "gpt-5.4" in out
+    assert "medium" in out
     assert "25%" in out
 
 

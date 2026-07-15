@@ -751,6 +751,46 @@ class TestInterimAssistantMessageConfig:
         assert raw["display"]["interim_assistant_messages"] is True
 
 
+class TestRuntimeFooterReasoningMigration:
+    def test_migrate_to_v25_adds_reasoning_to_legacy_default_fields(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 24,
+                    "display": {
+                        "runtime_footer": {
+                            "enabled": True,
+                            "fields": ["model", "context_pct", "cwd"],
+                        },
+                        "platforms": {
+                            "discord": {
+                                "runtime_footer": {
+                                    "fields": ["model", "context_pct", "cwd"],
+                                },
+                            },
+                            "slack": {
+                                "runtime_footer": {"fields": ["model", "cwd"]},
+                            },
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        expected_fields = ["model", "reasoning", "context_pct", "cwd"]
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert raw["display"]["runtime_footer"]["fields"] == expected_fields
+        assert raw["display"]["platforms"]["discord"]["runtime_footer"]["fields"] == expected_fields
+        assert raw["display"]["platforms"]["slack"]["runtime_footer"]["fields"] == ["model", "cwd"]
+        assert "display.runtime_footer.fields (added reasoning)" in results["config_added"]
+
+
 class TestDiscordChannelPromptsConfig:
     def test_default_config_includes_discord_channel_prompts(self):
         assert DEFAULT_CONFIG["discord"]["channel_prompts"] == {}
