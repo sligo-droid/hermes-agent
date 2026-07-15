@@ -13,7 +13,9 @@ Sidebar is updated to nest all per-skill pages under Skills → Bundled / Option
 """
 
 from __future__ import annotations
+import argparse
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,11 @@ SKILL_SOURCES = [
 # Pages the user had previously hand-written in user-guide/skills/.
 # We leave these alone (they get first-class sidebar treatment separately).
 HAND_WRITTEN = {"google-workspace.md"}
+
+GENERATED_NOTICE = (
+    "{/* This page is auto-generated from the skill's SKILL.md by "
+    "website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}"
+)
 
 
 _FENCE_RE = re.compile(r"^(?P<indent>\s*)(?P<fence>```+|~~~+)", re.MULTILINE)
@@ -429,7 +436,7 @@ def render_skill_page(
         f'description: "{fm_desc}"\n'
         "---\n"
         "\n"
-        "{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}\n"
+        f"{GENERATED_NOTICE}\n"
         "\n"
         f"# {display_name}\n"
         "\n"
@@ -650,7 +657,7 @@ def _render_sidebar_item(item: Any, indent: int) -> list[str]:
     return lines
 
 
-def write_sidebar(entries):
+def render_sidebar_text(entries, text: str | None = None) -> str:
     # Sidebar layout:
     #   Skills
     #   ├── reference/skills-catalog
@@ -695,16 +702,9 @@ def write_sidebar(entries):
     skills_subtree = "\n".join(_render_sidebar_item(skills_top, 8)) + "\n"
 
     sidebar_path = REPO / "website" / "sidebars.ts"
-    text = sidebar_path.read_text(encoding="utf-8")
-    # Replace the existing Skills block.
-    pattern = re.compile(
-        r"        \{\n"
-        r"          type: 'category',\n"
-        r"          label: 'Skills',\n"
-        r"(?:.*?\n)*?"
-        r"        \},\n",
-        re.DOTALL,
-    )
+    if text is None:
+        text = sidebar_path.read_text(encoding="utf-8")
+
     # Safer: match the exact current block shape.
     old_block_start = "        {\n          type: 'category',\n          label: 'Skills',\n"
     i = text.find(old_block_start)
@@ -727,47 +727,174 @@ def write_sidebar(entries):
     else:
         raise RuntimeError("Could not find end of Skills sidebar block")
 
-    new_text = text[:i] + skills_subtree + text[end:]
-    sidebar_path.write_text(new_text, encoding="utf-8")
+    return text[:i] + skills_subtree + text[end:]
+
+
+def write_sidebar(entries):
+    sidebar_path = REPO / "website" / "sidebars.ts"
+    sidebar_path.write_text(render_sidebar_text(entries), encoding="utf-8")
     print(f"Updated sidebar: {sidebar_path}")
 
 
-def main():
-    entries = discover_skills()
-    print(f"Discovered {len(entries)} skills")
-
-    # Build name -> meta index for related-skill cross-linking
+def build_skill_index(entries: list[tuple[dict[str, Any], dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """Build name -> meta index for related-skill cross-linking."""
     skill_index: dict[str, dict[str, Any]] = {}
     for meta, parsed in entries:
         name = parsed["frontmatter"].get("name", meta["slug"])
-        # Prefer bundled over optional if a name collision exists
+        # Prefer bundled over optional if a name collision exists.
         if name not in skill_index or meta["source_kind"] == "bundled":
             skill_index[name] = meta
+    return skill_index
 
-    # Write per-skill pages
-    written = 0
+
+def build_expected_outputs(
+    entries: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[Path, str]:
+    """Render every English generated output without writing files."""
+    skill_index = build_skill_index(entries)
+    outputs: dict[Path, str] = {}
+
     for meta, parsed in entries:
-        out_path = page_output_path(meta)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        content = render_skill_page(
+        outputs[page_output_path(meta)] = render_skill_page(
             meta, parsed["frontmatter"], parsed["body"], skill_index=skill_index
         )
+
+    outputs[DOCS / "reference" / "skills-catalog.md"] = build_catalog_md_bundled(entries)
+    outputs[DOCS / "reference" / "optional-skills-catalog.md"] = build_catalog_md_optional(entries)
+    outputs[REPO / "website" / "sidebars.ts"] = render_sidebar_text(entries)
+    return outputs
+
+
+def expected_skill_page_paths(outputs: dict[Path, str]) -> set[Path]:
+    expected: set[Path] = set()
+    for path in outputs:
+        if not path.is_relative_to(SKILLS_PAGES) or path.suffix != ".md":
+            continue
+        rel = path.relative_to(SKILLS_PAGES)
+        if rel.parts and rel.parts[0] in {"bundled", "optional"}:
+            expected.add(path)
+    return expected
+
+
+def find_orphan_skill_pages(expected_paths: set[Path]) -> list[Path]:
+    """Find tracked English generated skill pages no longer produced by sources.
+
+    Deliberately scans only website/docs/user-guide/skills/{bundled,optional};
+    zh-Hans generated pages live under website/i18n and are left untouched.
+    """
+    orphans: list[Path] = []
+    for source in ("bundled", "optional"):
+        base = SKILLS_PAGES / source
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*.md")):
+            if path not in expected_paths:
+                orphans.append(path)
+    return orphans
+
+
+def is_generated_skill_page(path: Path) -> bool:
+    try:
+        return GENERATED_NOTICE in path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+
+
+def compare_generated_outputs(
+    expected_outputs: dict[Path, str],
+    orphan_paths: list[Path],
+) -> list[str]:
+    issues: list[str] = []
+    for path, expected in sorted(expected_outputs.items(), key=lambda item: str(item[0])):
+        if not path.exists():
+            issues.append(f"missing: {path.relative_to(REPO)}")
+            continue
+        actual = path.read_text(encoding="utf-8")
+        if actual != expected:
+            issues.append(f"stale: {path.relative_to(REPO)}")
+
+    for path in orphan_paths:
+        label = "orphan"
+        if not is_generated_skill_page(path):
+            label = "orphan-unmarked"
+        issues.append(f"{label}: {path.relative_to(REPO)}")
+
+    return issues
+
+
+def remove_orphan_skill_pages(orphan_paths: list[Path]) -> None:
+    for path in orphan_paths:
+        if not is_generated_skill_page(path):
+            print(f"Skipped unmarked orphan: {path}")
+            continue
+        path.unlink()
+        print(f"Removed orphan generated page: {path}")
+        parent = path.parent
+        while parent != SKILLS_PAGES and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+
+def generate(*, check: bool = False) -> int:
+    entries = discover_skills()
+    print(f"Discovered {len(entries)} skills")
+    expected_outputs = build_expected_outputs(entries)
+    expected_pages = expected_skill_page_paths(expected_outputs)
+    orphan_pages = find_orphan_skill_pages(expected_pages)
+
+    if check:
+        issues = compare_generated_outputs(expected_outputs, orphan_pages)
+        if issues:
+            print("Generated skill docs are stale:", file=sys.stderr)
+            for issue in issues:
+                print(f"- {issue}", file=sys.stderr)
+            print(
+                "Run `python website/scripts/generate-skill-docs.py` and commit the English generated docs.",
+                file=sys.stderr,
+            )
+            return 1
+        print("Generated skill docs are up to date")
+        return 0
+
+    remove_orphan_skill_pages(orphan_pages)
+
+    # Write per-skill pages.
+    written = 0
+    for out_path, content in sorted(expected_outputs.items(), key=lambda item: str(item[0])):
+        if out_path == REPO / "website" / "sidebars.ts":
+            continue
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(content, encoding="utf-8")
-        written += 1
+        if out_path.is_relative_to(SKILLS_PAGES):
+            written += 1
     print(f"Wrote {written} per-skill pages under {SKILLS_PAGES}")
 
-    # Regenerate catalogs
-    bundled_catalog = build_catalog_md_bundled(entries)
-    (DOCS / "reference" / "skills-catalog.md").write_text(bundled_catalog, encoding="utf-8")
     print("Updated reference/skills-catalog.md")
-
-    optional_catalog = build_catalog_md_optional(entries)
-    (DOCS / "reference" / "optional-skills-catalog.md").write_text(optional_catalog, encoding="utf-8")
     print("Updated reference/optional-skills-catalog.md")
 
-    # Update sidebar
-    write_sidebar(entries)
+    # Update sidebar.
+    (REPO / "website" / "sidebars.ts").write_text(
+        expected_outputs[REPO / "website" / "sidebars.ts"],
+        encoding="utf-8",
+    )
+    print(f"Updated sidebar: {REPO / 'website' / 'sidebars.ts'}")
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Compare generated English skill docs/catalogs/sidebar with tracked files without writing.",
+    )
+    args = parser.parse_args(argv)
+    return generate(check=args.check)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

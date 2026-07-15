@@ -1103,6 +1103,11 @@ def _deliver_result(
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
+_SCRIPT_STREAM_HEAD_BYTES = 8 * 1024
+_SCRIPT_STREAM_TAIL_BYTES = 8 * 1024
+_CRON_CONTEXT_INJECTION_BUDGET = 12_000
+_CRON_SKILL_INJECTION_BUDGET = 12_000
+_CRON_IDENTIFIER_PREVIEW_CHARS = 1_200
 
 
 def _get_script_timeout() -> int:
@@ -1136,6 +1141,165 @@ def _get_script_timeout() -> int:
         logger.debug("Failed to load cron script timeout from config: %s", exc)
 
     return _DEFAULT_SCRIPT_TIMEOUT
+
+
+class _BoundedByteCapture:
+    """Keep first N and last N bytes while counting total observed bytes."""
+
+    def __init__(
+        self,
+        *,
+        head_limit: int = _SCRIPT_STREAM_HEAD_BYTES,
+        tail_limit: int = _SCRIPT_STREAM_TAIL_BYTES,
+    ) -> None:
+        self.head_limit = max(0, int(head_limit))
+        self.tail_limit = max(0, int(tail_limit))
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+        self._lock = threading.Lock()
+
+    def append(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        if not isinstance(chunk, (bytes, bytearray)):
+            chunk = bytes(chunk)
+        with self._lock:
+            self.total += len(chunk)
+            if len(self.head) < self.head_limit:
+                take = min(self.head_limit - len(self.head), len(chunk))
+                if take:
+                    self.head.extend(chunk[:take])
+            if self.tail_limit:
+                self.tail.extend(chunk)
+                if len(self.tail) > self.tail_limit:
+                    del self.tail[: len(self.tail) - self.tail_limit]
+
+    def render(self, label: str) -> str:
+        with self._lock:
+            total = self.total
+            head = bytes(self.head)
+            tail = bytes(self.tail)
+
+        if total <= len(head):
+            data = head
+        else:
+            tail_start = max(0, total - len(tail))
+            head_end = len(head)
+            if tail_start <= head_end:
+                overlap = head_end - tail_start
+                data = head + tail[overlap:]
+            else:
+                omitted = max(0, tail_start - head_end)
+                marker = (
+                    f"\n\n[... {label} truncated: omitted {omitted} bytes; "
+                    f"observed {total} bytes; kept first {len(head)} and last {len(tail)} bytes ...]\n\n"
+                ).encode("utf-8")
+                data = head + marker + tail
+        return data.decode("utf-8", errors="replace").strip()
+
+
+def _read_stream_bounded(stream: Any, capture: _BoundedByteCapture) -> None:
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            capture.append(chunk)
+    except Exception:
+        logger.debug("Cron script stream reader failed", exc_info=True)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _redact_script_stream(text: str) -> str:
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text)
+    except Exception:
+        return text
+
+
+def _head_tail_char_preview(text: str, max_chars: int, *, label: str) -> str:
+    text = str(text or "")
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+
+    marker = ""
+    available = max_chars
+    omitted = len(text)
+    for _ in range(4):
+        marker = (
+            f"\n\n[… {label} truncated: omitted {omitted} of {len(text)} chars; "
+            "kept head and tail.]\n\n"
+        )
+        available = max_chars - len(marker)
+        if available <= 0:
+            break
+        new_omitted = len(text) - available
+        if new_omitted == omitted:
+            break
+        omitted = new_omitted
+
+    if available <= 0:
+        return text[:max_chars]
+
+    head_chars = max(0, int(available * 0.70))
+    tail_chars = max(0, available - head_chars)
+    return text[:head_chars] + marker + (text[-tail_chars:] if tail_chars else "")
+
+
+class _AggregateTextBudget:
+    def __init__(self, max_chars: int, *, label_prefix: str) -> None:
+        self.remaining = max(0, int(max_chars))
+        self.label_prefix = label_prefix
+
+    def fit(self, text: str, label: str) -> str:
+        if self.remaining <= 0:
+            return ""
+        fitted = _head_tail_char_preview(
+            str(text or ""),
+            self.remaining,
+            label=f"{self.label_prefix} {label}".strip(),
+        )
+        self.remaining = max(0, self.remaining - len(fitted))
+        return fitted
+
+
+def _format_identifier_preview(identifiers: list[str], *, max_chars: int = _CRON_IDENTIFIER_PREVIEW_CHARS) -> str:
+    cleaned = [str(item).strip() for item in identifiers if str(item).strip()]
+    if not cleaned:
+        return "(none)"
+    full = ", ".join(cleaned)
+    if len(full) <= max_chars:
+        return full
+
+    def _candidate(head_count: int, tail_count: int) -> str:
+        head = cleaned[:head_count]
+        tail = cleaned[len(cleaned) - tail_count:] if tail_count else []
+        omitted = len(cleaned) - len(head) - len(tail)
+        return ", ".join([*head, f"… [{omitted} identifier(s) omitted] …", *tail])
+
+    best: tuple[int, int, str] | None = None
+    for head_count in range(1, len(cleaned)):
+        for tail_count in range(1, len(cleaned) - head_count + 1):
+            if head_count + tail_count >= len(cleaned):
+                continue
+            candidate = _candidate(head_count, tail_count)
+            if len(candidate) <= max_chars and (
+                best is None or head_count + tail_count > best[0] + best[1]
+            ):
+                best = (head_count, tail_count, candidate)
+    if best is None:
+        omitted = max(0, len(cleaned) - 1)
+        return f"{cleaned[0][:max(24, max_chars // 3)]} … [{omitted} identifier(s) omitted]"
+    return best[2]
 
 
 def _run_job_script(script_path: str) -> tuple[bool, str]:
@@ -1216,7 +1380,12 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     else:
         argv = [sys.executable, str(path)]
 
-    run_env = os.environ.copy()
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
+
+        run_env = _sanitize_subprocess_env(os.environ.copy())
+    except Exception:
+        run_env = os.environ.copy()
     run_env["HERMES_HOME"] = str(_get_hermes_home())
     try:
         from hermes_constants import get_subprocess_home
@@ -1229,28 +1398,53 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     try:
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
-        result = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
-            text=True,
-            timeout=script_timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             cwd=str(path.parent),
             env=run_env,
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        stdout_capture = _BoundedByteCapture()
+        stderr_capture = _BoundedByteCapture()
+        stdout_thread = threading.Thread(
+            target=_read_stream_bounded,
+            args=(proc.stdout, stdout_capture),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_read_stream_bounded,
+            args=(proc.stderr, stderr_capture),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
 
-        # Redact secrets from both stdout and stderr before any return path.
         try:
-            from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-            stderr = redact_sensitive_text(stderr)
-        except Exception:
-            pass
+            returncode = proc.wait(timeout=script_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            return False, f"Script timed out after {script_timeout}s: {path}"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+
+        stdout = _redact_script_stream(stdout_capture.render("stdout"))
+        stderr = _redact_script_stream(stderr_capture.render("stderr"))
+
+        if returncode != 0:
+            parts = [f"Script exited with code {returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -1259,8 +1453,6 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
         return True, stdout
 
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
@@ -1503,6 +1695,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
     skills = job.get("skills")
+    context_budget = _AggregateTextBudget(
+        _CRON_CONTEXT_INJECTION_BUDGET,
+        label_prefix="cron context",
+    )
 
     proposal = _self_improvement_proposal_config(job)
     if proposal is not None:
@@ -1521,6 +1717,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if success:
             if script_output:
                 script_output = _scan_trusted_cron_context(str(script_output), job)
+                script_output = context_budget.fit(script_output, "script output")
                 prompt = (
                     "## Script Output\n"
                     "The following data was collected by a pre-run script. "
@@ -1533,6 +1730,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 return None
         else:
             script_output = _scan_trusted_cron_context(str(script_output), job)
+            script_output = context_budget.fit(script_output, "script error")
             prompt = (
                 "## Script Error\n"
                 "The data-collection script failed. Report this to the user.\n\n"
@@ -1569,12 +1767,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 if not output_files:
                     continue  # silent skip — no output yet
                 latest_output = output_files[0].read_text(encoding="utf-8").strip()
-                # Truncate to 8K characters to avoid prompt bloat
-                _MAX_CONTEXT_CHARS = 8000
-                if len(latest_output) > _MAX_CONTEXT_CHARS:
-                    latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
                 if latest_output:
                     latest_output = _scan_trusted_cron_context(latest_output, job)
+                    latest_output = context_budget.fit(
+                        latest_output,
+                        f"context_from {source_job_id}",
+                    )
+                if latest_output:
                     prompt = (
                         f"## Output from job '{source_job_id}'\n"
                         "The following is the most recent output from a preceding "
@@ -1615,49 +1814,95 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
-    from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
+    from agent.skill_bundles import get_skill_bundles, resolve_bundle_command_key
 
-    parts = []
+    parts: list[str] = []
     skipped: list[str] = []
-    for skill_name in skill_names:
-        bundle_key = resolve_bundle_command_key(skill_name)
-        if bundle_key:
-            bundle_message = build_bundle_invocation_message(bundle_key)
-            if bundle_message is not None:
-                message, _loaded, missing = bundle_message
-                if parts:
-                    parts.append("")
-                parts.append(_sanitize_trusted_skill_content(message))
-                skipped.extend(missing)
-                continue
+    bundles = get_skill_bundles()
+
+    def _load_cron_skill_overview(skill_name: str) -> tuple[str | None, str | None]:
         try:
-            loaded = json.loads(skill_view(skill_name, full_content=True))
+            loaded = json.loads(skill_view(skill_name, full_content=False))
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
-            skipped.append(skill_name)
-            continue
+            logger.warning(
+                "Cron job '%s': skill '%s' returned invalid JSON, skipping",
+                job.get("name", job.get("id")),
+                skill_name,
+            )
+            return None, None
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
-            skipped.append(skill_name)
-            continue
+            logger.warning(
+                "Cron job '%s': skill not found, skipping — %s",
+                job.get("name", job.get("id")),
+                error,
+            )
+            return None, None
 
-        # Bump usage so the curator sees this skill as actively used.
+        display_name = str(loaded.get("name") or skill_name)
         try:
-            bump_use(skill_name)
+            bump_use(display_name)
         except Exception:
-            logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
+            logger.debug(
+                "Cron job: failed to bump skill usage for '%s'",
+                display_name,
+                exc_info=True,
+            )
 
         content = _sanitize_trusted_skill_content(str(loaded.get("content") or "").strip())
-        if parts:
-            parts.append("")
-        parts.extend(
+        block = "\n".join(
             [
-                f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
+                (
+                    f'[IMPORTANT: The "{display_name}" skill is attached to this cron job '
+                    "as a bounded overview. Follow applicable instructions, and call "
+                    f'skill_view(name="{display_name}", full_content=true) if the complete '
+                    "SKILL.md is needed.]"
+                ),
                 "",
                 content,
             ]
         )
+        return block, display_name
+
+    for skill_name in skill_names:
+        bundle_key = resolve_bundle_command_key(skill_name)
+        if bundle_key and bundle_key in bundles:
+            info = bundles[bundle_key]
+            bundle_name = str(info.get("name") or skill_name)
+            bundle_skills = [str(s).strip() for s in (info.get("skills") or []) if str(s).strip()]
+            bundle_blocks: list[str] = []
+            loaded_bundle_names: list[str] = []
+            for member in bundle_skills:
+                block, display_name = _load_cron_skill_overview(member)
+                if block:
+                    bundle_blocks.append(block)
+                    if display_name:
+                        loaded_bundle_names.append(display_name)
+                else:
+                    skipped.append(member)
+            if bundle_blocks:
+                if parts:
+                    parts.append("")
+                bundle_header = [
+                    f'[IMPORTANT: The "{bundle_name}" skill bundle is attached to this cron job '
+                    f"with {len(loaded_bundle_names)} bounded skill overview(s).]",
+                    f"Bundle: {bundle_name}",
+                    f"Skills loaded: {', '.join(loaded_bundle_names)}",
+                ]
+                extra_instruction = str(info.get("instruction") or "").strip()
+                if extra_instruction:
+                    bundle_header.append(f"Bundle instruction: {extra_instruction}")
+                parts.append("\n".join(bundle_header))
+                parts.extend(bundle_blocks)
+            continue
+
+        block, display_name = _load_cron_skill_overview(skill_name)
+        if block:
+            if parts:
+                parts.append("")
+            parts.append(block)
+        else:
+            skipped.append(skill_name)
 
     if skipped:
         notice = (
@@ -1668,9 +1913,25 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         )
         parts.insert(0, notice)
 
+    skill_header = (
+        "[Cron skill injection budget: bounded skill overview(s), "
+        f"{_CRON_SKILL_INJECTION_BUDGET:,} characters total. "
+        f"Ordered skill identifiers: {_format_identifier_preview(skill_names)}. "
+        "Call skill_view(name, full_content=true) if the complete SKILL.md is needed.]"
+    )
+    skill_text = _head_tail_char_preview(
+        "\n\n".join([skill_header, *parts]),
+        _CRON_SKILL_INJECTION_BUDGET,
+        label="cron skill injection",
+    )
     if prompt:
-        parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return "\n".join(parts)
+        return "\n\n".join(
+            [
+                skill_text,
+                f"The user has provided the following instruction alongside the skill invocation: {prompt}",
+            ]
+        )
+    return skill_text
 
 
 def _sanitize_trusted_skill_content(text: str) -> str:

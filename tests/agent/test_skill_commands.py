@@ -8,6 +8,7 @@ import pytest
 
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
+    build_automatic_skills_message,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
     resolve_skill_command_key,
@@ -466,6 +467,59 @@ class TestBuildPreloadedSkillsPrompt:
         assert "present-skill" in prompt
         assert loaded == ["present-skill"]
         assert missing == ["missing-skill"]
+
+
+class TestAutomaticSkillLoading:
+    def test_explicit_invocation_requests_full_content(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "full-skill", body="Complete instructions.")
+            scan_skill_commands()
+            with patch(
+                "tools.skills_tool.skill_view",
+                wraps=skills_tool_module.skill_view,
+            ) as skill_view_spy:
+                msg = build_skill_invocation_message("/full-skill", "do it")
+
+        assert msg is not None
+        assert skill_view_spy.call_args.kwargs["full_content"] is True
+        assert "The full skill content is loaded below" in msg
+
+    def test_automatic_batch_requests_bounded_overview_and_caps_skill_block(self, tmp_path):
+        large_body = "HEAD-" + ("x" * 30_000) + "-TAIL"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "auto-skill", body=large_body)
+            with patch(
+                "tools.skills_tool.skill_view",
+                wraps=skills_tool_module.skill_view,
+            ) as skill_view_spy:
+                msg, loaded, missing = build_automatic_skills_message(
+                    ["auto-skill"],
+                    user_text="User payload stays outside the skill budget.",
+                    task_id="auto-test",
+                    source_label="test binding",
+                )
+
+        assert missing == []
+        assert loaded == ["auto-skill"]
+        assert msg is not None
+        assert skill_view_spy.call_args.kwargs["full_content"] is False
+        skill_block, user_text = msg.rsplit("User payload stays outside the skill budget.", 1)
+        assert len(skill_block) <= 12_000
+        assert "Automatic skill injection budget" in skill_block
+        assert "bounded overview" in skill_block
+        assert "auto-skill" in skill_block
+        assert user_text == ""
+
+    def test_identifier_preview_reports_exact_omission_count(self):
+        import agent.skill_commands as sc_mod
+
+        identifiers = [f"skill-{idx:02d}" for idx in range(20)]
+        preview = sc_mod._format_identifier_preview(identifiers, max_chars=80)
+
+        assert "identifier(s) omitted" in preview
+        assert "skill-00" in preview
+        assert "skill-19" in preview
+        assert "[15 identifier(s) omitted]" in preview
 
 
 class TestBuildSkillInvocationMessage:

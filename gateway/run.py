@@ -12033,27 +12033,18 @@ class GatewayRunner:
         if _is_new_session and _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
-                from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _combined_parts: list[str] = []
-                _loaded_names: list[str] = []
-                for _sname in _skill_names:
-                    _loaded = _load_skill_payload(_sname, task_id=_quick_key)
-                    if _loaded:
-                        _loaded_skill, _skill_dir, _display_name = _loaded
-                        _note = (
-                            f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                            f"Follow its instructions for this session.]"
-                        )
-                        _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
-                        if _part:
-                            _combined_parts.append(_part)
-                            _loaded_names.append(_sname)
-                    else:
-                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
-                if _combined_parts:
-                    # Append the user's original text after all skill payloads
-                    _combined_parts.append(event.text)
-                    event.text = "\n\n".join(_combined_parts)
+                from agent.skill_commands import build_automatic_skills_message
+
+                _auto_msg, _loaded_names, _missing_names = build_automatic_skills_message(
+                    _skill_names,
+                    user_text=event.text,
+                    task_id=_quick_key,
+                    source_label="gateway channel/topic binding",
+                )
+                for _sname in _missing_names:
+                    logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
+                if _auto_msg:
+                    event.text = _auto_msg
                     logger.info(
                         "[Gateway] Auto-loaded skill(s) %s for session %s",
                         _loaded_names, session_key,

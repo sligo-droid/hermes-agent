@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+AUTOMATIC_SKILL_INJECTION_BUDGET = 12_000
+_AUTOMATIC_SKILL_IDENTIFIER_PREVIEW_CHARS = 1_200
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -135,7 +137,119 @@ def _resolve_skill_commands_platform() -> Optional[str]:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
 
-def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
+
+def _coerce_identifier_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    try:
+        return [str(item).strip() for item in value if str(item).strip()]
+    except TypeError:
+        return []
+
+
+def _format_identifier_preview(
+    identifiers: list[str],
+    *,
+    max_chars: int = _AUTOMATIC_SKILL_IDENTIFIER_PREVIEW_CHARS,
+) -> str:
+    """Render an ordered skill-id list, head/tail bounding very long lists."""
+    cleaned = [str(item).strip() for item in identifiers if str(item).strip()]
+    if not cleaned:
+        return "(none)"
+
+    full = ", ".join(cleaned)
+    if len(full) <= max_chars:
+        return full
+
+    def _candidate(head_count: int, tail_count: int) -> str:
+        head = cleaned[:head_count]
+        tail = cleaned[len(cleaned) - tail_count:] if tail_count else []
+        omitted = len(cleaned) - len(head) - len(tail)
+        return ", ".join(
+            [
+                *head,
+                f"… [{omitted} identifier(s) omitted] …",
+                *tail,
+            ]
+        )
+
+    best: tuple[int, int, str] | None = None
+    for head_count in range(1, len(cleaned)):
+        for tail_count in range(1, len(cleaned) - head_count + 1):
+            if head_count + tail_count >= len(cleaned):
+                continue
+            candidate = _candidate(head_count, tail_count)
+            if len(candidate) <= max_chars and (
+                best is None or head_count + tail_count > best[0] + best[1]
+            ):
+                best = (head_count, tail_count, candidate)
+
+    if best is None:
+        omitted = max(0, len(cleaned) - 1)
+        first = cleaned[0]
+        return f"{first[:max(24, max_chars // 3)]} … [{omitted} identifier(s) omitted]"
+    return best[2]
+
+
+def _head_tail_char_preview(text: str, max_chars: int, *, label: str) -> str:
+    """Keep a deterministic head/tail preview with an exact omission count."""
+    text = str(text or "")
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+
+    marker = ""
+    available = max_chars
+    omitted = len(text)
+    for _ in range(4):
+        marker = (
+            f"\n\n[… {label} truncated: omitted {omitted} of {len(text)} chars; "
+            "kept head and tail.]\n\n"
+        )
+        available = max_chars - len(marker)
+        if available <= 0:
+            break
+        new_omitted = len(text) - available
+        if new_omitted == omitted:
+            break
+        omitted = new_omitted
+
+    if available <= 0:
+        return text[:max_chars]
+
+    head_chars = max(0, int(available * 0.70))
+    tail_chars = max(0, available - head_chars)
+    return text[:head_chars] + marker + (text[-tail_chars:] if tail_chars else "")
+
+
+def _mark_automatic_skill_payload(
+    loaded_skill: dict[str, Any],
+    *,
+    identifiers: list[str] | None,
+    skill_identifier: str,
+    display_name: str,
+    source: str,
+) -> None:
+    ordered = _coerce_identifier_list(identifiers)
+    current = str(skill_identifier or display_name).strip()
+    loaded_skill["_hermes_automatic_skill_injection"] = True
+    loaded_skill["_hermes_automatic_skill_source"] = source or "automatic"
+    loaded_skill["_hermes_automatic_skill_identifier"] = current or skill_identifier or display_name
+    loaded_skill["_hermes_automatic_skill_identifiers"] = ordered or [current or skill_identifier or display_name]
+
+
+def _load_skill_payload(
+    skill_identifier: str,
+    task_id: str | None = None,
+    *,
+    full_content: bool | None = None,
+    automatic: bool = False,
+    automatic_identifiers: list[str] | None = None,
+    automatic_source: str = "automatic",
+) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
     if not raw_identifier:
@@ -144,6 +258,9 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
         from agent.skill_utils import get_external_skills_dirs
+
+        if full_content is None:
+            full_content = not automatic
 
         identifier_path = Path(raw_identifier).expanduser()
         if identifier_path.is_absolute():
@@ -180,7 +297,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
                 normalized,
                 task_id=task_id,
                 preprocess=False,
-                full_content=True,
+                full_content=bool(full_content),
             )
         )
     except Exception:
@@ -204,6 +321,15 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
             skill_dir = SKILLS_DIR / Path(skill_path).parent
         except Exception:
             skill_dir = None
+
+    if automatic:
+        _mark_automatic_skill_payload(
+            loaded_skill,
+            identifiers=automatic_identifiers or [raw_identifier],
+            skill_identifier=raw_identifier,
+            display_name=skill_name,
+            source=automatic_source,
+        )
 
     return loaded_skill, skill_dir, skill_name
 
@@ -258,6 +384,7 @@ def _build_skill_message(
     """Format a loaded skill into a user/system message payload."""
     from tools.skills_tool import SKILLS_DIR
 
+    is_automatic = bool(loaded_skill.get("_hermes_automatic_skill_injection"))
     content = str(loaded_skill.get("content") or "")
 
     # ── Template substitution and inline-shell expansion ──
@@ -271,6 +398,23 @@ def _build_skill_message(
         content = _expand_inline_shell(content, skill_dir, timeout)
 
     parts = [activation_note, "", content.strip()]
+
+    if is_automatic:
+        _skill_name = str(
+            loaded_skill.get("name")
+            or loaded_skill.get("_hermes_automatic_skill_identifier")
+            or "this skill"
+        )
+        parts.extend(
+            [
+                "",
+                (
+                    f"[Automatic skill load note: this is a bounded overview of {_skill_name}, "
+                    "not a guaranteed complete SKILL.md. If the detailed procedure matters, "
+                    f'call skill_view(name="{_skill_name}", full_content=true) before acting.]'
+                ),
+            ]
+        )
 
     # ── Inject the absolute skill directory so the agent can reference
     #    bundled scripts without an extra skill_view() round-trip. ──
@@ -314,7 +458,7 @@ def _build_skill_message(
         if isinstance(entries, list):
             supporting.extend(entries)
 
-    if not supporting and skill_dir:
+    if not supporting and skill_dir and not is_automatic:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
             if subdir_path.exists():
@@ -524,6 +668,7 @@ def build_skill_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     runtime_note: str = "",
+    automatic: bool = False,
 ) -> Optional[str]:
     """Build the user message content for a skill slash command invocation.
 
@@ -539,7 +684,15 @@ def build_skill_invocation_message(
     if not skill_info:
         return None
 
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
+    is_automatic = bool(automatic)
+    loaded = _load_skill_payload(
+        skill_info["skill_dir"],
+        task_id=task_id,
+        full_content=not is_automatic,
+        automatic=is_automatic,
+        automatic_identifiers=[skill_info.get("name") or cmd_key.lstrip("/")],
+        automatic_source="automatic",
+    )
     if not loaded:
         return None
 
@@ -552,10 +705,17 @@ def build_skill_invocation_message(
     except Exception:
         pass  # Non-critical — skill invocation proceeds regardless
 
-    activation_note = (
-        f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
-        "you to follow its instructions. The full skill content is loaded below.]"
-    )
+    if is_automatic:
+        activation_note = (
+            f'[IMPORTANT: The "{skill_name}" skill is automatically attached to this turn. '
+            "A bounded overview is loaded below; follow it where applicable and load the "
+            "complete skill with skill_view(..., full_content=true) if needed.]"
+        )
+    else:
+        activation_note = (
+            f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
     return _build_skill_message(
         loaded_skill,
         skill_dir,
@@ -564,6 +724,98 @@ def build_skill_invocation_message(
         runtime_note=runtime_note,
         session_id=task_id,
     )
+
+
+def _apply_automatic_skill_batch_budget(
+    skill_blocks: list[str],
+    *,
+    identifiers: list[str],
+    budget: int = AUTOMATIC_SKILL_INJECTION_BUDGET,
+) -> str:
+    ordered = _format_identifier_preview(identifiers)
+    header = (
+        "[Automatic skill injection budget: bounded skill overview(s), "
+        f"{budget:,} characters total. "
+        f"Ordered skill identifiers: {ordered}. "
+        "Call skill_view(name, full_content=true) if the complete SKILL.md is needed.]"
+    )
+    return _head_tail_char_preview(
+        "\n\n".join([header, *skill_blocks]),
+        budget,
+        label="automatic skill injection",
+    )
+
+
+def build_automatic_skills_message(
+    skill_identifiers: list[str] | str,
+    user_text: str = "",
+    task_id: str | None = None,
+    *,
+    source_label: str = "automatic",
+    budget: int = AUTOMATIC_SKILL_INJECTION_BUDGET,
+) -> tuple[Optional[str], list[str], list[str]]:
+    """Load automatic skill bindings as bounded overviews under one budget.
+
+    This is for channel/topic bindings, webhook routes, and similar
+    system-configured injections. Direct user slash/CLI loads should continue
+    to use ``build_skill_invocation_message`` or ``build_preloaded_skills_prompt``
+    so they receive the complete skill body.
+    """
+    identifiers = _coerce_identifier_list(skill_identifiers)
+    if not identifiers:
+        return None, [], []
+
+    skill_blocks: list[str] = []
+    loaded_names: list[str] = []
+    missing: list[str] = []
+
+    for identifier in identifiers:
+        loaded = _load_skill_payload(
+            identifier,
+            task_id=task_id,
+            full_content=False,
+            automatic=True,
+            automatic_identifiers=identifiers,
+            automatic_source=source_label,
+        )
+        if not loaded:
+            missing.append(identifier)
+            continue
+
+        loaded_skill, skill_dir, skill_name = loaded
+        try:
+            from tools.skill_usage import bump_use
+            bump_use(skill_name)
+        except Exception:
+            pass
+
+        activation_note = (
+            f'[IMPORTANT: The "{skill_name}" skill is automatically attached '
+            f"by {source_label}. A bounded overview is loaded below; follow it "
+            "where applicable and load the complete skill with "
+            "skill_view(..., full_content=true) if needed.]"
+        )
+        block = _build_skill_message(
+            loaded_skill,
+            skill_dir,
+            activation_note,
+            session_id=task_id,
+        )
+        if block:
+            skill_blocks.append(block)
+            loaded_names.append(skill_name)
+
+    if not skill_blocks:
+        return None, loaded_names, missing
+
+    message = _apply_automatic_skill_batch_budget(
+        skill_blocks,
+        identifiers=identifiers,
+        budget=budget,
+    )
+    if user_text:
+        message = "\n\n".join([message, str(user_text)])
+    return message, loaded_names, missing
 
 
 def build_preloaded_skills_prompt(
@@ -585,7 +837,11 @@ def build_preloaded_skills_prompt(
             continue
         seen.add(identifier)
 
-        loaded = _load_skill_payload(identifier, task_id=task_id)
+        loaded = _load_skill_payload(
+            identifier,
+            task_id=task_id,
+            full_content=True,
+        )
         if not loaded:
             missing.append(identifier)
             continue

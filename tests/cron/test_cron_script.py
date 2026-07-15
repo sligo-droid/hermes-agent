@@ -197,6 +197,43 @@ class TestRunJobScript:
         parsed = json.loads(output)
         assert parsed["new_prs"][0]["number"] == 42
 
+    def test_large_stdout_preserves_bounded_head_and_tail(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "large_stdout.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.write('STDOUT_HEAD-' + ('x' * 30000) + '-STDOUT_TAIL')\n"
+        )
+
+        success, output = _run_job_script(str(script))
+
+        assert success is True
+        assert "STDOUT_HEAD-" in output
+        assert "-STDOUT_TAIL" in output
+        assert "stdout truncated" in output
+        assert "observed" in output
+        assert len(output) < 20_000
+
+    def test_large_stderr_failure_preserves_bounded_head_and_tail(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "large_stderr.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stderr.write('STDERR_HEAD-' + ('e' * 30000) + '-STDERR_TAIL')\n"
+            "sys.exit(7)\n"
+        )
+
+        success, output = _run_job_script(str(script))
+
+        assert success is False
+        assert "exited with code 7" in output
+        assert "STDERR_HEAD-" in output
+        assert "-STDERR_TAIL" in output
+        assert "stderr truncated" in output
+        assert "observed" in output
+
 
 class TestBuildJobPromptWithScript:
     """Test that script output is injected into the prompt."""
@@ -235,6 +272,35 @@ class TestBuildJobPromptWithScript:
         prompt = _build_job_prompt(job)
         assert "## Script Output" not in prompt
         assert "Simple job." in prompt
+
+    def test_script_and_context_from_share_aggregate_budget(self, cron_env):
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        upstream = create_job(prompt="Collect", schedule="every 1h")
+        out_dir = OUTPUT_DIR / upstream["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.joinpath("2026-04-22_10-00-00.md").write_text(
+            "CTX_HEAD-" + ("c" * 20_000) + "-CTX_TAIL",
+            encoding="utf-8",
+        )
+
+        job = {
+            "prompt": "Summarize both.",
+            "script": "data.py",
+            "context_from": [upstream["id"]],
+        }
+        prompt = _build_job_prompt(
+            job,
+            prerun_script=(True, "SCRIPT_HEAD-" + ("s" * 9_000) + "-SCRIPT_TAIL"),
+        )
+
+        assert "SCRIPT_HEAD-" in prompt
+        assert "-SCRIPT_TAIL" in prompt
+        assert "CTX_HEAD-" in prompt
+        assert "-CTX_TAIL" in prompt
+        assert "cron context context_from" in prompt
+        assert prompt.count("cron context") >= 1
 
 
 

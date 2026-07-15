@@ -38,9 +38,23 @@ Complete guide for managing the PR lifecycle. Each section shows the `gh` way fi
 - Authenticated with GitHub (see `github-auth` skill)
 - Inside a git repository with a GitHub remote
 
+## Worker and Canonical Checkout Boundary
+
+Workers are implementation and review inputs. The Hermes orchestrator owns the
+PR lifecycle, including merge and post-merge finalization. A worker must not
+mutate the protected canonical checkout (for example with `git -C <canonical>
+checkout`, `pull`, `merge`, `reset`, or equivalent commands) to
+"finish" a task or bypass the canonical guard.
+
+After a verified merge, canonical synchronization is performed only through
+the narrowly scoped `sync_canonical_checkout` Hermes orchestrator tool, which
+preserves the canonical checkout guard. A synchronization failure is
+terminal/retryable work, not a successful completion; do not report the task
+complete until the orchestrator has verified the required sync.
+
 ## Default PR Merge Policy
 
-For Sligo Labs coding work, **opening a PR is not the stopping point**. Unless the user explicitly asks for review-only/draft-only behavior, or a repo/client policy truly blocks merging, the agent owns the full lifecycle: open the PR, merge it to the default branch as soon as GitHub says it is mergeable, and delete the feature branch.
+For orchestrator-led Sligo Labs coding work, **opening a PR is not the stopping point**. Unless the user explicitly asks for review-only/draft-only behavior, or a repo/client policy truly blocks merging, the orchestrator owns the full lifecycle: open the PR, merge it to the default branch as soon as GitHub says it is mergeable, and delete the feature branch. Workers should stop at their implementation/review handoff.
 
 Treat phrases like "open a PR," "make a PR," "ship this," "continue this work," and ordinary implementation requests as permission to merge the PR yourself once it has no merge conflicts. Do not wait for CI/status checks before merging; trust the worker or local verification already performed during implementation.
 
@@ -197,15 +211,18 @@ To create as a draft, add `"draft": true` to the JSON body.
 
 ### Check CI Status
 
+Start the CI watch immediately after `gh pr create` (or equivalent API flow): SKIPPED conclusions count as complete, and the loop is done when no check is pending.
+
 **With gh:**
 
 ```bash
 # One-shot check
-gh pr checks
+gh pr checks <number>
 
-# Watch until all checks finish (polls every 10s)
-gh pr checks --watch
+# Watch until checks finish (polls every 10s; SKIPPED counts as completed)
+gh pr checks <number> --watch -i 10
 ```
+If checks are still running after ~5 minutes, stop watching and report `CI-still-running` with the PR URL; avoid fixed sleeps and do not re-list checks after watch exits.
 
 **With git + curl:**
 
@@ -238,9 +255,9 @@ for cr in data.get('check_runs', []):
 ### Poll Until Complete (git + curl)
 
 ```bash
-# Simple polling loop — check every 30 seconds, up to 10 minutes
+# Simple polling loop — check every 10 seconds, up to ~5 minutes
 SHA=$(git rev-parse HEAD)
-for i in $(seq 1 20); do
+for i in $(seq 1 30); do
   STATUS=$(curl -s \
     -H "Authorization: token $GITHUB_TOKEN" \
     https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
@@ -249,8 +266,11 @@ for i in $(seq 1 20); do
   if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
     break
   fi
-  sleep 30
+  sleep 10
 done
+if [ "$STATUS" != "success" ] && [ "$STATUS" != "failure" ] && [ "$STATUS" != "error" ]; then
+  echo "CI still running for PR: https://github.com/$OWNER/$REPO/pull/<number>"
+fi
 ```
 
 ## 5. Auto-Fixing CI Failures

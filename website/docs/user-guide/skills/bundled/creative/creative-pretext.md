@@ -1,14 +1,14 @@
 ---
-title: "Pretext"
+title: "Pretext — Creative text-layout browser demos with pretext"
 sidebar_label: "Pretext"
-description: "Use when building creative browser demos with @chenglou/pretext — DOM-free text layout for ASCII art, typographic flow around obstacles, text-as-geometry gam..."
+description: "Creative text-layout browser demos with pretext"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Pretext
 
-Use when building creative browser demos with @chenglou/pretext — DOM-free text layout for ASCII art, typographic flow around obstacles, text-as-geometry games, kinetic typography, and text-powered generative art. Produces single-file HTML demos by default.
+Creative text-layout browser demos with pretext.
 
 ## Skill metadata
 

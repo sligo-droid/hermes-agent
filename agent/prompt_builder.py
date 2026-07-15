@@ -920,6 +920,8 @@ _SKILLS_PROMPT_CACHE: OrderedDict[
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 _SKILLS_SNAPSHOT_VERSION = 1
 _LAST_INDEX_REPORT: dict[str, Any] | None = None
+SKILLS_INDEX_MAX_CHARS = 12_000
+SKILLS_CATEGORY_DESCRIPTION_MAX_CHARS = 160
 _SKILLS_INDEX_COMPACT_NOTICE = (
     "Note: some categories above are listed name-only to save context; "
     "skills_list shows full descriptions and skill_view(name) loads a bounded overview; "
@@ -1113,6 +1115,14 @@ def _category_is_compact(category: str, compact_categories: frozenset[str]) -> b
     return any(category.startswith(f"{parent}/") for parent in compact_categories)
 
 
+def _truncate_category_description(description: str) -> str:
+    """Bound category descriptions so one chatty DESCRIPTION.md cannot dominate."""
+    desc = " ".join(str(description or "").split())
+    if len(desc) <= SKILLS_CATEGORY_DESCRIPTION_MAX_CHARS:
+        return desc
+    return desc[: SKILLS_CATEGORY_DESCRIPTION_MAX_CHARS - 3].rstrip() + "..."
+
+
 def _dedup_sorted_skills(skills: list[tuple[str, str]]) -> list[tuple[str, str]]:
     deduped: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -1128,18 +1138,23 @@ def _render_skills_index_lines(
     skills_by_category: dict[str, list[tuple[str, str]]],
     category_descriptions: dict[str, str],
     compact_categories: frozenset[str],
+    omitted_categories: frozenset[str] = frozenset(),
 ) -> tuple[list[str], dict[str, dict[str, Any]], set[str]]:
     index_lines: list[str] = []
     category_report: dict[str, dict[str, Any]] = {}
     demoted_categories: set[str] = set()
     for category in sorted(skills_by_category.keys()):
-        cat_desc = category_descriptions.get(category, "")
+        deduped = _dedup_sorted_skills(skills_by_category[category])
+        if category in omitted_categories:
+            category_report[category] = {"skills": len(deduped), "tier": "omitted"}
+            continue
+
+        cat_desc = _truncate_category_description(category_descriptions.get(category, ""))
         if cat_desc:
             index_lines.append(f"  {category}: {cat_desc}")
         else:
             index_lines.append(f"  {category}:")
 
-        deduped = _dedup_sorted_skills(skills_by_category[category])
         names_only = _category_is_compact(category, compact_categories)
         tier = "names-only" if names_only else "full"
         category_report[category] = {"skills": len(deduped), "tier": tier}
@@ -1155,11 +1170,38 @@ def _render_skills_index_lines(
                 index_lines.append(f"    - {name}: {desc}")
             else:
                 index_lines.append(f"    - {name}")
+    if omitted_categories:
+        omitted_skill_count = sum(
+            len(_dedup_sorted_skills(skills_by_category.get(category, [])))
+            for category in omitted_categories
+        )
+        index_lines.append(
+            f"  [omitted {len(omitted_categories)} categories containing "
+            f"{omitted_skill_count} skills to stay under the skills-index budget; "
+            "use skills_list to search all skills]"
+        )
     return index_lines, category_report, demoted_categories
 
 
-def _format_skills_system_prompt(index_lines: list[str], *, include_notice: bool) -> str:
-    notice = f"{_SKILLS_INDEX_COMPACT_NOTICE}\n" if include_notice else ""
+def _format_skills_system_prompt(
+    index_lines: list[str],
+    *,
+    include_notice: bool,
+    include_omission_notice: bool = False,
+    omitted_category_count: int = 0,
+    omitted_skill_count: int = 0,
+) -> str:
+    notices = []
+    if include_notice:
+        notices.append(_SKILLS_INDEX_COMPACT_NOTICE)
+    if include_omission_notice:
+        notices.append(
+            f"Note: omitted {omitted_category_count} skill categories containing "
+            f"{omitted_skill_count} skills to keep the skills index under "
+            f"{SKILLS_INDEX_MAX_CHARS:,} characters; use skills_list to search "
+            "all skills and skill_view(name) to load a bounded overview."
+        )
+    notice = ("\n".join(notices) + "\n") if notices else ""
     return (
         "## Skills (summary index)\n"
         "Before replying, scan the skill summaries below. Treat them as routing hints, "
@@ -1203,14 +1245,32 @@ def _skills_index_debug_enabled() -> bool:
 def _build_skills_index_report(
     *,
     compact_categories: frozenset[str],
+    requested_compact_categories: frozenset[str],
+    auto_demoted_categories: frozenset[str],
+    omitted_categories: frozenset[str],
     category_report: dict[str, dict[str, Any]],
     full_equivalent: str,
     rendered: str,
 ) -> dict[str, Any] | None:
     try:
+        rendered_chars = len(rendered)
         report = {
-            "mode": "compact" if compact_categories else "full",
+            "mode": (
+                "capped"
+                if auto_demoted_categories or omitted_categories
+                else "compact" if compact_categories else "full"
+            ),
+            "char_cap": SKILLS_INDEX_MAX_CHARS,
+            "chars_rendered": rendered_chars,
             "compact_categories": sorted(compact_categories),
+            "requested_compact_categories": sorted(requested_compact_categories),
+            "auto_demoted_categories": sorted(auto_demoted_categories),
+            "omitted_categories": sorted(omitted_categories),
+            "omitted_category_count": len(omitted_categories),
+            "omitted_skill_count": sum(
+                int(category_report.get(category, {}).get("skills", 0))
+                for category in omitted_categories
+            ),
             "categories": {
                 category: {
                     "skills": int(info.get("skills", 0)),
@@ -1236,6 +1296,129 @@ def _build_skills_index_report(
         return report
     except Exception:
         return None
+
+
+def _render_skills_index_prompt_under_cap(
+    *,
+    skills_by_category: dict[str, list[tuple[str, str]]],
+    category_descriptions: dict[str, str],
+    requested_compact_categories: frozenset[str],
+) -> tuple[str, dict[str, dict[str, Any]], str, frozenset[str], frozenset[str], frozenset[str]]:
+    """Render the skills index, demoting/omitting deterministically to fit."""
+
+    def _omitted_skill_count(omitted: set[str]) -> int:
+        return sum(
+            len(_dedup_sorted_skills(skills_by_category.get(category, [])))
+            for category in omitted
+        )
+
+    def _render(
+        compact: set[str],
+        omitted: set[str],
+    ) -> tuple[str, dict[str, dict[str, Any]], set[str]]:
+        index_lines, category_report, demoted_categories = _render_skills_index_lines(
+            skills_by_category,
+            category_descriptions,
+            frozenset(compact),
+            frozenset(omitted),
+        )
+        rendered = _format_skills_system_prompt(
+            index_lines,
+            include_notice=bool(demoted_categories),
+            include_omission_notice=bool(omitted),
+            omitted_category_count=len(omitted),
+            omitted_skill_count=_omitted_skill_count(omitted),
+        )
+        return rendered, category_report, demoted_categories
+
+    full_index_lines, _full_report, _full_demoted = _render_skills_index_lines(
+        skills_by_category,
+        category_descriptions,
+        frozenset(),
+    )
+    full_equivalent = _format_skills_system_prompt(
+        full_index_lines,
+        include_notice=False,
+    )
+
+    compact = set(requested_compact_categories)
+    omitted: set[str] = set()
+    rendered, category_report, demoted_categories = _render(compact, omitted)
+    if len(rendered) <= SKILLS_INDEX_MAX_CHARS:
+        auto_demoted = frozenset(
+            category
+            for category in demoted_categories
+            if not _category_is_compact(category, requested_compact_categories)
+        )
+        return (
+            rendered,
+            category_report,
+            full_equivalent,
+            frozenset(compact),
+            auto_demoted,
+            frozenset(omitted),
+        )
+
+    # Demote full categories to names-only.  Pick the category that saves the
+    # most tokens on each pass; tie-break by category name for deterministic
+    # output.  Parent category demotion also demotes descendants via
+    # _category_is_compact(), so the measured trial savings capture that.
+    all_categories = sorted(skills_by_category)
+    while len(rendered) > SKILLS_INDEX_MAX_CHARS:
+        current_chars = len(rendered)
+        candidates: list[tuple[int, str, str, dict[str, dict[str, Any]], set[str]]] = []
+        for category in all_categories:
+            if category in compact or category in omitted:
+                continue
+            trial_compact = set(compact)
+            trial_compact.add(category)
+            trial_rendered, trial_report, trial_demoted = _render(trial_compact, omitted)
+            savings = current_chars - len(trial_rendered)
+            if savings > 0:
+                candidates.append(
+                    (savings, category, trial_rendered, trial_report, trial_demoted)
+                )
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        _savings, category, rendered, category_report, demoted_categories = candidates[0]
+        compact.add(category)
+
+    # If a huge skill universe still does not fit even names-only, omit whole
+    # categories.  Again choose the largest deterministic reduction each pass.
+    while len(rendered) > SKILLS_INDEX_MAX_CHARS:
+        current_chars = len(rendered)
+        candidates: list[tuple[int, str, str, dict[str, dict[str, Any]], set[str]]] = []
+        for category in all_categories:
+            if category in omitted:
+                continue
+            trial_omitted = set(omitted)
+            trial_omitted.add(category)
+            trial_rendered, trial_report, trial_demoted = _render(compact, trial_omitted)
+            savings = current_chars - len(trial_rendered)
+            if savings > 0:
+                candidates.append(
+                    (savings, category, trial_rendered, trial_report, trial_demoted)
+                )
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        _savings, category, rendered, category_report, demoted_categories = candidates[0]
+        omitted.add(category)
+
+    auto_demoted = frozenset(
+        category
+        for category in demoted_categories
+        if not _category_is_compact(category, requested_compact_categories)
+    )
+    return (
+        rendered,
+        category_report,
+        full_equivalent,
+        frozenset(compact),
+        auto_demoted,
+        frozenset(omitted),
+    )
 
 
 def build_skills_system_prompt(
@@ -1429,26 +1612,23 @@ def build_skills_system_prompt(
         with _SKILLS_PROMPT_CACHE_LOCK:
             _LAST_INDEX_REPORT = None
     else:
-        index_lines, category_report, demoted_categories = _render_skills_index_lines(
-            skills_by_category,
-            category_descriptions,
-            compact_category_set,
-        )
-        full_index_lines, _full_report, _full_demoted = _render_skills_index_lines(
-            skills_by_category,
-            category_descriptions,
-            frozenset(),
-        )
-        full_equivalent = _format_skills_system_prompt(
-            full_index_lines,
-            include_notice=False,
-        )
-        result = _format_skills_system_prompt(
-            index_lines,
-            include_notice=bool(demoted_categories),
+        (
+            result,
+            category_report,
+            full_equivalent,
+            effective_compact_categories,
+            auto_demoted_categories,
+            omitted_categories,
+        ) = _render_skills_index_prompt_under_cap(
+            skills_by_category=skills_by_category,
+            category_descriptions=category_descriptions,
+            requested_compact_categories=compact_category_set,
         )
         report = _build_skills_index_report(
-            compact_categories=compact_category_set,
+            compact_categories=effective_compact_categories,
+            requested_compact_categories=compact_category_set,
+            auto_demoted_categories=auto_demoted_categories,
+            omitted_categories=omitted_categories,
             category_report=category_report,
             full_equivalent=full_equivalent,
             rendered=result,

@@ -2,12 +2,17 @@
 
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent.memory_provider import MemoryProvider
-from agent.memory_manager import MemoryManager, sanitize_context
+from agent.memory_manager import (
+    MemoryManager,
+    inject_memory_provider_tools,
+    sanitize_context,
+)
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -230,7 +235,8 @@ class TestMemoryManager:
         mgr.add_provider(p2)
 
         result = mgr.prefetch_all("query")
-        assert result == "Has memories"
+        assert "Memory provider: builtin" in result
+        assert "Has memories" in result
 
     def test_queue_prefetch_all(self):
         mgr = MemoryManager()

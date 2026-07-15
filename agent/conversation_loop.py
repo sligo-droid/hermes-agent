@@ -35,7 +35,6 @@ from agent.error_classifier import (
     is_upstream_null_iterable_error,
 )
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -59,6 +58,11 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.runtime_breakdown import build_turn_runtime_breakdown
 from agent.retry_utils import jittered_backoff
+from agent.runtime_context_budget import (
+    RuntimeContextPart,
+    automatic_context_budget,
+    render_runtime_context_parts,
+)
 from agent.runtime_audit import runtime_audit_fields
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
@@ -223,6 +227,159 @@ def _estimate_request_tokens_for_progress(
         )
     except Exception:
         return 0
+
+
+def _build_automatic_runtime_context_parts(
+    *,
+    memory_context: str,
+    plugin_context: str,
+) -> list[RuntimeContextPart]:
+    """Return automatic context sources in deterministic priority order."""
+    parts: list[RuntimeContextPart] = []
+    if memory_context and memory_context.strip():
+        parts.append(
+            RuntimeContextPart(
+                label="memory prefetch",
+                text=memory_context,
+                fence="memory-context",
+            )
+        )
+    if plugin_context and plugin_context.strip():
+        parts.append(
+            RuntimeContextPart(
+                label="pre_llm_call hook output",
+                text=plugin_context,
+                fence="automatic-context",
+            )
+        )
+    return parts
+
+
+def _find_current_user_api_message(api_messages: list[dict[str, Any]]) -> int | None:
+    """Find the current turn's user message in the API-copy list.
+
+    The current user turn is the newest user-role message.  System and prefill
+    messages may have been inserted ahead of it, and tool/assistant messages may
+    trail it on later loop iterations, so index arithmetic against the persisted
+    ``messages`` list is brittle here.
+    """
+    for idx in range(len(api_messages) - 1, -1, -1):
+        msg = api_messages[idx]
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return idx
+    return None
+
+
+def _set_api_message_content_with_runtime_context(
+    api_msg: dict[str, Any],
+    original_content: Any,
+    runtime_context: str,
+) -> bool:
+    """Append runtime context to an API-copy user message only."""
+    if not runtime_context:
+        api_msg["content"] = original_content
+        return False
+    if isinstance(original_content, str):
+        api_msg["content"] = original_content.rstrip() + "\n\n" + runtime_context
+        return True
+    if isinstance(original_content, list):
+        blocks = list(original_content)
+        blocks.append({"type": "text", "text": runtime_context})
+        api_msg["content"] = blocks
+        return True
+    return False
+
+
+def _apply_automatic_runtime_context_budget(
+    agent: Any,
+    api_messages: list[dict[str, Any]],
+    runtime_context_parts: list[RuntimeContextPart],
+) -> None:
+    """Inject automatic context into ``api_messages`` under a model-aware cap.
+
+    This runs after the API-copy request has been assembled enough to estimate
+    the real request footprint (system prompt, prefill messages, history, and
+    tool schemas) but before prompt caching / provider sanitizers.  It never
+    mutates the persisted ``messages`` list.
+    """
+    if not runtime_context_parts:
+        return
+    user_idx = _find_current_user_api_message(api_messages)
+    if user_idx is None:
+        return
+    api_msg = api_messages[user_idx]
+    original_content = api_msg.get("content", "")
+
+    compressor = getattr(agent, "context_compressor", None)
+    threshold_tokens = getattr(compressor, "threshold_tokens", None)
+    context_length = getattr(compressor, "context_length", None)
+    base_request_tokens = estimate_request_tokens_rough(
+        api_messages,
+        tools=getattr(agent, "tools", None) or None,
+    )
+    budget_tokens = automatic_context_budget(
+        context_length=context_length,
+        threshold_tokens=threshold_tokens,
+        base_request_tokens=base_request_tokens,
+    )
+    render = render_runtime_context_parts(
+        runtime_context_parts,
+        budget_tokens=budget_tokens,
+    )
+    if not _set_api_message_content_with_runtime_context(
+        api_msg,
+        original_content,
+        render.text,
+    ):
+        return
+
+    # Post-assembly guard: wrapper overhead and rough-estimator wobble can put
+    # the request a little above threshold.  Re-render from the raw automatic
+    # context with the exact overage removed instead of touching persisted
+    # conversation messages or explicit retrieval/tool outputs.
+    final_request_tokens = estimate_request_tokens_rough(
+        api_messages,
+        tools=getattr(agent, "tools", None) or None,
+    )
+    if (
+        threshold_tokens
+        and final_request_tokens > int(threshold_tokens)
+        and render.text
+    ):
+        overage = final_request_tokens - int(threshold_tokens)
+        retry_budget = max(0, int(render.budget_tokens) - int(overage) - 32)
+        retry_render = render_runtime_context_parts(
+            runtime_context_parts,
+            budget_tokens=retry_budget,
+        )
+        api_msg["content"] = original_content
+        if _set_api_message_content_with_runtime_context(
+            api_msg,
+            original_content,
+            retry_render.text,
+        ):
+            render = retry_render
+            final_request_tokens = estimate_request_tokens_rough(
+                api_messages,
+                tools=getattr(agent, "tools", None) or None,
+            )
+
+    if render.changed:
+        try:
+            logger.info(
+                "automatic runtime context budget applied: budget=%s input=%s rendered=%s "
+                "base_request=%s final_request=%s threshold=%s truncated=%s omitted=%s",
+                render.budget_tokens,
+                render.input_tokens,
+                render.rendered_tokens,
+                base_request_tokens,
+                final_request_tokens,
+                threshold_tokens,
+                ",".join(render.truncated) or "-",
+                ",".join(render.omitted) or "-",
+            )
+        except Exception:
+            pass
 
 
 def _compression_made_progress(
@@ -1066,6 +1223,7 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    max_compression_attempts = 3
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     try:
         agent._provider_no_progress_start_turn()
@@ -1118,6 +1276,11 @@ def run_conversation(
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception as exc:
             logger.warning("memory prefetch failed; turn runs without recall context: %s", exc)
+
+    _automatic_runtime_context_parts = _build_automatic_runtime_context_parts(
+        memory_context=_ext_prefetch_cache,
+        plugin_context=_plugin_user_context,
+    )
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -1300,24 +1463,6 @@ def run_conversation(
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                _injections = []
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
-                if _plugin_user_context:
-                    _injections.append(_plugin_user_context)
-                if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
-
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
             agent._copy_reasoning_content_for_api(msg, api_msg)
@@ -1368,6 +1513,17 @@ def run_conversation(
             sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
+
+        # Inject automatic runtime context into the current user message after
+        # the API-copy request has been assembled, so its aggregate budget can
+        # account for system prompt, prefill messages, history, and tool
+        # schemas.  This remains API-call-time only — persisted messages are
+        # untouched, and explicit retrieval/tool results are not clipped here.
+        _apply_automatic_runtime_context_budget(
+            agent,
+            api_messages,
+            _automatic_runtime_context_parts,
+        )
 
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
@@ -1462,6 +1618,132 @@ def run_conversation(
             except Exception:
                 pass
             break
+
+        # This post-assembly path exists specifically for a request that is
+        # numerically over the compressor's safe threshold after ephemeral
+        # context and late schemas have been attached.  Do not use a mocked or
+        # advisory ``should_compress`` result alone here: the normal preflight
+        # owns that behavior, and retrying a request that already fits the
+        # numeric threshold can churn indefinitely.
+        _runtime_threshold_tokens = int(
+            getattr(agent.context_compressor, "threshold_tokens", 0) or 0
+        )
+        _runtime_request_exceeds_threshold = bool(
+            _runtime_threshold_tokens
+            and approx_request_tokens >= _runtime_threshold_tokens
+        )
+        if (
+            agent.compression_enabled
+            and _runtime_request_exceeds_threshold
+            and agent.context_compressor.should_compress(approx_request_tokens)
+        ):
+            compression_attempts += 1
+            if compression_attempts > max_compression_attempts:
+                agent._flush_status_buffer()
+                agent._vprint(
+                    f"{agent.log_prefix}❌ Request remains over the context threshold after "
+                    f"{max_compression_attempts} pre-dispatch compression attempts.",
+                    force=True,
+                )
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "messages": messages,
+                    "completed": False,
+                    "api_calls": api_call_count - 1,
+                    "error": (
+                        "Request remained over the context threshold before provider dispatch; "
+                        "compression attempts were exhausted."
+                    ),
+                    "partial": True,
+                    "failed": True,
+                    "compression_exhausted": True,
+                }
+
+            agent._buffer_status(
+                f"🗜️ Request is over the context threshold after runtime-context sizing "
+                f"(~{approx_request_tokens:,} tokens) — compressing "
+                f"({compression_attempts}/{max_compression_attempts})..."
+            )
+            _orig_len = len(messages)
+            _orig_tokens = approx_request_tokens
+            try:
+                messages, active_system_prompt = agent._compress_context(
+                    messages,
+                    system_message,
+                    approx_tokens=approx_request_tokens,
+                    task_id=effective_task_id,
+                )
+            except CompressionChurnError as exc:
+                return _compression_churn_result(
+                    agent,
+                    messages,
+                    conversation_history,
+                    api_call_count - 1,
+                    exc,
+                )
+
+            _next_tokens = _estimate_request_tokens_for_progress(
+                agent,
+                messages,
+                active_system_prompt,
+            )
+            if not _compression_made_progress(
+                original_len=_orig_len,
+                original_tokens=_orig_tokens,
+                messages=messages,
+                compressed_tokens=_next_tokens,
+            ):
+                _shrunken_messages, _shrunken_tokens, _shrink_stats = _emergency_shrink_context(
+                    agent,
+                    messages,
+                    active_system_prompt,
+                    original_tokens=_orig_tokens,
+                    target_tokens=getattr(agent.context_compressor, "threshold_tokens", None),
+                )
+                if _shrunken_tokens:
+                    logger.info(
+                        "Pre-dispatch emergency shrink reduced context estimate %s -> %s tokens (stats=%s)",
+                        f"{_orig_tokens:,}",
+                        f"{_shrunken_tokens:,}",
+                        _shrink_stats,
+                    )
+                    messages = _shrunken_messages
+                    _next_tokens = _shrunken_tokens
+                else:
+                    agent._flush_status_buffer()
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Request is over the context threshold and cannot compress further.",
+                        force=True,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count - 1,
+                        "error": (
+                            "Request exceeded the context threshold before provider dispatch. "
+                            "Normal compression and deterministic emergency shrink made no progress."
+                        ),
+                        "partial": True,
+                        "failed": True,
+                        "compression_exhausted": True,
+                    }
+
+            # Compression created a new session — clear history so the
+            # session DB flush writes the compressed messages to the new row.
+            conversation_history = None
+            agent._empty_content_retries = 0
+            agent._thinking_prefill_retries = 0
+            agent._last_content_with_tools = None
+            agent._last_content_tools_all_housekeeping = False
+            agent._mute_post_response = False
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            continue
         
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
@@ -1495,7 +1777,6 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         primary_recovery_attempted = False
-        max_compression_attempts = 3
         codex_auth_retry_attempted=False
         anthropic_auth_retry_attempted=False
         nous_auth_retry_attempted=False

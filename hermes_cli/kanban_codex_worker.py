@@ -639,39 +639,26 @@ def _forced_worker_skill_prompt(conn: Any, task_id: str, role: str) -> str:
     if not names:
         return ""
 
-    rendered: list[str] = ["Force-loaded implementation skills for this dev worker:"]
-    for name in names:
-        message = _render_worker_skill(name, task_id=task_id)
-        if message:
-            rendered.append(message)
-        else:
-            rendered.append(
-                f"[Skill load warning: requested skill `{name}` did not resolve in this worker environment. "
-                "Continue only with the task context and record the missing skill in handoff.notes.]"
-            )
-    return "\n\n".join(rendered).rstrip() + "\n\n"
-
-
-def _render_worker_skill(name: str, *, task_id: str) -> str:
     try:
-        from agent.skill_commands import _build_skill_message, _load_skill_payload
+        from agent.skill_commands import build_automatic_skills_message
 
-        loaded = _load_skill_payload(name, task_id=task_id)
-        if not loaded:
-            return ""
-        payload, skill_dir, display_name = loaded
-        return _build_skill_message(
-            payload,
-            skill_dir,
-            activation_note=(
-                f"Skill `{display_name}` is loaded for this Kanban dev worker. "
-                "Follow it for implementation style, pitfalls, and verification."
-            ),
-            runtime_note="Loaded by hermes_cli.kanban_codex_worker from task/board worker_skill_hints.",
-            session_id=task_id,
+        message, _loaded, missing = build_automatic_skills_message(
+            names,
+            task_id=task_id,
+            source_label="Kanban dev worker task/board worker_skill_hints",
         )
     except Exception:
-        return ""
+        message, missing = None, names
+
+    rendered: list[str] = ["Force-loaded implementation skills for this dev worker:"]
+    if message:
+        rendered.append(message)
+    for name in missing:
+        rendered.append(
+            f"[Skill load warning: requested skill `{name}` did not resolve in this worker environment. "
+            "Continue only with the task context and record the missing skill in handoff.notes.]"
+        )
+    return "\n\n".join(rendered).rstrip() + "\n\n"
 
 
 def _merge_skill_names(*groups: Any) -> list[str]:

@@ -15,7 +15,8 @@ from agent.system_prompt import build_system_prompt_parts
 
 NOTICE = (
     "Note: some categories above are listed name-only to save context; "
-    "skills_list shows full descriptions and skill_view(name) loads any skill."
+    "skills_list shows full descriptions and skill_view(name) loads a bounded overview; "
+    "use full_content=true when the complete skill body is needed."
 )
 
 
@@ -229,3 +230,66 @@ def test_skills_index_full_env_restores_full_for_operator_and_worker(
         stable = _stable_prompt(_make_agent(session_role=role))
         assert "podcast-edit: Edit podcast audio" in stable
         assert "    - names: podcast-edit" not in stable
+
+
+def test_skill_index_auto_demotes_to_stay_under_12k_chars(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for cat_idx in range(24):
+        category = f"category-{cat_idx:02d}"
+        for skill_idx in range(8):
+            _seed_skill(
+                tmp_path,
+                category,
+                f"skill-{cat_idx:02d}-{skill_idx:02d}",
+                "Detailed routing summary with verification, pitfalls, setup, and handoff.",
+            )
+
+    result = build_skills_system_prompt()
+    report = get_last_skills_index_report()
+
+    assert len(result) <= 12_000
+    assert report["mode"] == "capped"
+    assert report["char_cap"] == 12_000
+    assert report["chars_rendered"] == len(result)
+    assert report["auto_demoted_categories"]
+    assert report["omitted_category_count"] == 0
+
+
+def test_skill_index_omission_notice_is_bounded_and_counts_exactly():
+    from agent.prompt_builder import _render_skills_index_prompt_under_cap
+
+    skills_by_category = {
+        "giant-a": [(f"giant-a-skill-{idx:04d}", "desc") for idx in range(700)],
+        "giant-b": [(f"giant-b-skill-{idx:04d}", "desc") for idx in range(700)],
+        "small": [("tiny", "desc")],
+    }
+
+    result, report, _full, _compact, _auto, omitted = _render_skills_index_prompt_under_cap(
+        skills_by_category=skills_by_category,
+        category_descriptions={},
+        requested_compact_categories=frozenset(),
+    )
+
+    omitted_skill_count = sum(report[category]["skills"] for category in omitted)
+    assert len(result) <= 12_000
+    assert omitted
+    assert f"omitted {len(omitted)} skill categories containing {omitted_skill_count} skills" in result
+    assert "giant-a, giant-b" not in result
+    assert "omitted_categories:" not in result
+
+
+def test_category_descriptions_are_capped_at_160_chars(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    long_desc = "A" * 220
+    desc_dir = tmp_path / "skills" / "longcat"
+    desc_dir.mkdir(parents=True)
+    (desc_dir / "DESCRIPTION.md").write_text(
+        f"---\ndescription: {long_desc}\n---\n",
+        encoding="utf-8",
+    )
+    _seed_skill(tmp_path, "longcat", "tiny", "Small skill")
+
+    result = build_skills_system_prompt()
+
+    assert ("A" * 157) + "..." in result
+    assert "A" * 180 not in result

@@ -181,15 +181,15 @@ class TestBuildJobPromptContextFrom:
         prompt_pos = prompt.find("Process the data above")
         assert context_pos < prompt_pos
 
-    def test_output_truncated_at_8k_chars(self, cron_env):
-        """Output longer than 8000 chars should be truncated."""
+    def test_output_truncated_with_aggregate_head_tail_budget(self, cron_env):
+        """Large prior output should be bounded with head and tail retained."""
         from cron.jobs import create_job, OUTPUT_DIR
         from cron.scheduler import _build_job_prompt
 
         job_a = create_job(prompt="Find data", schedule="every 1h")
         out_dir = OUTPUT_DIR / job_a["id"]
         out_dir.mkdir(parents=True, exist_ok=True)
-        big_output = "x" * 10000
+        big_output = "CTX_HEAD-" + ("x" * 20_000) + "-CTX_TAIL"
         (out_dir / "2026-04-22_10-00-00.md").write_text(big_output, encoding="utf-8")
 
         job_b = create_job(
@@ -197,7 +197,9 @@ class TestBuildJobPromptContextFrom:
         )
         prompt = _build_job_prompt(job_b)
         assert "truncated" in prompt
-        assert "x" * 10000 not in prompt
+        assert "CTX_HEAD-" in prompt
+        assert "-CTX_TAIL" in prompt
+        assert "x" * 20_000 not in prompt
 
     def test_graceful_when_file_deleted_between_listing_and_reading(self, cron_env):
         """Job should not crash if output file is deleted mid-read."""

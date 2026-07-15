@@ -357,10 +357,60 @@ def build_memory_context_block(raw_context: str) -> str:
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
         "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        "this is the agent's persistent memory and should inform all responses. "
+        "If this block says it was truncated, use explicit memory/retrieval "
+        "tools for full source content.]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )
+
+
+def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
+    """Return a bare function schema or ``None`` for malformed input.
+
+    Memory providers and context engines are expected to return a bare OpenAI
+    function schema (``{"name": ..., "parameters": ...}``), but some return an
+    already-wrapped tool entry (``{"type": "function", "function": {...}}``).
+    Normalize that single wrapper and reject nameless/double-wrapped shapes so
+    one bad provider schema cannot poison the whole tool surface.
+    """
+    if not isinstance(schema, dict):
+        return None
+    candidate = schema
+    if schema.get("type") == "function" and isinstance(schema.get("function"), dict):
+        candidate = schema["function"]
+    if candidate.get("type") == "function" and "function" in candidate:
+        return None
+    name = candidate.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return candidate
+
+
+def inject_memory_provider_tools(agent: Any) -> None:
+    """Append normalized memory-provider tool schemas to an agent-like object."""
+    manager = getattr(agent, "_memory_manager", None)
+    if not manager or getattr(agent, "tools", None) is None:
+        return
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    if enabled_toolsets is not None and "memory" not in enabled_toolsets:
+        return
+
+    existing_tool_names = {
+        t.get("function", {}).get("name")
+        for t in agent.tools
+        if isinstance(t, dict)
+    }
+    for schema in manager.get_all_tool_schemas():
+        normalized = normalize_tool_schema(schema)
+        if normalized is None:
+            continue
+        tool_name = normalized.get("name", "")
+        if tool_name in existing_tool_names:
+            continue
+        agent.tools.append({"type": "function", "function": normalized})
+        agent.valid_tool_names.add(tool_name)
+        existing_tool_names.add(tool_name)
 
 
 class MemoryManager:
@@ -424,7 +474,10 @@ class MemoryManager:
         self._providers.append(provider)
 
         # Index tool names → provider for routing
-        for schema in provider.get_tool_schemas():
+        for raw_schema in provider.get_tool_schemas():
+            schema = normalize_tool_schema(raw_schema)
+            if schema is None:
+                continue
             if self.read_only and self.is_write_like_tool_schema(schema):
                 continue
             tool_name = schema.get("name", "")
@@ -498,7 +551,9 @@ class MemoryManager:
             try:
                 result = provider.prefetch(query, session_id=session_id)
                 if result and result.strip():
-                    parts.append(result)
+                    parts.append(
+                        f"## Memory provider: {provider.name}\n\n{result.strip()}"
+                    )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
@@ -578,7 +633,10 @@ class MemoryManager:
         seen = set()
         for provider in self._providers:
             try:
-                for schema in provider.get_tool_schemas():
+                for raw_schema in provider.get_tool_schemas():
+                    schema = normalize_tool_schema(raw_schema)
+                    if schema is None:
+                        continue
                     if self.read_only and self.is_write_like_tool_schema(schema):
                         continue
                     name = schema.get("name", "")

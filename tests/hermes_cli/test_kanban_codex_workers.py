@@ -368,13 +368,20 @@ def test_dev_role_prompt_force_loads_board_worker_skill_hints(monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
     monkeypatch.setattr(worker, "_git_summary", lambda _workspace: "clean")
 
-    loaded: list[tuple[str, str]] = []
+    loaded: list[tuple[list[str], str, str]] = []
 
-    def fake_render_skill(name: str, *, task_id: str) -> str:
-        loaded.append((name, task_id))
-        return f"LOADED-SKILL {name} for {task_id}"
+    def fake_build_automatic_skills_message(names, user_text="", task_id=None, source_label="", **_kwargs):
+        loaded.append((list(names), task_id, source_label))
+        return (
+            f"LOADED-SKILL {','.join(names)} for {task_id}",
+            list(names),
+            [],
+        )
 
-    monkeypatch.setattr(worker, "_render_worker_skill", fake_render_skill)
+    monkeypatch.setattr(
+        "agent.skill_commands.build_automatic_skills_message",
+        fake_build_automatic_skills_message,
+    )
 
     conn = kanban_db.connect(board=board)
     try:
@@ -400,7 +407,13 @@ def test_dev_role_prompt_force_loads_board_worker_skill_hints(monkeypatch, tmp_p
     finally:
         conn.close()
 
-    assert loaded == [("reserve-solidity-style", dev_task_id)]
+    assert loaded == [
+        (
+            ["reserve-solidity-style"],
+            dev_task_id,
+            "Kanban dev worker task/board worker_skill_hints",
+        )
+    ]
     assert "Force-loaded implementation skills for this dev worker" in dev_prompt
     assert f"LOADED-SKILL reserve-solidity-style for {dev_task_id}" in dev_prompt
     assert "reserve-solidity-style" not in planner_prompt
@@ -416,7 +429,17 @@ def test_dev_role_prompt_force_loads_task_skills_and_deduplicates(monkeypatch, t
     kanban_db.create_board(board, name="Task skills")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
     monkeypatch.setattr(worker, "_git_summary", lambda _workspace: "clean")
-    monkeypatch.setattr(worker, "_render_worker_skill", lambda name, *, task_id: f"SKILL {name}")
+
+    captured: list[list[str]] = []
+
+    def fake_build_automatic_skills_message(names, user_text="", task_id=None, source_label="", **_kwargs):
+        captured.append(list(names))
+        return ("\n".join(f"SKILL {name}" for name in names), list(names), [])
+
+    monkeypatch.setattr(
+        "agent.skill_commands.build_automatic_skills_message",
+        fake_build_automatic_skills_message,
+    )
 
     conn = kanban_db.connect(board=board)
     try:
@@ -436,6 +459,7 @@ def test_dev_role_prompt_force_loads_task_skills_and_deduplicates(monkeypatch, t
 
     assert dev_prompt.count("SKILL general-coding") == 1
     assert dev_prompt.count("SKILL reserve-solidity-style") == 1
+    assert captured == [["general-coding", "reserve-solidity-style"]]
 
 
 def test_autoreview_helper_materializes_in_hermes_and_pid_like_workspaces(tmp_path):
@@ -534,12 +558,18 @@ def test_checkpoint_commit_returns_and_logs_commit_failure(monkeypatch, tmp_path
 def test_checkpoint_commit_clean_repo_is_noop(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
 
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "worker@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Worker"], cwd=tmp_path, check=True)
-    (tmp_path / "tracked.txt").write_text("already committed\n", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    # ``tmp_path`` itself contains the autouse fixture's ``hermes_test``
+    # directory. Keep the Git fixture in a child so the repository is truly
+    # clean and this test exercises the no-op branch rather than committing
+    # fixture state.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "worker@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Worker"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("already committed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True, text=True)
 
     real_run = subprocess.run
     calls: list[list[str]] = []
@@ -550,7 +580,7 @@ def test_checkpoint_commit_clean_repo_is_noop(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", recording_run)
 
-    assert worker._checkpoint_commit(str(tmp_path), "task-123", "nothing changed") is None
+    assert worker._checkpoint_commit(str(repo), "task-123", "nothing changed") is None
     assert calls == [["git", "status", "--porcelain"]]
 
 

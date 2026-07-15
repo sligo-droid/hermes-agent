@@ -151,15 +151,13 @@ class TestSkillsInjection:
 
     @pytest.mark.asyncio
     async def test_skills_injected_into_prompt(self):
-        """When a route has skills: [code-review], the adapter should
-        call build_skill_invocation_message() and use its output as the
-        prompt instead of the raw template render."""
+        """Route skills should be injected once as an automatic bounded batch."""
         routes = {
             "pr-review": {
                 "secret": _INSECURE_NO_AUTH,
                 "events": ["pull_request"],
                 "prompt": "Review this PR: {pull_request.title}",
-                "skills": ["code-review"],
+                "skills": ["code-review", "security-review"],
             }
         }
         adapter = _make_adapter(routes)
@@ -178,11 +176,14 @@ class TestSkillsInjection:
 
         # The imports are lazy (inside the handler), so patch the source module
         with patch(
-            "agent.skill_commands.build_skill_invocation_message",
-            return_value=skill_content,
+            "agent.skill_commands.build_automatic_skills_message",
+            return_value=(skill_content, ["code-review", "security-review"], []),
         ) as mock_build, patch(
             "agent.skill_commands.get_skill_commands",
-            return_value={"/code-review": {"name": "code-review"}},
+            return_value={
+                "/code-review": {"name": "code-review"},
+                "/security-review": {"name": "security-review"},
+            },
         ):
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
@@ -202,7 +203,11 @@ class TestSkillsInjection:
             event = captured_events[0]
             # The prompt should be the skill content, not the raw template
             assert "You are a code reviewer" in event.text
-            mock_build.assert_called_once()
+            mock_build.assert_called_once_with(
+                ["code-review", "security-review"],
+                user_text="Review this PR: Add webhook adapter",
+                source_label="webhook route",
+            )
 
 
 # ===================================================================

@@ -127,6 +127,24 @@ class TestClassification:
         assert "xx_unknown_tool" in names
         assert deferrable == []
 
+    def test_always_visible_late_schema_never_defers(self, monkeypatch):
+        """Late, non-registry schemas cannot be recovered by bridge dispatch."""
+        from tools.tool_search import classify_tools
+
+        defs = [_td("late_extension", "Late extension schema")]
+        monkeypatch.setattr(
+            "tools.tool_search.is_deferrable_tool_name",
+            lambda name: name == "late_extension",
+        )
+
+        visible, deferrable = classify_tools(
+            defs,
+            always_visible_names={"late_extension"},
+        )
+
+        assert [tool["function"]["name"] for tool in visible] == ["late_extension"]
+        assert deferrable == []
+
 
 # ---------------------------------------------------------------------------
 # Token estimation + threshold gate

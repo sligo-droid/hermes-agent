@@ -1,14 +1,14 @@
 ---
-title: "Kanban Worker — Pitfalls, examples, and edge cases for Hermes Kanban workers"
+title: "Kanban Worker — Kanban worker pitfalls, examples, and edge cases"
 sidebar_label: "Kanban Worker"
-description: "Pitfalls, examples, and edge cases for Hermes Kanban workers"
+description: "Kanban worker pitfalls, examples, and edge cases"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Kanban Worker
 
-Pitfalls, examples, and edge cases for Hermes Kanban workers. The lifecycle itself is auto-injected into every worker's system prompt as KANBAN_GUIDANCE (from agent/prompt_builder.py); this skill is what you load when you want deeper detail on specific scenarios.
+Kanban worker pitfalls, examples, and edge cases.
 
 ## Skill metadata
 

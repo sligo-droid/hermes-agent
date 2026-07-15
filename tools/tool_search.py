@@ -186,13 +186,26 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    always_visible_names: Optional[Iterable[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
     every core tool, plus any tool we can't classify. ``deferrable`` is the
-    candidate set for catalog entry.
+    candidate set for catalog entry. ``always_visible_names`` is for schemas
+    attached after registry assembly (for example memory/context-engine
+    extensions): tool-search's bridge rebuilds its catalog from the registry,
+    so those dynamically attached schemas must remain model-visible rather
+    than becoming unreachable deferred entries.
     """
+    always_visible = {
+        str(name).strip()
+        for name in (always_visible_names or ())
+        if str(name).strip()
+    }
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
     for td in tool_defs:
@@ -202,7 +215,9 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if name in always_visible:
+            visible.append(td)
+        elif is_deferrable_tool_name(name):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -531,6 +546,7 @@ def assemble_tool_defs(
     *,
     context_length: Optional[int] = None,
     config: Optional[ToolSearchConfig] = None,
+    always_visible_names: Optional[Iterable[str]] = None,
 ) -> AssemblyResult:
     """Return the tool-defs list the model should actually see.
 
@@ -551,7 +567,10 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(
+        incoming,
+        always_visible_names=always_visible_names,
+    )
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import textwrap
 
 import pytest
 
@@ -114,3 +115,140 @@ def test_bundled_catalog_explains_missing_local_skills(gen_module):
     result = gen_module.build_catalog_md_bundled([])
     assert "respects local deletions and user edits" in result
     assert "hermes skills reset <name> --restore" in result
+
+
+def _write_fake_skill(path: Path, name: str = "demo-skill"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        textwrap.dedent(
+            f"""\
+            ---
+            name: {name}
+            description: Demo skill for generated docs.
+            ---
+
+            # Demo Skill
+
+            Use this tiny skill in generator tests.
+            """
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_fake_sidebar(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        textwrap.dedent(
+            """\
+            const sidebars = {
+              docs: [
+                {
+                  type: 'category',
+                  label: 'Docs',
+                  items: [
+                    {
+                      type: 'category',
+                      label: 'Skills',
+                      collapsed: true,
+                      items: [
+                        'reference/skills-catalog',
+                      ],
+                    },
+                  ],
+                },
+              ],
+            };
+
+            export default sidebars;
+            """
+        ),
+        encoding="utf-8",
+    )
+
+
+def _point_generator_at_fake_repo(gen_module, monkeypatch, repo: Path):
+    docs = repo / "website" / "docs"
+    monkeypatch.setattr(gen_module, "REPO", repo)
+    monkeypatch.setattr(gen_module, "DOCS", docs)
+    monkeypatch.setattr(gen_module, "SKILLS_PAGES", docs / "user-guide" / "skills")
+    monkeypatch.setattr(
+        gen_module,
+        "SKILL_SOURCES",
+        [
+            ("bundled", repo / "skills"),
+            ("optional", repo / "optional-skills"),
+        ],
+    )
+
+
+def test_check_mode_reports_missing_stale_and_orphan_without_writing(
+    gen_module, monkeypatch, tmp_path, capsys
+):
+    repo = tmp_path / "repo"
+    _write_fake_skill(repo / "skills" / "alpha" / "demo-skill" / "SKILL.md")
+    (repo / "optional-skills").mkdir(parents=True)
+    (repo / "website" / "docs" / "reference").mkdir(parents=True)
+    _write_fake_sidebar(repo / "website" / "sidebars.ts")
+    _point_generator_at_fake_repo(gen_module, monkeypatch, repo)
+
+    assert gen_module.main([]) == 0
+
+    generated_page = (
+        repo
+        / "website"
+        / "docs"
+        / "user-guide"
+        / "skills"
+        / "bundled"
+        / "alpha"
+        / "alpha-demo-skill.md"
+    )
+    generated_page.unlink()
+    stale_catalog = repo / "website" / "docs" / "reference" / "skills-catalog.md"
+    stale_catalog.write_text("stale catalog\n", encoding="utf-8")
+    orphan = (
+        repo
+        / "website"
+        / "docs"
+        / "user-guide"
+        / "skills"
+        / "bundled"
+        / "alpha"
+        / "alpha-old-skill.md"
+    )
+    orphan.write_text(f"{gen_module.GENERATED_NOTICE}\nold\n", encoding="utf-8")
+
+    assert gen_module.main(["--check"]) == 1
+    err = capsys.readouterr().err
+    assert "missing: website/docs/user-guide/skills/bundled/alpha/alpha-demo-skill.md" in err
+    assert "stale: website/docs/reference/skills-catalog.md" in err
+    assert "orphan: website/docs/user-guide/skills/bundled/alpha/alpha-old-skill.md" in err
+    assert stale_catalog.read_text(encoding="utf-8") == "stale catalog\n"
+    assert orphan.exists()
+
+
+def test_write_mode_removes_generated_orphans(gen_module, monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    _write_fake_skill(repo / "skills" / "alpha" / "demo-skill" / "SKILL.md")
+    (repo / "optional-skills").mkdir(parents=True)
+    (repo / "website" / "docs" / "reference").mkdir(parents=True)
+    _write_fake_sidebar(repo / "website" / "sidebars.ts")
+    _point_generator_at_fake_repo(gen_module, monkeypatch, repo)
+
+    assert gen_module.main([]) == 0
+    orphan = (
+        repo
+        / "website"
+        / "docs"
+        / "user-guide"
+        / "skills"
+        / "bundled"
+        / "alpha"
+        / "alpha-old-skill.md"
+    )
+    orphan.write_text(f"{gen_module.GENERATED_NOTICE}\nold\n", encoding="utf-8")
+
+    assert gen_module.main([]) == 0
+    assert not orphan.exists()
+    assert gen_module.main(["--check"]) == 0

@@ -8,7 +8,7 @@ description: "Author in-repo SKILL"
 
 # Hermes Agent Skill Authoring
 
-Author in-repo SKILL.md: frontmatter, validator, structure, and writing-quality principles.
+Author in-repo SKILL.md files correctly.
 
 ## Skill metadata
 

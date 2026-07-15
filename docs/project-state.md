@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-26
+Last updated: 2026-07-15
 State owner: Sligo Labs agent
 
 This file is a tiny routing and pickup cursor for the Sligo Labs `hermes-agent` fork. It is not authoritative history, a completed-work ledger, a product spec, or runtime evidence. CI enforces a 3,000-byte ceiling; replace stale bullets instead of appending.
@@ -17,7 +17,7 @@ This file is a tiny routing and pickup cursor for the Sligo Labs `hermes-agent` 
 - Hermes is Sligo Labs command infrastructure: CLI/TUI agent, gateway, Discord dev-shop, Kanban workers, cron/self-improvement, and Command Center. Reliability for Discord, Kanban, gateway, worker routing, and Command Center wins over novelty.
 - Command Center should remain the operator ledger over the Work Item / Source / Worker Run model. Worker boards, Kanban tasks, task runs, PRs, logs, and deploys are execution artifacts, not peer ledgers.
 - Keep installed skills procedural. Move current target/status prose out of skills and into the narrowest repo source: this cursor for routing, `docs/context.md` for durable context, `docs/decisions/` for rationale, or focused runbooks/plans.
-- Dirty secondary main worktree quarantine remains active for `/home/droid/workspaces/hermes-self-improvement-live-test`; keep it excluded from automatic worker routing until human-approved reconciliation follows `docs/runbooks/worktree-quarantine-2026-06-17.md`.
+- Keep `/home/droid/workspaces/hermes-self-improvement-live-test` excluded from automatic worker routing until human-approved reconciliation follows `docs/runbooks/worktree-quarantine-2026-06-17.md`; this is a safety quarantine, not a current dirtiness claim.
 
 ## Route To Truth
 

@@ -546,32 +546,35 @@ class WebhookAdapter(BasePlatformAdapter):
             prompt_template, payload, event_type, route_name
         )
 
-        # Inject skill content if configured.
-        # We call build_skill_invocation_message() directly rather than
-        # using /skill-name slash commands — the gateway's command parser
-        # would intercept those and break the flow.
+        # Inject bounded automatic skill overviews if configured.  Do not use
+        # /skill-name slash commands here — the gateway command parser would
+        # intercept those and break the flow.
         skills = route_config.get("skills", [])
         if skills:
             try:
                 from agent.skill_commands import (
-                    build_skill_invocation_message,
+                    build_automatic_skills_message,
                     get_skill_commands,
                 )
 
                 skill_cmds = get_skill_commands()
+                valid_skills = []
                 for skill_name in skills:
                     cmd_key = f"/{skill_name}"
                     if cmd_key in skill_cmds:
-                        skill_content = build_skill_invocation_message(
-                            cmd_key, user_instruction=prompt
-                        )
-                        if skill_content:
-                            prompt = skill_content
-                            break  # Load the first matching skill
+                        valid_skills.append(skill_name)
                     else:
                         logger.warning(
                             "[webhook] Skill '%s' not found", skill_name
                         )
+                if valid_skills:
+                    skill_content, _loaded, _missing = build_automatic_skills_message(
+                        valid_skills,
+                        user_text=prompt,
+                        source_label="webhook route",
+                    )
+                    if skill_content:
+                        prompt = skill_content
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 

@@ -1903,15 +1903,15 @@ Hermes uses two different context scopes:
 |------|---------|-------|
 | `SOUL.md` | **Primary agent identity** — defines who the agent is (slot #1 in the system prompt) | `~/.hermes/SOUL.md` or `$HERMES_HOME/SOUL.md` |
 | `.hermes.md` / `HERMES.md` | Project-specific instructions (highest priority) | Walks to git root |
-| `AGENTS.md` | Project-specific instructions, coding conventions | Recursive directory walk |
-| `CLAUDE.md` | Claude Code context files (also detected) | Working directory only |
+| `AGENTS.md` | Project-specific instructions, coding conventions | CWD startup first-match project context; nested files only as lazy tool-result hints |
+| `CLAUDE.md` | Claude Code context files (also detected) | CWD startup first-match project context; nested files only as lazy tool-result hints |
 | `.cursorrules` | Cursor IDE rules (also detected) | Working directory only |
 | `.cursor/rules/*.mdc` | Cursor rule files (also detected) | Working directory only |
 
 - **SOUL.md** is the agent's primary identity. It occupies slot #1 in the system prompt, completely replacing the built-in default identity. Edit it to fully customize who the agent is.
 - If SOUL.md is missing, empty, or cannot be loaded, Hermes falls back to a built-in default identity.
 - **Project context files use a priority system** — only ONE type is loaded (first match wins): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. SOUL.md is always loaded independently.
-- **AGENTS.md** is hierarchical: if subdirectories also have AGENTS.md, all are combined.
+- Nested AGENTS.md files are not merged into startup project context. They may appear later as bounded tool-result hints when a tool call touches a relevant subdirectory.
 - Hermes automatically seeds a default `SOUL.md` if one does not already exist.
 - All loaded context files are capped at 20,000 characters with smart truncation.
 

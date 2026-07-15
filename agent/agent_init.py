@@ -59,6 +59,72 @@ from utils import base_url_host_matches
 logger = logging.getLogger("run_agent")
 
 
+def _refresh_visible_tool_names(agent) -> None:
+    agent.valid_tool_names = {
+        tool.get("function", {}).get("name")
+        for tool in (agent.tools or [])
+        if isinstance(tool, dict) and tool.get("function", {}).get("name")
+    }
+
+
+def _finalize_extended_tool_schemas(agent) -> None:
+    """Run schema sanitization and tool-search assembly after late schemas.
+
+    ``model_tools.get_tool_definitions()`` already runs these passes for the
+    registry-backed surface, but memory providers and context engines append
+    schemas during ``AIAgent.__init__`` after that initial assembly.  Re-run the
+    same finalization on the extended list so those late schemas are included in
+    the live schema budget without editing ``model_tools.py``.
+    """
+    if not getattr(agent, "tools", None):
+        _refresh_visible_tool_names(agent)
+        return
+    try:
+        from tools.schema_sanitizer import sanitize_tool_schemas
+
+        agent.tools = sanitize_tool_schemas(agent.tools)
+    except Exception as exc:
+        _ra().logger.warning("Schema sanitization skipped after extension schemas: %s", exc)
+
+    try:
+        from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
+
+        ts_cfg = _load_ts_config()
+        if ts_cfg.enabled != "off":
+            # Unlike registry-backed tools, schemas appended below cannot be
+            # rebuilt by tool_search's bridge dispatcher.  Keep them visible
+            # while still assembling the rest of the surface under the normal
+            # schema budget.
+            always_visible_names = set(
+                getattr(agent, "_late_extension_tool_names", set()) or set()
+            )
+            always_visible_names.update(
+                getattr(agent, "_context_engine_tool_names", set()) or set()
+            )
+            assembly = assemble_tool_defs(
+                agent.tools,
+                context_length=getattr(agent.context_compressor, "context_length", 0),
+                config=ts_cfg,
+                always_visible_names=always_visible_names,
+            )
+            agent.tools = assembly.tool_defs
+            agent._tool_search_final_assembly = {
+                "activated": bool(assembly.activated),
+                "deferred_count": int(assembly.deferred_count or 0),
+                "deferred_tokens": int(assembly.deferred_tokens or 0),
+                "threshold_tokens": int(assembly.threshold_tokens or 0),
+            }
+            if assembly.activated and not agent.quiet_mode:
+                print(
+                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
+                    f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call "
+                    "after extension schemas."
+                )
+    except Exception as exc:  # pragma: no cover - defensive parity with model_tools
+        _ra().logger.warning("Tool search assembly skipped after extension schemas: %s", exc)
+    _refresh_visible_tool_names(agent)
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -1130,6 +1196,7 @@ def init_agent(
         ]
         agent.valid_tool_names.discard("memory")
 
+    agent._late_extension_tool_names: set[str] = set()
     if agent._memory_manager and agent.tools is not None and (
         agent.enabled_toolsets is None or "memory" in agent.enabled_toolsets
     ):
@@ -1161,6 +1228,7 @@ def init_agent(
             agent.tools.append(_wrapped)
             if _tname:
                 agent.valid_tool_names.add(_tname)
+                agent._late_extension_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
 
     # Skills config: nudge interval for skill creation reminders
@@ -1519,6 +1587,8 @@ def init_agent(
                 agent.valid_tool_names.add(_tname)
                 agent._context_engine_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
+
+    _finalize_extended_tool_schemas(agent)
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
