@@ -102,6 +102,8 @@ Dashboard `/chat` embeds the real `hermes --tui` through `hermes_cli/pty_bridge.
 
 For custom/local-only tools, prefer plugins under `$HERMES_HOME/plugins/<name>/` with `plugin.yaml`, `__init__.py`, and `ctx.register_tool(...)`. Edit core only for tools intended to ship in the base system.
 
+For a Discord URL or message/thread investigation, first use Hermes' native Discord path: `tools/discord_tool.py` (`discord`/`discord_admin`) when it is enabled. If those tools are unavailable to the current agent, correlate Discord snowflakes with `$HERMES_HOME/logs/` and `$HERMES_HOME/sessions/`; do not assume an external connector is required.
+
 Core tool rules:
 
 - Tool modules live in `tools/*.py` and call `registry.register()` at import time.
