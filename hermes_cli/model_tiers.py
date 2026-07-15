@@ -35,7 +35,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "advanced": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "high",
+        "reasoning_effort": "xhigh",
     },
 }
 

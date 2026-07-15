@@ -2433,9 +2433,9 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
-        # Gateway sessions use Luna/medium independently of model.default, which
+        # Gateway sessions use Terra/high independently of model.default, which
         # remains the normal CLI/TUI default.
-        "model_tier": "basic",
+        "model_tier": "intermediate",
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
         # system-path denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,

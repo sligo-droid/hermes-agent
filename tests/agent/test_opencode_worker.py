@@ -518,12 +518,12 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "pass_count": 2,
         "plan_used": True,
         "passes": [
-            {"name": "plan", "agent": "plan", "reasoning": "high", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
+            {"name": "plan", "agent": "plan", "reasoning": "xhigh", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
             {"name": "build", "agent": "build", "reasoning": "high", "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate"},
         ],
     }
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["high", "high"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "high"]
     assert [_option(cmd, "--model") for cmd in calls] == [
         "hermes-codex/gpt-5.6-sol", "hermes-codex/gpt-5.6-terra"
     ]

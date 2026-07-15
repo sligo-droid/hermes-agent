@@ -189,7 +189,7 @@ def _is_standard_discord_feature_request(
 def _gateway_model_tier(config: Optional[dict]) -> Any:
     """Return the named tier used by ordinary gateway sessions."""
     cfg = config or {}
-    name = cfg_get(cfg, "gateway", "model_tier", default="basic")
+    name = cfg_get(cfg, "gateway", "model_tier", default="intermediate")
     return resolve_model_tier(cfg, name)
 
 

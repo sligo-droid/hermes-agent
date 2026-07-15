@@ -20,7 +20,7 @@ def test_default_routes_reference_resolvable_tiers():
     }
 
     assert route_names == {
-        "gateway": "basic",
+        "gateway": "intermediate",
         "cron": "trivial",
         "discord_action_request": "intermediate",
         "coding_worker_simple_build": "intermediate",
@@ -48,7 +48,7 @@ def test_default_routes_reference_resolvable_tiers():
         "trivial": "low",
         "basic": "medium",
         "intermediate": "high",
-        "advanced": "high",
+        "advanced": "xhigh",
     }
     for role in ("planner", "dev", "foreman", "reviewer"):
         assert "reasoning" not in DEFAULT_CONFIG["kanban"]["discord_worker"]["roles"][role]
