@@ -1211,7 +1211,33 @@ def switch_model(
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
             base_url = _da.base_url
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
+            # Direct aliases can choose a provider distinct from the current
+            # session provider. Prefer that provider's declared transport: URL
+            # heuristics cannot distinguish an OpenAI-compatible proxy's
+            # Responses endpoint from Chat Completions.
+            _configured_transport = ""
+            if isinstance(user_providers, dict):
+                _provider_config = user_providers.get(target_provider)
+                if isinstance(_provider_config, dict):
+                    _configured_transport = str(
+                        _provider_config.get("api_mode")
+                        or _provider_config.get("transport")
+                        or ""
+                    )
+            if _configured_transport:
+                api_mode = _configured_transport
+            elif not api_mode:
+                try:
+                    _alias_runtime = resolve_runtime_provider(
+                        requested=target_provider,
+                        target_model=new_model,
+                    )
+                    api_key = _alias_runtime.get("api_key", "") or api_key
+                    api_mode = _alias_runtime.get("api_mode", "") or api_mode
+                except Exception:
+                    pass
+            if not api_mode:
+                api_mode = determine_api_mode(target_provider, base_url)
             if not api_key:
                 api_key = "no-key-required"
 

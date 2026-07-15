@@ -117,6 +117,46 @@ class TestDirectAliases:
         assert provider == "custom"
         assert alias == "glm"
 
+    def test_direct_alias_preserves_configured_responses_transport(self, monkeypatch):
+        """A proxy alias retains the configured Responses API transport."""
+        from hermes_cli.model_switch import DirectAlias, switch_model
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(
+            ms,
+            "DIRECT_ALIASES",
+            {"sonnet": DirectAlias("claude-sonnet-4-6", "cli-proxy", "http://proxy.test/v1")},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **_kwargs: {
+                "api_key": "proxy-key",
+                "base_url": "http://proxy.test/v1",
+                "api_mode": "codex_responses",
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *_args, **_kwargs: {"accepted": True, "persist": True, "recognized": True},
+        )
+
+        user_providers = {
+            "cli-proxy": {
+                "api_mode": "codex_responses",
+                "base_url": "http://proxy.test/v1",
+            }
+        }
+        result = switch_model(
+            "sonnet",
+            current_provider="other-provider",
+            current_model="gpt-5.6-sol",
+            current_base_url="http://other.test/v1",
+            current_api_key="other-key",
+            user_providers=user_providers,
+        )
+        assert result.success
+        assert result.api_mode == "codex_responses"
+
     def test_reverse_lookup_by_model_id(self, monkeypatch):
         """Full model names (e.g. 'kimi-k2.5') match via reverse lookup."""
         from hermes_cli.model_switch import DirectAlias, resolve_alias
