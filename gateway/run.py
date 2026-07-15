@@ -130,6 +130,7 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "security effects, or the definition of done. For low-stakes ambiguity, "
     "state the assumption and continue."
 )
+_DISCORD_ACTION_WORKTREE_ROOT = Path("/home/droid/workspaces")
 _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT
 
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
@@ -2189,6 +2190,276 @@ def _resolve_gateway_session_cwd(
             return _expand_configured_cwd(project_cwd, fallback=default_cwd)
 
     return default_cwd
+
+
+def _discord_action_worktree_slug(value: Any, *, fallback: str = "project") -> str:
+    """Return a Git/path-safe lowercase slug for action worktree names."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return (slug or fallback)[:48].rstrip("-") or fallback
+
+
+def _discord_action_worktree_records(output: str) -> list[dict[str, str]]:
+    """Parse the bounded fields needed from ``git worktree --porcelain``."""
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        if line.startswith("worktree "):
+            if current:
+                records.append(current)
+            current = {"path": line[len("worktree ") :]}
+        elif line.startswith("branch "):
+            branch = line[len("branch ") :]
+            if branch.startswith("refs/heads/"):
+                branch = branch[len("refs/heads/") :]
+            current["branch"] = branch
+    if current:
+        records.append(current)
+    return records
+
+
+def _discord_action_worktree_target(
+    repo_root: Path,
+    source: Any,
+    session_key: str,
+) -> tuple[str, Path]:
+    """Return a stable, collision-resistant branch/path pair for one thread."""
+    repo_slug = _discord_action_worktree_slug(repo_root.name)
+    thread_identity = (
+        getattr(source, "thread_id", None)
+        or getattr(source, "chat_id", None)
+        or session_key
+    )
+    route_identity = "|".join(
+        str(value or "").strip()
+        for value in (
+            repo_root,
+            getattr(source, "guild_id", None),
+            getattr(source, "project_channel_id", None),
+            getattr(source, "parent_chat_id", None),
+            thread_identity,
+        )
+    )
+    digest = hashlib.sha256(route_identity.encode("utf-8", errors="replace")).hexdigest()[:12]
+    stem = f"{repo_slug}-discord-action-{digest}"
+    return f"discord-action/{repo_slug}-{digest}", _DISCORD_ACTION_WORKTREE_ROOT / stem
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except Exception:
+        return False
+
+
+def _discord_action_worktree_cwd(
+    source: Any,
+    feature_summary: Optional[Dict[str, Any]],
+    session_key: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve/create the mutable worktree for a normal Discord action thread.
+
+    Only protected canonical project mappings are redirected. Existing mutable
+    mappings and every non-action gateway route keep their established CWD
+    behavior. The branch/path identity is stable per Discord thread, so later
+    turns reuse the same worktree while unrelated threads cannot collide.
+    """
+    if not _is_standard_discord_action_request(source, feature_summary):
+        return None, None
+
+    mapped_value = str(getattr(source, "project_path", "") or "").strip()
+    if not mapped_value:
+        return None, None
+
+    try:
+        from tools.canonical_repo_guard import _repo_info_for_path
+
+        info = _repo_info_for_path(mapped_value)
+    except Exception as exc:
+        return None, (
+            "could not inspect the mapped project checkout before starting: "
+            f"{exc}"
+        )
+    if info is None:
+        return None, None
+
+    try:
+        mapped_path = Path(mapped_value).expanduser().resolve(strict=False)
+        relative_cwd = mapped_path.relative_to(info.repo_root)
+    except Exception:
+        return None, (
+            "the mapped Discord project path is not inside its protected canonical "
+            f"repository: {mapped_value}"
+        )
+
+    workspace_root = _DISCORD_ACTION_WORKTREE_ROOT.expanduser().resolve(strict=False)
+    try:
+        workspace_root.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return None, (
+            f"could not prepare the mutable action-worktree root {workspace_root}: {exc}"
+        )
+
+    import subprocess
+
+    def _git(args: list[str], *, timeout: float = 30.0) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(info.repo_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+
+    try:
+        inventory = _git(["worktree", "list", "--porcelain"], timeout=10.0)
+    except Exception as exc:
+        return None, f"Git could not list existing worktrees for {info.repo_root}: {exc}"
+    if inventory.returncode != 0:
+        detail = " ".join((inventory.stderr or inventory.stdout or "").split())[:600]
+        return None, (
+            f"Git could not list existing worktrees for {info.repo_root}"
+            + (f": {detail}" if detail else ".")
+        )
+
+    base_branch, base_path = _discord_action_worktree_target(
+        info.repo_root,
+        source,
+        session_key,
+    )
+
+    def _resolved_record_path(record: dict[str, str]) -> Optional[Path]:
+        raw = str(record.get("path") or "").strip()
+        if not raw:
+            return None
+        try:
+            return Path(raw).expanduser().resolve(strict=False)
+        except Exception:
+            return Path(raw).expanduser()
+
+    def _reuse_cwd(worktree_path: Path) -> tuple[Optional[str], Optional[str]]:
+        target_cwd = (worktree_path / relative_cwd).resolve(strict=False)
+        if not target_cwd.is_dir():
+            return None, (
+                "the action worktree exists, but the mapped project subdirectory "
+                f"is unavailable there: {target_cwd}"
+            )
+        return str(target_cwd), None
+
+    records = _discord_action_worktree_records(inventory.stdout)
+    for attempt in range(32):
+        suffix = "" if attempt == 0 else f"-{attempt + 1}"
+        branch = f"{base_branch}{suffix}"
+        target_path = Path(f"{base_path}{suffix}")
+
+        branch_record = next(
+            (record for record in records if record.get("branch") == branch),
+            None,
+        )
+        if branch_record is not None:
+            existing_path = _resolved_record_path(branch_record)
+            if (
+                existing_path is not None
+                and _path_within(existing_path, workspace_root)
+                and existing_path.is_dir()
+            ):
+                return _reuse_cwd(existing_path)
+            # The deterministic branch is attached elsewhere (or stale). Do
+            # not hijack it; advance both branch and path together.
+            continue
+
+        path_record = next(
+            (
+                record
+                for record in records
+                if _resolved_record_path(record) == target_path.resolve(strict=False)
+            ),
+            None,
+        )
+        if path_record is not None or target_path.exists():
+            continue
+
+        try:
+            branch_exists = _git(
+                ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                timeout=10.0,
+            ).returncode == 0
+            add_args = (
+                ["worktree", "add", str(target_path), branch]
+                if branch_exists
+                else ["worktree", "add", "-b", branch, str(target_path), "HEAD"]
+            )
+            created = _git(add_args)
+        except Exception as exc:
+            return None, (
+                f"Git could not create mutable action worktree {target_path}: {exc}"
+            )
+        if created.returncode == 0:
+            return _reuse_cwd(target_path)
+
+        # A concurrent first message for the same thread may have won the
+        # branch/path race. Refresh once and reuse it when present.
+        try:
+            refreshed = _git(["worktree", "list", "--porcelain"], timeout=10.0)
+        except Exception:
+            refreshed = None
+        if refreshed is not None and refreshed.returncode == 0:
+            records = _discord_action_worktree_records(refreshed.stdout)
+            concurrent_record = next(
+                (record for record in records if record.get("branch") == branch),
+                None,
+            )
+            if concurrent_record is not None:
+                concurrent_path = _resolved_record_path(concurrent_record)
+                if (
+                    concurrent_path is not None
+                    and _path_within(concurrent_path, workspace_root)
+                    and concurrent_path.is_dir()
+                ):
+                    return _reuse_cwd(concurrent_path)
+
+        detail = " ".join((created.stderr or created.stdout or "").split())[:600]
+        collision_markers = (
+            "already exists",
+            "already checked out",
+            "is a missing but already registered worktree",
+        )
+        if any(marker in detail.lower() for marker in collision_markers):
+            continue
+        return None, (
+            f"Git could not create mutable action worktree {target_path}"
+            + (f": {detail}" if detail else ".")
+        )
+
+    return None, (
+        "could not allocate a collision-free Discord action worktree under "
+        f"{workspace_root} after 32 attempts"
+    )
+
+
+def _resolve_gateway_turn_cwd(
+    source: Any,
+    feature_summary: Optional[Dict[str, Any]],
+    config: Optional[dict],
+    session_key: str,
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Resolve one turn's CWD, provisioning action worktrees when required."""
+    fallback = _resolve_gateway_session_cwd(source, config)
+    worktree_cwd, error = _discord_action_worktree_cwd(
+        source,
+        feature_summary,
+        session_key,
+    )
+    return worktree_cwd or fallback, error, worktree_cwd
 
 
 def _load_gateway_runtime_config() -> dict:
@@ -11625,10 +11896,46 @@ class GatewayRunner:
             _pcfg,
         )
 
+        # Fable retains its existing worker-owned mutable-worktree route. This
+        # provisioner is specifically for ordinary Discord action turns that
+        # can edit inline before a worker is involved.
+        if getattr(event, "fable_plan_metadata", None):
+            session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
+            session_cwd_error = None
+            action_worktree_cwd = None
+        else:
+            session_cwd, session_cwd_error, action_worktree_cwd = await asyncio.to_thread(
+                _resolve_gateway_turn_cwd,
+                source,
+                getattr(event, "feature_summary", None),
+                _pcfg,
+                session_key,
+            )
+        if session_cwd_error:
+            logger.error(
+                "Discord action-request worktree preparation failed for session %s: %s",
+                session_key,
+                session_cwd_error,
+            )
+            return (
+                "⚠️ I could not start this Discord action request safely in a mutable "
+                f"Git worktree. {session_cwd_error} The protected canonical checkout "
+                "was not used as the agent working directory."
+            )
+        if action_worktree_cwd:
+            # The Discord mapping remains canonical in its DB/adapter state,
+            # but this turn's injected project context must name the worktree.
+            # Otherwise the system prompt explicitly tells lower-tier models to
+            # cd back to source.project_path, defeating the safe session CWD.
+            source = dataclasses.replace(source, project_path=action_worktree_cwd)
+            try:
+                event.source = source
+            except Exception:
+                pass
+            self._cache_session_source(session_key, source)
+
         # Build session context
         context = build_session_context(source, self.config, session_entry)
-
-        session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
 
         # Set session context variables for tools (task-local, concurrency-safe).
         _set_env = self._set_session_env
@@ -12220,6 +12527,7 @@ class GatewayRunner:
                 action_request_transcript_user_message=getattr(
                     event, "action_request_transcript_user_message", None
                 ),
+                session_cwd_override=session_cwd,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -20525,6 +20833,7 @@ class GatewayRunner:
         fable_transcript_user_message: Optional[str] = None,
         action_request_model_tier_override: Optional[str] = None,
         action_request_transcript_user_message: Optional[str] = None,
+        session_cwd_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20561,7 +20870,10 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
-        session_cwd = _resolve_gateway_session_cwd(source, user_config)
+        session_cwd = (
+            str(session_cwd_override or "").strip()
+            or _resolve_gateway_session_cwd(source, user_config)
+        )
         standard_discord_action_request = _is_standard_discord_action_request(
             source,
             feature_summary,
@@ -22905,6 +23217,7 @@ class GatewayRunner:
                     feature_summary=next_feature_summary,
                     project_summary=next_project_summary,
                     fable_reasoning_config=fable_reasoning_config,
+                    session_cwd_override=session_cwd,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
