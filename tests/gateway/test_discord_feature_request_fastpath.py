@@ -145,14 +145,14 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     )
 
     assert result["final_response"] == "ok"
-    assert result["reasoning_effort"] == "medium"
+    assert result["reasoning_effort"] == "high"
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
     assert init["model"] == "gpt-5.6-terra"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
     cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
     audit = cached_agent._runtime_audit_context
     assert audit["model_tier"] == "basic"
@@ -260,7 +260,7 @@ async def test_discord_action_request_reasoning_override_is_configurable(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_tier_command_uses_adjacent_tier_for_one_turn_and_preserves_slash_text(monkeypatch):
+async def test_smart_tier_command_uses_advanced_tier_for_one_turn_and_preserves_slash_text(monkeypatch):
     _patch_agent_runtime(monkeypatch)
     runner = _make_runner()
     session_key = "agent:main:discord:thread:thread-1"
@@ -294,18 +294,18 @@ async def test_tier_command_uses_adjacent_tier_for_one_turn_and_preserves_slash_
         session_id="session-1",
         session_key=session_key,
         feature_summary={"initial_request": "Build it", "message_id": "300", "kanban_board": None},
-        action_request_model_tier_override="intermediate",
+        action_request_model_tier_override="advanced",
         action_request_transcript_user_message="/smart implement the dashboard",
     )
 
     assert result["final_response"] == "ok"
-    assert _CapturingAgent.last_init["model"] == "gpt-5.6-terra"
-    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "max"}
+    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
+    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
     assert _CapturingAgent.last_run["user_message"] == "implement the dashboard"
     assert _CapturingAgent.last_run["persist_user_message"] == "/smart implement the dashboard"
     assert runner._session_model_overrides[session_key] == session_override
     cached_agent = runner._agent_cache[session_key][0]
-    assert cached_agent._runtime_audit_context["model_tier"] == "intermediate"
+    assert cached_agent._runtime_audit_context["model_tier"] == "advanced"
     assert cached_agent._runtime_audit_context["model_tier_source"] == "per_turn"
     assert cached_agent._runtime_audit_context["runtime_route"] == "discord_action_request_tier_command"
     next_model, _next_runtime = runner._resolve_session_agent_runtime(

@@ -20,12 +20,12 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "trivial": {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",
     },
     "basic": {
         "model": "gpt-5.6-terra",
         "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "high",
     },
     "intermediate": {
         "model": "gpt-5.6-terra",
@@ -208,6 +208,24 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
     )
 
 
+def resolve_model_tier_offset(
+    config: Mapping[str, Any] | None,
+    name: Any,
+    offset: int,
+) -> ModelTier | None:
+    """Resolve a built-in tier at a relative offset, or ``None`` at an edge."""
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset == 0:
+        return None
+    try:
+        index = MODEL_TIER_LADDER.index(_normalized_name(name))
+    except ValueError:
+        return None
+    target_index = index + offset
+    if target_index < 0 or target_index >= len(MODEL_TIER_LADDER):
+        return None
+    return resolve_model_tier(config, MODEL_TIER_LADDER[target_index])
+
+
 def resolve_adjacent_model_tier(
     config: Mapping[str, Any] | None,
     name: Any,
@@ -216,11 +234,4 @@ def resolve_adjacent_model_tier(
     """Resolve the adjacent built-in tier, or ``None`` at an invalid edge."""
     if direction not in {-1, 1}:
         return None
-    try:
-        index = MODEL_TIER_LADDER.index(_normalized_name(name))
-    except ValueError:
-        return None
-    target_index = index + direction
-    if target_index < 0 or target_index >= len(MODEL_TIER_LADDER):
-        return None
-    return resolve_model_tier(config, MODEL_TIER_LADDER[target_index])
+    return resolve_model_tier_offset(config, name, direction)

@@ -40,7 +40,7 @@ def _event(
     ("command", "direction", "expected_tier"),
     [
         ("dumb", -1, "trivial"),
-        ("smart", 1, "intermediate"),
+        ("smart", 2, "advanced"),
     ],
 )
 async def test_tier_command_rewrites_only_the_current_action_turn(
@@ -84,21 +84,21 @@ async def test_tier_command_rewrites_only_the_current_action_turn(
             _event("/smart build", source=_source(chat_type="group")),
             {"discord": {"action_request_model_tier": "basic"}},
             "smart",
-            1,
+            2,
             "normal non-Kanban Discord action-request thread",
         ),
         (
             _event("/smart build", feature_summary={"initial_request": "/goal build", "kanban_board": {}}),
             {"discord": {"action_request_model_tier": "basic"}},
             "smart",
-            1,
+            2,
             "normal non-Kanban Discord action-request thread",
         ),
         (
             _event("/smart build"),
             {"discord": {"action_request_model_tier": "custom"}},
             "smart",
-            1,
+            2,
             "requires `discord.action_request_model_tier`",
         ),
         (
@@ -112,7 +112,7 @@ async def test_tier_command_rewrites_only_the_current_action_turn(
             _event("/smart build"),
             {"discord": {"action_request_model_tier": "advanced"}},
             "smart",
-            1,
+            2,
             "above `advanced`",
         ),
     ],

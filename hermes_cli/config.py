@@ -1969,7 +1969,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_model_tier": "basic", # Standard Discord action requests use Terra/medium
+        "action_request_model_tier": "basic", # Standard Discord action requests use Terra/high
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
@@ -2433,7 +2433,7 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
-        # Gateway sessions use Terra/medium independently of model.default, which
+        # Gateway sessions use Terra/high independently of model.default, which
         # remains the normal CLI/TUI default.
         "model_tier": "basic",
         # When false (default), any file path the agent emits is delivered

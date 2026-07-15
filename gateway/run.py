@@ -61,8 +61,8 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
 from hermes_cli.model_tiers import (
     MODEL_TIER_LADDER,
-    resolve_adjacent_model_tier,
     resolve_model_tier,
+    resolve_model_tier_offset,
 )
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -10994,10 +10994,12 @@ class GatewayRunner:
             canonical = None
 
         if canonical in {"dumb", "smart"}:
+            # /smart skips intermediate and bumps two built-in levels from
+            # the default basic action-request tier.
             tier_result = await self._handle_action_request_tier_command(
                 event,
                 command=canonical,
-                direction=-1 if canonical == "dumb" else 1,
+                direction=-1 if canonical == "dumb" else 2,
             )
             if tier_result is not None:
                 return tier_result
@@ -18259,7 +18261,7 @@ class GatewayRunner:
                 f"`discord.action_request_model_tier` to be one of {supported}."
             )
 
-        target_tier = resolve_adjacent_model_tier(cfg, current_name, direction)
+        target_tier = resolve_model_tier_offset(cfg, current_name, direction)
         if target_tier is None:
             bound = "below `trivial`" if direction < 0 else "above `advanced`"
             return f"⚠️ /{command} cannot move the action-request tier {bound}."

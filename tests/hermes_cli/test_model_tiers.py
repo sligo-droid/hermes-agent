@@ -6,6 +6,7 @@ from hermes_cli.model_tiers import (
     classify_task_complexity,
     resolve_adjacent_model_tier,
     resolve_model_tier,
+    resolve_model_tier_offset,
 )
 
 
@@ -50,8 +51,8 @@ def test_default_routes_reference_resolvable_tiers():
         name: resolve_model_tier({"model_tiers": tiers}, name).reasoning_effort
         for name in ("trivial", "basic", "intermediate", "advanced")
     } == {
-        "trivial": "low",
-        "basic": "medium",
+        "trivial": "medium",
+        "basic": "high",
         "intermediate": "max",
         "advanced": "xhigh",
     }
@@ -78,6 +79,11 @@ def test_builtin_tier_ladder_steps_in_order_and_rejects_custom_or_edge_tiers():
     assert resolve_adjacent_model_tier({}, "advanced", 1) is None
     assert resolve_adjacent_model_tier({}, "custom", 1) is None
     assert resolve_adjacent_model_tier({}, "basic", 0) is None
+
+    assert resolve_model_tier_offset({}, "basic", 2).name == "advanced"
+    assert resolve_model_tier_offset({}, "trivial", 2).name == "intermediate"
+    assert resolve_model_tier_offset({}, "advanced", 2) is None
+    assert resolve_model_tier_offset({}, "basic", 0) is None
 
 
 def test_partial_custom_tier_override_keeps_required_default_fields():
