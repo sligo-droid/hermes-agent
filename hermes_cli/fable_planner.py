@@ -22,6 +22,16 @@ FABLE_REASONING = {"enabled": True, "effort": "high"}
 FABLE_DEFAULT_TOOLSETS = ["file", "terminal", "web", "browser", "discord"]
 FABLE_PLAN_MODE = "plan"
 FABLE_IMPLEMENTATION_MODE = "implementation"
+FABLE_GIT_LIFECYCLE_NONE = "none"
+FABLE_GIT_LIFECYCLE_PR = "pr"
+FABLE_GIT_LIFECYCLE_MERGE = "merge"
+_FABLE_GIT_LIFECYCLE_MODES = frozenset(
+    {
+        FABLE_GIT_LIFECYCLE_NONE,
+        FABLE_GIT_LIFECYCLE_PR,
+        FABLE_GIT_LIFECYCLE_MERGE,
+    }
+)
 
 # Bare Discord `/fable` normally starts an implementation turn.  Keep clear
 # natural-language requests for a plan on the safer plan-only route instead.
@@ -41,7 +51,7 @@ _FABLE_NATURAL_PLAN_INTENT = re.compile(
 
 FABLE_RUNTIME_NOTE = """This is `/fable`: use Claude Fable 5, planning only, inspect repo with read-only tools as needed, save a plan artifact if the plan skill requires it, and do not implement. Do not edit files, create branches, open pull requests, deploy, or claim that implementation, tests, commits, PRs, or deployment happened. Generate a concrete Markdown implementation plan only. Your final answer must contain the full plan markdown, plus the saved path if you wrote one; do not answer with only a brief path/status note. Hermes/gateway will handle Discord delivery, threading, and artifact indexing outside the Fable turn, so do not describe or perform those operational steps."""
 
-FABLE_IMPLEMENTATION_RUNTIME_NOTE = """This is Discord `/fable` implementation mode: use Claude Fable 5 to inspect, coordinate, and review the requested implementation in the normal Discord action-request flow. You may use read-only tools to investigate and review the resulting work. Every repository mutation — including file edits, generated files, dependency changes, tests that write, and git changes — must be performed through `delegate_coding_task` using the Codex coding worker in a mutable git worktree. Do not use write_file, patch, execute_code, or mutating terminal commands to edit the repository yourself. Do not fall back to OpenCode, Claude Code, or direct Fable edits. If Codex or a mutable worktree is unavailable, report that exact blocker clearly. After the worker returns, inspect and review its result, run only safe read-only verification yourself, and report the outcome concisely."""
+FABLE_IMPLEMENTATION_RUNTIME_NOTE = """This is Discord `/fable` implementation mode: use Claude Fable 5 to inspect, coordinate, and review the requested implementation in the normal Discord action-request flow. You may use read-only tools to investigate and review the resulting work. Every repository mutation — including file edits, generated files, dependency changes, tests that write, and git changes — must be performed through `delegate_coding_task` using the Codex coding worker in a mutable git worktree. The Workdir in this request is the pre-provisioned workspace for this turn: pass it as `cwd` when delegating, or omit `cwd` to inherit it; never ask the worker to create a second worktree or clone from the canonical checkout. Do not use write_file, patch, execute_code, or mutating terminal commands to edit the repository yourself. Do not fall back to OpenCode, Claude Code, or direct Fable edits. If Codex or a mutable worktree is unavailable, report that exact blocker clearly. The Git Lifecycle Policy is gateway-owned, not model-controlled; do not promise remote Git actions until the worker returns evidence. After the worker returns, inspect and review its result, run only safe read-only verification yourself, and report the outcome concisely."""
 
 
 def fable_claude_code_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -72,6 +82,7 @@ class FablePlanRequest:
     workdir: str = ""
     source_text: str = ""
     platform: str = ""
+    git_lifecycle: str = FABLE_GIT_LIFECYCLE_NONE
     transport: str = FABLE_TRANSPORT
     max_tokens: int = 12000
     timeout_seconds: int = 300
@@ -98,6 +109,7 @@ def fable_metadata(
     metadata = {
         "command": "fable",
         "fable_mode": normalized_mode,
+        "git_lifecycle": fable_git_lifecycle_mode(config),
         "route": route,
         "transport": _fable_transport(route),
         "provider": FABLE_PROVIDER,
@@ -140,6 +152,14 @@ def fable_enabled_toolsets(config: dict[str, Any] | None = None) -> list[str]:
         if toolsets:
             return toolsets
     return list(FABLE_DEFAULT_TOOLSETS)
+
+
+def fable_git_lifecycle_mode(config: dict[str, Any] | None = None) -> str:
+    """Resolve the trusted remote-Git capability for Fable implementation turns."""
+    raw = str(_fable_config(config).get("git_lifecycle") or "").strip().lower()
+    if raw in _FABLE_GIT_LIFECYCLE_MODES:
+        return raw
+    return FABLE_GIT_LIFECYCLE_NONE
 
 
 def fable_reasoning_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -225,6 +245,7 @@ def build_fable_implementation_instruction(request: FablePlanRequest) -> str:
         ("Session", request.session_id.strip()),
         ("Platform", request.platform.strip()),
         ("Workdir", request.workdir.strip()),
+        ("Git Lifecycle Policy", request.git_lifecycle.strip()),
         ("Source Text", request.source_text.strip()),
     ]
     rendered = [f"## {title}\n{value.strip()}" for title, value in sections if value]

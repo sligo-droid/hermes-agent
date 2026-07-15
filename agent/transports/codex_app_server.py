@@ -139,6 +139,20 @@ class CodexAppServerClient:
             )
             if workspace and os.path.isabs(workspace) and workspace not in writable_roots:
                 writable_roots.append(workspace)
+            # A Git linked worktree keeps its object database and refs in the
+            # primary checkout's common .git directory. An explicitly trusted
+            # lifecycle worker needs that metadata root in addition to its
+            # checkout so normal commits and branch updates do not fail as
+            # read-only inside Codex's workspace-write sandbox.
+            common_git_dir = str(
+                explicit_env.get("HERMES_CODEX_WORKER_GIT_COMMON_DIR") or ""
+            ).strip()
+            if (
+                common_git_dir
+                and os.path.isabs(common_git_dir)
+                and common_git_dir not in writable_roots
+            ):
+                writable_roots.append(common_git_dir)
             app_server_args.extend(
                 [
                     "-c",

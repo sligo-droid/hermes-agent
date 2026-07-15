@@ -12002,10 +12002,19 @@ class GatewayRunner:
             _pcfg,
         )
 
-        # Fable retains its existing worker-owned mutable-worktree route. This
-        # provisioner is specifically for ordinary Discord action turns that
-        # can edit inline before a worker is involved.
-        if getattr(event, "fable_plan_metadata", None):
+        # Plan-only Fable turns retain the mapped canonical checkout for
+        # inspection. Fable implementation turns must receive the same
+        # per-thread mutable worktree as ordinary Discord action requests.
+        # Normally _handle_fable_command has already provisioned it so its
+        # prompt names the effective workdir; keep this branch as a robust
+        # fallback for callers that inject Fable metadata directly.
+        _fable_turn_metadata = getattr(event, "fable_plan_metadata", None)
+        _fable_implementation_turn = bool(
+            isinstance(_fable_turn_metadata, dict)
+            and str(_fable_turn_metadata.get("fable_mode") or "").strip().lower()
+            == "implementation"
+        )
+        if _fable_turn_metadata and not _fable_implementation_turn:
             session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
             session_cwd_error = None
             action_worktree_cwd = None
@@ -18410,6 +18419,7 @@ class GatewayRunner:
             build_fable_implementation_instruction,
             build_fable_plan_invocation,
             fable_enabled_toolsets,
+            fable_git_lifecycle_mode,
             fable_metadata,
             fable_reasoning_config,
             fable_session_model_override,
@@ -18437,6 +18447,36 @@ class GatewayRunner:
                 "action-request thread. Use `/fable plan <request>` for a plan-only artifact."
             )
 
+        override, error = fable_session_model_override(cfg)
+        if error or not override:
+            return f"⚠️ {error or 'Fable 5 route unavailable.'}"
+
+        if mode == FABLE_IMPLEMENTATION_MODE:
+            session_cwd, session_cwd_error, action_worktree_cwd = await asyncio.to_thread(
+                _resolve_gateway_turn_cwd,
+                event.source,
+                getattr(event, "feature_summary", None),
+                cfg,
+                session_key,
+            )
+            if session_cwd_error:
+                logger.error(
+                    "Fable action-worktree preparation failed for session %s: %s",
+                    session_key,
+                    session_cwd_error,
+                )
+                return (
+                    "⚠️ I could not start this Discord `/fable` implementation safely "
+                    f"in a mutable Git worktree. {session_cwd_error}"
+                )
+            if action_worktree_cwd:
+                source = dataclasses.replace(event.source, project_path=action_worktree_cwd)
+                try:
+                    event.source = source
+                except Exception:
+                    pass
+                self._cache_session_source(session_key, source)
+
         original_text = str(event.text or "").strip()
         request = FablePlanRequest(
             prompt=prompt,
@@ -18444,6 +18484,7 @@ class GatewayRunner:
             workdir=session_cwd,
             source_text=original_text,
             platform=event.source.platform.value if event.source.platform else "",
+            git_lifecycle=fable_git_lifecycle_mode(cfg),
         )
         if mode == FABLE_PLAN_MODE:
             msg = build_fable_plan_invocation(request, task_id=session_key)
@@ -18451,10 +18492,6 @@ class GatewayRunner:
                 return "⚠️ /fable plan requires the `plan` skill, but it is not installed or could not be loaded."
         else:
             msg = build_fable_implementation_instruction(request)
-
-        override, error = fable_session_model_override(cfg)
-        if error or not override:
-            return f"⚠️ {error or 'Fable 5 route unavailable.'}"
 
         try:
             event.text = msg
@@ -22018,6 +22055,12 @@ class GatewayRunner:
             # surface for inspection/review, while tool execution blocks all
             # direct repository mutations in favor of the Codex worker.
             agent._fable_implementation_turn = fable_implementation
+            if fable_implementation:
+                from hermes_cli.fable_planner import fable_git_lifecycle_mode
+
+                agent._fable_git_lifecycle = fable_git_lifecycle_mode(user_config)
+            else:
+                agent._fable_git_lifecycle = "none"
             session_model_override = bool(
                 (getattr(self, "_session_model_overrides", {}) or {}).get(session_key)
             )

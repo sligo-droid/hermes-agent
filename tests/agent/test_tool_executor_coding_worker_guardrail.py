@@ -88,6 +88,16 @@ def test_fable_implementation_never_unblocks_direct_mutation_after_delegate():
     assert "delegate_coding_task" in delegation_message
 
 
+def test_fable_implementation_allows_read_only_terminal_with_stderr_duplication():
+    agent = _agent(_fable_implementation_turn=True)
+
+    assert _coding_worker_mutation_block(
+        agent,
+        "terminal",
+        {"command": "git status --short --branch 2>&1 | head -20"},
+    ) is None
+
+
 def test_coding_worker_guardrail_allows_user_systemd_service_write(monkeypatch, tmp_path):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))

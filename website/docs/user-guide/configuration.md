@@ -1220,7 +1220,7 @@ Set it to `disabled` to turn off tier routing globally and use the legacy raw
 OpenCode model and per-pass reasoning fields. The UI visual specialist remains
 an independent Claude Code route pinned to Claude Fable 5 at medium effort. It
 uses Claude Code's supported Anthropic OAuth login and does not inherit
-coding-worker tiers or `/fable`'s plan-only contract.
+coding-worker tiers or `/fable`'s execution policy.
 OpenCode's `max` variant is forwarded literally as `reasoning.effort=max`; it is
 not normalized or aliased to `xhigh`.
 
@@ -1248,6 +1248,22 @@ or `reasoning_effort` override, then per-job `model_tier`, then the global
 override. Script-only `no_agent` jobs do not consume a model tier. A gateway
 session's `/model` override takes precedence over its route tier. The normal
 CLI/TUI default remains `model.default`.
+
+## Fable
+
+Discord `/fable <request>` uses the Fable implementation route; `/fable plan
+<request>` remains plan-only. Implementation turns receive a per-thread mutable
+Git worktree and delegate all repository mutations to the Codex coding worker.
+
+```yaml
+fable:
+  git_lifecycle: none   # none | pr | merge
+```
+
+`none` (the default) permits local implementation only. `pr` gives the trusted
+Codex worker network access and authority to commit, push, and open a PR.
+`merge` additionally permits a merge only when the original user request
+explicitly asks to land the PR; it never authorizes a direct update to `main`.
 
 Hermes writes the effective route to `turn_runtime_summary` log records. Audit
 fields include `model_tier`, `model_tier_source`, `runtime_route`,

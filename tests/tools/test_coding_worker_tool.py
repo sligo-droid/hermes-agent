@@ -488,6 +488,48 @@ def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, t
     assert "Do not merge PRs" in prompt
 
 
+def test_fable_merge_lifecycle_scopes_network_and_linked_git_metadata(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    canonical = tmp_path / "canonical"
+    worktree = tmp_path / "fable-worktree"
+    canonical.mkdir()
+    for args in (
+        ["init"],
+        ["config", "user.email", "tests@example.invalid"],
+        ["config", "user.name", "Hermes Tests"],
+        ["checkout", "-b", "main"],
+    ):
+        subprocess.run(["git", *args], cwd=canonical, check=True, stdout=subprocess.DEVNULL)
+    (canonical / "tracked.txt").write_text("initial\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=canonical, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=canonical, check=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "fable/lifecycle", str(worktree), "HEAD"],
+        cwd=canonical,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _fable_parent(worktree)
+    parent._fable_git_lifecycle = "merge"
+
+    result = json.loads(cwt.delegate_coding_task(task="land the requested change", parent_agent=parent))
+
+    assert result["success"] is True
+    assert result["fable_git_lifecycle"] == "merge"
+    env = FakeSession.instances[0].kwargs["env"]
+    assert env["HERMES_CODEX_WORKER_NETWORK_ACCESS"] == "1"
+    assert env["HERMES_CODEX_WORKER_WORKSPACE"] == str(worktree)
+    assert env["HERMES_CODEX_WORKER_GIT_COMMON_DIR"] == str(canonical / ".git")
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "pre-provisioned mutable checkout" in prompt
+    assert "Merge only when the original user request explicitly asks" in prompt
+
+
 def test_authorized_git_pr_lifecycle_preserves_explicit_git_ssh_command(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []

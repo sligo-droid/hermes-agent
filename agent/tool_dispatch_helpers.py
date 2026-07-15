@@ -73,8 +73,20 @@ _DESTRUCTIVE_PATTERNS = re.compile(
     )""",
     re.VERBOSE,
 )
-# Output redirects that overwrite files (> but not >>)
-_REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
+# File-output redirects can modify a file. Descriptor duplication (``2>&1``)
+# and writes to ``/dev/null`` are read-only verification plumbing, not repo
+# mutations, so they must not force an implementation turn through a worker.
+_REDIRECT_OVERWRITE = re.compile(
+    r"(?<![>&])(?:\d+)?>{1,2}(?!&)\s*(?P<target>\S+)"
+)
+
+
+def _has_file_output_redirect(cmd: str) -> bool:
+    for match in _REDIRECT_OVERWRITE.finditer(cmd):
+        target = str(match.group("target") or "").rstrip(";,|")
+        if target != "/dev/null":
+            return True
+    return False
 
 
 def _is_destructive_command(cmd: str) -> bool:
@@ -83,7 +95,7 @@ def _is_destructive_command(cmd: str) -> bool:
         return False
     if _DESTRUCTIVE_PATTERNS.search(cmd):
         return True
-    if _REDIRECT_OVERWRITE.search(cmd):
+    if _has_file_output_redirect(cmd):
         return True
     return False
 

@@ -539,6 +539,54 @@ class TestSpawnEnvIsolation:
         assert "GITHUB_TOKEN" not in captured["env"]
         assert "OPENROUTER_API_KEY" not in captured["env"]
 
+    def test_authorized_coding_worker_adds_linked_common_git_root(self, monkeypatch):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            env={
+                "PATH": "/bin",
+                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+                "HERMES_CODEX_WORKER_WORKSPACE": "/home/droid/workspaces/fable-pid",
+                "HERMES_CODEX_WORKER_GIT_COMMON_DIR": "/home/droid/.hermes/workspace/PID/.git",
+            },
+            replace_env=True,
+        )
+        client._closed = True
+
+        assert (
+            'sandbox_workspace_write.writable_roots=["/home/droid/workspaces/fable-pid", "/home/droid/.hermes/workspace/PID/.git"]'
+            in captured["cmd"]
+        )
+        assert "sandbox_workspace_write.network_access=true" in captured["cmd"]
+
     def test_spawn_wraps_codex_app_server_in_gateway_child_scope(self, monkeypatch, tmp_path):
         import subprocess
         from agent.transports import codex_app_server as cas

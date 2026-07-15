@@ -254,9 +254,11 @@ def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunn
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fable_implementation", [False, True])
 async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
     tmp_path,
     monkeypatch,
+    fable_implementation,
 ):
     canonical_root = tmp_path / "canonical"
     canonical = canonical_root / "PID"
@@ -288,6 +290,15 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
         message_id="message-1",
     )
     event.feature_summary = _feature_summary()
+    if fable_implementation:
+        event.fable_plan_metadata = {
+            "command": "fable",
+            "fable_mode": "implementation",
+        }
+        runner._run_agent.return_value.update(
+            model="claude-fable-5",
+            provider="anthropic",
+        )
 
     response = await runner._handle_message_with_agent(
         event,

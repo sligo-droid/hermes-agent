@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 from hermes_cli.fable_planner import (
     FABLE_DEFAULT_TOOLSETS,
+    FABLE_GIT_LIFECYCLE_MERGE,
+    FABLE_GIT_LIFECYCLE_NONE,
+    FABLE_GIT_LIFECYCLE_PR,
     FABLE_IMPLEMENTATION_MODE,
     FABLE_MODEL,
     FABLE_PLAN_MODE,
@@ -12,6 +15,7 @@ from hermes_cli.fable_planner import (
     build_fable_plan_invocation,
     build_fable_user_instruction,
     fable_enabled_toolsets,
+    fable_git_lifecycle_mode,
     fable_metadata,
     fable_reasoning_config,
     fable_session_model_override,
@@ -353,6 +357,7 @@ def test_default_config_pins_fable_route():
     assert DEFAULT_CONFIG["fable"]["provider"] == "anthropic"
     assert DEFAULT_CONFIG["fable"]["model"] == FABLE_MODEL
     assert DEFAULT_CONFIG["fable"]["route"] == "anthropic_oauth"
+    assert DEFAULT_CONFIG["fable"]["git_lifecycle"] == FABLE_GIT_LIFECYCLE_NONE
     assert DEFAULT_CONFIG["fable"]["enabled_toolsets"] == FABLE_DEFAULT_TOOLSETS
 
 
@@ -362,6 +367,13 @@ def test_fable_enabled_toolsets_defaults_to_compact_budget():
 
 def test_fable_enabled_toolsets_allows_config_override():
     assert fable_enabled_toolsets(config={"fable": {"enabled_toolsets": ["file", "web"]}}) == ["file", "web"]
+
+
+def test_fable_git_lifecycle_defaults_closed_and_normalizes_known_modes():
+    assert fable_git_lifecycle_mode({}) == FABLE_GIT_LIFECYCLE_NONE
+    assert fable_git_lifecycle_mode({"fable": {"git_lifecycle": "PR"}}) == FABLE_GIT_LIFECYCLE_PR
+    assert fable_git_lifecycle_mode({"fable": {"git_lifecycle": "merge"}}) == FABLE_GIT_LIFECYCLE_MERGE
+    assert fable_git_lifecycle_mode({"fable": {"git_lifecycle": "anything"}}) == FABLE_GIT_LIFECYCLE_NONE
 
 
 def test_fable_reasoning_config_uses_configured_discord_feature_effort():
@@ -400,6 +412,7 @@ def test_fable_implementation_metadata_is_not_a_plan_artifact():
     metadata = fable_metadata(mode=FABLE_IMPLEMENTATION_MODE)
 
     assert metadata["fable_mode"] == FABLE_IMPLEMENTATION_MODE
+    assert metadata["git_lifecycle"] == FABLE_GIT_LIFECYCLE_NONE
     assert metadata["kind"] == "fable_implementation"
     assert "plan_artifact_kind" not in metadata
 

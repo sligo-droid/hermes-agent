@@ -162,6 +162,47 @@ async def test_bare_discord_fable_routes_to_implementation_with_normal_tool_surf
 
 
 @pytest.mark.asyncio
+async def test_fable_implementation_preprovisions_worktree_for_worker_prompt(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+    runner._cache_session_source = MagicMock()
+    event = _make_event()
+    event.source.project_path = "/canonical/PID"
+
+    def fake_worktree(source, feature_summary, config, session_key):
+        assert source.project_path == "/canonical/PID"
+        assert feature_summary == event.feature_summary
+        assert session_key == build_session_key(event.source)
+        return "/workspaces/fable-pid", None, "/workspaces/fable-pid"
+
+    def fake_build(request):
+        assert request.workdir == "/workspaces/fable-pid"
+        assert request.git_lifecycle == "merge"
+        return "FABLE IMPLEMENTATION: build X"
+
+    monkeypatch.setattr("gateway.run._resolve_gateway_turn_cwd", fake_worktree)
+    monkeypatch.setattr("hermes_cli.fable_planner.build_fable_implementation_instruction", fake_build)
+    monkeypatch.setattr(
+        "hermes_cli.fable_planner.fable_session_model_override",
+        lambda config=None: (_fable_override(), ""),
+    )
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_runtime_config",
+        lambda: {"fable": {"git_lifecycle": "merge"}},
+    )
+
+    result = await GatewayRunner._handle_message(runner, event)
+
+    assert isinstance(result, MetadataReply)
+    assert result.metadata["git_lifecycle"] == "merge"
+    assert event.source.project_path == "/workspaces/fable-pid"
+    runner._cache_session_source.assert_called_once_with(
+        build_session_key(event.source), event.source
+    )
+
+
+@pytest.mark.asyncio
 async def test_natural_discord_fable_plan_is_plan_only_without_action_thread(monkeypatch):
     from gateway.run import GatewayRunner
 
@@ -496,7 +537,14 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = CapturingAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"tools": {"discord": {"enabled": ["all"]}}})
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "tools": {"discord": {"enabled": ["all"]}},
+            "fable": {"git_lifecycle": "pr"},
+        },
+    )
     import hermes_cli.tools_config as tools_config
 
     monkeypatch.setattr(tools_config, "_get_platform_tools", lambda _config, _platform: {"core", "terminal"})
@@ -525,6 +573,8 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
         "command": "fable",
         "fable_mode": "implementation",
         "route": "anthropic_proxy",
+        # Metadata is informational; the agent capability comes from config.
+        "git_lifecycle": "merge",
         "anthropic_oauth_tool_name_compat": True,
     }
     session_entry = _session_entry_for_event(event)
@@ -549,6 +599,7 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
     assert captured["fallback_model"] is None
     assert captured["providers_allowed"] == ["anthropic"]
     assert CapturingAgent.instance._fable_implementation_turn is True
+    assert CapturingAgent.instance._fable_git_lifecycle == "pr"
     assert CapturingAgent.instance._anthropic_oauth_tool_name_compat is True
 
 

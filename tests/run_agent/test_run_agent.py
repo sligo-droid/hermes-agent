@@ -52,6 +52,12 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_is_destructive_command_allows_descriptor_duplication_but_blocks_file_redirects():
+    assert run_agent._is_destructive_command("git status 2>&1 | head -20") is False
+    assert run_agent._is_destructive_command("git status 2>/dev/null") is False
+    assert run_agent._is_destructive_command("git status > status.txt") is True
+
+
 def test_default_max_iterations_is_1000():
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
