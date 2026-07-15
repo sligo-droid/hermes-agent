@@ -32,7 +32,7 @@ Use this when pulling `NousResearch/hermes-agent` `upstream/main` into the Sligo
 ## Verification
 
 - Minimum local gate: `scripts/run_tests.sh` from the merge worktree.
-- If npm workspaces or lockfiles changed, run `npm ci` and the Typecheck workflow's package commands locally before pushing.
+- If npm workspaces or lockfiles changed, run `npm ci` and the Basic Tests frontend package commands locally before pushing.
 - If smoke fails, run focused tests for the failing areas, fix the smallest integration break, then rerun smoke.
 - Before committing, check for unmerged paths and conflict markers: `git diff --name-only --diff-filter=U` and a search for `<<<<<<<` / `>>>>>>>`.
 - In the PR body, include upstream head SHA, divergence counts, conflict policy, and test results.
@@ -43,5 +43,5 @@ Use this when pulling `NousResearch/hermes-agent` `upstream/main` into the Sligo
 - Initial divergence was `10126 2538` from `git rev-list --left-right --count origin/main...upstream/main`.
 - First-pass conflicts used the conservative fork-side policy above; upstream non-conflicting changes were retained.
 - Smoke initially exposed regressions in tool middleware/hooks, file write safety guards, skills-hub recursive vetting, browse progress callbacks, and platform-bundle disabling. Those were fixed before commit.
-- CI exposed npm workspace manifest/lockfile drift and TUI prop-contract drift; root/workspace manifests were realigned with the lockfile, `npm ci` and the Typecheck package commands passed locally, and the workflow now installs the declared npm version before `npm ci`.
+- CI exposed npm workspace manifest/lockfile drift and TUI prop-contract drift; root/workspace manifests were realigned with the lockfile, `npm ci` and the Basic Tests frontend package commands passed locally, and the workflow installs the declared npm version before `npm ci`.
 - Verification: `scripts/run_tests.sh` passed with `856 passed, 16 warnings`.

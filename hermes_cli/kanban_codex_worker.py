@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -111,6 +112,19 @@ _WORKER_PROJECT_STATE_JUSTIFICATION = (
     "no current project-state ledger change required."
 )
 _DASHBOARD_QA_USERNAME = "hermes_qa"
+_REQUIRED_PR_CI_CHECKS = (
+    ("Basic Tests", "basic"),
+    ("PR Body Format", "pr body"),
+)
+_PR_CI_MIN_POLL_SECONDS = 10.0
+
+
+class PRFinalizationOutcome(str, Enum):
+    """The dispatcher-facing result of one nonblocking PR finalization pass."""
+
+    MERGED = "merged"
+    WAITING_FOR_CI = "waiting_for_ci"
+    FAILED = "failed"
 
 
 def _single_line_pr_title(value: Any) -> str:
@@ -2385,7 +2399,13 @@ def _pr_number_from_url(url: str) -> str:
 
 
 def _reset_pr_status_fields(worker: dict[str, Any]) -> None:
-    for key in (
+    """Clear stale finalizer facts before a real PR refresh.
+
+    CI wait data is intentionally durable between dispatcher ticks.  It is
+    changed head SHA is handled separately by ``_refresh_pr_status``; it is
+    never reset merely because the dispatcher looked at the board again.
+    """
+    keys = (
         "pr_error",
         "pr_status_error",
         "pr_state",
@@ -2407,11 +2427,23 @@ def _reset_pr_status_fields(worker: dict[str, Any]) -> None:
         "canonical_sync_head",
         "canonical_sync_merge_commit",
         "canonical_synced_at",
-    ):
+    )
+    for key in keys:
         # Keep previously persisted keys present so the final metadata merge
         # overwrites stale blockers. Popping only clears the local dict; it does
         # not delete/clear existing fields in board metadata. Do not introduce
         # absent fields just to clear them.
+        if key in worker:
+            worker[key] = None
+
+
+def _clear_pr_ci_wait(worker: dict[str, Any]) -> None:
+    for key in (
+        "pr_ci_wait_state",
+        "pr_ci_wait_started_at",
+        "pr_ci_next_poll_at",
+        "pr_ci_wait_seconds",
+    ):
         if key in worker:
             worker[key] = None
 
@@ -2594,20 +2626,102 @@ def _check_rollup_summary(items: Any) -> tuple[str, int, list[str]]:
     return "passed", total, []
 
 
-def _pr_merge_wait_seconds() -> float:
-    raw = os.environ.get("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "300")
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 300.0
+def _required_check_rollup_summary(
+    items: Any,
+    *,
+    head_sha: str = "",
+) -> tuple[str, int, list[str], str]:
+    """Summarize only the two stable merge-gate checks for the current head.
+
+    GitHub can retain cancelled attempts beside newer successful reruns.  The
+    generic rollup helper already collapses those attempts; this helper then
+    selects the explicit finalizer contract instead of making unrelated checks
+    accidental merge gates.
+    """
+    latest = _latest_check_rollup_items(items) if isinstance(items, list) else []
+    selected: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in latest:
+        identity = (str(item.get("workflowName") or ""), _check_rollup_item_name(item))
+        if identity not in _REQUIRED_PR_CI_CHECKS:
+            continue
+        item_head = str(item.get("headSha") or item.get("headRefOid") or "").strip()
+        if head_sha and item_head and item_head != head_sha:
+            continue
+        prior = selected.get(identity)
+        is_newer = prior is None or (
+            _check_rollup_item_sort_key(item, 0) >= _check_rollup_item_sort_key(prior, 0)
+        )
+        if is_newer:
+            selected[identity] = item
+
+    failed: list[str] = []
+    pending = False
+    running = False
+    for workflow_name, check_name in _REQUIRED_PR_CI_CHECKS:
+        item = selected.get((workflow_name, check_name))
+        if item is None:
+            pending = True
+            continue
+        status = str(item.get("status") or item.get("state") or "").strip().upper()
+        conclusion = str(item.get("conclusion") or item.get("conclusionState") or "").strip().upper()
+        display = f"{workflow_name} / {check_name}"
+        if conclusion in {"FAILURE", "FAILED", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"} or status in {
+            "FAILURE",
+            "FAILED",
+        }:
+            failed.append(display)
+        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+            continue
+        else:
+            pending = True
+            if status in {"IN_PROGRESS", "QUEUED", "REQUESTED", "PENDING", "WAITING"}:
+                running = True
+    if failed:
+        return "failed", len(selected), failed, ""
+    if pending:
+        return "pending", len(selected), [], "running" if running else "queued"
+    return "passed", len(selected), [], ""
 
 
-def _pr_merge_poll_seconds() -> float:
-    raw = os.environ.get("HERMES_KANBAN_PR_MERGE_POLL_SECONDS", "10")
+def _pr_ci_poll_seconds() -> float:
+    raw = os.environ.get(
+        "HERMES_KANBAN_PR_CI_POLL_SECONDS",
+        os.environ.get("HERMES_KANBAN_PR_MERGE_POLL_SECONDS", "10"),
+    )
     try:
-        return max(0.5, float(raw))
+        return max(_PR_CI_MIN_POLL_SECONDS, float(raw))
     except (TypeError, ValueError):
-        return 10.0
+        return _PR_CI_MIN_POLL_SECONDS
+
+
+def _pr_ci_wait_is_due(worker: dict[str, Any], *, now: int) -> bool:
+    if not str(worker.get("pr_ci_wait_state") or "").strip():
+        return True
+    try:
+        next_poll_at = int(float(worker.get("pr_ci_next_poll_at") or 0))
+    except (TypeError, ValueError):
+        return True
+    return next_poll_at <= now
+
+
+def _record_pr_ci_wait(worker: dict[str, Any], *, state: str, now: int) -> None:
+    try:
+        started_at = int(float(worker.get("pr_ci_wait_started_at") or now))
+    except (TypeError, ValueError):
+        started_at = now
+    if started_at > now:
+        started_at = now
+    worker.update(
+        {
+            "pr_ci_wait_state": state,
+            "pr_ci_wait_started_at": started_at,
+            "pr_ci_next_poll_at": now + int(_pr_ci_poll_seconds()),
+            "pr_ci_wait_seconds": max(0, now - started_at),
+            "pr_blocker": "",
+            "pr_error": None,
+            "pr_status_error": "",
+        }
+    )
 
 
 def _pr_ref(worker: dict[str, Any]) -> str:
@@ -2771,12 +2885,11 @@ def _pr_blocker(worker: dict[str, Any]) -> str:
     if checks_status == "failed":
         failed = ", ".join(str(item) for item in (worker.get("pr_checks_failed") or []) if item)
         return f"checks failed: {failed}" if failed else "checks failed"
-    if checks_status == "pending":
-        return "checks pending"
-    if checks_status == "not checked":
-        return "checks not checked"
+    # Pending/missing merge-gate checks are durable, nonblocking state.  The
+    # finalizer records them in pr_ci_wait_* rather than turning the board into
+    # an operator-blocked failure.
     merge_state = str(worker.get("pr_merge_state") or "unknown").strip().upper()
-    if merge_state and merge_state not in {"CLEAN", "HAS_HOOKS", "UNKNOWN"}:
+    if merge_state and merge_state not in {"CLEAN", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}:
         return f"merge state: {merge_state}"
     return ""
 
@@ -2800,7 +2913,7 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
             "--repo",
             repo,
             "--json",
-            "number,url,state,mergedAt,mergeCommit,mergeStateStatus,mergeable,isDraft,reviewDecision,statusCheckRollup",
+            "number,url,state,headRefOid,mergedAt,mergeCommit,mergeStateStatus,mergeable,isDraft,reviewDecision,statusCheckRollup",
         ],
         root=root,
         timeout=30,
@@ -2829,6 +2942,12 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
         worker["pr_url"] = str(data.get("url") or "")
     if data.get("number") is not None:
         worker["pr_number"] = str(data.get("number"))
+    head_sha = str(data.get("headRefOid") or "").strip()
+    if head_sha:
+        previous_head_sha = str(worker.get("pr_ci_head_sha") or "").strip()
+        if previous_head_sha != head_sha:
+            _clear_pr_ci_wait(worker)
+        worker["pr_ci_head_sha"] = head_sha
     worker["pr_state"] = str(data.get("state") or "unknown")
     worker["pr_merged_at"] = str(data.get("mergedAt") or "")
     merge_commit = data.get("mergeCommit") if isinstance(data.get("mergeCommit"), dict) else {}
@@ -2837,12 +2956,20 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     worker["pr_mergeable"] = data.get("mergeable") if data.get("mergeable") is not None else "unknown"
     worker["pr_is_draft"] = bool(data.get("isDraft"))
     worker["pr_review_decision"] = str(data.get("reviewDecision") or "").strip() or "unknown"
-    checks_status, checks_total, failed = _check_rollup_summary(data.get("statusCheckRollup"))
-    if worker["pr_state"] == "MERGED" and checks_status == "not checked" and checks_total == 0:
+    checks_status, checks_total, failed, wait_state = _required_check_rollup_summary(
+        data.get("statusCheckRollup"),
+        head_sha=head_sha,
+    )
+    if worker["pr_state"] == "MERGED" and checks_status == "pending" and checks_total == 0:
         checks_status = "passed"
     worker["pr_checks_status"] = checks_status
     worker["pr_checks_total"] = checks_total
     worker["pr_checks_failed"] = failed
+    worker["pr_status_error"] = ""
+    if checks_status == "pending":
+        worker["pr_ci_wait_state"] = wait_state or "queued"
+    if _pr_is_merged(worker):
+        _clear_pr_ci_wait(worker)
     worker["pr_blocker"] = _pr_blocker(worker)
 
 
@@ -2953,69 +3080,88 @@ def _ensure_pr_open(
     return not bool(worker.get("pr_blocker")) and _pr_is_open_or_merged(worker)
 
 
-def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
+def _ensure_pr_merged(
+    worker: dict[str, Any],
+    *,
+    root: Path,
+    repo: str,
+) -> PRFinalizationOutcome:
+    """Merge once the two stable CI gates pass, without blocking the dispatcher."""
     pr_ref = _pr_ref(worker)
     if not pr_ref:
         worker.setdefault("pr_checks_status", "not checked")
         worker.setdefault("pr_merge_state", "unknown")
         worker["pr_blocker"] = _pr_blocker(worker)
-        return False
+        return PRFinalizationOutcome.FAILED
 
-    deadline = time.monotonic() + _pr_merge_wait_seconds()
-    poll_seconds = _pr_merge_poll_seconds()
-    first = True
-    while True:
-        if not first or not worker.get("pr_state"):
-            _refresh_pr_status(worker, root=root, repo=repo)
-        first = False
-        if _pr_is_merged(worker):
-            worker["pr_blocker"] = ""
-            return True
+    if not worker.get("pr_state"):
+        _refresh_pr_status(worker, root=root, repo=repo)
+    if _pr_is_merged(worker):
+        _clear_pr_ci_wait(worker)
+        worker["pr_blocker"] = ""
+        return PRFinalizationOutcome.MERGED
 
-        blocker = _pr_blocker(worker)
-        if (
-            blocker == "checks not checked"
-            and int(worker.get("pr_checks_total") or 0) == 0
-            and str(worker.get("pr_merge_state") or "").strip().upper() in {"CLEAN", "HAS_HOOKS"}
-            and deadline - time.monotonic() <= 0
-        ):
-            worker["pr_checks_status"] = "passed"
-            worker["pr_blocker"] = ""
-            blocker = ""
-        if not blocker:
-            merged = _run_gh(
-                ["pr", "merge", pr_ref, "--repo", repo, "--merge", "--delete-branch"],
-                root=root,
-                timeout=300,
-            )
-            if merged.returncode != 0:
-                worker["pr_status_error"] = (
-                    merged.stderr or merged.stdout or "gh pr merge failed"
-                ).strip()
-                worker["pr_blocker"] = _pr_blocker(worker)
-                return False
-            _refresh_pr_status(worker, root=root, repo=repo)
-            if _pr_is_merged(worker):
-                worker["pr_blocker"] = ""
-                return True
-            worker["pr_blocker"] = _pr_blocker(worker) or "PR did not report merged after merge"
-            return False
+    if worker.get("pr_error") or worker.get("pr_status_error"):
+        worker["pr_blocker"] = _pr_blocker(worker)
+        _clear_pr_ci_wait(worker)
+        return PRFinalizationOutcome.FAILED
+    state = str(worker.get("pr_state") or "").strip().upper()
+    if state and state not in {"OPEN", "UNKNOWN"}:
+        worker["pr_blocker"] = _pr_blocker(worker)
+        _clear_pr_ci_wait(worker)
+        return PRFinalizationOutcome.FAILED
+    if worker.get("pr_is_draft") is True or (
+        str(worker.get("pr_review_decision") or "").strip().upper() == "CHANGES_REQUESTED"
+    ):
+        worker["pr_blocker"] = _pr_blocker(worker)
+        _clear_pr_ci_wait(worker)
+        return PRFinalizationOutcome.FAILED
 
-        if blocker == "merge state: UNSTABLE" and str(worker.get("pr_checks_status") or "").strip().lower() == "passed":
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                worker["pr_blocker"] = blocker
-                return False
-            time.sleep(min(poll_seconds, remaining))
-            continue
-        if blocker not in {"checks pending", "checks not checked"}:
-            worker["pr_blocker"] = blocker
-            return False
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            worker["pr_blocker"] = blocker
-            return False
-        time.sleep(min(poll_seconds, remaining))
+    checks_status = str(worker.get("pr_checks_status") or "pending").strip().lower()
+    now = int(time.time())
+    if checks_status in {"pending", "not checked"}:
+        # A legacy/not-checked response is queued until GitHub materializes
+        # the first expected run.  Refresh records running vs. queued when it
+        # can observe an expected check directly.
+        wait_state = str(worker.get("pr_ci_wait_state") or "").strip() or "queued"
+        _record_pr_ci_wait(worker, state=wait_state, now=now)
+        return PRFinalizationOutcome.WAITING_FOR_CI
+    if checks_status == "failed":
+        worker["pr_blocker"] = _pr_blocker(worker)
+        _clear_pr_ci_wait(worker)
+        return PRFinalizationOutcome.FAILED
+
+    blocker = _pr_blocker(worker)
+    if blocker:
+        worker["pr_blocker"] = blocker
+        _clear_pr_ci_wait(worker)
+        return PRFinalizationOutcome.FAILED
+
+    merge_state = str(worker.get("pr_merge_state") or "unknown").strip().upper()
+    if merge_state in {"", "UNKNOWN", "UNSTABLE"}:
+        _record_pr_ci_wait(worker, state="mergeability", now=now)
+        return PRFinalizationOutcome.WAITING_FOR_CI
+    if merge_state not in {"CLEAN", "HAS_HOOKS"}:
+        worker["pr_blocker"] = _pr_blocker(worker) or f"merge state: {merge_state}"
+        _clear_pr_ci_wait(worker)
+        return PRFinalizationOutcome.FAILED
+
+    merged = _run_gh(
+        ["pr", "merge", pr_ref, "--repo", repo, "--merge", "--delete-branch"],
+        root=root,
+        timeout=300,
+    )
+    if merged.returncode != 0:
+        worker["pr_status_error"] = (merged.stderr or merged.stdout or "gh pr merge failed").strip()
+        worker["pr_blocker"] = _pr_blocker(worker)
+        return PRFinalizationOutcome.FAILED
+    _refresh_pr_status(worker, root=root, repo=repo)
+    if _pr_is_merged(worker):
+        _clear_pr_ci_wait(worker)
+        worker["pr_blocker"] = ""
+        return PRFinalizationOutcome.MERGED
+    worker["pr_blocker"] = _pr_blocker(worker) or "PR did not report merged after merge"
+    return PRFinalizationOutcome.FAILED
 
 
 def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str) -> bool:
@@ -3037,11 +3183,11 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
     return result.state.startswith("synced")
 
 
-def _ensure_pr(board: Optional[str], workspace: str) -> bool:
-    """Finalize a board PR only from trusted dispatcher/orchestrator context."""
+def _ensure_pr(board: Optional[str], workspace: str) -> PRFinalizationOutcome:
+    """Advance one board PR finalization pass from trusted dispatcher context."""
     role_worker_task = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not board:
-        return not role_worker_task
+        return PRFinalizationOutcome.FAILED if role_worker_task else PRFinalizationOutcome.MERGED
     from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
     from hermes_cli.discord_worker_boards import effective_pr_policy_for_worker
     from hermes_cli.discord_worker_boards import _update_worker_meta
@@ -3063,7 +3209,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
             }
         )
         _update_worker_meta(board, worker)
-        return False
+        return PRFinalizationOutcome.FAILED
     worker["pr_finalizer_guard"] = ""
     root = Path(workspace)
     branch = str(worker.get("worker_branch") or "").strip()
@@ -3075,10 +3221,11 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     open_policy = _pr_open_policy(worker)
     worker["pr_open_policy"] = open_policy
     worker["merge_policy"] = policy
-    _reset_pr_status_fields(worker)
+    outcome = PRFinalizationOutcome.FAILED
     try:
         skip_pr_lifecycle = False
         if open_policy == PR_OPEN_POLICY_NEVER:
+            _reset_pr_status_fields(worker)
             worker["pr_skipped_no_changes"] = True
             worker["pr_state"] = "not_needed"
             worker["pr_checks_status"] = "passed"
@@ -3090,6 +3237,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
             worker["pr_merge_skipped_reason"] = "pr_open_policy_never"
             worker["pr_blocker"] = ""
             skip_pr_lifecycle = True
+            outcome = PRFinalizationOutcome.MERGED
         if not skip_pr_lifecycle:
             missing = []
             if not repo:
@@ -3101,25 +3249,57 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 worker["pr_checks_status"] = "not checked"
                 worker["pr_merge_state"] = "unknown"
                 worker["pr_blocker"] = worker["pr_error"]
-                raise RuntimeError(worker["pr_error"])
-            assert repo is not None
-            target_error = _validate_pr_amend_target(worker, repo=repo, base=base)
-            if target_error:
-                worker["pr_error"] = target_error
-                worker["pr_checks_status"] = "not checked"
-                worker["pr_merge_state"] = "unknown"
-                worker["pr_blocker"] = target_error
-                raise RuntimeError(target_error)
-            if _pr_ref(worker):
+                outcome = PRFinalizationOutcome.FAILED
+                skip_pr_lifecycle = True
+            if not skip_pr_lifecycle:
+                assert repo is not None
+                target_error = _validate_pr_amend_target(worker, repo=repo, base=base)
+                if target_error:
+                    worker["pr_error"] = target_error
+                    worker["pr_checks_status"] = "not checked"
+                    worker["pr_merge_state"] = "unknown"
+                    worker["pr_blocker"] = target_error
+                    outcome = PRFinalizationOutcome.FAILED
+                    skip_pr_lifecycle = True
+            if not skip_pr_lifecycle and policy == MERGE_POLICY_AUTO and _pr_ref(worker):
+                now = int(time.time())
+                if not _pr_ci_wait_is_due(worker, now=now):
+                    outcome = PRFinalizationOutcome.WAITING_FOR_CI
+                    skip_pr_lifecycle = True
+            if not skip_pr_lifecycle and _pr_ref(worker):
+                _reset_pr_status_fields(worker)
                 _refresh_pr_status(worker, root=root, repo=repo)
-                if policy == MERGE_POLICY_AUTO and _pr_is_merged(worker):
+                if _pr_is_merged(worker):
                     worker["pr_blocker"] = ""
-                    if not _sync_canonical_checkout_after_merge(worker, branch=base):
+                    if _sync_canonical_checkout_after_merge(worker, branch=base):
+                        outcome = PRFinalizationOutcome.MERGED
+                    else:
                         sync_error = str(worker.get("canonical_sync_error") or "Canonical checkout sync failed")
                         worker["pr_error"] = sync_error
                         worker["pr_blocker"] = sync_error
+                        outcome = PRFinalizationOutcome.FAILED
+                    skip_pr_lifecycle = True
+                elif policy == MERGE_POLICY_AUTO:
+                    outcome = _ensure_pr_merged(worker, root=root, repo=repo)
+                    if outcome == PRFinalizationOutcome.MERGED:
+                        if not _sync_canonical_checkout_after_merge(worker, branch=base):
+                            sync_error = str(worker.get("canonical_sync_error") or "Canonical checkout sync failed")
+                            worker["pr_error"] = sync_error
+                            worker["pr_blocker"] = sync_error
+                            outcome = PRFinalizationOutcome.FAILED
+                    skip_pr_lifecycle = True
+                else:
+                    worker["pr_merge_skipped"] = True
+                    worker["pr_merge_skipped_reason"] = policy
+                    worker["pr_blocker"] = _pr_open_blocker(worker)
+                    outcome = (
+                        PRFinalizationOutcome.MERGED
+                        if not worker.get("pr_blocker") and _pr_is_open_or_merged(worker)
+                        else PRFinalizationOutcome.FAILED
+                    )
                     skip_pr_lifecycle = True
             if not skip_pr_lifecycle:
+                _reset_pr_status_fields(worker)
                 has_commits = _branch_has_commits(root, base=base, branch=branch)
                 if _is_foreman_generated_worker(worker) and has_commits is False:
                     worker["pr_skipped_no_changes"] = True
@@ -3130,6 +3310,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                     worker["pr_merge_state"] = "clean"
                     worker["pr_mergeable"] = True
                     worker["pr_blocker"] = ""
+                    outcome = PRFinalizationOutcome.MERGED
                 else:
                     opened = _ensure_pr_open(
                         worker,
@@ -3140,27 +3321,39 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                         board=board,
                     )
                     if opened and policy == MERGE_POLICY_AUTO:
-                        if _ensure_pr_merged(worker, root=root, repo=repo):
+                        outcome = _ensure_pr_merged(worker, root=root, repo=repo)
+                        if outcome == PRFinalizationOutcome.MERGED:
                             if not _sync_canonical_checkout_after_merge(worker, branch=base):
                                 sync_error = str(worker.get("canonical_sync_error") or "Canonical checkout sync failed")
                                 worker["pr_error"] = sync_error
                                 worker["pr_blocker"] = sync_error
+                                outcome = PRFinalizationOutcome.FAILED
                     elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
                         worker["pr_merge_skipped"] = True
                         worker["pr_merge_skipped_reason"] = policy
                         worker["pr_blocker"] = _pr_open_blocker(worker)
+                        outcome = (
+                            PRFinalizationOutcome.MERGED
+                            if not worker.get("pr_blocker") and _pr_is_open_or_merged(worker)
+                            else PRFinalizationOutcome.FAILED
+                        )
                     elif not worker.get("pr_skipped_no_changes"):
                         worker.setdefault("pr_checks_status", "not checked")
                         worker.setdefault("pr_merge_state", "unknown")
                         worker["pr_blocker"] = _pr_open_blocker(worker)
-        if not worker.get("pr_blocker") and not _verify_pr_amend_head_advanced(worker, root=root):
+                        outcome = PRFinalizationOutcome.FAILED
+        if outcome == PRFinalizationOutcome.MERGED and not worker.get("pr_blocker") and not _verify_pr_amend_head_advanced(worker, root=root):
             worker.setdefault("pr_checks_status", "not checked")
             worker.setdefault("pr_merge_state", "unknown")
+            outcome = PRFinalizationOutcome.FAILED
     except Exception as exc:
         worker.setdefault("pr_error", str(exc))
         worker.setdefault("pr_checks_status", "not checked")
         worker.setdefault("pr_merge_state", "unknown")
         worker["pr_blocker"] = _pr_blocker(worker)
+        outcome = PRFinalizationOutcome.FAILED
+    if outcome != PRFinalizationOutcome.WAITING_FOR_CI:
+        _clear_pr_ci_wait(worker)
     _update_worker_meta(
         board,
         {
@@ -3173,6 +3366,11 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 "pr_checks_status",
                 "pr_checks_total",
                 "pr_checks_failed",
+                "pr_ci_wait_state",
+                "pr_ci_wait_started_at",
+                "pr_ci_next_poll_at",
+                "pr_ci_wait_seconds",
+                "pr_ci_head_sha",
                 "pr_merge_state",
                 "pr_mergeable",
                 "pr_merge_skipped",
@@ -3201,13 +3399,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
             if key in worker
         },
     )
-    if worker.get("pr_blocker"):
-        return False
-    if worker.get("pr_skipped_no_changes"):
-        return not bool(worker.get("pr_error"))
-    if policy == MERGE_POLICY_AUTO:
-        return bool(worker.get("pr_url")) and _pr_is_merged(worker) and not bool(worker.get("pr_error"))
-    return bool(worker.get("pr_url")) and _pr_is_open_or_merged(worker) and not bool(_pr_open_blocker(worker))
+    return outcome
 
 
 def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:

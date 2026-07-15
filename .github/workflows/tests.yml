@@ -3,63 +3,129 @@ name: Basic Tests
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '.gitignore'
-      - 'LICENSE'
-      - 'assets/**'
-      - 'infographic/**'
-      - 'locales/**'
-      - '**/*.md'
-      - 'docs/**'
-      - 'website/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '.gitignore'
-      - 'LICENSE'
-      - 'assets/**'
-      - 'infographic/**'
-      - 'locales/**'
-      - '**/*.md'
-      - 'docs/**'
-      - 'website/**'
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: basic-tests-${{ github.ref }}
-  cancel-in-progress: true
+  # Source CI and PR-body validation use separate groups: the latter runs
+  # trusted base code under pull_request_target, while this workflow runs PR
+  # source and must never cancel it.
+  group: merge-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   basic:
     name: basic
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed surfaces
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" != "pull_request" ]] \
+            || [[ -z "$BASE_SHA" || -z "$HEAD_SHA" ]] \
+            || [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]] \
+            || ! git cat-file -e "$BASE_SHA^{commit}" \
+            || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            # No reliable range is deliberately fail-open: the classifier's
+            # empty input enables every lane rather than silently skipping CI.
+            printf '\n' | python scripts/ci/classify_changes.py
+          else
+            git diff --name-only "$BASE_SHA...$HEAD_SHA" | python scripts/ci/classify_changes.py
+          fi
+
+      - name: Run source-CI preflight
+        if: >-
+          steps.changes.outputs.python == 'true' ||
+          steps.changes.outputs.frontend == 'true' ||
+          steps.changes.outputs.site == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/ci/source_ci_preflight.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --pr-number "$PR_NUMBER"
 
       - name: Install uv
+        if: steps.changes.outputs.python == 'true' || steps.changes.outputs.site == 'true'
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
 
       - name: Set up Python 3.11
+        if: steps.changes.outputs.python == 'true' || steps.changes.outputs.site == 'true'
         run: uv python install 3.11
 
-      - name: Install dependencies
+      - name: Install Python dependencies
+        if: steps.changes.outputs.python == 'true' || steps.changes.outputs.site == 'true'
         run: |
           uv venv .venv --python 3.11
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
       - name: Compile core Python packages
+        if: steps.changes.outputs.python == 'true'
         run: |
           source .venv/bin/activate
           python -m compileall hermes_cli gateway plugins tools agent -q
 
       - name: Run fork smoke suite
+        if: steps.changes.outputs.python == 'true'
+        run: scripts/run_tests.sh --smoke -q --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Set up Node 22
+        if: steps.changes.outputs.frontend == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        if: steps.changes.outputs.frontend == 'true'
         run: |
-          scripts/run_tests.sh --smoke -q --tb=short
+          npm install -g npm@11.14.1
+          npm ci
+
+      - name: Run frontend typechecks and desktop build
+        if: steps.changes.outputs.frontend == 'true'
+        run: |
+          npm run --workspace ui-tui typecheck
+          npm run --workspace web typecheck
+          npm run --workspace apps/bootstrap-installer typecheck
+          npm run --workspace apps/desktop typecheck
+          npm run --workspace apps/shared typecheck
+          npm run --workspace apps/desktop build
+
+      - name: Check generated English skill docs
+        if: steps.changes.outputs.site == 'true'
+        run: |
+          source .venv/bin/activate
+          python website/scripts/generate-skill-docs.py --check
+
+      - name: Run docs and skill source tests
+        if: steps.changes.outputs.site == 'true'
+        run: scripts/run_tests.sh tests/skills/test_shipped_skill_source_hygiene.py tests/website/test_generate_skill_docs.py -q --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

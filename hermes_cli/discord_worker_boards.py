@@ -774,6 +774,11 @@ _TERMINAL_SUMMARY_SYNC_FIELDS = frozenset(
         "pr_checks_status",
         "pr_checks_total",
         "pr_checks_failed",
+        "pr_ci_wait_state",
+        "pr_ci_wait_started_at",
+        "pr_ci_next_poll_at",
+        "pr_ci_wait_seconds",
+        "pr_ci_head_sha",
         "pr_blocker",
     }
 )
@@ -1014,6 +1019,11 @@ def _clear_pr_summary_fields(worker: dict[str, Any]) -> None:
         "pr_checks_status",
         "pr_checks_total",
         "pr_checks_failed",
+        "pr_ci_wait_state",
+        "pr_ci_wait_started_at",
+        "pr_ci_next_poll_at",
+        "pr_ci_wait_seconds",
+        "pr_ci_head_sha",
         "pr_blocker",
     ):
         worker[key] = _DELETE_META
@@ -3577,6 +3587,10 @@ def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
         "checks_status": checks_status,
         "checks_total": int(worker.get("pr_checks_total") or 0),
         "checks_failed": list(worker.get("pr_checks_failed") or []),
+        "ci_wait_state": str(worker.get("pr_ci_wait_state") or "").strip(),
+        "ci_wait_started_at": worker.get("pr_ci_wait_started_at"),
+        "ci_next_poll_at": worker.get("pr_ci_next_poll_at"),
+        "ci_wait_seconds": int(worker.get("pr_ci_wait_seconds") or 0),
         "blocker": "" if pr_success else str(worker.get("pr_blocker") or "").strip(),
     }
 
@@ -3809,6 +3823,7 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
     checks = pr.get("checks_status") or "not checked"
     merge = pr.get("merge_state") or "unknown"
     merge_commit = pr.get("merge_commit") or ""
+    ci_wait_state = str(pr.get("ci_wait_state") or "").strip()
     lines = [
         f"Kanban goal: {summary.get('goal_status') or 'unknown'} / {summary.get('phase') or 'unknown'}",
         f"Board: {summary.get('public_url') or summary.get('board') or 'unknown'}",
@@ -3822,6 +3837,9 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
         _review_line(review, verdict),
     ]
     blocker = str(summary.get("blocked_reason") or pr.get("blocker") or "").strip()
+    if ci_wait_state:
+        wait_seconds = int(pr.get("ci_wait_seconds") or 0)
+        lines.append(f"CI gate: waiting ({ci_wait_state}; {wait_seconds}s elapsed)")
     if blocker:
         lines.append(f"Blocker: {blocker}")
     if merge_commit:
@@ -3856,6 +3874,8 @@ def _terminal_summary_outcome(summary: dict[str, Any]) -> str:
     elif pr.get("error"):
         bits.append(f"PR blocked: {pr.get('error')}.")
     bits.append(f"Checks: {pr.get('checks_status') or 'not checked'}.")
+    if pr.get("ci_wait_state"):
+        bits.append(f"CI gate: waiting for {pr.get('ci_wait_state')}.")
     deployment = summary.get("deployment_status") or "not checked"
     bits.append(f"Deployment: {deployment}.")
     blocker = str(summary.get("blocked_reason") or pr.get("blocker") or "").strip()
@@ -6382,6 +6402,8 @@ def _pr_finalizer_failure_is_failed_checks(worker: dict[str, Any]) -> bool:
 
 
 def _pr_finalizer_failure_is_pending_checks(worker: dict[str, Any]) -> bool:
+    if str(worker.get("pr_ci_wait_state") or "").strip().lower() in {"queued", "running", "mergeability"}:
+        return True
     blocked_reason = str(worker.get("blocked_reason") or "").strip().lower()
     if blocked_reason != "approved reviewer pr finalization failed":
         return False
@@ -6618,6 +6640,37 @@ def _block_after_pr_finalizer_failure(board: str, worker: dict[str, Any], blocke
     persist_board_run_summary(board)
 
 
+def _leave_approved_reviewer_waiting_for_ci(board: str, worker: dict[str, Any]) -> None:
+    """Keep an approved board visible and active while its stable CI gate runs."""
+    worker.update(
+        {
+            "phase": "reviewing",
+            "goal_status": "active",
+            "blocked_reason": "",
+            "pr_blocker": "",
+            "pr_error": None,
+            "pr_finalizer_recovery_state": "waiting_for_ci",
+            "pr_finalizer_recovery_blocker": "",
+        }
+    )
+    _clear_board_run_summary(board, worker)
+    _update_worker_meta(board, worker)
+
+
+def _pr_finalization_merged(outcome: Any) -> bool:
+    from hermes_cli.kanban_codex_worker import PRFinalizationOutcome
+
+    # Keep older deterministic test doubles and third-party callers from
+    # interpreting the new enum as an accidental failure.
+    return outcome is True or outcome == PRFinalizationOutcome.MERGED
+
+
+def _pr_finalization_waiting_for_ci(outcome: Any) -> bool:
+    from hermes_cli.kanban_codex_worker import PRFinalizationOutcome
+
+    return outcome == PRFinalizationOutcome.WAITING_FOR_CI
+
+
 def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], conn: Any, tasks: list[Any]) -> Optional[str]:
     if str(worker.get("phase") or "").strip().lower() not in {"active", "reviewing", "review"}:
         return None
@@ -6628,12 +6681,16 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
 
     from hermes_cli import kanban_codex_worker
 
-    if kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or "")):
+    outcome = kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or ""))
+    if _pr_finalization_merged(outcome):
         kanban_codex_worker._update_phase(board, "complete", goal_status="done")
         return "approved_reviewer_finalized"
 
     metadata = kanban_db.read_board_metadata(board)
     refreshed = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if _pr_finalization_waiting_for_ci(outcome):
+        _leave_approved_reviewer_waiting_for_ci(board, refreshed)
+        return "approved_reviewer_waiting_for_ci"
     blocker = str(refreshed.get("pr_blocker") or refreshed.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(refreshed):
         if _pr_finalizer_failure_is_pr_body_check_only(refreshed):
@@ -6700,7 +6757,7 @@ def _recover_blocked_approved_reviewer_finalizer(
     finalizer_blocked_reason = blocked_reason == "approved reviewer PR finalization failed"
     finalizer_failure_evidence = _pr_finalizer_failure_is_failed_checks(
         worker
-    ) or _pr_finalizer_failure_is_merge_conflict(worker)
+    ) or _pr_finalizer_failure_is_merge_conflict(worker) or _pr_finalizer_failure_is_pending_checks(worker)
     finalizer_blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip()
     if not finalizer_blocked_reason and not finalizer_failure_evidence and not finalizer_blocker:
         return None
@@ -6712,6 +6769,7 @@ def _recover_blocked_approved_reviewer_finalizer(
         str(worker.get("pr_finalizer_recovery_state") or "") == "operator_blocked"
         and str(worker.get("pr_finalizer_recovery_blocker") or "") == finalizer_blocker
         and not _pr_finalizer_failure_is_merge_conflict(worker)
+        and not _pr_finalizer_failure_is_pending_checks(worker)
         and not _pr_amend_head_advance_blocker_is_retryable(worker, finalizer_blocker)
         and not _pr_finalizer_canonical_sync_blocker_is_retryable(worker, finalizer_blocker)
     ):
@@ -6725,12 +6783,16 @@ def _recover_blocked_approved_reviewer_finalizer(
     from hermes_cli import kanban_codex_worker
 
     if finalizer_blocked_reason or finalizer_failure_evidence or finalizer_blocker:
-        if kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or "")):
+        outcome = kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or ""))
+        if _pr_finalization_merged(outcome):
             _update_worker_meta(board, {"blocked_reason": "", "pr_blocker": "", "pr_error": None})
             kanban_codex_worker._update_phase(board, "complete", goal_status="done")
             return "approved_reviewer_finalized"
         metadata = kanban_db.read_board_metadata(board)
         worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or worker)
+        if _pr_finalization_waiting_for_ci(outcome):
+            _leave_approved_reviewer_waiting_for_ci(board, worker)
+            return "approved_reviewer_waiting_for_ci"
 
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(worker):

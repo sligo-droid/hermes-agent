@@ -27,7 +27,7 @@ DEFAULT = {
     "site": True,
     "scan": True,
     "deps": True,
-    "mcp_catalog": False,
+    "mcp_catalog": True,
 }
 
 
@@ -44,7 +44,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, mcp
 
 
 CASES = {
-    "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
+    "docs-only → docs source": (["README.md", "docs/guide.md"], _lanes(site=True)),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True)),
     "uv.lock → python": (["uv.lock"], _lanes(python=True)),
@@ -53,6 +53,16 @@ CASES = {
     # Lockfile bump shifts every TS package's tree, but not the Python suite.
     "root lockfile → frontend, not python": (["package-lock.json"], _lanes(frontend=True)),
     "website → site": (["website/docs/intro.md"], _lanes(site=True)),
+    "docs → site": (["docs/ci.md"], _lanes(site=True)),
+    "AGENTS instructions → site": (["AGENTS.md"], _lanes(site=True)),
+    "docs-source test → python + site": (
+        ["tests/skills/test_shipped_skill_source_hygiene.py"],
+        _lanes(python=True, site=True, scan=True),
+    ),
+    "skill-doc generator → python + site": (
+        ["website/scripts/generate-skill-docs.py"],
+        _lanes(site=True, scan=True),
+    ),
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
     "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
@@ -72,6 +82,7 @@ CASES = {
         ["hermes_cli/mcp_catalog.py"],
         _lanes(python=True, scan=True, mcp_catalog=True),
     ),
+    "tsconfig → frontend": (["tsconfig.base.json"], _lanes(frontend=True)),
     # Fail open: CI-config / empty / blank diffs run everything.
     ".github change → all": ([".github/workflows/tests.yml"], DEFAULT),
     "action change → all": ([".github/actions/detect-changes/action.yml"], DEFAULT),

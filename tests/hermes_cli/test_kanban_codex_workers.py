@@ -59,14 +59,29 @@ def _pr_view_json(
     merge_state: str = "CLEAN",
     mergeable: str = "MERGEABLE",
     checks: list[dict] | None = None,
+    head_sha: str = "current-head",
 ) -> str:
     if checks is None:
-        checks = [{"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        checks = [
+            {
+                "name": "basic",
+                "workflowName": "Basic Tests",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+            },
+            {
+                "name": "pr body",
+                "workflowName": "PR Body Format",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+            },
+        ]
     return json.dumps(
         {
             "number": number,
             "url": f"https://github.com/sligo-labs/PID/pull/{number}",
             "state": state,
+            "headRefOid": head_sha,
             "mergedAt": "2026-05-26T15:30:17Z" if state == "MERGED" else None,
             "mergeCommit": {"oid": "abc123"} if state == "MERGED" else None,
             "mergeStateStatus": merge_state,
@@ -153,6 +168,49 @@ def test_check_rollup_summary_uses_latest_duplicate_check_run():
     assert status == "passed"
     assert total == 2
     assert failed == []
+
+
+def test_required_check_rollup_uses_current_head_skipped_and_latest_rerun():
+    from hermes_cli import kanban_codex_worker as worker
+
+    status, total, failed, wait_state = worker._required_check_rollup_summary(
+        [
+            {
+                "name": "basic",
+                "workflowName": "Basic Tests",
+                "status": "COMPLETED",
+                "conclusion": "CANCELLED",
+                "headSha": "current-head",
+                "startedAt": "2026-06-09T15:00:00Z",
+            },
+            {
+                "name": "basic",
+                "workflowName": "Basic Tests",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "headSha": "current-head",
+                "startedAt": "2026-06-09T15:02:00Z",
+            },
+            {
+                "name": "pr body",
+                "workflowName": "PR Body Format",
+                "status": "COMPLETED",
+                "conclusion": "SKIPPED",
+                "headSha": "current-head",
+                "startedAt": "2026-06-09T15:03:00Z",
+            },
+            {
+                "name": "unrelated",
+                "workflowName": "Other Workflow",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "headSha": "current-head",
+            },
+        ],
+        head_sha="current-head",
+    )
+
+    assert (status, total, failed, wait_state) == ("passed", 2, [], "")
 
 
 def test_worker_retry_operation_names_are_backend_neutral():
@@ -4667,7 +4725,7 @@ def test_ensure_pr_honors_local_only_criteria_over_stale_pr_metadata(monkeypatch
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_open_policy"] == "never"
@@ -4716,7 +4774,7 @@ def test_ensure_pr_never_policy_opens_without_merging(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert ["git", "push", "-u", "origin", "discord/open-only-pr"] in calls
@@ -4976,7 +5034,7 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     pr_list = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "list"])
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
@@ -5082,7 +5140,7 @@ def test_ensure_pr_syncs_existing_worktree_when_base_branch_already_checked_out(
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert (['git', 'checkout', 'develop'], project_path) in calls
@@ -5163,7 +5221,7 @@ def test_ensure_pr_syncs_already_merged_pr(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
@@ -5222,7 +5280,7 @@ def test_ensure_pr_blocks_terminal_completion_when_canonical_sync_fails_after_me
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_state"] == "MERGED"
@@ -5264,13 +5322,24 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
                         "number": 125,
                         "url": "https://github.com/sligo-labs/PID/pull/125",
                         "state": "OPEN",
+                        "headRefOid": "current-head",
                         "mergeStateStatus": "BLOCKED",
                         "mergeable": "CONFLICTING",
                         "isDraft": False,
                         "reviewDecision": "REVIEW_REQUIRED",
                         "statusCheckRollup": [
-                            {"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS"},
-                            {"name": "lint", "status": "COMPLETED", "conclusion": "FAILURE"},
+                            {
+                                "name": "basic",
+                                "workflowName": "Basic Tests",
+                                "status": "COMPLETED",
+                                "conclusion": "FAILURE",
+                            },
+                            {
+                                "name": "pr body",
+                                "workflowName": "PR Body Format",
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                            },
                         ],
                     }
                 ),
@@ -5280,7 +5349,7 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/125"
@@ -5290,14 +5359,13 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
     assert meta["pr_mergeable"] == "CONFLICTING"
     assert meta["pr_checks_status"] == "failed"
     assert meta["pr_checks_total"] == 2
-    assert meta["pr_checks_failed"] == ["lint"]
-    assert meta["pr_blocker"] == "checks failed: lint"
+    assert meta["pr_checks_failed"] == ["Basic Tests / basic"]
+    assert meta["pr_blocker"] == "checks failed: Basic Tests / basic"
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
 
 
 def test_ensure_pr_waits_for_checks_before_merging(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
-    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "0")
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_db
@@ -5324,26 +5392,45 @@ def test_ensure_pr_waits_for_checks_before_merging(monkeypatch, tmp_path):
                     number=126,
                     state="OPEN",
                     merge_state="UNSTABLE",
-                    checks=[{"name": "ci", "status": "IN_PROGRESS", "conclusion": ""}],
+                    checks=[
+                        {
+                            "name": "basic",
+                            "workflowName": "Basic Tests",
+                            "status": "IN_PROGRESS",
+                            "conclusion": "",
+                        },
+                        {
+                            "name": "pr body",
+                            "workflowName": "PR Body Format",
+                            "status": "QUEUED",
+                            "conclusion": "",
+                        },
+                    ],
                 ),
                 stderr="",
             )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    monkeypatch.setattr(worker.time, "sleep", lambda *_args: pytest.fail("CI polling must not sleep"))
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_state"] == "OPEN"
     assert meta["pr_checks_status"] == "pending"
-    assert meta["pr_blocker"] == "checks pending"
+    assert meta["pr_blocker"] == ""
+    assert meta["pr_ci_wait_state"] == "running"
+    assert meta["pr_ci_next_poll_at"] - meta["pr_ci_wait_started_at"] >= 10
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
 
+    views_before_next_tick = len([cmd for cmd in calls if cmd[:3] == ["gh", "pr", "view"]])
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
+    assert len([cmd for cmd in calls if cmd[:3] == ["gh", "pr", "view"]]) == views_before_next_tick
 
-def test_ensure_pr_merges_clean_pr_with_no_reported_checks_after_wait(monkeypatch, tmp_path):
+
+def test_ensure_pr_waits_when_stable_checks_are_missing(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
-    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "0")
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_db
@@ -5354,15 +5441,11 @@ def test_ensure_pr_merges_clean_pr_with_no_reported_checks_after_wait(monkeypatc
         project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
     )
     workspace = tmp_path / "repo"
-    project_path = tmp_path / "canonical"
     workspace.mkdir()
-    project_path.mkdir()
-    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
     calls = []
     view_states = iter(
         [
             _pr_view_json(number=129, state="OPEN", merge_state="CLEAN", checks=[]),
-            _pr_view_json(number=129, state="MERGED", merge_state="CLEAN", checks=[]),
         ]
     )
 
@@ -5374,6 +5457,71 @@ def test_ensure_pr_merges_clean_pr_with_no_reported_checks_after_wait(monkeypatc
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/129\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
             return SimpleNamespace(returncode=0, stdout=next(view_states), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
+
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "OPEN"
+    assert meta["pr_checks_status"] == "pending"
+    assert meta["pr_checks_total"] == 0
+    assert meta["pr_blocker"] == ""
+    assert meta["pr_ci_wait_state"] == "queued"
+
+
+def test_ensure_pr_merges_after_pending_gate_checks_pass(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+
+    board = dwb.start_direct_goal(
+        thread_id="pending-then-passed-pr",
+        goal="Ship CI-gated PR",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    calls: list[list[str]] = []
+    views = iter(
+        [
+            _pr_view_json(
+                number=130,
+                state="OPEN",
+                merge_state="UNSTABLE",
+                checks=[
+                    {
+                        "name": "basic",
+                        "workflowName": "Basic Tests",
+                        "status": "IN_PROGRESS",
+                        "conclusion": "",
+                    },
+                    {
+                        "name": "pr body",
+                        "workflowName": "PR Body Format",
+                        "status": "QUEUED",
+                        "conclusion": "",
+                    },
+                ],
+            ),
+            _pr_view_json(number=130, state="OPEN", merge_state="CLEAN"),
+            _pr_view_json(number=130, state="MERGED", merge_state="CLEAN"),
+        ]
+    )
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/130\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=next(views), stderr="")
         if cmd[:3] == ["gh", "pr", "merge"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         sync_result = _canonical_sync_result(cmd)
@@ -5382,22 +5530,17 @@ def test_ensure_pr_merges_clean_pr_with_no_reported_checks_after_wait(monkeypatc
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    monkeypatch.setattr(worker.time, "sleep", lambda *_args: pytest.fail("CI polling must not sleep"))
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
-
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
+    dwb._update_worker_meta(board.slug, {"pr_ci_next_poll_at": 0})
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
     assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
-    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
-    assert meta["pr_state"] == "MERGED"
-    assert meta["pr_checks_status"] == "passed"
-    assert meta["pr_checks_total"] == 0
-    assert meta["pr_blocker"] == ""
 
 
 
-def test_ensure_pr_polls_passed_unstable_before_merging(monkeypatch, tmp_path):
+def test_ensure_pr_polls_passed_unstable_nonblockingly_before_merging(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
-    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "1")
-    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_POLL_SECONDS", "0")
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_db
@@ -5438,7 +5581,11 @@ def test_ensure_pr_polls_passed_unstable_before_merging(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.WAITING_FOR_CI
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+
+    dwb._update_worker_meta(board.slug, {"pr_ci_next_poll_at": 0})
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     merge_index = next(index for index, cmd in enumerate(calls) if cmd[:3] == ["gh", "pr", "merge"])
     view_indices = [index for index, cmd in enumerate(calls) if cmd[:3] == ["gh", "pr", "view"]]
@@ -5481,7 +5628,7 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
@@ -5523,7 +5670,7 @@ def test_ensure_pr_blocks_local_only_remote_before_pr_creation(monkeypatch, tmp_
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert "only local/file remotes" in meta["pr_error"]
@@ -5569,7 +5716,7 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     pr_list = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "list"])
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
@@ -5615,7 +5762,7 @@ def test_ensure_pr_explicit_target_repo_overrides_checkout_remote(monkeypatch, t
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-droid/reserve-index-dtf"
@@ -5669,7 +5816,7 @@ def test_ensure_pr_amend_uses_head_repo_and_never_upstream_for_pr_commands(monke
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     gh_pr_calls = [cmd for cmd in calls if cmd[:2] == ["gh", "pr"]]
     assert gh_pr_calls
@@ -5728,7 +5875,7 @@ def test_ensure_pr_amend_blocks_when_upstream_head_sha_does_not_advance(monkeypa
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_state"] == "MERGED"
@@ -5787,7 +5934,7 @@ def test_ensure_pr_amend_succeeds_when_upstream_head_sha_advances(monkeypatch, t
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_state"] == "MERGED"
@@ -5851,7 +5998,7 @@ def test_ensure_pr_amend_finalizer_ignores_dev_worker_no_pr_text(monkeypatch, tm
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_open_policy"] == dwb.PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
@@ -5889,7 +6036,7 @@ def test_ensure_pr_skips_foreman_no_change_branch(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.MERGED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_skipped_no_changes"] is True
@@ -5922,7 +6069,7 @@ def test_ensure_pr_rejects_kanban_role_worker_context(monkeypatch, tmp_path):
         lambda *args, **kwargs: pytest.fail("role-worker guard must run before git or gh"),
     )
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
 
     meta = kanban_db.read_board_metadata(board.slug)[DISCORD_WORKER_META_KEY]
     assert meta["pr_finalizer_guard"] == "role_worker_context"
@@ -5957,7 +6104,7 @@ def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
 
     meta = kanban_db.read_board_metadata(board.slug)[DISCORD_WORKER_META_KEY]
     assert meta["pr_error"] == "Cannot create PR: missing GitHub repository, worker branch"
@@ -5992,7 +6139,7 @@ def test_ensure_pr_records_push_failure_before_create(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is False
+    assert worker._ensure_pr(board.slug, str(workspace)) == worker.PRFinalizationOutcome.FAILED
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_error"] == "permission denied"

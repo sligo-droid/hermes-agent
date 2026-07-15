@@ -11,7 +11,7 @@ Lanes:
 * ``python``      — pytest / ruff / ty / footguns.
 * ``docker_meta`` — Dockerfiles etc.
 * ``frontend``    — TS typecheck matrix + desktop build.
-* ``site``        — Docusaurus + generated skill docs.
+* ``site``        — docs-source integrity checks and generated skill docs.
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
@@ -22,7 +22,7 @@ never per-PR.
 Contract — *fail open, never closed*. We may run a lane we didn't need, but
 must never skip one a change could break:
 
-* An empty diff, or any ``.github/`` change, runs everything.
+* An empty/unavailable diff, or any ``.github/`` change, runs everything.
 * ``python`` is a denylist: skipped only when *every* file is provably prose
   or a frontend-only package; an unrecognized path keeps it on.
 * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
@@ -37,7 +37,16 @@ import sys
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
 _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
-_SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
+_DOCS_SOURCE = (
+    "docs/",
+    "website/",
+    "skills/",
+    "optional-skills/",
+    "tests/skills/test_shipped_skill_source_hygiene.py",
+    "tests/website/test_generate_skill_docs.py",
+    "website/scripts/generate-skill-docs.py",
+)
+_DOCS_SOURCE_FILES = {"AGENTS.md"}
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
 
@@ -56,7 +65,7 @@ def _is_docs(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
-    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
+    return _is_docs(p) or _is_frontend(p) or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
 
 
 def _is_scan(p: str) -> bool:
@@ -67,14 +76,22 @@ def _is_mcp_catalog(p: str) -> bool:
     return p.startswith(_MCP_CATALOG_PATHS) or p in _MCP_CATALOG_FILES
 
 
+def _is_frontend(p: str) -> bool:
+    return p.startswith(_FRONTEND) or p in _ROOT_NPM or p.startswith("tsconfig")
+
+
+def _is_docs_source(p: str) -> bool:
+    return p.startswith(_DOCS_SOURCE) or p in _DOCS_SOURCE_FILES
+
+
 def classify(files: list[str]) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``."""
     files = [f.strip() for f in files if f.strip()]
     ret = {
         "python": any(not _py_irrelevant(f) for f in files),
         "docker_meta":  any(f.startswith(_DOCKER_META) for f in files),
-        "frontend": any(f.startswith(_FRONTEND) or f in _ROOT_NPM for f in files),
-        "site": any(f.startswith(_SITE) for f in files),
+        "frontend": any(_is_frontend(f) for f in files),
+        "site": any(_is_docs_source(f) for f in files),
         "scan": any(_is_scan(f) for f in files),
         "deps": any(f == "pyproject.toml" for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
@@ -87,7 +104,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["scan"] = True
         ret["deps"] = True
 
-        # explicitly skip mcp catalog here. it's not needed unless those files are modified.
+        ret["mcp_catalog"] = True
     return ret
 
 

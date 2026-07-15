@@ -16,7 +16,7 @@ GitHub PR lifecycle: branch, commit, open, CI, merge.
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/github/github-pr-workflow` |
-| Version | `1.1.3` |
+| Version | `1.1.4` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -41,7 +41,7 @@ Complete guide for managing the PR lifecycle. Each section shows the `gh` way fi
 ## Worker and Canonical Checkout Boundary
 
 Workers are implementation and review inputs. The Hermes orchestrator owns the
-PR lifecycle, including merge and post-merge finalization. A worker must not
+PR lifecycle, including CI-gated merge and post-merge finalization. A worker must not
 mutate the protected canonical checkout (for example with `git -C <canonical>
 checkout`, `pull`, `merge`, `reset`, or equivalent commands) to
 "finish" a task or bypass the canonical guard.
@@ -54,16 +54,16 @@ complete until the orchestrator has verified the required sync.
 
 ## Default PR Merge Policy
 
-For orchestrator-led Sligo Labs coding work, **opening a PR is not the stopping point**. Unless the user explicitly asks for review-only/draft-only behavior, or a repo/client policy truly blocks merging, the orchestrator owns the full lifecycle: open the PR, merge it to the default branch as soon as GitHub says it is mergeable, and delete the feature branch. Workers should stop at their implementation/review handoff.
+For orchestrator-led Sligo Labs coding work, **opening a PR is not the stopping point**. Unless the user explicitly asks for review-only/draft-only behavior, or a repo/client policy truly blocks merging, the orchestrator owns the full lifecycle: open the PR, wait nonblockingly for its stable CI gate, merge it to the default branch, and delete the feature branch. Workers should stop at their implementation/review handoff.
 
-Treat phrases like "open a PR," "make a PR," "ship this," "continue this work," and ordinary implementation requests as permission to merge the PR yourself once it has no merge conflicts. Do not wait for CI/status checks before merging; trust the worker or local verification already performed during implementation.
+Treat phrases like "open a PR," "make a PR," "ship this," "continue this work," and ordinary implementation requests as permission for the orchestrator to merge after CI passes. The Hermes finalizer gates automatic merge on exactly `Basic Tests / basic` and `PR Body Format / pr body`; a current-head `SKIPPED` result is complete where applicable.
 
 Operational rule:
-1. After creating/updating a PR, refresh against the current remote base, push, and perform only the agreed local/worker verification for the task.
-2. Inspect mergeability with `gh pr view ... --json mergeStateStatus,isDraft,state`. If the PR is open, non-draft, and not conflicted, merge immediately with squash merge + branch deletion (`gh pr merge --squash --delete-branch`).
-3. Do not enable auto-merge just to wait for pending checks. If branch protection requires checks or review before merging, report that policy blocker clearly instead of waiting silently.
+1. After creating/updating a PR, refresh against the current remote base, push, and perform the agreed local/worker verification for the task.
+2. The dispatcher records `waiting_for_ci` when either stable check is queued/running/missing, with a persisted next poll at least 10 seconds later. It keeps the board active; it does not sleep, block the dispatcher, create recovery work, or enable GitHub auto-merge.
+3. Merge only when both named checks pass and GitHub reports a clean merge state. Treat transient `UNKNOWN` or `UNSTABLE` mergeability as another nonblocking wait; treat failed checks, conflicts, requested changes, and permission failures as actionable blockers.
 4. After merge, verify terminal state explicitly: `gh pr view ... --json state,mergedAt,mergeCommit` and fetch/pull the target branch. Poll deployment status only when deployment verification is part of the task.
-5. Only leave the PR unmerged when blocked by policy or missing permissions (required human review, branch protection, merge conflicts that require product judgment, unavailable merge permissions, or explicit user instruction). Report that blocker clearly and include the exact command/status that failed.
+5. Only leave the PR unmerged when blocked by a concrete failure, missing permissions, required human review, a merge conflict, or explicit user instruction. Report that blocker clearly and include the exact command/status that failed.
 
 ### Quick Auth Detection
 
@@ -211,18 +211,15 @@ To create as a draft, add `"draft": true` to the JSON body.
 
 ### Check CI Status
 
-Start the CI watch immediately after `gh pr create` (or equivalent API flow): SKIPPED conclusions count as complete, and the loop is done when no check is pending.
+Use a one-shot CI inspection for diagnosis. The Hermes dispatcher owns nonblocking polling for its two stable merge-gate checks; workers and callers must not hold a five-minute watch loop or use fixed sleeps.
 
 **With gh:**
 
 ```bash
-# One-shot check
-gh pr checks <number>
-
-# Watch until checks finish (polls every 10s; SKIPPED counts as completed)
-gh pr checks <number> --watch -i 10
+# Inspect the current PR head and all check-run conclusions.
+gh pr view <number> --json headRefOid,statusCheckRollup
 ```
-If checks are still running after ~5 minutes, stop watching and report `CI-still-running` with the PR URL; avoid fixed sleeps and do not re-list checks after watch exits.
+For automatic finalization, only `Basic Tests / basic` and `PR Body Format / pr body` decide merge eligibility. A current-head `SKIPPED` conclusion counts as complete. Pending/queued checks remain `waiting_for_ci`, not a terminal board blocker.
 
 **With git + curl:**
 
@@ -250,27 +247,6 @@ import sys, json
 data = json.load(sys.stdin)
 for cr in data.get('check_runs', []):
     print(f\"  {cr['name']}: {cr['status']} / {cr['conclusion'] or 'pending'}\")"
-```
-
-### Poll Until Complete (git + curl)
-
-```bash
-# Simple polling loop — check every 10 seconds, up to ~5 minutes
-SHA=$(git rev-parse HEAD)
-for i in $(seq 1 30); do
-  STATUS=$(curl -s \
-    -H "Authorization: token $GITHUB_TOKEN" \
-    https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
-  echo "Check $i: $STATUS"
-  if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
-    break
-  fi
-  sleep 10
-done
-if [ "$STATUS" != "success" ] && [ "$STATUS" != "failure" ] && [ "$STATUS" != "error" ]; then
-  echo "CI still running for PR: https://github.com/$OWNER/$REPO/pull/<number>"
-fi
 ```
 
 ## 5. Auto-Fixing CI Failures

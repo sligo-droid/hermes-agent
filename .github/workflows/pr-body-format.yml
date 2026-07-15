@@ -9,6 +9,11 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  # This trusted-base validation must not share the untrusted source-CI group.
+  group: pr-body-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   pr-body:
     name: pr body
