@@ -518,6 +518,33 @@ class TestActiveQueries:
         assert registry.has_active_for_session("gw_session_1") is True
         assert registry.has_active_for_session("other") is False
 
+    def test_kill_for_session_targets_only_matching_processes(self, registry, monkeypatch):
+        matching = _make_session(sid="proc_matching")
+        matching.session_key = "gw_session_1"
+        other = _make_session(sid="proc_other")
+        other.session_key = "gw_session_2"
+        registry._running[matching.id] = matching
+        registry._running[other.id] = other
+        killed_ids = []
+
+        def fake_kill(session_id):
+            killed_ids.append(session_id)
+            return {"status": "killed"}
+
+        monkeypatch.setattr(registry, "kill_process", fake_kill)
+
+        assert registry.kill_for_session("gw_session_1") == 1
+        assert killed_ids == [matching.id]
+
+    def test_kill_for_empty_session_is_noop(self, registry, monkeypatch):
+        session = _make_session(sid="proc_blank")
+        registry._running[session.id] = session
+        kill_process = MagicMock(return_value={"status": "killed"})
+        monkeypatch.setattr(registry, "kill_process", kill_process)
+
+        assert registry.kill_for_session("") == 0
+        kill_process.assert_not_called()
+
     def test_exited_not_active(self, registry):
         s = _make_session(task_id="t1", exited=True, exit_code=0)
         registry._finished[s.id] = s

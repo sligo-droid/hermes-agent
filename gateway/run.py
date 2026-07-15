@@ -10255,6 +10255,7 @@ class GatewayRunner:
                     source,
                     interrupt_reason=_INTERRUPT_REASON_STOP,
                     invalidation_reason="stop_command",
+                    cleanup_background_processes=True,
                 )
                 logger.info(
                     "STOP for session %s — agent interrupted, session lock released, boards_stopped=%s",
@@ -13438,6 +13439,7 @@ class GatewayRunner:
                 source,
                 interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason="stop_command_pending",
+                cleanup_background_processes=True,
             )
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
@@ -13449,13 +13451,16 @@ class GatewayRunner:
                 source,
                 interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason="stop_command_handler",
+                cleanup_background_processes=True,
             )
             return EphemeralReply(t("gateway.stop.stopped"))
-        if stopped_boards:
+        stopped_processes = self._stop_session_background_processes(session_key)
+        if stopped_boards or stopped_processes:
             logger.info(
-                "STOP for session %s — Discord worker boards stopped: %s",
+                "STOP for session %s — Discord worker boards stopped: %s, background_processes_stopped=%d",
                 session_key,
-                ",".join(stopped_boards),
+                ",".join(stopped_boards) if stopped_boards else "-",
+                stopped_processes,
             )
             return EphemeralReply(t("gateway.stop.stopped"))
         return t("gateway.stop.no_active")
@@ -19795,6 +19800,7 @@ class GatewayRunner:
         interrupt_reason: str,
         invalidation_reason: str,
         release_running_state: bool = True,
+        cleanup_background_processes: bool = False,
     ) -> None:
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
@@ -19809,8 +19815,34 @@ class GatewayRunner:
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        if cleanup_background_processes:
+            self._stop_session_background_processes(session_key)
         if release_running_state:
             self._release_running_agent_state(session_key)
+
+    @staticmethod
+    def _stop_session_background_processes(session_key: str) -> int:
+        """Stop tracked background processes belonging to one gateway session."""
+        if not session_key:
+            return 0
+        try:
+            from tools.process_registry import process_registry
+
+            killed = process_registry.kill_for_session(session_key)
+            if killed:
+                logger.info(
+                    "Stopped %d background process(es) for session %s",
+                    killed,
+                    session_key,
+                )
+            return killed
+        except Exception as exc:
+            logger.debug(
+                "Failed stopping background processes for session %s: %s",
+                session_key,
+                exc,
+            )
+            return 0
 
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc)."""

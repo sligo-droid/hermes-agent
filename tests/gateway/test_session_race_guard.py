@@ -9,6 +9,7 @@ duplicate agent.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -467,6 +468,8 @@ async def test_stop_hard_kills_running_agent():
     fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
     runner._running_agents[session_key] = fake_agent
     runner.adapters[Platform.TELEGRAM]._active_sessions[session_key] = asyncio.Event()
+    cleanup_processes = MagicMock(return_value=1)
+    runner._stop_session_background_processes = cleanup_processes
 
     # Send /stop
     stop_event = _make_event(text="/stop")
@@ -474,6 +477,7 @@ async def test_stop_hard_kills_running_agent():
 
     # Agent must have been interrupted
     fake_agent.interrupt.assert_called_once_with("Stop requested")
+    cleanup_processes.assert_called_once_with(session_key)
 
     # Session must be unlocked
     assert session_key not in runner._running_agents, (
@@ -486,6 +490,26 @@ async def test_stop_hard_kills_running_agent():
 
     # Must return a confirmation
     assert result is not None
+    assert "stopped" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_stop_cleans_background_processes_without_running_agent():
+    """A late /stop must still stop a session-owned background process."""
+    runner = _make_runner()
+    session_key = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
+    )
+    runner.session_store.get_or_create_session.return_value = SimpleNamespace(
+        session_key=session_key
+    )
+    runner._stop_discord_thread_boards_for_event = AsyncMock(return_value=[])
+    cleanup_processes = MagicMock(return_value=1)
+    runner._stop_session_background_processes = cleanup_processes
+
+    result = await runner._handle_stop_command(_make_event(text="/stop"))
+
+    cleanup_processes.assert_called_once_with(session_key)
     assert "stopped" in result.lower()
 
 

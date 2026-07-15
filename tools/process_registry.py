@@ -1350,6 +1350,24 @@ class ProcessRegistry:
                 for s in self._running.values()
             )
 
+    def kill_for_session(self, session_key: str) -> int:
+        """Kill all running background processes owned by ``session_key``."""
+        if not session_key:
+            return 0
+
+        with self._lock:
+            targets = [
+                s for s in self._running.values()
+                if s.session_key == session_key and not s.exited
+            ]
+
+        killed = 0
+        for session in targets:
+            result = self.kill_process(session.id)
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+        return killed
+
     def kill_all(self, task_id: str = None) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
