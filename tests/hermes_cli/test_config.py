@@ -83,6 +83,29 @@ class TestLoadConfigDefaults:
             assert "max_turns" not in config
 
 
+class TestVisualQaConfig:
+    def test_default_visual_qa_is_shadowed_and_bounded(self):
+        assert DEFAULT_CONFIG["agent"]["visual_qa"] == {
+            "mode": "shadow",
+            "max_receipts_per_turn": 1,
+            "max_followup_turns": 1,
+        }
+
+    def test_visual_qa_partial_override_keeps_bounded_defaults(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(
+                "agent:\n  visual_qa:\n    mode: enforce_explicit\n",
+                encoding="utf-8",
+            )
+            config = load_config()
+
+        assert config["agent"]["visual_qa"] == {
+            "mode": "enforce_explicit",
+            "max_receipts_per_turn": 1,
+            "max_followup_turns": 1,
+        }
+
+
 class TestLoadConfigParseFailure:
     """A YAML parse failure must NOT silently fall back to defaults.
 

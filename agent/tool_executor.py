@@ -31,7 +31,10 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
-from agent.verification_evidence import classify_tool_verification_evidence
+from agent.verification_evidence import (
+    classify_tool_verification_evidence,
+    classify_tool_visual_receipt,
+)
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -249,6 +252,7 @@ def _record_turn_verification_evidence(
     function_args: dict[str, Any] | None,
     result: Any,
     is_error: bool,
+    duration_s: float = 0.0,
 ) -> None:
     stats = getattr(agent, "_turn_runtime_stats", None)
     if not isinstance(stats, dict):
@@ -264,8 +268,58 @@ def _record_turn_verification_evidence(
         )
         if evidence:
             stats.setdefault("verification_evidence", []).extend(evidence)
+        # Visual QA is a distinct, opt-in receipt channel.  In particular, do
+        # not derive it from ordinary browser evidence: navigation, snapshots,
+        # screenshots, and console success cannot prove a visual assertion.
+        requirement = getattr(agent, "visual_qa_requirement", None)
+        receipt = classify_tool_visual_receipt(
+            function_name,
+            function_args,
+            result,
+            is_error,
+            order=order,
+            requirement=requirement,
+        )
+        if receipt:
+            try:
+                from agent.visual_qa import normalize_visual_qa_config
+
+                budget = normalize_visual_qa_config(
+                    getattr(agent, "visual_qa_config", None)
+                )["max_receipts_per_turn"]
+            except Exception:
+                budget = 1
+            receipts = stats.setdefault("visual_qa_receipts", [])
+            if len(receipts) < budget:
+                receipts.append(receipt)
+                try:
+                    stats["visual_qa_check_duration_s"] = float(
+                        stats.get("visual_qa_check_duration_s") or 0.0
+                    ) + max(0.0, float(duration_s or 0.0))
+                except (TypeError, ValueError):
+                    stats["visual_qa_check_duration_s"] = 0.0
     except Exception:
         logger.debug("turn verification evidence accounting failed", exc_info=True)
+
+
+def _record_visual_qa_edit_order(
+    agent: Any,
+    function_name: str,
+    function_result: Any,
+    *,
+    tool_runtime_recorded: bool = False,
+) -> None:
+    """Remember the last landed edit's tool order for receipt freshness."""
+    try:
+        from agent.tool_result_classification import file_mutation_result_landed
+
+        if not file_mutation_result_landed(function_name, function_result):
+            return
+        stats = getattr(agent, "_turn_runtime_stats", None)
+        prior_calls = int(stats.get("tool_calls") or 0) if isinstance(stats, dict) else 0
+        agent._visual_qa_last_edit_order = prior_calls if tool_runtime_recorded else prior_calls + 1
+    except Exception:
+        logger.debug("visual QA edit-order accounting failed", exc_info=True)
 
 
 def apply_tool_result_hooks(
@@ -746,6 +800,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     agent._record_file_mutation_result(
                         function_name, result_storage_args, function_result, is_error,
                     )
+                    _record_visual_qa_edit_order(agent, function_name, function_result)
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
@@ -772,7 +827,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             blocked=blocked,
         )
         if not blocked:
-            _record_turn_verification_evidence(agent, name, storage_args, function_result, is_error)
+            _record_turn_verification_evidence(
+                agent, name, storage_args, function_result, is_error, tool_duration,
+            )
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
@@ -1320,7 +1377,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         )
         if not _execution_blocked:
             _record_turn_verification_evidence(
-                agent, function_name, storage_args, function_result, _is_error_result,
+                agent, function_name, storage_args, function_result, _is_error_result, tool_duration,
             )
 
         # Track file-mutation outcome for the turn-end verifier.  See
@@ -1331,6 +1388,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 agent._record_file_mutation_result(
                     function_name, storage_args, function_result, _is_error_result,
+                )
+                _record_visual_qa_edit_order(
+                    agent, function_name, function_result, tool_runtime_recorded=True,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)

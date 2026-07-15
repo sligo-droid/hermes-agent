@@ -91,6 +91,10 @@ def _new_turn_runtime_stats(started_at: float) -> dict[str, Any]:
         "tool_blocked": 0,
         "tool_chars": 0,
         "tools": {},
+        "visual_qa_receipts": [],
+        "visual_qa_level": "none",
+        "visual_qa_followup_count": 0,
+        "visual_qa_check_duration_s": 0.0,
     }
 
 
@@ -1057,6 +1061,16 @@ def run_conversation(
     # Main conversation loop
     _turn_runtime_started_at = time.perf_counter()
     agent._turn_runtime_stats = _new_turn_runtime_stats(_turn_runtime_started_at)
+    agent._visual_qa_last_edit_order = 0
+    agent._visual_qa_followup_turns = 0
+    try:
+        from agent.visual_qa import normalize_visual_requirement
+
+        agent._turn_runtime_stats["visual_qa_level"] = normalize_visual_requirement(
+            getattr(agent, "visual_qa_requirement", None)
+        )["level"]
+    except Exception:
+        logger.debug("visual QA runtime classification accounting failed", exc_info=True)
     api_call_count = 0
     final_response = None
     interrupted = False
@@ -4893,7 +4907,11 @@ def run_conversation(
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
+                        build_visual_qa_stop_nudge,
                         verify_on_stop_enabled,
+                    )
+                    from agent.visual_qa import (
+                        normalize_visual_qa_config,
                     )
 
                     verify_setting = getattr(agent, "verify_on_stop", None)
@@ -4902,7 +4920,33 @@ def run_conversation(
                         if verify_setting is not None
                         else None
                     )
-                    if verify_on_stop_enabled(verify_config):
+                    visual_config = normalize_visual_qa_config(
+                        getattr(agent, "visual_qa_config", None)
+                    )
+                    visual_nudge = None
+                    # Shadow mode records/report gaps at the gateway boundary
+                    # but must not withhold a response.  Enforcement remains
+                    # restricted to explicitly classified visual work.
+                    if visual_config["mode"] == "enforce_explicit":
+                        visual_nudge = build_visual_qa_stop_nudge(
+                            requirement=getattr(agent, "visual_qa_requirement", None),
+                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                            receipts=getattr(agent, "_turn_runtime_stats", {}).get("visual_qa_receipts", []),
+                            attempts=getattr(agent, "_visual_qa_followup_turns", 0),
+                            max_attempts=visual_config["max_followup_turns"],
+                            min_order=getattr(agent, "_visual_qa_last_edit_order", 0) + 1,
+                        )
+                    if visual_nudge:
+                        _verify_nudge = visual_nudge
+                        agent._visual_qa_followup_turns = (
+                            getattr(agent, "_visual_qa_followup_turns", 0) + 1
+                        )
+                        stats = getattr(agent, "_turn_runtime_stats", None)
+                        if isinstance(stats, dict):
+                            stats["visual_qa_followup_count"] = int(
+                                stats.get("visual_qa_followup_count") or 0
+                            ) + 1
+                    elif verify_on_stop_enabled(verify_config):
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),

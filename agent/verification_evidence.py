@@ -556,6 +556,55 @@ def classify_tool_verification_evidence(
     ]
 
 
+def _visual_receipt_tag(tool_args: dict[str, Any], result_data: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract an opt-in receipt tag without promoting raw tool output."""
+    for source in (tool_args, result_data):
+        for key in ("visual_qa_receipt", "visual_qa"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def classify_tool_visual_receipt(
+    tool_name: str,
+    tool_args: dict[str, Any] | None,
+    result: Any,
+    is_error: bool,
+    *,
+    order: int | None = None,
+    requirement: Any = None,
+) -> dict[str, Any] | None:
+    """Return one explicitly tagged visual receipt, never inferred browser proof.
+
+    A check must opt in via a ``visual_qa_receipt`` (or legacy ``visual_qa``)
+    object in its arguments or structured result.  Generic browser navigation,
+    snapshots, screenshots, console output, and terminal success therefore
+    remain ordinary verification evidence.
+    """
+    name = str(tool_name or "")
+    if name != "terminal" and not name.startswith("browser") and name != "vision_analyze":
+        return None
+    args = tool_args if isinstance(tool_args, dict) else {}
+    tag = _visual_receipt_tag(args, _json_object(result))
+    if tag is None:
+        return None
+    candidate = dict(tag)
+    if order is not None:
+        candidate["order"] = int(order)
+    # A tool error cannot become a passing receipt merely because stale tag
+    # data said passed.  It is still valid only if all receipt fields are
+    # explicit and safe after this status correction.
+    if is_error and str(candidate.get("status") or "").lower() in {"passed", "pass", "success"}:
+        candidate["status"] = "failed"
+    try:
+        from agent.visual_qa import sanitize_visual_receipt
+
+        return sanitize_visual_receipt(candidate, requirement=requirement)
+    except Exception:
+        return None
+
+
 def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     if not isinstance(evidence, list):
@@ -582,6 +631,16 @@ def evidence_from_runtime_breakdown(runtime_breakdown: Any) -> list[dict[str, An
     evidence = runtime_breakdown.get("verification_evidence")
     if isinstance(evidence, list):
         return [item for item in evidence if isinstance(item, dict)]
+    return []
+
+
+def visual_receipts_from_runtime_breakdown(runtime_breakdown: Any) -> list[dict[str, Any]]:
+    """Return compact visual receipts carried alongside ordinary evidence."""
+    if not isinstance(runtime_breakdown, dict):
+        return []
+    receipts = runtime_breakdown.get("visual_qa_receipts")
+    if isinstance(receipts, list):
+        return [item for item in receipts if isinstance(item, dict)]
     return []
 
 

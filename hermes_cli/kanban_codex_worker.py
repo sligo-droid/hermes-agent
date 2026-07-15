@@ -585,6 +585,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     dashboard_qa_auth = _dashboard_qa_auth_prompt()
     pr_policy = _pr_policy_prompt_note(role)
     autoreview = _dev_autoreview_prompt(role)
+    visual_qa_handoff = _visual_qa_handoff_prompt(role)
     forced_skills = _forced_worker_skill_prompt(conn, task_id, role)
     return (
         f"You are the Discord Kanban {role} worker.\n"
@@ -597,6 +598,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         f"{browser_preflight}"
         f"{dashboard_qa_auth}"
         f"{autoreview}"
+        f"{visual_qa_handoff}"
         f"{forced_skills}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
@@ -849,6 +851,17 @@ def _dev_autoreview_prompt(role: str) -> str:
     )
 
 
+def _visual_qa_handoff_prompt(role: str) -> str:
+    """Return the bounded visual-QA handoff contract for dev workers only."""
+    if role != ROLE_DEV:
+        return ""
+    return (
+        "Visual-QA handoff contract:\n"
+        "- Match the ticket's `Visual QA: required` or `Visual QA: N/A — <reason>` acceptance criterion in `handoff.visual_qa`. For explicit visual UI or rendered-artifact work, run one assertion-driven rendered check and record `{level,target,assertions,check,status,evidence_ref}` with the actual passed, failed, or blocked status.\n"
+        "- Navigation, a generic screenshot, or console success alone is not evidence. For nonvisual work record `{status: \"not_applicable\", reason: \"...\"}` instead and do not launch visual tooling.\n\n"
+    )
+
+
 def _role_outcome_frame(role: str) -> str:
     if role == ROLE_PLANNER:
         return (
@@ -858,6 +871,7 @@ def _role_outcome_frame(role: str) -> str:
             "- The JSON status is planned or blocked.\n"
             "- The board-level acceptance_criteria list is deduplicated and canonical.\n"
             "- Each dev ticket body opens with Goal, Success means, and Stop when, then gives the worker scope, files, dependencies, verification, and out-of-scope boundaries.\n"
+            "- Each dev ticket's Success means explicitly states `Visual QA: required` with one assertion-driven receipt for explicit visual work, or `Visual QA: N/A — <reason>` for nonvisual work.\n"
             "- Simple or single-surface Hermes/Discord jobs default to exactly one dev ticket unless the request explicitly needs separate deliverables.\n"
             "- Dev tickets stop at local verified branch state; they do not open PRs, push remotes, or merge.\n"
             "Stop when: Return the JSON plan or a concise blocker."
@@ -873,6 +887,7 @@ def _role_outcome_frame(role: str) -> str:
             "- If requirements are satisfied and only optional improvements remain, approve with empty new_tasks and mention optional follow-up in the summary.\n"
             "- PR lifecycle chores are excluded from new dev tasks; the deterministic finalizer owns push/open/merge after approval.\n"
             "- Live pickup, deployment, active-path, and provenance gaps are treated as real implementation/closeout gaps, not PR lifecycle chores.\n"
+            "- criteria_assessment checks each ticket's Visual QA required-or-N/A acceptance criterion against its handoff.\n"
             "- criteria_assessment maps each criterion to evidence or a gap.\n"
             "Stop when: Return the JSON review verdict."
         )
@@ -895,7 +910,7 @@ def _role_outcome_frame(role: str) -> str:
         "- The smallest correct change within ticket scope is implemented.\n"
         "- Focused verification is run when available and recorded in tests.\n"
         "- Autoreview closeout is applied after non-trivial code edits when available, with command/result or unavailable reason recorded for reviewers.\n"
-        "- changed_files, tests, handoff, pr_ready, and blocker reflect the actual repository state.\n"
+        "- changed_files, tests, handoff (including required visual_qa receipt or N/A), pr_ready, and blocker reflect the actual repository state.\n"
         "- Remote push and PR lifecycle work are not attempted by this role.\n"
         "Stop when: Return the JSON completion, checkpoint, or blocker object."
     )
@@ -939,6 +954,7 @@ def _schema_instructions(role: str) -> str:
             "Do not create extra assertion, telemetry, debug, hardening, or PR-check tickets unless they are tied to a concrete unmet acceptance criterion. "
             f"{DEV_TICKET_BODY_GUIDANCE} "
             "Write Success means as ticket-specific acceptance criteria for the slice owned by that dev ticket; include board-level criteria only when that ticket owns the whole outcome. "
+            "Each dev ticket's Success means must state `Visual QA: required` for explicit visual UI or rendered-artifact work and require one assertion-driven rendered-check receipt, or `Visual QA: N/A — <reason>` for nonvisual work. "
             "Set Stop when to the concrete handoff point for that ticket, usually code changed and verification recorded or a blocker stated. "
             "Do not create dev tickets whose goal is to push a branch, open/update a PR, watch PR checks, or merge; those are finalizer chores after review approval. "
             "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket. "
@@ -952,6 +968,8 @@ def _schema_instructions(role: str) -> str:
             '"new_tasks":[{"title":"...","body":"...","priority":0}],"criteria_assessment":{}, "blocker":null} '
             "Assess any requirements included in the Kanban context for coverage gaps. "
             "Use parent task handoff manifests as primary review inputs, along with focused code/tests inspection. "
+            "Assess each ticket's `Visual QA: required` or `Visual QA: N/A — <reason>` acceptance criterion against the parent handoff. "
+            "For an explicit visual UI or rendered-artifact change, treat a missing `handoff.visual_qa` receipt or explicit `not_applicable` record as a concrete evidence gap; do not require visual tooling for nonvisual work. "
             "Use any pre_review_readiness advisory only as evidence to inspect, not as approval. "
             "Request a new round only for concrete acceptance gaps, evidenced regressions, real defects, or requested behavior that is unmet. "
             "Do not emit new_tasks for optional hardening, extra tests, PR lifecycle, docs polish, telemetry, routine active-path/code-island checks, or nice-to-have cleanup when requirements are satisfied. "
@@ -976,8 +994,8 @@ def _schema_instructions(role: str) -> str:
         '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],'
         '"handoff":{"changed_files":["..."],"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],'
         '"verification":["..."],"preview":{"url":"...","command":"...","status":"passed|failed|not_run"},'
-        '"smoke_routes":["..."],"known_warnings":["..."],"notes":"..."},"blocker":null,"pr_ready":false} '
-        "Always include handoff so reviewers can audit the exact changed files, checks, autoreview closeout command/result or unavailable reason, preview URL/command, smoke routes, warnings, and notes. "
+        '"smoke_routes":["..."],"visual_qa":{},"known_warnings":["..."],"notes":"..."},"blocker":null,"pr_ready":false} '
+        "Always include handoff so reviewers can audit the exact changed files, checks, autoreview closeout command/result or unavailable reason, preview URL/command, smoke routes, required visual_qa receipt or N/A record, warnings, and notes. "
         "Never push to a remote branch and never create, update, or merge a PR; stop after local code and verification."
     )
 
