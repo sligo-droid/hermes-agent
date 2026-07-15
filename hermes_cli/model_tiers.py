@@ -20,17 +20,17 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "trivial": {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",
     },
     "basic": {
-        "model": "gpt-5.6-luna",
-        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "model": "gpt-5.6-terra",
+        "opencode_model": "hermes-codex/gpt-5.6-terra",
         "reasoning_effort": "medium",
     },
     "intermediate": {
-        "model": "gpt-5.6-terra",
-        "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "high",
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "medium",
     },
     "advanced": {
         "model": "gpt-5.6-sol",

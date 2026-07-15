@@ -20,9 +20,9 @@ def test_default_routes_reference_resolvable_tiers():
     }
 
     assert route_names == {
-        "gateway": "intermediate",
+        "gateway": "basic",
         "cron": "trivial",
-        "discord_action_request": "intermediate",
+        "discord_action_request": "basic",
         "coding_worker_simple_build": "intermediate",
         "coding_worker_complex_plan": "advanced",
         "coding_worker_complex_build": "intermediate",
@@ -45,10 +45,19 @@ def test_default_routes_reference_resolvable_tiers():
         name: resolve_model_tier({"model_tiers": tiers}, name).reasoning_effort
         for name in ("trivial", "basic", "intermediate", "advanced")
     } == {
-        "trivial": "low",
+        "trivial": "medium",
         "basic": "medium",
-        "intermediate": "high",
+        "intermediate": "medium",
         "advanced": "xhigh",
+    }
+    assert {
+        name: resolve_model_tier({"model_tiers": tiers}, name).model
+        for name in ("trivial", "basic", "intermediate", "advanced")
+    } == {
+        "trivial": "gpt-5.6-luna",
+        "basic": "gpt-5.6-terra",
+        "intermediate": "gpt-5.6-sol",
+        "advanced": "gpt-5.6-sol",
     }
     for role in ("planner", "dev", "foreman", "reviewer"):
         assert "reasoning" not in DEFAULT_CONFIG["kanban"]["discord_worker"]["roles"][role]

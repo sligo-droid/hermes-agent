@@ -18,7 +18,7 @@ def test_unpinned_cron_uses_the_global_trivial_tier(monkeypatch):
     assert DEFAULT_CONFIG["cron"]["model_tier"] == "trivial"
     assert tier.name == "trivial"
     assert model == tier.model
-    assert tier.reasoning_config() == {"enabled": True, "effort": "low"}
+    assert tier.reasoning_config() == {"enabled": True, "effort": "medium"}
 
 
 def test_job_model_tier_precedes_global_tier(monkeypatch):

@@ -189,14 +189,14 @@ def _is_standard_discord_feature_request(
 def _gateway_model_tier(config: Optional[dict]) -> Any:
     """Return the named tier used by ordinary gateway sessions."""
     cfg = config or {}
-    name = cfg_get(cfg, "gateway", "model_tier", default="intermediate")
+    name = cfg_get(cfg, "gateway", "model_tier", default="basic")
     return resolve_model_tier(cfg, name)
 
 
 def _discord_action_request_model_tier(config: Optional[dict]) -> Any:
     """Return the named tier for ordinary Discord action-request threads."""
     cfg = config or {}
-    name = cfg_get(cfg, "discord", "action_request_model_tier", default="intermediate")
+    name = cfg_get(cfg, "discord", "action_request_model_tier", default="basic")
     return resolve_model_tier(cfg, name)
 
 

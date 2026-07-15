@@ -3,7 +3,7 @@
 import gateway.run as gateway_run
 
 
-def test_gateway_uses_intermediate_tier_instead_of_global_model_default(monkeypatch):
+def test_gateway_uses_basic_tier_instead_of_global_model_default(monkeypatch):
     config = {
         "model": {"default": "global/model"},
         "agent": {"reasoning_effort": "low"},
@@ -13,7 +13,7 @@ def test_gateway_uses_intermediate_tier_instead_of_global_model_default(monkeypa
     monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: config)
     assert gateway_run.GatewayRunner._load_reasoning_config() == {
         "enabled": True,
-        "effort": "high",
+        "effort": "medium",
     }
 
 
