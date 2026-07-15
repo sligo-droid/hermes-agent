@@ -521,7 +521,12 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
     runner.adapters = {}
     event = _make_event()
     event.text = "FABLE IMPLEMENTATION PAYLOAD"
-    event.fable_plan_metadata = {"command": "fable", "fable_mode": "implementation"}
+    event.fable_plan_metadata = {
+        "command": "fable",
+        "fable_mode": "implementation",
+        "route": "anthropic_proxy",
+        "anthropic_oauth_tool_name_compat": True,
+    }
     session_entry = _session_entry_for_event(event)
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store.load_transcript.return_value = []
@@ -544,6 +549,7 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
     assert captured["fallback_model"] is None
     assert captured["providers_allowed"] == ["anthropic"]
     assert CapturingAgent.instance._fable_implementation_turn is True
+    assert CapturingAgent.instance._anthropic_oauth_tool_name_compat is True
 
 
 def test_fable_run_agent_refuses_non_fable_model_result(monkeypatch):

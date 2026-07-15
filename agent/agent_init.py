@@ -597,6 +597,11 @@ def init_agent(
     # access for Codex Responses API streaming.
     agent._anthropic_client = None
     agent._is_anthropic_oauth = False
+    # Some trusted local proxies terminate against Claude Code OAuth while
+    # Hermes authenticates to the proxy with a non-OAuth key.  This flag only
+    # controls the OAuth-compatible tool-name wire format; it must not change
+    # credential identity, headers, refresh, or system-prompt behavior.
+    agent._anthropic_oauth_tool_name_compat = False
 
     # Resolve per-provider / per-model request timeout once up front so
     # every client construction path below (Anthropic native, OpenAI-wire,

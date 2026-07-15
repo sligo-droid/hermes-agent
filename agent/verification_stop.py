@@ -310,4 +310,38 @@ def build_verify_on_stop_nudge(
     )
 
 
-__all__ = ["build_verify_on_stop_nudge", "verify_on_stop_enabled"]
+def build_visual_qa_stop_nudge(
+    *,
+    requirement: Any,
+    changed_paths: Iterable[str],
+    receipts: Any,
+    attempts: int = 0,
+    max_attempts: int = 1,
+    min_order: int = 0,
+) -> str | None:
+    """Return the separate bounded visual-QA stop nudge when explicitly required.
+
+    This intentionally does not consult ``verify_on_stop_enabled``: that
+    generic setting remains surface-aware and off by default for Discord.
+    Visual enforcement is opted into independently by an explicit requirement.
+    """
+    try:
+        from agent.visual_qa import build_visual_qa_followup_nudge
+
+        return build_visual_qa_followup_nudge(
+            requirement,
+            changed_paths,
+            receipts,
+            attempts=attempts,
+            max_attempts=max_attempts,
+            min_order=min_order,
+        )
+    except Exception:
+        return None
+
+
+__all__ = [
+    "build_verify_on_stop_nudge",
+    "build_visual_qa_stop_nudge",
+    "verify_on_stop_enabled",
+]

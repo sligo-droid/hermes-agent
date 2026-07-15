@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from agent.visual_qa import sanitize_visual_receipt
+
 
 def _seconds(value: Any) -> float:
     try:
@@ -49,6 +51,33 @@ def _clean_name(value: Any, *, limit: int = 32) -> str:
     return text[:limit]
 
 
+def _visual_qa_summary(stats: dict[str, Any], receipts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build public-safe visual QA observability from accepted receipt state."""
+    level = str(stats.get("visual_qa_level") or "none").strip().lower()
+    if level not in {"none", "surface", "artifact"}:
+        level = "none"
+    latest = None
+    for receipt in receipts:
+        if latest is None or _count(receipt.get("order")) >= _count(latest.get("order")):
+            latest = receipt
+    if level == "none":
+        status = "not_applicable"
+    elif latest is None:
+        status = "missing"
+    else:
+        status = str(latest.get("status") or "missing").lower()
+        if status not in {"passed", "failed", "blocked"}:
+            status = "missing"
+    # The executor increments this only when a tagged receipt is accepted.
+    duration = _seconds(stats.get("visual_qa_check_duration_s")) if latest is not None else 0.0
+    return {
+        "level": level,
+        "receipt_status": status,
+        "followup_count": min(1, _count(stats.get("visual_qa_followup_count"))),
+        "check_duration_s": duration,
+    }
+
+
 def build_turn_runtime_breakdown(
     stats: dict[str, Any] | None,
     total_elapsed_s: Any = None,
@@ -88,6 +117,17 @@ def build_turn_runtime_breakdown(
         )
     tool_rows.sort(key=lambda item: item["duration_s"], reverse=True)
 
+    visual_receipts: list[dict[str, Any]] = []
+    raw_receipts = stats.get("visual_qa_receipts")
+    if isinstance(raw_receipts, list):
+        for raw in raw_receipts:
+            receipt = sanitize_visual_receipt(raw)
+            if receipt is not None:
+                visual_receipts.append(receipt)
+            if len(visual_receipts) >= 1:
+                break
+    visual_qa = _visual_qa_summary(stats, visual_receipts)
+
     return {
         "schema_version": 1,
         "scope": _clean_name(scope, limit=48),
@@ -112,6 +152,8 @@ def build_turn_runtime_breakdown(
         "verification_evidence": list(stats.get("verification_evidence") or [])[:20]
         if isinstance(stats.get("verification_evidence"), list)
         else [],
+        "visual_qa_receipts": visual_receipts,
+        "visual_qa": visual_qa,
         "active_exceeds_wall": bool(wall and active > wall + 0.25),
     }
 
@@ -136,6 +178,13 @@ def merge_runtime_breakdowns(
         "tool_errors": 0,
         "tool_blocked": 0,
         "top_tools": [],
+        "visual_qa_receipts": [],
+        "visual_qa": {
+            "level": "none",
+            "receipt_status": "not_applicable",
+            "followup_count": 0,
+            "check_duration_s": 0.0,
+        },
         "phases": [],
         "active_exceeds_wall": False,
     }
@@ -164,8 +213,30 @@ def merge_runtime_breakdowns(
             slot["count"] += _count(tool.get("count"))
             slot["errors"] += _count(tool.get("errors"))
             slot["blocked"] += _count(tool.get("blocked"))
+        for raw in item.get("visual_qa_receipts") or []:
+            receipt = sanitize_visual_receipt(raw)
+            if receipt is not None:
+                merged["visual_qa_receipts"].append(receipt)
+        visual = item.get("visual_qa") if isinstance(item.get("visual_qa"), dict) else {}
+        level = str(visual.get("level") or "none").lower()
+        if level in {"surface", "artifact"}:
+            merged["visual_qa"]["level"] = level
+            merged["visual_qa"]["receipt_status"] = str(
+                visual.get("receipt_status") or "missing"
+            ).lower()
+        merged["visual_qa"]["followup_count"] = min(
+            1,
+            _count(merged["visual_qa"].get("followup_count"))
+            + _count(visual.get("followup_count")),
+        )
+        merged["visual_qa"]["check_duration_s"] += _seconds(visual.get("check_duration_s"))
     merged["top_tools"] = sorted(tools.values(), key=lambda item: item["duration_s"], reverse=True)[:5]
     merged["phases"] = sorted(phases.values(), key=lambda item: item["duration_s"], reverse=True)[:6]
+    merged["visual_qa_receipts"] = merged["visual_qa_receipts"][-20:]
+    if merged["visual_qa_receipts"]:
+        merged["visual_qa"]["receipt_status"] = str(
+            merged["visual_qa_receipts"][-1].get("status") or "missing"
+        ).lower()
     return merged
 
 
@@ -207,6 +278,39 @@ def render_runtime_breakdown_text(breakdown: dict[str, Any] | None, compact: boo
             )
             if rendered_phases:
                 lines.append(f"Phases: {rendered_phases}")
+        visual_receipts = [
+            receipt
+            for receipt in (breakdown.get("visual_qa_receipts") or [])
+            if isinstance(receipt, dict)
+        ]
+        if visual_receipts:
+            receipt = visual_receipts[-1]
+            lines.append(
+                f"Visual QA: {_clean_name(receipt.get('level'), limit=16)} — "
+                f"{_clean_name(receipt.get('status'), limit=16)}"
+            )
+        visual = breakdown.get("visual_qa") if isinstance(breakdown.get("visual_qa"), dict) else {}
+        visual_level = str(visual.get("level") or "none").lower()
+        visual_active = bool(
+            visual_receipts
+            or visual_level in {"surface", "artifact"}
+            or _seconds(visual.get("check_duration_s"))
+            or _count(visual.get("followup_count"))
+        )
+        if visual_active and visual and not visual_receipts:
+            level = _clean_name(visual.get("level"), limit=16)
+            status = _clean_name(visual.get("receipt_status"), limit=16)
+            lines.append(f"Visual QA: {level} — {status}")
+        if visual_active and visual:
+            extras = []
+            duration = _seconds(visual.get("check_duration_s"))
+            if duration:
+                extras.append(f"check {_duration_text(duration)}")
+            followups = min(1, _count(visual.get("followup_count")))
+            if followups:
+                extras.append(f"{followups} follow-up")
+            if extras:
+                lines.append("Visual QA: " + " · ".join(extras))
     else:
         total_for_pct = wall or max(model + tools + overhead, sum(_seconds(p.get("duration_s")) for p in phases), 1.0)
         if wall:

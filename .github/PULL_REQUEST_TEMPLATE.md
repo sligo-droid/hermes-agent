@@ -60,8 +60,10 @@ Fixes #
 - [ ] I've updated `CONTRIBUTING.md` or `AGENTS.md` if I changed architecture or workflows — or N/A
 - [ ] I've considered cross-platform impact (Windows, macOS) per the [compatibility guide](https://github.com/NousResearch/hermes-agent/blob/main/CONTRIBUTING.md#cross-platform-compatibility) — or N/A
 - [ ] I've updated tool descriptions/schemas if I changed tool behavior — or N/A
+- [ ] For an explicit visual UI or rendered-artifact change, I've included one assertion-driven visual-QA receipt; otherwise I recorded `Visual QA: N/A — <reason>` below
 
 Project-state: not needed <!-- If applicable, replace this comment with a short reason. -->
+Visual QA: N/A <!-- For explicit visual changes, replace with: target; assertions; check; passed/failed/blocked status; safe evidence reference. -->
 
 ## For New Skills
 

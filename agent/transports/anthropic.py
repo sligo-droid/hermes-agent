@@ -70,6 +70,7 @@ class AnthropicTransport(ProviderTransport):
             reasoning_config=params.get("reasoning_config"),
             tool_choice=params.get("tool_choice"),
             is_oauth=params.get("is_oauth", False),
+            oauth_tool_name_compat=params.get("oauth_tool_name_compat", False),
             preserve_dots=params.get("preserve_dots", False),
             context_length=params.get("context_length"),
             base_url=params.get("base_url"),

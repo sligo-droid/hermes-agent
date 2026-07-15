@@ -180,15 +180,22 @@ class TestAnthropicOAuthOutgoingPrefix:
     """build_anthropic_kwargs must emit ZERO single-underscore ``mcp_`` names on
     the OAuth wire — bare names and MCP server names both land on ``mcp__``."""
 
-    def _build(self, tools, is_oauth=True):
+    def _build(
+        self,
+        tools,
+        is_oauth=True,
+        oauth_tool_name_compat=False,
+        messages=None,
+    ):
         from agent.anthropic_adapter import build_anthropic_kwargs
         return build_anthropic_kwargs(
             model="claude-sonnet-4-6",
-            messages=[{"role": "user", "content": "Hi"}],
+            messages=messages or [{"role": "user", "content": "Hi"}],
             tools=tools,
             max_tokens=4096,
             reasoning_config=None,
             is_oauth=is_oauth,
+            oauth_tool_name_compat=oauth_tool_name_compat,
         )
 
     def test_oauth_adds_double_prefix_to_bare_tool_name(self):
@@ -253,3 +260,52 @@ class TestAnthropicOAuthOutgoingPrefix:
         ], is_oauth=False)
         names = sorted(t["name"] for t in kwargs["tools"])
         assert names == ["mcp_linear_get_issue", "read_file"]
+
+    def test_proxy_compat_converts_tools_without_oauth_identity(self):
+        """A proxy can use OAuth-safe names without pretending its key is OAuth."""
+        system_prompt = "Hermes Agent remains the product name."
+        kwargs = self._build(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "x",
+                        "parameters": {},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp_supabase_get_logs",
+                        "description": "x",
+                        "parameters": {},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__already_safe",
+                        "description": "x",
+                        "parameters": {},
+                    },
+                },
+            ],
+            is_oauth=False,
+            oauth_tool_name_compat=True,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        names = [tool["name"] for tool in kwargs["tools"]]
+        assert names == [
+            "mcp__read_file",
+            "mcp__supabase_get_logs",
+            "mcp__already_safe",
+        ]
+        assert not any(name.startswith("mcp_") and not name.startswith("mcp__") for name in names)
+        # Tool-name compatibility must not inject Claude Code identity or
+        # sanitize the proxy caller's system prompt.
+        assert kwargs["system"] == system_prompt

@@ -195,6 +195,93 @@ def _is_standard_discord_feature_request(
     return _is_standard_discord_action_request(source, feature_summary)
 
 
+def _normalize_gateway_visual_qa_contract(
+    requirement: Any,
+    config: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the safe visual-QA contract used by one gateway turn."""
+
+    try:
+        from agent.visual_qa import (
+            normalize_visual_qa_config,
+            normalize_visual_requirement,
+        )
+
+        return (
+            normalize_visual_requirement(requirement),
+            normalize_visual_qa_config(config),
+        )
+    except Exception:
+        # A partial install must not prevent ordinary gateway work from
+        # running. The ledger persists the same conservative shape.
+        return (
+            {"level": "none", "target": "", "assertions": []},
+            {"mode": "shadow", "max_receipts_per_turn": 1, "max_followup_turns": 1},
+        )
+
+
+def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any]) -> str:
+    """Render one compact, secret-safe instruction for clear visual work."""
+
+    if requirement.get("level") == "none" or config.get("mode") == "off":
+        return ""
+    assertions = "; ".join(str(item) for item in requirement.get("assertions") or [])
+    if not assertions:
+        return ""
+    mode = str(config.get("mode") or "shadow")
+    enforcement = (
+        "This receipt is required before completion after a landed code edit."
+        if mode == "enforce_explicit"
+        else "This is shadow-only reporting and does not block completion."
+    )
+    return (
+        "[Visual QA: "
+        f"mode={mode}; target={requirement.get('target')}; assertions={assertions}. "
+        "After the relevant code edit, attach one explicit "
+        "visual_qa_receipt: {level, target, assertions, check, status, evidence_ref} "
+        "to a terminal/browser/vision tool call. Generic navigation, screenshots, "
+        f"or console success do not count. {enforcement}]"
+    )
+
+
+def _visual_qa_turn_result(
+    agent: Any,
+    runtime_breakdown: Any,
+    requirement: Any,
+) -> dict[str, Any]:
+    """Extract bounded post-turn receipt evidence without exposing changed paths."""
+
+    normalized_requirement, config = _normalize_gateway_visual_qa_contract(requirement, None)
+    receipts: list[dict[str, Any]] = []
+    try:
+        from agent.verification_evidence import visual_receipts_from_runtime_breakdown
+        from agent.visual_qa import sanitize_visual_receipt
+
+        for raw in visual_receipts_from_runtime_breakdown(runtime_breakdown):
+            receipt = sanitize_visual_receipt(raw, requirement=normalized_requirement)
+            if receipt is not None:
+                receipts.append(receipt)
+            if len(receipts) >= config["max_receipts_per_turn"]:
+                break
+    except Exception:
+        pass
+
+    changed_paths = getattr(agent, "_turn_file_mutation_paths", None)
+    mutation_observed = isinstance(changed_paths, (set, frozenset, list, tuple)) and bool(changed_paths)
+    result: dict[str, Any] = {
+        "receipts": receipts,
+        "code_mutation_observed": mutation_observed,
+    }
+    if mutation_observed:
+        try:
+            last_edit_order = max(0, int(getattr(agent, "_visual_qa_last_edit_order", 0) or 0))
+        except (TypeError, ValueError):
+            last_edit_order = 0
+        if last_edit_order:
+            result["min_receipt_order"] = last_edit_order + 1
+    return result
+
+
 def _gateway_model_tier(config: Optional[dict]) -> Any:
     """Return the named tier used by ordinary gateway sessions."""
     cfg = config or {}
@@ -1613,6 +1700,10 @@ from gateway.config import (
     PlatformConfig,
     load_gateway_config,
 )
+# ``_run_agent`` has a legacy function-local Platform import below. Keep a
+# module-level alias for early visual-QA checks so Python does not treat those
+# checks as references to that later local binding.
+_GATEWAY_PLATFORM = Platform
 from gateway.session import (
     SessionStore,
     SessionSource,
@@ -4321,15 +4412,24 @@ class GatewayRunner:
         if getattr(event.source, "platform", None) != Platform.DISCORD:
             return None
         ledger = self._ledger()
+        _, visual_qa_config = _normalize_gateway_visual_qa_contract(
+            None,
+            _load_gateway_config(),
+        )
         item = ledger.accept_event(
             event,
             session_key=session_key,
             freshness_seconds=_auto_continue_freshness_window(),
+            visual_qa_config=visual_qa_config,
         )
         if not item:
             return None
         event.work_item_id = item.get("id")
         event.defer_work_completion = defer_completion
+        event.visual_qa_requirement, event.visual_qa_config = _normalize_gateway_visual_qa_contract(
+            item.get("visual_qa_requirement"),
+            item.get("visual_qa_config"),
+        )
         status = str(item.get("status") or "")
         if status in {"completed", "blocked", "cancelled", "expired"}:
             return item
@@ -5068,6 +5168,10 @@ class GatewayRunner:
         ):
             if not preserve_event_context or getattr(event, field, None) is None:
                 setattr(event, field, item.get(field))
+        event.visual_qa_requirement, event.visual_qa_config = _normalize_gateway_visual_qa_contract(
+            item.get("visual_qa_requirement"),
+            item.get("visual_qa_config"),
+        )
         if item.get("message_id") and not preserve_message_id:
             event.message_id = str(item.get("message_id"))
             if getattr(event.source, "message_id", None) is None:
@@ -12521,6 +12625,8 @@ class GatewayRunner:
                     event, "action_request_transcript_user_message", None
                 ),
                 session_cwd_override=session_cwd,
+                visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
+                visual_qa_config=getattr(event, "visual_qa_config", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -12719,6 +12825,21 @@ class GatewayRunner:
                         project_summary=getattr(event, "project_summary", None),
                         runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
                         provider_no_progress=agent_result.get("provider_no_progress") if isinstance(agent_result, dict) else None,
+                        visual_qa_receipts=(
+                            agent_result.get("visual_qa", {}).get("receipts")
+                            if isinstance(agent_result.get("visual_qa"), dict)
+                            else None
+                        ),
+                        visual_qa_code_mutation_observed=(
+                            agent_result.get("visual_qa", {}).get("code_mutation_observed")
+                            if isinstance(agent_result.get("visual_qa"), dict)
+                            else None
+                        ),
+                        visual_qa_min_receipt_order=(
+                            agent_result.get("visual_qa", {}).get("min_receipt_order")
+                            if isinstance(agent_result.get("visual_qa"), dict)
+                            else None
+                        ),
                         already_delivered=bool(agent_result.get("already_sent"))
                         and not agent_result.get("failed"),
                     )
@@ -20827,6 +20948,8 @@ class GatewayRunner:
         action_request_model_tier_override: Optional[str] = None,
         action_request_transcript_user_message: Optional[str] = None,
         session_cwd_override: Optional[str] = None,
+        visual_qa_requirement: Optional[Dict[str, Any]] = None,
+        visual_qa_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20842,7 +20965,15 @@ class GatewayRunner:
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            proxy_requirement, proxy_config = _normalize_gateway_visual_qa_contract(
+                visual_qa_requirement,
+                visual_qa_config if visual_qa_config is not None else _load_gateway_config(),
+            )
+            if source.platform == _GATEWAY_PLATFORM.DISCORD:
+                proxy_visual_prompt = _visual_qa_context_prompt(proxy_requirement, proxy_config)
+                if proxy_visual_prompt:
+                    context_prompt = (context_prompt + "\n\n" + proxy_visual_prompt).strip()
+            proxy_result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
                 history=history,
@@ -20852,6 +20983,14 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            if isinstance(proxy_result, dict):
+                # A remote proxy does not expose local mutation ordering, so
+                # its response cannot be mistaken for a fresh local receipt.
+                proxy_result.setdefault(
+                    "visual_qa",
+                    {"receipts": [], "code_mutation_observed": False},
+                )
+            return proxy_result
 
         from run_agent import AIAgent
         import queue
@@ -20862,6 +21001,12 @@ class GatewayRunner:
             return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
+        visual_qa_requirement, visual_qa_config = _normalize_gateway_visual_qa_contract(
+            visual_qa_requirement,
+            visual_qa_config if visual_qa_config is not None else user_config,
+        )
+        if source.platform != _GATEWAY_PLATFORM.DISCORD:
+            visual_qa_requirement = {"level": "none", "target": "", "assertions": []}
         platform_key = _platform_config_key(source.platform)
         session_cwd = (
             str(session_cwd_override or "").strip()
@@ -20878,6 +21023,11 @@ class GatewayRunner:
         ).strip().lower() or "plan"
         fable_plan_only = bool(fable_plan_metadata) and fable_mode == "plan"
         fable_implementation = bool(fable_plan_metadata) and fable_mode == "implementation"
+        fable_oauth_tool_name_compat = bool(
+            (fable_plan_metadata or {}).get("anthropic_oauth_tool_name_compat", False)
+            if isinstance(fable_plan_metadata, dict)
+            else False
+        )
 
         from hermes_cli.tools_config import _get_platform_tools
         default_discord_kanban_intake = bool(
@@ -21562,6 +21712,12 @@ class GatewayRunner:
                     + "\n\n"
                     + _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT
                 ).strip()
+            visual_qa_prompt = _visual_qa_context_prompt(
+                visual_qa_requirement,
+                visual_qa_config,
+            )
+            if visual_qa_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + visual_qa_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
@@ -21756,6 +21912,7 @@ class GatewayRunner:
                         str(action_request_model_tier_override or "").strip()
                     ),
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
+                    "gateway.fable_oauth_tool_name_compat": fable_oauth_tool_name_compat,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
                     "gateway.tool_delay": 0.0 if standard_discord_action_request else None,
                     "gateway.verify_on_stop": True if standard_discord_action_request else None,
@@ -21846,6 +22003,17 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.session_cwd = session_cwd
             agent.terminal_cwd = session_cwd
+            # Per-turn rather than constructor state: cached agents must not
+            # carry a previous Discord work item's requirement into a later
+            # message. The agent/tool executor owns receipt collection.
+            agent.visual_qa_requirement = visual_qa_requirement
+            agent.visual_qa_config = visual_qa_config
+            agent._visual_qa_last_edit_order = 0
+            # Fable proxy credentials are not OAuth tokens, but the trusted
+            # proxy route can terminate against Claude Code OAuth upstream.
+            # Reset this on every turn so a cached agent cannot leak the wire
+            # format into an unrelated non-Fable request.
+            agent._anthropic_oauth_tool_name_compat = fable_oauth_tool_name_compat
             # Fable implementation parents retain the normal Discord tool
             # surface for inspection/review, while tool execution blocks all
             # direct repository mutations in favor of the Codex worker.
@@ -22358,6 +22526,11 @@ class GatewayRunner:
                     "context_length": _context_length,
                     "reasoning_effort": _reasoning_effort,
                     "runtime_breakdown": result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
+                    "visual_qa": _visual_qa_turn_result(
+                        _agent,
+                        result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
+                        visual_qa_requirement,
+                    ),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -22579,6 +22752,11 @@ class GatewayRunner:
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
                 "runtime_breakdown": result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
+                "visual_qa": _visual_qa_turn_result(
+                    agent,
+                    result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
+                    visual_qa_requirement,
+                ),
             }
         
         # Start progress message sender if enabled

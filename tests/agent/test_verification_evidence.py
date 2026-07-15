@@ -36,6 +36,48 @@ def test_terminal_production_browser_timeout_blocks_matching_shipped_claim():
     assert "worker_frontend_smoke" in blocked["production_browser"]["check_name"]
 
 
+def test_untagged_successful_browser_navigation_is_not_visual_qa_receipt():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps({"success": True, "output": "page loaded"})
+
+    tool_executor._record_turn_tool_runtime(agent, "browser_navigate", 0.1, result, False)
+    tool_executor._record_turn_verification_evidence(
+        agent, "browser_navigate", {"url": "http://127.0.0.1:3000"}, result, False
+    )
+
+    assert agent._turn_runtime_stats.get("visual_qa_receipts", []) == []
+
+
+def test_explicit_tagged_visual_check_records_distinct_safe_receipt():
+    requirement = {
+        "level": "surface",
+        "target": "mobile-toolbar",
+        "assertions": ["toolbar has no horizontal overflow"],
+    }
+    agent = SimpleNamespace(
+        _turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0),
+        visual_qa_requirement=requirement,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    result = json.dumps({"success": True, "output": "inspection completed"})
+    args = {
+        "command": "npm run browser:inspect",
+        "visual_qa_receipt": {
+            **requirement,
+            "check": "mobile-browser-inspection",
+            "status": "passed",
+            "evidence_ref": "mobile viewport inspection recorded",
+        },
+    }
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 0.1, result, False)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", args, result, False, 2.5)
+
+    receipts = agent._turn_runtime_stats["visual_qa_receipts"]
+    assert receipts == [{**args["visual_qa_receipt"], "order": 1}]
+    assert agent._turn_runtime_stats["visual_qa_check_duration_s"] == 2.5
+
+
 def test_later_success_supersedes_earlier_failed_browser_check():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     fail = json.dumps({"output": "modal missing", "exit_code": 1, "error": None})

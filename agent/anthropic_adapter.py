@@ -2431,6 +2431,7 @@ def build_anthropic_kwargs(
     reasoning_config: Optional[Dict[str, Any]],
     tool_choice: Optional[str] = None,
     is_oauth: bool = False,
+    oauth_tool_name_compat: bool = False,
     preserve_dots: bool = False,
     context_length: Optional[int] = None,
     base_url: str | None = None,
@@ -2462,7 +2463,9 @@ def build_anthropic_kwargs(
     (see parse_available_output_tokens_from_error + _ephemeral_max_output_tokens).
 
     When *is_oauth* is True, applies Claude Code compatibility transforms:
-    system prompt prefix, tool name prefixing, and prompt sanitization.
+    system prompt prefix, tool name prefixing, and prompt sanitization.  A
+    trusted proxy may set *oauth_tool_name_compat* to use only the OAuth tool
+    name conversion while keeping its non-OAuth credential identity.
 
     When *preserve_dots* is True, model name dots are not converted to hyphens
     (for Alibaba/DashScope anthropic-compatible endpoints: qwen3.5-plus).
@@ -2519,29 +2522,22 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
-        # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
-        #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth
-        #    billing classifier treats a single-underscore ``mcp_`` tool name as
-        #    a third-party-app fingerprint and rejects the request with HTTP 400
-        #    "Third-party apps now draw from extra usage, not plan limits"
-        #    (verified empirically: a single ``mcp_foo`` tool flips a request
-        #    from plan-billing to the extra-usage lane; ``mcp__foo`` is accepted).
-        #
-        #    Two cases, both must land on the double-underscore ``mcp__`` form:
-        #      a) bare Hermes-native tools (``read_file``)  -> ``mcp__read_file``
-        #      b) native MCP server tools registered under their full
-        #         single-underscore ``mcp_<server>_<tool>`` name
-        #         (``mcp_linear_get_issue``) -> ``mcp__linear_get_issue``
-        #    Case (b) is the gap that the bare ``mcp_``->``mcp__`` constant swap
-        #    left open: those tools were *skipped* and stayed single-underscore,
-        #    so any session with an MCP server configured still tripped the
-        #    classifier. normalize_response reverses both forms via registry
-        #    lookup so the dispatcher still sees the original name. GH-25255.
+    # Normalize tool names so NOTHING goes on an OAuth-compatible wire with a
+    # single-underscore ``mcp_`` prefix. Anthropic's subscription/OAuth billing
+    # classifier treats it as a third-party-app fingerprint and rejects the
+    # request with HTTP 400 "Third-party apps now draw from extra usage, not
+    # plan limits". A trusted proxy can need this conversion even though its
+    # Hermes-facing credential is not itself an OAuth token.
+    if is_oauth or oauth_tool_name_compat:
+        # Two cases, both must land on the double-underscore ``mcp__`` form:
+        #   a) bare Hermes-native tools (``read_file``) -> ``mcp__read_file``
+        #   b) MCP tools registered as ``mcp_<server>_<tool>`` ->
+        #      ``mcp__<server>_<tool>``. Response normalization reverses both
+        #      forms via registry lookup before tool dispatch. GH-25255.
         def _to_oauth_wire_name(name: str) -> str:
             if name.startswith("mcp__"):
                 return name  # already correct, don't double-prefix
             if name.startswith("mcp_"):
-                # single-underscore native MCP tool -> promote to double
                 return "mcp__" + name[len("mcp_"):]
             return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
 
@@ -2550,8 +2546,8 @@ def build_anthropic_kwargs(
                 if "name" in tool:
                     tool["name"] = _to_oauth_wire_name(tool["name"])
 
-        # 4. Apply the same normalization to tool names in message history
-        #    (tool_use blocks) so replayed turns match the wire names above.
+        # Apply the same normalization to tool names in message history
+        # (tool_use blocks) so replayed turns match the wire names above.
         for msg in anthropic_messages:
             content = msg.get("content")
             if isinstance(content, list):

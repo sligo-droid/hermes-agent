@@ -319,6 +319,44 @@ def test_dev_role_prompt_includes_autoreview_closeout_contract(monkeypatch, tmp_
     assert "Autoreview closeout contract for dev workers" not in planner_prompt
 
 
+def test_dev_worker_prompt_requires_bounded_visual_qa_or_explicit_na(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
+
+    board = "discord-worker-visual-qa-handoff"
+    kanban_db.create_board(board, name="Visual QA handoff")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    conn = kanban_db.connect(board=board)
+    try:
+        dev_task_id = kanban_db.create_task(
+            conn,
+            title="Implement visual change",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        dev_prompt = worker._build_prompt(conn, dev_task_id, ROLE_DEV)
+    finally:
+        conn.close()
+
+    assert "Visual-QA handoff contract" in dev_prompt
+    assert "Visual QA: required" in dev_prompt
+    assert "Visual QA: N/A" in dev_prompt
+    assert "run one assertion-driven rendered check" in dev_prompt
+    assert "`handoff.visual_qa`" in dev_prompt
+    assert "passed, failed, or blocked" in dev_prompt
+    assert "not_applicable" in dev_prompt
+    assert "do not launch visual tooling" in dev_prompt
+    assert '"visual_qa"' in worker._schema_instructions(ROLE_DEV)
+    planner_schema = worker._schema_instructions(ROLE_PLANNER)
+    assert "Visual QA: required" in planner_schema
+    assert "Visual QA: N/A" in planner_schema
+    assert "missing `handoff.visual_qa` receipt" in worker._schema_instructions(ROLE_REVIEWER)
+    assert worker._visual_qa_handoff_prompt(ROLE_PLANNER) == ""
+
+
 def test_worker_prompt_includes_dashboard_qa_auth_without_secret(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import kanban_codex_worker as worker

@@ -742,6 +742,15 @@ DEFAULT_CONFIG = {
         # paths opt in explicitly when they need human-request accountability.
         # Set true/false to force the behavior globally.
         "verify_on_stop": "auto",
+        # Bounded visual-QA receipts for explicit rendered UI/artifact work.
+        # ``shadow`` is the non-enforcing default; ``off`` disables the
+        # feature and ``enforce_explicit`` may request one focused follow-up.
+        # The runtime intentionally clamps both budgets to one.
+        "visual_qa": {
+            "mode": "shadow",
+            "max_receipts_per_turn": 1,
+            "max_followup_turns": 1,
+        },
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

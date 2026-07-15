@@ -48,6 +48,18 @@ def _repo_discord_event(message_id="m1", text="do the work"):
     return event
 
 
+def _visual_receipt(requirement, *, order=3, status="passed", evidence_ref="local rendered check"):
+    return {
+        "level": requirement["level"],
+        "target": requirement["target"],
+        "assertions": list(requirement["assertions"]),
+        "check": "browser viewport inspection",
+        "status": status,
+        "evidence_ref": evidence_ref,
+        "order": order,
+    }
+
+
 def test_ledger_deduplicates_discord_message_ids(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="m1")
@@ -93,6 +105,184 @@ def test_ledger_strips_transient_summary_objects(tmp_path):
     assert stored["project_summary"] == {"channel_id": "channel-1"}
 
 
+def test_ledger_persists_normalized_visual_requirement_from_feature_summary(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(text="Please handle this request.")
+    event.feature_summary = {
+        "initial_request": "Build a responsive dashboard with a mobile sidebar.",
+    }
+
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit", "unexpected_secret": "do-not-store"},
+    )
+
+    assert item is not None
+    stored = ledger.get(item["id"])
+    assert stored["visual_qa_config"] == {
+        "mode": "enforce_explicit",
+        "max_receipts_per_turn": 1,
+        "max_followup_turns": 1,
+    }
+    requirement = stored["visual_qa_requirement"]
+    assert requirement["level"] == "surface"
+    assert requirement["target"]
+    assert requirement["assertions"]
+    replay = ledger.event_from_item(stored)
+    assert replay.visual_qa_requirement == requirement
+    assert replay.visual_qa_config == stored["visual_qa_config"]
+
+
+def test_shadow_visual_qa_reports_missing_fresh_receipt_without_blocking(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(text="Build a responsive dashboard with a mobile sidebar.")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "shadow"},
+    )
+    assert item is not None
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Implemented the dashboard.",
+        visual_qa_receipts=[],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=2,
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["visual_qa"] == {
+        "mode": "shadow",
+        "requirement": stored["visual_qa_requirement"],
+        "code_mutation_observed": True,
+        "enforced": False,
+        "status": "missing",
+        "receipt": None,
+        "min_receipt_order": 2,
+        "shadow_report": "receipt_missing",
+    }
+    assert ledger.mark_completed(item["id"])
+    assert ledger.get(item["id"])["status"] == "completed"
+
+
+def test_gateway_visual_qa_context_and_turn_state_are_bounded():
+    from gateway.run import _visual_qa_context_prompt, _visual_qa_turn_result
+
+    requirement = {
+        "level": "surface",
+        "target": "responsive dashboard",
+        "assertions": ["dashboard has no unintended overflow"],
+    }
+    config = {"mode": "enforce_explicit", "max_receipts_per_turn": 1, "max_followup_turns": 1}
+    prompt = _visual_qa_context_prompt(requirement, config)
+    assert "mode=enforce_explicit" in prompt
+    assert "visual_qa_receipt: {level, target, assertions, check, status, evidence_ref}" in prompt
+    assert "Generic navigation" in prompt
+
+    agent = SimpleNamespace(
+        _turn_file_mutation_paths={"/private/workspace/dashboard.tsx"},
+        _visual_qa_last_edit_order=2,
+    )
+    state = _visual_qa_turn_result(
+        agent,
+        {"visual_qa_receipts": [_visual_receipt(requirement, order=3)]},
+        requirement,
+    )
+    assert state == {
+        "receipts": [_visual_receipt(requirement, order=3)],
+        "code_mutation_observed": True,
+        "min_receipt_order": 3,
+    }
+    assert "private/workspace" not in str(state)
+
+
+def test_enforced_visual_qa_requires_a_fresh_post_edit_receipt(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    stale_event = _discord_event(
+        message_id="stale",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    stale = ledger.accept_event(
+        stale_event,
+        session_key=build_session_key(stale_event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert stale is not None
+    stale_requirement = stale["visual_qa_requirement"]
+    assert ledger.mark_agent_done(
+        stale["id"],
+        final_response="Implemented the dashboard.",
+        visual_qa_receipts=[_visual_receipt(stale_requirement, order=2)],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=3,
+    )
+    stale_stored = ledger.get(stale["id"])
+    assert stale_stored["completion_gate"]["allowed_to_complete"] is False
+    assert stale_stored["completion_gate"]["reason"] == "visual_qa_receipt_missing"
+
+    fresh_event = _discord_event(
+        message_id="fresh",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    fresh = ledger.accept_event(
+        fresh_event,
+        session_key=build_session_key(fresh_event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert fresh is not None
+    fresh_requirement = fresh["visual_qa_requirement"]
+    assert ledger.mark_agent_done(
+        fresh["id"],
+        final_response="Implemented the dashboard.",
+        visual_qa_receipts=[_visual_receipt(fresh_requirement, order=3)],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=3,
+    )
+    fresh_stored = ledger.get(fresh["id"])
+    assert fresh_stored["completion_gate"]["allowed_to_complete"] is True
+    assert fresh_stored["completion_gate"]["visual_qa"]["status"] == "passed"
+
+
+def test_enforced_visual_qa_blocks_unverifiable_mutation_and_strips_unsafe_receipt(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(text="Build a responsive dashboard with a mobile sidebar.")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    unsafe = _visual_receipt(
+        item["visual_qa_requirement"],
+        evidence_ref="https://example.test/check?access_token=do-not-store",
+    )
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Implemented the dashboard.",
+        runtime_breakdown={"visual_qa_receipts": [unsafe]},
+        visual_qa_receipts=[unsafe],
+        visual_qa_code_mutation_observed=True,
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["visual_qa_receipts"] == []
+    assert stored["runtime_breakdown"]["visual_qa_receipts"] == []
+    assert "do-not-store" not in str(stored["visual_qa_receipts"])
+    assert "do-not-store" not in str(stored["runtime_breakdown"])
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["reason"] == "visual_qa_receipt_unverifiable"
+    assert stored["completion_gate"]["visual_qa"]["status"] == "missing"
+
+
 def test_mark_agent_running_clears_stale_terminal_fields(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(message_id="m1")
@@ -127,6 +317,37 @@ def test_mark_agent_running_clears_stale_terminal_fields(tmp_path):
         "summary_updated_at",
     ):
         assert key not in stored
+
+
+def test_mark_agent_running_clears_prior_visual_receipt_but_keeps_contract(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(text="Build a responsive dashboard with a mobile sidebar.")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    requirement = item["visual_qa_requirement"]
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Implemented the dashboard.",
+        runtime_breakdown={"visual_qa_receipts": [_visual_receipt(requirement, order=3)]},
+        visual_qa_receipts=[_visual_receipt(requirement, order=3)],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=3,
+    )
+
+    assert ledger.mark_agent_running(item["id"], session_id="retry-session")
+
+    stored = ledger.get(item["id"])
+    assert stored["visual_qa_requirement"] == requirement
+    assert stored["visual_qa_config"]["mode"] == "enforce_explicit"
+    assert stored["visual_qa_receipts"] == []
+    assert stored["runtime_breakdown"]["visual_qa_receipts"] == []
+    assert "visual_qa_code_mutation_observed" not in stored
+    assert "visual_qa_min_receipt_order" not in stored
 
 
 def test_mark_agent_done_persists_provider_no_progress_metadata(tmp_path):
