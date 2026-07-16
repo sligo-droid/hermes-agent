@@ -83,6 +83,24 @@ def test_finalize_owns_commit_pr_checks_merge_and_worktree_alignment(monkeypatch
             merged["value"] = pushed.returncode == 0
             return subprocess.CompletedProcess(args, pushed.returncode, stdout="", stderr=pushed.stderr)
         if args[:3] == ["gh", "pr", "view"]:
+            if "statusCheckRollup" in args:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "statusCheckRollup": [
+                                {
+                                    "__typename": "CheckRun",
+                                    "status": "COMPLETED",
+                                    "conclusion": "SUCCESS",
+                                    "name": "test",
+                                }
+                            ]
+                        }
+                    ),
+                    stderr="",
+                )
             head = real_run(
                 ["git", "rev-parse", "HEAD"],
                 cwd=Path(cwd),
@@ -124,3 +142,63 @@ def test_finalize_owns_commit_pr_checks_merge_and_worktree_alignment(monkeypatch
     assert result.changed_files == ["tracked.txt"]
     assert _git(worktree, "status", "--short").stdout == ""
     assert _git(worktree, "rev-list", "--count", "origin/main..HEAD").stdout.strip() == "0"
+
+
+def test_wait_for_checks_waits_for_github_to_materialize_rollup(monkeypatch, tmp_path):
+    calls = {"view": 0, "watch": 0, "sleep": 0}
+
+    def fake_run(args, *, cwd, timeout=60, github=False):
+        if args[:3] == ["gh", "pr", "view"]:
+            calls["view"] += 1
+            rollup = [] if calls["view"] == 1 else [{"status": "IN_PROGRESS", "name": "ci"}]
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps({"statusCheckRollup": rollup}),
+                stderr="",
+            )
+        if args[:3] == ["gh", "pr", "checks"]:
+            calls["watch"] += 1
+            return subprocess.CompletedProcess(args, 0, stdout="ci pass\n", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(finalizer, "_run", fake_run)
+    monkeypatch.setattr(
+        finalizer.time,
+        "sleep",
+        lambda _seconds: calls.__setitem__("sleep", calls["sleep"] + 1),
+    )
+
+    error = finalizer._wait_for_checks(
+        tmp_path,
+        repo="acme/example",
+        pr_url="https://github.com/acme/example/pull/7",
+    )
+
+    assert error == ""
+    assert calls == {"view": 2, "watch": 1, "sleep": 1}
+
+
+def test_wait_for_checks_allows_persistently_empty_rollup_after_grace(monkeypatch, tmp_path):
+    calls = {"view": 0}
+
+    def fake_run(args, *, cwd, timeout=60, github=False):
+        calls["view"] += 1
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=json.dumps({"statusCheckRollup": []}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(finalizer, "_run", fake_run)
+    monkeypatch.setattr(finalizer, "_CHECK_MATERIALIZATION_TIMEOUT_SECONDS", 0)
+
+    error = finalizer._wait_for_checks(
+        tmp_path,
+        repo="acme/no-checks",
+        pr_url="https://github.com/acme/no-checks/pull/1",
+    )
+
+    assert error == ""
+    assert calls["view"] == 1
