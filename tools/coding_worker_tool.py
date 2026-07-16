@@ -1149,10 +1149,16 @@ def delegate_coding_task(
         bool(allow_git_pr_lifecycle),
         trusted_allow_git_pr_lifecycle,
     )
-    if fable_implementation and fable_git_lifecycle in {"pr", "merge"}:
-        allow_git_pr_lifecycle = True
-    allow_git_pr_merge = fable_implementation and fable_git_lifecycle == "merge"
+    # Fable follows the same ownership split as the Kanban coding lanes:
+    # Codex owns implementation and focused verification, while trusted Hermes
+    # code owns commit/push/PR/CI/merge. Never give the Fable child GitHub
+    # authority or linked-worktree Git metadata merely because the parent
+    # lifecycle policy is ``pr`` or ``merge``.
+    if fable_implementation:
+        allow_git_pr_lifecycle = False
+    allow_git_pr_merge = False
     workdir = _resolve_cwd(cwd, parent_agent)
+    fable_git_preparation = None
     cwd_fallback_metadata: dict[str, str] | None = None
     if not Path(workdir).exists():
         fallback_workdir, cwd_fallback_metadata = _workspace_fallback_for_missing_cwd(workdir)
@@ -1191,6 +1197,21 @@ def delegate_coding_task(
         worktree_error = _fable_mutable_worktree_error(workdir)
         if worktree_error:
             return tool_error(worktree_error)
+        if fable_git_lifecycle in {"pr", "merge"}:
+            try:
+                from hermes_cli.fable_git_finalizer import prepare_fable_git_lifecycle
+
+                fable_git_preparation = prepare_fable_git_lifecycle(
+                    workdir,
+                    fable_git_lifecycle,
+                )
+            except Exception as exc:
+                return tool_error(
+                    "Fable Git lifecycle preflight failed before the Codex worker "
+                    f"started: {exc}"
+                )
+            if not fable_git_preparation.success:
+                return tool_error(fable_git_preparation.error)
 
     try:
         from hermes_cli.config import load_config
@@ -1358,6 +1379,12 @@ def delegate_coding_task(
             "This is a Fable implementation worker. The requested workdir is a "
             "pre-provisioned mutable checkout; work there and do not create a second "
             "worktree or clone from the canonical checkout."
+        )
+        worker_prompt_parts.append(
+            "Stop at local file edits and focused verification. Do not stage files, "
+            "create commits, push branches, open or edit pull requests, wait for CI, "
+            "merge, or mutate the protected canonical checkout. Trusted Hermes code "
+            "owns that GitHub lifecycle after you return."
         )
     if allow_git_pr_lifecycle:
         if allow_git_pr_merge:
@@ -1823,6 +1850,32 @@ def delegate_coding_task(
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted
+    fable_git_result = None
+    lifecycle_error = ""
+    if (
+        success
+        and fable_implementation
+        and fable_git_lifecycle in {"pr", "merge"}
+        and fable_git_preparation is not None
+    ):
+        try:
+            from hermes_cli.fable_git_finalizer import finalize_fable_git_lifecycle
+
+            finalized = finalize_fable_git_lifecycle(
+                fable_git_preparation,
+                mode=fable_git_lifecycle,
+                task=task_text,
+                worker_summary=turn.final_text,
+            )
+            fable_git_result = finalized.as_dict()
+            if not finalized.success:
+                success = False
+                lifecycle_error = finalized.error or (
+                    f"Fable Git lifecycle stopped at {finalized.status}."
+                )
+        except Exception as exc:
+            success = False
+            lifecycle_error = f"Fable Git lifecycle finalization failed: {exc}"
     tool_iterations = sum(getattr(item, "tool_iterations", 0) or 0 for item in turns)
     projected_message_count = sum(
         len(getattr(item, "projected_messages", []) or []) for item in turns
@@ -1831,7 +1884,7 @@ def delegate_coding_task(
         "success": success,
         "status": "completed" if success else "partial",
         "summary": turn.final_text,
-        "error": turn.error,
+        "error": turn.error or lifecycle_error or None,
         "interrupted": turn.interrupted,
         "duration_seconds": duration,
         "cwd": workdir,
@@ -1846,6 +1899,8 @@ def delegate_coding_task(
         "task_inferred_from_context": task_inferred_from_context,
         "fable_git_lifecycle": fable_git_lifecycle if fable_implementation else "none",
     }
+    if fable_git_result is not None:
+        payload["fable_git_result"] = fable_git_result
     if cwd_fallback_metadata is not None:
         payload["cwd_fallback"] = cwd_fallback_metadata
     return json.dumps(payload, ensure_ascii=False)

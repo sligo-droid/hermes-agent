@@ -488,7 +488,10 @@ def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, t
     assert "Do not merge PRs" in prompt
 
 
-def test_fable_merge_lifecycle_scopes_network_and_linked_git_metadata(monkeypatch, tmp_path):
+def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
+    monkeypatch,
+    tmp_path,
+):
     FakeSession.instances = []
     FakeSession.results = []
     canonical = tmp_path / "canonical"
@@ -514,6 +517,38 @@ def test_fable_merge_lifecycle_scopes_network_and_linked_git_metadata(monkeypatc
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
     )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server.check_codex_binary",
+        lambda: (True, "codex ready"),
+    )
+    preparation = SimpleNamespace(
+        success=True,
+        worktree=str(worktree),
+        branch="fable/lifecycle",
+        base_branch="main",
+        repo="sligo-labs/example",
+        error="",
+    )
+    finalized = SimpleNamespace(
+        success=True,
+        status="merged",
+        error="",
+        as_dict=lambda: {
+            "success": True,
+            "status": "merged",
+            "pr_url": "https://github.com/sligo-labs/example/pull/1",
+        },
+    )
+    prepare = MagicMock(return_value=preparation)
+    finalize = MagicMock(return_value=finalized)
+    monkeypatch.setattr(
+        "hermes_cli.fable_git_finalizer.prepare_fable_git_lifecycle",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.fable_git_finalizer.finalize_fable_git_lifecycle",
+        finalize,
+    )
     parent = _fable_parent(worktree)
     parent._fable_git_lifecycle = "merge"
 
@@ -521,13 +556,23 @@ def test_fable_merge_lifecycle_scopes_network_and_linked_git_metadata(monkeypatc
 
     assert result["success"] is True
     assert result["fable_git_lifecycle"] == "merge"
+    assert result["fable_git_result"]["status"] == "merged"
     env = FakeSession.instances[0].kwargs["env"]
-    assert env["HERMES_CODEX_WORKER_NETWORK_ACCESS"] == "1"
-    assert env["HERMES_CODEX_WORKER_WORKSPACE"] == str(worktree)
-    assert env["HERMES_CODEX_WORKER_GIT_COMMON_DIR"] == str(canonical / ".git")
+    assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in env
+    assert "HERMES_CODEX_WORKER_WORKSPACE" not in env
+    assert "HERMES_CODEX_WORKER_GIT_COMMON_DIR" not in env
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
     assert "pre-provisioned mutable checkout" in prompt
-    assert "Merge only when the original user request explicitly asks" in prompt
+    assert "Do not stage files" in prompt
+    assert "Trusted Hermes code owns that GitHub lifecycle" in prompt
+    assert "Git/PR lifecycle is explicitly authorized" not in prompt
+    prepare.assert_called_once_with(str(worktree), "merge")
+    finalize.assert_called_once_with(
+        preparation,
+        mode="merge",
+        task="land the requested change",
+        worker_summary="Changed src/app.py and ran pytest.",
+    )
 
 
 def test_authorized_git_pr_lifecycle_preserves_explicit_git_ssh_command(monkeypatch, tmp_path):
