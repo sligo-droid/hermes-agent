@@ -9,14 +9,14 @@ from hermes_cli.commands import (
 )
 
 
-def test_tier_commands_are_visible_only_on_discord_gateway_surfaces():
+def test_removed_tier_commands_are_absent_from_all_command_surfaces():
     discord_help = "\n".join(gateway_help_lines("discord"))
     generic_help = "\n".join(gateway_help_lines())
     telegram_help = "\n".join(gateway_help_lines("telegram"))
     slack_help = "\n".join(gateway_help_lines("slack"))
 
     for command in ("dumb", "smart"):
-        assert f"/{command}" in discord_help
+        assert f"/{command}" not in discord_help
         assert f"/{command}" not in generic_help
         assert f"/{command}" not in telegram_help
         assert f"/{command}" not in slack_help

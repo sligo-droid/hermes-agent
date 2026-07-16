@@ -59,11 +59,7 @@ from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
-from hermes_cli.model_tiers import (
-    MODEL_TIER_LADDER,
-    resolve_model_tier,
-    resolve_model_tier_offset,
-)
+from hermes_cli.model_tiers import resolve_model_tier
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -121,7 +117,12 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "pickup or production verification passes, stop and report; do not open extra "
     "cleanup, credential, discoverability, or follow-up PRs unless they are required "
     "to correct a regression introduced by this task or the user explicitly asks. "
-    "Record non-critical follow-ups instead of expanding the active turn. Prefer one "
+    "Record non-critical follow-ups instead of expanding the active turn. "
+    "Choose delegate_coding_task worker_tier deliberately: use quick for obvious tiny "
+    "changes, escalate the tier on retry instead of re-instructing at the same tier, "
+    "and reserve max for rare complete-redesign situations. Front-load what you learned "
+    "into relevant_files, approach, constraints, and verification; a well-briefed cheap "
+    "worker beats an expensive worker that must rediscover the repository. Prefer one "
     "focused coding-worker attempt; if its backend fails, diagnose the failure and "
     "continue inline or report the blocker instead of repeatedly retrying the same "
     "backend in one turn. Do not suppress a necessary clarifying question: "
@@ -292,7 +293,7 @@ def _gateway_model_tier(config: Optional[dict]) -> Any:
 def _discord_action_request_model_tier(config: Optional[dict]) -> Any:
     """Return the named tier for ordinary Discord action-request threads."""
     cfg = config or {}
-    name = cfg_get(cfg, "discord", "action_request_model_tier", default="basic")
+    name = cfg_get(cfg, "discord", "action_request_model_tier", default="advanced")
     return resolve_model_tier(cfg, name)
 
 
@@ -11097,19 +11098,6 @@ class GatewayRunner:
             command = None
             canonical = None
 
-        if canonical in {"dumb", "smart"}:
-            # /smart skips intermediate and bumps two built-in levels from
-            # the default basic action-request tier.
-            tier_result = await self._handle_action_request_tier_command(
-                event,
-                command=canonical,
-                direction=-1 if canonical == "dumb" else 2,
-            )
-            if tier_result is not None:
-                return tier_result
-            command = None
-            canonical = None
-        
         if canonical == "help":
             return await self._handle_help_command(event)
 
@@ -12627,12 +12615,6 @@ class GatewayRunner:
                 fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
                 fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
                 fable_transcript_user_message=getattr(event, "fable_transcript_user_message", None),
-                action_request_model_tier_override=getattr(
-                    event, "action_request_model_tier_override", None
-                ),
-                action_request_transcript_user_message=getattr(
-                    event, "action_request_transcript_user_message", None
-                ),
                 session_cwd_override=session_cwd,
                 visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
                 visual_qa_config=getattr(event, "visual_qa_config", None),
@@ -12707,9 +12689,7 @@ class GatewayRunner:
                 )
             agent_messages = agent_result.get("messages", [])
             transcript_user_message = str(
-                getattr(event, "fable_transcript_user_message", "")
-                or getattr(event, "action_request_transcript_user_message", "")
-                or ""
+                getattr(event, "fable_transcript_user_message", "") or ""
             ).strip()
             if transcript_user_message:
                 try:
@@ -18340,63 +18320,6 @@ class GatewayRunner:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
-    async def _handle_action_request_tier_command(
-        self,
-        event: MessageEvent,
-        *,
-        command: str,
-        direction: int,
-    ) -> Optional[str]:
-        """Rewrite Discord /dumb or /smart into one tier-scoped action turn."""
-        source = event.source
-        if getattr(source, "platform", None) != Platform.DISCORD:
-            return f"⚠️ /{command} is available only for Discord action requests."
-
-        request = event.get_command_args().strip()
-        if not request:
-            return f"Usage: /{command} <request>"
-
-        feature_summary = getattr(event, "feature_summary", None)
-        if not _is_standard_discord_action_request(source, feature_summary):
-            return (
-                f"⚠️ /{command} must be used in a normal non-Kanban Discord action-request "
-                "thread. Start or enter an action thread first."
-            )
-
-        try:
-            cfg = _load_gateway_runtime_config()
-        except Exception:
-            cfg = {}
-        configured_name = cfg_get(
-            cfg,
-            "discord",
-            "action_request_model_tier",
-            default="basic",
-        )
-        current_tier = resolve_model_tier(cfg, configured_name)
-        current_name = str(configured_name or "").strip().lower()
-        if current_tier is None or current_name not in MODEL_TIER_LADDER:
-            supported = ", ".join(f"`{name}`" for name in MODEL_TIER_LADDER)
-            return (
-                "⚠️ Discord action-request tier stepping requires "
-                f"`discord.action_request_model_tier` to be one of {supported}."
-            )
-
-        target_tier = resolve_model_tier_offset(cfg, current_name, direction)
-        if target_tier is None:
-            bound = "below `trivial`" if direction < 0 else "above `advanced`"
-            return f"⚠️ /{command} cannot move the action-request tier {bound}."
-
-        original_text = str(event.text or "").strip()
-        try:
-            event.text = request
-            event.action_request_model_tier_override = target_tier.name
-            event.action_request_tier_command = command
-            event.action_request_transcript_user_message = original_text
-        except Exception:
-            return f"⚠️ Could not prepare the /{command} action request."
-        return None
-
     async def _handle_fable_command(self, event: MessageEvent, session_key: str) -> Optional[str]:
         """Route Fable to plan-only or Discord implementation mode."""
         raw_args = event.get_command_args().strip()
@@ -20982,8 +20905,6 @@ class GatewayRunner:
         fable_toolsets: Optional[List[str]] = None,
         fable_reasoning_config: Optional[Dict[str, Any]] = None,
         fable_transcript_user_message: Optional[str] = None,
-        action_request_model_tier_override: Optional[str] = None,
-        action_request_transcript_user_message: Optional[str] = None,
         session_cwd_override: Optional[str] = None,
         visual_qa_requirement: Optional[Dict[str, Any]] = None,
         visual_qa_config: Optional[Dict[str, Any]] = None,
@@ -21764,34 +21685,14 @@ class GatewayRunner:
             _reload_runtime_env_preserving_config_authority()
 
             try:
-                per_turn_tier_name = str(action_request_model_tier_override or "").strip()
                 action_request_tier = None
                 if standard_discord_action_request:
-                    action_request_tier = (
-                        resolve_model_tier(user_config, per_turn_tier_name)
-                        if per_turn_tier_name
-                        else _discord_action_request_model_tier(user_config)
-                    )
-                if per_turn_tier_name and action_request_tier is None:
-                    return {
-                        "final_response": (
-                            "⚠️ The requested Discord action-request tier is no longer valid; "
-                            "retry /dumb or /smart after fixing the configured tier."
-                        ),
-                        "messages": [],
-                        "api_calls": 0,
-                        "tools": [],
-                    }
+                    action_request_tier = _discord_action_request_model_tier(user_config)
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
                     model_override=action_request_tier.model if action_request_tier is not None else None,
-                    turn_model_override=(
-                        action_request_tier.model
-                        if per_turn_tier_name and action_request_tier is not None
-                        else None
-                    ),
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
@@ -21945,9 +21846,6 @@ class GatewayRunner:
                     "gateway.session_cwd": session_cwd,
                     "gateway.discord_action_request_fast_path": standard_discord_action_request,
                     "gateway.discord_feature_request_fast_path": standard_discord_action_request,
-                    "gateway.discord_action_request_tier_override": (
-                        str(action_request_model_tier_override or "").strip()
-                    ),
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
                     "gateway.fable_oauth_tool_name_compat": fable_oauth_tool_name_compat,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
@@ -22075,14 +21973,8 @@ class GatewayRunner:
                 runtime_route = "gateway_fable"
                 model_override_source = "fable"
             elif standard_discord_action_request:
-                runtime_route = (
-                    "discord_action_request_tier_command"
-                    if str(action_request_model_tier_override or "").strip()
-                    else "discord_action_request"
-                )
+                runtime_route = "discord_action_request"
                 active_tier = action_request_tier
-                if str(action_request_model_tier_override or "").strip():
-                    model_override_source = "per_turn_tier"
             else:
                 active_tier = _gateway_model_tier(user_config)
             _set_gateway_runtime_audit(
@@ -22500,11 +22392,7 @@ class GatewayRunner:
                     "task_id": session_id,
                 }
                 _persist_user_message = (
-                    str(
-                        fable_transcript_user_message
-                        or action_request_transcript_user_message
-                        or ""
-                    ).strip()
+                    str(fable_transcript_user_message or "").strip()
                 )
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message or message

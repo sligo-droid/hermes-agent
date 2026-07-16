@@ -15,9 +15,10 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
+from hermes_cli.model_tiers import DEFAULT_WORKER_TIERS, resolve_worker_tier
 from tools.registry import registry, tool_error
 
 
@@ -78,6 +79,183 @@ def _codex_reasoning_args(reasoning_level: str) -> list[str]:
 def _codex_model_args(model: str) -> list[str]:
     selected_model = str(model or "").strip()
     return ["-c", f"model={json.dumps(selected_model)}"] if selected_model else []
+
+
+def _worker_tier_config(tier: Any) -> dict[str, Any]:
+    """Build a pass-wide OpenCode override for an orchestrator worker tier."""
+    return {
+        "model_tier": "disabled",
+        "simple_build_reasoning_level": tier.reasoning_effort,
+        "complex_plan_reasoning_level": tier.reasoning_effort,
+        "complex_build_reasoning_level": tier.reasoning_effort,
+        "opencode": {"model": tier.opencode_model},
+    }
+
+
+def _merge_worker_config(
+    base: Optional[dict[str, Any]],
+    override: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not base and not override:
+        return None
+    merged = dict(base or {})
+    override = override or {}
+    for key, value in override.items():
+        if key == "opencode" and isinstance(value, dict):
+            opencode = dict(merged.get("opencode") or {})
+            opencode.update(value)
+            merged[key] = opencode
+        else:
+            merged[key] = value
+    return merged
+
+
+def _context_pack_lines(
+    relevant_files: Any,
+    approach: Any,
+    constraints: Any,
+    verification: Any,
+) -> list[str]:
+    file_lines: list[str] = []
+    if isinstance(relevant_files, list):
+        for item in relevant_files:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            note = str(item.get("note") or "").strip()
+            if not path:
+                continue
+            file_lines.append(f"- `{path}` — {note}" if note else f"- `{path}`")
+
+    sections = [
+        ("Approach", str(approach or "").strip()),
+        ("Constraints", str(constraints or "").strip()),
+        ("Verification", str(verification or "").strip()),
+    ]
+    if not file_lines and not any(value for _label, value in sections):
+        return []
+
+    lines = ["", "## Context from orchestrator"]
+    if file_lines:
+        lines.extend(["", "Relevant files:", *file_lines])
+    for label, value in sections:
+        if value:
+            lines.extend(["", f"{label}:", value])
+    lines.extend(["", "## End context from orchestrator"])
+    return lines
+
+
+def _normalize_scope_paths(scope_paths: Any) -> tuple[Optional[list[str]], Optional[str]]:
+    if scope_paths is None:
+        return None, None
+    if not isinstance(scope_paths, list):
+        return None, "scope_paths must be a list of relative path prefixes."
+
+    normalized: list[str] = []
+    for raw_path in scope_paths:
+        value = str(raw_path or "").strip().replace("\\", "/")
+        path = PurePosixPath(value)
+        if not value or path.is_absolute() or ".." in path.parts:
+            return None, (
+                "scope_paths must contain non-empty relative path prefixes "
+                "without parent-directory ('..') segments."
+            )
+        rendered = str(path)
+        if rendered not in normalized:
+            normalized.append(rendered)
+    return normalized, None
+
+
+def _scope_prompt_lines(scope_paths: Optional[list[str]]) -> list[str]:
+    if scope_paths is None:
+        return []
+    if not scope_paths:
+        return [
+            "",
+            "Scope guardrail: scope_paths is empty, so do not modify any files.",
+        ]
+    return [
+        "",
+        "Scope guardrail: You may only modify files under these workdir-relative prefixes:",
+        *[f"- `{path}`" for path in scope_paths],
+        "Do not modify files outside those prefixes; Hermes will check the worktree after you return.",
+    ]
+
+
+def _git_changed_paths(workdir: str) -> list[str]:
+    root_proc = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=workdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if root_proc.returncode != 0:
+        detail = str(root_proc.stderr or root_proc.stdout or "not a git worktree").strip()
+        raise RuntimeError(detail)
+    repo_root = Path(root_proc.stdout.strip()).resolve(strict=False)
+    workdir_path = Path(workdir).resolve(strict=False)
+    status_proc = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=workdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if status_proc.returncode != 0:
+        detail = bytes(status_proc.stderr or status_proc.stdout or b"git status failed").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise RuntimeError(detail)
+
+    records = bytes(status_proc.stdout or b"").split(b"\0")
+    changed: set[str] = set()
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if len(record) < 4:
+            continue
+        status = record[:2]
+        paths = [record[3:]]
+        if (b"R" in status or b"C" in status) and index < len(records):
+            paths.append(records[index])
+            index += 1
+        for raw_path in paths:
+            if not raw_path:
+                continue
+            repo_relative = raw_path.decode("utf-8", errors="surrogateescape")
+            absolute = repo_root / repo_relative
+            relative = os.path.relpath(absolute, workdir_path).replace(os.sep, "/")
+            changed.add(relative)
+    return sorted(changed)
+
+
+def _scope_check(workdir: str, scope_paths: list[str]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "scope_paths": list(scope_paths),
+        "out_of_scope_files": [],
+        "clean": False,
+    }
+    try:
+        changed = _git_changed_paths(workdir)
+    except Exception as exc:
+        result["inspection_error"] = str(exc)
+        return result
+
+    def in_scope(path: str) -> bool:
+        return any(
+            prefix == "." or path == prefix or path.startswith(f"{prefix}/")
+            for prefix in scope_paths
+        )
+
+    out_of_scope = [path for path in changed if not in_scope(path)]
+    result["out_of_scope_files"] = out_of_scope
+    result["clean"] = not out_of_scope
+    return result
 
 
 _UI_ROUTE_DEFAULT_FALLBACK_HINTS = (
@@ -1122,6 +1300,12 @@ def delegate_coding_task(
     context: Optional[str] = None,
     cwd: Optional[str] = None,
     turn_timeout_seconds: Optional[float] = None,
+    worker_tier: Optional[str] = None,
+    relevant_files: Optional[list[dict[str, str]]] = None,
+    approach: Optional[str] = None,
+    constraints: Optional[str] = None,
+    verification: Optional[str] = None,
+    scope_paths: Optional[list[str]] = None,
     allow_git_pr_lifecycle: bool = False,
     trusted_allow_git_pr_lifecycle: bool = False,
     route_decision: Any = None,
@@ -1141,6 +1325,30 @@ def delegate_coding_task(
     task_text, context_text, task_inferred_from_context = _normalize_task_and_context(task, context)
     if not task_text:
         return tool_error("delegate_coding_task requires a non-empty task.")
+    normalized_scope_paths, scope_error = _normalize_scope_paths(scope_paths)
+    if scope_error:
+        return tool_error(scope_error)
+
+    try:
+        from hermes_cli.config import load_config
+
+        loaded_config = load_config() or {}
+    except Exception:
+        loaded_config = {}
+
+    selected_worker_tier = None
+    if worker_tier is not None:
+        selected_worker_tier = resolve_worker_tier(loaded_config, worker_tier)
+        if selected_worker_tier is None:
+            valid_tiers = ", ".join(DEFAULT_WORKER_TIERS)
+            return tool_error(
+                f"Unknown worker_tier {worker_tier!r}. Valid tiers: {valid_tiers}."
+            )
+    worker_tier_config = (
+        _worker_tier_config(selected_worker_tier)
+        if selected_worker_tier is not None
+        else None
+    )
 
     fable_implementation = _is_fable_implementation_parent(parent_agent)
     fable_git_lifecycle = _fable_git_lifecycle_mode(parent_agent)
@@ -1253,13 +1461,6 @@ def delegate_coding_task(
                         "focused verification; do not stage, commit, push, or touch the PR."
                     )
                 context_text = _prepend_context_note(context_text, recovery_note)
-
-    try:
-        from hermes_cli.config import load_config
-
-        loaded_config = load_config() or {}
-    except Exception:
-        loaded_config = {}
 
     try:
         from agent.opencode_worker import (
@@ -1527,6 +1728,10 @@ def delegate_coding_task(
         worker_prompt_parts.extend(["", ui_skill_prompt])
     if repo_state_notes:
         worker_prompt_parts.extend(["", repo_state_notes])
+    worker_prompt_parts.extend(_scope_prompt_lines(normalized_scope_paths))
+    worker_prompt_parts.extend(
+        _context_pack_lines(relevant_files, approach, constraints, verification)
+    )
     worker_prompt_parts.extend(["", "Task:", task_text])
     if context_text:
         worker_prompt_parts.extend(["", "Context from Hermes:", context_text])
@@ -1556,6 +1761,11 @@ def delegate_coding_task(
         specialist_result["task_inferred_from_context"] = task_inferred_from_context
         if cwd_fallback_metadata is not None:
             specialist_result["cwd_fallback"] = cwd_fallback_metadata
+        if normalized_scope_paths is not None:
+            specialist_result["scope_check"] = _scope_check(
+                workdir,
+                normalized_scope_paths,
+            )
         return json.dumps(specialist_result, ensure_ascii=False)
 
     classification_context = f"{task_text}\n{context_text}"
@@ -1595,6 +1805,7 @@ def delegate_coding_task(
             "title": "Hermes delegated coding task",
             "on_event": _touch_opencode_activity,
         }
+        opencode_worker_config = None
         if opencode_ui_work_worker_config is not None and ui_route is not None:
             ui_opencode_config = opencode_ui_work_worker_config(ui_route)
             if ui_opencode_config:
@@ -1602,7 +1813,13 @@ def delegate_coding_task(
                 # an ordinary feature-worker tier. Preserve its own pass
                 # configuration while its model override is active.
                 ui_opencode_config["model_tier"] = "disabled"
-                opencode_kwargs["worker_config"] = ui_opencode_config
+                opencode_worker_config = ui_opencode_config
+        opencode_worker_config = _merge_worker_config(
+            opencode_worker_config,
+            worker_tier_config,
+        )
+        if opencode_worker_config is not None:
+            opencode_kwargs["worker_config"] = opencode_worker_config
         if allow_git_pr_lifecycle:
             opencode_kwargs["env"] = worker_env
         elif ui_route is not None and ui_route.matched and ui_route.enabled:
@@ -1640,6 +1857,8 @@ def delegate_coding_task(
             payload["evidence_status"] = no_final_metadata.get("evidence_status") or "degraded"
             payload["failure_class"] = no_final_metadata.get("failure_class") or "no_final_text"
             payload["no_final_metadata"] = no_final_metadata
+        if normalized_scope_paths is not None:
+            payload["scope_check"] = _scope_check(workdir, normalized_scope_paths)
         return json.dumps(payload, ensure_ascii=False)
 
     try:
@@ -1712,7 +1931,13 @@ def delegate_coding_task(
         if codex_ui_work_extra_args is not None and ui_route is not None
         else []
     )
-    default_profiles = load_coding_worker_pass_profiles()
+    if selected_worker_tier is not None:
+        default_profiles = {
+            pass_name: {"codex_model": selected_worker_tier.model}
+            for pass_name in ("simple_build", "complex_plan", "complex_build")
+        }
+    else:
+        default_profiles = load_coding_worker_pass_profiles()
     turn = None
     if (
         ui_route is not None
@@ -1728,22 +1953,35 @@ def delegate_coding_task(
         )
 
     try:
-        default_pass_cfg = load_coding_worker_pass_config()
-        ui_worker_config = (
+        default_pass_cfg = (
+            {
+                "simple_build_reasoning_level": selected_worker_tier.reasoning_effort,
+                "complex_plan_reasoning_level": selected_worker_tier.reasoning_effort,
+                "complex_build_reasoning_level": selected_worker_tier.reasoning_effort,
+            }
+            if selected_worker_tier is not None
+            else load_coding_worker_pass_config()
+        )
+        ui_worker_config = _merge_worker_config(
             {"model_tier": "disabled"}
             if ui_route is not None
             and ui_route.matched
             and ui_route.enabled
             and ui_route.backend == "codex"
-            else None
+            else None,
+            worker_tier_config,
         )
         ui_pass_cfg = (
             load_coding_worker_pass_config(worker_config=ui_worker_config)
-            if ui_worker_config is not None
+            if ui_worker_config is not None and selected_worker_tier is None
             else default_pass_cfg
         )
         route_attempts = [
-            (ui_codex_args, ui_pass_cfg, None)
+            (
+                ui_codex_args,
+                ui_pass_cfg,
+                default_profiles if selected_worker_tier is not None else None,
+            )
             if ui_codex_args
             else ([], default_pass_cfg, default_profiles)
         ]
@@ -1809,26 +2047,29 @@ def delegate_coding_task(
                         )
                         continue
                     duration = round(time.monotonic() - started, 2)
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "status": "partial",
-                            "summary": plan_turn.final_text,
-                            "error": plan_turn.error,
-                            "interrupted": plan_turn.interrupted,
-                            "duration_seconds": duration,
-                            "cwd": workdir,
-                            "backend": "codex",
-                            "agents": agents,
-                            "plan_used": True,
-                            "thread_id": plan_turn.thread_id,
-                            "turn_id": plan_turn.turn_id,
-                            "tool_iterations": plan_turn.tool_iterations,
-                            "projected_message_count": len(plan_turn.projected_messages),
-                            "ui_work_route": ui_route_metadata,
-                        },
-                        ensure_ascii=False,
-                    )
+                    payload = {
+                        "success": False,
+                        "status": "partial",
+                        "summary": plan_turn.final_text,
+                        "error": plan_turn.error,
+                        "interrupted": plan_turn.interrupted,
+                        "duration_seconds": duration,
+                        "cwd": workdir,
+                        "backend": "codex",
+                        "agents": agents,
+                        "plan_used": True,
+                        "thread_id": plan_turn.thread_id,
+                        "turn_id": plan_turn.turn_id,
+                        "tool_iterations": plan_turn.tool_iterations,
+                        "projected_message_count": len(plan_turn.projected_messages),
+                        "ui_work_route": ui_route_metadata,
+                    }
+                    if normalized_scope_paths is not None:
+                        payload["scope_check"] = _scope_check(
+                            workdir,
+                            normalized_scope_paths,
+                        )
+                    return json.dumps(payload, ensure_ascii=False)
                 plan_text = plan_turn.final_text.strip()
 
             agents.append("build")
@@ -1891,6 +2132,11 @@ def delegate_coding_task(
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted
+    scope_check = (
+        _scope_check(workdir, normalized_scope_paths)
+        if normalized_scope_paths is not None
+        else None
+    )
     fable_git_result = None
     lifecycle_error = ""
     if (
@@ -1942,6 +2188,8 @@ def delegate_coding_task(
     }
     if fable_git_result is not None:
         payload["fable_git_result"] = fable_git_result
+    if scope_check is not None:
+        payload["scope_check"] = scope_check
     if cwd_fallback_metadata is not None:
         payload["cwd_fallback"] = cwd_fallback_metadata
     return json.dumps(payload, ensure_ascii=False)
@@ -1984,6 +2232,67 @@ CODING_WORKER_SCHEMA = {
                     "coding_worker.turn_timeout_seconds (1800 seconds by default), "
                     "minimum 30 seconds."
                 ),
+            },
+            "worker_tier": {
+                "type": "string",
+                "enum": list(DEFAULT_WORKER_TIERS),
+                "description": (
+                    "Orchestrator-selected worker model/reasoning tier. "
+                    "quick = trivial mechanical changes (rename, copy edit, config tweak); "
+                    "standard = ordinary small features and fixes; "
+                    "thorough = multi-file features, refactors, tricky bugs; "
+                    "deep = complex cross-cutting work; "
+                    "max = RARE: reach for this only under exceptional circumstances "
+                    "such as a complete re-design; expensive and slow."
+                ),
+            },
+            "relevant_files": {
+                "type": "array",
+                "description": (
+                    "Files the orchestrator already inspected, with concise notes explaining "
+                    "why each is relevant so the worker does not rediscover them."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repo-relative file path; line references are welcome.",
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "What the orchestrator learned from this file.",
+                        },
+                    },
+                    "required": ["path", "note"],
+                },
+            },
+            "approach": {
+                "type": "string",
+                "description": (
+                    "Intended approach or decomposition from the orchestrator's investigation."
+                ),
+            },
+            "constraints": {
+                "type": "string",
+                "description": (
+                    "Repo conventions, exclusions, compatibility requirements, and gotchas "
+                    "already identified by the orchestrator."
+                ),
+            },
+            "verification": {
+                "type": "string",
+                "description": (
+                    "Focused verification the orchestrator expects the worker to run."
+                ),
+            },
+            "scope_paths": {
+                "type": "array",
+                "description": (
+                    "Optional workdir-relative path prefixes the worker may modify. Hermes "
+                    "deterministically reports any changed files outside these prefixes."
+                ),
+                "items": {"type": "string"},
             },
             "route_decision": {
                 "type": "object",
@@ -2038,6 +2347,12 @@ registry.register(
         context=args.get("context"),
         cwd=args.get("cwd"),
         turn_timeout_seconds=args.get("turn_timeout_seconds"),
+        worker_tier=args.get("worker_tier"),
+        relevant_files=args.get("relevant_files"),
+        approach=args.get("approach"),
+        constraints=args.get("constraints"),
+        verification=args.get("verification"),
+        scope_paths=args.get("scope_paths"),
         allow_git_pr_lifecycle=False,
         trusted_allow_git_pr_lifecycle=False,
         route_decision=args.get("route_decision"),

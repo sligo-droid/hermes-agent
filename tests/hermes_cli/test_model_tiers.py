@@ -2,11 +2,13 @@
 
 from hermes_cli.config import DEFAULT_CONFIG
 from hermes_cli.model_tiers import (
+    DEFAULT_WORKER_TIERS,
     MODEL_TIER_LADDER,
     classify_task_complexity,
     resolve_adjacent_model_tier,
     resolve_model_tier,
     resolve_model_tier_offset,
+    resolve_worker_tier,
 )
 
 
@@ -28,7 +30,7 @@ def test_default_routes_reference_resolvable_tiers():
     assert route_names == {
         "gateway": "basic",
         "cron": "trivial",
-        "discord_action_request": "basic",
+        "discord_action_request": "advanced",
         "coding_worker_simple_build": "intermediate",
         "coding_worker_complex_plan": "advanced",
         "coding_worker_complex_build": "intermediate",
@@ -109,6 +111,62 @@ def test_invalid_tier_is_rejected_without_leaking_into_runtime():
     assert resolve_model_tier(
         {"model_tiers": {"broken": {"model": "x", "reasoning_effort": "ultra"}}},
         "broken",
+    ) is None
+
+
+def test_default_worker_tiers_resolve_to_expected_model_and_effort():
+    expected = {
+        "quick": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "low"),
+        "standard": ("gpt-5.6-terra", "hermes-codex/gpt-5.6-terra", "medium"),
+        "thorough": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "high"),
+        "deep": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "xhigh"),
+        "max": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "max"),
+    }
+
+    assert tuple(DEFAULT_WORKER_TIERS) == tuple(expected)
+    assert DEFAULT_CONFIG["coding_worker"]["worker_tiers"] == DEFAULT_WORKER_TIERS
+    assert {
+        name: (
+            resolve_worker_tier({}, name).model,
+            resolve_worker_tier({}, name).opencode_model,
+            resolve_worker_tier({}, name).reasoning_effort,
+        )
+        for name in expected
+    } == expected
+
+
+def test_worker_tier_config_override_merges_with_defaults():
+    tier = resolve_worker_tier(
+        {
+            "coding_worker": {
+                "worker_tiers": {
+                    "standard": {
+                        "model": "custom/worker",
+                        "reasoning_effort": "high",
+                    }
+                }
+            }
+        },
+        "standard",
+    )
+
+    assert tier is not None
+    assert tier.model == "custom/worker"
+    assert tier.opencode_model == "custom/worker"
+    assert tier.reasoning_effort == "high"
+
+
+def test_invalid_worker_tier_is_rejected():
+    assert resolve_worker_tier({}, "unknown") is None
+    assert resolve_worker_tier(
+        {
+            "coding_worker": {
+                "worker_tiers": {
+                    "quick": {"model": "custom/quick", "reasoning_effort": "ultra"}
+                }
+            }
+        },
+        "quick",
     ) is None
 
 

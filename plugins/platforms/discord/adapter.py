@@ -2987,7 +2987,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         command = match.group(1).lower()
         args = (match.group(2) or "").strip()
-        if command in {"fable", "dumb", "smart"}:
+        if command == "fable":
             return bool(args)
         if command != "goal":
             return False
@@ -3005,7 +3005,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not match:
             return False
         command = match.group(1).lower()
-        if command in {"fable", "dumb", "smart"}:
+        if command == "fable":
             return False
         return self._slash_command_starts_threaded_work(cleaned)
 
@@ -6365,13 +6365,6 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._is_fable_command_text(command_text):
             if not await self._route_fable_slash_to_thread(interaction, event, command_text):
                 return
-        elif self._is_action_request_tier_command_text(command_text):
-            if not await self._route_action_request_slash_to_thread(
-                interaction,
-                event,
-                command_text,
-            ):
-                return
         await self.handle_message(event)
         try:
             if followup_msg:
@@ -6384,17 +6377,6 @@ class DiscordAdapter(BasePlatformAdapter):
     @staticmethod
     def _is_fable_command_text(text: str) -> bool:
         return bool(re.match(r"^/fable(?:\s|$)", str(text or "").strip(), re.IGNORECASE))
-
-    @staticmethod
-    def _is_action_request_tier_command_text(text: str) -> bool:
-        return bool(
-            re.match(r"^/(?:dumb|smart)(?:\s|$)", str(text or "").strip(), re.IGNORECASE)
-        )
-
-    @staticmethod
-    def _action_request_tier_command_name(text: str) -> str:
-        match = re.match(r"^/(dumb|smart)(?:\s|$)", str(text or "").strip(), re.IGNORECASE)
-        return str(match.group(1) or "").lower() if match else ""
 
     @staticmethod
     def _command_request_text(text: str) -> str:
@@ -6476,7 +6458,7 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> bool:
         """Route a native command through a normal, non-Kanban action thread."""
         source = getattr(event, "source", None)
-        command = reason_command or self._action_request_tier_command_name(command_text) or "action"
+        command = reason_command or "action"
         request = self._command_request_text(command_text)
         if not request:
             try:
@@ -10186,9 +10168,6 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_audio_attachment(att, message_is_voice=message_is_voice)
         ]
         is_slash_command_message = normalized_content.startswith("/")
-        is_action_request_tier_command = self._is_action_request_tier_command_text(
-            normalized_content
-        )
         is_fable_implementation_command = False
         if self._is_fable_command_text(normalized_content):
             try:
@@ -10209,14 +10188,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 is_fable_implementation_command = not bool(
                     re.match(r"^/fable\s+plan(?:\s|$)", normalized_content, re.IGNORECASE)
                 )
-        # Tier commands deliberately accept one inline text request.  Do not
-        # reinterpret attachments as a second request or a feature intake.
-        if is_action_request_tier_command and all_attachments:
-            logger.debug(
-                "[%s] Ignoring attachment-bearing /dumb or /smart message; tier commands are text-only",
-                self.name,
-            )
-            return
         is_meeting_command_message = self._is_meeting_command_text(normalized_content)
         if (
             not is_meeting_command_message
@@ -10292,18 +10263,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
             replies_to_self = self._message_replies_to_self(message)
-
-            # Unlike ordinary chat in free-response channels, tier commands
-            # are an explicit action trigger. Keep their existing direct bot
-            # mention/reply admission boundary even when the channel itself is
-            # otherwise open.
-            if is_action_request_tier_command and not (mention_prefix or replies_to_self):
-                logger.debug(
-                    "[%s] Ignoring unaddressed Discord tier command in channel %s",
-                    self.name,
-                    current_channel_id,
-                )
-                return
 
             voice_auto_tag = self._discord_voice_auto_tag()
             meeting_audio_command = bool(is_meeting_command_message and all_audio_attachments)
@@ -10395,7 +10354,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_thread
                 and not skip_thread
                 and not is_voice_linked_channel
-                and (not is_reply_message or is_action_request_tier_command)
+                and not is_reply_message
                 and (not is_slash_command_message or slash_command_starts_threaded_work)
             )
             if should_consider_auto_thread:
@@ -10499,7 +10458,7 @@ class DiscordAdapter(BasePlatformAdapter):
             and not slash_goal_uses_attachment_body
             and (slash_command_starts_threaded_work or action_request_intent is True)
         ):
-            if is_action_request_tier_command or is_fable_implementation_command:
+            if is_fable_implementation_command:
                 # These commands must operate on a pre-existing normal action
                 # thread. Do not replace a worker/non-action summary with a
                 # new one that would make the gateway misclassify the thread.

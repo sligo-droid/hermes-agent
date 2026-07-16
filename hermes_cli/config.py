@@ -226,7 +226,7 @@ import yaml
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD
-from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS
+from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS, DEFAULT_WORKER_TIERS
 
 
 # =============================================================================
@@ -1611,6 +1611,7 @@ DEFAULT_CONFIG = {
     "coding_worker": {
         "enabled": True,
         "backend": "codex",  # opencode | codex
+        "worker_tiers": copy.deepcopy(DEFAULT_WORKER_TIERS),
         # Pass tiers are atomic model/reasoning bundles. model_tier is an
         # optional compatibility-wide override; "disabled" temporarily turns
         # off all pass-tier routing and restores the legacy raw settings below.
@@ -1981,7 +1982,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_model_tier": "basic", # Standard Discord action requests use Terra/high
+        "action_request_model_tier": "advanced", # Standard Discord action requests use Sol/xhigh
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context

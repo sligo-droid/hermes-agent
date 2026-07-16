@@ -39,6 +39,34 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     },
 }
 
+DEFAULT_WORKER_TIERS: dict[str, dict[str, str]] = {
+    "quick": {
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "low",
+    },
+    "standard": {
+        "model": "gpt-5.6-terra",
+        "opencode_model": "hermes-codex/gpt-5.6-terra",
+        "reasoning_effort": "medium",
+    },
+    "thorough": {
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "high",
+    },
+    "deep": {
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+    },
+    "max": {
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "max",
+    },
+}
+
 # Ordered built-in execution tiers. Custom tier names remain valid for normal
 # routing, but cannot be stepped because their relative ordering is unknown.
 MODEL_TIER_LADDER: tuple[str, ...] = (
@@ -184,6 +212,33 @@ def _merged_model_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:
     return tiers
 
 
+def _merged_worker_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Merge partial coding-worker tier overrides onto the built-in catalog."""
+    tiers: dict[str, Any] = copy.deepcopy(DEFAULT_WORKER_TIERS)
+    coding_worker = config.get("coding_worker") if isinstance(config, Mapping) else None
+    configured = coding_worker.get("worker_tiers") if isinstance(coding_worker, Mapping) else None
+    if not isinstance(configured, Mapping):
+        return tiers
+
+    for raw_name, raw_tier in configured.items():
+        name = _normalized_name(raw_name)
+        if not name:
+            continue
+        if not isinstance(raw_tier, Mapping):
+            tiers[name] = raw_tier
+            continue
+        inherited = tiers.get(name)
+        if isinstance(inherited, Mapping):
+            merged = dict(inherited)
+            merged.update(raw_tier)
+            if "model" in raw_tier and "opencode_model" not in raw_tier:
+                merged["opencode_model"] = raw_tier["model"]
+            tiers[name] = merged
+        else:
+            tiers[name] = dict(raw_tier)
+    return tiers
+
+
 def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier | None:
     """Resolve a configured tier, returning ``None`` for blank or invalid input."""
     normalized = _normalized_name(name)
@@ -191,6 +246,30 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
         return None
 
     raw_tier = _merged_model_tiers(config).get(normalized)
+    if not isinstance(raw_tier, Mapping):
+        return None
+
+    model = str(raw_tier.get("model") or "").strip()
+    opencode_model = str(raw_tier.get("opencode_model") or model).strip()
+    reasoning_effort = _normalized_name(raw_tier.get("reasoning_effort"))
+    if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
+        return None
+
+    return ModelTier(
+        name=normalized,
+        model=model,
+        opencode_model=opencode_model,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def resolve_worker_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier | None:
+    """Resolve an orchestrator-selected coding-worker tier."""
+    normalized = _normalized_name(name)
+    if not normalized:
+        return None
+
+    raw_tier = _merged_worker_tiers(config).get(normalized)
     if not isinstance(raw_tier, Mapping):
         return None
 

@@ -88,6 +88,22 @@ def _fable_parent(tmp_path):
     return parent
 
 
+def _init_git_worktree(path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Hermes Tests"], cwd=path, check=True)
+    (path / "src").mkdir()
+    (path / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (path / "README.md").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "test fixture"],
+        cwd=path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+
 def _skill_block(name, body, directory=None, description=None):
     lines = [
         f'[IMPORTANT: The user launched this CLI session with the "{name}" skill preloaded. Treat its instructions as active guidance for the duration of this session unless the user overrides them.]'
@@ -172,6 +188,8 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
     assert "fix the parser" in prompt
     assert "focus on src/parser.py" in prompt
+    assert "## Context from orchestrator" not in prompt
+    assert "Scope guardrail:" not in prompt
     assert "Repository context loaded by Hermes" in prompt
     assert "## AGENTS.md" in prompt
     assert "Always use the repo test wrapper." in prompt
@@ -187,6 +205,170 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert result["agents"] == ["build"]
     assert result["plan_used"] is False
     assert result["ui_work_route"]["matched"] is False
+    assert "scope_check" not in result
+
+
+def test_context_pack_is_injected_before_task(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            relevant_files=[
+                {"path": "src/parser.py:40", "note": "failure starts in parse_config"},
+                {"path": "tests/test_parser.py", "note": "covers the regression"},
+            ],
+            approach="Patch the existing parser helper without adding a new abstraction.",
+            constraints="Preserve the public config shape.",
+            verification="Run scripts/run_tests.sh tests/test_parser.py.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "## Context from orchestrator" in prompt
+    assert "- `src/parser.py:40` — failure starts in parse_config" in prompt
+    assert "Approach:\nPatch the existing parser helper" in prompt
+    assert "Constraints:\nPreserve the public config shape." in prompt
+    assert "Verification:\nRun scripts/run_tests.sh tests/test_parser.py." in prompt
+    assert prompt.index("## Context from orchestrator") < prompt.index("\nTask:\nfix the parser")
+
+
+def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = [
+        TurnResult(final_text="Plan", thread_id="thread-plan", turn_id="turn-plan"),
+        TurnResult(final_text="Built", thread_id="thread-build", turn_id="turn-build"),
+    ]
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the production auth race",
+            worker_tier="thorough",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert [session.kwargs["extra_args"] for session in FakeSession.instances] == [
+        [
+            "-c",
+            'model="gpt-5.6-sol"',
+            "-c",
+            'model_reasoning_effort="high"',
+        ],
+        [
+            "-c",
+            'model="gpt-5.6-sol"',
+            "-c",
+            'model_reasoning_effort="high"',
+        ],
+    ]
+
+
+def test_invalid_worker_tier_returns_tool_error(tmp_path):
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            worker_tier="impossible",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert "Unknown worker_tier 'impossible'" in result["error"]
+    for tier in ("quick", "standard", "thorough", "deep", "max"):
+        assert tier in result["error"]
+
+
+def test_coding_worker_schema_exposes_orchestrator_inputs():
+    properties = cwt.CODING_WORKER_SCHEMA["parameters"]["properties"]
+
+    assert properties["worker_tier"]["enum"] == [
+        "quick",
+        "standard",
+        "thorough",
+        "deep",
+        "max",
+    ]
+    assert {"relevant_files", "approach", "constraints", "verification", "scope_paths"} <= set(
+        properties
+    )
+
+
+def test_scope_check_reports_in_scope_changes_as_clean(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    (repo / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="update the app",
+            scope_paths=["src"],
+            parent_agent=_parent(repo),
+        )
+    )
+
+    assert result["scope_check"] == {
+        "scope_paths": ["src"],
+        "out_of_scope_files": [],
+        "clean": True,
+    }
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "You may only modify files under these workdir-relative prefixes" in prompt
+    assert "- `src`" in prompt
+
+
+def test_scope_check_lists_out_of_scope_changes(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    (repo / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
+    (repo / "README.md").write_text("changed outside scope\n", encoding="utf-8")
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="update the app",
+            scope_paths=["src"],
+            parent_agent=_parent(repo),
+        )
+    )
+
+    assert result["scope_check"] == {
+        "scope_paths": ["src"],
+        "out_of_scope_files": ["README.md"],
+        "clean": False,
+    }
 
 
 def test_delegate_repairs_missing_task_from_worker_context(monkeypatch, tmp_path):
@@ -727,7 +909,7 @@ def test_registry_ignores_model_supplied_git_pr_lifecycle_authorization(monkeypa
     assert "Do not create commits or pull requests." in prompt
 
 
-def test_registry_forwards_route_decision(monkeypatch, tmp_path):
+def test_registry_forwards_orchestrator_worker_inputs(monkeypatch, tmp_path):
     captured = {}
 
     def fake_delegate_coding_task(**kwargs):
@@ -742,12 +924,20 @@ def test_registry_forwards_route_decision(monkeypatch, tmp_path):
         "confidence": 0.91,
         "rationale": "visual implementation",
     }
+    relevant_files = [{"path": "src/app.py", "note": "main implementation"}]
+    scope_paths = ["src", "tests"]
 
     result = json.loads(
         entry.handler(
             {
                 "task": "polish the AI budget dashboard",
                 "route_decision": route_decision,
+                "worker_tier": "thorough",
+                "relevant_files": relevant_files,
+                "approach": "Patch the existing component.",
+                "constraints": "Preserve the public props.",
+                "verification": "Run the component tests.",
+                "scope_paths": scope_paths,
             },
             parent_agent=_parent(tmp_path),
         )
@@ -755,6 +945,12 @@ def test_registry_forwards_route_decision(monkeypatch, tmp_path):
 
     assert result == {"success": True}
     assert captured["route_decision"] is route_decision
+    assert captured["worker_tier"] == "thorough"
+    assert captured["relevant_files"] is relevant_files
+    assert captured["approach"] == "Patch the existing component."
+    assert captured["constraints"] == "Preserve the public props."
+    assert captured["verification"] == "Run the component tests."
+    assert captured["scope_paths"] is scope_paths
 
 
 def test_default_coding_worker_keeps_local_only_sanitized_codex_env(monkeypatch, tmp_path):
@@ -1605,6 +1801,59 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert result["agents"] == ["build"]
     assert result["summary"] == "Changed src/parser.py and ran pytest."
     assert activity_messages == ["OpenCode coding worker event: message: build"]
+
+
+def test_worker_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "opencode"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+    seen = {}
+
+    def fake_run(prompt, workspace, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            final_text="done",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            worker_tier="deep",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert seen["worker_config"] == {
+        "model_tier": "disabled",
+        "simple_build_reasoning_level": "xhigh",
+        "complex_plan_reasoning_level": "xhigh",
+        "complex_build_reasoning_level": "xhigh",
+        "opencode": {"model": "hermes-codex/gpt-5.6-sol"},
+    }
+    resolved = ow.load_opencode_config(cfg, worker_config=seen["worker_config"])
+    assert resolved["simple_build_model"] == "hermes-codex/gpt-5.6-sol"
+    assert resolved["complex_plan_model"] == "hermes-codex/gpt-5.6-sol"
+    assert resolved["complex_build_model"] == "hermes-codex/gpt-5.6-sol"
+    assert resolved["simple_build_reasoning_level"] == "xhigh"
+    assert resolved["complex_plan_reasoning_level"] == "xhigh"
+    assert resolved["complex_build_reasoning_level"] == "xhigh"
 
 
 def test_delegate_opencode_preserves_parent_scope_when_backend_supports_it(monkeypatch, tmp_path):
