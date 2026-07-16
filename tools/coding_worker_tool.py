@@ -92,6 +92,56 @@ def _worker_tier_config(tier: Any) -> dict[str, Any]:
     }
 
 
+def _start_worker_run(
+    parent_agent: Any,
+    *,
+    backend: str,
+    model: str,
+    reasoning: str,
+    tier: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Append a best-effort per-turn worker record before execution starts."""
+    record: dict[str, Any] = {
+        "backend": str(backend or "").strip(),
+        "model": str(model or "").strip(),
+        "reasoning": str(reasoning or "").strip(),
+        "tier": str(tier).strip() if tier else None,
+        "failed": True,
+    }
+    try:
+        runs = getattr(parent_agent, "turn_worker_runs", None)
+        if not isinstance(runs, list):
+            runs = []
+            parent_agent.turn_worker_runs = runs
+        runs.append(record)
+    except Exception:
+        return None
+    return record
+
+
+def _update_worker_run(
+    record: Optional[dict[str, Any]],
+    *,
+    model: Any,
+    reasoning: Any,
+) -> None:
+    """Update a run to the last pass that actually started."""
+    if record is None:
+        return
+    record["model"] = str(model or "").strip()
+    record["reasoning"] = str(reasoning or "").strip()
+
+
+def _finish_worker_run(record: Optional[dict[str, Any]], *, failed: bool) -> None:
+    """Finalize the failure marker without affecting worker execution."""
+    if record is None:
+        return
+    if failed:
+        record["failed"] = True
+    else:
+        record.pop("failed", None)
+
+
 def _merge_worker_config(
     base: Optional[dict[str, Any]],
     override: Optional[dict[str, Any]],
@@ -1751,6 +1801,13 @@ def delegate_coding_task(
         and ui_route.enabled
         and ui_route.selected_route == "ui_visual_specialist"
     ):
+        specialist_run = _start_worker_run(
+            parent_agent,
+            backend="claude_code",
+            model=ui_route_metadata.get("selected_model") or "claude-fable-5",
+            reasoning="medium",
+            tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+        )
         specialist_result = json.loads(_run_ui_specialist(
             prompt=worker_prompt,
             workdir=workdir,
@@ -1758,6 +1815,11 @@ def delegate_coding_task(
             parent_agent=parent_agent,
             route_metadata=ui_route_metadata,
         ))
+        _finish_worker_run(
+            specialist_run,
+            failed=not bool(specialist_result.get("success"))
+            or bool(specialist_result.get("error")),
+        )
         specialist_result["task_inferred_from_context"] = task_inferred_from_context
         if cwd_fallback_metadata is not None:
             specialist_result["cwd_fallback"] = cwd_fallback_metadata
@@ -1778,7 +1840,11 @@ def delegate_coding_task(
 
     if backend == BACKEND_OPENCODE:
         try:
-            from agent.opencode_worker import run_opencode_task
+            from agent.opencode_worker import (
+                load_opencode_config,
+                looks_complex_or_risky,
+                run_opencode_task,
+            )
         except Exception as exc:
             return tool_error(f"could not import OpenCode worker backend: {exc}")
 
@@ -1824,6 +1890,19 @@ def delegate_coding_task(
             opencode_kwargs["env"] = worker_env
         elif ui_route is not None and ui_route.matched and ui_route.enabled:
             opencode_kwargs["env"] = worker_env
+        opencode_runtime = load_opencode_config(worker_config=opencode_worker_config)
+        opencode_needs_plan = looks_complex_or_risky(
+            worker_prompt,
+            classification_context,
+        )
+        opencode_pass = "complex_build" if opencode_needs_plan else "simple_build"
+        opencode_run = _start_worker_run(
+            parent_agent,
+            backend="opencode",
+            model=opencode_runtime.get(f"{opencode_pass}_model") or "",
+            reasoning=opencode_runtime.get(f"{opencode_pass}_reasoning_level") or "",
+            tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+        )
         result = _call_opencode_task(
             run_opencode_task,
             worker_prompt,
@@ -1833,6 +1912,19 @@ def delegate_coding_task(
         )
         duration = round(time.monotonic() - started, 2)
         success = bool(result.final_text) and not result.error and not result.interrupted
+        run_profile = getattr(result, "run_profile", None)
+        profile_passes = run_profile.get("passes") if isinstance(run_profile, dict) else None
+        if isinstance(profile_passes, list) and profile_passes:
+            executed_passes = len(getattr(result, "agents", []) or [])
+            profile_index = min(max(executed_passes - 1, 0), len(profile_passes) - 1)
+            actual_pass = profile_passes[profile_index]
+            if isinstance(actual_pass, dict):
+                _update_worker_run(
+                    opencode_run,
+                    model=actual_pass.get("model"),
+                    reasoning=actual_pass.get("reasoning"),
+                )
+        _finish_worker_run(opencode_run, failed=not success)
         payload = {
             "success": success,
             "status": "completed" if success else "partial",
@@ -1939,6 +2031,7 @@ def delegate_coding_task(
     else:
         default_profiles = load_coding_worker_pass_profiles()
     turn = None
+    codex_run = None
     if (
         ui_route is not None
         and ui_route.matched
@@ -2012,6 +2105,22 @@ def delegate_coding_task(
             turns = []
             plan_text = ""
 
+            def _attempt_model(pass_name: str) -> str:
+                if active_ui_codex_args and ui_route is not None:
+                    return str(ui_route.model or "").strip()
+                if pass_profiles:
+                    return str(pass_profiles[pass_name]["codex_model"] or "").strip()
+                return ""
+
+            initial_pass = "complex_plan" if needs_plan else "simple_build"
+            codex_run = _start_worker_run(
+                parent_agent,
+                backend="codex",
+                model=_attempt_model(initial_pass),
+                reasoning=pass_cfg[f"{initial_pass}_reasoning_level"],
+                tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+            )
+
             if needs_plan:
                 agents.append("plan")
                 with CodexAppServerSession(
@@ -2045,6 +2154,7 @@ def delegate_coding_task(
                             ui_route_metadata,
                             plan_turn.error,
                         )
+                        _finish_worker_run(codex_run, failed=True)
                         continue
                     duration = round(time.monotonic() - started, 2)
                     payload = {
@@ -2069,6 +2179,7 @@ def delegate_coding_task(
                             workdir,
                             normalized_scope_paths,
                         )
+                    _finish_worker_run(codex_run, failed=True)
                     return json.dumps(payload, ensure_ascii=False)
                 plan_text = plan_turn.final_text.strip()
 
@@ -2084,6 +2195,12 @@ def delegate_coding_task(
                 pass_cfg["complex_build_reasoning_level"]
                 if needs_plan
                 else pass_cfg["simple_build_reasoning_level"]
+            )
+            build_pass = "complex_build" if needs_plan else "simple_build"
+            _update_worker_run(
+                codex_run,
+                model=_attempt_model(build_pass),
+                reasoning=reasoning_level,
             )
             with CodexAppServerSession(
                 cwd=workdir,
@@ -2114,6 +2231,7 @@ def delegate_coding_task(
                     ui_route_metadata,
                     turn.error,
                 )
+                _finish_worker_run(codex_run, failed=True)
                 continue
             break
     finally:
@@ -2128,10 +2246,12 @@ def delegate_coding_task(
             codex_home_lease.cleanup()
 
     if turn is None:
+        _finish_worker_run(codex_run, failed=True)
         return tool_error("coding worker did not produce a build turn")
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted
+    _finish_worker_run(codex_run, failed=not success)
     scope_check = (
         _scope_check(workdir, normalized_scope_paths)
         if normalized_scope_paths is not None

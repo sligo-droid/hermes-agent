@@ -71,6 +71,25 @@ def test_init_cached_agent_preserves_max_iterations_on_interrupt_depth():
     assert agent.max_iterations == 200
 
 
+def test_init_cached_agent_for_turn_clears_previous_worker_runs():
+    """Cached agents must not leak coding-worker footer data across turns."""
+    from gateway.run import GatewayRunner
+
+    agent = _make_cached_agent(90)
+    agent.turn_worker_runs = [
+        {
+            "backend": "codex",
+            "model": "gpt-5.6-luna",
+            "reasoning": "low",
+            "tier": "quick",
+        },
+    ]
+
+    GatewayRunner._init_cached_agent_for_turn(agent, interrupt_depth=0)
+
+    assert agent.turn_worker_runs == []
+
+
 def test_refreshed_max_iterations_propagates_to_turn_budget():
     """Refreshing max_iterations on a cached agent changes the operative cap.
 

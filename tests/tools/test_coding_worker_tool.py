@@ -162,12 +162,13 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
         FakeSession,
     )
     monkeypatch.setattr(cwt, "_load_coding_worker_timeout", lambda: 123.0)
+    parent = _parent(tmp_path)
 
     result = json.loads(
         cwt.delegate_coding_task(
             task="fix the parser",
             context="focus on src/parser.py",
-            parent_agent=_parent(tmp_path),
+            parent_agent=parent,
         )
     )
 
@@ -207,6 +208,14 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert result["plan_used"] is False
     assert result["ui_work_route"]["matched"] is False
     assert "scope_check" not in result
+    assert parent.turn_worker_runs == [
+        {
+            "backend": "codex",
+            "model": "gpt-5.6-terra",
+            "reasoning": "max",
+            "tier": None,
+        },
+    ]
 
 
 def test_context_pack_is_injected_before_task(monkeypatch, tmp_path):
@@ -251,12 +260,13 @@ def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
     )
+    parent = _parent(tmp_path)
 
     result = json.loads(
         cwt.delegate_coding_task(
             task="fix the production auth race",
             worker_tier="thorough",
-            parent_agent=_parent(tmp_path),
+            parent_agent=parent,
         )
     )
 
@@ -274,6 +284,42 @@ def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
             "-c",
             'model_reasoning_effort="high"',
         ],
+    ]
+    assert parent.turn_worker_runs == [
+        {
+            "backend": "codex",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high",
+            "tier": "thorough",
+        },
+    ]
+
+
+def test_backend_error_marks_recorded_worker_run_failed(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = [TurnResult(error="worker backend failed")]
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is False
+    assert parent.turn_worker_runs == [
+        {
+            "backend": "codex",
+            "model": "gpt-5.6-terra",
+            "reasoning": "max",
+            "tier": None,
+            "failed": True,
+        },
     ]
 
 
@@ -500,18 +546,27 @@ def test_ui_specialist_route_does_not_launch_codex(monkeypatch, tmp_path):
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
     )
+    parent = _parent(tmp_path)
 
     result = json.loads(
         cwt.delegate_coding_task(
             task="Polish the Command Center card spacing.",
             route_decision={"route": "ui_visual_specialist"},
-            parent_agent=_parent(tmp_path),
+            parent_agent=parent,
         )
     )
 
     assert result["success"] is True
     assert result["backend"] == "claude_code"
     assert FakeSession.instances == []
+    assert parent.turn_worker_runs == [
+        {
+            "backend": "claude_code",
+            "model": "claude-fable-5",
+            "reasoning": "medium",
+            "tier": None,
+        },
+    ]
 
 
 def test_ui_opencode_route_uses_independent_specialist_backend(monkeypatch, tmp_path):
@@ -1802,6 +1857,14 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert result["agents"] == ["build"]
     assert result["summary"] == "Changed src/parser.py and ran pytest."
     assert activity_messages == ["OpenCode coding worker event: message: build"]
+    assert parent.turn_worker_runs == [
+        {
+            "backend": "opencode",
+            "model": "hermes-codex/gpt-5.6-terra",
+            "reasoning": "max",
+            "tier": None,
+        },
+    ]
 
 
 def test_worker_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_path):
