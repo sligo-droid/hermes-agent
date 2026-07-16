@@ -1055,8 +1055,8 @@ DEFAULT_CONFIG = {
         "provider": "anthropic",
         "model": "claude-fable-5",
         "route": "anthropic_oauth",
-        # Remote Git authority stays opt-in: "none", "pr", or "merge".
-        # A merge-capable worker must still receive an explicit user request to merge.
+        # Trusted Hermes Git finalization stays opt-in: "none", "pr", or "merge".
+        # The Codex worker edits/tests locally; it never owns push or PR mutation.
         "git_lifecycle": "none",
         # To use an Anthropic-compatible proxy without copying its secret into
         # ANTHROPIC_API_KEY, set route: anthropic_proxy plus key_env and base_url.

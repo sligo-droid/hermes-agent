@@ -1260,10 +1260,14 @@ fable:
   git_lifecycle: none   # none | pr | merge
 ```
 
-`none` (the default) permits local implementation only. `pr` gives the trusted
-Codex worker network access and authority to commit, push, and open a PR.
-`merge` additionally permits a merge only when the original user request
-explicitly asks to land the PR; it never authorizes a direct update to `main`.
+`none` (the default) permits local implementation only. With every mode, the
+Codex worker stops after local edits and focused verification: it cannot stage,
+commit, push, mutate a PR, or touch the protected canonical checkout. `pr`
+authorizes trusted Hermes finalizer code to commit the worker diff, push the
+owned branch, and open a non-draft PR. `merge` additionally waits for reported
+checks, merges the PR, verifies the merge, and synchronizes the protected
+canonical checkout through the narrow orchestrator path. It never authorizes a
+direct worker update to `main`.
 
 Hermes writes the effective route to `turn_runtime_summary` log records. Audit
 fields include `model_tier`, `model_tier_source`, `runtime_route`,
