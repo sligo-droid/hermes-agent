@@ -12,6 +12,8 @@ provider error. This is a diagnostic improvement and is platform-agnostic.
 
 from types import SimpleNamespace
 
+import httpx
+
 from run_agent import AIAgent
 
 
@@ -53,3 +55,27 @@ def test_empty_body_fallback_redacts_secrets(monkeypatch):
     )
     summary = AIAgent._summarize_api_error(err)
     assert "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" not in summary
+
+
+def test_unread_streaming_response_does_not_mask_anthropic_overload():
+    """Anthropic streaming failures retain an unread httpx response.
+
+    Reading ``response.text`` raises ``ResponseNotRead`` on this shape.  Error
+    summarization must instead preserve the parsed provider body so the
+    conversation loop can retry the original overload.
+    """
+    err = Exception("Anthropic overloaded")
+    err.status_code = 529
+    err.body = {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "Overloaded"},
+    }
+    err.response = httpx.Response(
+        529,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        stream=httpx.ByteStream(b'{"error":{"message":"Overloaded"}}'),
+    )
+
+    summary = AIAgent._summarize_api_error(err)
+
+    assert summary == "HTTP 529: Overloaded"
