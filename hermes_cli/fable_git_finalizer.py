@@ -44,6 +44,10 @@ class FableGitPreparation:
     branch: str = ""
     base_branch: str = ""
     repo: str = ""
+    pr_url: str = ""
+    resume_existing_pr: bool = False
+    recovery_kind: str = ""
+    conflict_files: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -60,8 +64,17 @@ class FableGitFinalization:
     pr_url: str = ""
     merge_commit: str = ""
     changed_files: list[str] = field(default_factory=list)
+    conflict_files: list[str] = field(default_factory=list)
+    recovery_kind: str = ""
+    recovery_required: bool = False
+    next_action: str = ""
     checks_status: str = "not_run"
     canonical_sync_state: str = "not_run"
+    commit_performed: bool = False
+    push_performed: bool = False
+    pr_created: bool = False
+    merge_performed: bool = False
+    merge_observed: bool = False
     error: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -90,6 +103,20 @@ def _run(
 
 def _detail(result: subprocess.CompletedProcess[str], fallback: str) -> str:
     return " ".join((result.stderr or result.stdout or fallback).split())[:1200]
+
+
+def _is_merge_conflict_error(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "has merge conflicts",
+            "merge conflict",
+            "merge conflicts",
+            "not mergeable",
+            "conflicting",
+        )
+    )
 
 
 def _git_root(workdir: str) -> tuple[Path | None, str]:
@@ -151,8 +178,28 @@ def _status_porcelain(root: Path) -> tuple[str, str]:
     return result.stdout or "", ""
 
 
+def _unmerged_files(root: Path) -> list[str]:
+    result = _run(
+        ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+        cwd=root,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return []
+    return [path for path in (result.stdout or "").split("\0") if path]
+
+
+def _merge_in_progress(root: Path) -> bool:
+    result = _run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=root,
+        timeout=10,
+    )
+    return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
 def prepare_fable_git_lifecycle(workdir: str, mode: str) -> FableGitPreparation:
-    """Validate and refresh an owned Fable worktree before Codex edits it."""
+    """Validate, refresh, or resume an owned Fable worktree before Codex edits it."""
     normalized_mode = str(mode or "").strip().lower()
     if normalized_mode not in _FABLE_GIT_LIFECYCLE_MODES:
         return FableGitPreparation(success=True, worktree=str(workdir or ""))
@@ -171,6 +218,7 @@ def prepare_fable_git_lifecycle(workdir: str, mode: str) -> FableGitPreparation:
             error=f"Refusing Fable Git lifecycle on protected branch {branch}.",
         )
 
+    merge_in_progress = _merge_in_progress(root)
     status, error = _status_porcelain(root)
     if error:
         return FableGitPreparation(
@@ -179,7 +227,7 @@ def prepare_fable_git_lifecycle(workdir: str, mode: str) -> FableGitPreparation:
             branch=branch,
             error=error,
         )
-    if status.strip():
+    if status.strip() and not merge_in_progress:
         return FableGitPreparation(
             success=False,
             worktree=str(root),
@@ -243,6 +291,146 @@ def prepare_fable_git_lifecycle(workdir: str, mode: str) -> FableGitPreparation:
             repo=repo,
             error=_detail(fetched, f"git fetch origin {base_branch} failed"),
         )
+
+    pr_url = _existing_pr(
+        root,
+        repo=repo,
+        branch=branch,
+        base_branch=base_branch,
+    )
+    if pr_url:
+        if merge_in_progress:
+            conflict_files = _unmerged_files(root)
+            return FableGitPreparation(
+                success=True,
+                worktree=str(root),
+                branch=branch,
+                base_branch=base_branch,
+                repo=repo,
+                pr_url=pr_url,
+                resume_existing_pr=True,
+                recovery_kind="merge_conflict" if conflict_files else "base_refresh",
+                conflict_files=conflict_files,
+            )
+        contains_base = _run(
+            ["git", "merge-base", "--is-ancestor", f"origin/{base_branch}", "HEAD"],
+            cwd=root,
+            timeout=30,
+        )
+        if contains_base.returncode == 0:
+            return FableGitPreparation(
+                success=True,
+                worktree=str(root),
+                branch=branch,
+                base_branch=base_branch,
+                repo=repo,
+                pr_url=pr_url,
+                resume_existing_pr=True,
+                recovery_kind="existing_pr_resume",
+            )
+        if contains_base.returncode != 1:
+            return FableGitPreparation(
+                success=False,
+                worktree=str(root),
+                branch=branch,
+                base_branch=base_branch,
+                repo=repo,
+                pr_url=pr_url,
+                resume_existing_pr=True,
+                error=_detail(contains_base, "could not compare the Fable PR branch with its base"),
+            )
+
+        refreshed = _run(
+            ["git", "merge", "--no-commit", "--no-ff", f"origin/{base_branch}"],
+            cwd=root,
+            timeout=120,
+        )
+        conflict_files = _unmerged_files(root)
+        if refreshed.returncode == 0:
+            return FableGitPreparation(
+                success=True,
+                worktree=str(root),
+                branch=branch,
+                base_branch=base_branch,
+                repo=repo,
+                pr_url=pr_url,
+                resume_existing_pr=True,
+                recovery_kind="base_refresh",
+            )
+        if conflict_files:
+            return FableGitPreparation(
+                success=True,
+                worktree=str(root),
+                branch=branch,
+                base_branch=base_branch,
+                repo=repo,
+                pr_url=pr_url,
+                resume_existing_pr=True,
+                recovery_kind="merge_conflict",
+                conflict_files=conflict_files,
+            )
+        if _merge_in_progress(root):
+            _run(["git", "merge", "--abort"], cwd=root, timeout=60)
+        return FableGitPreparation(
+            success=False,
+            worktree=str(root),
+            branch=branch,
+            base_branch=base_branch,
+            repo=repo,
+            pr_url=pr_url,
+            resume_existing_pr=True,
+            error=_detail(refreshed, f"could not refresh the existing Fable PR from {base_branch}"),
+        )
+
+    merged_pr_url = _merged_pr(
+        root,
+        repo=repo,
+        branch=branch,
+        base_branch=base_branch,
+    )
+    if merged_pr_url:
+        if merge_in_progress:
+            aborted = _run(["git", "merge", "--abort"], cwd=root, timeout=60)
+            if aborted.returncode != 0:
+                return FableGitPreparation(
+                    success=False,
+                    worktree=str(root),
+                    branch=branch,
+                    base_branch=base_branch,
+                    repo=repo,
+                    pr_url=merged_pr_url,
+                    resume_existing_pr=True,
+                    recovery_kind="merged_pr_observation",
+                    error=_detail(aborted, "could not clear obsolete local merge recovery state"),
+                )
+        aligned = _run(
+            ["git", "merge", "--ff-only", f"origin/{base_branch}"],
+            cwd=root,
+            timeout=120,
+        )
+        if aligned.returncode != 0:
+            return FableGitPreparation(
+                success=False,
+                worktree=str(root),
+                branch=branch,
+                base_branch=base_branch,
+                repo=repo,
+                pr_url=merged_pr_url,
+                resume_existing_pr=True,
+                recovery_kind="merged_pr_observation",
+                error=_detail(aligned, "could not align the owned branch with its merged PR"),
+            )
+        return FableGitPreparation(
+            success=True,
+            worktree=str(root),
+            branch=branch,
+            base_branch=base_branch,
+            repo=repo,
+            pr_url=merged_pr_url,
+            resume_existing_pr=True,
+            recovery_kind="merged_pr_observation",
+        )
+
     refreshed = _run(
         ["git", "merge", "--ff-only", f"origin/{base_branch}"],
         cwd=root,
@@ -275,6 +463,7 @@ def _changed_files(root: Path) -> list[str]:
     seen: set[str] = set()
     for args in (
         ["git", "diff", "--name-only", "-z"],
+        ["git", "diff", "--cached", "--name-only", "-z"],
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
     ):
         result = _run(args, cwd=root, timeout=30)
@@ -356,6 +545,37 @@ def _existing_pr(root: Path, *, repo: str, branch: str, base_branch: str) -> str
     return "" if value == "null" else value
 
 
+def _merged_pr(root: Path, *, repo: str, branch: str, base_branch: str) -> str:
+    result = _run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            branch,
+            "--base",
+            base_branch,
+            "--state",
+            "merged",
+            "--limit",
+            "1",
+            "--json",
+            "url",
+            "--jq",
+            ".[0].url",
+        ],
+        cwd=root,
+        timeout=30,
+        github=True,
+    )
+    if result.returncode != 0:
+        return ""
+    value = (result.stdout or "").strip()
+    return "" if value == "null" else value
+
+
 def _open_pr(
     root: Path,
     *,
@@ -364,7 +584,7 @@ def _open_pr(
     base_branch: str,
     title: str,
     body: str,
-) -> tuple[str, str]:
+) -> tuple[str, bool, str]:
     existing = _existing_pr(
         root,
         repo=repo,
@@ -372,7 +592,7 @@ def _open_pr(
         base_branch=base_branch,
     )
     if existing:
-        return existing, ""
+        return existing, False, ""
     with tempfile.TemporaryDirectory(prefix="hermes-fable-pr-") as temp_dir:
         body_path = Path(temp_dir) / "body.md"
         body_path.write_text(body, encoding="utf-8")
@@ -397,12 +617,12 @@ def _open_pr(
             github=True,
         )
     if created.returncode != 0:
-        return "", _detail(created, "gh pr create failed")
+        return "", False, _detail(created, "gh pr create failed")
     url = next(
         (line.strip() for line in reversed((created.stdout or "").splitlines()) if line.strip()),
         "",
     )
-    return url, "" if url else "gh pr create returned no PR URL"
+    return url, bool(url), "" if url else "gh pr create returned no PR URL"
 
 
 def _reported_checks(
@@ -560,6 +780,9 @@ def finalize_fable_git_lifecycle(
         branch=preparation.branch,
         base_branch=preparation.base_branch,
         repo=preparation.repo,
+        pr_url=preparation.pr_url,
+        conflict_files=list(preparation.conflict_files),
+        recovery_kind=preparation.recovery_kind,
     )
     if not preparation.success:
         result.error = preparation.error
@@ -571,38 +794,54 @@ def finalize_fable_git_lifecycle(
 
     changed_files = _changed_files(root)
     result.changed_files = changed_files
-    if not changed_files:
+    merge_in_progress = _merge_in_progress(root)
+    if not changed_files and not merge_in_progress and not preparation.resume_existing_pr:
         result.success = True
         result.status = "no_changes"
         result.checks_status = "not_needed"
         return result
 
-    checked = _run(["git", "diff", "--check"], cwd=root, timeout=60)
-    if checked.returncode != 0:
-        result.error = _detail(checked, "git diff --check failed")
-        return result
-    staged = _run(["git", "add", "-A"], cwd=root, timeout=60)
-    if staged.returncode != 0:
-        result.error = _detail(staged, "git add failed")
-        return result
     title = _commit_title(task)
-    committed = _run(["git", "commit", "-m", title], cwd=root, timeout=120)
-    if committed.returncode != 0:
-        result.error = _detail(committed, "git commit failed")
-        return result
-    commit = _run(["git", "rev-parse", "HEAD"], cwd=root, timeout=10)
-    result.commit = (commit.stdout or "").strip()
+    if changed_files or merge_in_progress:
+        checked = _run(["git", "diff", "--check"], cwd=root, timeout=60)
+        if checked.returncode != 0:
+            result.error = _detail(checked, "git diff --check failed")
+            return result
+        staged = _run(["git", "add", "-A"], cwd=root, timeout=60)
+        if staged.returncode != 0:
+            result.error = _detail(staged, "git add failed")
+            return result
+        unresolved = _unmerged_files(root)
+        if unresolved:
+            result.conflict_files = unresolved
+            result.error = "Codex returned with unresolved merge conflicts: " + ", ".join(unresolved)
+            return result
+        cached_checked = _run(["git", "diff", "--cached", "--check"], cwd=root, timeout=60)
+        if cached_checked.returncode != 0:
+            result.error = _detail(cached_checked, "git diff --cached --check failed")
+            return result
+        committed = _run(["git", "commit", "-m", title], cwd=root, timeout=120)
+        if committed.returncode != 0:
+            result.error = _detail(committed, "git commit failed")
+            return result
+        result.commit_performed = True
+        commit = _run(["git", "rev-parse", "HEAD"], cwd=root, timeout=10)
+        result.commit = (commit.stdout or "").strip()
 
-    pushed = _run(
-        ["git", "push", "-u", "origin", preparation.branch],
-        cwd=root,
-        timeout=300,
-        github=True,
-    )
-    if pushed.returncode != 0:
-        result.status = "committed"
-        result.error = _detail(pushed, "git push failed")
-        return result
+        pushed = _run(
+            ["git", "push", "-u", "origin", preparation.branch],
+            cwd=root,
+            timeout=300,
+            github=True,
+        )
+        if pushed.returncode != 0:
+            result.status = "committed"
+            result.error = _detail(pushed, "git push failed")
+            return result
+        result.push_performed = True
+    else:
+        commit = _run(["git", "rev-parse", "HEAD"], cwd=root, timeout=10)
+        result.commit = (commit.stdout or "").strip()
 
     body = _pr_body(
         task=task,
@@ -610,14 +849,17 @@ def finalize_fable_git_lifecycle(
         changed_files=changed_files,
         branch=preparation.branch,
     )
-    pr_url, error = _open_pr(
-        root,
-        repo=preparation.repo,
-        branch=preparation.branch,
-        base_branch=preparation.base_branch,
-        title=title,
-        body=body,
-    )
+    pr_url = preparation.pr_url
+    error = ""
+    if not pr_url:
+        pr_url, result.pr_created, error = _open_pr(
+            root,
+            repo=preparation.repo,
+            branch=preparation.branch,
+            base_branch=preparation.base_branch,
+            title=title,
+            body=body,
+        )
     result.pr_url = pr_url
     if error:
         result.status = "pushed"
@@ -651,6 +893,7 @@ def finalize_fable_git_lifecycle(
         result.error = "Fable finalizer refuses to merge a draft PR."
         return result
     if str(before_merge.get("state") or "").upper() == "MERGED":
+        result.merge_observed = True
         merge = before_merge.get("mergeCommit") or {}
         result.merge_commit = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
     else:
@@ -672,6 +915,13 @@ def finalize_fable_git_lifecycle(
         if merged.returncode != 0:
             result.status = "pr_opened"
             result.error = _detail(merged, "gh pr merge failed")
+            if _is_merge_conflict_error(result.error):
+                result.recovery_kind = "merge_conflict_retry"
+                result.recovery_required = True
+                result.next_action = (
+                    "Call delegate_coding_task again with the same cwd so trusted Hermes "
+                    "can prepare the base merge and Codex can resolve the conflict files."
+                )
             return result
         after_merge, error = _pr_state(
             root,
@@ -686,6 +936,7 @@ def finalize_fable_git_lifecycle(
             result.status = "pr_opened"
             result.error = "GitHub did not report the PR merged after gh pr merge."
             return result
+        result.merge_performed = True
         merge = after_merge.get("mergeCommit") or {}
         result.merge_commit = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
 

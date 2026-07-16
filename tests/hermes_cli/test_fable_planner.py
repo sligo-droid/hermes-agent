@@ -329,6 +329,11 @@ def test_build_fable_implementation_instruction_requires_codex_delegation():
     assert "delegate_coding_task" in packet
     assert "Codex coding worker" in packet
     assert "Do not fall back to OpenCode" in packet
+    assert "`fable_git_result.recovery_required`" in packet
+    assert "call `delegate_coding_task` again with the same `cwd`" in packet
+    assert "`merge_performed`" in packet
+    assert "`merge_observed`" in packet
+    assert "Never say that Codex committed" in packet
 
 
 def test_build_fable_plan_invocation_uses_plan_skill(monkeypatch):

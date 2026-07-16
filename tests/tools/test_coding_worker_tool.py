@@ -527,6 +527,10 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
         branch="fable/lifecycle",
         base_branch="main",
         repo="sligo-labs/example",
+        pr_url="https://github.com/sligo-labs/example/pull/1",
+        resume_existing_pr=True,
+        recovery_kind="merge_conflict",
+        conflict_files=["src/app.py"],
         error="",
     )
     finalized = SimpleNamespace(
@@ -565,6 +569,9 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
     assert "pre-provisioned mutable checkout" in prompt
     assert "Do not stage files" in prompt
     assert "Trusted Hermes code owns that GitHub lifecycle" in prompt
+    assert "Trusted Hermes lifecycle recovery has started a local merge" in prompt
+    assert "src/app.py" in prompt
+    assert "trusted Hermes will validate, stage, commit, push" in prompt
     assert "Git/PR lifecycle is explicitly authorized" not in prompt
     prepare.assert_called_once_with(str(worktree), "merge")
     finalize.assert_called_once_with(
