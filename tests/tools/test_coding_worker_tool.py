@@ -144,10 +144,11 @@ def test_unavailable_inside_codex_app_server(tmp_path):
     assert "unavailable" in result["error"]
 
 
-def test_default_turn_timeout_is_1800(monkeypatch):
+def test_missing_turn_timeout_uses_config_default(monkeypatch):
+    default_timeout = DEFAULT_CONFIG["coding_worker"]["turn_timeout_seconds"]
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"coding_worker": {}})
 
-    assert cwt._load_coding_worker_timeout() == 1800.0
+    assert cwt._load_coding_worker_timeout() == float(default_timeout)
 
 
 def test_runs_codex_app_server_session(monkeypatch, tmp_path):
