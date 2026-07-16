@@ -25,6 +25,7 @@ returns a 403 at call time and :func:`_enrich_403` maps it to
 actionable guidance the model can relay to the user.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -591,7 +592,218 @@ def _create_thread(
         "success": True,
         "thread_id": thread["id"],
         "name": thread.get("name"),
+        "guild_id": thread.get("guild_id"),
     })
+
+
+def _promoted_thread_name(message_text: str) -> str:
+    """Build the same compact, human-readable title used by auto-threading."""
+    content = re.sub(r"<@[!&]?\d+>", "", str(message_text or ""))
+    content = re.sub(r"<#\d+>", "", content)
+    content = re.sub(r"\s+", " ", content).strip()
+    if not content:
+        return "Hermes action request"
+    return content[:80] if len(content) <= 80 else content[:77].rstrip() + "..."
+
+
+def _existing_message_thread(message: Any) -> Optional[Dict[str, Any]]:
+    """Return the thread embedded on a Discord message payload, when present."""
+    if not isinstance(message, dict):
+        return None
+    thread = message.get("thread")
+    if not isinstance(thread, dict) or not str(thread.get("id") or "").strip():
+        return None
+    return thread
+
+
+def _initialize_promoted_thread_feature_summary(
+    token: str,
+    *,
+    channel_id: str,
+    message_id: str,
+    thread_id: str,
+    initial_request: str,
+) -> Tuple[bool, Optional[str]]:
+    """Initialize a promoted thread through the live Discord gateway adapter."""
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from gateway.session_context import get_session_env
+
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return False, "Live Discord gateway adapter is unavailable."
+
+        candidates = []
+        profile = str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
+        if profile and profile != "default":
+            adapter = getattr(runner, "_profile_adapters", {}).get(profile, {}).get(Platform.DISCORD)
+            if adapter is not None:
+                candidates.append(adapter)
+        adapter = getattr(runner, "adapters", {}).get(Platform.DISCORD)
+        if adapter is not None:
+            candidates.append(adapter)
+        for profile_adapters in getattr(runner, "_profile_adapters", {}).values():
+            adapter = profile_adapters.get(Platform.DISCORD)
+            if adapter is not None:
+                candidates.append(adapter)
+
+        unique_candidates = []
+        seen = set()
+        for adapter in candidates:
+            marker = id(adapter)
+            if marker not in seen:
+                seen.add(marker)
+                unique_candidates.append(adapter)
+
+        token_matches = [
+            adapter
+            for adapter in unique_candidates
+            if str(getattr(getattr(adapter, "config", None), "token", "") or "").strip() == token
+        ]
+        adapter = (token_matches or [None])[0]
+        if adapter is None:
+            return False, "Matching live Discord gateway adapter is unavailable."
+
+        initialize = getattr(adapter, "initialize_promoted_action_thread", None)
+        if not callable(initialize):
+            return False, "Live Discord adapter does not support action-thread promotion."
+
+        loop = getattr(runner, "_gateway_loop", None)
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return False, "Discord gateway event loop is unavailable."
+
+        future = asyncio.run_coroutine_threadsafe(
+            initialize(
+                channel_id=channel_id,
+                message_id=message_id,
+                thread_id=thread_id,
+                initial_request=initial_request,
+            ),
+            loop,
+        )
+        initialized = bool(future.result(timeout=30))
+        if initialized:
+            return True, None
+        return False, "Discord feature-summary initialization failed."
+    except Exception as exc:
+        logger.warning("Discord promoted-thread feature summary failed: %s", exc)
+        return False, f"Discord feature-summary initialization failed: {exc}"
+
+
+def _promote_to_action_thread(
+    token: str,
+    channel_id: str,
+    message_id: str,
+    name: str = "",
+    **_kwargs: Any,
+) -> str:
+    """Promote an existing Discord message into a summarized action thread."""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    except Exception:
+        platform = ""
+    if platform != "discord":
+        return json.dumps({
+            "error": "promote_to_action_thread is available only in Discord sessions.",
+        })
+
+    message = _discord_request(
+        "GET",
+        f"/channels/{channel_id}/messages/{message_id}",
+        token,
+    )
+    initial_request = str((message or {}).get("content") or "").strip()
+    if not initial_request:
+        return json.dumps({
+            "error": (
+                "The original Discord message text is unavailable; cannot initialize "
+                "an action-thread feature summary."
+            ),
+            "channel_id": channel_id,
+            "message_id": message_id,
+        })
+
+    thread = _existing_message_thread(message)
+    already_existed = thread is not None
+    resolved_name = str(name or "").strip() or _promoted_thread_name(initial_request)
+    resolved_name = resolved_name[:80] if len(resolved_name) <= 80 else resolved_name[:77].rstrip() + "..."
+
+    if thread is None:
+        try:
+            created = json.loads(_create_thread(
+                token=token,
+                channel_id=channel_id,
+                message_id=message_id,
+                name=resolved_name,
+            ))
+            thread = {
+                "id": created.get("thread_id"),
+                "name": created.get("name") or resolved_name,
+                "guild_id": created.get("guild_id"),
+            }
+        except DiscordAPIError as exc:
+            if exc.status not in {400, 409}:
+                raise
+            refreshed = _discord_request(
+                "GET",
+                f"/channels/{channel_id}/messages/{message_id}",
+                token,
+            )
+            thread = _existing_message_thread(refreshed)
+            if thread is None:
+                try:
+                    candidate = _discord_request("GET", f"/channels/{message_id}", token)
+                except DiscordAPIError as lookup_exc:
+                    if lookup_exc.status != 404:
+                        raise
+                    candidate = None
+                if isinstance(candidate, dict) and str(candidate.get("id") or "") == str(message_id):
+                    try:
+                        candidate_type = int(candidate.get("type", -1))
+                    except (TypeError, ValueError):
+                        candidate_type = -1
+                    if candidate_type in {10, 11, 12}:
+                        thread = candidate
+            if thread is None:
+                raise
+            already_existed = True
+
+    thread_id = str((thread or {}).get("id") or "").strip()
+    if not thread_id:
+        return json.dumps({
+            "error": "Discord did not return a thread id for the promoted message.",
+            "channel_id": channel_id,
+            "message_id": message_id,
+        })
+
+    initialized, initialization_error = _initialize_promoted_thread_feature_summary(
+        token,
+        channel_id=channel_id,
+        message_id=message_id,
+        thread_id=thread_id,
+        initial_request=initial_request,
+    )
+    guild_id = str(
+        (message or {}).get("guild_id")
+        or (thread or {}).get("guild_id")
+        or ""
+    ).strip()
+    result = {
+        "success": initialized,
+        "thread_id": thread_id,
+        "thread_url": (
+            f"https://discord.com/channels/{guild_id}/{thread_id}"
+            if guild_id else None
+        ),
+        "already_existed": already_existed,
+        "feature_summary_initialized": initialized,
+    }
+    if initialization_error:
+        result["feature_summary_error"] = initialization_error
+    return json.dumps(result)
 
 
 def _get_message(
@@ -849,6 +1061,7 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "promote_to_action_thread": _promote_to_action_thread,
     "add_reaction": _add_reaction,
     "remove_reaction": _remove_reaction,
     "send_message": _send_message,
@@ -858,7 +1071,7 @@ _ACTIONS = {
 }
 
 _CORE_ACTION_NAMES = frozenset({
-    "fetch_messages", "search_members", "create_thread",
+    "fetch_messages", "search_members", "create_thread", "promote_to_action_thread",
     "add_reaction", "remove_reaction", "send_message", "edit_message",
 })
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
@@ -883,6 +1096,11 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    (
+        "promote_to_action_thread",
+        "(channel_id, message_id; optional name)",
+        "promote a misclassified work request into a summarized public action thread",
+    ),
     ("add_reaction", "(channel_id, message_id, emoji)", "add the bot user's reaction to a message"),
     ("remove_reaction", "(channel_id, message_id, emoji)", "remove the bot user's reaction from a message"),
     ("send_message", "(channel_id, content)", "send a bot message with mentions disabled by default"),
@@ -908,6 +1126,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "promote_to_action_thread": ["channel_id", "message_id"],
     "add_reaction": ["channel_id", "message_id", "emoji"],
     "remove_reaction": ["channel_id", "message_id", "emoji"],
     "send_message": ["channel_id", "content"],
@@ -1103,7 +1322,10 @@ def _build_schema(
         },
         "name": {
             "type": "string",
-            "description": "New thread name (create_thread).",
+            "description": (
+                "New thread name (create_thread), or optional promoted action-thread "
+                "name (promote_to_action_thread; defaults from message text)."
+            ),
         },
         "limit": {
             "type": "integer",
@@ -1184,6 +1406,9 @@ _ACTION_403_HINT = {
     ),
     "create_thread": (
         "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it."
+    ),
+    "promote_to_action_thread": (
+        "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view the source message."
     ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
@@ -1322,7 +1547,7 @@ def _run_discord_action(
 
 
 def discord_core(action: str, **kwargs) -> str:
-    """Execute a core Discord action (fetch_messages, search_members, create_thread)."""
+    """Execute a core Discord action, including action-thread promotion."""
     return _run_discord_action(action, _CORE_ACTIONS, "discord", **kwargs)
 
 
