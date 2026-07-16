@@ -1212,6 +1212,47 @@ def delegate_coding_task(
                 )
             if not fable_git_preparation.success:
                 return tool_error(fable_git_preparation.error)
+            if getattr(fable_git_preparation, "resume_existing_pr", False):
+                recovery_kind = str(
+                    getattr(fable_git_preparation, "recovery_kind", "") or ""
+                )
+                conflict_files = list(
+                    getattr(fable_git_preparation, "conflict_files", []) or []
+                )
+                if recovery_kind == "merge_conflict":
+                    recovery_note = (
+                        "Trusted Hermes lifecycle recovery has started a local merge of "
+                        f"origin/{fable_git_preparation.base_branch} into the existing PR "
+                        f"branch {fable_git_preparation.branch}. Resolve the file contents "
+                        "for these conflicts, then run focused verification: "
+                        + ", ".join(conflict_files)
+                        + ". Do not run git add, commit, push, PR, CI, or merge commands; "
+                        "trusted Hermes will validate, stage, commit, push, wait for checks, "
+                        "and merge after you return."
+                    )
+                elif recovery_kind == "base_refresh":
+                    recovery_note = (
+                        "Trusted Hermes lifecycle recovery has prepared a non-conflicting "
+                        f"local merge of origin/{fable_git_preparation.base_branch} into the "
+                        f"existing PR branch {fable_git_preparation.branch}. Review the merged "
+                        "result and run focused verification, but do not stage, commit, push, "
+                        "or touch the PR; trusted Hermes owns finalization."
+                    )
+                elif recovery_kind == "merged_pr_observation":
+                    recovery_note = (
+                        f"Trusted Hermes found that PR {fable_git_preparation.pr_url} "
+                        "is already merged and aligned this owned worktree to the remote "
+                        "base. Perform only the requested read-only/focused verification; "
+                        "do not attribute the earlier commit, push, or merge to this Codex "
+                        "worker or to the current Hermes finalization attempt."
+                    )
+                else:
+                    recovery_note = (
+                        f"Trusted Hermes is resuming existing PR {fable_git_preparation.pr_url} "
+                        "for this owned branch. Inspect the current files and run the requested "
+                        "focused verification; do not stage, commit, push, or touch the PR."
+                    )
+                context_text = _prepend_context_note(context_text, recovery_note)
 
     try:
         from hermes_cli.config import load_config
