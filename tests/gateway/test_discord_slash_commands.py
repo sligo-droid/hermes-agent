@@ -194,12 +194,12 @@ async def test_auto_registers_missing_gateway_commands(adapter):
 
 
 @pytest.mark.asyncio
-async def test_auto_registers_discord_only_tier_commands(adapter):
+async def test_removed_tier_commands_are_not_registered(adapter):
     adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
 
     tree_names = set(adapter._client.tree.commands.keys())
-    assert {"dumb", "smart"} <= tree_names
+    assert {"dumb", "smart"}.isdisjoint(tree_names)
 
 
 @pytest.mark.asyncio
@@ -854,8 +854,6 @@ class _FakeThreadChannel(_discord_mod.Thread):
 def test_fable_text_command_counts_as_threaded_work(adapter):
     assert adapter._slash_command_starts_threaded_work("/fable plan reporting") is True
     assert adapter._slash_command_starts_threaded_work("/FABLE plan reporting") is True
-    assert adapter._slash_command_starts_threaded_work("/dumb simplify reporting") is True
-    assert adapter._slash_command_starts_threaded_work("/smart implement reporting") is True
     assert adapter._slash_command_starts_threaded_work("/fable") is False
     assert adapter._slash_command_starts_threaded_work("/usage") is False
 
@@ -863,8 +861,6 @@ def test_fable_text_command_counts_as_threaded_work(adapter):
 def test_fable_text_command_does_not_create_worker_board(adapter):
     assert adapter._slash_command_creates_worker_board("/fable plan reporting") is False
     assert adapter._slash_command_creates_worker_board("/FABLE plan reporting") is False
-    assert adapter._slash_command_creates_worker_board("/dumb simplify reporting") is False
-    assert adapter._slash_command_creates_worker_board("/smart implement reporting") is False
     assert adapter._slash_command_creates_worker_board("/goal ship reporting") is True
     assert adapter._slash_command_creates_worker_board("/goal stop") is False
 
@@ -965,81 +961,6 @@ async def test_fable_implementation_slash_uses_normal_non_kanban_action_thread(a
     assert captured_events[0].text == "/fable build the work"
     assert captured_events[0].source.chat_type == "thread"
     assert captured_events[0].feature_summary["kanban_board"] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("command_text", ["/dumb simplify the dashboard", "/smart implement the dashboard"])
-async def test_tier_slash_creates_normal_non_kanban_action_thread(adapter, command_text):
-    parent = _FakeTextChannel(channel_id=123, name="planning")
-    thread = _FakeThreadChannel(channel_id=555, name="Action — dashboard", parent_id=123)
-    thread.parent = parent
-    command = command_text.split()[0].lstrip("/")
-    interaction = SimpleNamespace(
-        channel=parent,
-        channel_id=123,
-        guild=SimpleNamespace(name="TestGuild", id=1),
-        guild_id=1,
-        user=SimpleNamespace(display_name="Jezza", id=42),
-        response=SimpleNamespace(defer=AsyncMock()),
-        edit_original_response=AsyncMock(),
-        delete_original_response=AsyncMock(),
-    )
-    adapter._create_thread = AsyncMock(
-        return_value={
-            "success": True,
-            "thread_id": "555",
-            "thread_name": "Action — dashboard",
-            "_thread": thread,
-        }
-    )
-    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
-    adapter.initialize_feature_summary = AsyncMock(
-        return_value={"initial_request": command_text, "kanban_board": None}
-    )
-    captured_events = []
-    adapter.handle_message = AsyncMock(side_effect=lambda event: captured_events.append(event))
-
-    await adapter._run_simple_slash(interaction, command_text)
-
-    adapter._create_thread.assert_awaited_once_with(
-        interaction,
-        name=adapter._action_request_thread_name(command_text),
-        message="",
-        auto_archive_duration=1440,
-        reason_command=command,
-    )
-    adapter.initialize_feature_summary.assert_awaited_once()
-    event = captured_events[0]
-    assert event.source.chat_type == "thread"
-    assert event.source.chat_id == "555"
-    assert event.feature_summary["kanban_board"] is None
-
-
-@pytest.mark.asyncio
-async def test_tier_slash_rejects_existing_kanban_worker_thread(adapter):
-    thread = _FakeThreadChannel(channel_id=555, name="worker", parent_id=123)
-    interaction = SimpleNamespace(
-        channel=thread,
-        channel_id=555,
-        guild=SimpleNamespace(name="TestGuild", id=1),
-        guild_id=1,
-        user=SimpleNamespace(display_name="Jezza", id=42),
-        response=SimpleNamespace(defer=AsyncMock()),
-        edit_original_response=AsyncMock(),
-        delete_original_response=AsyncMock(),
-    )
-    adapter._load_feature_summary_handle_for_thread = MagicMock(
-        return_value={"initial_request": "/goal build", "kanban_board": {"slug": "worker"}}
-    )
-    adapter.handle_message = AsyncMock()
-    adapter._create_thread = AsyncMock()
-
-    await adapter._run_simple_slash(interaction, "/smart build the dashboard")
-
-    adapter._create_thread.assert_not_awaited()
-    adapter.handle_message.assert_not_awaited()
-    interaction.edit_original_response.assert_awaited_once()
-    assert "Kanban worker board" in interaction.edit_original_response.await_args.kwargs["content"]
 
 
 @pytest.mark.asyncio

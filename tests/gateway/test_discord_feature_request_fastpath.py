@@ -145,17 +145,17 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     )
 
     assert result["final_response"] == "ok"
-    assert result["reasoning_effort"] == "high"
+    assert result["reasoning_effort"] == "xhigh"
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
-    assert init["model"] == "gpt-5.6-terra"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert init["model"] == "gpt-5.6-sol"
+    assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
     cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
     audit = cached_agent._runtime_audit_context
-    assert audit["model_tier"] == "basic"
+    assert audit["model_tier"] == "advanced"
     assert audit["model_tier_source"] == "route"
     assert audit["runtime_route"] == "discord_action_request"
     assert audit["reasoning_source"] == "model_tier"
@@ -172,6 +172,8 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "Once the requested change is merged" in init["ephemeral_system_prompt"]
     assert "do not open extra cleanup" in init["ephemeral_system_prompt"]
     assert "Record non-critical follow-ups" in init["ephemeral_system_prompt"]
+    assert "Choose delegate_coding_task worker_tier deliberately" in init["ephemeral_system_prompt"]
+    assert "Front-load what you learned into relevant_files" in init["ephemeral_system_prompt"]
     assert "one focused coding-worker attempt" in init["ephemeral_system_prompt"]
     assert "repeatedly retrying the same backend" in init["ephemeral_system_prompt"]
     assert "local-only work" in init["ephemeral_system_prompt"]
@@ -257,63 +259,6 @@ async def test_discord_action_request_reasoning_override_is_configurable(monkeyp
 
     assert _CapturingAgent.last_init["model"] == "custom/feature-model"
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
-
-
-@pytest.mark.asyncio
-async def test_smart_tier_command_uses_advanced_tier_for_one_turn_and_preserves_slash_text(monkeypatch):
-    _patch_agent_runtime(monkeypatch)
-    runner = _make_runner()
-    session_key = "agent:main:discord:thread:thread-1"
-    runner._session_model_overrides[session_key] = {
-        "model": "session/model",
-        "provider": "openrouter",
-        "api_key": "session-key",
-        "base_url": "https://session.example/v1",
-        "api_mode": "chat_completions",
-    }
-    session_override = dict(runner._session_model_overrides[session_key])
-    monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs",
-        lambda: {
-            "model": "runtime/model",
-            "provider": "openrouter",
-            "api_key": "runtime-key",
-            "base_url": "https://runtime.example/v1",
-            "api_mode": "chat_completions",
-        },
-    )
-    _CapturingAgent.last_init = None
-    _CapturingAgent.last_run = None
-
-    result = await runner._run_agent(
-        message="implement the dashboard",
-        context_prompt="Context prompt",
-        history=[],
-        source=_make_discord_source(),
-        session_id="session-1",
-        session_key=session_key,
-        feature_summary={"initial_request": "Build it", "message_id": "300", "kanban_board": None},
-        action_request_model_tier_override="advanced",
-        action_request_transcript_user_message="/smart implement the dashboard",
-    )
-
-    assert result["final_response"] == "ok"
-    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
-    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
-    assert _CapturingAgent.last_run["user_message"] == "implement the dashboard"
-    assert _CapturingAgent.last_run["persist_user_message"] == "/smart implement the dashboard"
-    assert runner._session_model_overrides[session_key] == session_override
-    cached_agent = runner._agent_cache[session_key][0]
-    assert cached_agent._runtime_audit_context["model_tier"] == "advanced"
-    assert cached_agent._runtime_audit_context["model_tier_source"] == "per_turn"
-    assert cached_agent._runtime_audit_context["runtime_route"] == "discord_action_request_tier_command"
-    next_model, _next_runtime = runner._resolve_session_agent_runtime(
-        source=_make_discord_source(),
-        session_key=session_key,
-        user_config={},
-    )
-    assert next_model == "session/model"
 
 
 @pytest.mark.asyncio

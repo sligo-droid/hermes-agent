@@ -328,6 +328,8 @@ def test_build_fable_implementation_instruction_requires_codex_delegation():
     assert "add feature" in packet
     assert "delegate_coding_task" in packet
     assert "Codex coding worker" in packet
+    assert "Choose `worker_tier` deliberately" in packet
+    assert "Front-load what you learned into `relevant_files`" in packet
     assert "Do not fall back to OpenCode" in packet
     assert "`fable_git_result.recovery_required`" in packet
     assert "call `delegate_coding_task` again with the same `cwd`" in packet
@@ -393,14 +395,14 @@ def test_fable_reasoning_config_uses_configured_discord_feature_effort():
 def test_fable_reasoning_config_does_not_inherit_medium_when_unconfigured():
     assert fable_reasoning_config({"agent": {"reasoning_effort": "medium"}}) == {
         "enabled": True,
-        "effort": "xhigh",
+        "effort": "high",
     }
 
 
-def test_fable_reasoning_config_falls_back_xhigh_for_invalid_config():
+def test_fable_reasoning_config_falls_back_high_for_invalid_config():
     assert fable_reasoning_config({"discord": {"feature_request_reasoning_effort": "bogus"}}) == {
         "enabled": True,
-        "effort": "xhigh",
+        "effort": "high",
     }
 
 
