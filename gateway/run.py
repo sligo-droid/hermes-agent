@@ -410,6 +410,7 @@ def _runtime_footer_line_for_agent_result(
             context_length=agent_result.get("context_length") or None,
             reasoning_effort=agent_result.get("reasoning_effort"),
             cwd=cwd,
+            worker_runs=agent_result.get("worker_runs"),
         )
     except Exception as exc:
         logger.debug("runtime footer build failed: %s", exc)
@@ -20403,6 +20404,7 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+        agent.turn_worker_runs = []
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
@@ -22433,6 +22435,7 @@ class GatewayRunner:
             _resolved_model = (result.get("model") if isinstance(result, dict) else None) or (getattr(_agent, "model", None) if _agent else None)
             _resolved_provider = (result.get("provider") if isinstance(result, dict) else None) or (getattr(_agent, "provider", None) if _agent else None)
             _reasoning_effort = _reasoning_effort_footer_label(reasoning_config)
+            _worker_runs = list(getattr(_agent, "turn_worker_runs", []) or []) if _agent else []
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -22456,6 +22459,7 @@ class GatewayRunner:
                     "provider": _resolved_provider,
                     "context_length": _context_length,
                     "reasoning_effort": _reasoning_effort,
+                    "worker_runs": _worker_runs,
                     "runtime_breakdown": result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
                     "visual_qa": _visual_qa_turn_result(
                         _agent,
@@ -22679,6 +22683,7 @@ class GatewayRunner:
                 "provider": _resolved_provider,
                 "context_length": _context_length,
                 "reasoning_effort": _reasoning_effort,
+                "worker_runs": _worker_runs,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),

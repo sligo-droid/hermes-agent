@@ -4,6 +4,7 @@ appended to final gateway replies."""
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -160,20 +161,103 @@ def test_format_footer_includes_disabled_reasoning_level():
     assert out == "gpt-5.6-luna · none · 17% · /tmp/workspace"
 
 
+def test_format_footer_empty_workers_keeps_existing_output_byte_identical():
+    out = format_runtime_footer(
+        model="openai/gpt-5.6-sol",
+        context_tokens=12,
+        context_length=100,
+        cwd="/tmp/workspace",
+        reasoning_effort="xhigh",
+        worker_runs=[],
+    )
+    assert out == "gpt-5.6-sol · xhigh · 12% · /tmp/workspace"
+
+
+def test_format_footer_renders_one_worker():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        worker_runs=[
+            {
+                "backend": "codex",
+                "model": "openai/gpt-5.6-luna",
+                "reasoning": "low",
+            },
+        ],
+        fields=("workers",),
+    )
+    assert out == "workers: codex gpt-5.6-luna/low"
+
+
+def test_format_footer_renders_workers_and_collapses_consecutive_duplicates():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        worker_runs=[
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "low"},
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "low"},
+            {
+                "backend": "opencode",
+                "model": "hermes-codex/gpt-5.6-sol",
+                "reasoning": "xhigh",
+            },
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "low"},
+        ],
+        fields=("workers",),
+    )
+    assert out == (
+        "workers: codex gpt-5.6-luna/low x2, "
+        "opencode gpt-5.6-sol/xhigh, codex gpt-5.6-luna/low"
+    )
+
+
+def test_format_footer_worker_omits_unknown_reasoning():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        worker_runs=[{"backend": "claude_code", "model": "claude-fable-5"}],
+        fields=("workers",),
+    )
+    assert out == "workers: claude_code claude-fable-5"
+
+
+def test_format_footer_workers_respect_field_order():
+    out = format_runtime_footer(
+        model="openai/gpt-5.6-sol",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        worker_runs=[
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "low"},
+        ],
+        fields=("workers", "model"),
+    )
+    assert out == "workers: codex gpt-5.6-luna/low · gpt-5.6-sol"
+
+
 # ---------------------------------------------------------------------------
 # resolve_footer_config
 # ---------------------------------------------------------------------------
 
 def test_resolve_defaults_off_empty_config():
     cfg = resolve_footer_config({}, "telegram")
-    assert cfg == {"enabled": False, "fields": ["model", "reasoning", "context_pct", "cwd"]}
+    assert cfg == {
+        "enabled": False,
+        "fields": ["model", "reasoning", "context_pct", "cwd", "workers"],
+    }
 
 
 def test_resolve_global_enable():
     user = {"display": {"runtime_footer": {"enabled": True}}}
     cfg = resolve_footer_config(user, "telegram")
     assert cfg["enabled"] is True
-    assert cfg["fields"] == ["model", "reasoning", "context_pct", "cwd"]
+    assert cfg["fields"] == ["model", "reasoning", "context_pct", "cwd", "workers"]
 
 
 def test_resolve_platform_override_wins():
@@ -202,18 +286,18 @@ def test_resolve_platform_can_add_fields_only():
     }
     tg = resolve_footer_config(user, "telegram")
     assert tg["enabled"] is True
-    assert tg["fields"] == ["model", "reasoning", "context_pct", "cwd"]
+    assert tg["fields"] == ["model", "reasoning", "context_pct", "cwd", "workers"]
     dc = resolve_footer_config(user, "discord")
     assert dc["enabled"] is True
     assert dc["fields"] == ["context_pct"]
 
 
-def test_resolve_legacy_default_fields_adds_reasoning_immediately():
+def test_resolve_previous_default_field_lists_add_workers_immediately():
     user = {
         "display": {
             "runtime_footer": {
                 "enabled": True,
-                "fields": ["model", "context_pct", "cwd"],
+                "fields": ["model", "reasoning", "context_pct", "cwd"],
             },
             "platforms": {
                 "discord": {
@@ -226,10 +310,10 @@ def test_resolve_legacy_default_fields_adds_reasoning_immediately():
     }
 
     assert resolve_footer_config(user, "telegram")["fields"] == [
-        "model", "reasoning", "context_pct", "cwd",
+        "model", "reasoning", "context_pct", "cwd", "workers",
     ]
     assert resolve_footer_config(user, "discord")["fields"] == [
-        "model", "reasoning", "context_pct", "cwd",
+        "model", "reasoning", "context_pct", "cwd", "workers",
     ]
 
 
@@ -273,11 +357,15 @@ def test_build_footer_returns_rendered_when_enabled(monkeypatch, tmp_path):
         context_tokens=25, context_length=100,
         reasoning_effort="medium",
         cwd=str(tmp_path / "proj"),
+        worker_runs=[
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "low"},
+        ],
     )
     (tmp_path / "proj").mkdir(exist_ok=True)
     assert "gpt-5.4" in out
     assert "medium" in out
     assert "25%" in out
+    assert "workers: codex gpt-5.6-luna/low" in out
 
 
 def test_build_footer_per_platform_off_suppresses():
@@ -295,6 +383,34 @@ def test_build_footer_per_platform_off_suppresses():
         cwd="/tmp",
     )
     assert out == ""
+
+
+def test_gateway_footer_builder_passes_worker_runs_from_agent_result():
+    from gateway.config import Platform
+    from gateway.run import _runtime_footer_line_for_agent_result
+
+    out = _runtime_footer_line_for_agent_result(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["workers"],
+                },
+            },
+        },
+        source=SimpleNamespace(platform=Platform.DISCORD),
+        agent_result={
+            "worker_runs": [
+                {
+                    "backend": "codex",
+                    "model": "gpt-5.6-luna",
+                    "reasoning": "low",
+                },
+            ],
+        },
+    )
+
+    assert out == "workers: codex gpt-5.6-luna/low"
 
 
 def test_build_footer_no_data_returns_empty_even_when_enabled():

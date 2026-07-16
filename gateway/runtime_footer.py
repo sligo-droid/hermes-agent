@@ -1,7 +1,8 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, cwd, reasoning)
-appends it to the final response of each completed agent turn when enabled.
+Renders a compact footer showing runtime state (model, context %, cwd,
+reasoning, coding workers) and appends it to the final response of each
+completed agent turn when enabled.
 Off by default to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
@@ -9,7 +10,7 @@ Config (``~/.hermes/config.yaml``)::
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, reasoning, context_pct, cwd]  # order shown; drop any to hide
+        fields: [model, reasoning, context_pct, cwd, workers]  # order shown; drop any to hide
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -28,7 +29,14 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
-_DEFAULT_FIELDS: tuple[str, ...] = ("model", "reasoning", "context_pct", "cwd")
+_DEFAULT_FIELDS: tuple[str, ...] = (
+    "model",
+    "reasoning",
+    "context_pct",
+    "cwd",
+    "workers",
+)
+_PREVIOUS_DEFAULT_FIELDS: tuple[str, ...] = ("model", "reasoning", "context_pct", "cwd")
 _LEGACY_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
@@ -58,16 +66,43 @@ def _footer_fields(fields: Iterable[Any]) -> list[str]:
     """Return configured footer fields, upgrading only the old default list.
 
     ``fields`` is persisted as a list, so changing the built-in default cannot
-    update installs that already wrote the prior default. Treat that exact
-    legacy list as inherited configuration so deployed gateways render the
-    reasoning effort immediately, even before ``hermes config migrate`` has
-    persisted the v25 schema update. Any other layout remains an explicit user
-    choice, including layouts that intentionally omit reasoning.
+    update installs that already wrote a prior default. Treat those exact
+    legacy lists as inherited configuration so deployed gateways render new
+    default fields immediately. Any other layout remains an explicit user
+    choice, including layouts that intentionally omit reasoning or workers.
     """
     normalized = [str(field) for field in fields]
-    if tuple(normalized) == _LEGACY_DEFAULT_FIELDS:
+    if tuple(normalized) in {_PREVIOUS_DEFAULT_FIELDS, _LEGACY_DEFAULT_FIELDS}:
         return list(_DEFAULT_FIELDS)
     return normalized
+
+
+def _format_worker_runs(worker_runs: Iterable[Any] | None) -> str:
+    """Render consecutive coding-worker runs with compact duplicate counts."""
+    collapsed: list[tuple[str, int]] = []
+    for raw_run in worker_runs or []:
+        if not isinstance(raw_run, dict):
+            continue
+        backend = str(raw_run.get("backend") or "").strip()
+        model = _model_short(str(raw_run.get("model") or "").strip())
+        reasoning = str(raw_run.get("reasoning") or "").strip()
+        if not backend or not model:
+            continue
+        label = f"{backend} {model}"
+        if reasoning:
+            label += f"/{reasoning}"
+        if collapsed and collapsed[-1][0] == label:
+            previous_label, count = collapsed[-1]
+            collapsed[-1] = (previous_label, count + 1)
+        else:
+            collapsed.append((label, 1))
+    if not collapsed:
+        return ""
+    rendered = [
+        f"{label} x{count}" if count > 1 else label
+        for label, count in collapsed
+    ]
+    return "workers: " + ", ".join(rendered)
 
 
 def resolve_footer_config(
@@ -112,6 +147,7 @@ def format_runtime_footer(
     context_length: Optional[int],
     reasoning_effort: Optional[str] = None,
     cwd: Optional[str] = None,
+    worker_runs: Iterable[Any] | None = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -144,6 +180,10 @@ def format_runtime_footer(
             effort = str(reasoning_effort or "").strip()
             if effort:
                 parts.append(effort)
+        elif field == "workers":
+            workers = _format_worker_runs(worker_runs)
+            if workers:
+                parts.append(workers)
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -160,6 +200,7 @@ def build_footer_line(
     context_length: Optional[int],
     reasoning_effort: Optional[str] = None,
     cwd: Optional[str] = None,
+    worker_runs: Iterable[Any] | None = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -176,5 +217,6 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         reasoning_effort=reasoning_effort,
+        worker_runs=worker_runs,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
