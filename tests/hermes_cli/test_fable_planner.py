@@ -388,14 +388,14 @@ def test_fable_reasoning_config_uses_configured_discord_feature_effort():
 def test_fable_reasoning_config_does_not_inherit_medium_when_unconfigured():
     assert fable_reasoning_config({"agent": {"reasoning_effort": "medium"}}) == {
         "enabled": True,
-        "effort": "high",
+        "effort": "xhigh",
     }
 
 
-def test_fable_reasoning_config_falls_back_high_for_invalid_config():
+def test_fable_reasoning_config_falls_back_xhigh_for_invalid_config():
     assert fable_reasoning_config({"discord": {"feature_request_reasoning_effort": "bogus"}}) == {
         "enabled": True,
-        "effort": "high",
+        "effort": "xhigh",
     }
 
 

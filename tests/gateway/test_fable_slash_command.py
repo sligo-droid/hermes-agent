@@ -125,7 +125,7 @@ async def test_fable_plan_command_routes_through_normal_agent_with_fable_overrid
     assert agent_event.text == "PLAN SKILL: build X"
     assert agent_event.invoked_skill_command == "fable"
     assert agent_event.fable_enabled_toolsets == ["file", "terminal", "web", "browser", "discord"]
-    assert agent_event.fable_reasoning_config == {"enabled": True, "effort": "high"}
+    assert agent_event.fable_reasoning_config == {"enabled": True, "effort": "xhigh"}
     assert agent_event.fable_transcript_user_message == "/fable plan build X"
     assert build_session_key(agent_event.source) not in runner._session_model_overrides
 
