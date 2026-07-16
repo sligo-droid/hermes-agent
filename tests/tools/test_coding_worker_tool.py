@@ -517,6 +517,10 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
     )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server.check_codex_binary",
+        lambda: (True, "codex ready"),
+    )
     preparation = SimpleNamespace(
         success=True,
         worktree=str(worktree),
