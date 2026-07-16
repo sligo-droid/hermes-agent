@@ -62,10 +62,10 @@ def _load_coding_worker_timeout() -> float:
 
         cfg = load_config()
         worker_cfg = cfg.get("coding_worker") or {}
-        value = worker_cfg.get("turn_timeout_seconds", 1800)
+        value = worker_cfg.get("turn_timeout_seconds", 3600)
         timeout = float(value)
     except Exception:
-        timeout = 1800.0
+        timeout = 3600.0
     return max(30.0, timeout)
 
 
@@ -2229,7 +2229,7 @@ CODING_WORKER_SCHEMA = {
                 "type": "number",
                 "description": (
                     "Optional per-call timeout. Defaults to "
-                    "coding_worker.turn_timeout_seconds (1800 seconds by default), "
+                    "coding_worker.turn_timeout_seconds (3600 seconds / 1 hour by default), "
                     "minimum 30 seconds."
                 ),
             },

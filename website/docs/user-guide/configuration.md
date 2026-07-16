@@ -1188,6 +1188,7 @@ discord:
 
 coding_worker:
   backend: codex
+  turn_timeout_seconds: 3600 # 1 hour default
   simple_build_model_tier: intermediate
   complex_plan_model_tier: advanced
   complex_build_model_tier: intermediate
@@ -1207,6 +1208,10 @@ kanban:
 Coding workers use one `intermediate` build pass for simple work. Complex or
 risky work uses an `advanced` planning pass followed by an `intermediate` build
 pass.
+
+Coding-worker turns default to one hour (`3600` seconds). An explicit
+`turn_timeout_seconds` passed to `delegate_coding_task` takes precedence over
+this configuration value.
 
 In a normal non-Kanban Discord action thread, `/dumb <request>` runs that one
 request one tier below `discord.action_request_model_tier`, and `/smart
