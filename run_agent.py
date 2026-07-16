@@ -1713,7 +1713,14 @@ class AIAgent:
         response_text = ""
         response = getattr(error, "response", None)
         if response is not None:
-            candidate = getattr(response, "text", "")
+            try:
+                candidate = getattr(response, "text", "")
+            except Exception:
+                # Streaming SDK errors can expose an httpx.Response whose body
+                # was never read.  Accessing ``response.text`` then raises
+                # ``ResponseNotRead`` and masks the original provider error,
+                # preventing the normal retry/failover path from running.
+                candidate = ""
             if isinstance(candidate, str):
                 response_text = candidate.strip()
 
