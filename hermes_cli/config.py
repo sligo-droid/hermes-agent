@@ -1619,7 +1619,7 @@ DEFAULT_CONFIG = {
         "simple_build_model_tier": "intermediate",
         "complex_plan_model_tier": "advanced",
         "complex_build_model_tier": "intermediate",
-        "turn_timeout_seconds": 1800,  # 30 minutes
+        "turn_timeout_seconds": 3600,  # 1 hour
         "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",
         "complex_build_reasoning_level": "medium",
