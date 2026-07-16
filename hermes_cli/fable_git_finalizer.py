@@ -12,6 +12,7 @@ import json
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,8 @@ _FABLE_GIT_LIFECYCLE_MODES = {
 }
 _PROTECTED_BRANCHES = {"main", "master"}
 _CHECK_TIMEOUT_SECONDS = 900
+_CHECK_MATERIALIZATION_TIMEOUT_SECONDS = 60
+_CHECK_MATERIALIZATION_POLL_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -402,7 +405,55 @@ def _open_pr(
     return url, "" if url else "gh pr create returned no PR URL"
 
 
+def _reported_checks(
+    root: Path,
+    *,
+    repo: str,
+    pr_url: str,
+) -> tuple[list[dict[str, Any]] | None, str]:
+    viewed = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            pr_url,
+            "--repo",
+            repo,
+            "--json",
+            "statusCheckRollup",
+        ],
+        cwd=root,
+        timeout=60,
+        github=True,
+    )
+    if viewed.returncode != 0:
+        return None, _detail(viewed, "gh pr view checks failed")
+    try:
+        payload = json.loads(viewed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return None, f"gh pr view checks returned invalid JSON: {exc}"
+    raw = payload.get("statusCheckRollup") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return [], ""
+    return [item for item in raw if isinstance(item, dict)], ""
+
+
 def _wait_for_checks(root: Path, *, repo: str, pr_url: str) -> str:
+    # GitHub commonly returns an empty rollup for a few seconds immediately
+    # after PR creation. Treating that transient state as "this repo has no
+    # checks" lets merge race ahead of CI. Wait for bounded materialization;
+    # only a persistently empty rollup counts as a genuine no-check repository.
+    deadline = time.monotonic() + _CHECK_MATERIALIZATION_TIMEOUT_SECONDS
+    while True:
+        reported, error = _reported_checks(root, repo=repo, pr_url=pr_url)
+        if error:
+            return error
+        if reported:
+            break
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(_CHECK_MATERIALIZATION_POLL_SECONDS)
+
     watched = _run(
         [
             "gh",
@@ -422,8 +473,6 @@ def _wait_for_checks(root: Path, *, repo: str, pr_url: str) -> str:
     if watched.returncode == 0:
         return ""
     detail = _detail(watched, "gh pr checks failed")
-    if "no checks reported" in detail.lower():
-        return ""
     return detail
 
 
