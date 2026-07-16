@@ -239,7 +239,14 @@ async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adap
         flags=SimpleNamespace(value=0, voice=False),
         guild=guild,
         created_at=datetime(2026, 5, 19, 4, 0, 0),
-        reference=None,
+        reference=SimpleNamespace(
+            message_id=None,
+            resolved=None,
+            cached_message=SimpleNamespace(
+                clean_content="Please prepare the client kickoff notes.",
+                author=SimpleNamespace(display_name="alex", name="alex"),
+            ),
+        ),
         create_thread=create_thread,
         thread=None,
     )
@@ -252,7 +259,13 @@ async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adap
     assert event.text == "client kickoff"
     assert event.message_type == MessageType.TEXT
     assert event.media_urls == []
-    classifier.assert_awaited_once_with("client kickoff")
+    classifier.assert_awaited_once_with(
+        "client kickoff",
+        context_lines=[
+            "channel: #general",
+            "alex: Please prepare the client kickoff notes.",
+        ],
+    )
 
 
 @pytest.mark.asyncio

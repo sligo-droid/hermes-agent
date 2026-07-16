@@ -2868,68 +2868,101 @@ class DiscordAdapter(BasePlatformAdapter):
         cleaned = re.sub(r"<#\d+>", "", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
         if not cleaned:
-            return None
+            return False
 
         question_starts = (
             "what ", "why ", "when ", "where ", "who ", "whose ", "which ",
             "how ", "can you explain", "can you tell", "do you know",
             "is there", "are there", "does ", "do ", "did ", "should ",
-            "would ", "could you explain", "status", "what's", "whats",
+            "would ", "could you explain", "what's", "whats",
         )
-        feature_starts = (
+        feature_verbs = (
             "build", "create", "add", "implement", "fix", "change", "update",
             "remove", "delete", "ship", "deploy", "make", "refactor", "wire",
             "integrate", "set up", "setup", "turn on", "enable", "disable",
             "support", "replace", "migrate", "simplify", "clean up", "run",
-            "rerun", "re-run", "execute", "regenerate",
+            "rerun", "re-run", "execute", "regenerate", "retry", "get",
         )
-        feature_phrases = (
-            "please build", "please create", "please add", "please implement",
-            "please fix", "please update", "please change", "please remove",
-            "please run", "please rerun", "please re-run", "please execute",
-            "can you build", "can you create", "can you add", "can you implement",
-            "can you run", "can you rerun", "can you re-run", "can you execute",
-            "can we add", "can we make", "can we support", "could we add",
-            "could we make", "could you add", "could you fix", "could you update",
-            "could you run", "could you rerun", "could you re-run", "could you execute",
-            "we need to build", "we need to add", "we need to fix", "we need to update",
-            "we need to run", "we need to rerun", "we need to re-run", "we need to execute",
-            "we need a", "we should add", "we should make", "we should support",
-            "we should run", "we should rerun", "we should re-run", "we should execute",
-            "i need you to build", "i need you to add", "i need you to fix",
-            "i need you to run", "i need you to rerun", "i need you to re-run",
-            "i need you to execute", "run the pipeline", "run the entire pipeline",
+        explicit_markers = (
+            "action request", "feature request:", "bug fix", "new feature",
+        )
+        pipeline_action_phrases = (
+            "run the pipeline", "run the entire pipeline",
             "execute the pipeline", "execute the entire pipeline",
-            "action request", "feature request", "new feature", "bug fix", "make the app",
+        )
+        imperative_starts = (
+            "build ", "create ", "add ", "implement ", "fix ", "remove ",
+            "delete ", "refactor ", "wire ", "integrate ", "set up ",
+            "turn on ", "enable ", "disable ", "replace ", "migrate ",
+            "simplify ", "clean up ", "rerun ", "re-run ", "execute ",
+            "regenerate ",
         )
         direct_starts = (
             "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
-            "quick question", "question:",
+            "quick question", "question",
         )
         leading_ack = re.sub(
             r"^(?:ok|okay|sure|great|cool|thanks|thank you)[\s,!.:\-]+",
             "",
             cleaned,
         ).strip()
-        intent_candidates = tuple(dict.fromkeys(c for c in (cleaned, leading_ack) if c))
+        intent_candidates = tuple(
+            dict.fromkeys(candidate for candidate in (cleaned, leading_ack) if candidate)
+        )
 
-        def _starts_any(candidate: str, prefixes: tuple[str, ...]) -> bool:
-            return candidate.startswith(prefixes)
-
-        def _has_feature_intent() -> bool:
-            return any(
-                _starts_any(candidate, feature_starts)
-                or any(phrase in candidate for phrase in feature_phrases)
-                for candidate in intent_candidates
-            )
-
-        if cleaned.endswith("?") or cleaned.startswith(question_starts):
-            if not _has_feature_intent():
-                return False
-        if _has_feature_intent():
+        if any(
+            marker in candidate
+            for candidate in intent_candidates
+            for marker in explicit_markers
+        ):
             return True
-        if cleaned in direct_starts or cleaned.startswith(tuple(f"{p} " for p in direct_starts)):
+
+        feature_verb_pattern = re.compile(
+            r"\b(?:"
+            + "|".join(re.escape(verb).replace(r"\ ", r"\s+") for verb in feature_verbs)
+            + r")\b"
+        )
+        direct_message = any(
+            candidate == prefix
+            or re.match(rf"^{re.escape(prefix)}(?:[\s,!.:\-]|$)", candidate)
+            for candidate in intent_candidates
+            for prefix in direct_starts
+        )
+        if direct_message and not any(
+            feature_verb_pattern.search(candidate) for candidate in intent_candidates
+        ):
             return False
+        if any(
+            candidate.startswith(question_starts)
+            and candidate.endswith("?")
+            and not feature_verb_pattern.search(candidate)
+            for candidate in intent_candidates
+        ):
+            return False
+
+        pipeline_action = any(
+            phrase in candidate
+            for candidate in intent_candidates
+            for phrase in pipeline_action_phrases
+        )
+        precise_imperative = any(
+            candidate.startswith(imperative_starts)
+            or re.match(
+                r"^(?:"
+                r"ship\s+(?:it|a|an|the|this|that|our|my|your)\b|"
+                r"deploy\s+(?:a|an|the|this|that|our|my|your|to)\b|"
+                r"update\s+(?:a|an|the|this|that|our|my|your)\b|"
+                r"change\s+(?:a|an|the|this|that|our|my|your)\b|"
+                r"make\s+(?:a|an|the|this|that|our|my|your|sure)\b|"
+                r"run\s+(?:a|an|the|this|that|our|my|your|all|tests?|suite|"
+                r"pipeline|workflow|job|command|scraper)\b"
+                r")",
+                candidate,
+            )
+            for candidate in intent_candidates
+        )
+        if (pipeline_action or precise_imperative) and not cleaned.endswith("?"):
+            return True
         return None
 
     def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:
@@ -3001,20 +3034,44 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return False
 
-    async def _classify_discord_action_request(self, text: str) -> bool:
+    async def _classify_discord_action_request(
+        self,
+        text: str,
+        context_lines: list[str] | None = None,
+    ) -> bool:
         if not str(text or "").strip():
             return False
         heuristic = self._heuristic_action_request_intent(text)
         if heuristic is not None:
             return heuristic
 
+        context = []
+        for line in (context_lines or [])[:3]:
+            cleaned_line = re.sub(r"\s+", " ", str(line or "")).strip()
+            if cleaned_line:
+                context.append(cleaned_line[:200])
+        context_block = "\n".join(f"- {line}" for line in context) or "(none)"
         prompt = (
             "Classify this Discord message for a software-development assistant.\n"
-            "Return exactly one word: action or question.\n\n"
-            "action = the user is asking Hermes to implement, change, fix, deploy, run, "
-            "or otherwise do something that should get an action thread.\n"
-            "question = the user is asking for an explanation, status, advice, or "
-            "short direct answer, even if it is about code.\n\n"
+            "Return exactly one word: action, question, or unsure.\n\n"
+            "action = a clear request for Hermes to implement, change, fix, deploy, run, "
+            "or otherwise do work that should get an action thread.\n"
+            "question = a request for an explanation, status, advice, or short inline answer; "
+            "standalone status reports also use question.\n"
+            "unsure = mixed intent, missing conversational context, or no clear request.\n\n"
+            "Few-shot examples:\n"
+            "Message: update: the deploy finished\nVerdict: question\n"
+            "Message: can you get the tests passing?\nVerdict: action\n"
+            "Message: should we retry the deploy?\nVerdict: unsure\n"
+            "Message: run the pipeline again\nVerdict: action\n"
+            "Message: how do I run the pipeline?\nVerdict: question\n"
+            "Message: yes do that\nVerdict: unsure\n"
+            "Context: alex: Please rerun the failed deploy.\n"
+            "Message: yes do that\nVerdict: action\n"
+            "Message: hello\nVerdict: question\n"
+            "Message: feature request: add dark mode\nVerdict: action\n"
+            "Message: the deploy failed; explain why and rerun it\nVerdict: unsure\n\n"
+            f"Available context:\n{context_block}\n\n"
             f"Message:\n{text[:2000]}"
         )
         try:
@@ -3026,18 +3083,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a strict intent classifier. Return only action or question.",
+                        "content": (
+                            "You are a strict intent classifier. Return only action, question, "
+                            "or unsure."
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=8,
+                max_tokens=12,
                 temperature=0,
                 timeout=self._feature_triage_timeout_seconds(),
             )
             verdict = (response.choices[0].message.content or "").strip().lower()
-            if verdict.startswith("action") or verdict.startswith("feature"):
+            if verdict == "action":
                 return True
-            if verdict.startswith("question"):
+            if verdict in {"question", "unsure"}:
                 return False
         except Exception as exc:
             logger.debug("[%s] Discord action-request triage failed: %s", self.name, exc)
@@ -10223,6 +10283,29 @@ class DiscordAdapter(BasePlatformAdapter):
         direct_question_prompt = False
         action_request_intent: Optional[bool] = None
         voice_action_transcript = ""
+        triage_context_lines: list[str] = []
+        channel_name = str(getattr(message.channel, "name", "") or "").strip().lstrip("#")
+        if channel_name:
+            triage_context_lines.append(f"channel: #{channel_name}"[:200])
+        reference = getattr(message, "reference", None)
+        referenced_message = None
+        if reference is not None:
+            referenced_message = (
+                getattr(reference, "resolved", None)
+                or getattr(reference, "cached_message", None)
+            )
+        referenced_text = self._discord_message_context_text(referenced_message)
+        if referenced_text:
+            referenced_author = getattr(referenced_message, "author", None)
+            referenced_author_name = (
+                getattr(referenced_author, "display_name", None)
+                or getattr(referenced_author, "name", None)
+                or str(getattr(referenced_author, "id", "unknown"))
+            )
+            referenced_text = re.sub(r"\s+", " ", referenced_text).strip()
+            triage_context_lines.append(
+                f"{referenced_author_name}: {referenced_text}"[:200]
+            )
 
         # Auto-thread: when enabled, automatically create a thread for action
         # requests in text channels so each implementation conversation is
@@ -10287,7 +10370,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 action_request_intent = (
                     True
                     if has_discord_message_link or slash_command_starts_threaded_work or is_action_request_channel
-                    else await self._classify_discord_action_request(triage_text)
+                    else await self._classify_discord_action_request(
+                        triage_text,
+                        context_lines=triage_context_lines,
+                    )
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
                 direct_question_prompt = not action_request_intent
@@ -10331,7 +10417,10 @@ class DiscordAdapter(BasePlatformAdapter):
             action_request_intent = (
                 True
                 if is_action_request_channel
-                else await self._classify_discord_action_request(normalized_content)
+                else await self._classify_discord_action_request(
+                    normalized_content,
+                    context_lines=triage_context_lines,
+                )
             )
             self._mark_discord_stage(_intake_timing, "triage", _stage_started)
             direct_question_prompt = not action_request_intent
