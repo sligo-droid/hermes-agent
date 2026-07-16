@@ -326,6 +326,37 @@ async def test_non_goal_feature_summary_does_not_start_kanban_pipeline(adapter, 
 
 
 @pytest.mark.asyncio
+async def test_promoted_action_thread_initializes_summary_once(adapter):
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    source_message_id = _discord_snowflake_at(time.time())
+    parent.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(id=int(source_message_id), thread=thread)
+    )
+    adapter._resolve_channel_by_id = AsyncMock(
+        side_effect=lambda channel_id: parent if str(channel_id) == "100" else thread
+    )
+    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
+    adapter._threads.mark = MagicMock()
+
+    assert await adapter.initialize_promoted_action_thread(
+        channel_id="100",
+        message_id=source_message_id,
+        thread_id="200",
+        initial_request="Build a deploy dashboard",
+    ) is True
+    assert await adapter.initialize_promoted_action_thread(
+        channel_id="100",
+        message_id=source_message_id,
+        thread_id="200",
+        initial_request="Build a deploy dashboard",
+    ) is True
+
+    assert len(thread.sent) == 1
+    adapter._threads.mark.assert_called_with("200")
+
+
+@pytest.mark.asyncio
 async def test_non_goal_feature_summary_can_render_explicit_pr_url(adapter):
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     thread = FakeThread(channel_id=200, parent=parent)
@@ -2349,6 +2380,7 @@ async def test_tagged_question_answers_in_thread_without_feature_summary(adapter
     assert event.source.thread_id == "200"
     assert event.source.parent_chat_id == "100"
     assert "classified as a direct question, not an action request" in event.channel_prompt
+    assert "promote_to_action_thread" in event.channel_prompt
 
 
 @pytest.mark.asyncio
