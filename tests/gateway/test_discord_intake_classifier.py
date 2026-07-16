@@ -43,6 +43,29 @@ def test_heuristic_keeps_only_precise_verdicts(adapter, message, expected):
 
 
 @pytest.mark.parametrize(
+    "acknowledgement",
+    ["ok", "okay", "sure", "great", "cool", "thanks", "thank you"],
+)
+def test_heuristic_strips_leading_acknowledgements(adapter, acknowledgement):
+    message = f"{acknowledgement}, fix the login bug"
+
+    assert adapter._heuristic_action_request_intent(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "run the pipeline again",
+        "the billing issue is resolved; run the entire pipeline from scratch",
+        "execute the pipeline for the latest release",
+        "okay the incident is resolved, execute the entire pipeline again",
+    ],
+)
+def test_heuristic_keeps_pipeline_action_phrases_precise(adapter, message):
+    assert adapter._heuristic_action_request_intent(message) is True
+
+
+@pytest.mark.parametrize(
     "message",
     [
         "fix the login bug?",
@@ -57,6 +80,7 @@ def test_heuristic_keeps_only_precise_verdicts(adapter, message, expected):
         "yes do that",
         "thanks, can you update the docs?",
         "we need to fix the flaky test",
+        "okay, run the entire pipeline?",
     ],
 )
 def test_heuristic_defers_ambiguous_messages(adapter, message):

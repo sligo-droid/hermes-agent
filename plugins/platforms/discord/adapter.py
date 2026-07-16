@@ -2886,18 +2886,35 @@ class DiscordAdapter(BasePlatformAdapter):
         explicit_markers = (
             "action request", "feature request:", "bug fix", "new feature",
         )
+        pipeline_action_phrases = (
+            "run the pipeline", "run the entire pipeline",
+            "execute the pipeline", "execute the entire pipeline",
+        )
         imperative_starts = (
-            "create ", "add ", "implement ", "fix ", "remove ", "delete ",
-            "refactor ", "wire ", "integrate ", "set up ", "turn on ",
-            "enable ", "disable ", "replace ", "migrate ", "simplify ",
-            "clean up ", "rerun ", "re-run ", "execute ", "regenerate ",
+            "build ", "create ", "add ", "implement ", "fix ", "remove ",
+            "delete ", "refactor ", "wire ", "integrate ", "set up ",
+            "turn on ", "enable ", "disable ", "replace ", "migrate ",
+            "simplify ", "clean up ", "rerun ", "re-run ", "execute ",
+            "regenerate ",
         )
         direct_starts = (
             "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
             "quick question", "question",
         )
+        leading_ack = re.sub(
+            r"^(?:ok|okay|sure|great|cool|thanks|thank you)[\s,!.:\-]+",
+            "",
+            cleaned,
+        ).strip()
+        intent_candidates = tuple(
+            dict.fromkeys(candidate for candidate in (cleaned, leading_ack) if candidate)
+        )
 
-        if any(marker in cleaned for marker in explicit_markers):
+        if any(
+            marker in candidate
+            for candidate in intent_candidates
+            for marker in explicit_markers
+        ):
             return True
 
         feature_verb_pattern = re.compile(
@@ -2906,24 +2923,32 @@ class DiscordAdapter(BasePlatformAdapter):
             + r")\b"
         )
         direct_message = any(
-            cleaned == prefix
-            or re.match(rf"^{re.escape(prefix)}(?:[\s,!.:\-]|$)", cleaned)
+            candidate == prefix
+            or re.match(rf"^{re.escape(prefix)}(?:[\s,!.:\-]|$)", candidate)
+            for candidate in intent_candidates
             for prefix in direct_starts
         )
-        if direct_message and not feature_verb_pattern.search(cleaned):
+        if direct_message and not any(
+            feature_verb_pattern.search(candidate) for candidate in intent_candidates
+        ):
             return False
-        if (
-            cleaned.startswith(question_starts)
-            and cleaned.endswith("?")
-            and not feature_verb_pattern.search(cleaned)
+        if any(
+            candidate.startswith(question_starts)
+            and candidate.endswith("?")
+            and not feature_verb_pattern.search(candidate)
+            for candidate in intent_candidates
         ):
             return False
 
-        precise_imperative = bool(
-            cleaned.startswith(imperative_starts)
+        pipeline_action = any(
+            phrase in candidate
+            for candidate in intent_candidates
+            for phrase in pipeline_action_phrases
+        )
+        precise_imperative = any(
+            candidate.startswith(imperative_starts)
             or re.match(
                 r"^(?:"
-                r"build\s+(?:a|an|the|this|that|our|my|your)\b|"
                 r"ship\s+(?:it|a|an|the|this|that|our|my|your)\b|"
                 r"deploy\s+(?:a|an|the|this|that|our|my|your|to)\b|"
                 r"update\s+(?:a|an|the|this|that|our|my|your)\b|"
@@ -2932,10 +2957,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 r"run\s+(?:a|an|the|this|that|our|my|your|all|tests?|suite|"
                 r"pipeline|workflow|job|command|scraper)\b"
                 r")",
-                cleaned,
+                candidate,
             )
+            for candidate in intent_candidates
         )
-        if precise_imperative and not cleaned.endswith("?"):
+        if (pipeline_action or precise_imperative) and not cleaned.endswith("?"):
             return True
         return None
 
