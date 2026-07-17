@@ -786,6 +786,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
         self._thread_backfill_task: Optional[asyncio.Task] = None
+        self._root_mention_recovery_task: Optional[asyncio.Task] = None
         self._root_mention_recovery_state_lock = threading.RLock()
         self._hot_session_db = None
         self._relevant_root_channels_cache: Optional[Tuple[float, frozenset[str]]] = None
@@ -3294,6 +3295,13 @@ class DiscordAdapter(BasePlatformAdapter):
             # connected to Discord gateway and both fire on_message, causing
             # double responses.
             if self._client is not None:
+                if self._root_mention_recovery_task and not self._root_mention_recovery_task.done():
+                    self._root_mention_recovery_task.cancel()
+                    try:
+                        await self._root_mention_recovery_task
+                    except asyncio.CancelledError:
+                        pass
+                self._root_mention_recovery_task = None
                 try:
                     if not self._client.is_closed():
                         await self._client.close()
@@ -3314,17 +3322,35 @@ class DiscordAdapter(BasePlatformAdapter):
             # Register event handlers
             @self._client.event
             async def on_ready():
-                logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
+                client = adapter_self._client
+                if client is None:
+                    return
+                logger.info("[%s] Connected as %s", adapter_self.name, client.user)
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
-                # Run root-channel recovery before releasing queued on_message
-                # handlers from the ready gate.  Otherwise a live message that
-                # arrives just after READY could advance the root-channel
-                # watermark past an older offline-gap mention and make it
-                # unrecoverable.
-                await adapter_self._run_root_channel_missed_mention_recovery_task()
+                if adapter_self._client is not client:
+                    return
+
+                # Snapshot the offline watermark before releasing queued live
+                # messages.  The Discord API sweep itself runs after the ready
+                # gate so a slow history request cannot make connect() time out.
+                recovery_state = (
+                    adapter_self._read_discord_root_mention_recovery_state()
+                    if adapter_self._discord_root_mention_recovery_enabled()
+                    else None
+                )
                 adapter_self._ready_event.set()
+                if (
+                    adapter_self._root_mention_recovery_task
+                    and not adapter_self._root_mention_recovery_task.done()
+                ):
+                    adapter_self._root_mention_recovery_task.cancel()
+                adapter_self._root_mention_recovery_task = asyncio.create_task(
+                    adapter_self._run_root_channel_missed_mention_recovery_task(
+                        recovery_state=recovery_state,
+                    )
+                )
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
@@ -3343,12 +3369,16 @@ class DiscordAdapter(BasePlatformAdapter):
                     except asyncio.TimeoutError:
                         pass
 
+                client = adapter_self._client
+                if client is None:
+                    return
+
                 # Dedup: Discord RESUME replays events after reconnects (#4777)
                 if adapter_self._dedup.is_duplicate(str(message.id)):
                     return
 
                 # Always ignore our own messages
-                if message.author == self._client.user:
+                if message.author == client.user:
                     return
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
@@ -3382,9 +3412,9 @@ class DiscordAdapter(BasePlatformAdapter):
                         return
                     elif allow_bots == "mentions":
                         if (
-                            not self._client.user
+                            not client.user
                             or (
-                                self._client.user not in message.mentions
+                                client.user not in message.mentions
                                 and not replies_to_self
                             )
                         ):
@@ -3417,11 +3447,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 # agents share a channel.
                 if not isinstance(message.channel, discord.DMChannel) and message.mentions:
                     _self_mentioned = (
-                        self._client.user is not None
-                        and (self._client.user in message.mentions or replies_to_self)
+                        client.user is not None
+                        and (client.user in message.mentions or replies_to_self)
                     )
                     _other_bots_mentioned = any(
-                        m.bot and m != self._client.user
+                        m.bot and m != client.user
                         for m in message.mentions
                     )
                     # If other bots are mentioned but we're not → not for us
@@ -3446,7 +3476,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         if "*" not in _free_channels and not (_channel_ids & _free_channels):
                             return
 
-                await self._handle_message(message)
+                await adapter_self._handle_message(message)
                 # _handle_message() can bootstrap a project-channel mapping
                 # for newly seen project channels.  Record again after that
                 # path so future offline-gap recovery has a baseline even when
@@ -3461,8 +3491,24 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_resumed():
                 logger.info("[%s] Discord gateway session resumed", adapter_self.name)
-                await adapter_self._run_root_channel_missed_mention_recovery_task()
+                if adapter_self._client is None:
+                    return
+                recovery_state = (
+                    adapter_self._read_discord_root_mention_recovery_state()
+                    if adapter_self._discord_root_mention_recovery_enabled()
+                    else None
+                )
                 adapter_self._ready_event.set()
+                if (
+                    adapter_self._root_mention_recovery_task
+                    and not adapter_self._root_mention_recovery_task.done()
+                ):
+                    adapter_self._root_mention_recovery_task.cancel()
+                adapter_self._root_mention_recovery_task = asyncio.create_task(
+                    adapter_self._run_root_channel_missed_mention_recovery_task(
+                        recovery_state=recovery_state,
+                    )
+                )
                 if adapter_self._thread_backfill_task and not adapter_self._thread_backfill_task.done():
                     adapter_self._thread_backfill_task.cancel()
                 adapter_self._thread_backfill_task = asyncio.create_task(
@@ -3539,6 +3585,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        if self._root_mention_recovery_task and not self._root_mention_recovery_task.done():
+            self._root_mention_recovery_task.cancel()
+            try:
+                await self._root_mention_recovery_task
+            except asyncio.CancelledError:
+                pass
+
         # Clean up all active voice connections before closing the client
         for guild_id in list(self._voice_clients.keys()):
             try:
@@ -3571,6 +3624,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event.clear()
         self._post_connect_task = None
         self._thread_backfill_task = None
+        self._root_mention_recovery_task = None
 
         self._release_platform_lock()
 
@@ -3745,9 +3799,15 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] Discord tracked-thread backfill failed: %s", self.name, e, exc_info=True)
 
-    async def _run_root_channel_missed_mention_recovery_task(self) -> None:
+    async def _run_root_channel_missed_mention_recovery_task(
+        self,
+        *,
+        recovery_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
         try:
-            await self._recover_missed_root_channel_mentions()
+            await self._recover_missed_root_channel_mentions(
+                recovery_state=recovery_state,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3758,7 +3818,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return
         try:
-            await self._run_root_channel_missed_mention_recovery_task()
+            if self._root_mention_recovery_task is not None:
+                await self._root_mention_recovery_task
+            else:
+                await self._run_root_channel_missed_mention_recovery_task()
             await self._run_tracked_thread_backfill_task()
 
             sync_policy = self._get_discord_command_sync_policy()
@@ -8401,7 +8464,11 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return False
 
-    async def _recover_missed_root_channel_mentions(self) -> int:
+    async def _recover_missed_root_channel_mentions(
+        self,
+        *,
+        recovery_state: Optional[Dict[str, Any]] = None,
+    ) -> int:
         """Replay bounded root-channel bot triggers missed during a known offline gap.
 
         First observation of a channel only seeds its high-water mark to the
@@ -8415,7 +8482,11 @@ class DiscordAdapter(BasePlatformAdapter):
             return 0
 
         with self._root_mention_recovery_state_lock:
-            state = self._read_discord_root_mention_recovery_state()
+            state = (
+                recovery_state
+                if recovery_state is not None
+                else self._read_discord_root_mention_recovery_state()
+            )
             channels = state.setdefault("channels", {})
             if not isinstance(channels, dict):
                 channels = {}
