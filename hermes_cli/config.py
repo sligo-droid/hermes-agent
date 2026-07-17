@@ -1611,6 +1611,7 @@ DEFAULT_CONFIG = {
     "coding_worker": {
         "enabled": True,
         "backend": "codex",  # opencode | codex
+        "inherit_fast_mode": True,
         "worker_tiers": copy.deepcopy(DEFAULT_WORKER_TIERS),
         # Pass tiers are atomic model/reasoning bundles. model_tier is an
         # optional compatibility-wide override; "disabled" temporarily turns
