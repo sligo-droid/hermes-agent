@@ -1638,12 +1638,10 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
 # Optional ``board`` parameter — per-call DB override
 # ---------------------------------------------------------------------------
 #
-# The dispatcher pins the active board via HERMES_KANBAN_BOARD env var,
-# but a Telegram-side orchestrator handling multiple boards needs to be
-# able to route a single tool call to a specific board's DB without
-# restarting Hermes. These tests pin that ``board=<slug>`` argument
-# routes each handler to that board's sqlite file, and that omitting
-# ``board`` preserves the legacy env-driven resolution.
+# The dispatcher pins workers to one board/database at spawn time. Workers
+# must not bypass that boundary via the optional per-call ``board`` argument,
+# while orchestrators still need explicit routing across boards. These tests
+# pin both sides of that contract.
 
 
 @pytest.fixture
@@ -1691,6 +1689,138 @@ def multi_board_env(monkeypatch, tmp_path):
         "default_db": kb.kanban_db_path(),
         "alt_db": kb.kanban_db_path(board="alt"),
     }
+
+
+@pytest.fixture
+def pinned_worker_multi_board_env(monkeypatch, multi_board_env):
+    """Pin a dispatcher-style worker to the default board in a two-board home."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", multi_board_env["default_seed"])
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(multi_board_env["default_db"]))
+    monkeypatch.setenv("_HERMES_KANBAN_DB_HANDOFF", "1")
+    monkeypatch.setenv("HERMES_PROFILE", "pinned-worker")
+    return multi_board_env
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "args"),
+    [
+        ("_handle_show", {"task_id": "foreign", "board": "alt"}),
+        (
+            "_handle_complete",
+            {"task_id": "foreign", "summary": "cross-board", "board": "alt"},
+        ),
+        (
+            "_handle_block",
+            {"task_id": "foreign", "reason": "cross-board", "board": "alt"},
+        ),
+        ("_handle_heartbeat", {"task_id": "foreign", "board": "alt"}),
+        (
+            "_handle_comment",
+            {"task_id": "foreign", "body": "cross-board", "board": "alt"},
+        ),
+        (
+            "_handle_create",
+            {"title": "cross-board", "assignee": "worker", "board": "alt"},
+        ),
+        (
+            "_handle_link",
+            {"parent_id": "foreign-a", "child_id": "foreign-b", "board": "alt"},
+        ),
+    ],
+)
+def test_worker_board_override_rejected_for_every_visible_handler(
+    pinned_worker_multi_board_env,
+    handler_name,
+    args,
+):
+    """Every worker-visible board argument fails closed before DB access."""
+    from tools import kanban_tools as kt
+
+    out = getattr(kt, handler_name)(args)
+    result = json.loads(out)
+
+    assert result.get("ok") is not True
+    assert "spawn-time board" in result.get("error", "")
+    assert result.get("evidence") == {
+        "code": "worker_board_override_rejected",
+        "field": "board",
+        "worker_scoped": True,
+        "required_resolution": "spawn_time_pin",
+    }
+    serialized = json.dumps(result)
+    assert str(pinned_worker_multi_board_env["default_db"]) not in serialized
+    assert str(pinned_worker_multi_board_env["alt_db"]) not in serialized
+
+
+def test_worker_cross_board_read_and_write_are_rejected_without_leaks(
+    pinned_worker_multi_board_env,
+):
+    """A pinned worker cannot read or comment on a task in another board."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    alt_seed = pinned_worker_multi_board_env["alt_seed"]
+    read_result = json.loads(kt._handle_show({
+        "task_id": alt_seed,
+        "board": "alt",
+    }))
+    write_result = json.loads(kt._handle_comment({
+        "task_id": alt_seed,
+        "body": "must not land",
+        "board": "alt",
+    }))
+
+    for result in (read_result, write_result):
+        assert result["evidence"]["code"] == "worker_board_override_rejected"
+        serialized = json.dumps(result)
+        assert "seed-alt" not in serialized
+        assert str(pinned_worker_multi_board_env["alt_db"]) not in serialized
+
+    with kb.connect(board="alt") as conn:
+        assert kb.list_comments(conn, alt_seed) == []
+
+
+def test_worker_same_board_handoffs_work_when_override_is_omitted(
+    pinned_worker_multi_board_env,
+):
+    """Workers may comment across tasks and create follow-ups on their board."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect(board="default") as conn:
+        sibling = kb.create_task(conn, title="same-board sibling", assignee="peer")
+
+    comment = json.loads(kt._handle_comment({
+        "task_id": sibling,
+        "body": "same-board handoff",
+    }))
+    created = json.loads(kt._handle_create({
+        "title": "same-board follow-up",
+        "assignee": "peer",
+        "parents": [pinned_worker_multi_board_env["default_seed"]],
+    }))
+
+    assert comment.get("ok") is True
+    assert created.get("ok") is True
+    with kb.connect(board="default") as conn:
+        assert kb.list_comments(conn, sibling)[0].body == "same-board handoff"
+        assert kb.get_task(conn, created["task_id"]).title == "same-board follow-up"
+    with kb.connect(board="alt") as conn:
+        assert kb.get_task(conn, created["task_id"]) is None
+
+
+def test_worker_explicit_same_board_is_still_rejected(
+    pinned_worker_multi_board_env,
+):
+    """Fail closed even when a caller claims the override matches the pin."""
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_show({
+        "task_id": pinned_worker_multi_board_env["default_seed"],
+        "board": "default",
+    }))
+    assert result["evidence"]["code"] == "worker_board_override_rejected"
 
 
 def test_board_param_routes_create_to_alt_board(multi_board_env):
@@ -1864,15 +1994,14 @@ def test_board_param_routes_unblock_to_alt_board(multi_board_env):
 
 
 def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
-    """kanban_heartbeat targets the alt board's DB. Worker-scoped, so we
-    use the worker-env style fixture inline (pinning HERMES_KANBAN_TASK
-    to a task that exists in the alt board)."""
+    """An orchestrator can heartbeat a task on an explicitly routed board."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_PROFILE", "alt-worker")
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
@@ -1882,10 +2011,12 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
     with kb.connect(board="alt") as conn:
         tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
         kb.claim_task(conn, tid)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
-
     from tools import kanban_tools as kt
-    out = kt._handle_heartbeat({"note": "alive on alt", "board": "alt"})
+    out = kt._handle_heartbeat({
+        "task_id": tid,
+        "note": "alive on alt",
+        "board": "alt",
+    })
     d = json.loads(out)
     assert d["ok"] is True
 
