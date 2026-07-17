@@ -449,7 +449,10 @@ def test_scope_check_lists_out_of_scope_changes(monkeypatch, tmp_path):
     }
 
 
-def test_parallel_group_runs_in_isolated_worktree_and_merges_back(monkeypatch, tmp_path):
+def test_parallel_group_returns_pending_isolated_worktree_without_merging(
+    monkeypatch,
+    tmp_path,
+):
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_git_worktree(repo)
@@ -479,6 +482,9 @@ def test_parallel_group_runs_in_isolated_worktree_and_merges_back(monkeypatch, t
         "hermes_cli.worker_autoreview.materialize_autoreview_helper",
         lambda workdir: None,
     )
+    merge_back = cwt.merge_parallel_worker_result
+    merge_mock = MagicMock(side_effect=AssertionError("wrapper must not merge"))
+    monkeypatch.setattr(cwt, "merge_parallel_worker_result", merge_mock)
 
     result = json.loads(
         cwt.delegate_coding_task(
@@ -493,9 +499,10 @@ def test_parallel_group_runs_in_isolated_worktree_and_merges_back(monkeypatch, t
     assert result["parallel"] == {
         "group_id": "batch-1",
         "worker_cwd": str(seen["cwd"]),
-        "merged": True,
+        "merged": False,
+        "merge_pending": True,
         "merge_conflicts": [],
-        "worktree_kept": False,
+        "worktree_kept": True,
     }
     assert result["scope_check"] == {
         "scope_paths": ["src"],
@@ -506,10 +513,17 @@ def test_parallel_group_runs_in_isolated_worktree_and_merges_back(monkeypatch, t
     assert "-pw-batch-1-" in seen["cwd"].name
     assert seen["head"] == base_head
     assert seen["readme"] == "baseline\n"
-    assert not seen["cwd"].exists()
+    assert seen["cwd"].exists()
+    assert (seen["cwd"] / "src" / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert (seen["cwd"] / "src" / "new.py").read_text(encoding="utf-8") == "NEW = True\n"
     assert (repo / "README.md").read_text(encoding="utf-8") == "pre-existing base edit\n"
-    assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "value = 2\n"
-    assert (repo / "src" / "new.py").read_text(encoding="utf-8") == "NEW = True\n"
+    assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert not (repo / "src" / "new.py").exists()
+    merge_mock.assert_not_called()
+
+    merge_result = merge_back(str(repo), str(seen["cwd"]), "batch-1")
+    assert merge_result["merged"] is True
+    assert not seen["cwd"].exists()
 
 
 def test_merge_parallel_worker_result_handles_modify_add_delete_and_mode(tmp_path):
@@ -2343,14 +2357,27 @@ def test_fable_parallel_group_rejects_opencode_and_reports_merge_evidence(
 
     assert "coding_worker.backend=codex" in result["error"]
     assert "OpenCode" in result["error"]
-    assert result["parallel"]["group_id"] == "fable-opencode"
-    assert result["parallel"]["merged"] is True
-    assert result["parallel"]["merge_conflicts"] == []
-    assert result["parallel"]["worktree_kept"] is False
-    assert not Path(result["parallel"]["worker_cwd"]).exists()
+    worker_cwd = Path(result["parallel"]["worker_cwd"])
+    assert result["parallel"] == {
+        "group_id": "fable-opencode",
+        "worker_cwd": str(worker_cwd),
+        "merged": False,
+        "merge_pending": True,
+        "merge_conflicts": [],
+        "worktree_kept": True,
+    }
+    assert worker_cwd.exists()
+
+    merge_result = cwt.merge_parallel_worker_result(
+        str(repo),
+        str(worker_cwd),
+        "fable-opencode",
+    )
+    assert merge_result["merged"] is True
+    assert not worker_cwd.exists()
 
 
-def test_fable_parallel_merge_back_precedes_trusted_git_finalizer(monkeypatch, tmp_path):
+def test_fable_parallel_worker_returns_pending_merge_evidence(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
     repo = tmp_path / "repo"
@@ -2384,53 +2411,35 @@ def test_fable_parallel_merge_back_precedes_trusted_git_finalizer(monkeypatch, t
         "hermes_cli.worker_autoreview.materialize_autoreview_helper",
         lambda workdir: None,
     )
-    preparation = SimpleNamespace(
-        success=True,
-        resume_existing_pr=False,
-        error="",
-    )
-    prepare = MagicMock(return_value=preparation)
-
-    def finalize(prepared, **kwargs):
-        assert prepared is preparation
-        assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "fable result\n"
-        assert not seen["worker_cwd"].exists()
-        return SimpleNamespace(
-            success=True,
-            status="merged",
-            error="",
-            as_dict=lambda: {"success": True, "status": "merged"},
-        )
-
-    monkeypatch.setattr(
-        "hermes_cli.fable_git_finalizer.prepare_fable_git_lifecycle",
-        prepare,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.fable_git_finalizer.finalize_fable_git_lifecycle",
-        finalize,
-    )
     parent = _fable_parent(repo)
-    parent._fable_git_lifecycle = "merge"
 
     result = json.loads(
         cwt.delegate_coding_task(
-            task="land the parallel implementation",
+            task="build the parallel implementation",
             parent_agent=parent,
             _parallel_group={"group_id": "fable-merge", "base_cwd": str(repo)},
         )
     )
 
     assert result["success"] is True
-    assert result["fable_git_result"]["status"] == "merged"
     assert result["parallel"] == {
         "group_id": "fable-merge",
         "worker_cwd": str(seen["worker_cwd"]),
-        "merged": True,
+        "merged": False,
+        "merge_pending": True,
         "merge_conflicts": [],
-        "worktree_kept": False,
+        "worktree_kept": True,
     }
-    prepare.assert_called_once_with(str(repo), "merge")
+    assert seen["worker_cwd"].exists()
+    assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+
+    merge_result = cwt.merge_parallel_worker_result(
+        str(repo),
+        str(seen["worker_cwd"]),
+        "fable-merge",
+    )
+    assert merge_result["merged"] is True
+    assert not seen["worker_cwd"].exists()
 
 
 def test_fable_delegate_fails_clearly_when_codex_is_unavailable(monkeypatch, tmp_path):

@@ -23,7 +23,6 @@ from hermes_cli.model_tiers import DEFAULT_WORKER_TIERS, resolve_worker_tier
 from tools.parallel_worker_worktrees import (
     ParallelWorkerContext as _ParallelWorkerContext,
     merge_parallel_worker_result_unlocked as _merge_parallel_worker_result_locked,
-    parallel_recovery_action as _parallel_recovery_action,
     provision_parallel_worker as _provision_parallel_worker,
 )
 from tools.registry import registry, tool_error
@@ -370,54 +369,6 @@ def merge_parallel_worker_result(
             str(Path(worker_cwd).expanduser().resolve()),
             str(group_id),
         )
-
-
-def _apply_parallel_result_to_payload(
-    payload: dict[str, Any],
-    merge_result: dict[str, Any],
-) -> None:
-    payload["parallel"] = {
-        key: merge_result[key]
-        for key in (
-            "group_id",
-            "worker_cwd",
-            "merged",
-            "merge_conflicts",
-            "worktree_kept",
-        )
-    }
-    if merge_result.get("recovery_required"):
-        payload["success"] = False
-        payload["status"] = "partial"
-        payload["recovery_required"] = True
-        payload["next_action"] = merge_result.get("next_action")
-        if not payload.get("error"):
-            payload["error"] = "Parallel worker merge-back requires conflict recovery."
-
-
-def _merge_parallel_context(context: _ParallelWorkerContext) -> dict[str, Any]:
-    try:
-        return merge_parallel_worker_result(
-            context.base_cwd,
-            context.worker_cwd,
-            context.group_id,
-        )
-    except Exception as exc:
-        return {
-            "group_id": context.group_id,
-            "worker_cwd": context.worker_cwd,
-            "merged": False,
-            "merge_conflicts": [],
-            "worktree_kept": Path(context.worker_root).exists(),
-            "recovery_required": True,
-            "next_action": _parallel_recovery_action(
-                context.base_cwd,
-                context.worker_cwd,
-                context.group_id,
-                [],
-            ),
-            "merge_error": str(exc),
-        }
 
 
 _UI_ROUTE_DEFAULT_FALLBACK_HINTS = (
@@ -2384,16 +2335,8 @@ def _delegate_coding_task_impl(
         if normalized_scope_paths is not None
         else None
     )
-    parallel_merge_result = (
-        _merge_parallel_context(_parallel_context)
-        if _parallel_context is not None
-        else None
-    )
     fable_git_result = None
     lifecycle_error = ""
-    if parallel_merge_result is not None and not parallel_merge_result.get("merged"):
-        success = False
-        lifecycle_error = "Parallel worker merge-back requires conflict recovery."
     if (
         success
         and fable_implementation
@@ -2445,8 +2388,6 @@ def _delegate_coding_task_impl(
         payload["fable_git_result"] = fable_git_result
     if scope_check is not None:
         payload["scope_check"] = scope_check
-    if parallel_merge_result is not None:
-        _apply_parallel_result_to_payload(payload, parallel_merge_result)
     if cwd_fallback_metadata is not None:
         payload["cwd_fallback"] = cwd_fallback_metadata
     return json.dumps(payload, ensure_ascii=False)
@@ -2527,10 +2468,14 @@ def delegate_coding_task(
     if "parallel" not in payload and isinstance(
         parallel_context, _ParallelWorkerContext
     ):
-        _apply_parallel_result_to_payload(
-            payload,
-            _merge_parallel_context(parallel_context),
-        )
+        payload["parallel"] = {
+            "group_id": parallel_context.group_id,
+            "worker_cwd": parallel_context.worker_cwd,
+            "merged": False,
+            "merge_pending": True,
+            "merge_conflicts": [],
+            "worktree_kept": True,
+        }
     elif "parallel" not in payload:
         payload["parallel"] = {
             "group_id": group_id,
