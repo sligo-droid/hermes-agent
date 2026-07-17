@@ -2384,6 +2384,37 @@ async def test_tagged_question_answers_in_thread_without_feature_summary(adapter
 
 
 @pytest.mark.asyncio
+async def test_auto_threaded_noop_action_label_attaches_feature_summary(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    triage = MagicMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="question"))]
+        )
+    )
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", triage)
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=parent,
+            content="<@999> no-op change end-to-end",
+        )
+    )
+
+    triage.assert_not_called()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.feature_summary is not None
+    assert event.feature_summary["initial_request"] == "no-op change end-to-end"
+    assert event.feature_summary["thread_id"] == "200"
+    assert len(thread.sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_tagged_grill_me_parent_message_threads_without_feature_summary(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
