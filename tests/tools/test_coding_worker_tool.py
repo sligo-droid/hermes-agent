@@ -3,8 +3,11 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -149,6 +152,33 @@ def test_missing_turn_timeout_uses_config_default(monkeypatch):
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"coding_worker": {}})
 
     assert cwt._load_coding_worker_timeout() == float(default_timeout)
+
+
+def test_parallel_config_defaults_and_max_workers_floor(monkeypatch):
+    assert DEFAULT_CONFIG["coding_worker"]["parallel"] == {
+        "enabled": True,
+        "max_workers": 3,
+    }
+    assert cwt.is_coding_worker_parallel_enabled(DEFAULT_CONFIG) is True
+    assert cwt.get_coding_worker_parallel_max_workers(DEFAULT_CONFIG) == 3
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "coding_worker": {
+                "parallel": {"enabled": False, "max_workers": 0},
+            }
+        },
+    )
+    assert cwt.is_coding_worker_parallel_enabled() is False
+    assert cwt.get_coding_worker_parallel_max_workers() == 1
+
+
+def test_plain_call_returns_sequential_result_byte_identically(monkeypatch):
+    expected = '{"success":true, "status":"completed", "custom":"unchanged bytes"}'
+    monkeypatch.setattr(cwt, "_delegate_coding_task_impl", lambda **kwargs: expected)
+
+    assert cwt.delegate_coding_task(task="plain sequential call") == expected
 
 
 def test_runs_codex_app_server_session(monkeypatch, tmp_path):
@@ -350,6 +380,7 @@ def test_coding_worker_schema_exposes_orchestrator_inputs():
     assert {"relevant_files", "approach", "constraints", "verification", "scope_paths"} <= set(
         properties
     )
+    assert "_parallel_group" not in properties
 
 
 def test_scope_check_reports_in_scope_changes_as_clean(monkeypatch, tmp_path):
@@ -416,6 +447,257 @@ def test_scope_check_lists_out_of_scope_changes(monkeypatch, tmp_path):
         "out_of_scope_files": ["README.md"],
         "clean": False,
     }
+
+
+def test_parallel_group_runs_in_isolated_worktree_and_merges_back(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    base_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "README.md").write_text("pre-existing base edit\n", encoding="utf-8")
+    seen = {}
+
+    class EditingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            worker_cwd = Path(self.kwargs["cwd"])
+            seen["cwd"] = worker_cwd
+            seen["head"] = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=worker_cwd, text=True
+            ).strip()
+            seen["readme"] = (worker_cwd / "README.md").read_text(encoding="utf-8")
+            (worker_cwd / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
+            (worker_cwd / "src" / "new.py").write_text("NEW = True\n", encoding="utf-8")
+            return super().run_turn(**kwargs)
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        EditingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="update only src",
+            scope_paths=["src"],
+            parent_agent=_parent(repo),
+            _parallel_group={"group_id": "batch-1", "base_cwd": str(repo)},
+        )
+    )
+
+    assert result["success"] is True
+    assert result["parallel"] == {
+        "group_id": "batch-1",
+        "worker_cwd": str(seen["cwd"]),
+        "merged": True,
+        "merge_conflicts": [],
+        "worktree_kept": False,
+    }
+    assert result["scope_check"] == {
+        "scope_paths": ["src"],
+        "out_of_scope_files": [],
+        "clean": True,
+    }
+    assert seen["cwd"] != repo
+    assert "-pw-batch-1-" in seen["cwd"].name
+    assert seen["head"] == base_head
+    assert seen["readme"] == "baseline\n"
+    assert not seen["cwd"].exists()
+    assert (repo / "README.md").read_text(encoding="utf-8") == "pre-existing base edit\n"
+    assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert (repo / "src" / "new.py").read_text(encoding="utf-8") == "NEW = True\n"
+
+
+def test_merge_parallel_worker_result_handles_modify_add_delete_and_mode(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    (repo / "delete.txt").write_text("delete me\n", encoding="utf-8")
+    subprocess.run(["git", "add", "delete.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add delete fixture"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    worker = cwt._provision_parallel_worker(str(repo), "clean-merge")
+    worker_cwd = Path(worker.worker_cwd)
+    (worker_cwd / "src" / "app.py").write_text("value = 3\n", encoding="utf-8")
+    (worker_cwd / "added.txt").write_text("added\n", encoding="utf-8")
+    (worker_cwd / "delete.txt").unlink()
+    (worker_cwd / "README.md").chmod(0o755)
+
+    result = cwt.merge_parallel_worker_result(
+        str(repo),
+        str(worker_cwd),
+        "clean-merge",
+    )
+
+    assert result == {
+        "group_id": "clean-merge",
+        "worker_cwd": str(worker_cwd),
+        "merged": True,
+        "merge_conflicts": [],
+        "worktree_kept": False,
+    }
+    assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "value = 3\n"
+    assert (repo / "added.txt").read_text(encoding="utf-8") == "added\n"
+    assert not (repo / "delete.txt").exists()
+    assert stat.S_IMODE((repo / "README.md").stat().st_mode) & 0o111 == 0o111
+    assert not Path(worker.worker_root).exists()
+    assert subprocess.check_output(
+        ["git", "branch", "--list", worker.branch], cwd=repo, text=True
+    ).strip() == ""
+
+
+def test_merge_parallel_worker_conflict_leaves_base_untouched_and_keeps_worktree(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    worker = cwt._provision_parallel_worker(str(repo), "conflict-merge")
+    worker_cwd = Path(worker.worker_cwd)
+    (worker_cwd / "src" / "app.py").write_text("worker value\n", encoding="utf-8")
+    (repo / "src" / "app.py").write_text("base value\n", encoding="utf-8")
+    before_content = (repo / "src" / "app.py").read_bytes()
+    before_status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1"], cwd=repo
+    )
+
+    result = cwt.merge_parallel_worker_result(
+        str(repo),
+        str(worker_cwd),
+        "conflict-merge",
+    )
+
+    assert result["merged"] is False
+    assert result["merge_conflicts"] == ["src/app.py"]
+    assert result["worktree_kept"] is True
+    assert result["recovery_required"] is True
+    assert str(worker_cwd) in result["next_action"]
+    assert (repo / "src" / "app.py").read_bytes() == before_content
+    assert subprocess.check_output(
+        ["git", "status", "--porcelain=v1"], cwd=repo
+    ) == before_status
+    assert worker_cwd.exists()
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", worker.worker_root],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "branch", "-D", worker.branch], cwd=repo, check=True)
+
+
+def test_parallel_merge_lock_serializes_same_group(monkeypatch, tmp_path):
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_submitted = threading.Event()
+    order = []
+
+    def fake_merge(base_cwd, worker_cwd, group_id):
+        name = Path(worker_cwd).name
+        order.append(f"start:{name}")
+        if name == "worker-1":
+            first_entered.set()
+            assert release_first.wait(5)
+        order.append(f"end:{name}")
+        return {
+            "group_id": group_id,
+            "worker_cwd": worker_cwd,
+            "merged": True,
+            "merge_conflicts": [],
+            "worktree_kept": False,
+        }
+
+    monkeypatch.setattr(cwt, "_merge_parallel_worker_result_locked", fake_merge)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            cwt.merge_parallel_worker_result,
+            str(tmp_path),
+            str(tmp_path / "worker-1"),
+            "serialized",
+        )
+        assert first_entered.wait(5)
+
+        def run_second():
+            second_submitted.set()
+            return cwt.merge_parallel_worker_result(
+                str(tmp_path),
+                str(tmp_path / "worker-2"),
+                "serialized",
+            )
+
+        second = executor.submit(run_second)
+        assert second_submitted.wait(5)
+        assert order == ["start:worker-1"]
+        release_first.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+
+    assert order == [
+        "start:worker-1",
+        "end:worker-1",
+        "start:worker-2",
+        "end:worker-2",
+    ]
+
+
+def test_parallel_disabled_falls_back_to_in_place_execution(monkeypatch, tmp_path):
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["parallel"]["enabled"] = False
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="run without isolation",
+            parent_agent=_parent(tmp_path),
+            _parallel_group={"group_id": "disabled", "base_cwd": str(tmp_path)},
+        )
+    )
+
+    assert result["success"] is True
+    assert result["cwd"] == str(tmp_path)
+    assert result["parallel"] == {"disabled": True}
+    assert not list(tmp_path.parent.glob(f"{tmp_path.name}-pw-*"))
+
+
+def test_turn_worker_runs_append_is_thread_safe():
+    parent = SimpleNamespace()
+    barrier = threading.Barrier(33)
+
+    def start(index):
+        barrier.wait()
+        return cwt._start_worker_run(
+            parent,
+            backend="codex",
+            model=f"model-{index}",
+            reasoning="medium",
+            tier=None,
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        futures = [executor.submit(start, index) for index in range(32)]
+        barrier.wait()
+        records = [future.result(timeout=5) for future in futures]
+
+    assert len(parent.turn_worker_runs) == 32
+    assert {record["model"] for record in parent.turn_worker_runs} == {
+        f"model-{index}" for index in range(32)
+    }
+    assert all(record in parent.turn_worker_runs for record in records)
 
 
 def test_delegate_repairs_missing_task_from_worker_context(monkeypatch, tmp_path):
@@ -2031,6 +2313,124 @@ def test_fable_delegate_rejects_opencode_backend(monkeypatch, tmp_path):
 
     assert "coding_worker.backend=codex" in result["error"]
     assert "OpenCode" in result["error"]
+
+
+def test_fable_parallel_group_rejects_opencode_and_reports_merge_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    from agent import opencode_worker as ow
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "opencode"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the feature",
+            parent_agent=_fable_parent(repo),
+            _parallel_group={"group_id": "fable-opencode", "base_cwd": str(repo)},
+        )
+    )
+
+    assert "coding_worker.backend=codex" in result["error"]
+    assert "OpenCode" in result["error"]
+    assert result["parallel"]["group_id"] == "fable-opencode"
+    assert result["parallel"]["merged"] is True
+    assert result["parallel"]["merge_conflicts"] == []
+    assert result["parallel"]["worktree_kept"] is False
+    assert not Path(result["parallel"]["worker_cwd"]).exists()
+
+
+def test_fable_parallel_merge_back_precedes_trusted_git_finalizer(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_CODEX,
+    )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server.check_codex_binary",
+        lambda: (True, "codex ready"),
+    )
+    seen = {}
+
+    class EditingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            worker_cwd = Path(self.kwargs["cwd"])
+            seen["worker_cwd"] = worker_cwd
+            (worker_cwd / "src" / "app.py").write_text("fable result\n", encoding="utf-8")
+            return super().run_turn(**kwargs)
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        EditingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+    preparation = SimpleNamespace(
+        success=True,
+        resume_existing_pr=False,
+        error="",
+    )
+    prepare = MagicMock(return_value=preparation)
+
+    def finalize(prepared, **kwargs):
+        assert prepared is preparation
+        assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "fable result\n"
+        assert not seen["worker_cwd"].exists()
+        return SimpleNamespace(
+            success=True,
+            status="merged",
+            error="",
+            as_dict=lambda: {"success": True, "status": "merged"},
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.fable_git_finalizer.prepare_fable_git_lifecycle",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.fable_git_finalizer.finalize_fable_git_lifecycle",
+        finalize,
+    )
+    parent = _fable_parent(repo)
+    parent._fable_git_lifecycle = "merge"
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="land the parallel implementation",
+            parent_agent=parent,
+            _parallel_group={"group_id": "fable-merge", "base_cwd": str(repo)},
+        )
+    )
+
+    assert result["success"] is True
+    assert result["fable_git_result"]["status"] == "merged"
+    assert result["parallel"] == {
+        "group_id": "fable-merge",
+        "worker_cwd": str(seen["worker_cwd"]),
+        "merged": True,
+        "merge_conflicts": [],
+        "worktree_kept": False,
+    }
+    prepare.assert_called_once_with(str(repo), "merge")
 
 
 def test_fable_delegate_fails_clearly_when_codex_is_unavailable(monkeypatch, tmp_path):
