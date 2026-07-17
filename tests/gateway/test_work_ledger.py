@@ -608,6 +608,35 @@ def test_full_lifecycle_blocks_unsynced_runtime_and_unverified_live_pickup(tmp_p
     ]
 
 
+def test_full_lifecycle_allows_preserved_protected_checkout_when_production_is_current(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Proceed with the same treatment across the other sources")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "77 official items audited; 52 published and 25 intentionally held by quality gates. "
+            "Production deployment and main CI passed. Airflow runtime is current at d6e4042, clean, "
+            "zero behind, no sensitive lag; all services are healthy. Preserved: the protected "
+            "canonical checkout remains untouched because it has a pre-existing deleted test file and "
+            "is 16 commits behind. The active worktree and production runtime are current."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
+
+
 def test_full_lifecycle_allows_background_watch_after_live_pickup(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Schedule the Airflow DAG")
