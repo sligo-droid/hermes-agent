@@ -230,7 +230,7 @@ _TOOL_STUBS = {
     "web_extract": (
         "web_extract",
         "urls: list, char_limit: int = None",
-        '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
+        '"""Extract content from URLs without LLM summarization. Returns dict with results list of {url, title, content, error}. Long pages use deterministic head+tail truncation; omitted middle text is not stored. char_limit defaults to 15000 (range 2000..90000), subject to a 90000-character aggregate content budget. Provider metadata is JSON-sanitized and bounded: URL 4096, title 1024, error 2048, policy values 512 chars. content is markdown."""',
         '{"urls": urls, "char_limit": char_limit}',
     ),
     "read_file": (
@@ -1795,7 +1795,9 @@ _TOOL_DOC_LINES = [
     ("web_extract",
      "  web_extract(urls: list[str], char_limit: int = None) -> dict\n"
      "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
-     "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
+     "    No LLM summarization. Long pages use deterministic head+tail truncation; omitted middle text is not stored.\n"
+     "    char_limit defaults to 15000 (range 2000..90000), subject to a 90000-character aggregate content budget.\n"
+     "    Provider metadata limits: URL 4096, title 1024, error 2048, policy values 512 chars."),
     ("read_file",
      "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),

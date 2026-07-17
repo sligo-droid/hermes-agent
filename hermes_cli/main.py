@@ -2612,7 +2612,7 @@ def _clear_stale_openai_base_url():
 # Auxiliary model configuration
 #
 # Hermes uses lightweight "auxiliary" models for side tasks (vision analysis,
-# context compression, web extraction, session search, etc.). Each task has
+# context compression, browser text summarization, session search, etc.). Each task has
 # its own provider+model pair in config.yaml under `auxiliary.<task>`.
 #
 # The UI lives behind "Configure auxiliary models..." at the bottom of the
@@ -2625,7 +2625,7 @@ def _clear_stale_openai_base_url():
 _AUX_TASKS: list[tuple[str, str, str]] = [
     ("vision", "Vision", "image/screenshot analysis"),
     ("compression", "Compression", "context summarization"),
-    ("web_extract", "Web extract", "web page summarization"),
+    ("web_extract", "Browser text", "browser snapshot summarization"),
     ("approval", "Approval", "smart command approval"),
     ("mcp", "MCP", "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),

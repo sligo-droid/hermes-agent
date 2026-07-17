@@ -454,6 +454,7 @@ def load_cli_config() -> Dict[str, Any]:
                 "api_key": "",
             },
             "web_extract": {
+                # Legacy key: browser snapshot text summarization only.
                 "provider": "auto",
                 "model": "",
                 "base_url": "",
@@ -625,7 +626,8 @@ def load_cli_config() -> Dict[str, Any]:
             os.environ[env_var] = str(browser_config[config_key])
     
     # Apply auxiliary model/direct-endpoint overrides to environment variables.
-    # Vision and web_extract each have their own provider/model/base_url/api_key tuple.
+    # Vision and browser text summarization (legacy key: web_extract) each have
+    # their own provider/model/base_url/api_key tuple.
     # Compression config is read directly from config.yaml by run_agent.py and
     # auxiliary_client.py — no env var bridging needed.
     # Only set env vars for non-empty / non-default values so auto-detection

@@ -7,12 +7,10 @@ Run this after any updates to the web_tools.py module or backend libraries.
 
 Usage:
     python test_web_tools.py              # Run all tests
-    python test_web_tools.py --no-llm     # Skip LLM processing tests
     python test_web_tools.py --verbose    # Show detailed output
 
 Requirements:
     - PARALLEL_API_KEY or FIRECRAWL_API_KEY environment variable must be set
-    - An auxiliary LLM provider (OPENROUTER_API_KEY or Nous Portal auth) (optional, for LLM tests)
 """
 
 import pytest
@@ -86,9 +84,8 @@ def print_info(text: str, indent: int = 0):
 class WebToolsTester:
     """Test suite for web tools"""
     
-    def __init__(self, verbose: bool = False, test_llm: bool = True):
+    def __init__(self, verbose: bool = False):
         self.verbose = verbose
-        self.test_llm = test_llm
         self.test_results = {
             "passed": [],
             "failed": [],
@@ -127,12 +124,6 @@ class WebToolsTester:
         else:
             backend = _get_backend()
             self.log_result("Web Backend API Key", "passed", f"Using {backend} backend")
-        
-        # Auxiliary LLM summarization was removed — web_extract is now
-        # truncate-and-store (no LLM). Keep the flag off so any residual
-        # LLM-path assertions stay skipped.
-        self.log_result("Auxiliary LLM", "skipped", "web_extract no longer uses an LLM (truncate-and-store)")
-        self.test_llm = False
         
         return True
     
@@ -237,8 +228,8 @@ class WebToolsTester:
         return extracted_urls
     
     async def test_web_extract(self, urls: List[str] = None):
-        """Test web content extraction"""
-        print_section("Test 2: Web Extract (without LLM)")
+        """Test deterministic bounded web content extraction."""
+        print_section("Test 2: Web Extract (deterministic truncation)")
         
         # Use provided URLs or defaults
         if not urls:
@@ -264,25 +255,26 @@ class WebToolsTester:
                 result = await web_extract_tool(
                     test_urls,
                     format="markdown",
+                    char_limit=2_000,
                 )
                 
                 # Parse result
                 try:
                     data = json.loads(result)
                 except json.JSONDecodeError as e:
-                    self.log_result("Extract (no LLM)", "failed", f"Invalid JSON: {e}")
+                    self.log_result("Bounded extract", "failed", f"Invalid JSON: {e}")
                     if self.verbose:
                         print(f"    Raw response (first 500 chars): {result[:500]}...")
                     return
                 
                 if "error" in data:
-                    self.log_result("Extract (no LLM)", "failed", f"API error: {data['error']}")
+                    self.log_result("Bounded extract", "failed", f"API error: {data['error']}")
                     return
                 
                 results = data.get("results", [])
                 
                 if not results:
-                    self.log_result("Extract (no LLM)", "failed", "No results in response")
+                    self.log_result("Bounded extract", "failed", "No results in response")
                     if self.verbose:
                         print(f"    Response keys: {list(data.keys())}")
                     return
@@ -319,13 +311,13 @@ class WebToolsTester:
                 # Log results
                 if valid_results > 0:
                     self.log_result(
-                        "Extract (no LLM)", 
+                        "Bounded extract",
                         "passed", 
                         f"{valid_results}/{len(results)} pages extracted, {total_content_length} total chars"
                     )
                 else:
                     self.log_result(
-                        "Extract (no LLM)", 
+                        "Bounded extract",
                         "failed", 
                         f"No valid content. {failed_results} errors, {len(results) - failed_results} empty"
                     )
@@ -335,69 +327,10 @@ class WebToolsTester:
                             print(f"    {detail}")
                     
             except Exception as e:
-                self.log_result("Extract (no LLM)", "failed", f"Exception: {type(e).__name__}: {str(e)}")
+                self.log_result("Bounded extract", "failed", f"Exception: {type(e).__name__}: {str(e)}")
                 if self.verbose:
                     import traceback
                     print(f"    Traceback: {traceback.format_exc()}")
-    
-    async def test_web_extract_with_llm(self, urls: List[str] = None):
-        """Test web extraction with LLM processing"""
-        print_section("Test 3: Web Extract (with Gemini LLM)")
-        
-        if not self.test_llm:
-            self.log_result("Extract (with LLM)", "skipped", "LLM testing disabled")
-            return
-        
-        # Use a URL likely to have substantial content
-        test_url = urls[0] if urls else "https://docs.firecrawl.dev/features/scrape"
-        
-        try:
-            print(f"\n  Extracting and processing: {test_url}")
-            
-            result = await web_extract_tool(
-                [test_url],
-                format="markdown",
-                char_limit=1000,  # small budget to force truncation in the test
-            )
-            
-            data = json.loads(result)
-            
-            if "error" in data:
-                self.log_result("Extract (with LLM)", "failed", data["error"])
-                return
-            
-            results = data.get("results", [])
-            
-            if not results:
-                self.log_result("Extract (with LLM)", "failed", "No results returned")
-                return
-            
-            result = results[0]
-            content = result.get("content", "")
-            
-            if content:
-                content_len = len(content)
-                
-                # Check if content was actually processed (should be shorter than typical raw content)
-                if content_len > 0:
-                    self.log_result(
-                        "Extract (with LLM)", 
-                        "passed", 
-                        f"Content processed: {content_len} chars"
-                    )
-                    
-                    if self.verbose:
-                        print(f"\n    First 300 chars of processed content:")
-                        print(f"    {content[:300]}...")
-                else:
-                    self.log_result("Extract (with LLM)", "failed", "No content after processing")
-            else:
-                self.log_result("Extract (with LLM)", "failed", "No content field in result")
-                
-        except json.JSONDecodeError as e:
-            self.log_result("Extract (with LLM)", "failed", f"Invalid JSON: {e}")
-        except Exception as e:
-            self.log_result("Extract (with LLM)", "failed", str(e))
     
     async def run_all_tests(self):
         """Run all tests"""
@@ -416,10 +349,6 @@ class WebToolsTester:
         
         # Test extraction
         await self.test_web_extract(urls if urls else None)
-        
-        # Test extraction with LLM
-        if self.test_llm:
-            await self.test_web_extract_with_llm(urls if urls else None)
         
         # Print summary
         self.end_time = datetime.now()
@@ -462,7 +391,6 @@ class WebToolsTester:
                 "web_backend": _get_backend() if check_web_api_key() else None,
                 "firecrawl_api_key": check_firecrawl_api_key(),
                 "parallel_api_key": bool(os.getenv("PARALLEL_API_KEY")),
-                "auxiliary_model": False,
             }
         }
         
@@ -477,7 +405,6 @@ class WebToolsTester:
 async def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Test Web Tools Module")
-    parser.add_argument("--no-llm", action="store_true", help="Skip LLM processing tests")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed output")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode for web tools")
     
@@ -489,10 +416,7 @@ async def main():
         print_info("Debug mode enabled for web tools")
     
     # Create tester
-    tester = WebToolsTester(
-        verbose=args.verbose,
-        test_llm=not args.no_llm
-    )
+    tester = WebToolsTester(verbose=args.verbose)
     
     # Run tests
     success = await tester.run_all_tests()

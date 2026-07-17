@@ -7,7 +7,7 @@ sidebar_position: 3
 Hermes uses two kinds of model slots:
 
 - **Main model** — what the agent thinks with. Every user message, every tool-call loop, every streamed response goes through this model.
-- **Auxiliary models** — smaller side-jobs the agent offloads. Context compression, vision (image analysis), web-page summarization, approval scoring, MCP tool routing, session-title generation, and skill search. Each has its own slot and can be overridden independently.
+- **Auxiliary models** — smaller side-jobs the agent offloads. Context compression, vision (image analysis), browser snapshot text summarization, approval scoring, MCP tool routing, session-title generation, and skill search. Each has its own slot and can be overridden independently.
 
 This page covers configuring both from the dashboard. If you prefer config files or the CLI, jump to [Alternative methods](#alternative-methods) at the bottom.
 
@@ -67,7 +67,7 @@ Every auxiliary task defaults to `auto` — meaning Hermes tries your main model
 | **Vision** | When your main model lacks vision support. Point it at `google/gemini-2.5-flash` or `gpt-4o-mini`. |
 | **Compression** | When you're burning reasoning tokens on Opus/M2.7 just to summarize context. A fast chat model does the job at 1/50th the cost. |
 | **Approval** | For `approval_mode: smart` — a fast/cheap model (haiku, flash, gpt-5-mini) decides whether to auto-approve low-risk commands. Expensive models here are waste. |
-| **Web Extract** | When you use `web_extract` heavily. Same logic as compression — summarization doesn't need reasoning. |
+| **Browser Text** | Controls browser snapshot text summarization. The legacy config key is `auxiliary.web_extract`; the `web_extract` tool itself does not use an auxiliary model. |
 | **Skills Hub** | `hermes skills search` uses this. Usually fine at `auto`. |
 | **MCP** | MCP tool routing. Usually fine at `auto`. |
 | **Triage Specifier** | Routes the Kanban triage specifier (`hermes kanban specify`) that expands a rough one-liner into a concrete spec. A cheap, capable model works well. |
@@ -93,7 +93,7 @@ The dropdown has:
 
 - **Main model** — same as clicking Change on the main row.
 - **All auxiliary tasks** — assigns this model to all 11 aux slots at once. Useful when you just want every side-job on a cheap flash model.
-- **Individual task options** — Vision, Web Extract, Compression, etc. The currently-assigned model for each task is marked `current`.
+- **Individual task options** — Vision, Browser Text, Compression, etc. The currently-assigned model for each task is marked `current`.
 
 Cards are badged with `main` or `aux · <task>` when they're currently assigned to something — so you can see at a glance which of your historical models are wired in where.
 

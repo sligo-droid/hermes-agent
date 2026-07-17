@@ -352,7 +352,11 @@ async def test_web_extract_short_circuits_blocked_url(monkeypatch):
     from plugins.web.firecrawl import provider as firecrawl_provider
 
     # Allow test URLs past SSRF check so website policy is what gets tested
-    monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
+    async def allow_url(_url):
+        return True
+
+    monkeypatch.setattr(web_tools, "async_is_safe_url", allow_url)
+    monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda _url: True)
     # The per-URL website-policy gate moved into the firecrawl plugin's
     # extract() during the web-provider migration. Patch it at the new
     # location; the dispatcher-level gate (used by web_crawl_tool's
@@ -376,7 +380,7 @@ async def test_web_extract_short_circuits_blocked_url(monkeypatch):
     # Force the firecrawl plugin to be the active extract provider.
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
 
-    result = json.loads(await web_tools.web_extract_tool(["https://blocked.test"], use_llm_processing=False))
+    result = json.loads(await web_tools.web_extract_tool(["https://blocked.test"]))
 
     assert result["results"][0]["url"] == "https://blocked.test"
     assert "Blocked by website policy" in result["results"][0]["error"]
@@ -387,7 +391,11 @@ async def test_web_extract_blocks_redirected_final_url(monkeypatch):
     from tools import web_tools
     from plugins.web.firecrawl import provider as firecrawl_provider
 
-    monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
+    async def allow_url(_url):
+        return True
+
+    monkeypatch.setattr(web_tools, "async_is_safe_url", allow_url)
+    monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda _url: True)
 
     def fake_check(url):
         if url == "https://allowed.test":
@@ -416,7 +424,7 @@ async def test_web_extract_blocks_redirected_final_url(monkeypatch):
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
 
-    result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"], use_llm_processing=False))
+    result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"]))
 
     assert result["results"][0]["url"] == "https://blocked.test/final"
     assert result["results"][0]["content"] == ""
@@ -448,7 +456,11 @@ async def test_web_extract_blocks_redirected_final_url(monkeypatch):
     from plugins.web.firecrawl import provider as firecrawl_provider
 
     # Allow test URLs past SSRF check so website policy is what gets tested
-    monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
+    async def allow_url(_url):
+        return True
+
+    monkeypatch.setattr(web_tools, "async_is_safe_url", allow_url)
+    monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda _url: True)
 
     def fake_check(url):
         if url == "https://allowed.test":
@@ -479,7 +491,7 @@ async def test_web_extract_blocks_redirected_final_url(monkeypatch):
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
 
-    result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"], use_llm_processing=False))
+    result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"]))
 
     assert result["results"][0]["url"] == "https://blocked.test/final"
     assert result["results"][0]["content"] == ""
