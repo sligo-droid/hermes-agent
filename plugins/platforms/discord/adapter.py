@@ -127,7 +127,10 @@ _DISCORD_DIRECT_QUESTION_PROMPT = (
     "feature summary, or long-lived client-project coding workflow unless the "
     "user explicitly asks for implementation work. If the inline exchange turns "
     "out to be a genuine work request, call the Discord tool's "
-    "promote_to_action_thread action and continue the work in the new thread."
+    "promote_to_action_thread action. The tool returns the target thread link. "
+    "After it succeeds, STOP current-turn implementation, include that link in "
+    "your response, and ask the user to continue by sending a new message in the "
+    "promoted thread. Do not implement the work until that new inbound message."
 )
 
 try:
@@ -158,6 +161,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    merge_discord_action_request_metadata,
     cache_image_from_url,
     cache_image_from_bytes,
     cache_audio_from_url,
@@ -2912,7 +2916,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Failed to clear Discord terminal summary sync flag", self.name, exc_info=True)
         return str(target.get("sync_key") or board)
 
-    def _heuristic_action_request_intent(self, text: str) -> Optional[bool]:
+    def _heuristic_action_request_intent(
+        self,
+        text: str,
+        *,
+        actionable_thread_context: bool = False,
+    ) -> Optional[bool]:
         cleaned = re.sub(r"<@[!&]?\d+>", "", str(text or "")).strip()
         cleaned = re.sub(r"<#\d+>", "", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
@@ -2959,10 +2968,45 @@ class DiscordAdapter(BasePlatformAdapter):
             dict.fromkeys(candidate for candidate in (cleaned, leading_ack) if candidate)
         )
 
+        # An explicit request not to build is a direct-question signal even
+        # though the sentence contains an implementation verb. This pins the
+        # production wording from Discord message 1527747538797465641.
+        if any(
+            candidate.endswith("?")
+            and re.match(
+                r"^without\s+(?:building|implementing|changing|creating|adding|"
+                r"fixing|deploying|shipping|modifying|writing)\b",
+                candidate,
+            )
+            for candidate in intent_candidates
+        ):
+            return False
+
         if any(
             marker in candidate
             for candidate in intent_candidates
             for marker in explicit_markers
+        ):
+            return True
+
+        # Referential approvals are actionable only when the surrounding
+        # Discord thread is already a normal action thread. Outside that
+        # structural context, phrases such as "let's do this" remain too
+        # ambiguous to create or promote work on their own.
+        if actionable_thread_context and any(
+            re.fullmatch(
+                r"(?:(?:let(?:['’]?s)|lets|let us)\s+|"
+                r"(?:go ahead|please)\s+(?:and\s+)?)"
+                r"(?:build|create|add|implement|fix|change|update|remove|ship|"
+                r"deploy|make|refactor|wire|integrate|run|execute|do)\s+"
+                r"(?:it|this|that)(?:\s+now)?[.!]*",
+                candidate,
+            )
+            or re.fullmatch(
+                r"go ahead(?:\s+with\s+(?:it|this|that))?[.!]*",
+                candidate,
+            )
+            for candidate in intent_candidates
         ):
             return True
 
@@ -3100,10 +3144,15 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         text: str,
         context_lines: list[str] | None = None,
+        *,
+        actionable_thread_context: bool = False,
     ) -> bool:
         if not str(text or "").strip():
             return False
-        heuristic = self._heuristic_action_request_intent(text)
+        heuristic = self._heuristic_action_request_intent(
+            text,
+            actionable_thread_context=actionable_thread_context,
+        )
         if heuristic is not None:
             return heuristic
 
@@ -4812,6 +4861,11 @@ class DiscordAdapter(BasePlatformAdapter):
             and str(fable_plan_metadata.get("command", "") or "").strip().lower() == "fable"
         )
 
+    @staticmethod
+    def _action_lifecycle_enabled(event: MessageEvent) -> bool:
+        """Return whether this turn may mutate action summary/reaction state."""
+        return getattr(event, "discord_action_request_intent", None) is not False
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 
@@ -4821,6 +4875,8 @@ class DiscordAdapter(BasePlatformAdapter):
         own summary/embed message.
         """
         if not self._reactions_enabled():
+            return
+        if not self._action_lifecycle_enabled(event):
             return
         await self._mark_feature_summary_running(event)
         messages = await self._processing_reaction_messages(event)
@@ -4832,6 +4888,8 @@ class DiscordAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
+            return
+        if not self._action_lifecycle_enabled(event):
             return
         is_fable_event = self._is_fable_event(event)
         kanban_state = None
@@ -10411,10 +10469,22 @@ class DiscordAdapter(BasePlatformAdapter):
         project_context_obj = self._resolve_discord_project_context_with_shared_db(message.channel)
         self._invalidate_relevant_root_channels_cache_for_context(project_context_obj)
         project_context = project_context_obj.to_dict() if project_context_obj else None
+        existing_feature_summary_handle = None
+        existing_actionable_thread_context = False
+        if is_thread:
+            existing_feature_summary_handle = self._load_feature_summary_handle_for_thread(
+                message.channel,
+                project_context=project_context,
+            )
+            existing_actionable_thread_context = bool(
+                isinstance(existing_feature_summary_handle, dict)
+                and not self._action_thread_rejection_reason(existing_feature_summary_handle)
+            )
         preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
         direct_question_prompt = False
         action_request_intent: Optional[bool] = None
         voice_action_transcript = ""
+        voice_triage_preprocessed = False
         triage_context_lines: list[str] = []
         channel_name = str(getattr(message.channel, "name", "") or "").strip().lstrip("#")
         if channel_name:
@@ -10497,6 +10567,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         all_attachments,
                         message_is_voice=message_is_voice,
                     )
+                    voice_triage_preprocessed = True
                     triage_text = voice_triage_text
                     voice_action_transcript = voice_triage_text
                 action_request_intent = (
@@ -10505,6 +10576,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     else await self._classify_discord_action_request(
                         triage_text,
                         context_lines=triage_context_lines,
+                        actionable_thread_context=existing_actionable_thread_context,
                     )
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
@@ -10542,20 +10614,84 @@ class DiscordAdapter(BasePlatformAdapter):
             and not grill_me_trigger
             and (
                 (is_parent_channel_message and mention_prefix)
-                or (is_thread and (mention_prefix or replies_to_self))
+                or (is_thread and (mention_prefix or replies_to_self or message_is_voice))
             )
         ):
-            _stage_started = time.perf_counter()
-            action_request_intent = (
-                True
-                if is_action_request_channel
-                else await self._classify_discord_action_request(
-                    normalized_content,
-                    context_lines=triage_context_lines,
+            triage_text = normalized_content
+            if message_is_voice and all_attachments and not triage_text.strip():
+                preprocessed_attachment_media, voice_triage_text = await self._preprocess_voice_for_feature_triage(
+                    all_attachments,
+                    message_is_voice=True,
                 )
+                voice_triage_preprocessed = True
+                triage_text = voice_triage_text
+                voice_action_transcript = voice_triage_text
+            empty_action_attachment = bool(
+                existing_actionable_thread_context
+                and all_attachments
+                and not triage_text.strip()
             )
-            self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-            direct_question_prompt = not action_request_intent
+            if not empty_action_attachment or triage_text.strip():
+                _stage_started = time.perf_counter()
+                action_request_intent = (
+                    True
+                    if is_action_request_channel
+                    else await self._classify_discord_action_request(
+                        triage_text,
+                        context_lines=triage_context_lines,
+                        actionable_thread_context=existing_actionable_thread_context,
+                    )
+                )
+                self._mark_discord_stage(_intake_timing, "triage", _stage_started)
+                direct_question_prompt = not action_request_intent
+
+        # Accepted unmentioned turns in a participated/free-response action
+        # thread bypass the earlier mention/reply classifier. Classify them
+        # here once structural action identity is known so direct questions
+        # use ordinary runtime while terse approvals stay action turns.
+        if (
+            action_request_intent is None
+            and is_thread
+            and existing_actionable_thread_context
+            and not is_meeting_command_message
+            and not grill_me_trigger
+            and not is_slash_command_message
+        ):
+            late_triage_text = normalized_content or voice_action_transcript
+            if (
+                message_is_voice
+                and not late_triage_text.strip()
+                and not voice_triage_preprocessed
+            ):
+                preprocessed_attachment_media, voice_triage_text = await self._preprocess_voice_for_feature_triage(
+                    all_attachments,
+                    message_is_voice=True,
+                )
+                voice_triage_preprocessed = True
+                late_triage_text = voice_triage_text
+                voice_action_transcript = voice_triage_text
+            # Empty screenshot/document follow-ups retain structural action
+            # routing. There is no user text to classify as a direct question;
+            # native voice remains classifiable when transcription produced text.
+            if late_triage_text.strip():
+                _stage_started = time.perf_counter()
+                action_request_intent = await self._classify_discord_action_request(
+                    late_triage_text,
+                    context_lines=triage_context_lines,
+                    actionable_thread_context=True,
+                )
+                self._mark_discord_stage(_intake_timing, "triage", _stage_started)
+                direct_question_prompt = not action_request_intent
+
+        def _feature_summary_initial_request(candidate: Any) -> str:
+            candidate_text = str(candidate or "")
+            if (
+                message_is_voice
+                and not candidate_text.strip()
+                and voice_action_transcript.strip()
+            ):
+                return voice_action_transcript
+            return candidate_text
 
         project_summary_handle = None
         feature_summary_handle = None
@@ -10579,7 +10715,7 @@ class DiscordAdapter(BasePlatformAdapter):
             feature_summary_handle = await self.initialize_feature_summary(
                 auto_threaded_channel,
                 parent_channel=message.channel,
-                initial_request=normalized_content,
+                initial_request=_feature_summary_initial_request(normalized_content),
                 project_context=project_context,
                 transcript_quote=voice_action_transcript if message_is_voice else None,
                 source_message_id=str(message.id),
@@ -10588,32 +10724,45 @@ class DiscordAdapter(BasePlatformAdapter):
         elif (
             is_thread
             and not slash_goal_uses_attachment_body
-            and (slash_command_starts_threaded_work or action_request_intent is True)
+            and slash_command_starts_threaded_work
         ):
             if is_fable_implementation_command:
                 # These commands must operate on a pre-existing normal action
                 # thread. Do not replace a worker/non-action summary with a
                 # new one that would make the gateway misclassify the thread.
-                feature_summary_handle = self._load_feature_summary_handle_for_thread(
-                    message.channel,
-                    project_context=project_context,
-                )
+                feature_summary_handle = existing_feature_summary_handle
             else:
                 _stage_started = time.perf_counter()
                 feature_summary_handle = await self.initialize_feature_summary(
                     message.channel,
                     parent_channel=self._thread_parent_channel(message.channel),
-                    initial_request=normalized_content,
+                    initial_request=_feature_summary_initial_request(normalized_content),
                     project_context=project_context,
+                    transcript_quote=voice_action_transcript if message_is_voice else None,
                     source_message_id=str(message.id),
                     reply_to_message=message,
                 )
                 self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
-        elif is_thread:
-            feature_summary_handle = self._load_feature_summary_handle_for_thread(
+        elif is_thread and isinstance(existing_feature_summary_handle, dict):
+            feature_summary_handle = existing_feature_summary_handle
+        elif (
+            is_thread
+            and not slash_goal_uses_attachment_body
+            and action_request_intent is True
+        ):
+            _stage_started = time.perf_counter()
+            feature_summary_handle = await self.initialize_feature_summary(
                 message.channel,
+                parent_channel=self._thread_parent_channel(message.channel),
+                initial_request=_feature_summary_initial_request(normalized_content),
                 project_context=project_context,
+                transcript_quote=voice_action_transcript if message_is_voice else None,
+                source_message_id=str(message.id),
+                reply_to_message=message,
             )
+            self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
+        elif is_thread:
+            feature_summary_handle = existing_feature_summary_handle
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -10835,8 +10984,9 @@ class DiscordAdapter(BasePlatformAdapter):
             feature_summary_handle = await self.initialize_feature_summary(
                 summary_channel,
                 parent_channel=parent_for_summary,
-                initial_request=event_text,
+                initial_request=_feature_summary_initial_request(event_text),
                 project_context=project_context,
+                transcript_quote=voice_action_transcript if message_is_voice else None,
                 source_message_id=str(message.id),
                 reply_to_message=None if auto_threaded_channel is not None else message,
             )
@@ -10924,6 +11074,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
+        _base_channel_prompt = _channel_prompt
         if direct_question_prompt:
             _channel_prompt = self._append_direct_question_prompt(_channel_prompt)
 
@@ -10944,6 +11095,8 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             feature_summary=feature_summary_handle,
             project_summary=project_summary_handle,
+            discord_action_request_intent=action_request_intent,
+            discord_action_request_base_channel_prompt=_base_channel_prompt,
             channel_context=_channel_context,
             goal_thread_context=_goal_thread_context,
             text_document_inlined=text_document_inlined,
@@ -11024,6 +11177,7 @@ class DiscordAdapter(BasePlatformAdapter):
         else:
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            merge_discord_action_request_metadata(existing, event)
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             raw_messages = getattr(existing, "_batched_raw_messages", None)
             if raw_messages is None:

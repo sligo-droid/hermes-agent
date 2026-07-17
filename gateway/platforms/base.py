@@ -1355,6 +1355,16 @@ class MessageEvent:
     feature_summary: Optional[Dict[str, Any]] = None
     project_summary: Optional[Dict[str, Any]] = None
 
+    # Discord adapter intent verdict for the current user turn. True selects
+    # action runtime behavior, False selects ordinary question behavior while
+    # retaining action-thread identity, and None preserves legacy/synthetic
+    # routing based on structural thread metadata.
+    discord_action_request_intent: Optional[bool] = None
+
+    # Discord channel prompt before any per-turn direct-question overlay.
+    # This is transient intake metadata used when coalescing inbound messages.
+    discord_action_request_base_channel_prompt: Optional[str] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the
@@ -1546,6 +1556,38 @@ class MetadataReply(str):
         return str.__str__(self)
 
 
+def merge_discord_action_request_metadata(
+    existing: MessageEvent,
+    event: MessageEvent,
+) -> None:
+    """Merge per-turn Discord intent without retaining a stale prompt overlay.
+
+    Coalesced text belongs to one ordered semantic turn. The latest explicit
+    verdict wins, while a legacy/synthetic ``None`` verdict never replaces an
+    earlier explicit one. The matching prompt metadata moves with that verdict.
+    """
+    incoming_intent = getattr(event, "discord_action_request_intent", None)
+    if incoming_intent is None:
+        return
+
+    base_prompt_attr = "discord_action_request_base_channel_prompt"
+    legacy_base_prompt_attr = "_discord_action_request_base_channel_prompt"
+    incoming_base_prompt = getattr(event, base_prompt_attr, None)
+    if incoming_base_prompt is None:
+        incoming_base_prompt = getattr(event, legacy_base_prompt_attr, None)
+    if incoming_base_prompt is None:
+        incoming_base_prompt = getattr(existing, base_prompt_attr, None)
+    if incoming_base_prompt is None:
+        incoming_base_prompt = getattr(existing, legacy_base_prompt_attr, None)
+
+    existing.discord_action_request_intent = incoming_intent
+    existing.discord_action_request_base_channel_prompt = incoming_base_prompt
+    if incoming_intent is True:
+        existing.channel_prompt = incoming_base_prompt
+    else:
+        existing.channel_prompt = getattr(event, "channel_prompt", None)
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -1572,6 +1614,7 @@ def merge_pending_message_event(
         incoming_has_media = bool(event.media_urls)
 
         if existing_is_photo and incoming_is_photo:
+            merge_discord_action_request_metadata(existing, event)
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -1579,6 +1622,7 @@ def merge_pending_message_event(
             return
 
         if existing_has_media or incoming_has_media:
+            merge_discord_action_request_metadata(existing, event)
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -1601,6 +1645,7 @@ def merge_pending_message_event(
             and getattr(existing, "message_type", None) == MessageType.TEXT
             and event.message_type == MessageType.TEXT
         ):
+            merge_discord_action_request_metadata(existing, event)
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
@@ -3290,6 +3335,7 @@ class BasePlatformAdapter(ABC):
                     if state.event.text
                     else event.text
                 )
+            merge_discord_action_request_metadata(state.event, event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:

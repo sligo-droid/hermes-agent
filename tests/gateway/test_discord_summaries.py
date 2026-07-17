@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 from gateway.work_ledger import GatewayWorkLedger
 import gateway.run as gateway_run
@@ -271,6 +271,14 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert event.project_summary["channel_id"] == "100"
     assert event.feature_summary["thread_id"] == "200"
     assert event.feature_summary["kanban_board"] is None
+    assert event.feature_summary["initial_request"] == "Build a deploy dashboard"
+    tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
+    assert tier is not None
+    assert (tier.name, tier.model, tier.reasoning_effort) == (
+        "discord_action",
+        "gpt-5.6-sol",
+        "high",
+    )
     assert event.text == "Build a deploy dashboard"
     assert event.message_type == MessageType.TEXT
 
@@ -2381,6 +2389,10 @@ async def test_tagged_question_answers_in_thread_without_feature_summary(adapter
     assert event.source.parent_chat_id == "100"
     assert "classified as a direct question, not an action request" in event.channel_prompt
     assert "promote_to_action_thread" in event.channel_prompt
+    assert "STOP current-turn implementation" in event.channel_prompt
+    assert "include that link" in event.channel_prompt
+    assert "sending a new message in the promoted thread" in event.channel_prompt
+    assert "continue the work in the new thread" not in event.channel_prompt
 
 
 @pytest.mark.asyncio
@@ -2532,7 +2544,486 @@ async def test_tagged_thread_question_gets_direct_answer_prompt(adapter, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_native_voice_feature_request_triages_from_transcript(adapter, monkeypatch):
+async def test_existing_action_thread_exact_direct_question_keeps_summary_and_sets_false_intent(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    adapter.initialize_feature_summary = AsyncMock()
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=thread,
+            message_id=1527747538797465641,
+            content=(
+                "<@999> Without building anything, can you give me some concrete "
+                'examples of the sort of items in the "include only" list?'
+            ),
+        )
+    )
+
+    adapter.initialize_feature_summary.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_id == "1527747538797465641"
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is False
+    assert event.source.chat_id == "200"
+    assert event.source.thread_id == "200"
+    assert "classified as a direct question, not an action request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_mentioned_attachment_only_existing_action_thread_keeps_none_intent(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._cache_discord_image = AsyncMock(return_value="/tmp/screenshot.png")
+    attachment = FakeAttachment(
+        filename="screenshot.png",
+        content_type="image/png",
+        data=b"png",
+    )
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=thread,
+            content="<@999>",
+            attachments=[attachment],
+        )
+    )
+
+    adapter._classify_discord_action_request.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is None
+    assert event.message_type == MessageType.PHOTO
+    assert event.media_urls == ["/tmp/screenshot.png"]
+    assert "classified as a direct question" not in str(event.channel_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_reply_attachment_only_existing_action_thread_keeps_none_intent(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._cache_discord_document = AsyncMock(return_value=b"pdf")
+    attachment = FakeAttachment(
+        filename="requirements.pdf",
+        content_type="application/pdf",
+        data=b"pdf",
+    )
+    message = _make_message(adapter, channel=thread, content="", attachments=[attachment])
+    message.mentions = []
+    message.type = discord_platform.discord.MessageType.reply
+    message.reference = SimpleNamespace(
+        resolved=SimpleNamespace(id=777, author=adapter._client.user, content="Prior response"),
+        cached_message=None,
+    )
+
+    with patch(
+        "plugins.platforms.discord.adapter.cache_document_from_bytes",
+        return_value="/tmp/requirements.pdf",
+    ):
+        await adapter._handle_message(message)
+
+    adapter._classify_discord_action_request.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is None
+    assert event.message_type == MessageType.DOCUMENT
+    assert event.media_urls == ["/tmp/requirements.pdf"]
+    assert "classified as a direct question" not in str(event.channel_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_reply_native_voice_existing_action_thread_classifies_transcript(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    adapter._classify_discord_action_request = AsyncMock(return_value=True)
+    attachment = SimpleNamespace(
+        url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        filename="voice-message.ogg",
+        content_type=None,
+        size=10,
+        read=AsyncMock(return_value=b"fake ogg"),
+        duration_secs=2.0,
+        waveform=b"fake",
+    )
+    adapter._preprocess_voice_for_feature_triage = AsyncMock(
+        return_value=({id(attachment): ("/tmp/voice.ogg", "audio/ogg")}, "Build the approved parser")
+    )
+    message = _make_message(adapter, channel=thread, content="", attachments=[attachment])
+    message.mentions = []
+    message.type = discord_platform.discord.MessageType.reply
+    message.reference = SimpleNamespace(
+        resolved=SimpleNamespace(id=777, author=adapter._client.user, content="Prior response"),
+        cached_message=None,
+    )
+    message.guild = parent.guild
+    message.author.bot = False
+    message.flags = SimpleNamespace(voice=True)
+
+    await adapter._handle_message(message)
+
+    adapter._preprocess_voice_for_feature_triage.assert_awaited_once()
+    adapter._classify_discord_action_request.assert_awaited_once()
+    assert adapter._classify_discord_action_request.await_args.args[0] == "Build the approved parser"
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is True
+    assert event.message_type == MessageType.VOICE
+    assert event.media_urls == ["/tmp/voice.ogg"]
+    assert "classified as a direct question" not in str(event.channel_prompt or "")
+
+
+@pytest.mark.parametrize(
+    ("trigger", "transcript", "expected_tier", "expected_effort"),
+    [
+        ("auto", "Build the approved parser", "discord_action", "high"),
+        ("mention", "Migrate the production auth schema", "advanced", "xhigh"),
+        ("reply", "Add parser telemetry", "discord_action", "high"),
+        ("action_channel", "Audit the production permission model", "advanced", "xhigh"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_existing_thread_native_voice_promotes_action_from_transcript(
+    adapter,
+    monkeypatch,
+    trigger,
+    transcript,
+    expected_tier,
+    expected_effort,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    if trigger in {"auto", "action_channel"}:
+        monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
+    if trigger == "action_channel":
+        adapter.config.extra["action_request_channels"] = "100"
+
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=None)
+    adapter._classify_discord_action_request = AsyncMock(return_value=True)
+    attachment = SimpleNamespace(
+        url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        filename="voice-message.ogg",
+        content_type=None,
+        size=10,
+        read=AsyncMock(return_value=b"fake ogg"),
+        duration_secs=2.0,
+        waveform=b"fake",
+    )
+    adapter._preprocess_voice_for_feature_triage = AsyncMock(
+        return_value=({id(attachment): ("/tmp/voice.ogg", "audio/ogg")}, transcript)
+    )
+    content = "<@999>" if trigger == "mention" else ""
+    message = _make_message(adapter, channel=thread, content=content, attachments=[attachment])
+    if trigger != "mention":
+        message.mentions = []
+    if trigger == "reply":
+        message.type = discord_platform.discord.MessageType.reply
+        message.reference = SimpleNamespace(
+            resolved=SimpleNamespace(id=777, author=adapter._client.user, content="Prior response"),
+            cached_message=None,
+        )
+    message.guild = parent.guild
+    message.author.bot = False
+    message.flags = SimpleNamespace(voice=True)
+
+    await adapter._handle_message(message)
+
+    adapter._preprocess_voice_for_feature_triage.assert_awaited_once()
+    if trigger == "action_channel":
+        adapter._classify_discord_action_request.assert_not_awaited()
+    else:
+        adapter._classify_discord_action_request.assert_awaited_once()
+        assert adapter._classify_discord_action_request.await_args.args[0] == transcript
+    event = adapter.handle_message.await_args.args[0]
+    assert event.discord_action_request_intent is True
+    assert event.feature_summary["initial_request"] == transcript
+    assert gateway_run._is_standard_discord_action_request(event.source, event.feature_summary)
+    tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
+    assert tier is not None
+    assert (tier.name, tier.model, tier.reasoning_effort) == (
+        expected_tier,
+        "gpt-5.6-sol",
+        expected_effort,
+    )
+    assert any(
+        payload.get("content") == f"> {transcript}"
+        for payload, _message in thread.sent
+    )
+    assert event.media_urls == ["/tmp/voice.ogg"]
+
+
+@pytest.mark.asyncio
+async def test_untriggered_existing_thread_native_voice_is_not_transcribed(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "false")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    attachment = SimpleNamespace(
+        filename="voice-message.ogg",
+        content_type=None,
+        duration_secs=2.0,
+        waveform=b"fake",
+    )
+    adapter._preprocess_voice_for_feature_triage = AsyncMock()
+    message = _make_message(adapter, channel=thread, content="", attachments=[attachment])
+    message.mentions = []
+    message.guild = parent.guild
+    message.author.bot = False
+    message.flags = SimpleNamespace(voice=True)
+
+    await adapter._handle_message(message)
+
+    adapter._preprocess_voice_for_feature_triage.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_action_thread_exact_approval_stays_action_without_promotion_prompt(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    adapter.initialize_feature_summary = AsyncMock()
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=thread,
+            message_id=1527750909164261467,
+            content="<@999> Okay, let's build this.",
+        )
+    )
+
+    adapter.initialize_feature_summary.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_id == "1527750909164261467"
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is True
+    assert "promote_to_action_thread" not in str(event.channel_prompt or "")
+    assert "classified as a direct question" not in str(event.channel_prompt or "")
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_intent", "expects_question_prompt"),
+    [
+        ("What changed?", False, True),
+        ("Okay, let's build this.", True, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unmentioned_existing_action_thread_gets_late_intent_classification(
+    adapter,
+    monkeypatch,
+    content,
+    expected_intent,
+    expects_question_prompt,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.extra["thread_require_mention"] = False
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._threads.mark("200")
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    message = _make_message(adapter, channel=thread, content=content)
+    message.mentions = []
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is expected_intent
+    assert (
+        "classified as a direct question" in str(event.channel_prompt or "")
+    ) is expects_question_prompt
+
+
+@pytest.mark.parametrize(
+    ("attachment", "expected_type", "cached_path"),
+    [
+        (
+            FakeAttachment(filename="screenshot.png", content_type="image/png", data=b"png"),
+            MessageType.PHOTO,
+            "/tmp/screenshot.png",
+        ),
+        (
+            FakeAttachment(filename="requirements.pdf", content_type="application/pdf", data=b"pdf"),
+            MessageType.DOCUMENT,
+            "/tmp/requirements.pdf",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unmentioned_attachment_only_action_followup_skips_late_intent_classification(
+    adapter,
+    monkeypatch,
+    attachment,
+    expected_type,
+    cached_path,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.extra["thread_require_mention"] = False
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._threads.mark("200")
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._cache_discord_image = AsyncMock(return_value=cached_path)
+    adapter._cache_discord_document = AsyncMock(return_value=attachment._data)
+    message = _make_message(
+        adapter,
+        channel=thread,
+        content="",
+        attachments=[attachment],
+    )
+    message.mentions = []
+
+    with patch(
+        "plugins.platforms.discord.adapter.cache_document_from_bytes",
+        return_value=cached_path,
+    ):
+        await adapter._handle_message(message)
+
+    adapter._classify_discord_action_request.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is None
+    assert event.message_type == expected_type
+    assert event.media_urls == [cached_path]
+    assert "classified as a direct question" not in str(event.channel_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_voice_action_followup_classifies_transcript(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.extra["thread_require_mention"] = False
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._threads.mark("200")
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
+    adapter._classify_discord_action_request = AsyncMock(return_value=True)
+    attachment = SimpleNamespace(
+        url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        filename="voice-message.ogg",
+        content_type=None,
+        size=10,
+        read=AsyncMock(return_value=b"fake ogg"),
+        duration_secs=2.0,
+        waveform=b"fake",
+    )
+    adapter._preprocess_voice_for_feature_triage = AsyncMock(
+        return_value=({id(attachment): ("/tmp/voice.ogg", "audio/ogg")}, "Build the approved parser")
+    )
+    message = _make_message(adapter, channel=thread, content="", attachments=[attachment])
+    message.mentions = []
+    message.guild = parent.guild
+    message.author.bot = False
+    message.flags = SimpleNamespace(voice=True)
+
+    await adapter._handle_message(message)
+
+    adapter._classify_discord_action_request.assert_awaited_once()
+    assert adapter._classify_discord_action_request.await_args.args[0] == "Build the approved parser"
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is feature_summary
+    assert event.discord_action_request_intent is True
+    assert event.media_urls == ["/tmp/voice.ogg"]
+    assert "classified as a direct question" not in str(event.channel_prompt or "")
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected_tier", "expected_effort"),
+    [
+        ("Build a deploy dashboard", "discord_action", "high"),
+        ("Migrate the production auth schema", "advanced", "xhigh"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_native_voice_feature_request_triages_from_transcript(
+    adapter,
+    monkeypatch,
+    transcript,
+    expected_tier,
+    expected_effort,
+):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
@@ -2566,7 +3057,7 @@ async def test_native_voice_feature_request_triages_from_transcript(adapter, mon
         return_value="/tmp/voice_from_read.ogg",
     ) as mock_cache, patch(
         "tools.transcription_tools.transcribe_audio",
-        return_value={"success": True, "transcript": "Build a deploy dashboard"},
+        return_value={"success": True, "transcript": transcript},
     ) as mock_transcribe:
         await adapter._handle_message(message)
 
@@ -2574,9 +3065,17 @@ async def test_native_voice_feature_request_triages_from_transcript(adapter, mon
     mock_transcribe.assert_called_once_with("/tmp/voice_from_read.ogg")
     adapter._auto_create_thread.assert_awaited_once_with(message)
     assert len(thread.sent) == 2
-    assert thread.sent[1][0]["content"] == "> Build a deploy dashboard"
+    assert thread.sent[1][0]["content"] == f"> {transcript}"
     event = adapter.handle_message.await_args.args[0]
     assert event.feature_summary["thread_id"] == "200"
+    assert event.feature_summary["initial_request"] == transcript
+    tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
+    assert tier is not None
+    assert (tier.name, tier.model, tier.reasoning_effort) == (
+        expected_tier,
+        "gpt-5.6-sol",
+        expected_effort,
+    )
     assert event.media_urls == ["/tmp/voice_from_read.ogg"]
     assert event.media_types == ["audio/ogg"]
 
@@ -2709,6 +3208,144 @@ async def test_discord_feature_summary_title_uses_request_not_stale_session_titl
         status="Complete",
         title="investigate and fix thread 1507755696501030933",
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_question_processing_start_and_end_leave_action_lifecycle_unchanged(adapter):
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": "Implement the parser",
+        "title": "Parser rollout",
+        "status": "In progress",
+        "outcome": "Implementation is halfway complete.",
+        "kanban_board": None,
+    }
+    before = dict(feature_summary)
+    event = MessageEvent(
+        text="What remains unfinished?",
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="200",
+            chat_type="thread",
+            thread_id="200",
+        ),
+        feature_summary=feature_summary,
+        discord_action_request_intent=False,
+    )
+    adapter._reactions_enabled = MagicMock(return_value=True)
+    adapter.update_feature_summary = AsyncMock(return_value=True)
+    adapter._processing_reaction_messages = AsyncMock(return_value=[SimpleNamespace(id=400)])
+    adapter._set_message_reaction_state = AsyncMock()
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter.update_feature_summary.assert_not_awaited()
+    adapter._processing_reaction_messages.assert_not_awaited()
+    adapter._set_message_reaction_state.assert_not_awaited()
+    assert feature_summary == before
+
+
+@pytest.mark.asyncio
+async def test_successful_promotion_waits_for_next_target_thread_message(adapter):
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    source_message_id = _discord_snowflake_at(time.time())
+    parent.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(id=int(source_message_id), thread=thread)
+    )
+    adapter._resolve_channel_by_id = AsyncMock(
+        side_effect=lambda channel_id: parent if str(channel_id) == "100" else thread
+    )
+    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
+    adapter._threads.mark = MagicMock()
+
+    assert await adapter.initialize_promoted_action_thread(
+        channel_id="100",
+        message_id=source_message_id,
+        thread_id="200",
+        initial_request="Build the parser",
+    ) is True
+    feature_summary = adapter._load_feature_summary_handle_by_thread_id("200")
+    assert feature_summary is not None
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._adapter_for_source = lambda _source: adapter
+    runner._session_has_pending_background_workers = lambda *args, **kwargs: False
+    runner._discord_work_item_id_for_event = lambda *args, **kwargs: None
+    runner._discord_ledger_summary_status = lambda _work_id, status: status
+    runner._summarize_discord_feature_outcome = lambda response: response
+    callbacks = []
+    adapter.register_post_delivery_callback = (
+        lambda session_key, callback, generation=None: callbacks.append(callback)
+    )
+    adapter._reactions_enabled = MagicMock(return_value=True)
+    adapter._processing_reaction_messages = AsyncMock(return_value=[])
+    adapter.update_feature_summary = AsyncMock(return_value=True)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="200",
+        chat_type="thread",
+        thread_id="200",
+    )
+    promoted_turn = MessageEvent(
+        text="Can you explain this first?",
+        source=source,
+        discord_action_request_intent=False,
+    )
+    promotion_link = "https://discord.com/channels/5/200"
+    promotion_response = (
+        f"I created the action thread: {promotion_link}. "
+        "Please continue by sending a new message there."
+    )
+    await adapter.on_processing_start(promoted_turn)
+    runner._register_discord_summary_post_delivery(
+        event=promoted_turn,
+        source=source,
+        session_key="discord:200",
+        run_generation=1,
+        session_id="session-1",
+        final_response=promotion_response,
+        agent_result={"completed": True},
+    )
+    assert promoted_turn.source is source
+    assert promoted_turn.feature_summary is None
+    assert promotion_link in promotion_response
+    assert "sending a new message" in promotion_response
+    adapter.update_feature_summary.assert_not_awaited()
+    adapter._processing_reaction_messages.assert_not_awaited()
+    assert callbacks == []
+
+    next_turn = MessageEvent(
+        text="Build it now.",
+        source=source,
+    )
+    assert runner._hydrate_discord_feature_summary_from_adapter(next_turn) is not None
+    assert next_turn.feature_summary == feature_summary
+    assert gateway_run._is_standard_discord_action_request(
+        next_turn.source,
+        next_turn.feature_summary,
+    )
+    await adapter.on_processing_start(next_turn)
+    runner._register_discord_summary_post_delivery(
+        event=next_turn,
+        source=source,
+        session_key="discord:200",
+        run_generation=2,
+        session_id="session-1",
+        final_response="Implemented the parser.",
+        agent_result={"completed": True},
+    )
+
+    assert len(callbacks) == 1
+    assert await callbacks[0]() is True
+    assert [call.kwargs["status"] for call in adapter.update_feature_summary.await_args_list] == [
+        "Running",
+        "Complete",
+    ]
 
 
 @pytest.mark.asyncio

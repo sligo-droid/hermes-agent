@@ -103,6 +103,52 @@ async def test_completion_turn_targets_original_discord_thread_and_carries_worke
 
 
 @pytest.mark.asyncio
+async def test_coding_worker_completion_keeps_legacy_action_runtime_after_false_user_turn():
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner._adapter_for_source = lambda source: adapter
+    feature_summary = {
+        "initial_request": "Implement the parser fix",
+        "kanban_board": None,
+    }
+
+    class _Ledger:
+        def id_for_event(self, _event, _session_key):
+            return None
+
+        def get(self, _work_id):
+            return None
+
+        def incomplete_items(self):
+            return [
+                {
+                    "id": "work-1",
+                    "session_key": "agent:main:discord:thread:111:222",
+                    "platform": "discord",
+                    "status": "agent_running",
+                    "feature_summary": feature_summary,
+                    "channel_prompt": "Project instructions",
+                }
+            ]
+
+    runner._ledger = lambda: _Ledger()
+    event = _coding_event()
+    runner._enrich_async_delegation_routing(event)
+
+    assert await runner._inject_async_delegation_completion(
+        _format_gateway_process_notification(event),
+        event,
+    )
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.internal is True
+    assert synth_event.feature_summary == feature_summary
+    assert synth_event.discord_action_request_intent is None
+    assert synth_event.channel_prompt == "Project instructions"
+    assert synth_event.discord_action_request_base_channel_prompt is None
+
+
+@pytest.mark.asyncio
 async def test_discord_reaction_gate_keeps_dispatch_pending_until_completion_turn():
     _reset_async_state()
     gate = threading.Event()

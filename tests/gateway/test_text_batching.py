@@ -119,6 +119,89 @@ class TestDiscordTextBatching:
         assert "split" in text
 
     @pytest.mark.asyncio
+    async def test_split_batch_later_action_upgrades_intent_and_removes_question_prompt(self):
+        adapter = _make_discord_adapter()
+        adapter._text_batch_delay_seconds = 30
+        first = _make_event("What should we build?", Platform.DISCORD)
+        first.message_id = "first-message"
+        first.discord_action_request_intent = False
+        first.channel_prompt = "Project instructions\n\nDirect question overlay"
+        first.discord_action_request_base_channel_prompt = "Project instructions"
+        second = _make_event("Okay, let's build this", Platform.DISCORD)
+        second.message_id = "second-message"
+        second.discord_action_request_intent = True
+        second.channel_prompt = "Project instructions"
+        second.discord_action_request_base_channel_prompt = "Project instructions"
+
+        adapter._enqueue_text_event(first)
+        adapter._enqueue_text_event(second)
+
+        pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
+        assert pending.text == "What should we build?\nOkay, let's build this"
+        assert pending.discord_action_request_intent is True
+        assert pending.channel_prompt == "Project instructions"
+        assert "Direct question overlay" not in pending.channel_prompt
+        assert pending.message_id == "first-message"
+        assert pending.source is first.source
+
+        for task in list(adapter._pending_text_batch_tasks.values()):
+            task.cancel()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_split_batch_later_question_overrides_action_intent_and_prompt(self):
+        adapter = _make_discord_adapter()
+        adapter._text_batch_delay_seconds = 30
+        first = _make_event("Okay, let's build this", Platform.DISCORD)
+        first.discord_action_request_intent = True
+        first.channel_prompt = "Project instructions"
+        first.discord_action_request_base_channel_prompt = "Project instructions"
+        second = _make_event("Actually, stop. What would this change?", Platform.DISCORD)
+        second.discord_action_request_intent = False
+        second.channel_prompt = "Project instructions\n\nDirect question overlay"
+        second.discord_action_request_base_channel_prompt = "Project instructions"
+
+        adapter._enqueue_text_event(first)
+        adapter._enqueue_text_event(second)
+
+        pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
+        assert pending.discord_action_request_intent is False
+        assert pending.channel_prompt == "Project instructions\n\nDirect question overlay"
+        assert pending.discord_action_request_base_channel_prompt == "Project instructions"
+
+        for task in list(adapter._pending_text_batch_tasks.values()):
+            task.cancel()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_split_batch_question_only_chunks_remain_question_intent(self):
+        adapter = _make_discord_adapter()
+        adapter._text_batch_delay_seconds = 30
+        first = _make_event("Without building, can you explain", Platform.DISCORD)
+        first.message_id = "first-question"
+        first.discord_action_request_intent = False
+        first.channel_prompt = "Project instructions\n\nDirect question overlay"
+        first.discord_action_request_base_channel_prompt = "Project instructions"
+        second = _make_event("which items qualify?", Platform.DISCORD)
+        second.message_id = "second-question"
+        second.discord_action_request_intent = False
+        second.channel_prompt = "Project instructions\n\nDirect question overlay"
+        second.discord_action_request_base_channel_prompt = "Project instructions"
+
+        adapter._enqueue_text_event(first)
+        adapter._enqueue_text_event(second)
+
+        pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
+        assert pending.discord_action_request_intent is False
+        assert pending.channel_prompt.endswith("Direct question overlay")
+        assert pending.message_id == "first-question"
+        assert pending.source is first.source
+
+        for task in list(adapter._pending_text_batch_tasks.values()):
+            task.cancel()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
     async def test_three_way_split_aggregated(self):
         adapter = _make_discord_adapter()
 

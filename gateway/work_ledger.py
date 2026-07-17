@@ -762,6 +762,14 @@ class GatewayWorkLedger:
         message_type = getattr(getattr(event, "message_type", None), "value", None)
         normalized_visual_config = normalize_visual_qa_config(visual_qa_config)
         visual_requirement = _visual_qa_requirement_for_event(event)
+        action_intent = getattr(event, "discord_action_request_intent", None)
+        channel_prompt = getattr(event, "channel_prompt", None)
+        if isinstance(action_intent, bool):
+            channel_prompt = getattr(
+                event,
+                "discord_action_request_base_channel_prompt",
+                None,
+            )
         item = {
             "id": work_id,
             "status": status,
@@ -776,7 +784,7 @@ class GatewayWorkLedger:
             "message_id": getattr(event, "message_id", None) or getattr(source, "message_id", None),
             "reply_to_message_id": getattr(event, "reply_to_message_id", None),
             "reply_to_text": getattr(event, "reply_to_text", None),
-            "channel_prompt": getattr(event, "channel_prompt", None),
+            "channel_prompt": channel_prompt,
             "channel_context": getattr(event, "channel_context", None),
             "goal_thread_context": getattr(event, "goal_thread_context", None),
             "feature_summary": _durable_metadata(getattr(event, "feature_summary", None)),

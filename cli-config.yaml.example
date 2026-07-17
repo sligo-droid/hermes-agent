@@ -177,6 +177,32 @@ model:
 #   response_cache_ttl: 300      # Cache TTL in seconds, 1-86400 (default: 300)
 
 # =============================================================================
+# Named Model Tiers
+# =============================================================================
+# Model and reasoning effort are selected atomically for runtime routes.
+model_tiers:
+  trivial:
+    model: gpt-5.6-luna
+    opencode_model: hermes-codex/gpt-5.6-luna
+    reasoning_effort: medium
+  basic:
+    model: gpt-5.6-terra
+    opencode_model: hermes-codex/gpt-5.6-terra
+    reasoning_effort: high
+  intermediate:
+    model: gpt-5.6-terra
+    opencode_model: hermes-codex/gpt-5.6-terra
+    reasoning_effort: max
+  advanced:
+    model: gpt-5.6-sol
+    opencode_model: hermes-codex/gpt-5.6-sol
+    reasoning_effort: xhigh
+  discord_action:
+    model: gpt-5.6-sol
+    opencode_model: hermes-codex/gpt-5.6-sol
+    reasoning_effort: high
+
+# =============================================================================
 # Git Worktree Isolation
 # =============================================================================
 # When enabled, each CLI session creates an isolated git worktree so multiple
@@ -851,6 +877,8 @@ platform_toolsets:
 #   require_mention: true            # Require @mention in server channels (default: true)
 #   auto_thread: true                # Auto-create thread on @mention (default: true)
 #   free_response_channels: ""       # Channel IDs where no mention is needed
+#   action_request_model_tier: discord_action          # Simple/ordinary actions: Sol/high
+#   action_request_complex_model_tier: advanced        # Complex/risky actions: Sol/xhigh
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)

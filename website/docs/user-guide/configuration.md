@@ -1148,9 +1148,10 @@ choose a model and reasoning effort.
 
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
-| `trivial` | GPT-5.6 Luna | `low` | Unpinned cron jobs |
-| `basic` | GPT-5.6 Terra | `medium` | Ordinary gateway sessions and Discord action requests |
+| `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
+| `basic` | GPT-5.6 Terra | `high` | Ordinary gateway sessions |
 | `intermediate` | GPT-5.6 Terra | `max` | Coding-worker build passes and Kanban `dev` |
+| `discord_action` | GPT-5.6 Sol | `high` | Simple and ordinary Discord action requests |
 | `advanced` | GPT-5.6 Sol | `xhigh` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
 These defaults are runtime-aware: routine routes use lower effort, build passes
@@ -1163,11 +1164,11 @@ model_tiers:
   trivial:
     model: gpt-5.6-luna
     opencode_model: hermes-codex/gpt-5.6-luna
-    reasoning_effort: low
+    reasoning_effort: medium
   basic:
     model: gpt-5.6-terra
     opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: medium
+    reasoning_effort: high
   intermediate:
     model: gpt-5.6-terra
     opencode_model: hermes-codex/gpt-5.6-terra
@@ -1176,6 +1177,10 @@ model_tiers:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol
     reasoning_effort: xhigh
+  discord_action:
+    model: gpt-5.6-sol
+    opencode_model: hermes-codex/gpt-5.6-sol
+    reasoning_effort: high
 
 gateway:
   model_tier: basic
@@ -1184,7 +1189,8 @@ cron:
   model_tier: trivial
 
 discord:
-  action_request_model_tier: basic
+  action_request_model_tier: discord_action
+  action_request_complex_model_tier: advanced
 
 coding_worker:
   backend: codex
@@ -1213,10 +1219,6 @@ Coding-worker turns default to one hour (`3600` seconds). An explicit
 `turn_timeout_seconds` passed to `delegate_coding_task` takes precedence over
 this configuration value.
 
-In a normal non-Kanban Discord action thread, `/dumb <request>` runs that one
-request one tier below `discord.action_request_model_tier`, and `/smart
-<request>` runs it one tier above. These commands do not change the configured
-tier or the session's `/model` setting.
 Each tier supplies the model and reasoning effort atomically. Explicit worker
 raw model/reasoning values override the corresponding pass tier; an explicit
 per-worker pass tier overrides the configured pass tier. The compatibility

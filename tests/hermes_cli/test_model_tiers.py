@@ -18,6 +18,7 @@ def test_default_routes_reference_resolvable_tiers():
         "gateway": DEFAULT_CONFIG["gateway"]["model_tier"],
         "cron": DEFAULT_CONFIG["cron"]["model_tier"],
         "discord_action_request": DEFAULT_CONFIG["discord"]["action_request_model_tier"],
+        "discord_action_request_complex": DEFAULT_CONFIG["discord"]["action_request_complex_model_tier"],
         "coding_worker_simple_build": DEFAULT_CONFIG["coding_worker"]["simple_build_model_tier"],
         "coding_worker_complex_plan": DEFAULT_CONFIG["coding_worker"]["complex_plan_model_tier"],
         "coding_worker_complex_build": DEFAULT_CONFIG["coding_worker"]["complex_build_model_tier"],
@@ -30,7 +31,8 @@ def test_default_routes_reference_resolvable_tiers():
     assert route_names == {
         "gateway": "basic",
         "cron": "trivial",
-        "discord_action_request": "advanced",
+        "discord_action_request": "discord_action",
+        "discord_action_request_complex": "advanced",
         "coding_worker_simple_build": "intermediate",
         "coding_worker_complex_plan": "advanced",
         "coding_worker_complex_build": "intermediate",
@@ -51,21 +53,23 @@ def test_default_routes_reference_resolvable_tiers():
 
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).reasoning_effort
-        for name in ("trivial", "basic", "intermediate", "advanced")
+        for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "medium",
         "basic": "high",
         "intermediate": "max",
         "advanced": "xhigh",
+        "discord_action": "high",
     }
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).model
-        for name in ("trivial", "basic", "intermediate", "advanced")
+        for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "gpt-5.6-luna",
         "basic": "gpt-5.6-terra",
         "intermediate": "gpt-5.6-terra",
         "advanced": "gpt-5.6-sol",
+        "discord_action": "gpt-5.6-sol",
     }
     for role in ("planner", "dev", "foreman", "reviewer"):
         assert "reasoning" not in DEFAULT_CONFIG["kanban"]["discord_worker"]["roles"][role]
@@ -79,6 +83,7 @@ def test_builtin_tier_ladder_steps_in_order_and_rejects_custom_or_edge_tiers():
     assert resolve_adjacent_model_tier({}, "intermediate", 1).name == "advanced"
     assert resolve_adjacent_model_tier({}, "trivial", -1) is None
     assert resolve_adjacent_model_tier({}, "advanced", 1) is None
+    assert resolve_adjacent_model_tier({}, "discord_action", 1) is None
     assert resolve_adjacent_model_tier({}, "custom", 1) is None
     assert resolve_adjacent_model_tier({}, "basic", 0) is None
 

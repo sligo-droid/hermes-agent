@@ -4,6 +4,7 @@ import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -436,11 +437,102 @@ def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunn
 
 
 @pytest.mark.asyncio
+async def test_successful_promotion_stays_out_of_current_turn_until_target_inbound(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: _config(canonical))
+
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    feature_summary = {
+        "thread_id": "thread-123",
+        "message_id": "summary-1",
+        "initial_request": "Build the parser",
+        "kanban_board": None,
+    }
+    promoted_summaries: dict[str, dict] = {}
+    callbacks = []
+    adapter = SimpleNamespace(
+        _active_sessions={},
+        _load_feature_summary_handle_by_thread_id=lambda thread_id: promoted_summaries.get(thread_id),
+        register_post_delivery_callback=lambda *args, **kwargs: callbacks.append((args, kwargs)),
+        send=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_has_pending_background_workers = lambda *args, **kwargs: False
+    runner._discord_ledger_summary_status = lambda _work_id, status: status
+    runner._register_discord_summary_post_delivery = (
+        gateway_run.GatewayRunner._register_discord_summary_post_delivery.__get__(runner)
+    )
+    source = _source(canonical)
+    event = MessageEvent(
+        text="Can you explain this first?",
+        source=source,
+        message_id="message-1",
+        discord_action_request_intent=False,
+    )
+    promotion_link = "https://discord.com/channels/guild-1/thread-123"
+
+    async def _promote_then_stop(**_kwargs):
+        promoted_summaries["thread-123"] = feature_summary
+        return {
+            "final_response": (
+                f"I created the action thread: {promotion_link}. "
+                "Please continue by sending a new message there."
+            ),
+            "messages": [
+                {"role": "user", "content": event.text},
+                {"role": "assistant", "content": promotion_link},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+
+    runner._run_agent = AsyncMock(side_effect=_promote_then_stop)
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:discord:thread:thread-123",
+        1,
+    )
+
+    assert promotion_link in response
+    assert "sending a new message" in response
+    assert event.source is source
+    assert event.feature_summary is None
+    assert callbacks == []
+
+    next_event = MessageEvent(
+        text="Build it now.",
+        source=source,
+        message_id="message-2",
+    )
+    assert runner._hydrate_discord_feature_summary_from_adapter(next_event) == feature_summary
+    assert next_event.feature_summary == feature_summary
+    assert gateway_run._is_standard_discord_action_request(
+        next_event.source,
+        next_event.feature_summary,
+    )
+    tier = gateway_run._discord_action_request_model_tier({}, next_event.feature_summary)
+    assert tier.name == "discord_action"
+    assert tier.reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fable_implementation", [False, True])
+@pytest.mark.parametrize("discord_action_request_intent", [None, False])
 async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
     tmp_path,
     monkeypatch,
     fable_implementation,
+    discord_action_request_intent,
 ):
     canonical_root = tmp_path / "canonical"
     canonical = canonical_root / "PID"
@@ -472,6 +564,7 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
         message_id="message-1",
     )
     event.feature_summary = _feature_summary()
+    event.discord_action_request_intent = discord_action_request_intent
     if fable_implementation:
         event.fable_plan_metadata = {
             "command": "fable",
@@ -497,5 +590,9 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
     assert event.source.project_path == worktree_cwd
     assert captured["context_source"].project_path == worktree_cwd
     assert captured["session_env_cwd"] == worktree_cwd
+    assert (
+        run_kwargs["discord_action_request_intent"]
+        is discord_action_request_intent
+    )
     assert str(canonical) not in run_kwargs["context_prompt"]
     assert f"Path: `{worktree_cwd}`" in run_kwargs["context_prompt"]
