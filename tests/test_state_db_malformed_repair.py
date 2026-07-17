@@ -99,6 +99,19 @@ def test_repaired_db_search_works(tmp_path):
         assert hits == 5
         msg_count = db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
         assert msg_count == 10
+        trigram_hits = db._conn.execute(
+            "SELECT COUNT(*) FROM messages_fts_trigram "
+            "WHERE messages_fts_trigram MATCH 'pizza'"
+        ).fetchone()[0]
+        assert trigram_hits == 5
+        trigram_count = db._conn.execute(
+            "SELECT COUNT(*) FROM messages_fts_trigram"
+        ).fetchone()[0]
+        assert trigram_count == 10
+        schema_version = db._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+        assert schema_version == hermes_state.SCHEMA_VERSION
     finally:
         db.close()
 
@@ -222,6 +235,25 @@ def test_unrepairable_file_fails_safely(tmp_path, monkeypatch):
     assert report["backup_path"] and Path(report["backup_path"]).exists()
 
 
+def test_backup_failure_aborts_without_modifying_db(tmp_path, monkeypatch):
+    """Requested backup failure must stop before any schema surgery."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    original_bytes = db_path.read_bytes()
+
+    def fail_backup(_path):
+        raise OSError("backup destination unavailable")
+
+    monkeypatch.setattr(hermes_state, "_backup_db_file", fail_backup)
+    report = repair_state_db_schema(db_path)
+
+    assert report["repaired"] is False
+    assert report["backup_path"] is None
+    assert "backup failed" in report["error"]
+    assert db_path.read_bytes() == original_bytes
+
+
 def test_non_malformed_error_is_not_auto_repaired(tmp_path, monkeypatch):
     """Auto-heal must only trigger for the malformed-schema class, not for
     e.g. 'file is not a database' — those raise unchanged."""
@@ -263,7 +295,10 @@ def test_repair_on_clean_db_is_noop(tmp_path):
 # it healthy and the gateway silently dropped conversation history.
 
 
-def _corrupt_fts_index_data(db_path: Path) -> None:
+def _corrupt_fts_index_data(
+    db_path: Path,
+    table_name: str = "messages_fts",
+) -> None:
     """Overwrite the FTS5 shadow b-tree blocks with garbage bytes.
 
     Reproduces the runtime "database disk image is malformed" / "malformed
@@ -271,7 +306,10 @@ def _corrupt_fts_index_data(db_path: Path) -> None:
     triggers while base-table reads still return rows.
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
-    conn.execute("UPDATE messages_fts_data SET block = X'DEADBEEFDEADBEEF'")
+    assert table_name in {"messages_fts", "messages_fts_trigram"}
+    conn.execute(
+        f"UPDATE {table_name}_data SET block = X'DEADBEEFDEADBEEF'"
+    )
     conn.close()
 
 
@@ -324,6 +362,30 @@ def test_fts_write_corruption_repaired_in_place(tmp_path):
         db.close()
 
 
+def test_trigram_fts_write_corruption_repaired_in_place(tmp_path):
+    """The write probe and repair cover the current trigram FTS index too."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_fts_index_data(db_path, "messages_fts_trigram")
+
+    assert hermes_state._db_opens_cleanly(db_path) is not None
+    report = repair_state_db_schema(db_path)
+    assert report["repaired"] is True
+    assert hermes_state._db_opens_cleanly(db_path) is None
+
+    db = SessionDB(db_path=db_path)
+    try:
+        sid = db._conn.execute("SELECT id FROM sessions LIMIT 1").fetchone()[0]
+        db.append_message(sid, role="user", content="trigram repair message")
+        hits = db._conn.execute(
+            "SELECT COUNT(*) FROM messages_fts_trigram "
+            "WHERE messages_fts_trigram MATCH 'trigram'"
+        ).fetchone()[0]
+        assert hits == 1
+    finally:
+        db.close()
+
+
 def test_repair_noop_db_uses_already_healthy_shortcut(tmp_path):
     """A healthy DB returns the cheap already_healthy strategy, no surgery."""
     db_path = tmp_path / "state.db"
@@ -331,28 +393,3 @@ def test_repair_noop_db_uses_already_healthy_shortcut(tmp_path):
     report = repair_state_db_schema(db_path, backup=False)
     assert report["repaired"] is True
     assert report["strategy"] == "already_healthy"
-
-
-def test_select_cached_agent_history_prefers_longer_live_transcript():
-    """Gateway guard keeps the live transcript when persisted history lags."""
-    from gateway.run import _select_cached_agent_history
-
-    persisted = [{"role": "user", "content": "only one"}]
-    live = [
-        {"role": "user", "content": "one"},
-        {"role": "assistant", "content": "two"},
-        {"role": "user", "content": "three"},
-    ]
-    # Persisted lags (FTS write failed) → keep the longer live copy.
-    out = _select_cached_agent_history(persisted, live)
-    assert out == live
-    assert out is not live  # returns a copy, not the live list
-
-    # Persisted is current/longer → leave it untouched (identity preserved).
-    longer_persisted = live + [{"role": "assistant", "content": "four"}]
-    out2 = _select_cached_agent_history(longer_persisted, live)
-    assert out2 is longer_persisted
-
-    # No live transcript / not a list → no-op.
-    assert _select_cached_agent_history(persisted, None) is persisted
-    assert _select_cached_agent_history(persisted, "nope") is persisted

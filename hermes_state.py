@@ -18,6 +18,7 @@ import json
 import logging
 import random
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -227,6 +228,283 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
         exc,
     )
 
+
+# ---------------------------------------------------------------------------
+# Malformed-schema and FTS corruption recovery
+# ---------------------------------------------------------------------------
+# A malformed sqlite_master is distinct from a corrupt FTS inverted index.
+# Duplicate schema rows make SQLite fail while preparing the first statement
+# on a connection, before SessionDB can reach normal schema initialization.
+# Corrupt FTS shadow data is subtler: canonical reads and integrity_check can
+# succeed while every messages write fails through the FTS triggers.
+_MALFORMED_SCHEMA_MARKERS = (
+    "malformed database schema",
+    "database disk image is malformed",
+)
+
+# Auto-repair is attempted at most once per database path in a process. This
+# prevents an unrecoverable file from causing a repair/reopen loop and keeps
+# concurrent initializers from performing schema surgery simultaneously.
+_repair_attempted_paths: set[str] = set()
+_repair_attempt_lock = threading.Lock()
+
+
+def is_malformed_db_error(exc: BaseException) -> bool:
+    """Return whether *exc* is a SQLite malformed-schema/image error."""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _MALFORMED_SCHEMA_MARKERS)
+
+
+def _claim_repair_attempt(db_path: Path) -> bool:
+    """Claim the process-local one-shot automatic repair for *db_path*."""
+    key = str(Path(db_path).resolve())
+    with _repair_attempt_lock:
+        if key in _repair_attempted_paths:
+            return False
+        _repair_attempted_paths.add(key)
+        return True
+
+
+def _backup_db_file(db_path: Path) -> Path:
+    """Copy a possibly malformed database and its WAL sidecars beside it."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    nanos = time.time_ns() % 1_000_000_000
+    backup_path = db_path.with_name(
+        f"{db_path.name}.malformed-backup-{stamp}_{nanos:09d}"
+    )
+    shutil.copy2(db_path, backup_path)
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar.exists():
+            shutil.copy2(
+                sidecar,
+                backup_path.with_name(backup_path.name + suffix),
+            )
+    return backup_path
+
+
+def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+    """Return ``None`` if a database is readable and writable, else a reason.
+
+    The write is rolled back, but it deliberately passes through both FTS
+    trigger sets. This detects corrupt FTS shadow data that ordinary reads and
+    ``PRAGMA integrity_check`` do not expose.
+    """
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn.execute("PRAGMA journal_mode").fetchone()
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+        problems = [
+            str(row[0])
+            for row in rows
+            if row and str(row[0]).lower() != "ok"
+        ]
+        if problems:
+            return "; ".join(problems[:3])
+
+        canonical_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name IN ('sessions', 'messages')"
+            ).fetchall()
+        }
+        if canonical_tables != {"sessions", "messages"}:
+            # A new/empty SQLite file can be initialized normally and has no
+            # FTS triggers to probe yet.
+            return None
+
+        conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+
+        probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                (probe_session_id, "_health_probe", time.time()),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (probe_session_id, "user", "_fts_health_probe", time.time()),
+            )
+            conn.execute("ROLLBACK")
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            return str(exc)
+        return None
+    except sqlite3.DatabaseError as exc:
+        return str(exc)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _delete_sqlite_master_rows(
+    db_path: Path,
+    sql: str,
+    parameters: Tuple[Any, ...] = (),
+) -> None:
+    """Run narrowly scoped sqlite_master surgery with writable_schema."""
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(sql, parameters)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("PRAGMA writable_schema=OFF")
+    finally:
+        conn.close()
+
+
+def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+    """Repair malformed schema rows or FTS indexes that reject writes.
+
+    The least-destructive strategy is tried first: rebuild both current FTS5
+    indexes, then de-duplicate sqlite_master, then remove only the derived FTS
+    schema so the next SessionDB open recreates and backfills it. Canonical
+    session and message rows are never intentionally modified.
+    """
+    report: Dict[str, Any] = {
+        "repaired": False,
+        "strategy": None,
+        "backup_path": None,
+        "error": None,
+    }
+    db_path = Path(db_path)
+    if not db_path.exists():
+        report["error"] = f"{db_path} does not exist"
+        return report
+
+    initial_reason = _db_opens_cleanly(db_path)
+    if initial_reason is None:
+        report["repaired"] = True
+        report["strategy"] = "already_healthy"
+        return report
+
+    if backup:
+        try:
+            backup_path = _backup_db_file(db_path)
+        except Exception as exc:
+            report["error"] = f"backup failed: {exc}"
+            logger.error(
+                "state.db repair aborted because backup failed for %s: %s",
+                db_path,
+                exc,
+            )
+            return report
+        report["backup_path"] = str(backup_path)
+
+    last_reason = initial_reason
+
+    # Strategy 0: ask each current inline FTS table to rebuild its shadow data.
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            for table_name in ("messages_fts", "messages_fts_trigram"):
+                try:
+                    conn.execute(
+                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
+                    )
+                except sqlite3.OperationalError as exc:
+                    message = str(exc).lower()
+                    if "no such table" not in message and "no such module" not in message:
+                        raise
+        finally:
+            conn.close()
+        last_reason = _db_opens_cleanly(db_path)
+        if last_reason is None:
+            report["repaired"] = True
+            report["strategy"] = "rebuild_fts"
+            logger.warning(
+                "state.db FTS indexes rebuilt in place: %s",
+                db_path,
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        last_reason = str(exc)
+        logger.warning("state.db FTS rebuild pass failed: %s", exc)
+
+    # Strategy 1: remove duplicate object definitions while retaining the
+    # lowest-rowid copy of each schema object and all existing FTS data.
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.execute("PRAGMA writable_schema=ON")
+            duplicates = conn.execute(
+                "SELECT type, name, MIN(rowid) AS keep_rowid "
+                "FROM sqlite_master GROUP BY type, name HAVING COUNT(*) > 1"
+            ).fetchall()
+        finally:
+            conn.close()
+        for object_type, name, keep_rowid in duplicates:
+            _delete_sqlite_master_rows(
+                db_path,
+                "DELETE FROM sqlite_master "
+                "WHERE type IS ? AND name IS ? AND rowid <> ?",
+                (object_type, name, keep_rowid),
+            )
+        last_reason = _db_opens_cleanly(db_path)
+        if last_reason is None:
+            report["repaired"] = True
+            report["strategy"] = "dedup_schema"
+            logger.warning(
+                "state.db schema repaired by de-duplicating sqlite_master: %s",
+                db_path,
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        last_reason = str(exc)
+        logger.warning("state.db schema de-duplication pass failed: %s", exc)
+
+    # Strategy 2: delete only FTS-derived schema objects. A fresh connection
+    # VACUUMs away the orphaned shadow pages, and SessionDB recreates/backfills
+    # both canonical and trigram indexes from messages on its next open.
+    try:
+        _delete_sqlite_master_rows(
+            db_path,
+            "DELETE FROM sqlite_master "
+            "WHERE name LIKE 'messages_fts%' OR tbl_name LIKE 'messages_fts%'",
+        )
+        vacuum_conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            vacuum_conn.execute("VACUUM")
+        finally:
+            vacuum_conn.close()
+        last_reason = _db_opens_cleanly(db_path)
+        if last_reason is None:
+            report["repaired"] = True
+            report["strategy"] = "drop_fts_rebuild"
+            logger.warning(
+                "state.db repaired by dropping derived FTS schema; indexes "
+                "will rebuild from messages on next open: %s",
+                db_path,
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        last_reason = str(exc)
+
+    report["error"] = last_reason or "state.db repair did not restore write health"
+    logger.error(
+        "state.db repair could not recover %s automatically (backup: %s): %s",
+        db_path,
+        report["backup_path"],
+        report["error"],
+    )
+    return report
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -412,25 +690,55 @@ class SessionDB:
         self._write_count = 0
         self._fts_enabled = False
         self._fts_unavailable_warned = False
+        self._conn = None
         try:
-            self._conn = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                # Short timeout — application-level retry with random jitter
-                # handles contention instead of sitting in SQLite's internal
-                # busy handler for up to 30s.
-                timeout=1.0,
-                # auto-starts transactions on DML, which conflicts with our
-                # explicit BEGIN IMMEDIATE.  None = we manage transactions
-                # ourselves.
-                isolation_level=None,
-            )
-            self._conn.row_factory = sqlite3.Row
-            apply_wal_with_fallback(self._conn, db_label="state.db")
-            self._conn.execute("PRAGMA foreign_keys=ON")
+            def _connect_and_init() -> None:
+                self._conn = sqlite3.connect(
+                    str(self.db_path),
+                    check_same_thread=False,
+                    # Short timeout — application-level retry with random jitter
+                    # handles contention instead of sitting in SQLite's internal
+                    # busy handler for up to 30s.
+                    timeout=1.0,
+                    # auto-starts transactions on DML, which conflicts with our
+                    # explicit BEGIN IMMEDIATE. None = we manage transactions.
+                    isolation_level=None,
+                )
+                self._conn.row_factory = sqlite3.Row
+                apply_wal_with_fallback(self._conn, db_label="state.db")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._init_schema()
 
-            self._init_schema()
+            try:
+                _connect_and_init()
+            except sqlite3.DatabaseError as exc:
+                if (
+                    not is_malformed_db_error(exc)
+                    or not _claim_repair_attempt(self.db_path)
+                ):
+                    raise
+                logger.error(
+                    "state.db is malformed (%s); attempting one automatic "
+                    "in-place repair after creating a backup",
+                    exc,
+                )
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                report = repair_state_db_schema(self.db_path)
+                if not report.get("repaired"):
+                    raise
+                _connect_and_init()
         except Exception as exc:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
             # not available."  Callers that catch this exception keep their
