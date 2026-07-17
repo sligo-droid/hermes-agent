@@ -57,6 +57,7 @@ tests/tools/test_coding_worker_tool.py
 tests/hermes_cli/test_coding_worker_switch.py
 tests/hermes_cli/test_kanban_codex_workers.py
 tests/hermes_cli/test_discord_worker_read.py
+tests/hermes_cli/test_discord_cli.py
 tests/hermes_cli/test_discord_worker_boards.py
 tests/hermes_cli/test_discord_worker_dispatch.py
 tests/gateway/test_discord_summaries.py
