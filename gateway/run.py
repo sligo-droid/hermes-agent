@@ -21811,6 +21811,18 @@ class GatewayRunner:
             else None
         )
 
+        # Start persistent typing before the agent thread can enter context
+        # compression or make its first API call.  Discord records the parent
+        # chat as an alias when thread metadata is present, so the existing
+        # stop_typing(source.chat_id) cleanup cancels the same thread loop.
+        _typing_adapter = self._adapter_for_source(source)
+        _send_typing = getattr(_typing_adapter, "send_typing", None)
+        if _send_typing is not None:
+            try:
+                await _send_typing(source.chat_id, metadata=_progress_metadata)
+            except Exception:
+                pass
+
         async def send_progress_messages():
             if not progress_queue:
                 return
