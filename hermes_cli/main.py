@@ -11003,6 +11003,13 @@ def cmd_logs(args):
         since=getattr(args, "since", None),
         component=getattr(args, "component", None),
     )
+
+
+def cmd_discord(args):
+    """Invoke the read-only native Discord tool adapter."""
+    from hermes_cli.discord_cli import run
+
+    raise SystemExit(run(args))
 # Top-level subcommands that argparse knows about WITHOUT running plugin
 # discovery.  Used to short-circuit eager plugin imports (which can take
 # 500ms+ pulling in google.cloud.pubsub_v1, aiohttp, grpc, etc.) when the
@@ -11016,7 +11023,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use", "compression-diagnostics",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "config", "cron", "curator", "dashboard", "debug", "discord", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
@@ -13153,6 +13160,13 @@ Examples:
             tools_command(args)
 
     tools_parser.set_defaults(func=cmd_tools)
+
+    # =========================================================================
+    # discord command — lazy read-only adapter over native Discord tools
+    # =========================================================================
+    from hermes_cli.subcommands.discord import build_discord_parser
+
+    build_discord_parser(subparsers, cmd_discord=cmd_discord)
 
     # =========================================================================
     # computer-use command — manage Computer Use (cua-driver) on macOS
