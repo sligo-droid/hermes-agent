@@ -2001,7 +2001,8 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_model_tier": "advanced", # Standard Discord action requests use Sol/xhigh
+        "action_request_model_tier": "discord_action", # Ordinary Discord action requests use Sol/high
+        "action_request_complex_model_tier": "advanced", # Complex/risky initial requests use shared Sol/xhigh
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "action_worktree_warmup": "auto", # auto | off; install JS deps when provisioning action worktrees
@@ -2688,7 +2689,7 @@ DEFAULT_CONFIG = {
 
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 25,
+    "_config_version": 26,
 }
 
 # =============================================================================
@@ -4964,6 +4965,26 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             )
             if not quiet:
                 print("  ✓ Added reasoning to the runtime footer fields")
+
+    # ── Version 25 → 26: split routine Discord actions from advanced ──
+    # Only the exact persisted former default is rewritten. Missing values are
+    # filled by the normal default migration below, while custom tier names,
+    # disabled values, and even differently-cased strings remain untouched.
+    if current_ver < 26:
+        config = read_raw_config()
+        discord_config = config.get("discord")
+        if (
+            isinstance(discord_config, dict)
+            and discord_config.get("action_request_model_tier") == "advanced"
+        ):
+            discord_config["action_request_model_tier"] = "discord_action"
+            config["discord"] = discord_config
+            save_config(config)
+            results["config_added"].append(
+                "discord.action_request_model_tier=discord_action (migrated from former default)"
+            )
+            if not quiet:
+                print("  ✓ Migrated routine Discord action requests to discord_action")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")

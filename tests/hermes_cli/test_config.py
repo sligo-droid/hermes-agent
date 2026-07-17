@@ -814,6 +814,57 @@ class TestRuntimeFooterReasoningMigration:
         assert "display.runtime_footer.fields (added reasoning)" in results["config_added"]
 
 
+class TestDiscordActionTierMigration:
+    def test_migrate_to_v26_rewrites_only_the_exact_former_default(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 25,
+                    "discord": {"action_request_model_tier": "advanced"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == 26
+        assert raw["discord"]["action_request_model_tier"] == "discord_action"
+        assert raw["discord"]["action_request_complex_model_tier"] == "advanced"
+        assert (
+            "discord.action_request_model_tier=discord_action (migrated from former default)"
+            in results["config_added"]
+        )
+
+    @pytest.mark.parametrize("custom_value", ["feature", "", "Advanced"])
+    def test_migrate_to_v26_preserves_custom_or_disabled_values(
+        self,
+        tmp_path,
+        custom_value,
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 25,
+                    "discord": {"action_request_model_tier": custom_value},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["discord"]["action_request_model_tier"] == custom_value
+        assert raw["discord"]["action_request_complex_model_tier"] == "advanced"
+        assert not any("migrated from former default" in value for value in results["config_added"])
+
+
 class TestDiscordChannelPromptsConfig:
     def test_default_config_includes_discord_channel_prompts(self):
         assert DEFAULT_CONFIG["discord"]["channel_prompts"] == {}

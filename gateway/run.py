@@ -59,7 +59,7 @@ from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
-from hermes_cli.model_tiers import resolve_model_tier
+from hermes_cli.model_tiers import classify_task_complexity, resolve_model_tier
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -210,6 +210,20 @@ def _is_standard_discord_feature_request(
     return _is_standard_discord_action_request(source, feature_summary)
 
 
+def _discord_feature_summary_for_turn(
+    source: Any,
+    feature_summary: Optional[Dict[str, Any]],
+    discord_action_request_intent: Optional[bool],
+) -> Optional[Dict[str, Any]]:
+    """Suppress action-summary mutation for an explicit direct-question turn."""
+    if (
+        discord_action_request_intent is False
+        and _is_standard_discord_action_request(source, feature_summary)
+    ):
+        return None
+    return feature_summary
+
+
 def _normalize_gateway_visual_qa_contract(
     requirement: Any,
     config: Any,
@@ -304,11 +318,39 @@ def _gateway_model_tier(config: Optional[dict]) -> Any:
     return resolve_model_tier(cfg, name)
 
 
-def _discord_action_request_model_tier(config: Optional[dict]) -> Any:
-    """Return the named tier for ordinary Discord action-request threads."""
+def _discord_action_request_model_tier(
+    config: Optional[dict],
+    feature_summary: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Return the route tier selected from the action's initial request."""
     cfg = config or {}
-    name = cfg_get(cfg, "discord", "action_request_model_tier", default="advanced")
-    return resolve_model_tier(cfg, name)
+    routine_name = cfg_get(
+        cfg,
+        "discord",
+        "action_request_model_tier",
+        default="discord_action",
+    )
+    routine_tier = resolve_model_tier(cfg, routine_name)
+    initial_request = (
+        str(feature_summary.get("initial_request") or "")
+        if isinstance(feature_summary, dict)
+        else ""
+    )
+    if classify_task_complexity(initial_request) == "complex":
+        complex_name = cfg_get(
+            cfg,
+            "discord",
+            "action_request_complex_model_tier",
+            default="advanced",
+        )
+        # Keep the model+reasoning selection atomic. A broken optional complex
+        # route falls back to the configured routine action tier as one unit.
+        # If both are disabled/invalid, callers retain the legacy raw fallback.
+        return resolve_model_tier(cfg, complex_name) or routine_tier
+    return routine_tier
+
+
+_MODEL_TIER_UNSET = object()
 
 
 def _set_gateway_runtime_audit(
@@ -351,10 +393,11 @@ def _set_gateway_runtime_audit(
 
 def _discord_action_request_reasoning_config(
     config: Optional[dict],
-    model_tier: Any = None,
+    model_tier: Any = _MODEL_TIER_UNSET,
 ) -> dict | None:
     """Reasoning override for ordinary Discord action-request threads."""
-    model_tier = model_tier or _discord_action_request_model_tier(config)
+    if model_tier is _MODEL_TIER_UNSET:
+        model_tier = _discord_action_request_model_tier(config)
     if model_tier is not None:
         return model_tier.reasoning_config()
 
@@ -1948,6 +1991,17 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     to a placeholder string.
     """
     return adapter.get_pending_message(session_key)
+
+
+def _dequeue_pending_event_for_turn(
+    adapter,
+    session_key: str,
+    discord_action_request_intent: Optional[bool],
+) -> MessageEvent | None:
+    """Leave queued input for a fresh adapter turn after a direct question."""
+    if discord_action_request_intent is False:
+        return None
+    return _dequeue_pending_event(adapter, session_key)
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
@@ -5811,7 +5865,8 @@ class GatewayRunner:
             runtime_breakdown=item.get("runtime_breakdown") if isinstance(item.get("runtime_breakdown"), dict) else None,
         )
         if summary_ok:
-            ledger.mark_summary_updated(work_id)
+            if item.get("feature_summary") or item.get("project_summary"):
+                ledger.mark_summary_updated(work_id)
             gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
             if gate and not gate.get("allowed_to_complete"):
                 ledger.mark_blocked(work_id, reason=str(gate.get("reason") or "completion_gate"))
@@ -13002,6 +13057,11 @@ class GatewayRunner:
                 channel_prompt=event.channel_prompt,
                 feature_summary=getattr(event, "feature_summary", None),
                 project_summary=getattr(event, "project_summary", None),
+                discord_action_request_intent=getattr(
+                    event,
+                    "discord_action_request_intent",
+                    None,
+                ),
                 fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
                 fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
                 fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
@@ -13011,12 +13071,6 @@ class GatewayRunner:
                 visual_qa_config=getattr(event, "visual_qa_config", None),
                 completed_worker_run=getattr(event, "completed_worker_run", None),
             )
-
-            # A direct-question turn can promote itself to an action thread
-            # through the Discord tool. That creates and persists the summary
-            # after route selection, so reload it before turn-end lifecycle
-            # work even though this turn necessarily keeps its original model.
-            self._hydrate_discord_feature_summary_from_adapter(event)
 
             _pending_background_workers = self._session_has_pending_background_workers(
                 session_key,
@@ -13473,6 +13527,11 @@ class GatewayRunner:
 
             if _already_sent and not agent_result.get("failed"):
                 work_item_id = getattr(event, "work_item_id", None)
+                turn_feature_summary = _discord_feature_summary_for_turn(
+                    source,
+                    getattr(event, "feature_summary", None),
+                    getattr(event, "discord_action_request_intent", None),
+                )
                 summary_status = (
                     "Running"
                     if _pending_background_workers
@@ -13483,7 +13542,7 @@ class GatewayRunner:
                 )
                 summary_ok = await self._update_discord_summaries(
                     source=source,
-                    feature_summary=getattr(event, "feature_summary", None),
+                    feature_summary=turn_feature_summary,
                     project_summary=getattr(event, "project_summary", None),
                     final_response=response,
                     status=summary_status,
@@ -13497,7 +13556,8 @@ class GatewayRunner:
                     and not _pending_background_workers
                 ):
                     try:
-                        self._ledger().mark_summary_updated(str(work_item_id))
+                        if turn_feature_summary or getattr(event, "project_summary", None):
+                            self._ledger().mark_summary_updated(str(work_item_id))
                         self._ledger().mark_completed(str(work_item_id))
                     except Exception as exc:
                         logger.debug("Discord work ledger summary completion update failed: %s", exc)
@@ -16131,9 +16191,13 @@ class GatewayRunner:
             else self._discord_summary_status(agent_result)
         )
         work_item_id = self._discord_work_item_id_for_event(event, session_key)
-        feature_summary = getattr(event, "feature_summary", None)
+        feature_summary = _discord_feature_summary_for_turn(
+            source,
+            getattr(event, "feature_summary", None),
+            getattr(event, "discord_action_request_intent", None),
+        )
         project_summary = getattr(event, "project_summary", None)
-        if not feature_summary and not project_summary:
+        if not feature_summary and not project_summary and not work_item_id:
             return
         if not pending_background:
             status = self._discord_ledger_summary_status(work_item_id, status)
@@ -16155,7 +16219,8 @@ class GatewayRunner:
             )
             if summary_ok and work_item_id and not pending_background:
                 try:
-                    self._ledger().mark_summary_updated(str(work_item_id))
+                    if feature_summary or project_summary:
+                        self._ledger().mark_summary_updated(str(work_item_id))
                     self._ledger().mark_completed(str(work_item_id))
                 except Exception as exc:
                     logger.debug("Discord work ledger summary completion update failed: %s", exc)
@@ -21543,6 +21608,7 @@ class GatewayRunner:
         channel_prompt: Optional[str] = None,
         feature_summary: Optional[Dict[str, Any]] = None,
         project_summary: Optional[Dict[str, Any]] = None,
+        discord_action_request_intent: Optional[bool] = None,
         fable_plan_metadata: Optional[Dict[str, Any]] = None,
         fable_toolsets: Optional[List[str]] = None,
         fable_reasoning_config: Optional[Dict[str, Any]] = None,
@@ -21613,9 +21679,13 @@ class GatewayRunner:
             str(session_cwd_override or "").strip()
             or _resolve_gateway_session_cwd(source, user_config)
         )
-        standard_discord_action_request = _is_standard_discord_action_request(
+        standard_discord_action_thread = _is_standard_discord_action_request(
             source,
             feature_summary,
+        )
+        discord_action_runtime = (
+            standard_discord_action_thread
+            and discord_action_request_intent is not False
         )
         fable_mode = str(
             (fable_plan_metadata or {}).get("fable_mode", "")
@@ -22319,7 +22389,7 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            if standard_discord_action_request:
+            if discord_action_runtime:
                 combined_ephemeral = (
                     combined_ephemeral
                     + "\n\n"
@@ -22341,8 +22411,11 @@ class GatewayRunner:
 
             try:
                 action_request_tier = None
-                if standard_discord_action_request:
-                    action_request_tier = _discord_action_request_model_tier(user_config)
+                if discord_action_runtime:
+                    action_request_tier = _discord_action_request_model_tier(
+                        user_config,
+                        feature_summary,
+                    )
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
@@ -22373,7 +22446,7 @@ class GatewayRunner:
 
                     resolved_fable_reasoning = resolve_fable_reasoning_config(user_config)
                 reasoning_config = dict(resolved_fable_reasoning)
-            elif standard_discord_action_request:
+            elif discord_action_runtime:
                 reasoning_config = _discord_action_request_reasoning_config(
                     user_config,
                     action_request_tier,
@@ -22499,13 +22572,13 @@ class GatewayRunner:
                 cache_keys={
                     **self._extract_cache_busting_config(user_config),
                     "gateway.session_cwd": session_cwd,
-                    "gateway.discord_action_request_fast_path": standard_discord_action_request,
-                    "gateway.discord_feature_request_fast_path": standard_discord_action_request,
+                    "gateway.discord_action_request_fast_path": discord_action_runtime,
+                    "gateway.discord_feature_request_fast_path": discord_action_runtime,
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
                     "gateway.fable_oauth_tool_name_compat": fable_oauth_tool_name_compat,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
-                    "gateway.tool_delay": 0.0 if standard_discord_action_request else None,
-                    "gateway.verify_on_stop": True if standard_discord_action_request else None,
+                    "gateway.tool_delay": 0.0 if discord_action_runtime else None,
+                    "gateway.verify_on_stop": True if discord_action_runtime else None,
                     "gateway.max_iterations": max_iterations,
                 },
                 user_id=getattr(source, "user_id", None),
@@ -22569,7 +22642,7 @@ class GatewayRunner:
                 }
                 if fable_plan_metadata:
                     agent_kwargs["providers_allowed"] = ["anthropic"]
-                if standard_discord_action_request:
+                if discord_action_runtime:
                     agent_kwargs["tool_delay"] = 0.0
                     agent_kwargs["verify_on_stop"] = True
                 agent = AIAgent(**agent_kwargs)
@@ -22629,7 +22702,7 @@ class GatewayRunner:
             if fable_plan_metadata:
                 runtime_route = "gateway_fable"
                 model_override_source = "fable"
-            elif standard_discord_action_request:
+            elif discord_action_runtime:
                 runtime_route = "discord_action_request"
                 active_tier = action_request_tier
             else:
@@ -22644,9 +22717,9 @@ class GatewayRunner:
                     "fable"
                     if fable_plan_metadata
                     else "model_tier"
-                    if standard_discord_action_request and active_tier is not None
+                    if discord_action_runtime and active_tier is not None
                     else "discord_config"
-                    if standard_discord_action_request and reasoning_config is not None
+                    if discord_action_runtime and reasoning_config is not None
                     else "session_override"
                     if session_reasoning_override
                     else "model_tier"
@@ -23276,13 +23349,18 @@ class GatewayRunner:
                                 title,
                             )
                         )
-                    if source.platform == Platform.DISCORD and (feature_summary or project_summary):
+                    title_feature_summary = _discord_feature_summary_for_turn(
+                        source,
+                        feature_summary,
+                        discord_action_request_intent,
+                    )
+                    if source.platform == Platform.DISCORD and (title_feature_summary or project_summary):
                         def _update_discord_title(title: str) -> None:
                             try:
                                 asyncio.run_coroutine_threadsafe(
                                     self._update_discord_summaries(
                                         source=source,
-                                        feature_summary=feature_summary,
+                                        feature_summary=title_feature_summary,
                                         project_summary=project_summary,
                                         final_response=final_response,
                                         status="Complete",
@@ -23738,28 +23816,37 @@ class GatewayRunner:
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
-            if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
-                # /queue overflow: after consuming the adapter's "next-up"
-                # slot, promote the next queued event into it so the
-                # recursive run's drain will see it.  This keeps the slot
-                # occupied for the full FIFO chain, which (a) preserves
-                # order, and (b) causes any mid-chain /queue to correctly
-                # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-                if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
-                    interrupt_message = result.get("interrupt_message")
-                    if _is_control_interrupt_message(interrupt_message):
-                        logger.info(
-                            "Ignoring control interrupt message for session %s: %s",
-                            session_key or "?",
-                            interrupt_message,
-                        )
-                    else:
-                        pending = interrupt_message
-                elif pending_event:
-                    pending = pending_event.text or _build_media_placeholder(pending_event)
-                    logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+            if (
+                result
+                and adapter
+                and session_key
+            ):
+                pending_event = _dequeue_pending_event_for_turn(
+                    adapter,
+                    session_key,
+                    discord_action_request_intent,
+                )
+                if discord_action_request_intent is not False:
+                    # /queue overflow: after consuming the adapter's "next-up"
+                    # slot, promote the next queued event into it so the
+                    # recursive run's drain will see it.  This keeps the slot
+                    # occupied for the full FIFO chain, which (a) preserves
+                    # order, and (b) causes any mid-chain /queue to correctly
+                    # route to overflow rather than jumping the queue.
+                    pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                    if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+                        interrupt_message = result.get("interrupt_message")
+                        if _is_control_interrupt_message(interrupt_message):
+                            logger.info(
+                                "Ignoring control interrupt message for session %s: %s",
+                                session_key or "?",
+                                interrupt_message,
+                            )
+                        else:
+                            pending = interrupt_message
+                    elif pending_event:
+                        pending = pending_event.text or _build_media_placeholder(pending_event)
+                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
             # Leftover /steer: if a steer arrived after the last tool batch
             # (e.g. during the final API call), the agent couldn't inject it
@@ -23919,11 +24006,9 @@ class GatewayRunner:
                 next_source = source
                 next_message = pending
                 next_message_id = None
-                # A raw continuation (an in-band steer or interrupt fallback)
-                # has no event object to carry metadata. It is still a turn in
-                # this same thread, so preserve the route context that selected
-                # this run's model instead of silently falling back to the
-                # generic gateway tier.
+                # Preserve structural thread context across ordinary in-band
+                # continuations. Per-intake Discord action intent does not
+                # carry into recursive continuation turns.
                 next_channel_prompt = channel_prompt
                 next_feature_summary = feature_summary
                 next_project_summary = project_summary

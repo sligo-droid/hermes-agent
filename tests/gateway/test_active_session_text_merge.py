@@ -156,6 +156,70 @@ async def test_debounce_buffers_rapid_text_then_flushes_to_pending():
 
 
 @pytest.mark.asyncio
+async def test_debounce_later_action_upgrades_question_intent_and_prompt():
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 10.0
+    session_key = build_session_key(_make_event("current").source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    question = _make_event("What should we build?")
+    question.discord_action_request_intent = False
+    question.channel_prompt = "Project instructions\n\nDirect question overlay"
+    question.discord_action_request_base_channel_prompt = "Project instructions"
+    action = _make_event("Okay, let's build this")
+    action.discord_action_request_intent = True
+    action.channel_prompt = None
+    action.discord_action_request_base_channel_prompt = "Project instructions"
+
+    await adapter.handle_message(question)
+    await adapter.handle_message(action)
+
+    aggregate = _debounced_event(adapter, session_key)
+    assert aggregate.text == "What should we build?\nOkay, let's build this"
+    assert aggregate.discord_action_request_intent is True
+    assert aggregate.channel_prompt == "Project instructions"
+    assert "Direct question overlay" not in aggregate.channel_prompt
+
+    timer_task = adapter._text_debounce[session_key].task
+    assert timer_task is not None
+    timer_task.cancel()
+    await asyncio.gather(timer_task, return_exceptions=True)
+    adapter._text_debounce.clear()
+
+
+@pytest.mark.asyncio
+async def test_debounce_later_question_overrides_action_intent_and_prompt():
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 10.0
+    session_key = build_session_key(_make_event("current").source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    action = _make_event("Okay, let's build this")
+    action.discord_action_request_intent = True
+    action.channel_prompt = "Project instructions"
+    action.discord_action_request_base_channel_prompt = "Project instructions"
+    question = _make_event("Actually, stop. What would this change?")
+    question.discord_action_request_intent = False
+    question.channel_prompt = "Project instructions\n\nDirect question overlay"
+    question.discord_action_request_base_channel_prompt = "Project instructions"
+
+    await adapter.handle_message(action)
+    await adapter.handle_message(question)
+
+    aggregate = _debounced_event(adapter, session_key)
+    assert aggregate.text == "Okay, let's build this\nActually, stop. What would this change?"
+    assert aggregate.discord_action_request_intent is False
+    assert aggregate.channel_prompt == "Project instructions\n\nDirect question overlay"
+    assert aggregate.discord_action_request_base_channel_prompt == "Project instructions"
+
+    timer_task = adapter._text_debounce[session_key].task
+    assert timer_task is not None
+    timer_task.cancel()
+    await asyncio.gather(timer_task, return_exceptions=True)
+    adapter._text_debounce.clear()
+
+
+@pytest.mark.asyncio
 async def test_debounce_resets_timer_on_new_arrival():
     adapter = _make_adapter()
     adapter._busy_text_debounce_seconds = 0.1

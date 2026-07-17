@@ -35,6 +35,32 @@ def _discord_source() -> SessionSource:
     )
 
 
+def test_direct_question_leaves_pending_followup_for_fresh_event_processing() -> None:
+    session_key = "agent:main:discord:thread:thread-1"
+    followup = MessageEvent(
+        text="Okay, let's build this.",
+        source=_discord_source(),
+        message_id="followup-message",
+        discord_action_request_intent=True,
+    )
+    pending = {session_key: followup}
+    adapter = SimpleNamespace(
+        get_pending_message=lambda key: pending.pop(key, None),
+    )
+
+    recursive = gateway_run._dequeue_pending_event_for_turn(
+        adapter,
+        session_key,
+        False,
+    )
+
+    assert recursive is None
+    assert pending[session_key] is followup
+    fresh_event = adapter.get_pending_message(session_key)
+    assert fresh_event is followup
+    assert fresh_event.discord_action_request_intent is True
+
+
 @pytest.mark.asyncio
 async def test_queued_response_footer_uses_its_completed_turn_model() -> None:
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -134,7 +160,7 @@ class _SessionFallbackLedger:
         return [self.item]
 
 
-def test_queued_continuation_recovers_discord_action_metadata() -> None:
+def test_queued_continuation_recovers_structural_metadata_with_legacy_intent() -> None:
     feature_summary = {
         "initial_request": "Deploy the dashboard",
         "kanban_board": None,
@@ -146,14 +172,13 @@ def test_queued_continuation_recovers_discord_action_metadata() -> None:
         "platform": "discord",
         "feature_summary": feature_summary,
         "project_summary": {"title": "Dashboard"},
-        "channel_prompt": "stale stored prompt",
+        "channel_prompt": "Project instructions",
         "status": "agent_running",
     })
     event = MessageEvent(
         text="Ship the completed build.",
         source=_discord_source(),
         message_id="queued-message",
-        channel_prompt="current prompt",
     )
 
     runner._hydrate_discord_continuation_event_from_work_item(
@@ -166,7 +191,9 @@ def test_queued_continuation_recovers_discord_action_metadata() -> None:
     assert event.project_summary == {"title": "Dashboard"}
     assert event.work_item_id == "work-1"
     assert event.message_id == "queued-message"
-    assert event.channel_prompt == "current prompt"
+    assert event.channel_prompt == "Project instructions"
+    assert event.discord_action_request_intent is None
+    assert event.discord_action_request_base_channel_prompt is None
     assert gateway_run._is_standard_discord_action_request(
         event.source,
         event.feature_summary,
@@ -186,6 +213,7 @@ async def test_process_completion_inherits_discord_action_metadata(monkeypatch) 
         "message_id": "root-message",
         "feature_summary": feature_summary,
         "project_summary": {"title": "Dashboard"},
+        "channel_prompt": "Project instructions",
     })
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.adapters = {Platform.DISCORD: adapter}
@@ -231,3 +259,31 @@ async def test_process_completion_inherits_discord_action_metadata(monkeypatch) 
     assert event.project_summary == {"title": "Dashboard"}
     assert event.work_item_id == "work-1"
     assert event.work_replay is True
+    assert event.discord_action_request_intent is None
+    assert event.channel_prompt == "Project instructions"
+    assert event.discord_action_request_base_channel_prompt is None
+
+
+def test_internal_restart_event_does_not_copy_stored_false_intent() -> None:
+    event = MessageEvent(
+        text="Continue after restart.",
+        source=_discord_source(),
+        internal=True,
+    )
+
+    gateway_run.GatewayRunner._hydrate_discord_resume_event_from_work_item(
+        event,
+        {
+            "id": "work-1",
+            "feature_summary": {
+                "initial_request": "Deploy the dashboard",
+                "kanban_board": None,
+            },
+            "channel_prompt": "Project instructions",
+        },
+    )
+
+    assert event.feature_summary["initial_request"] == "Deploy the dashboard"
+    assert event.discord_action_request_intent is None
+    assert event.channel_prompt == "Project instructions"
+    assert event.discord_action_request_base_channel_prompt is None

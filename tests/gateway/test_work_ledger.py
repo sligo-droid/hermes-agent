@@ -77,6 +77,45 @@ def test_ledger_deduplicates_discord_message_ids(tmp_path):
     assert len(ledger.incomplete_items()) == 1
 
 
+def test_ledger_persists_only_base_prompt_for_direct_question(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="intent-message")
+    event.discord_action_request_intent = False
+    event.discord_action_request_base_channel_prompt = "Project instructions"
+    event.channel_prompt = "Project instructions\n\nDirect question overlay"
+
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+
+    assert item is not None
+    stored = ledger.get(item["id"])
+    assert stored["channel_prompt"] == "Project instructions"
+    assert "discord_action_request_intent" not in stored
+    assert "discord_action_request_base_channel_prompt" not in stored
+    replay = ledger.event_from_item(stored)
+    assert replay.discord_action_request_intent is None
+    assert replay.discord_action_request_base_channel_prompt is None
+    assert replay.channel_prompt == "Project instructions"
+
+
+def test_legacy_ledger_item_replays_with_none_action_intent(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="legacy-message")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    stored = ledger.get(item["id"])
+    replay = ledger.event_from_item(stored)
+
+    assert replay.discord_action_request_intent is None
+
+
 def test_ledger_strips_transient_summary_objects(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="m1")
@@ -1428,6 +1467,64 @@ async def test_post_delivery_summary_recovers_existing_discord_work_item(tmp_pat
     runner._update_discord_summaries.assert_awaited_once()
     assert runner._update_discord_summaries.await_args.kwargs["feature_summary"] == event.feature_summary
     assert runner.work_ledger.get(item["id"])["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_direct_question_completes_ledger_without_mutating_action_summary(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = None
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    callbacks = []
+    adapter = SimpleNamespace(
+        register_post_delivery_callback=lambda session_key, callback, generation=None: callbacks.append(callback),
+        update_feature_summary=AsyncMock(return_value=True),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _discord_event(message_id="question-1", text="What remains unfinished?")
+    feature_summary = {
+        "thread_id": "thread-1",
+        "message_id": "summary-1",
+        "initial_request": "Implement the ingestion pipeline",
+        "status": "In progress",
+        "outcome": "Parser implementation is still underway.",
+        "kanban_board": None,
+    }
+    original_summary = dict(feature_summary)
+    event.feature_summary = feature_summary
+    event.discord_action_request_intent = False
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert item is not None
+    event.work_item_id = item["id"]
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response="The parser and deployment verification are still outstanding.",
+        feature_summary=feature_summary,
+    )
+    runner.work_ledger.mark_response_delivered(item["id"], result_message_id="answer-1")
+
+    runner._register_discord_summary_post_delivery(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        run_generation=9,
+        session_id="session-1",
+        final_response="The parser and deployment verification are still outstanding.",
+        agent_result={"completed": True},
+    )
+
+    assert len(callbacks) == 1
+    assert await callbacks[0]() is True
+    adapter.update_feature_summary.assert_not_awaited()
+    assert feature_summary == original_summary
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "completed"
+    assert stored["final_response"].startswith("The parser")
 
 
 @pytest.mark.asyncio

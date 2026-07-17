@@ -88,7 +88,7 @@ def _patch_agent_runtime(monkeypatch):
         "_load_reasoning_config",
         staticmethod(lambda: {"enabled": True, "effort": "high"}),
     )
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.6-terra")
     monkeypatch.setattr(
         gateway_run,
         "_resolve_runtime_agent_kwargs",
@@ -105,15 +105,24 @@ def _patch_agent_runtime(monkeypatch):
     monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
 
 
-async def _run_discord_agent(runner, feature_summary):
+async def _run_discord_agent(
+    runner,
+    feature_summary,
+    *,
+    intent=None,
+    message="Build a deploy dashboard",
+    channel_prompt=None,
+):
     return await runner._run_agent(
-        message="Build a deploy dashboard",
+        message=message,
         context_prompt="Context prompt",
         history=[],
         source=_make_discord_source(),
         session_id="session-1",
         session_key="agent:main:discord:thread:thread-1",
+        channel_prompt=channel_prompt,
         feature_summary=feature_summary,
+        discord_action_request_intent=intent,
     )
 
 
@@ -146,17 +155,17 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     )
 
     assert result["final_response"] == "ok"
-    assert result["reasoning_effort"] == "xhigh"
+    assert result["reasoning_effort"] == "high"
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
     cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
     audit = cached_agent._runtime_audit_context
-    assert audit["model_tier"] == "advanced"
+    assert audit["model_tier"] == "discord_action"
     assert audit["model_tier_source"] == "route"
     assert audit["runtime_route"] == "discord_action_request"
     assert audit["reasoning_source"] == "model_tier"
@@ -196,6 +205,176 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "phase timing line" in init["ephemeral_system_prompt"]
     assert "contradictory done/not-verified" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
+
+
+@pytest.mark.parametrize(
+    ("initial_request", "expected_tier", "expected_effort"),
+    [
+        ("Fix a typo in the README", "discord_action", "high"),
+        ("Migrate the production auth schema", "advanced", "xhigh"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_discord_action_request_tier_audit_matrix(
+    monkeypatch,
+    initial_request,
+    expected_tier,
+    expected_effort,
+):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+
+    result = await _run_discord_agent(
+        runner,
+        {"initial_request": initial_request, "message_id": "300", "kanban_board": None},
+        intent=True,
+    )
+
+    assert result["reasoning_effort"] == expected_effort
+    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": expected_effort,
+    }
+    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
+    assert audit["model_tier"] == expected_tier
+    assert audit["runtime_route"] == "discord_action_request"
+
+
+@pytest.mark.parametrize("complex_tier", ["missing-tier", "disabled", ""])
+@pytest.mark.asyncio
+async def test_invalid_or_disabled_complex_tier_falls_back_atomically_to_routine_tier(
+    monkeypatch,
+    complex_tier,
+):
+    _patch_agent_runtime(monkeypatch)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "discord": {
+                "action_request_model_tier": "discord_action",
+                "action_request_complex_model_tier": complex_tier,
+            }
+        },
+    )
+    runner = _make_runner()
+
+    result = await _run_discord_agent(
+        runner,
+        {
+            "initial_request": "Migrate the production auth schema",
+            "message_id": "300",
+            "kanban_board": None,
+        },
+        intent=True,
+    )
+
+    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
+    assert result["reasoning_effort"] == "high"
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": "high",
+    }
+    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
+    assert audit["model_tier"] == "discord_action"
+    assert audit["model_tier_source"] == "route"
+
+
+@pytest.mark.asyncio
+async def test_invalid_routine_tier_preserves_legacy_action_fallback(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "discord": {
+                "action_request_model_tier": "missing-tier",
+                "action_request_reasoning_effort": "xhigh",
+            }
+        },
+    )
+    runner = _make_runner()
+
+    result = await _run_discord_agent(
+        runner,
+        {"initial_request": "Build it", "message_id": "300", "kanban_board": None},
+        intent=True,
+    )
+
+    assert _CapturingAgent.last_init["model"] == "gpt-5.6-terra"
+    assert result["reasoning_effort"] == "xhigh"
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": "xhigh",
+    }
+    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
+    assert audit["model_tier"] == ""
+    assert audit["runtime_route"] == "discord_action_request"
+    assert audit["reasoning_source"] == "discord_config"
+
+
+@pytest.mark.asyncio
+async def test_existing_action_thread_direct_question_uses_ordinary_runtime(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+    feature_summary = {
+        "initial_request": "Build bounded Federal Register evidence ingestion",
+        "message_id": "300",
+        "kanban_board": None,
+    }
+
+    result = await _run_discord_agent(
+        runner,
+        feature_summary,
+        intent=False,
+        message=(
+            "Without building anything, can you give me some concrete examples of "
+            'the sort of items in the "include only" list?'
+        ),
+        channel_prompt="Answer this current direct question in place.",
+    )
+
+    assert result["reasoning_effort"] == "high"
+    init = _CapturingAgent.last_init
+    assert init["model"] == "gpt-5.6-terra"
+    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert "tool_delay" not in init
+    assert "verify_on_stop" not in init
+    assert "Discord action-request thread guidance" not in init["ephemeral_system_prompt"]
+    assert "Answer this current direct question in place." in init["ephemeral_system_prompt"]
+    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
+    assert audit["model_tier"] == "basic"
+    assert audit["runtime_route"] == "gateway"
+    assert feature_summary["initial_request"] == "Build bounded Federal Register evidence ingestion"
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_model_and_provider_override_action_tier(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+    session_key = "agent:main:discord:thread:thread-1"
+    runner._session_model_overrides[session_key] = {
+        "model": "custom/explicit-model",
+        "provider": "custom-provider",
+        "api_key": "test-key",
+        "base_url": "https://provider.example/v1",
+        "api_mode": "chat_completions",
+    }
+
+    await _run_discord_agent(
+        runner,
+        {"initial_request": "Build it", "message_id": "300", "kanban_board": None},
+        intent=True,
+    )
+
+    init = _CapturingAgent.last_init
+    assert init["model"] == "custom/explicit-model"
+    assert init["provider"] == "custom-provider"
+    audit = runner._agent_cache[session_key][0]._runtime_audit_context
+    assert audit["model_tier"] == ""
+    assert audit["model_tier_source"] == "session_override"
+    assert audit["runtime_route"] == "discord_action_request"
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,12 @@ def run_llm_inline(monkeypatch):
         ("Hello!", False),
         ("why did the scraper fail?", False),
         ("can you explain the cache?", False),
+        (
+            '<@1504235933598486580> Without building anything, can you give me some '
+            'concrete examples of the sort of items in the "include only" list?',
+            False,
+        ),
+        ("okay, thanks", False),
         ("action request: investigate the flaky tests", True),
         ("feature request: add dark mode", True),
         ("this needs a bug fix", True),
@@ -50,6 +56,31 @@ def test_heuristic_strips_leading_acknowledgements(adapter, acknowledgement):
     message = f"{acknowledgement}, fix the login bug"
 
     assert adapter._heuristic_action_request_intent(message) is True
+
+
+def test_referential_approval_requires_existing_action_thread_context(adapter):
+    message = "<@1504235933598486580> Okay, let's build this."
+
+    assert adapter._heuristic_action_request_intent(message) is None
+    assert adapter._heuristic_action_request_intent(
+        message,
+        actionable_thread_context=True,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_referential_approval_in_action_thread_skips_llm_triage(
+    adapter,
+    run_llm_inline,
+):
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        result = await adapter._classify_discord_action_request(
+            "<@1504235933598486580> Okay, let's build this.",
+            actionable_thread_context=True,
+        )
+
+    assert result is True
+    call_llm.assert_not_called()
 
 
 @pytest.mark.parametrize(
