@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import tempfile
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
@@ -245,18 +246,68 @@ def _codex_auth_has_id_token(codex_home: Path) -> bool:
     return isinstance(tokens, dict) and bool(str(tokens.get("id_token", "") or "").strip())
 
 
-def _write_minimal_config(codex_home: Path) -> None:
+def _inherit_fast_mode_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        worker_config = config.get("coding_worker") or {}
+        return bool(worker_config.get("inherit_fast_mode", True))
+    except Exception:
+        return True
+
+
+def _parent_fast_mode_settings(
+    *,
+    source_env: dict[str, str] | None = None,
+) -> tuple[Optional[str], Optional[bool]]:
+    if not _inherit_fast_mode_enabled():
+        return None, None
+
+    env = os.environ if source_env is None else source_env
+    source_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+    try:
+        with (source_home / "config.toml").open("rb") as config_file:
+            parent_config = tomllib.load(config_file)
+    except Exception:
+        return None, None
+
+    service_tier = parent_config.get("service_tier")
+    if not isinstance(service_tier, str):
+        service_tier = None
+
+    features = parent_config.get("features")
+    fast_mode = features.get("fast_mode") if isinstance(features, dict) else None
+    if not isinstance(fast_mode, bool):
+        fast_mode = None
+    return service_tier, fast_mode
+
+
+def _write_minimal_config(
+    codex_home: Path,
+    *,
+    source_env: dict[str, str] | None = None,
+) -> None:
     config = codex_home / "config.toml"
     if config.exists():
         return
-    config.write_text(
-        "\n".join(
+    service_tier, fast_mode = _parent_fast_mode_settings(source_env=source_env)
+    lines = [
+        'sandbox_mode = "workspace-write"',
+        'approval_policy = "never"',
+    ]
+    if service_tier is not None:
+        lines.append(f"service_tier = {json.dumps(service_tier)}")
+    if fast_mode is not None:
+        lines.extend(
             [
-                'sandbox_mode = "workspace-write"',
-                'approval_policy = "never"',
-                "",
+                "[features]",
+                f"fast_mode = {'true' if fast_mode else 'false'}",
             ]
-        ),
+        )
+    lines.append("")
+    config.write_text(
+        "\n".join(lines),
         encoding="utf-8",
     )
 
@@ -317,6 +368,7 @@ def _prepare_shared_codex_home(
     *,
     entry: Any,
     credential_id: str,
+    source_env: dict[str, str] | None,
     use_shared_home_symlink: bool,
 ) -> bool:
     """Prepare shared auth for a pool credential and point ``path`` at it.
@@ -352,13 +404,13 @@ def _prepare_shared_codex_home(
     if use_shared_home_symlink:
         if not _write_codex_auth(shared_home, entry):
             return False
-        _write_minimal_config(shared_home)
+        _write_minimal_config(shared_home, source_env=source_env)
         _replace_path_with_directory_symlink(path, shared_home)
     else:
         path.mkdir(parents=True, exist_ok=True)
         if not _write_codex_auth(path, entry):
             return False
-        _write_minimal_config(path)
+        _write_minimal_config(path, source_env=source_env)
     return True
 
 
@@ -393,6 +445,7 @@ def prepare_codex_worker_home(
         path,
         entry=entry,
         credential_id=credential_id,
+        source_env=source_env,
         use_shared_home_symlink=use_shared_home_symlink,
     ):
         logger.info(
@@ -416,7 +469,7 @@ def prepare_codex_worker_home(
             "Codex worker copied fallback auth from CODEX_HOME; configure "
             "Hermes openai-codex auth to avoid independent refresh-token owners."
         )
-    _write_minimal_config(path)
+    _write_minimal_config(path, source_env=source_env)
     return credential_id
 
 
