@@ -257,12 +257,12 @@ def _inherit_fast_mode_enabled() -> bool:
         return True
 
 
-def _parent_fast_mode_settings(
+def _parent_worker_config_settings(
     *,
     source_env: dict[str, str] | None = None,
-) -> tuple[Optional[str], Optional[bool]]:
+) -> dict[str, str | bool]:
     if not _inherit_fast_mode_enabled():
-        return None, None
+        return {}
 
     env = os.environ if source_env is None else source_env
     source_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
@@ -270,17 +270,32 @@ def _parent_fast_mode_settings(
         with (source_home / "config.toml").open("rb") as config_file:
             parent_config = tomllib.load(config_file)
     except Exception:
-        return None, None
+        return {}
 
-    service_tier = parent_config.get("service_tier")
-    if not isinstance(service_tier, str):
-        service_tier = None
+    settings: dict[str, str | bool] = {}
+    for key in (
+        "service_tier",
+        "personality",
+        "model_verbosity",
+        "model_reasoning_summary",
+    ):
+        value = parent_config.get(key)
+        if isinstance(value, str):
+            settings[key] = value
 
     features = parent_config.get("features")
     fast_mode = features.get("fast_mode") if isinstance(features, dict) else None
-    if not isinstance(fast_mode, bool):
-        fast_mode = None
-    return service_tier, fast_mode
+    if isinstance(fast_mode, bool):
+        settings["features.fast_mode"] = fast_mode
+
+    memories = parent_config.get("memories")
+    if isinstance(memories, dict):
+        for key in ("use_memories", "generate_memories"):
+            value = memories.get(key)
+            if isinstance(value, bool):
+                settings[f"memories.{key}"] = value
+
+    return settings
 
 
 def _write_minimal_config(
@@ -291,20 +306,35 @@ def _write_minimal_config(
     config = codex_home / "config.toml"
     if config.exists():
         return
-    service_tier, fast_mode = _parent_fast_mode_settings(source_env=source_env)
+    settings = _parent_worker_config_settings(source_env=source_env)
     lines = [
         'sandbox_mode = "workspace-write"',
         'approval_policy = "never"',
     ]
-    if service_tier is not None:
-        lines.append(f"service_tier = {json.dumps(service_tier)}")
-    if fast_mode is not None:
+    for key in (
+        "service_tier",
+        "personality",
+        "model_verbosity",
+        "model_reasoning_summary",
+    ):
+        if key in settings:
+            lines.append(f"{key} = {json.dumps(settings[key])}")
+    if "features.fast_mode" in settings:
         lines.extend(
             [
                 "[features]",
-                f"fast_mode = {'true' if fast_mode else 'false'}",
+                f"fast_mode = {'true' if settings['features.fast_mode'] else 'false'}",
             ]
         )
+    memory_lines = []
+    for key in ("use_memories", "generate_memories"):
+        setting_key = f"memories.{key}"
+        if setting_key in settings:
+            value = "true" if settings[setting_key] else "false"
+            memory_lines.append(f"{key} = {value}")
+    if memory_lines:
+        lines.append("[memories]")
+        lines.extend(memory_lines)
     lines.append("")
     config.write_text(
         "\n".join(lines),
