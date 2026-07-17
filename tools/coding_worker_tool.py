@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,10 +20,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from hermes_cli.model_tiers import DEFAULT_WORKER_TIERS, resolve_worker_tier
+from tools.parallel_worker_worktrees import (
+    ParallelWorkerContext as _ParallelWorkerContext,
+    merge_parallel_worker_result_unlocked as _merge_parallel_worker_result_locked,
+    provision_parallel_worker as _provision_parallel_worker,
+)
 from tools.registry import registry, tool_error
 
 
 DEFAULT_CODING_WORKER_GIT_SSH_COMMAND = "ssh -F /dev/null"
+_PARALLEL_MERGE_LOCKS: dict[str, threading.Lock] = {}
+_PARALLEL_MERGE_LOCKS_GUARD = threading.Lock()
+_TURN_WORKER_RUNS_LOCK = threading.Lock()
 _CODING_WORKER_FALLBACK_ENV_KEYS = frozenset({
     "ALL_PROXY",
     "GIT_CONFIG_GLOBAL",
@@ -69,6 +78,36 @@ def _load_coding_worker_timeout() -> float:
     return max(30.0, timeout)
 
 
+def _coding_worker_config(config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+        except Exception:
+            config = {}
+    worker_cfg = config.get("coding_worker") if isinstance(config, dict) else None
+    return worker_cfg if isinstance(worker_cfg, dict) else {}
+
+
+def is_coding_worker_parallel_enabled(config: Optional[dict[str, Any]] = None) -> bool:
+    """Return whether trusted parallel coding-worker provisioning is enabled."""
+    parallel_cfg = _coding_worker_config(config).get("parallel") or {}
+    if not isinstance(parallel_cfg, dict):
+        return True
+    return bool(parallel_cfg.get("enabled", True))
+
+
+def get_coding_worker_parallel_max_workers(config: Optional[dict[str, Any]] = None) -> int:
+    """Return the configured coding-worker parallelism with a floor of one."""
+    parallel_cfg = _coding_worker_config(config).get("parallel") or {}
+    value = parallel_cfg.get("max_workers", 3) if isinstance(parallel_cfg, dict) else 3
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 3
+
+
 def _codex_reasoning_args(reasoning_level: str) -> list[str]:
     level = str(reasoning_level or "").strip().lower()
     if not level:
@@ -109,11 +148,12 @@ def _start_worker_run(
         "failed": True,
     }
     try:
-        runs = getattr(parent_agent, "turn_worker_runs", None)
-        if not isinstance(runs, list):
-            runs = []
-            parent_agent.turn_worker_runs = runs
-        runs.append(record)
+        with _TURN_WORKER_RUNS_LOCK:
+            runs = getattr(parent_agent, "turn_worker_runs", None)
+            if not isinstance(runs, list):
+                runs = []
+                parent_agent.turn_worker_runs = runs
+            runs.append(record)
     except Exception:
         return None
     return record
@@ -306,6 +346,29 @@ def _scope_check(workdir: str, scope_paths: list[str]) -> dict[str, Any]:
     result["out_of_scope_files"] = out_of_scope
     result["clean"] = not out_of_scope
     return result
+
+
+def _parallel_merge_lock_for(group_id: str) -> threading.Lock:
+    with _PARALLEL_MERGE_LOCKS_GUARD:
+        lock = _PARALLEL_MERGE_LOCKS.get(group_id)
+        if lock is None:
+            lock = threading.Lock()
+            _PARALLEL_MERGE_LOCKS[group_id] = lock
+        return lock
+
+
+def merge_parallel_worker_result(
+    base_cwd: str,
+    worker_cwd: str,
+    group_id: str,
+) -> dict[str, Any]:
+    """Apply one isolated worker diff to the turn workspace under a group lock."""
+    with _parallel_merge_lock_for(str(group_id)):
+        return _merge_parallel_worker_result_locked(
+            str(Path(base_cwd).expanduser().resolve()),
+            str(Path(worker_cwd).expanduser().resolve()),
+            str(group_id),
+        )
 
 
 _UI_ROUTE_DEFAULT_FALLBACK_HINTS = (
@@ -1345,7 +1408,7 @@ def _prepare_pnpm_dependency_links(workdir: str) -> list[str]:
     return notes
 
 
-def delegate_coding_task(
+def _delegate_coding_task_impl(
     task: Optional[str] = None,
     context: Optional[str] = None,
     cwd: Optional[str] = None,
@@ -1361,6 +1424,7 @@ def delegate_coding_task(
     route_decision: Any = None,
     parent_agent: Any = None,
     parent_messages: Optional[list[dict]] = None,
+    _parallel_request: Optional[dict[str, Any]] = None,
 ) -> str:
     """Run a bounded coding task in the configured coding worker backend."""
     if parent_agent is None:
@@ -1416,6 +1480,7 @@ def delegate_coding_task(
         allow_git_pr_lifecycle = False
     allow_git_pr_merge = False
     workdir = _resolve_cwd(cwd, parent_agent)
+    _parallel_context: Optional[_ParallelWorkerContext] = None
     fable_git_preparation = None
     cwd_fallback_metadata: dict[str, str] | None = None
     if not Path(workdir).exists():
@@ -1511,6 +1576,19 @@ def delegate_coding_task(
                         "focused verification; do not stage, commit, push, or touch the PR."
                     )
                 context_text = _prepend_context_note(context_text, recovery_note)
+
+    if _parallel_request is not None:
+        try:
+            _parallel_context = _provision_parallel_worker(
+                str(_parallel_request["base_cwd"]),
+                str(_parallel_request["group_id"]),
+                requested_cwd=workdir,
+            )
+        except Exception as exc:
+            _parallel_request["provision_error"] = str(exc)
+            return tool_error(f"parallel worker provisioning failed: {exc}")
+        _parallel_request["context"] = _parallel_context
+        workdir = _parallel_context.worker_cwd
 
     try:
         from agent.opencode_worker import (
@@ -2315,6 +2393,100 @@ def delegate_coding_task(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def delegate_coding_task(
+    task: Optional[str] = None,
+    context: Optional[str] = None,
+    cwd: Optional[str] = None,
+    turn_timeout_seconds: Optional[float] = None,
+    worker_tier: Optional[str] = None,
+    relevant_files: Optional[list[dict[str, str]]] = None,
+    approach: Optional[str] = None,
+    constraints: Optional[str] = None,
+    verification: Optional[str] = None,
+    scope_paths: Optional[list[str]] = None,
+    allow_git_pr_lifecycle: bool = False,
+    trusted_allow_git_pr_lifecycle: bool = False,
+    route_decision: Any = None,
+    parent_agent: Any = None,
+    parent_messages: Optional[list[dict]] = None,
+    _parallel_group: Optional[dict[str, Any]] = None,
+) -> str:
+    """Run a coding worker, isolating trusted parallel calls in linked worktrees."""
+    call_kwargs = {
+        "task": task,
+        "context": context,
+        "cwd": cwd,
+        "turn_timeout_seconds": turn_timeout_seconds,
+        "worker_tier": worker_tier,
+        "relevant_files": relevant_files,
+        "approach": approach,
+        "constraints": constraints,
+        "verification": verification,
+        "scope_paths": scope_paths,
+        "allow_git_pr_lifecycle": allow_git_pr_lifecycle,
+        "trusted_allow_git_pr_lifecycle": trusted_allow_git_pr_lifecycle,
+        "route_decision": route_decision,
+        "parent_agent": parent_agent,
+        "parent_messages": parent_messages,
+    }
+    if _parallel_group is None:
+        return _delegate_coding_task_impl(**call_kwargs)
+
+    if not is_coding_worker_parallel_enabled():
+        payload = json.loads(_delegate_coding_task_impl(**call_kwargs))
+        payload["parallel"] = {"disabled": True}
+        return json.dumps(payload, ensure_ascii=False)
+
+    group = _parallel_group if isinstance(_parallel_group, dict) else {}
+    group_id = str(group.get("group_id") or "").strip()
+    base_cwd = str(group.get("base_cwd") or "").strip()
+    if not group_id or not base_cwd:
+        payload = json.loads(
+            tool_error("_parallel_group requires non-empty group_id and base_cwd values.")
+        )
+        payload["parallel"] = {
+            "group_id": group_id,
+            "worker_cwd": "",
+            "merged": False,
+            "merge_conflicts": [],
+            "worktree_kept": False,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    parallel_request: dict[str, Any] = {
+        "group_id": group_id,
+        "base_cwd": base_cwd,
+    }
+    call_kwargs["cwd"] = _resolve_cwd(cwd, parent_agent) if cwd else base_cwd
+    call_kwargs["_parallel_request"] = parallel_request
+    try:
+        raw_result = _delegate_coding_task_impl(**call_kwargs)
+        payload = json.loads(raw_result)
+    except Exception as exc:
+        payload = json.loads(tool_error(f"parallel coding worker failed: {exc}"))
+    parallel_context = parallel_request.get("context")
+    if "parallel" not in payload and isinstance(
+        parallel_context, _ParallelWorkerContext
+    ):
+        payload["parallel"] = {
+            "group_id": parallel_context.group_id,
+            "worker_cwd": parallel_context.worker_cwd,
+            "merged": False,
+            "merge_pending": True,
+            "merge_conflicts": [],
+            "worktree_kept": True,
+        }
+    elif "parallel" not in payload:
+        payload["parallel"] = {
+            "group_id": group_id,
+            "worker_cwd": "",
+            "merged": False,
+            "merge_conflicts": [],
+            "worktree_kept": False,
+        }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 CODING_WORKER_SCHEMA = {
     "name": "delegate_coding_task",
     "description": (
@@ -2478,6 +2650,7 @@ registry.register(
         route_decision=args.get("route_decision"),
         parent_agent=kw.get("parent_agent"),
         parent_messages=args.get("_parent_messages") or kw.get("parent_messages"),
+        _parallel_group=args.get("_parallel_group"),
     ),
     check_fn=check_coding_worker_requirements,
     emoji="code",
