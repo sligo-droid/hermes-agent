@@ -5,12 +5,13 @@ import sys
 import threading
 import types
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import gateway.run as gateway_run
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 
 
@@ -189,6 +190,112 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "phase timing line" in init["ephemeral_system_prompt"]
     assert "contradictory done/not-verified" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
+
+
+@pytest.mark.asyncio
+async def test_persisted_auto_thread_summary_reaches_action_request_route(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"discord": {"action_request_model_tier": "advanced"}},
+    )
+    runner = _make_runner()
+    source = _make_discord_source()
+    feature_summary = {
+        "initial_request": "no-op change end-to-end",
+        "message_id": "300",
+        "thread_id": "thread-1",
+        "kanban_board": None,
+    }
+    load_handle = MagicMock(return_value=feature_summary)
+    runner.adapters = {
+        Platform.DISCORD: SimpleNamespace(
+            _load_feature_summary_handle_by_thread_id=load_handle,
+        )
+    }
+    event = MessageEvent(
+        text="no-op change end-to-end",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="thread-1",
+    )
+
+    assert runner._hydrate_discord_feature_summary_from_adapter(event) is feature_summary
+    load_handle.assert_called_once_with("thread-1")
+    runner.adapters = {}
+
+    result = await runner._run_agent(
+        message=event.text,
+        context_prompt="Context prompt",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key="agent:main:discord:thread:thread-1",
+        feature_summary=event.feature_summary,
+    )
+
+    assert result["final_response"] == "ok"
+    init = _CapturingAgent.last_init
+    assert init["model"] == "gpt-5.6-sol"
+    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
+    assert audit["model_tier"] == "advanced"
+    assert audit["model_tier_source"] == "route"
+    assert audit["runtime_route"] == "discord_action_request"
+
+
+@pytest.mark.asyncio
+async def test_zero_background_workers_finalize_summary_and_reaction():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    callbacks = []
+    original_start = AsyncMock()
+    original_complete = AsyncMock()
+
+    def register_callback(session_key, callback, generation=None):
+        callbacks.append(callback)
+
+    adapter = SimpleNamespace(
+        platform=Platform.DISCORD,
+        on_processing_start=original_start,
+        on_processing_complete=original_complete,
+        register_post_delivery_callback=register_callback,
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_has_pending_background_workers = MagicMock(return_value=False)
+    runner._discord_work_item_id_for_event = lambda *args, **kwargs: None
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+    source = _make_discord_source()
+    event = MessageEvent(
+        text="no-op change end-to-end",
+        source=source,
+        feature_summary={
+            "initial_request": "no-op change end-to-end",
+            "message_id": "300",
+            "kanban_board": None,
+        },
+    )
+
+    runner._install_background_worker_reaction_gate(adapter)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    original_start.assert_not_awaited()
+    original_complete.assert_awaited_once_with(event, ProcessingOutcome.SUCCESS)
+
+    runner._register_discord_summary_post_delivery(
+        event=event,
+        source=source,
+        session_key="agent:main:discord:thread:thread-1",
+        run_generation=1,
+        session_id="session-1",
+        final_response="Completed the no-op change.",
+        agent_result={"completed": True},
+    )
+    assert len(callbacks) == 1
+    assert await callbacks[0]() is True
+    update_kwargs = runner._update_discord_summaries.await_args.kwargs
+    assert update_kwargs["feature_summary"] is event.feature_summary
+    assert update_kwargs["status"] == "Complete"
+    assert update_kwargs["final_response"] == "Completed the no-op change."
 
 
 @pytest.mark.asyncio

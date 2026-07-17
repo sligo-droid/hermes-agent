@@ -2966,6 +2966,19 @@ class DiscordAdapter(BasePlatformAdapter):
         ):
             return True
 
+        # Short action-thread smoke requests are often written as task labels
+        # rather than imperative sentences. Keep this deliberately narrow so
+        # status prose such as "the change passed" still falls through to the
+        # triage classifier.
+        if any(
+            re.match(
+                r"^no[- ]?op\s+change(?:\s+(?:end[- ]to[- ]end|e2e))?$",
+                candidate,
+            )
+            for candidate in intent_candidates
+        ):
+            return True
+
         feature_verb_pattern = re.compile(
             r"\b(?:"
             + "|".join(re.escape(verb).replace(r"\ ", r"\s+") for verb in feature_verbs)

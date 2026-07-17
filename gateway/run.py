@@ -5510,6 +5510,48 @@ class GatewayRunner:
             if getattr(event.source, "message_id", None) is None:
                 event.source.message_id = event.message_id
 
+    def _hydrate_discord_feature_summary_from_adapter(
+        self,
+        event: MessageEvent,
+    ) -> Optional[Dict[str, Any]]:
+        """Restore a persisted Discord thread summary onto an event.
+
+        Normal adapter intake attaches the handle directly. This fallback also
+        covers a summary created after intake (for example by the Discord
+        ``promote_to_action_thread`` tool during a misclassified turn), so the
+        turn-end callback can still finalize the embed and its reaction.
+        """
+        existing = getattr(event, "feature_summary", None)
+        if isinstance(existing, dict):
+            return existing
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return None
+        thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        if not thread_id:
+            return None
+        adapter = self._adapter_for_source(source)
+        load_handle = getattr(
+            adapter,
+            "_load_feature_summary_handle_by_thread_id",
+            None,
+        )
+        if not callable(load_handle):
+            return None
+        try:
+            feature_summary = load_handle(thread_id)
+        except Exception:
+            logger.debug(
+                "Discord feature-summary event hydration failed for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            return None
+        if not isinstance(feature_summary, dict):
+            return None
+        event.feature_summary = feature_summary
+        return feature_summary
+
     def _discord_work_item_id_for_event(
         self,
         event: MessageEvent,
@@ -10739,6 +10781,7 @@ class GatewayRunner:
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        self._hydrate_discord_feature_summary_from_adapter(event)
         _work_item = self._accept_discord_work_item(event, _quick_key)
         if (
             _work_item
@@ -12962,6 +13005,12 @@ class GatewayRunner:
                 visual_qa_config=getattr(event, "visual_qa_config", None),
                 completed_worker_run=getattr(event, "completed_worker_run", None),
             )
+
+            # A direct-question turn can promote itself to an action thread
+            # through the Discord tool. That creates and persists the summary
+            # after route selection, so reload it before turn-end lifecycle
+            # work even though this turn necessarily keeps its original model.
+            self._hydrate_discord_feature_summary_from_adapter(event)
 
             _pending_background_workers = self._session_has_pending_background_workers(
                 session_key,
