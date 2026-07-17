@@ -371,6 +371,21 @@ class TestCronWithGatewayOrigin:
     hanging the job instead of respecting approvals.cron_mode.
     """
 
+    def test_scoped_cron_identity_does_not_contaminate_later_gateway_turn(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        from gateway.session_context import reset_cron_execution, set_cron_execution
+
+        token = set_cron_execution()
+        try:
+            assert approval_module._is_gateway_approval_context() is False
+        finally:
+            reset_cron_execution(token)
+
+        assert approval_module._is_gateway_approval_context() is True
+
     def test_cron_with_telegram_origin_uses_cron_mode_not_gateway(self, monkeypatch):
         """Cron + contextvar platform=telegram + cron_mode=deny → BLOCKED, not pending."""
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")

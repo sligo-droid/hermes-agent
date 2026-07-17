@@ -574,6 +574,54 @@ def test_background_refuses_cron_and_kanban_contexts(monkeypatch, tmp_path):
     assert "unavailable in Kanban worker sessions" in kanban_result["error"]
 
 
+def test_background_cron_gate_resets_for_later_gateway_context(monkeypatch, tmp_path):
+    from gateway.session_context import reset_cron_execution, set_cron_execution
+
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    parent = _parent(tmp_path)
+    parent.platform = "discord"
+
+    token = set_cron_execution()
+    try:
+        assert "unavailable in cron sessions" in cwt._background_context_error(parent)
+    finally:
+        reset_cron_execution(token)
+
+    assert cwt._background_context_error(parent) == ""
+
+
+def test_background_cron_gate_is_concurrent_context_local(monkeypatch, tmp_path):
+    from gateway.session_context import reset_cron_execution, set_cron_execution
+
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    barrier = threading.Barrier(2, timeout=5)
+
+    def check_cron():
+        parent = _parent(tmp_path)
+        parent.platform = "discord"
+        token = set_cron_execution()
+        try:
+            barrier.wait()
+            return cwt._background_context_error(parent)
+        finally:
+            reset_cron_execution(token)
+
+    def check_gateway():
+        parent = _parent(tmp_path)
+        parent.platform = "telegram"
+        barrier.wait()
+        return cwt._background_context_error(parent)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cron_future = pool.submit(check_cron)
+        gateway_future = pool.submit(check_gateway)
+
+    assert "unavailable in cron sessions" in cron_future.result()
+    assert gateway_future.result() == ""
+
+
 def test_background_refuses_session_without_async_delivery(monkeypatch, tmp_path):
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)

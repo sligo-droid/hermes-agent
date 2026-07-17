@@ -2062,9 +2062,15 @@ def _set_cron_runtime_audit(
 
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
+    from gateway.session_context import reset_cron_execution, set_cron_execution
+
     job_id = job["id"]
-    with _job_profile_context(job_id, job.get("profile")):
-        return _run_job_impl(job)
+    cron_token = set_cron_execution()
+    try:
+        with _job_profile_context(job_id, job.get("profile")):
+            return _run_job_impl(job)
+    finally:
+        reset_cron_execution(cron_token)
 
 
 def _cron_output_metadata_value(value: object) -> str:
@@ -2550,11 +2556,6 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
-
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).

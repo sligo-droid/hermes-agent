@@ -36,7 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -72,6 +72,7 @@ _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
+_CRON_EXECUTION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 _PROJECT_PATH: ContextVar = ContextVar("HERMES_PROJECT_PATH", default=_UNSET)
 _PROJECT_NAME: ContextVar = ContextVar("HERMES_PROJECT_NAME", default=_UNSET)
 _PROJECT_GITHUB_URL: ContextVar = ContextVar("HERMES_PROJECT_GITHUB_URL", default=_UNSET)
@@ -114,10 +115,31 @@ _VAR_MAP = {
     "HERMES_KANBAN_DEFAULT_INTAKE_ASSIGNEE": _KANBAN_DEFAULT_INTAKE_ASSIGNEE,
     "HERMES_KANBAN_NOTIFY_PROFILE": _KANBAN_NOTIFY_PROFILE,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
+    "HERMES_CRON_SESSION": _CRON_EXECUTION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
+
+
+def set_cron_execution(active: bool = True) -> Token:
+    """Bind cron identity to the current task/thread and return a reset token."""
+    return _CRON_EXECUTION.set("1" if active else "")
+
+
+def reset_cron_execution(token: Token) -> None:
+    """Restore the cron identity that preceded :func:`set_cron_execution`."""
+    _CRON_EXECUTION.reset(token)
+
+
+def is_cron_execution() -> bool:
+    """Whether the current context is a cron run, with legacy env fallback."""
+    from utils import env_var_enabled, is_truthy_value
+
+    value = _CRON_EXECUTION.get()
+    if value is not _UNSET:
+        return is_truthy_value(value)
+    return env_var_enabled("HERMES_CRON_SESSION")
 
 
 def set_current_session_id(session_id: str) -> None:
