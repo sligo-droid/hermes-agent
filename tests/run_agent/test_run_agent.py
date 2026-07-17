@@ -2249,6 +2249,163 @@ class TestExecuteToolCalls:
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
+    @staticmethod
+    def _parallel_coding_config(monkeypatch, *, enabled=True, max_workers=3):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "coding_worker": {
+                    "parallel": {
+                        "enabled": enabled,
+                        "max_workers": max_workers,
+                    }
+                }
+            },
+        )
+
+    def test_disjoint_coding_worker_scopes_use_concurrent_path(self, monkeypatch):
+        self._parallel_coding_config(monkeypatch)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "two", "scope_paths": ["src/two"]}),
+                call_id="c2",
+            ),
+        ]
+
+        assert run_agent._should_parallelize_tool_batch(calls)
+
+    def test_missing_coding_worker_scope_forces_sequential(self, monkeypatch):
+        self._parallel_coding_config(monkeypatch)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "two"}),
+                call_id="c2",
+            ),
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(calls)
+
+    @pytest.mark.parametrize("scope_path", ["", "../src", "/absolute/src"])
+    def test_invalid_coding_worker_scope_forces_sequential(
+        self, monkeypatch, scope_path
+    ):
+        self._parallel_coding_config(monkeypatch)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "two", "scope_paths": [scope_path]}),
+                call_id="c2",
+            ),
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(calls)
+
+    def test_overlapping_coding_worker_scopes_force_sequential(self, monkeypatch):
+        self._parallel_coding_config(monkeypatch)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/api"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps(
+                    {"task": "two", "scope_paths": ["src/api/callers"]}
+                ),
+                call_id="c2",
+            ),
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(calls)
+
+    def test_coding_worker_batch_over_max_workers_forces_sequential(
+        self, monkeypatch
+    ):
+        self._parallel_coding_config(monkeypatch, max_workers=2)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps(
+                    {"task": str(index), "scope_paths": [f"src/{index}"]}
+                ),
+                call_id=f"c{index}",
+            )
+            for index in range(3)
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(calls)
+
+    def test_disabled_parallel_coding_workers_force_sequential(self, monkeypatch):
+        self._parallel_coding_config(monkeypatch, enabled=False)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "two", "scope_paths": ["src/two"]}),
+                call_id="c2",
+            ),
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(calls)
+
+    def test_clarify_keeps_priority_over_parallel_coding_workers(
+        self, monkeypatch
+    ):
+        self._parallel_coding_config(monkeypatch)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="clarify",
+                arguments=json.dumps({"question": "Continue?"}),
+                call_id="c2",
+            ),
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(calls)
+
+    def test_mixed_coding_worker_batch_stays_sequential(self, monkeypatch):
+        self._parallel_coding_config(monkeypatch)
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="web_search",
+                arguments=json.dumps({"query": "independent lookup"}),
+                call_id="c2",
+            ),
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(calls)
+
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
@@ -2423,6 +2580,115 @@ class TestConcurrentToolExecution:
         assert "result_slow" in messages[0]["content"]
         assert messages[1]["tool_call_id"] == "c2"
         assert "result_fast" in messages[1]["content"]
+
+    def test_parallel_coding_workers_share_group_and_merge_in_completion_order(
+        self, agent, monkeypatch, tmp_path
+    ):
+        import threading
+
+        from agent import tool_dispatch_helpers
+        from tools import coding_worker_tool as cwt
+
+        monkeypatch.setattr(
+            tool_dispatch_helpers,
+            "_coding_worker_parallel_settings",
+            lambda: (True, 3),
+        )
+        monkeypatch.setattr(
+            cwt,
+            "preflight_delegate_coding_task",
+            lambda args, _agent: SimpleNamespace(
+                args=dict(args or {}), suppressed_result=None
+            ),
+        )
+
+        base_cwd = tmp_path / "base"
+        base_cwd.mkdir()
+        agent.session_cwd = str(base_cwd)
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        dispatched = []
+        merge_calls = []
+        coordinating_thread = threading.get_ident()
+
+        def fake_delegate_coding_task(**kwargs):
+            dispatched.append(kwargs)
+            task = kwargs["task"]
+            if task == "slow":
+                slow_started.set()
+                assert release_slow.wait(timeout=2)
+            else:
+                assert slow_started.wait(timeout=2)
+            return json.dumps(
+                {
+                    "success": True,
+                    "parallel": {
+                        "worker_cwd": str(tmp_path / f"worker-{task}"),
+                    },
+                }
+            )
+
+        def fake_merge_parallel_worker_result(received_base, worker_cwd, group_id):
+            merge_calls.append(
+                (received_base, worker_cwd, group_id, threading.get_ident())
+            )
+            if worker_cwd.endswith("worker-fast"):
+                release_slow.set()
+            return {"success": True, "worker_cwd": worker_cwd}
+
+        monkeypatch.setattr(cwt, "delegate_coding_task", fake_delegate_coding_task)
+        monkeypatch.setattr(
+            cwt,
+            "merge_parallel_worker_result",
+            fake_merge_parallel_worker_result,
+            raising=False,
+        )
+
+        calls = [
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps(
+                    {"task": "slow", "scope_paths": ["src/slow"]}
+                ),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps(
+                    {"task": "fast", "scope_paths": ["src/fast"]}
+                ),
+                call_id="c2",
+            ),
+        ]
+        messages = []
+
+        agent._execute_tool_calls(
+            _mock_assistant_msg(content="", tool_calls=calls),
+            messages,
+            "task-1",
+        )
+
+        assert len(dispatched) == 2
+        parallel_groups = [call["_parallel_group"] for call in dispatched]
+        assert {group["group_id"] for group in parallel_groups} == {
+            parallel_groups[0]["group_id"]
+        }
+        assert {group["base_cwd"] for group in parallel_groups} == {
+            str(base_cwd.resolve())
+        }
+        group_id = parallel_groups[0]["group_id"]
+        assert [Path(call[1]).name for call in merge_calls] == [
+            "worker-fast",
+            "worker-slow",
+        ]
+        assert all(call[0] == str(base_cwd.resolve()) for call in merge_calls)
+        assert all(call[2] == group_id for call in merge_calls)
+        assert all(call[3] == coordinating_thread for call in merge_calls)
+        assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+        assert all(
+            json.loads(message["content"])["parallel_merge"]["success"]
+            for message in messages
+        )
 
     def test_concurrent_handles_tool_error(self, agent):
         """If one tool raises, others should still complete."""

@@ -16,10 +16,12 @@ import concurrent.futures
 import json
 import logging
 import os
+import queue
 import random
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,9 +58,17 @@ logger = logging.getLogger(__name__)
 
 def _storage_safe_tool_args(tool_name: str, args: dict) -> dict:
     """Return callback/persistence-safe args without changing execution args."""
-    if tool_name != "browser_type" or not isinstance(args, dict) or "text" not in args:
+    if not isinstance(args, dict):
         return args
-    return {**args, "text": "[REDACTED_BROWSER_INPUT]"}
+    safe_args = args
+    if "_parallel_group" in safe_args:
+        safe_args = {
+            key: value for key, value in safe_args.items()
+            if key != "_parallel_group"
+        }
+    if tool_name == "browser_type" and "text" in safe_args:
+        safe_args = {**safe_args, "text": "[REDACTED_BROWSER_INPUT]"}
+    return safe_args
 
 
 def _current_session_cwd(agent: Any = None) -> str:
@@ -75,6 +85,127 @@ def _current_session_cwd(agent: Any = None) -> str:
     except Exception:
         pass
     return os.getenv("TERMINAL_CWD", os.getcwd())
+
+
+def _parallel_coding_base_cwd(agent: Any) -> str:
+    """Resolve the coordinating worktree the same way a worker cwd is resolved."""
+    path = Path(_current_session_cwd(agent)).expanduser()
+    if not path.is_absolute():
+        path = Path(os.getcwd()) / path
+    return str(path.resolve(strict=False))
+
+
+def _json_safe_parallel_merge_outcome(outcome: Any) -> Any:
+    if isinstance(outcome, str):
+        try:
+            return json.loads(outcome)
+        except (TypeError, ValueError):
+            return outcome
+    try:
+        json.dumps(outcome)
+        return outcome
+    except (TypeError, ValueError):
+        return str(outcome)
+
+
+def _attach_parallel_merge_outcome(function_result: Any, outcome: Any) -> str:
+    merge_payload = {"parallel_merge": _json_safe_parallel_merge_outcome(outcome)}
+    if isinstance(function_result, str):
+        try:
+            payload = json.loads(function_result)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            payload.update(merge_payload)
+            return json.dumps(payload, ensure_ascii=False)
+        return f"{function_result.rstrip()}\n{json.dumps(merge_payload, ensure_ascii=False)}"
+    return json.dumps(merge_payload, ensure_ascii=False)
+
+
+def _merge_completed_parallel_coding_result(
+    result_entry: Any,
+    *,
+    base_cwd: str,
+    group_id: str,
+) -> Any:
+    """Merge one completed coding worker from the coordinating thread."""
+    if result_entry is None:
+        return None
+
+    (
+        function_name,
+        function_args,
+        storage_args,
+        function_result,
+        duration,
+        is_error,
+        blocked,
+    ) = result_entry
+    if function_name != "delegate_coding_task" or blocked or is_error:
+        return result_entry
+
+    try:
+        payload = json.loads(function_result) if isinstance(function_result, str) else None
+    except (TypeError, ValueError):
+        payload = None
+    parallel = payload.get("parallel") if isinstance(payload, dict) else None
+    worker_cwd = parallel.get("worker_cwd") if isinstance(parallel, dict) else None
+
+    if not isinstance(worker_cwd, str) or not worker_cwd.strip():
+        merge_outcome = {
+            "success": False,
+            "recovery_required": True,
+            "error": "Grouped coding-worker result did not include parallel.worker_cwd.",
+            "next_action": (
+                "Inspect the grouped worker result and recover its isolated worktree "
+                "before continuing."
+            ),
+        }
+    else:
+        try:
+            from tools.coding_worker_tool import merge_parallel_worker_result
+
+            merge_outcome = merge_parallel_worker_result(
+                base_cwd,
+                worker_cwd,
+                group_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "parallel coding-worker merge-back failed for %s: %s",
+                worker_cwd,
+                exc,
+                exc_info=True,
+            )
+            merge_outcome = {
+                "success": False,
+                "recovery_required": True,
+                "error": f"Parallel coding-worker merge-back failed: {exc}",
+                "next_action": (
+                    "Inspect the isolated worker worktree and recover or retry the "
+                    "merge-back before continuing."
+                ),
+            }
+
+    function_result = _attach_parallel_merge_outcome(function_result, merge_outcome)
+    normalized_outcome = _json_safe_parallel_merge_outcome(merge_outcome)
+    merge_failed = bool(
+        isinstance(normalized_outcome, dict)
+        and (
+            normalized_outcome.get("success") is False
+            or normalized_outcome.get("recovery_required") is True
+            or normalized_outcome.get("error")
+        )
+    )
+    return (
+        function_name,
+        function_args,
+        storage_args,
+        function_result,
+        duration,
+        is_error or merge_failed,
+        blocked,
+    )
 
 
 # Maximum number of concurrent worker threads for parallel tool execution.
@@ -595,6 +726,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool start callback error: {cb_err}")
 
+    parallel_coding_group = None
+    if num_tools > 1 and all(
+        name == "delegate_coding_task"
+        for _tc, name, _args, _storage_args, _block_result, _blocked in parsed_calls
+    ):
+        parallel_coding_group = {
+            "group_id": uuid.uuid4().hex,
+            "base_cwd": _parallel_coding_base_cwd(agent),
+        }
+        for _tc, _name, args, _storage_args, _block_result, _blocked in parsed_calls:
+            args["_parallel_group"] = dict(parallel_coding_group)
+
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, execution_args, storage_args, result, duration, error_flag, blocked_flag)
     results = [None] * num_tools
@@ -696,6 +839,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                completed_futures: queue.Queue = queue.Queue()
+                future_indexes = {}
                 for i, tc, name, args in runnable_calls:
                     # Propagate the agent turn's ContextVars (e.g.
                     # _approval_session_key) AND thread-local approval/sudo
@@ -704,6 +849,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         propagate_context_to_thread(_run_tool), i, tc, name, args
                     )
                     futures.append(f)
+                    future_indexes[f] = i
+                    f.add_done_callback(completed_futures.put)
 
                 # Wait for all to complete with periodic heartbeats so the
                 # gateway's inactivity monitor doesn't kill us during long
@@ -712,12 +859,38 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 # or a new message during concurrent tool execution.
                 _conc_start = time.time()
                 _interrupt_logged = False
-                while True:
-                    done, not_done = concurrent.futures.wait(
-                        futures, timeout=5.0,
-                    )
-                    if not not_done:
-                        break
+                pending_futures = set(futures)
+
+                def _process_completed_future(completed_future) -> None:
+                    if completed_future not in pending_futures:
+                        return
+                    pending_futures.discard(completed_future)
+                    try:
+                        completed_future.result()
+                    except concurrent.futures.CancelledError:
+                        return
+                    except BaseException as tool_error:
+                        logger.error(
+                            "concurrent tool worker raised: %s",
+                            tool_error,
+                            exc_info=True,
+                        )
+                    if parallel_coding_group is not None:
+                        result_index = future_indexes[completed_future]
+                        results[result_index] = _merge_completed_parallel_coding_result(
+                            results[result_index],
+                            base_cwd=parallel_coding_group["base_cwd"],
+                            group_id=parallel_coding_group["group_id"],
+                        )
+
+                while pending_futures:
+                    try:
+                        completed_future = completed_futures.get(timeout=5.0)
+                    except queue.Empty:
+                        completed_future = None
+                    if completed_future is not None:
+                        _process_completed_future(completed_future)
+                        continue
 
                     # Check for interrupt — the per-thread interrupt signal
                     # already causes individual tools (terminal, execute_code)
@@ -729,28 +902,34 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             _interrupt_logged = True
                             agent._vprint(
                                 f"{agent.log_prefix}⚡ Interrupt: cancelling "
-                                f"{len(not_done)} pending concurrent tool(s)",
+                                f"{len(pending_futures)} pending concurrent tool(s)",
                                 force=True,
                             )
-                        for f in not_done:
+                        for f in pending_futures:
                             f.cancel()
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
-                        concurrent.futures.wait(not_done, timeout=3.0)
+                        concurrent.futures.wait(pending_futures, timeout=3.0)
                         break
 
                     _conc_elapsed = int(time.time() - _conc_start)
                     # Heartbeat every ~30s (6 × 5s poll intervals)
                     if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
                         _still_running = [
-                            parsed_calls[futures.index(f)][1]
-                            for f in not_done
-                            if f in futures
+                            parsed_calls[future_indexes[f]][1]
+                            for f in pending_futures
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+                            f"{len(pending_futures)} remaining: {', '.join(_still_running[:3])})"
                         )
+
+                # ThreadPoolExecutor waits for running calls during shutdown.
+                # Drain their completion callbacks here so grouped merge-backs
+                # still happen on this coordinating thread, in completion order.
+                while pending_futures:
+                    completed_future = completed_futures.get()
+                    _process_completed_future(completed_future)
     finally:
         if spinner:
             # Build a summary message for the spinner stop. Results are
