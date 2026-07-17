@@ -562,6 +562,279 @@ async def test_connect_respects_slash_commands_opt_out(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_connect_sets_ready_before_root_recovery_completes(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "off")
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    monkeypatch.setattr(
+        discord_platform.commands,
+        "Bot",
+        lambda **kwargs: FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    recovery_started = asyncio.Event()
+    allow_recovery_finish = asyncio.Event()
+
+    async def slow_recovery(*, recovery_state=None):
+        recovery_started.set()
+        await allow_recovery_finish.wait()
+        return 0
+
+    recovery = AsyncMock(side_effect=slow_recovery)
+    monkeypatch.setattr(adapter, "_recover_missed_root_channel_mentions", recovery)
+
+    ok = await asyncio.wait_for(adapter.connect(), timeout=1.0)
+
+    assert ok is True
+    assert adapter._ready_event.is_set()
+    await asyncio.wait_for(recovery_started.wait(), timeout=1.0)
+    recovery_task = adapter._root_mention_recovery_task
+    assert recovery_task is not None
+    assert not recovery_task.done()
+
+    allow_recovery_finish.set()
+    await asyncio.wait_for(recovery_task, timeout=1.0)
+    recovery.assert_awaited_once()
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_resumed_sets_ready_before_root_recovery_completes(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "off")
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    created = {}
+
+    def fake_bot_factory(**kwargs):
+        bot = FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        )
+        created["bot"] = bot
+        return bot
+
+    monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    assert await adapter.connect() is True
+    initial_recovery_task = adapter._root_mention_recovery_task
+    assert initial_recovery_task is not None
+    await asyncio.wait_for(initial_recovery_task, timeout=1.0)
+
+    recovery_started = asyncio.Event()
+    allow_recovery_finish = asyncio.Event()
+
+    async def slow_recovery(*, recovery_state=None):
+        recovery_started.set()
+        await allow_recovery_finish.wait()
+
+    recovery = AsyncMock(side_effect=slow_recovery)
+    monkeypatch.setattr(
+        adapter,
+        "_run_root_channel_missed_mention_recovery_task",
+        recovery,
+    )
+
+    await created["bot"]._events["on_disconnect"]()
+    assert not adapter._ready_event.is_set()
+
+    await asyncio.wait_for(created["bot"]._events["on_resumed"](), timeout=1.0)
+
+    assert adapter._ready_event.is_set()
+    await asyncio.wait_for(recovery_started.wait(), timeout=1.0)
+    recovery_task = adapter._root_mention_recovery_task
+    assert recovery_task is not None
+    assert not recovery_task.done()
+
+    allow_recovery_finish.set()
+    await asyncio.wait_for(recovery_task, timeout=1.0)
+    recovery.assert_awaited_once()
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_live_message_dedup_wins_during_root_recovery_replay(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"allowed_channels": ["555"]},
+        )
+    )
+
+    monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "off")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    bot_user = SimpleNamespace(id=999, name="Hermes", bot=True)
+    message = _fake_discord_root_message(125)
+    channel = _FakeDiscordRootChannel("555", [message])
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {"555": {"last_seen_message_id": "123", "last_online_at": 950.0}}}))
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    created = {}
+
+    class RecoveryBot(FakeBot):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.user = bot_user
+
+        def get_channel(self, channel_id):
+            return channel if channel_id == 555 else None
+
+    def fake_bot_factory(**kwargs):
+        bot = RecoveryBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        )
+        created["bot"] = bot
+        return bot
+
+    monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+    monkeypatch.setattr(adapter, "_record_discord_root_channel_seen_message", MagicMock())
+    monkeypatch.setattr(adapter, "_is_allowed_user", lambda *args, **kwargs: True)
+    adapter._handle_message = AsyncMock()
+
+    recovery_checked_message = asyncio.Event()
+    allow_recovery_dedup = asyncio.Event()
+
+    async def pause_before_recovery_dedup(message, channel_id, cutoff_ts):
+        recovery_checked_message.set()
+        await allow_recovery_dedup.wait()
+        return True
+
+    monkeypatch.setattr(
+        adapter,
+        "_should_replay_root_channel_message",
+        pause_before_recovery_dedup,
+    )
+
+    assert await adapter.connect() is True
+    await asyncio.wait_for(recovery_checked_message.wait(), timeout=1.0)
+
+    await created["bot"]._events["on_message"](message)
+    adapter._handle_message.assert_awaited_once_with(message)
+
+    allow_recovery_dedup.set()
+    recovery_task = adapter._root_mention_recovery_task
+    assert recovery_task is not None
+    await asyncio.wait_for(recovery_task, timeout=1.0)
+    adapter._handle_message.assert_awaited_once_with(message)
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_on_message_ignores_teardown_after_client_is_cleared(monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"root_mention_recovery": False},
+        )
+    )
+
+    monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "off")
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    created = {}
+
+    def fake_bot_factory(**kwargs):
+        bot = FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        )
+        created["bot"] = bot
+        return bot
+
+    monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    assert await adapter.connect() is True
+    bot = created["bot"]
+    adapter._client = None
+
+    await bot._events["on_message"](SimpleNamespace(id=123))
+
+    assert "123" not in adapter._dedup._seen
+    adapter._client = bot
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_root_recovery_task(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "off")
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    monkeypatch.setattr(
+        discord_platform.commands,
+        "Bot",
+        lambda **kwargs: FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    recovery_started = asyncio.Event()
+
+    async def slow_recovery(*, recovery_state=None):
+        recovery_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        adapter,
+        "_recover_missed_root_channel_mentions",
+        slow_recovery,
+    )
+
+    assert await adapter.connect() is True
+    await asyncio.wait_for(recovery_started.wait(), timeout=1.0)
+    recovery_task = adapter._root_mention_recovery_task
+    assert recovery_task is not None
+
+    await adapter.disconnect()
+
+    assert recovery_task.cancelled()
+    assert adapter._root_mention_recovery_task is None
+
+
+@pytest.mark.asyncio
 async def test_safe_sync_slash_commands_only_mutates_diffs():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
@@ -808,6 +1081,36 @@ async def test_root_channel_recovery_replays_newer_missed_mention(tmp_path, monk
     adapter._handle_message.assert_awaited_once_with(missed)
     state = json.loads(state_path.read_text())
     assert state["channels"]["555"]["last_seen_message_id"] == "125"
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_uses_pre_ready_watermark_snapshot(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"allowed_channels": ["555"]})
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    missed = _fake_discord_root_message(125, mentions=[bot_user])
+    channel = _FakeDiscordRootChannel("555", [missed])
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {"555": {"last_seen_message_id": "130", "last_online_at": 990.0}}}))
+    recovery_state = {
+        "version": 1,
+        "channels": {"555": {"last_seen_message_id": "123", "last_online_at": 950.0}},
+    }
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channel if channel_id == 555 else None)
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_root_channel_mentions(
+        recovery_state=recovery_state,
+    )
+
+    assert recovered == 1
+    adapter._handle_message.assert_awaited_once_with(missed)
+    state = json.loads(state_path.read_text())
+    assert state["channels"]["555"]["last_seen_message_id"] == "130"
 
 
 @pytest.mark.asyncio
