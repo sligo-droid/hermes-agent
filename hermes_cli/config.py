@@ -1116,10 +1116,19 @@ DEFAULT_CONFIG = {
 
     # Auxiliary model config — provider:model for each side task.
     # Format: provider is the provider name, model is the model slug.
-    # "auto" for provider = auto-detect best available provider.
+    # "auto" for provider = use the main provider/model first, then the
+    # standard auxiliary auto-detection chain if the main route is unavailable.
     # Empty model = use provider's default auxiliary model.
-    # All tasks fall back to openrouter:google/gemini-3-flash-preview if
-    # the configured provider is unavailable.
+    # For compression failures, fallback_chain entries run first. Explicit
+    # routes then retain the main-agent model as a final safety net; auto routes
+    # continue through the generic auto fallback chain after fallback_chain.
+    # Example native Anthropic compression fallback (credentials must be
+    # explicitly configured in Hermes as ANTHROPIC_API_KEY / ANTHROPIC_TOKEN
+    # or an Anthropic credential-pool entry):
+    #
+    #   fallback_chain:
+    #     - provider: anthropic
+    #       model: claude-sonnet-4-6
     #
     # extra_body: forwarded verbatim as request body fields on every aux call
     # for that task. Use this to set provider-specific knobs (independent of
@@ -1165,6 +1174,7 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
+            "fallback_chain": [],  # ordered routes tried before generic/main fallback handling
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
