@@ -454,9 +454,9 @@ prompt_caching:
 # browser screenshot analysis, web page summarization, TTS audio-tag insertion,
 # and context compression.
 #
-# By default these use Gemini Flash via OpenRouter or Nous Portal and are
-# auto-detected from your credentials.  You do NOT need to change anything
-# here for normal usage.
+# By default "auto" uses your configured main provider/model first, then
+# checks the standard auxiliary fallback providers. You do NOT need to change
+# anything here for normal usage.
 #
 # WARNING: Overriding these with providers other than OpenRouter or Nous Portal
 # is EXPERIMENTAL and may not work.  Not all models/providers support vision,
@@ -468,16 +468,15 @@ prompt_caching:
 # local endpoint for compression (just needs text).
 #
 # Provider options:
-#   "auto"       - Best available: OpenRouter → Nous Portal → main endpoint (default)
+#   "auto"       - Main provider/model first, then OpenRouter → Nous Portal →
+#                  custom endpoint → configured API-key providers (default)
 #   "openrouter" - Force OpenRouter (requires OPENROUTER_API_KEY)
 #   "nous"       - Force Nous Portal (requires: hermes auth add nous)
 #   "gemini"      - Force Google AI Studio direct (requires: GOOGLE_API_KEY or GEMINI_API_KEY)
 #   "ollama-cloud" - Ollama Cloud (requires: OLLAMA_API_KEY)
 #   "codex"       - Force Codex OAuth (requires: hermes model → Codex).
 #                  Uses gpt-5.3-codex which supports vision.
-#   "main"       - Use your custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY).
-#                  Works with OpenAI API, local models, or any OpenAI-compatible
-#                  endpoint.  Also falls back to Codex OAuth and API-key providers.
+#   "main"       - Use the configured main provider/model for this task.
 #
 # Model: leave empty to use the provider's default.  When empty, OpenRouter
 # uses "google/gemini-3-flash-preview" and Nous uses "gemini-3-flash".
@@ -496,6 +495,17 @@ prompt_caching:
 #   web_extract:
 #     provider: "auto"
 #     model: ""
+#
+#   # Context compression. On payment, rate-limit, connection/timeout, or
+#   # provider-service outage, this ordered chain runs before other fallback
+#   # handling. Explicit routes retain the main-agent model as a final safety
+#   # net; auto routes continue through the generic auto fallback chain.
+#   compression:
+#     provider: "auto"
+#     model: ""
+#     fallback_chain:
+#       - provider: "anthropic"     # Uses explicitly configured Hermes Anthropic credentials
+#         model: "claude-sonnet-4-6"
 #
 #   # Gemini 3.1 TTS hidden audio-tag insertion
 #   tts_audio_tags:

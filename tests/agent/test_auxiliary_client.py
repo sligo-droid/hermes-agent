@@ -23,7 +23,9 @@ from agent.auxiliary_client import (
     _get_provider_chain,
     _is_payment_error,
     _is_rate_limit_error,
+    _is_provider_service_outage,
     _normalize_aux_provider,
+    _try_configured_fallback_chain,
     _try_payment_fallback,
     _resolve_auto,
     _resolve_xai_oauth_for_aux,
@@ -1338,6 +1340,35 @@ class TestIsRateLimitError:
         assert _is_rate_limit_error(exc) is False
 
 
+class TestIsProviderServiceOutage:
+    @pytest.mark.parametrize("status", [500, 502, 503, 504, 529])
+    def test_provider_outage_statuses(self, status):
+        exc = Exception("provider failed")
+        exc.status_code = status
+        assert _is_provider_service_outage(exc) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "service unavailable",
+            "overloaded_error: server is overloaded",
+            "upstream is overloaded, retry later",
+            "no available capacity",
+        ],
+    )
+    def test_provider_outage_signals_without_status(self, message):
+        assert _is_provider_service_outage(Exception(message)) is True
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+    def test_ordinary_4xx_never_classified_as_outage(self, status):
+        exc = Exception("service unavailable: invalid request or credentials")
+        exc.status_code = status
+        assert _is_provider_service_outage(exc) is False
+
+    def test_unrelated_server_message_is_not_outage(self):
+        assert _is_provider_service_outage(Exception("model validation failed")) is False
+
+
 class TestGetProviderChain:
     """_get_provider_chain() resolves functions at call time (testable)."""
 
@@ -1407,6 +1438,23 @@ class TestTryPaymentFallback:
         assert model is None
         assert label == ""
 
+    def test_api_key_rung_skips_same_annotated_backend(self):
+        """The generic rung must not immediately reselect the failed backend."""
+        same_backend = MagicMock()
+        same_backend._hermes_provider = "copilot"
+        with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_nous", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+             patch("agent.auxiliary_client._resolve_api_key_provider",
+                   return_value=(same_backend, "gpt-5.4")), \
+             patch("agent.auxiliary_client._read_main_provider", return_value="copilot"):
+            client, model, label = _try_payment_fallback(
+                "copilot", task="compression", reason="provider service outage"
+            )
+        assert client is None
+        assert model is None
+        assert label == ""
+
 
 class TestCallLlmPaymentFallback:
     """call_llm() retries with a different provider on 402 / payment / rate-limit errors."""
@@ -1421,8 +1469,8 @@ class TestCallLlmPaymentFallback:
         exc.status_code = 429
         return exc
 
-    def test_non_payment_error_not_caught(self, monkeypatch):
-        """Non-payment/non-connection errors (500) should NOT trigger fallback."""
+    def test_non_compression_500_not_caught(self, monkeypatch):
+        """Service-outage fallback is intentionally scoped to compression."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
         primary_client = MagicMock()
@@ -1431,14 +1479,18 @@ class TestCallLlmPaymentFallback:
         primary_client.chat.completions.create.side_effect = server_err
 
         with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+                   return_value=(primary_client, "google/gemini-3-flash-preview")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
+                   return_value=("auto", "google/gemini-3-flash-preview", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain") as chain, \
+             patch("agent.auxiliary_client._try_payment_fallback") as generic:
             with pytest.raises(Exception, match="Internal Server Error"):
                 call_llm(
-                    task="compression",
+                    task="session_search",
                     messages=[{"role": "user", "content": "hello"}],
                 )
+        chain.assert_not_called()
+        generic.assert_not_called()
 
     def test_429_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit errors should trigger fallback to next provider."""
@@ -1488,6 +1540,380 @@ class TestCallLlmPaymentFallback:
 
         assert result is response
         assert primary_client.chat.completions.create.call_count == 2
+
+
+class TestCompressionProviderOutageFallback:
+    @staticmethod
+    def _outage(status=503, message="Service Unavailable"):
+        exc = Exception(message)
+        exc.status_code = status
+        return exc
+
+    @staticmethod
+    def _response(text):
+        return MagicMock(choices=[
+            MagicMock(message=MagicMock(content=text))
+        ])
+
+    def test_explicit_gpt_503_uses_configured_anthropic_exact_sonnet(self):
+        primary = MagicMock()
+        primary.base_url = "https://chatgpt.com/backend-api/codex"
+        primary._hermes_provider = "openai-codex"
+        primary.chat.completions.create.side_effect = self._outage()
+
+        anthropic = MagicMock()
+        anthropic.base_url = "https://api.anthropic.com"
+        anthropic._hermes_provider = "anthropic"
+        anthropic.chat.completions.create.return_value = self._response("summary")
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("openai-codex", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, "gpt-5.4"),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(
+                anthropic,
+                "claude-sonnet-4-6",
+                "fallback_chain[0](anthropic)",
+            ),
+        ) as chain, patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback"
+        ) as main_fallback:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "summary"
+        chain.assert_called_once_with(
+            "compression", "openai-codex", reason="provider service outage"
+        )
+        main_fallback.assert_not_called()
+        assert anthropic.chat.completions.create.call_args.kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_auto_gpt_503_uses_configured_chain_before_generic_auto(self):
+        primary = MagicMock()
+        primary.base_url = "https://chatgpt.com/backend-api/codex"
+        primary._hermes_provider = "openai-codex"
+        primary.chat.completions.create.side_effect = self._outage()
+
+        generic_client = MagicMock()
+        generic_client._hermes_provider = "openrouter"
+        generic_client.chat.completions.create.return_value = self._response("generic")
+        order = []
+
+        def configured(*args, **kwargs):
+            order.append(("configured", args, kwargs))
+            return None, None, ""
+
+        def generic(*args, **kwargs):
+            order.append(("generic", args, kwargs))
+            return generic_client, "openai/gpt-4o-mini", "openrouter"
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, "gpt-5.4"),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            side_effect=configured,
+        ), patch(
+            "agent.auxiliary_client._try_payment_fallback",
+            side_effect=generic,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "generic"
+        assert [item[0] for item in order] == ["configured", "generic"]
+        assert order[0][1] == ("compression", "openai-codex")
+        assert order[1][1][0] == "openai-codex"
+
+    def test_explicit_gpt_503_keeps_main_agent_safety_net_after_chain(self):
+        primary = MagicMock()
+        primary.base_url = "https://chatgpt.com/backend-api/codex"
+        primary._hermes_provider = "openai-codex"
+        primary.chat.completions.create.side_effect = self._outage()
+
+        main_client = MagicMock()
+        main_client._hermes_provider = "openrouter"
+        main_client.chat.completions.create.return_value = self._response("main safety net")
+        order = []
+
+        def configured(*args, **kwargs):
+            order.append("configured")
+            return None, None, ""
+
+        def main_fallback(*args, **kwargs):
+            order.append("main")
+            return main_client, "anthropic/claude-sonnet-4.6", "main-agent(openrouter)"
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("openai-codex", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, "gpt-5.4"),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            side_effect=configured,
+        ), patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback",
+            side_effect=main_fallback,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "main safety net"
+        assert order == ["configured", "main"]
+
+    @pytest.mark.asyncio
+    async def test_async_explicit_gpt_503_matches_sync_fallback(self):
+        primary = MagicMock()
+        primary.base_url = "https://chatgpt.com/backend-api/codex"
+        primary._hermes_provider = "openai-codex"
+        primary.chat.completions.create = AsyncMock(side_effect=self._outage())
+
+        anthropic = MagicMock()
+        anthropic.base_url = "https://api.anthropic.com"
+        anthropic._hermes_provider = "anthropic"
+        async_anthropic = MagicMock()
+        async_anthropic.base_url = "https://api.anthropic.com"
+        async_anthropic._hermes_provider = "anthropic"
+        async_anthropic.chat.completions.create = AsyncMock(
+            return_value=self._response("async summary")
+        )
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("openai-codex", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, "gpt-5.4"),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(
+                anthropic,
+                "claude-sonnet-4-6",
+                "fallback_chain[0](anthropic)",
+            ),
+        ) as chain, patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_anthropic, "claude-sonnet-4-6"),
+        ), patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback"
+        ) as main_fallback:
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "async summary"
+        chain.assert_called_once_with(
+            "compression", "openai-codex", reason="provider service outage"
+        )
+        main_fallback.assert_not_called()
+        assert async_anthropic.chat.completions.create.call_args.kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_explicit_compression_rate_limit_enters_configured_chain(self):
+        primary = MagicMock()
+        primary.base_url = "https://api.openai.com/v1"
+        primary._hermes_provider = "openai"
+        rate_limit = Exception("rate limit exceeded")
+        rate_limit.status_code = 429
+        primary.chat.completions.create.side_effect = rate_limit
+
+        fallback = MagicMock()
+        fallback._hermes_provider = "anthropic"
+        fallback.chat.completions.create.return_value = self._response("rate fallback")
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "gpt-5.4", "https://api.openai.com/v1", "key", None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, "gpt-5.4"),
+        ), patch(
+            "agent.auxiliary_client._recoverable_pool_provider",
+            return_value=None,
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback, "claude-sonnet-4-6", "fallback_chain[0](anthropic)"),
+        ) as chain:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "rate fallback"
+        chain.assert_called_once_with("compression", "openai", reason="rate limit")
+
+    def test_compression_ordinary_400_does_not_fallback(self):
+        primary = MagicMock()
+        primary._hermes_provider = "openai-codex"
+        invalid = Exception("invalid request body")
+        invalid.status_code = 400
+        primary.chat.completions.create.side_effect = invalid
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, "gpt-5.4"),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain"
+        ) as chain, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as generic:
+            with pytest.raises(Exception, match="invalid request body"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        chain.assert_not_called()
+        generic.assert_not_called()
+
+    def test_configured_anthropic_chain_ignores_implicit_claude_code_oauth(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "cc-implicit-token")
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._select_explicit_anthropic_pool_entry",
+            return_value=(False, None),
+        ), patch(
+            "agent.anthropic_adapter.resolve_anthropic_token"
+        ) as implicit_resolver, patch(
+            "agent.anthropic_adapter.build_anthropic_client"
+        ) as build_client:
+            client, model, label = _try_configured_fallback_chain(
+                "compression", "openai-codex", reason="provider service outage"
+            )
+
+        assert client is None
+        assert model is None
+        assert label == ""
+        implicit_resolver.assert_not_called()
+        build_client.assert_not_called()
+
+    def test_explicit_anthropic_pool_selector_skips_claude_code_sources(self):
+        from agent.auxiliary_client import _select_explicit_anthropic_pool_entry
+
+        persisted = [
+            {
+                "source": "claude_code",
+                "auth_type": "oauth",
+                "access_token": "cc-file-token",
+                "priority": 0,
+            },
+            {
+                "source": "env:CLAUDE_CODE_OAUTH_TOKEN",
+                "auth_type": "oauth",
+                "access_token": "cc-env-token",
+                "priority": 1,
+            },
+            {
+                "source": "hermes_pkce",
+                "auth_type": "oauth",
+                "access_token": "hermes-token",
+                "priority": 2,
+                "expires_at_ms": int(time.time() * 1000) + 60_000,
+            },
+        ]
+
+        with patch(
+            "hermes_cli.auth.read_credential_pool", return_value=persisted
+        ), patch(
+            "agent.anthropic_adapter.read_claude_code_credentials"
+        ) as read_claude_code:
+            present, entry = _select_explicit_anthropic_pool_entry()
+
+        assert present is True
+        assert entry.source == "hermes_pkce"
+        assert entry.runtime_api_key == "hermes-token"
+        read_claude_code.assert_not_called()
+
+    def test_non_compression_anthropic_chain_keeps_existing_resolver_semantics(self):
+        client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "anthropic",
+                        "model": "claude-sonnet-4-6",
+                        "base_url": "https://compat.example/anthropic",
+                        "api_key": "compat-key",
+                    }
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(client, "claude-sonnet-4-6"),
+        ) as resolve:
+            resolved_client, model, label = _try_configured_fallback_chain(
+                "vision", "openai-codex", reason="connection error"
+            )
+
+        assert resolved_client is client
+        assert model == "claude-sonnet-4-6"
+        assert label == "fallback_chain[0](anthropic)"
+        resolve.assert_called_once_with(
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            explicit_base_url="https://compat.example/anthropic",
+            explicit_api_key="compat-key",
+        )
+
+    def test_compression_anthropic_chain_honors_explicit_base_url(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "explicit-anthropic-key")
+        real_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "anthropic",
+                        "model": "claude-sonnet-4-6",
+                        "base_url": "https://anthropic-fallback.example/v1/",
+                    }
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._select_explicit_anthropic_pool_entry",
+            return_value=(False, None),
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=real_client,
+        ) as build_client:
+            client, model, label = _try_configured_fallback_chain(
+                "compression", "openai-codex", reason="provider service outage"
+            )
+
+        assert client is not None
+        assert client.base_url == "https://anthropic-fallback.example/v1"
+        assert model == "claude-sonnet-4-6"
+        assert label == "fallback_chain[0](anthropic)"
+        build_client.assert_called_once_with(
+            "explicit-anthropic-key",
+            "https://anthropic-fallback.example/v1",
+        )
 
 
 class TestAuxiliaryFallbackLayering:

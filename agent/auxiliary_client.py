@@ -216,6 +216,20 @@ def _task_provider_provenance(task: str, resolved_provider: Optional[str]) -> st
     return str(resolved_provider or "").strip().lower()
 
 
+def _client_provider_provenance(client: Any, resolved_provider: Optional[str]) -> str:
+    """Return the backend that actually produced ``client``.
+
+    Auto routing intentionally keeps the public provider value as ``"auto"``,
+    but the selected client is annotated by the resolver.  Error fallback must
+    use that annotation so the failed backend is skipped instead of being
+    selected again on the next rung.
+    """
+    annotated = getattr(client, "_hermes_provider", "")
+    if isinstance(annotated, str) and annotated.strip():
+        return _normalize_aux_provider(annotated)
+    return _normalize_aux_provider(resolved_provider)
+
+
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
 # strip the ``temperature`` key from API kwargs entirely so the provider's
 # server-side default applies.  Kimi/Moonshot models manage temperature
@@ -2158,20 +2172,103 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _resolve_explicit_anthropic_token() -> Optional[str]:
+    """Return only credentials explicitly configured for Hermes/Anthropic.
+
+    Compression fallback chains must not opportunistically adopt Claude Code's
+    OAuth environment or credential files.  Hermes-managed ``ANTHROPIC_TOKEN``
+    and ``ANTHROPIC_API_KEY`` values remain valid, including values stored in
+    the active profile's ``.env``.
+    """
+    try:
+        from hermes_cli.config import get_env_value
+    except ImportError:
+        get_env_value = None
+
+    for key in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY"):
+        value = os.getenv(key, "").strip()
+        if not value and get_env_value is not None:
+            try:
+                value = str(get_env_value(key) or "").strip()
+            except Exception:
+                value = ""
+        if value:
+            return value
+    return None
+
+
+def _select_explicit_anthropic_pool_entry() -> Tuple[bool, Optional[Any]]:
+    """Read a Hermes-managed Anthropic pool entry without external discovery.
+
+    ``load_pool("anthropic")`` can seed from Claude Code credential files when
+    Anthropic is the active main provider.  Fallback-chain resolution must not
+    even read those files, so inspect only the already-persisted Hermes pool.
+    """
+    try:
+        from agent.credential_pool import PooledCredential
+        from hermes_cli.auth import read_credential_pool
+
+        raw_entries = read_credential_pool("anthropic")
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not read explicit Anthropic pool: %s", exc)
+        return False, None
+    if not isinstance(raw_entries, list) or not raw_entries:
+        return False, None
+
+    implicit_sources = {"claude_code", "env:CLAUDE_CODE_OAUTH_TOKEN"}
+    entries = sorted(
+        (
+            PooledCredential.from_dict("anthropic", payload)
+            for payload in raw_entries
+            if isinstance(payload, dict)
+        ),
+        key=lambda entry: entry.priority,
+    )
+    now_ms = int(time.time() * 1000)
+    for entry in entries:
+        source = str(getattr(entry, "source", "") or "").strip()
+        if source in implicit_sources:
+            continue
+        if str(getattr(entry, "last_status", "") or "").lower() in {"dead", "exhausted"}:
+            continue
+        expires_at_ms = getattr(entry, "expires_at_ms", None)
+        if isinstance(expires_at_ms, (int, float)) and expires_at_ms <= now_ms:
+            continue
+        if _pool_runtime_api_key(entry):
+            return True, entry
+    return True, None
+
+
+def _try_anthropic(
+    explicit_api_key: str = None,
+    *,
+    explicit_base_url: str = None,
+    allow_implicit_credentials: bool = True,
+) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
         return None, None
 
-    pool_present, entry = _select_pool_entry("anthropic")
-    if pool_present:
-        if entry is None:
-            return None, None
-        token = explicit_api_key or _pool_runtime_api_key(entry)
+    pool_present = False
+    if allow_implicit_credentials:
+        pool_present, entry = _select_pool_entry("anthropic")
+        if pool_present:
+            if entry is None:
+                return None, None
+            token = explicit_api_key or _pool_runtime_api_key(entry)
+        else:
+            entry = None
+            token = explicit_api_key or resolve_anthropic_token()
     else:
         entry = None
-        token = explicit_api_key or resolve_anthropic_token()
+        token = explicit_api_key or _resolve_explicit_anthropic_token()
+        if not token:
+            pool_present, entry = _select_explicit_anthropic_pool_entry()
+            if pool_present:
+                if entry is None:
+                    return None, None
+                token = _pool_runtime_api_key(entry)
     if not token:
         return None, None
 
@@ -2191,6 +2288,8 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
                     base_url = cfg_base_url
     except Exception:
         pass
+    if explicit_base_url:
+        base_url = explicit_base_url.strip().rstrip("/")
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
@@ -2630,6 +2729,69 @@ def _is_connection_error(exc: Exception) -> bool:
     return False
 
 
+_PROVIDER_SERVICE_OUTAGE_STATUSES = frozenset({500, 502, 503, 504, 529})
+_PROVIDER_SERVICE_OUTAGE_SIGNALS = (
+    "service unavailable",
+    "service_unavailable",
+    "temporarily unavailable",
+    "overloaded_error",
+    "server overloaded",
+    "server is overloaded",
+    "provider overloaded",
+    "provider is overloaded",
+    "upstream overloaded",
+    "upstream is overloaded",
+    "no available capacity",
+    "capacity temporarily unavailable",
+)
+
+
+def _exception_status_code(exc: Exception) -> Optional[int]:
+    """Best-effort HTTP status extraction for SDK and wrapped errors."""
+    raw_status = getattr(exc, "status_code", None)
+    if raw_status is None:
+        raw_status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_provider_service_outage(exc: Exception) -> bool:
+    """Detect narrow provider-side service outages suitable for fallback.
+
+    HTTP 500/502/503/504/529 are provider availability failures.  A small set
+    of overload/service-unavailable signals covers SDK wrappers that omit the
+    status code.  Validation, authentication, and permission 4xx responses are
+    explicitly excluded even if their body contains one of those phrases.
+    """
+    status = _exception_status_code(exc)
+    if status in _PROVIDER_SERVICE_OUTAGE_STATUSES:
+        return True
+    if status is not None and 400 <= status < 500:
+        return False
+
+    err_lower = f"{type(exc).__name__}: {exc}".lower()
+    return any(signal in err_lower for signal in _PROVIDER_SERVICE_OUTAGE_SIGNALS)
+
+
+def _fallback_reason_for_error(exc: Exception, task: Optional[str]) -> Optional[str]:
+    """Return the fallback reason for a recoverable auxiliary failure."""
+    if _is_payment_error(exc):
+        return "payment error"
+    if _is_rate_limit_error(exc):
+        return "rate limit"
+    if _is_connection_error(exc):
+        return "connection error"
+    if task == "compression" and _is_provider_service_outage(exc):
+        return "provider service outage"
+    return None
+
+
+def _is_fallback_error(exc: Exception, task: Optional[str]) -> bool:
+    return _fallback_reason_for_error(exc, task) is not None
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
@@ -3055,13 +3217,13 @@ def _try_payment_fallback(
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
     # Normalise the failed provider label for matching.
-    skip = failed_provider.lower().strip()
+    skip = _normalize_aux_provider(failed_provider)
     # Also skip Step-1 main-provider path if it maps to the same backend.
     # (e.g. main_provider="openrouter" → skip "openrouter" in chain)
     main_provider = _read_main_provider()
     skip_labels = {skip}
-    if main_provider and main_provider.lower() in skip:
-        skip_labels.add(main_provider.lower())
+    if main_provider and _normalize_aux_provider(main_provider) == skip:
+        skip_labels.add(_normalize_aux_provider(main_provider))
     # Map common resolved_provider values back to chain labels.
     _alias_to_label = {"openrouter": "openrouter", "nous": "nous",
                        "openai-codex": "openai-codex", "codex": "openai-codex",
@@ -3081,6 +3243,11 @@ def _try_payment_fallback(
         except TypeError:
             client, model = try_fn()
         if client is not None:
+            candidate_provider = _provider_chain_provenance(client, label)
+            if _normalize_aux_provider(candidate_provider) in skip_labels:
+                tried.append(f"{label} (same backend)")
+                continue
+            _annotate_resolved_provider(client, candidate_provider)
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
@@ -3186,14 +3353,14 @@ def _try_configured_fallback_chain(
     if not chain or not isinstance(chain, list):
         return None, None, ""
 
-    skip = failed_provider.lower().strip()
+    skip = _normalize_aux_provider(failed_provider)
     tried = []
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
-        if not fb_provider or fb_provider.lower() == skip:
+        if not fb_provider or _normalize_aux_provider(fb_provider) == skip:
             continue
         fb_model = str(entry.get("model", "")).strip() or None
         fb_base_url = str(entry.get("base_url", "")).strip() or None
@@ -3203,7 +3370,12 @@ def _try_configured_fallback_chain(
 
         try:
             fb_client, fb_resolved_model = _resolve_single_provider(
-                fb_provider, fb_model, fb_base_url, fb_api_key)
+                fb_provider,
+                fb_model,
+                fb_base_url,
+                fb_api_key,
+                strict_anthropic_credentials=(task == "compression"),
+            )
         except Exception:
             fb_client, fb_resolved_model = None, None
 
@@ -3224,16 +3396,84 @@ def _try_configured_fallback_chain(
     return None, None, ""
 
 
+def _try_error_fallback(
+    *,
+    task: Optional[str],
+    resolved_provider: Optional[str],
+    client: Any,
+    reason: str,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str], str, str]:
+    """Select the next client after a recoverable provider failure.
+
+    Compression precedence is deliberately identical for sync and async calls:
+
+    * explicit route: configured chain, then the existing main-agent safety net
+    * auto route: configured chain, then the generic auto fallback chain
+
+    The returned fourth value is the actual failed backend provenance.
+    """
+    failed_provider = _client_provider_provenance(client, resolved_provider)
+    is_auto = resolved_provider in {"auto", "", None}
+
+    fb_client, fb_model, fb_label = (None, None, "")
+    if task == "compression":
+        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+            task, failed_provider, reason=reason
+        )
+
+    if fb_client is None:
+        if is_auto:
+            fb_client, fb_model, fb_label = _try_payment_fallback(
+                failed_provider, task, reason=reason
+            )
+        else:
+            # Non-compression explicit routes retain their historical configured
+            # chain behavior; compression already tried the chain above.
+            if task != "compression":
+                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                    task, failed_provider, reason=reason
+                )
+            if fb_client is None:
+                fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    failed_provider, task, reason=reason
+                )
+
+    return fb_client, fb_model, fb_label, failed_provider
+
+
+def _fallback_call_provider(client: Any, label: str) -> str:
+    """Use fallback client provenance for provider-specific request shaping."""
+    return _client_provider_provenance(client, label) or label
+
+
 def _resolve_single_provider(
     provider: str,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    strict_anthropic_credentials: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve a single provider entry from fallback_chain to an OpenAI client.
 
     Uses the existing provider resolution infrastructure where possible.
     """
+    normalized_provider = _normalize_aux_provider(provider)
+    if normalized_provider == "anthropic" and strict_anthropic_credentials:
+        client, default_model = _try_anthropic(
+            explicit_api_key=api_key,
+            explicit_base_url=base_url,
+            allow_implicit_credentials=False,
+        )
+        if client is None:
+            return None, None
+        resolved_model = _normalize_resolved_model(
+            model or default_model, normalized_provider
+        )
+        _annotate_resolved_provider(client, normalized_provider)
+        return client, resolved_model
+
     # Reuse resolve_provider_client which handles provider→client mapping.
     client, resolved_model = resolve_provider_client(
         provider=provider,
@@ -5422,8 +5662,7 @@ def call_llm(
                 # kwargs.  Re-raise only if the retry hit something those
                 # chains won't handle.
                 if not (
-                    _is_payment_error(retry_err)
-                    or _is_connection_error(retry_err)
+                    _is_fallback_error(retry_err, task)
                     or _is_auth_error(retry_err)
                     or "max_tokens" in retry_err_str
                     or "unsupported_parameter" in retry_err_str
@@ -5454,9 +5693,9 @@ def call_llm(
                 return _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
             except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
-                # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                # If the retry hits a recoverable provider failure, fall
+                # through to the fallback chain below.
+                if not _is_fallback_error(retry_err, task):
                     raise
                 first_err = retry_err
 
@@ -5504,9 +5743,7 @@ def call_llm(
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
-                        or _is_payment_error(retry_err)
-                        or _is_connection_error(retry_err)
-                        or _is_rate_limit_error(retry_err)
+                        or _is_fallback_error(retry_err, task)
                     ):
                         raise
                     first_err = retry_err
@@ -5559,9 +5796,7 @@ def call_llm(
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
-                        or _is_payment_error(retry_err)
-                        or _is_connection_error(retry_err)
-                        or _is_rate_limit_error(retry_err)
+                        or _is_fallback_error(retry_err, task)
                     ):
                         raise
                     first_err = retry_err
@@ -5632,7 +5867,8 @@ def call_llm(
                 task, resolved_provider or "auto", reason="authentication error")
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model or "", messages,
+                    _fallback_call_provider(fb_client, fb_label),
+                    fb_model or "", messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
@@ -5640,75 +5876,42 @@ def call_llm(
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
 
-        # ── Payment / credit exhaustion fallback ──────────────────────
-        # When the resolved provider returns 402 or a credit-related error,
-        # try alternative providers instead of giving up.  This handles the
-        # common case where a user runs out of OpenRouter credits but has
-        # Codex OAuth or another provider available.
-        #
-        # ── Connection error fallback ────────────────────────────────
-        # When a provider endpoint is unreachable (DNS failure, connection
-        # refused, timeout), try alternative providers.  This handles stale
-        # Codex/OAuth tokens that authenticate but whose endpoint is down,
-        # and providers the user never configured that got picked up by
-        # the auto-detection chain.
-        #
-        # ── Rate-limit fallback (#13579) ─────────────────────────────
-        # When the provider returns a 429 rate-limit (not billing), fall
-        # back to an alternative provider instead of exhausting retries
-        # against the same rate-limited endpoint.
-        should_fallback = (
+        # ── Recoverable provider failure fallback ─────────────────────
+        # Payment/quota and connection failures retain their historical
+        # behavior. Compression additionally treats explicit-route rate limits
+        # and narrow provider service outages as fallback-worthy so compaction
+        # can complete and the conversation can continue.
+        reason = _fallback_reason_for_error(first_err, task)
+        is_auto = resolved_provider in {"auto", "", None}
+        allow_explicit_fallback = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
+            or task == "compression"
         )
-        # Respect explicit provider choice for transient errors (auth, request
-        # validation, etc.) but allow fallback when the provider clearly cannot
-        # serve the request due to capacity: payment/quota exhaustion and
-        # connection failures are capacity problems, not request constraints.
-        # See #26803: daily token quota (429 + "too many tokens per day") must
-        # fall back just like a 402 credit error.
-        is_auto = resolved_provider in {"auto", "", None}
-        # Capacity errors bypass the explicit-provider gate: the provider
-        # literally cannot serve this request regardless of user intent.
-        is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
-        if should_fallback and (is_auto or is_capacity_error):
+        if reason and (is_auto or allow_explicit_fallback):
+            failed_provider = _client_provider_provenance(client, resolved_provider)
             if _is_payment_error(first_err):
-                reason = "payment error"
-                # Resolve the actual provider label (resolved_provider may be
-                # "auto"; the client's base_url tells us which backend got the
-                # 402). Mark THAT label unhealthy so subsequent aux calls
-                # skip it instead of paying another doomed RTT.
                 _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider
+                    _recoverable_pool_provider(
+                        resolved_provider, client, main_runtime=main_runtime
+                    ) or failed_provider,
+                    task=task,
                 )
-            elif _is_rate_limit_error(first_err):
-                reason = "rate limit"
-            else:
-                reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, failed_provider, first_err)
 
-            # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
-            #   2. Main agent model (last-resort safety net)
-            # For auto users (no explicit aux provider), use the full
-            # auto-detection chain instead — its Step 1 IS the main agent
-            # model, so users on `auto` already get main-model fallback.
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+            fb_client, fb_model, fb_label, failed_provider = _try_error_fallback(
+                task=task,
+                resolved_provider=resolved_provider,
+                client=client,
+                reason=reason,
+                main_runtime=main_runtime,
+            )
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
+                    _fallback_call_provider(fb_client, fb_label),
+                    fb_model or "", messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
@@ -5719,11 +5922,11 @@ def call_llm(
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
             log_auxiliary_health_warning(
-                resolved_provider or "auto",
+                failed_provider or "auto",
                 "fallbacks_exhausted",
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",
-                task or "call", reason, resolved_provider,
+                task or "call", reason, failed_provider,
             )
         # Connection/timeout errors leave the cached client poisoned (closed
         # httpx transport, half-read stream, dead async loop).  Drop it from
@@ -5851,6 +6054,7 @@ async def async_call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
             task=task,
         )
         if client is None:
@@ -5873,7 +6077,9 @@ async def async_call_llm(
             elif not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", async_mode=True, task=task)
+                client, final_model = _get_cached_client(
+                    "auto", async_mode=True, main_runtime=main_runtime, task=task
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -5917,8 +6123,7 @@ async def async_call_llm(
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 if not (
-                    _is_payment_error(retry_err)
-                    or _is_connection_error(retry_err)
+                    _is_fallback_error(retry_err, task)
                     or _is_auth_error(retry_err)
                     or "max_tokens" in retry_err_str
                     or "unsupported_parameter" in retry_err_str
@@ -5949,9 +6154,9 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await client.chat.completions.create(**kwargs), task)
             except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
-                # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                # If the retry hits a recoverable provider failure, fall
+                # through to the fallback chain below.
+                if not _is_fallback_error(retry_err, task):
                     raise
                 first_err = retry_err
 
@@ -5998,9 +6203,7 @@ async def async_call_llm(
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
-                        or _is_payment_error(retry_err)
-                        or _is_connection_error(retry_err)
-                        or _is_rate_limit_error(retry_err)
+                        or _is_fallback_error(retry_err, task)
                     ):
                         raise
                     first_err = retry_err
@@ -6051,9 +6254,7 @@ async def async_call_llm(
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
-                        or _is_payment_error(retry_err)
-                        or _is_connection_error(retry_err)
-                        or _is_rate_limit_error(retry_err)
+                        or _is_fallback_error(retry_err, task)
                     ):
                         raise
                     first_err = retry_err
@@ -6114,7 +6315,8 @@ async def async_call_llm(
                 task, resolved_provider or "auto", reason="authentication error")
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model or "", messages,
+                    _fallback_call_provider(fb_client, fb_label),
+                    fb_model or "", messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
@@ -6127,49 +6329,38 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
 
-        # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
-        should_fallback = (
+        # ── Recoverable provider failure fallback (mirrors sync call_llm) ──
+        reason = _fallback_reason_for_error(first_err, task)
+        is_auto = resolved_provider in {"auto", "", None}
+        allow_explicit_fallback = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
+            or task == "compression"
         )
-        # Capacity errors (payment/quota/connection) bypass the explicit-provider
-        # gate — the provider cannot serve the request regardless of user intent.
-        # See #26803: daily token quota must fall back like a 402 credit error.
-        is_auto = resolved_provider in {"auto", "", None}
-        is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
-        if should_fallback and (is_auto or is_capacity_error):
+        if reason and (is_auto or allow_explicit_fallback):
+            failed_provider = _client_provider_provenance(client, resolved_provider)
             if _is_payment_error(first_err):
-                reason = "payment error"
                 _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
+                    _recoverable_pool_provider(
+                        resolved_provider, client, main_runtime=main_runtime
+                    ) or failed_provider,
+                    task=task,
                 )
-            elif _is_rate_limit_error(first_err):
-                reason = "rate limit"
-            else:
-                reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, failed_provider, first_err)
 
-            # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
-            #   2. Main agent model (last-resort safety net)
-            # Auto users get the full auto-detection chain instead — its
-            # Step 1 IS the main agent model.
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+            fb_client, fb_model, fb_label, failed_provider = _try_error_fallback(
+                task=task,
+                resolved_provider=resolved_provider,
+                client=client,
+                reason=reason,
+                main_runtime=main_runtime,
+            )
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
+                    _fallback_call_provider(fb_client, fb_label),
+                    fb_model or "", messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
@@ -6184,11 +6375,11 @@ async def async_call_llm(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — warn before re-raising. (#26882)
             log_auxiliary_health_warning(
-                resolved_provider or "auto",
+                failed_provider or "auto",
                 "fallbacks_exhausted",
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",
-                task or "call", reason, resolved_provider,
+                task or "call", reason, failed_provider,
             )
         # Mirror the sync path: drop poisoned clients on connection/timeout
         # so the next aux call rebuilds.  See issue #23432.
