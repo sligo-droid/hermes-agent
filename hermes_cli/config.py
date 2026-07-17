@@ -1990,6 +1990,8 @@ DEFAULT_CONFIG = {
         "action_request_model_tier": "advanced", # Standard Discord action requests use Sol/xhigh
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
+        "action_worktree_warmup": "auto", # auto | off; install JS deps when provisioning action worktrees
+        "action_worktree_warmup_timeout_seconds": 180, # Hard timeout; failures remain non-fatal
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
         "channel_cwds": {},            # Per-channel cwd overrides keyed by Discord channel ID
         "project_mapping_ignored_channel_names": "",  # Comma-separated channel name/glob patterns ignored by project auto-mapping

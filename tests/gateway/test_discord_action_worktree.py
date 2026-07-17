@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
+from hermes_cli.config import DEFAULT_CONFIG
 from tools.canonical_repo_guard import canonical_main_terminal_violation
 
 
@@ -33,6 +35,12 @@ def _init_repo(repo: Path) -> None:
     (repo / "tracked.txt").write_text("original\n", encoding="utf-8")
     _run(repo, "add", "tracked.txt")
     _run(repo, "commit", "-m", "initial")
+
+
+def _commit_lockfile(repo: Path, name: str) -> None:
+    (repo / name).write_text("lockfile\n", encoding="utf-8")
+    _run(repo, "add", name)
+    _run(repo, "commit", "-m", f"add {name}")
 
 
 def _protect(monkeypatch, root: Path) -> None:
@@ -63,8 +71,182 @@ def _feature_summary() -> dict[str, str]:
     return {"initial_request": "do a no-op change end-to-end"}
 
 
-def _config(default_cwd: Path) -> dict:
-    return {"terminal": {"cwd": str(default_cwd)}}
+def _config(default_cwd: Path, **discord: object) -> dict:
+    config: dict = {"terminal": {"cwd": str(default_cwd)}}
+    if discord:
+        config["discord"] = discord
+    return config
+
+
+def test_action_worktree_warmup_config_defaults():
+    discord = DEFAULT_CONFIG["discord"]
+
+    assert discord["action_worktree_warmup"] == "auto"
+    assert discord["action_worktree_warmup_timeout_seconds"] == 180
+
+
+@pytest.mark.parametrize(
+    ("lockfile", "expected_command", "expected_log"),
+    [
+        (
+            "pnpm-lock.yaml",
+            ["pnpm", "install", "--frozen-lockfile", "--prefer-offline"],
+            "warmup pnpm",
+        ),
+        (
+            "package-lock.json",
+            ["npm", "ci", "--prefer-offline", "--no-audit", "--no-fund"],
+            "warmup npm",
+        ),
+        ("yarn.lock", None, "warmup skipped: yarn.lock has ambiguous yarn variants"),
+        (None, None, "warmup skipped: no lockfile"),
+    ],
+)
+def test_action_worktree_warmup_lockfile_detection_matrix(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    lockfile,
+    expected_command,
+    expected_log,
+):
+    if lockfile:
+        (tmp_path / lockfile).write_text("lockfile\n", encoding="utf-8")
+    calls = []
+
+    def _fake_run(command, *, cwd, timeout):
+        calls.append((command, cwd, timeout))
+        return subprocess.CompletedProcess(command, 0, stdout="ready")
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_discord_action_worktree_warmup",
+        _fake_run,
+    )
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        gateway_run._discord_action_worktree_warmup(tmp_path, {})
+
+    if expected_command is None:
+        assert calls == []
+    else:
+        assert calls == [(expected_command, tmp_path, 180.0)]
+        assert " ok" in caplog.text
+    assert expected_log in caplog.text
+
+
+def test_action_worktree_warmup_off_gate_skips_install(tmp_path, monkeypatch, caplog):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _commit_lockfile(canonical, "pnpm-lock.yaml")
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    def _unexpected_run(*_args, **_kwargs):
+        pytest.fail("warm-up subprocess should be disabled")
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_discord_action_worktree_warmup",
+        _unexpected_run,
+    )
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        cwd, error, worktree_cwd = gateway_run._resolve_gateway_turn_cwd(
+            _source(canonical),
+            _feature_summary(),
+            _config(canonical, action_worktree_warmup="off"),
+            "agent:main:discord:thread:thread-123",
+        )
+
+    assert error is None
+    assert worktree_cwd == cwd
+    assert Path(cwd).is_dir()
+    assert "warmup skipped: off" in caplog.text
+
+
+def test_action_worktree_warmup_timeout_does_not_fail_provisioning(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _commit_lockfile(canonical, "pnpm-lock.yaml")
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    def _timeout(command, *, cwd, timeout):
+        assert cwd.parent == workspaces
+        assert timeout == 0.25
+        raise subprocess.TimeoutExpired(command, timeout, output="still installing")
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_discord_action_worktree_warmup",
+        _timeout,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        cwd, error, worktree_cwd = gateway_run._resolve_gateway_turn_cwd(
+            _source(canonical),
+            _feature_summary(),
+            _config(canonical, action_worktree_warmup_timeout_seconds=0.25),
+            "agent:main:discord:thread:thread-123",
+        )
+
+    assert error is None
+    assert worktree_cwd == cwd
+    assert Path(cwd).is_dir()
+    assert "warmup failed (continuing): pnpm timed out" in caplog.text
+    assert "still installing" in caplog.text
+
+
+def test_action_worktree_warmup_failure_does_not_fail_provisioning(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _commit_lockfile(canonical, "package-lock.json")
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+
+    noisy_output = "install failed sk-exampletoken1234567890 " + ("x" * 2_000)
+
+    def _failure(command, *, cwd, timeout):
+        assert cwd.parent == workspaces
+        assert timeout == 180.0
+        return subprocess.CompletedProcess(command, 17, stdout=noisy_output)
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_discord_action_worktree_warmup",
+        _failure,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        cwd, error, worktree_cwd = gateway_run._resolve_gateway_turn_cwd(
+            _source(canonical),
+            _feature_summary(),
+            _config(canonical),
+            "agent:main:discord:thread:thread-123",
+        )
+
+    assert error is None
+    assert worktree_cwd == cwd
+    assert Path(cwd).is_dir()
+    assert "warmup failed (continuing): npm exited 17" in caplog.text
+    assert "install failed" in caplog.text
+    assert "sk-exampletoken1234567890" not in caplog.text
+    assert "x" * 801 not in caplog.text
 
 
 def test_normal_action_creates_and_reuses_thread_worktree(tmp_path, monkeypatch):

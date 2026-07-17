@@ -2321,6 +2321,184 @@ def _discord_action_worktree_records(output: str) -> list[dict[str, str]]:
     return records
 
 
+def _discord_action_worktree_warmup_command(
+    worktree_root: Path,
+) -> tuple[Optional[str], Optional[list[str]]]:
+    """Return the unambiguous JS dependency warm-up command, if any."""
+    if (worktree_root / "pnpm-lock.yaml").is_file():
+        return "pnpm", [
+            "pnpm",
+            "install",
+            "--frozen-lockfile",
+            "--prefer-offline",
+        ]
+    if (worktree_root / "package-lock.json").is_file():
+        return "npm", [
+            "npm",
+            "ci",
+            "--prefer-offline",
+            "--no-audit",
+            "--no-fund",
+        ]
+    if (worktree_root / "yarn.lock").is_file():
+        return "yarn", None
+    return None, None
+
+
+def _run_discord_action_worktree_warmup(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+) -> Any:
+    """Run one dependency warm-up with output captured for bounded logging."""
+    import subprocess
+
+    with tempfile.TemporaryFile(mode="w+b") as output:
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd),
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output.seek(0)
+            exc.output = output.read(801)
+            raise
+        output.seek(0)
+        captured = output.read(801)
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        stdout=captured,
+    )
+
+
+def _discord_action_worktree_warmup_output(output: Any, *, limit: int = 800) -> str:
+    """Return a single bounded log line from package-manager output."""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    detail = _redact_gateway_user_facing_secrets(
+        " ".join(str(output or "").split())
+    )
+    if len(detail) <= limit:
+        return detail
+    return f"{detail[:limit]}..."
+
+
+def _discord_action_worktree_warmup(
+    worktree_root: Path,
+    config: Optional[dict],
+) -> None:
+    """Best-effort JS dependency warm-up for a newly created action worktree."""
+    mode = str(
+        cfg_get(
+            config or {},
+            "discord",
+            "action_worktree_warmup",
+            default="auto",
+        )
+        or "auto"
+    ).strip().lower()
+    if mode == "off":
+        logger.info(
+            "Discord action worktree provisioning for %s: warmup skipped: off",
+            worktree_root,
+        )
+        return
+
+    manager, command = _discord_action_worktree_warmup_command(worktree_root)
+    if manager == "yarn":
+        logger.info(
+            "Discord action worktree provisioning for %s: warmup skipped: "
+            "yarn.lock has ambiguous yarn variants",
+            worktree_root,
+        )
+        return
+    if command is None:
+        logger.info(
+            "Discord action worktree provisioning for %s: warmup skipped: no lockfile",
+            worktree_root,
+        )
+        return
+
+    raw_timeout = cfg_get(
+        config or {},
+        "discord",
+        "action_worktree_warmup_timeout_seconds",
+        default=180,
+    )
+    try:
+        timeout = float(raw_timeout)
+        if timeout <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        timeout = 180.0
+
+    import subprocess
+
+    started = time.monotonic()
+    try:
+        completed = _run_discord_action_worktree_warmup(
+            command,
+            cwd=worktree_root,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        detail = _discord_action_worktree_warmup_output(
+            getattr(exc, "stdout", None)
+            or getattr(exc, "output", None)
+            or getattr(exc, "stderr", None)
+        )
+        logger.warning(
+            "Discord action worktree provisioning for %s: warmup failed "
+            "(continuing): %s timed out after %.1fs (%.1fs elapsed)%s",
+            worktree_root,
+            manager,
+            timeout,
+            elapsed,
+            f": {detail}" if detail else "",
+        )
+        return
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        detail = _discord_action_worktree_warmup_output(exc)
+        logger.warning(
+            "Discord action worktree provisioning for %s: warmup failed "
+            "(continuing): %s could not run after %.1fs: %s",
+            worktree_root,
+            manager,
+            elapsed,
+            detail,
+        )
+        return
+
+    elapsed = time.monotonic() - started
+    if completed.returncode == 0:
+        logger.info(
+            "Discord action worktree provisioning for %s: warmup %s %.1fs ok",
+            worktree_root,
+            manager,
+            elapsed,
+        )
+        return
+
+    detail = _discord_action_worktree_warmup_output(completed.stdout)
+    logger.warning(
+        "Discord action worktree provisioning for %s: warmup failed (continuing): "
+        "%s exited %s after %.1fs%s",
+        worktree_root,
+        manager,
+        completed.returncode,
+        elapsed,
+        f": {detail}" if detail else "",
+    )
+
+
 def _discord_action_worktree_target(
     repo_root: Path,
     source: Any,
@@ -2360,6 +2538,7 @@ def _discord_action_worktree_cwd(
     source: Any,
     feature_summary: Optional[Dict[str, Any]],
     session_key: str,
+    config: Optional[dict] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Resolve/create the mutable worktree for a normal Discord action thread.
 
@@ -2502,6 +2681,7 @@ def _discord_action_worktree_cwd(
                 f"Git could not create mutable action worktree {target_path}: {exc}"
             )
         if created.returncode == 0:
+            _discord_action_worktree_warmup(target_path, config)
             return _reuse_cwd(target_path)
 
         # A concurrent first message for the same thread may have won the
@@ -2556,6 +2736,7 @@ def _resolve_gateway_turn_cwd(
         source,
         feature_summary,
         session_key,
+        config,
     )
     return worktree_cwd or fallback, error, worktree_cwd
 
