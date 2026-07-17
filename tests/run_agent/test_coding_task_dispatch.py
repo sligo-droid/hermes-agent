@@ -14,15 +14,7 @@ def test_dispatch_coding_task_forwards_route_decision(monkeypatch):
         return json.dumps({"success": True})
 
     monkeypatch.setattr(cwt, "delegate_coding_task", fake_delegate_coding_task)
-    agent = AIAgent(
-        api_key="test-key",
-        base_url="https://openrouter.ai/api/v1",
-        provider="openrouter",
-        api_mode="chat_completions",
-        quiet_mode=True,
-        skip_context_files=True,
-        skip_memory=True,
-    )
+    agent = object.__new__(AIAgent)
     route_decision = {
         "route": "ui_visual_specialist",
         "confidence": 0.91,
@@ -59,3 +51,24 @@ def test_dispatch_coding_task_forwards_route_decision(monkeypatch):
     assert captured["route_decision"] is route_decision
     assert captured["_parallel_group"] is parallel_group
     assert captured["parent_agent"] is agent
+
+
+def test_dispatch_coding_task_preserves_background_from_owned_preflight(monkeypatch, tmp_path):
+    agent = object.__new__(AIAgent)
+    agent.session_cwd = str(tmp_path)
+    preflight = cwt.preflight_delegate_coding_task(
+        {"task": "long change", "background": True},
+        agent,
+    )
+    captured = {}
+
+    def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "background": True})
+
+    monkeypatch.setattr(cwt, "_dispatch_background_coding_task", fake_dispatch)
+
+    result = agent._dispatch_coding_task(preflight.args)
+
+    assert json.loads(result)["background"] is True
+    assert captured["call_kwargs"]["route_decision"] is None
