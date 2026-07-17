@@ -1,6 +1,7 @@
 """Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
 
 import json
+import time
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -11,6 +12,31 @@ from agent.context_compressor import (
     _MIN_SUMMARY_TOKENS,
     _sanitize_summary_error,
 )
+
+
+def _write_exhausted_codex_auth(tmp_path, reset_at: float) -> None:
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "openai-codex": [{
+                "id": "codex-oauth",
+                "label": "ChatGPT OAuth",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "secret-codex-access-token",
+                "refresh_token": "secret-codex-refresh-token",
+                "last_status": "exhausted",
+                "last_status_at": time.time(),
+                "last_error_code": 429,
+                "last_error_reason": "usage_limit_reached",
+                "last_error_message": "usage limit reached",
+                "last_error_reset_at": reset_at,
+            }],
+        },
+    }))
 
 
 @pytest.fixture()
@@ -1370,21 +1396,47 @@ class TestAbortOnSummaryFailure:
             for m in result
         )
 
-    def test_abort_records_runtime_error_cause_instead_of_unknown_error(self):
+    def test_abort_preserves_messages_with_exhausted_oauth_guidance(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+        _write_exhausted_codex_auth(tmp_path, time.time() + 600)
+        from agent.credential_pool import provider_unavailable_guidance
+
         c = self._make_compressor()
         msgs = self._make_msgs()
-        cause = (
-            "Provider 'anthropic' is set in config.yaml but no API key was found. "
-            "Set ANTHROPIC_API_KEY, or switch providers."
-        )
+        cause = provider_unavailable_guidance("openai-codex")
+        emitted_warnings = []
+        agent = MagicMock()
+        agent.session_id = None
+        agent.model = "test"
+        agent._session_db = None
+        agent._memory_manager = None
+        agent.context_compressor = c
+        agent._last_compression_summary_warning = None
+        agent._emit_warning = emitted_warnings.append
+        agent._cached_system_prompt = "sys"
 
         with patch("agent.context_compressor.call_llm", side_effect=RuntimeError(cause)):
-            result = c.compress(msgs)
+            from agent.conversation_compression import compress_context
+
+            result, system_prompt = compress_context(agent, msgs, "sys")
 
         assert result == msgs
+        assert system_prompt == "sys"
         assert c._last_compress_aborted is True
         assert c._last_summary_error == cause
         assert c._last_summary_error != "unknown error"
+        assert "usage_limit_reached" in c._last_summary_error
+        assert "API_KEY" not in c._last_summary_error
+        assert "secret-codex" not in c._last_summary_error
+        assert emitted_warnings == [
+            f"⚠ Compression aborted: {cause} "
+            "No messages were dropped — conversation continues unchanged. "
+            "Run /compress to retry, or /new to start a fresh session."
+        ]
+        assert "provider.. No messages" not in emitted_warnings[0]
 
     def test_summary_error_sanitizer_redacts_secret_values(self):
         sanitized = _sanitize_summary_error(

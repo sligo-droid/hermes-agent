@@ -8,6 +8,8 @@ Two-phase design:
      status_callback (gateway platforms)
 """
 
+import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,6 +18,31 @@ import agent.auxiliary_client as auxiliary_client
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
 from agent.auxiliary_client import CodexAuxiliaryClient
+
+
+def _write_exhausted_codex_auth(tmp_path, reset_at: float) -> None:
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "openai-codex": [{
+                "id": "codex-oauth",
+                "label": "ChatGPT OAuth",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "secret-codex-access-token",
+                "refresh_token": "secret-codex-refresh-token",
+                "last_status": "exhausted",
+                "last_status_at": time.time(),
+                "last_error_code": 429,
+                "last_error_reason": "usage_limit_reached",
+                "last_error_message": "usage limit reached",
+                "last_error_reset_at": reset_at,
+            }],
+        },
+    }))
 
 
 @pytest.fixture(autouse=True)
@@ -420,6 +447,40 @@ def test_warns_when_no_auxiliary_provider(mock_get_client):
     assert len(messages) == 1
     assert "No auxiliary LLM provider" in messages[0]
     assert agent._compression_warning is not None
+
+
+@patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(None, None))
+def test_exhausted_codex_oauth_warning_reports_actual_state_and_replays(
+    mock_get_client, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_exhausted_codex_auth(tmp_path, time.time() + 600)
+    agent = _make_agent()
+    emitted = []
+    agent._emit_status = emitted.append
+
+    with patch(
+        "agent.auxiliary_client._resolve_task_provider_model",
+        return_value=("openai-codex", "gpt-5.4", None, None, None),
+    ):
+        agent._check_compression_model_feasibility()
+
+    assert mock_get_client.called
+    assert len(emitted) == 1
+    warning = emitted[0]
+    assert warning == agent._compression_warning
+    assert "OpenAI Codex OAuth credentials are exhausted" in warning
+    assert "HTTP 429" in warning
+    assert "usage_limit_reached" in warning
+    assert "API_KEY" not in warning
+    assert "secret-codex" not in warning
+    assert "continue without LLM summaries" in warning
+
+    replayed = []
+    agent.status_callback = lambda event, message: replayed.append((event, message))
+    agent._replay_compression_warning()
+    assert replayed == [("lifecycle", warning)]
 
 
 def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
