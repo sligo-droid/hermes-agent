@@ -407,6 +407,38 @@ def _without_verification_downgrade_lines(text: str) -> str:
     )
 
 
+def _is_preserved_protected_checkout_gap(text: str, match: re.Match[str]) -> bool:
+    """Ignore an intentionally untouched local checkout when production is current."""
+
+    context = text[max(0, match.start() - 80) : min(len(text), match.end() + 220)]
+    return bool(
+        re.search(r"\bprotected\s+canonical\s+checkout\b", context, flags=re.IGNORECASE)
+        and re.search(r"\bpre-existing\b", context, flags=re.IGNORECASE)
+        and re.search(
+            r"\bproduction\s+runtime\b[^\n.]{0,80}\b(?:current|synced|clean|up[- ]to[- ]date)\b",
+            context,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _is_explicitly_healthy_runtime_match(match: re.Match[str]) -> bool:
+    """Return whether a broad runtime-gap match contains explicit zero-lag evidence."""
+
+    snippet = match.group(0)
+    healthy_state = re.search(
+        r"\b(?:current|synced|updated|clean|up[- ]to[- ]date)\b",
+        snippet,
+        flags=re.IGNORECASE,
+    )
+    zero_gap = re.search(
+        r"\b(?:zero|0)\s+(?:commits?\s+)?behind\b|\bno\s+(?:sensitive\s+)?(?:lag|drift)\b",
+        snippet,
+        flags=re.IGNORECASE,
+    )
+    return bool(healthy_state and zero_gap)
+
+
 def _incomplete_final_markers(text: str) -> list[str]:
     """Return incomplete-delivery markers while filtering known summary noise."""
 
@@ -417,6 +449,10 @@ def _incomplete_final_markers(text: str) -> list[str]:
             snippet = match.group(0)
             prefix = text[max(0, match.start() - 80) : match.start()].lower()
             if reason == "checks_not_green" and ("→" in snippet or "phase timing" in prefix):
+                continue
+            if reason == "runtime_not_synced" and _is_explicitly_healthy_runtime_match(match):
+                continue
+            if reason == "runtime_not_synced" and _is_preserved_protected_checkout_gap(text, match):
                 continue
             if reason == "runtime_not_synced" and re.search(
                 r"\b(?:live\s+)?runtime\s+pickup\b", snippet, flags=re.IGNORECASE

@@ -2601,6 +2601,46 @@ def test_failed_feature_summary_status_uses_red_cross(adapter):
     assert embed.color == "red"
 
 
+def test_successful_rollout_ledger_status_maps_to_complete_reaction(adapter, tmp_path):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="200",
+        chat_type="thread",
+        thread_id="200",
+        message_id="400",
+    )
+    source.project_path = "/home/droid/workspaces/pid-action"
+    source.project_github_url = "https://github.com/sligo-labs/PID"
+    event = MessageEvent(
+        text="Proceed with the same treatment across the other sources",
+        source=source,
+        message_id="400",
+    )
+    item = runner.work_ledger.accept_event(event, session_key="discord:200", freshness_seconds=60)
+    assert item is not None
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "77 items audited, 52 published, and 25 intentionally held by quality gates. "
+            "Production deployment passed. Airflow runtime is current, clean, zero behind, and has "
+            "no sensitive lag. The protected canonical checkout remains untouched because it has a "
+            "pre-existing deleted test and is 16 commits behind. The active worktree and production "
+            "runtime are current."
+        ),
+        summary_status="Complete",
+    )
+
+    status = runner._discord_ledger_summary_status(
+        item["id"],
+        runner._discord_summary_status({"exit_reason": "text_response"}),
+    )
+
+    assert status == "Complete"
+    assert adapter._summary_status_reaction_emoji(status) == "✅"
+
+
 def test_runner_summarizes_long_discord_feature_outcome():
     runner = object.__new__(gateway_run.GatewayRunner)
     response = SimpleNamespace(

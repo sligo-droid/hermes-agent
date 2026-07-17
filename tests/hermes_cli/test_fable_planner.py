@@ -334,6 +334,12 @@ def test_build_fable_implementation_instruction_requires_codex_delegation():
     assert "non-overlapping `scope_paths`" in packet
     assert "Never parallelize coupled edits" in packet
     assert "review the merged result afterward" in packet
+    assert "only for read-only analysis fan-out" in packet
+    assert "proposed content transformations and data-quality assessments" in packet
+    assert "keep every mutation on `delegate_coding_task`" in packet
+    assert "Do not foreground-watch long external Airflow/DAG/intake/deploy runs" in packet
+    assert "bounded cron poller" in packet
+    assert "completion re-enters as a follow-up turn" in packet
     assert "Do not fall back to OpenCode" in packet
     assert "`fable_git_result.recovery_required`" in packet
     assert "call `delegate_coding_task` again with the same `cwd`" in packet
