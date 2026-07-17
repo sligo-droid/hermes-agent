@@ -799,17 +799,6 @@ def init_agent(
                 # message instead of silently routing through OpenRouter.
                 _explicit = (agent.provider or "").strip().lower()
                 if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                    # Look up the actual env var name from the provider
-                    # config — some providers use non-standard names
-                    # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
-                    _env_hint = f"{_explicit.upper()}_API_KEY"
-                    try:
-                        from hermes_cli.auth import PROVIDER_REGISTRY
-                        _pcfg = PROVIDER_REGISTRY.get(_explicit)
-                        if _pcfg and _pcfg.api_key_env_vars:
-                            _env_hint = _pcfg.api_key_env_vars[0]
-                    except Exception:
-                        pass
                     # --- Init-time fallback (#17929) ---
                     _fb_entries = []
                     if isinstance(fallback_model, list):
@@ -849,11 +838,9 @@ def init_agent(
                             _fb_resolved = True
                             break
                     if not _fb_resolved:
-                        raise RuntimeError(
-                            f"Provider '{_explicit}' is set in config.yaml but no API key "
-                            f"was found. Set the {_env_hint} environment "
-                            f"variable, or switch to a different provider with `hermes model`."
-                        )
+                        from agent.credential_pool import provider_unavailable_guidance
+
+                        raise RuntimeError(provider_unavailable_guidance(_explicit))
                 if not getattr(agent, "_fallback_activated", False):
                     # No provider configured — reject with a clear message.
                     raise RuntimeError(

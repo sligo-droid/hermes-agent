@@ -445,6 +445,116 @@ def describe_provider_credential_availability(provider: str) -> Dict[str, Any]:
     return result
 
 
+_PROVIDER_GUIDANCE_ALIASES = {
+    "codex": "openai-codex",
+    "openai": "openai-api",
+}
+
+
+def _normalize_provider_for_guidance(provider: str) -> str:
+    normalized = (provider or "").strip().lower()
+    normalized = _PROVIDER_GUIDANCE_ALIASES.get(normalized, normalized)
+    if not normalized:
+        return ""
+    try:
+        from hermes_cli.models import normalize_provider
+
+        normalized = normalize_provider(normalized)
+    except Exception:
+        pass
+    return normalized
+
+
+def _format_credential_reset_time(value: Any) -> Optional[str]:
+    reset_at = _parse_absolute_timestamp(value)
+    if reset_at is None:
+        return None
+    return datetime.fromtimestamp(reset_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def provider_unavailable_guidance(provider: str) -> str:
+    """Return concise, non-secret guidance after provider resolution fails.
+
+    The caller has already attempted to construct a client and any configured
+    fallback chain.  An ``available`` pool therefore means client construction,
+    rather than credential discovery, failed.
+    """
+    normalized_provider = _normalize_provider_for_guidance(provider)
+    provider_config = PROVIDER_REGISTRY.get(normalized_provider)
+    provider_name = (
+        provider_config.name
+        if provider_config is not None
+        else normalized_provider or "Unknown provider"
+    )
+    availability = describe_provider_credential_availability(normalized_provider)
+    status = str(availability.get("credential_status") or "unavailable").lower()
+    entries = availability.get("unavailable_entries")
+    first_entry = entries[0] if isinstance(entries, list) and entries else {}
+    if not isinstance(first_entry, dict):
+        first_entry = {}
+
+    auth_type = str(getattr(provider_config, "auth_type", "") or "").lower()
+    is_oauth = auth_type.startswith("oauth")
+    reason = _sanitize_diagnostic_text(first_entry.get("last_error_reason"), limit=60)
+    error_code = first_entry.get("last_error_code")
+
+    if status == "exhausted":
+        details = []
+        if isinstance(error_code, int):
+            details.append(f"HTTP {error_code}")
+        if reason:
+            details.append(reason)
+        detail_text = f" ({', '.join(details)})" if details else ""
+        reset_time = _format_credential_reset_time(first_entry.get("last_error_reset_at"))
+        reset_text = f" until {reset_time}" if reset_time else ""
+        message = (
+            f"{provider_name} {'OAuth ' if is_oauth else ''}credentials are exhausted"
+            f"{detail_text}{reset_text}. Wait for reset or choose another provider."
+        )
+    elif status == "dead":
+        reason_text = f" ({reason})" if reason else ""
+        if is_oauth:
+            message = (
+                f"{provider_name} OAuth credentials are revoked or invalid{reason_text}. "
+                f"Reauthenticate with `hermes auth add {normalized_provider}`."
+            )
+        else:
+            message = (
+                f"{provider_name} credentials are revoked or invalid{reason_text}. "
+                f"Replace them with `hermes auth add {normalized_provider}`."
+            )
+    elif status == "missing":
+        env_vars = tuple(getattr(provider_config, "api_key_env_vars", ()) or ())
+        if auth_type == AUTH_TYPE_API_KEY and env_vars:
+            env_text = ", ".join(str(name) for name in env_vars)
+            message = f"{provider_name} credentials are missing. Set one of: {env_text}."
+        elif is_oauth:
+            message = (
+                f"{provider_name} OAuth credentials are missing. "
+                f"Authenticate with `hermes auth add {normalized_provider}`."
+            )
+        elif provider_config is None:
+            message = (
+                f"Provider '{provider_name}' is unavailable; no credential metadata is registered. "
+                "Check config.yaml."
+            )
+        else:
+            message = (
+                f"{provider_name} credentials are missing. "
+                f"Configure them with `hermes auth add {normalized_provider}`."
+            )
+    elif status == "available":
+        message = (
+            f"{provider_name} credentials are available, but Hermes could not construct the client. "
+            "Run `hermes doctor`."
+        )
+    else:
+        message = f"{provider_name} credential status is unavailable. Run `hermes doctor`."
+
+    message = re.sub(r"\s+", " ", message).strip()
+    return _sanitize_diagnostic_text(message, limit=205) or "Provider credentials are unavailable."
+
+
 def _normalize_custom_pool_name(name: str) -> str:
     """Normalize a custom provider name for use as a pool key suffix."""
     return name.strip().lower().replace(" ", "-")

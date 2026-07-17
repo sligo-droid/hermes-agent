@@ -42,6 +42,14 @@ from agent.model_metadata import estimate_request_tokens_rough
 logger = logging.getLogger(__name__)
 
 
+def _with_terminal_punctuation(value: Any) -> str:
+    """Return stripped text with exactly one sentence-ending mark."""
+    text = str(value).strip()
+    if text.endswith((".", "!", "?", "…")):
+        return text
+    return f"{text}."
+
+
 def _log_compression_degraded_once(
     provider: str,
     failure_class: str,
@@ -137,12 +145,12 @@ def check_compression_model_feasibility(agent: Any) -> None:
             _aux_cfg_provider = ""
         if client is None or not aux_model:
             if _aux_cfg_provider and _aux_cfg_provider != "auto":
+                from agent.credential_pool import provider_unavailable_guidance
+
                 msg = (
-                    "⚠ Configured auxiliary compression provider "
-                    f"'{_aux_cfg_provider}' is unavailable — context "
-                    "compression will drop middle turns without a summary. "
-                    "Check auxiliary.compression in config.yaml and "
-                    "reauthenticate that provider."
+                    "⚠ Auxiliary compression provider unavailable: "
+                    f"{provider_unavailable_guidance(_aux_cfg_provider)} "
+                    "Context compression will continue without LLM summaries."
                 )
             else:
                 msg = (
@@ -707,8 +715,9 @@ def compress_context(
         _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
         if getattr(agent, "_last_compression_summary_warning", None) != _err:
             agent._last_compression_summary_warning = _err
+            _err_sentence = _with_terminal_punctuation(_err)
             agent._emit_warning(
-                f"⚠ Compression aborted: {_err}. "
+                f"⚠ Compression aborted: {_err_sentence} "
                 "No messages were dropped — conversation continues unchanged. "
                 "Run /compress to retry, or /new to start a fresh session."
             )
@@ -722,8 +731,9 @@ def compress_context(
     if summary_error:
         if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
             agent._last_compression_summary_warning = summary_error
+            summary_error_sentence = _with_terminal_punctuation(summary_error)
             agent._emit_warning(
-                f"⚠ Compression summary failed: {summary_error}. "
+                f"⚠ Compression summary failed: {summary_error_sentence} "
                 "Inserted a local fallback summary."
             )
     else:

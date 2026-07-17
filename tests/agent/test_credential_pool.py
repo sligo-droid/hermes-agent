@@ -16,6 +16,31 @@ def _write_auth_store(tmp_path, payload: dict) -> None:
     (hermes_home / "auth.json").write_text(json.dumps(payload, indent=2))
 
 
+def _exhausted_codex_auth_store(reset_at: float) -> dict:
+    return {
+        "version": 1,
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "codex-oauth",
+                    "label": "ChatGPT OAuth",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:device_code",
+                    "access_token": "secret-codex-access-token",
+                    "refresh_token": "secret-codex-refresh-token",
+                    "last_status": "exhausted",
+                    "last_status_at": time.time(),
+                    "last_error_code": 429,
+                    "last_error_reason": "usage_limit_reached",
+                    "last_error_message": "usage limit reached",
+                    "last_error_reset_at": reset_at,
+                }
+            ]
+        },
+    }
+
+
 def _jwt_with_claims(claims: dict) -> str:
     def _part(payload: dict) -> str:
         raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -163,6 +188,113 @@ def test_describe_provider_credential_availability_reports_missing_credentials(t
     assert diag["has_credentials"] is False
     assert diag["has_available"] is False
     assert diag["credential_count"] == 0
+
+
+def test_provider_unavailable_guidance_reports_exhausted_codex_oauth(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    reset_at = time.time() + 600
+    _write_auth_store(tmp_path, _exhausted_codex_auth_store(reset_at))
+
+    from agent.credential_pool import provider_unavailable_guidance
+
+    message = provider_unavailable_guidance("codex")
+
+    assert "OpenAI Codex OAuth credentials are exhausted" in message
+    assert "HTTP 429" in message
+    assert "usage_limit_reached" in message
+    assert datetime.fromtimestamp(reset_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") in message
+    assert "API_KEY" not in message
+    assert "secret-codex" not in message
+    assert len(message) <= 220
+
+
+def test_provider_unavailable_guidance_distinguishes_missing_and_dead_oauth(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+    from agent.credential_pool import provider_unavailable_guidance
+
+    missing = provider_unavailable_guidance("openai-codex")
+    assert "OAuth credentials are missing" in missing
+    assert "hermes auth add openai-codex" in missing
+    assert "API_KEY" not in missing
+
+    dead_payload = _exhausted_codex_auth_store(time.time() + 600)
+    dead_entry = dead_payload["credential_pool"]["openai-codex"][0]
+    dead_entry.update(
+        {
+            "last_status": "dead",
+            "last_error_code": 401,
+            "last_error_reason": "token_revoked",
+            "last_error_reset_at": None,
+        }
+    )
+    _write_auth_store(tmp_path, dead_payload)
+
+    dead = provider_unavailable_guidance("openai-codex")
+    assert "revoked or invalid" in dead
+    assert "token_revoked" in dead
+    assert "hermes auth add openai-codex" in dead
+    assert "API_KEY" not in dead
+
+
+def test_provider_unavailable_guidance_uses_registry_envs_and_available_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for env_var in ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"):
+        monkeypatch.delenv(env_var, raising=False)
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+
+    from agent.credential_pool import provider_unavailable_guidance
+
+    missing = provider_unavailable_guidance("glm")
+    assert "Z.AI / GLM credentials are missing" in missing
+    assert "GLM_API_KEY, ZAI_API_KEY, Z_AI_API_KEY" in missing
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "zai": [
+                    {
+                        "id": "zai-key",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "secret-zai-key",
+                        "last_status": "ok",
+                    }
+                ]
+            },
+        },
+    )
+
+    available = provider_unavailable_guidance("glm")
+    assert "credentials are available" in available
+    assert "could not construct the client" in available
+    assert "secret-zai-key" not in available
+
+
+def test_provider_unavailable_guidance_distinguishes_diagnostic_failure(monkeypatch):
+    from agent import credential_pool
+
+    monkeypatch.setattr(
+        credential_pool,
+        "describe_provider_credential_availability",
+        lambda provider: {
+            "provider": provider,
+            "credential_status": "unavailable",
+            "error": "token=secret-value",
+        },
+    )
+
+    message = credential_pool.provider_unavailable_guidance("openai-codex")
+
+    assert message == "OpenAI Codex credential status is unavailable. Run `hermes doctor`."
+    assert "secret-value" not in message
 
 
 def test_round_robin_strategy_rotates_priorities(tmp_path, monkeypatch):

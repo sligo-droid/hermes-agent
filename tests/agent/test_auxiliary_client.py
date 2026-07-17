@@ -40,6 +40,31 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{header}.{payload}.sig"
 
 
+def _write_exhausted_codex_auth(tmp_path, reset_at: float) -> None:
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "openai-codex": [{
+                "id": "codex-oauth",
+                "label": "ChatGPT OAuth",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "secret-codex-access-token",
+                "refresh_token": "secret-codex-refresh-token",
+                "last_status": "exhausted",
+                "last_status_at": time.time(),
+                "last_error_code": 429,
+                "last_error_reason": "usage_limit_reached",
+                "last_error_message": "usage limit reached",
+                "last_error_reset_at": reset_at,
+            }],
+        },
+    }))
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Strip provider env vars so each test starts clean."""
@@ -2016,6 +2041,8 @@ class TestAuxiliaryFallbackLayering:
                    return_value={"fallback_chain": [
                        {"provider": "openai-codex", "model": "gpt-5.4-mini"},
                    ]}), \
+             patch("agent.auxiliary_client.provider_unavailable_guidance",
+                   side_effect=AssertionError("fallback success must not emit unavailable guidance")), \
              patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve):
             result = call_llm(
                 task="compression",
@@ -2057,6 +2084,8 @@ class TestAuxiliaryFallbackLayering:
                    return_value={"fallback_chain": [
                        {"provider": "openai-codex", "model": "gpt-5.4-mini"},
                    ]}), \
+             patch("agent.auxiliary_client.provider_unavailable_guidance",
+                   side_effect=AssertionError("fallback success must not emit unavailable guidance")), \
              patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
              patch("agent.auxiliary_client._to_async_client",
                    return_value=(async_chain_client, "gpt-5.4-mini")):
@@ -2072,6 +2101,56 @@ class TestAuxiliaryFallbackLayering:
             ("anthropic", "claude-sonnet-4-6"),
             ("openai-codex", "gpt-5.4-mini"),
         ]
+
+    @pytest.mark.asyncio
+    async def test_exhausted_codex_oauth_guidance_has_sync_async_parity(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+        reset_at = time.time() + 600
+        _write_exhausted_codex_auth(tmp_path, reset_at)
+
+        common_patches = (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openai-codex", "gpt-5.4", None, None, None),
+            ),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(None, None)),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+        )
+
+        with common_patches[0], common_patches[1], common_patches[2]:
+            with pytest.raises(RuntimeError) as sync_exc:
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("openai-codex", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client", return_value=(None, None)
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, ""),
+        ):
+            with pytest.raises(RuntimeError) as async_exc:
+                await async_call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        assert str(sync_exc.value) == str(async_exc.value)
+        assert "OpenAI Codex OAuth credentials are exhausted" in str(sync_exc.value)
+        assert "HTTP 429" in str(sync_exc.value)
+        assert "usage_limit_reached" in str(sync_exc.value)
+        assert "API_KEY" not in str(sync_exc.value)
+        assert "secret-codex" not in str(sync_exc.value)
 
     def test_explicit_provider_unavailable_async_converts_configured_chain(self):
         """Async text helper mirrors resolution-time configured fallback."""
