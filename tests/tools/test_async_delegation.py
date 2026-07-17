@@ -111,6 +111,57 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_completion_event_carries_original_session_routing(monkeypatch):
+    routing = {
+        "HERMES_SESSION_PLATFORM": "discord",
+        "HERMES_SESSION_CHAT_ID": "111",
+        "HERMES_SESSION_THREAD_ID": "222",
+        "HERMES_SESSION_USER_ID": "333",
+        "HERMES_SESSION_USER_NAME": "Ada",
+        "HERMES_SESSION_MESSAGE_ID": "444",
+    }
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": routing.get(name, default),
+    )
+
+    result = ad.dispatch_async_delegation(
+        goal="route me",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="agent:main:discord:thread:111:222",
+        runner=lambda: {"status": "completed", "summary": "done"},
+    )
+
+    assert result["status"] == "dispatched"
+    event = _drain_one()
+    assert event["platform"] == "discord"
+    assert event["chat_id"] == "111"
+    assert event["thread_id"] == "222"
+    assert event["user_id"] == "333"
+    assert event["user_name"] == "Ada"
+    assert event["message_id"] == "444"
+
+
+def test_cli_coding_completion_does_not_retain_delivery_pending_state():
+    result = ad.dispatch_async_delegation(
+        goal="local worker",
+        context=None,
+        toolsets=["coding_worker"],
+        role="coding_worker",
+        model="quick",
+        session_key="agent:main:cli:dm:local",
+        runner=lambda: {"status": "completed", "summary": "done"},
+        kind="coding_worker",
+    )
+
+    assert result["status"] == "dispatched"
+    assert _drain_one() is not None
+    assert ad.pending_count(kind="coding_worker") == 0
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
@@ -521,6 +572,49 @@ def test_concurrent_dispatch_respects_capacity():
     statuses = sorted(r["status"] for r in results)
     assert statuses == ["dispatched", "rejected"]
     gate.set()
+
+
+def test_capacity_is_independent_between_coding_workers_and_delegations():
+    gate = threading.Event()
+
+    coding = ad.dispatch_async_delegation(
+        goal="coding",
+        context=None,
+        toolsets=["coding_worker"],
+        role="coding_worker",
+        model="quick",
+        session_key="",
+        runner=lambda: (
+            gate.wait(timeout=5)
+            and {"status": "completed", "summary": "coding done"}
+        ),
+        max_async_children=1,
+        kind="coding_worker",
+    )
+    delegated = ad.dispatch_async_delegation_batch(
+        goals=["delegated"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=lambda: (
+            gate.wait(timeout=5)
+            and {
+                "results": [{"status": "completed", "summary": "delegated done"}],
+                "total_duration_seconds": 0.1,
+            }
+        ),
+        max_async_children=1,
+    )
+
+    assert coding["status"] == "dispatched"
+    assert delegated["status"] == "dispatched"
+    assert ad.active_count(kind="coding_worker") == 1
+    assert ad.active_count(kind="delegation") == 1
+    gate.set()
+    assert _drain_one() is not None
+    assert _drain_one() is not None
 
 
 # ---------------------------------------------------------------------------

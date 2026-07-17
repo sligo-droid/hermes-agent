@@ -16,7 +16,9 @@ import pytest
 
 from agent.transports.codex_app_server_session import TurnResult
 from hermes_cli.config import DEFAULT_CONFIG
+from tools import async_delegation as ad
 from tools import coding_worker_tool as cwt
+from tools.process_registry import process_registry
 
 
 class FakeSession:
@@ -107,6 +109,24 @@ def _init_git_worktree(path: Path) -> None:
     )
 
 
+def _drain_background_completion(timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_registry.completion_queue.empty():
+            return process_registry.completion_queue.get_nowait()
+        time.sleep(0.01)
+    raise AssertionError("background coding-worker completion did not arrive")
+
+
+def _reset_background_state() -> None:
+    ad._reset_for_tests()
+    with cwt._BACKGROUND_PARALLEL_WORKERS_GUARD:
+        cwt._BACKGROUND_PARALLEL_WORKERS.clear()
+        cwt._BACKGROUND_PARALLEL_RESULTS.clear()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+
 def _skill_block(name, body, directory=None, description=None):
     lines = [
         f'[IMPORTANT: The user launched this CLI session with the "{name}" skill preloaded. Treat its instructions as active guidance for the duration of this session unless the user overrides them.]'
@@ -172,6 +192,16 @@ def test_parallel_config_defaults_and_max_workers_floor(monkeypatch):
     )
     assert cwt.is_coding_worker_parallel_enabled() is False
     assert cwt.get_coding_worker_parallel_max_workers() == 1
+
+    assert DEFAULT_CONFIG["coding_worker"]["background"] == {
+        "enabled": True,
+        "max_concurrent": 3,
+    }
+    assert cwt.is_coding_worker_background_enabled(DEFAULT_CONFIG) is True
+    assert cwt.get_coding_worker_background_max_concurrent(DEFAULT_CONFIG) == 3
+    assert cwt.get_coding_worker_background_max_concurrent(
+        {"coding_worker": {"background": {"max_concurrent": 0}}}
+    ) == 1
 
 
 def test_plain_call_returns_sequential_result_byte_identically(monkeypatch):
@@ -381,6 +411,330 @@ def test_coding_worker_schema_exposes_orchestrator_inputs():
         properties
     )
     assert "_parallel_group" not in properties
+    assert properties["background"]["default"] is False
+
+
+def test_background_dispatch_returns_handle_and_records_worker_run(monkeypatch, tmp_path):
+    _reset_background_state()
+    gate = threading.Event()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+
+    class BlockingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            assert gate.wait(5)
+            return super().run_turn(**kwargs)
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        BlockingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+    parent = _parent(repo)
+
+    started = time.monotonic()
+    handle = json.loads(
+        cwt.delegate_coding_task(
+            task="update the parser",
+            worker_tier="quick",
+            scope_paths=["src"],
+            background=True,
+            parent_agent=parent,
+        )
+    )
+
+    assert time.monotonic() - started < 2
+    assert handle == {
+        "success": True,
+        "background": True,
+        "delegation_id": handle["delegation_id"],
+        "worker_cwd": str(repo),
+        "worker_tier": "quick",
+        "scope_paths": ["src"],
+        "note": "worker running; completion will arrive as a follow-up turn",
+    }
+    assert handle["delegation_id"].startswith("deleg_")
+    assert parent.turn_worker_runs[0]["background"] is True
+    assert parent.turn_worker_runs[0]["tier"] == "quick"
+    assert process_registry.completion_queue.empty()
+
+    gate.set()
+    event = _drain_background_completion()
+    assert event["kind"] == "coding_worker"
+    assert event["worker_run"]["background"] is True
+    assert event["result"]["scope_check"] == {
+        "scope_paths": ["src"],
+        "out_of_scope_files": [],
+        "clean": True,
+    }
+    _reset_background_state()
+
+
+def test_background_disabled_and_capacity_errors(monkeypatch, tmp_path):
+    _reset_background_state()
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["background"]["enabled"] = False
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    disabled = json.loads(
+        cwt.delegate_coding_task(
+            task="disabled",
+            background=True,
+            parent_agent=_parent(tmp_path),
+        )
+    )
+    assert "coding_worker.background.enabled=false" in disabled["error"]
+
+    cfg["coding_worker"]["background"] = {"enabled": True, "max_concurrent": 1}
+    gate = threading.Event()
+
+    class BlockingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            assert gate.wait(5)
+            return super().run_turn(**kwargs)
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        BlockingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+    first = json.loads(
+        cwt.delegate_coding_task(
+            task="first",
+            background=True,
+            parent_agent=_parent(tmp_path),
+        )
+    )
+    assert first["success"] is True
+    over_limit = json.loads(
+        cwt.delegate_coding_task(
+            task="second",
+            background=True,
+            parent_agent=_parent(tmp_path),
+        )
+    )
+    assert "capacity reached" in over_limit["error"].lower()
+    assert "background=false" in over_limit["error"]
+    gate.set()
+    _drain_background_completion()
+    _reset_background_state()
+
+
+def test_background_preflight_failure_is_synchronous(monkeypatch, tmp_path):
+    _reset_background_state()
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="use missing cwd",
+            cwd=str(tmp_path / "missing" / "repo"),
+            background=True,
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert "cwd does not exist" in result["error"]
+    assert process_registry.completion_queue.empty()
+    assert ad.active_count(kind="coding_worker") == 0
+    _reset_background_state()
+
+
+def test_background_refuses_cron_and_kanban_contexts(monkeypatch, tmp_path):
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    cron_parent = _parent(tmp_path)
+    cron_parent.platform = "cron"
+
+    cron_result = json.loads(
+        cwt.delegate_coding_task(
+            task="cron background",
+            background=True,
+            parent_agent=cron_parent,
+        )
+    )
+    assert "unavailable in cron sessions" in cron_result["error"]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    kanban_result = json.loads(
+        cwt.delegate_coding_task(
+            task="kanban background",
+            background=True,
+            parent_agent=_parent(tmp_path),
+        )
+    )
+    assert "unavailable in Kanban worker sessions" in kanban_result["error"]
+
+
+def test_background_refuses_session_without_async_delivery(monkeypatch, tmp_path):
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported",
+        lambda: False,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="stateless background",
+            background=True,
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert "cannot receive a completion turn" in result["error"]
+
+
+def test_background_parallel_completion_merges_and_cleans_worktree(monkeypatch, tmp_path):
+    _reset_background_state()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    gate = threading.Event()
+    edited = threading.Event()
+
+    class EditingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            worker_cwd = Path(self.kwargs["cwd"])
+            (worker_cwd / "src" / "app.py").write_text(
+                "background value\n",
+                encoding="utf-8",
+            )
+            edited.set()
+            assert gate.wait(5)
+            return super().run_turn(**kwargs)
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        EditingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+
+    handle = json.loads(
+        cwt.delegate_coding_task(
+            task="edit src",
+            scope_paths=["src"],
+            background=True,
+            parent_agent=_parent(repo),
+            _parallel_group={"group_id": "async-clean", "base_cwd": str(repo)},
+        )
+    )
+    worker_cwd = Path(handle["worker_cwd"])
+    assert worker_cwd.exists()
+    assert cwt.merge_parallel_worker_result(
+        str(repo),
+        str(worker_cwd),
+        "async-clean",
+    )["merge_pending"] is True
+    assert edited.wait(5)
+    gate.set()
+
+    event = _drain_background_completion()
+    assert event["result"]["scope_check"]["clean"] is True
+    expected_merge = {
+        "group_id": "async-clean",
+        "worker_cwd": str(worker_cwd),
+        "merged": True,
+        "merge_conflicts": [],
+        "worktree_kept": False,
+    }
+    assert event["result"]["parallel_merge"] == expected_merge
+    assert cwt.merge_parallel_worker_result(
+        str(repo),
+        str(worker_cwd),
+        "async-clean",
+    ) == expected_merge
+    assert (repo / "src" / "app.py").read_text(encoding="utf-8") == "background value\n"
+    assert not worker_cwd.exists()
+    _reset_background_state()
+
+
+def test_background_parallel_conflict_keeps_worker_worktree(monkeypatch, tmp_path):
+    _reset_background_state()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    gate = threading.Event()
+    edited = threading.Event()
+
+    class EditingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            worker_cwd = Path(self.kwargs["cwd"])
+            (worker_cwd / "src" / "app.py").write_text("worker value\n", encoding="utf-8")
+            edited.set()
+            assert gate.wait(5)
+            return super().run_turn(**kwargs)
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        EditingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+    handle = json.loads(
+        cwt.delegate_coding_task(
+            task="edit conflicting src",
+            scope_paths=["src"],
+            background=True,
+            parent_agent=_parent(repo),
+            _parallel_group={"group_id": "async-conflict", "base_cwd": str(repo)},
+        )
+    )
+    worker_cwd = Path(handle["worker_cwd"])
+    assert edited.wait(5)
+    (repo / "src" / "app.py").write_text("base value\n", encoding="utf-8")
+    gate.set()
+
+    event = _drain_background_completion()
+    merge = event["result"]["parallel_merge"]
+    assert merge["merged"] is False
+    assert merge["recovery_required"] is True
+    assert merge["worktree_kept"] is True
+    assert worker_cwd.exists()
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worker_cwd)],
+        cwd=repo,
+        check=True,
+    )
+    branch = subprocess.check_output(
+        ["git", "branch", "--list", "hermes-parallel/async-conflict-*"],
+        cwd=repo,
+        text=True,
+    ).strip()
+    if branch:
+        subprocess.run(["git", "branch", "-D", branch], cwd=repo, check=True)
+    _reset_background_state()
+
+
+def test_background_parallel_fable_reports_supported_cut_line(tmp_path):
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="parallel fable",
+            background=True,
+            parent_agent=_fable_parent(tmp_path),
+            _parallel_group={"group_id": "fable-bg", "base_cwd": str(tmp_path)},
+        )
+    )
+
+    assert "do not yet support _parallel_group" in result["error"]
 
 
 def test_scope_check_reports_in_scope_changes_as_clean(monkeypatch, tmp_path):
@@ -1114,6 +1468,94 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
         task="land the requested change",
         worker_summary="Changed src/app.py and ran pytest.",
     )
+
+
+def test_background_fable_completion_contains_trusted_git_evidence(monkeypatch, tmp_path):
+    _reset_background_state()
+    canonical = tmp_path / "canonical"
+    worktree = tmp_path / "fable-worktree"
+    canonical.mkdir()
+    for args in (
+        ["init"],
+        ["config", "user.email", "tests@example.invalid"],
+        ["config", "user.name", "Hermes Tests"],
+        ["checkout", "-b", "main"],
+    ):
+        subprocess.run(["git", *args], cwd=canonical, check=True, stdout=subprocess.DEVNULL)
+    (canonical / "tracked.txt").write_text("initial\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=canonical, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=canonical, check=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "fable/background", str(worktree), "HEAD"],
+        cwd=canonical,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server.check_codex_binary",
+        lambda: (True, "codex ready"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+    preparation = SimpleNamespace(
+        success=True,
+        worktree=str(worktree),
+        branch="fable/background",
+        base_branch="main",
+        repo="sligo-labs/example",
+        pr_url="",
+        resume_existing_pr=False,
+        error="",
+    )
+    finalized = SimpleNamespace(
+        success=True,
+        status="pr_opened",
+        error="",
+        as_dict=lambda: {
+            "success": True,
+            "status": "pr_opened",
+            "commit_performed": True,
+            "push_performed": True,
+            "pr_created": True,
+            "pr_url": "https://github.com/sligo-labs/example/pull/9",
+        },
+    )
+    prepare = MagicMock(return_value=preparation)
+    finalize = MagicMock(return_value=finalized)
+    monkeypatch.setattr(
+        "hermes_cli.fable_git_finalizer.prepare_fable_git_lifecycle",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.fable_git_finalizer.finalize_fable_git_lifecycle",
+        finalize,
+    )
+    parent = _fable_parent(worktree)
+    parent._fable_git_lifecycle = "pr"
+
+    handle = json.loads(
+        cwt.delegate_coding_task(
+            task="open the requested PR",
+            background=True,
+            parent_agent=parent,
+        )
+    )
+    assert handle["success"] is True
+    event = _drain_background_completion()
+    evidence = event["result"]["fable_git_result"]
+    assert evidence["pr_created"] is True
+    assert evidence["pr_url"].endswith("/pull/9")
+    prepare.assert_called_once_with(str(worktree), "pr")
+    finalize.assert_called_once()
+    _reset_background_state()
 
 
 def test_authorized_git_pr_lifecycle_preserves_explicit_git_ssh_command(monkeypatch, tmp_path):

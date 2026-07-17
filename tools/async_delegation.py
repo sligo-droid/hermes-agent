@@ -2,9 +2,9 @@
 """
 Async (background) delegation registry.
 
-Backs ``delegate_task(background=true)``: the parent agent dispatches a
-subagent that runs on a module-level daemon executor and returns a handle
-immediately, so the user and the model can keep working while the child runs.
+Backs ``delegate_task(background=true)`` and background coding workers: the
+parent agent dispatches trusted work on a module-level daemon executor and
+returns a handle immediately, so the user and the model can keep working.
 
 When the child finishes, a completion event is pushed onto the SHARED
 ``process_registry.completion_queue`` with ``type="async_delegation"``. The
@@ -36,11 +36,14 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 import uuid
+import weakref
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures.thread import _worker
 from typing import Any, Callable, Dict, List, Optional
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -48,10 +51,41 @@ from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
-# Back-compat alias — the daemon executor now lives in tools.daemon_pool so
-# other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
-# can share it. Existing imports of ``_DaemonThreadPoolExecutor`` keep working.
-_DaemonThreadPoolExecutor = DaemonThreadPoolExecutor
+
+class _DaemonThreadPoolExecutor(DaemonThreadPoolExecutor):
+    """Python-version-compatible daemon executor for detached delegations.
+
+    ``tools.daemon_pool`` mirrors the CPython 3.8-3.13 private worker API.  On
+    Python 3.14 the worker signature moved to a worker-context object, so keep
+    this rail compatible locally without changing the shared executor used by
+    unrelated subsystems.
+    """
+
+    def _adjust_thread_count(self) -> None:
+        if not hasattr(self, "_create_worker_context"):
+            return super()._adjust_thread_count()
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads >= self._max_workers:
+            return
+        thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+        thread = threading.Thread(
+            name=thread_name,
+            target=_worker,
+            args=(
+                weakref.ref(self, weakref_cb),
+                self._create_worker_context(),
+                self._work_queue,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        self._threads.add(thread)
 
 
 # ---------------------------------------------------------------------------
@@ -93,14 +127,79 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
         return _executor
 
 
-def active_count() -> int:
-    """Number of async delegations currently running."""
+def active_count(*, kind: Optional[str] = None, session_key: Optional[str] = None) -> int:
+    """Number of async delegations currently running, optionally filtered."""
     with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") == "running")
+        return sum(
+            1
+            for record in _records.values()
+            if record.get("status") == "running"
+            and (kind is None or record.get("kind", "delegation") == kind)
+            and (session_key is None or record.get("session_key", "") == session_key)
+        )
+
+
+def pending_count(
+    *,
+    kind: Optional[str] = None,
+    session_key: Optional[str] = None,
+    exclude_delegation_id: Optional[str] = None,
+) -> int:
+    """Count running or completed-but-not-delivered background units."""
+    with _records_lock:
+        return sum(
+            1
+            for delegation_id, record in _records.items()
+            if delegation_id != exclude_delegation_id
+            and (
+                record.get("status") == "running"
+                or bool(record.get("delivery_pending"))
+            )
+            and (kind is None or record.get("kind", "delegation") == kind)
+            and (session_key is None or record.get("session_key", "") == session_key)
+        )
 
 
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
+
+
+def _capture_session_routing() -> Dict[str, str]:
+    """Snapshot gateway routing metadata on the dispatching parent thread."""
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return {}
+
+    fields = {
+        "platform": "HERMES_SESSION_PLATFORM",
+        "chat_id": "HERMES_SESSION_CHAT_ID",
+        "thread_id": "HERMES_SESSION_THREAD_ID",
+        "user_id": "HERMES_SESSION_USER_ID",
+        "user_name": "HERMES_SESSION_USER_NAME",
+        "message_id": "HERMES_SESSION_MESSAGE_ID",
+    }
+    captured: Dict[str, str] = {}
+    for field, env_name in fields.items():
+        try:
+            value = str(get_session_env(env_name, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            captured[field] = value
+    return captured
+
+
+def _completion_requires_delivery_ack(record: Dict[str, Any]) -> bool:
+    """Whether gateway-visible state must stay pending until a forged turn runs."""
+    if record.get("kind") != "coding_worker":
+        return False
+    platform = str(record.get("platform") or "").strip().lower()
+    if not platform:
+        parts = str(record.get("session_key") or "").split(":")
+        if len(parts) >= 3 and parts[:2] == ["agent", "main"]:
+            platform = parts[2].strip().lower()
+    return bool(platform and platform != "cli")
 
 
 def _prune_completed_locked() -> None:
@@ -112,6 +211,10 @@ def _prune_completed_locked() -> None:
         (rid, r)
         for rid, r in _records.items()
         if r.get("status") != "running"
+        and not (
+            r.get("kind") == "coding_worker"
+            and r.get("delivery_pending")
+        )
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -132,6 +235,7 @@ def dispatch_async_delegation(
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    kind: str = "delegation",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -176,13 +280,19 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "kind": str(kind or "delegation"),
+        "delivery_pending": False,
     }
+    record.update(_capture_session_routing())
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1
+            for r in _records.values()
+            if r.get("status") == "running"
+            and r.get("kind", "delegation") == record["kind"]
         )
         if running >= max_async_children:
             return {
@@ -246,6 +356,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["status"] = status
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
+        record["delivery_pending"] = _completion_requires_delivery_ack(record)
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
         _prune_completed_locked()
@@ -271,8 +382,23 @@ def _push_completion_event(
         )
         return
 
-    summary = result.get("summary")
-    error = result.get("error")
+    coding_event = result.get("_async_coding_worker")
+    deterministic_result = result.get("result")
+    is_coding_worker = (
+        record.get("kind") == "coding_worker"
+        and isinstance(coding_event, dict)
+        and isinstance(deterministic_result, dict)
+    )
+    summary = (
+        deterministic_result.get("summary")
+        if is_coding_worker
+        else result.get("summary")
+    )
+    error = (
+        deterministic_result.get("error")
+        if is_coding_worker
+        else result.get("error")
+    )
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
 
@@ -298,6 +424,71 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    for field in (
+        "platform",
+        "chat_id",
+        "thread_id",
+        "user_id",
+        "user_name",
+        "message_id",
+    ):
+        if record.get(field):
+            evt[field] = record[field]
+    if is_coding_worker:
+        evt.update(
+            {
+                "kind": "coding_worker",
+                "result": deterministic_result,
+                "task": coding_event.get("task") or record.get("goal", ""),
+                "context_pack": coding_event.get("context_pack") or {},
+                "worker_cwd": coding_event.get("worker_cwd") or "",
+                "worker_tier": coding_event.get("worker_tier") or "default",
+                "scope_paths": list(coding_event.get("scope_paths") or []),
+                "worker_run": coding_event.get("worker_run") or {},
+                "parallel_group": coding_event.get("parallel_group"),
+            }
+        )
+        evt.update(
+            {
+                # Compatibility with queue consumers whose formatter predates
+                # async-delegation event types (notably the TUI gateway).
+                "session_id": record.get("delegation_id"),
+                "command": "delegate_coding_task(background=true)",
+                "exit_code": 0 if deterministic_result.get("success") else 1,
+                "output": (
+                    "Review this completed coding worker as a fresh turn. Trusted "
+                    "post-processing has already run; verify deterministic evidence "
+                    "and report the outcome.\n"
+                    f"Original task: {coding_event.get('task') or record.get('goal', '')}\n"
+                    "Context pack:\n"
+                    + json.dumps(
+                        coding_event.get("context_pack") or {},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\nDeterministic result JSON:\n"
+                    + json.dumps(
+                        deterministic_result,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                ),
+            }
+        )
+    else:
+        evt.update(
+            {
+                "session_id": record.get("delegation_id"),
+                "command": "delegate_task(background=true)",
+                "exit_code": 0 if status in {"completed", "success"} else 1,
+                "output": (
+                    f"Original goal: {record.get('goal', '')}\n"
+                    + (f"Context: {record.get('context')}\n" if record.get("context") else "")
+                    + f"Status: {status}\n"
+                    + str(summary or error or "No result text.")
+                ),
+            }
+        )
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -361,10 +552,16 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "kind": "delegation",
+        "delivery_pending": False,
     }
+    record.update(_capture_session_routing())
     with _records_lock:
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1
+            for r in _records.values()
+            if r.get("status") == "running"
+            and r.get("kind", "delegation") == record["kind"]
         )
         if running >= max_async_children:
             return {
@@ -434,6 +631,7 @@ def _finalize_batch(
         record["status"] = status
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
+        record["delivery_pending"] = False
         event_record = dict(record)
         _prune_completed_locked()
 
@@ -452,6 +650,9 @@ def _finalize_batch(
     evt = {
         "type": "async_delegation",
         "delegation_id": delegation_id,
+        "session_id": delegation_id,
+        "command": "delegate_task(background=true, batch=true)",
+        "exit_code": 0 if status == "completed" else 1,
         "session_key": event_record.get("session_key", ""),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
@@ -469,6 +670,21 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    for field in (
+        "platform",
+        "chat_id",
+        "thread_id",
+        "user_id",
+        "user_name",
+        "message_id",
+    ):
+        if event_record.get(field):
+            evt[field] = event_record[field]
+    evt["output"] = (
+        f"Original goals: {json.dumps(event_record.get('goals') or [], ensure_ascii=False)}\n"
+        f"Status: {status}\nResults:\n"
+        + json.dumps(evt["results"], ensure_ascii=False, indent=2)
+    )
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -489,6 +705,23 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             {k: v for k, v in r.items() if k != "interrupt_fn"}
             for r in _records.values()
         ]
+
+
+def discard_async_delegation(delegation_id: str) -> bool:
+    """Drop a not-yet-started record without emitting a completion event."""
+    with _records_lock:
+        return _records.pop(str(delegation_id), None) is not None
+
+
+def mark_completion_delivered(delegation_id: str) -> bool:
+    """Clear the delivery-pending marker after the forged turn is accepted."""
+    with _records_lock:
+        record = _records.get(str(delegation_id))
+        if record is None:
+            return False
+        record["delivery_pending"] = False
+        _prune_completed_locked()
+        return True
 
 
 def interrupt_all(reason: str = "shutdown") -> int:

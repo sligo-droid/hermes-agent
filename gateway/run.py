@@ -127,6 +127,9 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "independent; give each its own worker_tier, context pack, and non-overlapping "
     "scope_paths, which are required for parallel execution. Never parallelize coupled "
     "edits such as an API change and its callers, and review the merged result afterward. "
+    "Prefer background=true for long or batchable coding delegations so the thread stays "
+    "responsive; completion arrives as a follow-up turn, so do not claim the work is "
+    "complete when the dispatch handle returns. "
     "Prefer one "
     "focused coding-worker attempt; if its backend fails, diagnose the failure and "
     "continue inline or report the blocker instead of repeatedly retrying the same "
@@ -2857,7 +2860,76 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
+    if evt_type == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "unknown")
+        if evt.get("kind") == "coding_worker":
+            result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+            context_pack = (
+                evt.get("context_pack")
+                if isinstance(evt.get("context_pack"), dict)
+                else {}
+            )
+            return "\n".join(
+                [
+                    f"[ASYNC CODING WORKER COMPLETE — {delegation_id}]",
+                    "Trusted Hermes completion-time post-processing has already run. "
+                    "Review the deterministic evidence below, verify scope_check, "
+                    "parallel_merge, and fable_git_result when present, then report the "
+                    "outcome to the user. Include the PR link when fable_git_result "
+                    "contains one. Do not attribute trusted Git lifecycle actions to "
+                    "the coding worker.",
+                    "",
+                    f"Original task: {evt.get('task') or evt.get('goal') or ''}",
+                    f"Worker cwd: {evt.get('worker_cwd') or ''}",
+                    f"Worker tier: {evt.get('worker_tier') or 'default'}",
+                    "Scope paths: " + json.dumps(evt.get("scope_paths") or []),
+                    "Original context pack:",
+                    json.dumps(context_pack, ensure_ascii=False, indent=2),
+                    "--- DETERMINISTIC RESULT JSON ---",
+                    json.dumps(result, ensure_ascii=False, indent=2),
+                ]
+            )
+
+        status = str(evt.get("status") or "completed")
+        lines = [
+            f"[ASYNC DELEGATION COMPLETE — {delegation_id}]",
+            "A background subagent dispatched earlier has finished. Review the "
+            "self-contained task source and report the result in this fresh turn.",
+            "",
+            f"Original goal: {evt.get('goal') or ''}",
+        ]
+        if evt.get("context"):
+            lines.append(f"Context provided: {evt['context']}")
+        lines.extend(
+            [
+                f"Role: {evt.get('role') or 'leaf'}   Model: {evt.get('model') or '?'}",
+                f"Status: {status}   Duration: {evt.get('duration_seconds', '?')}s",
+                "--- RESULT ---",
+                str(evt.get("summary") or evt.get("error") or "No result text."),
+            ]
+        )
+        return "\n".join(lines)
+
     return None
+
+
+def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
+    """Drain watch events while leaving async completions for their watcher."""
+    watch_events: list[dict] = []
+    requeue: list[dict] = []
+    while not completion_queue.empty():
+        try:
+            evt = completion_queue.get_nowait()
+        except Exception:
+            break
+        evt_type = evt.get("type", "completion")
+        if evt_type in {"watch_match", "watch_disabled"}:
+            watch_events.append(evt)
+        elif evt_type == "async_delegation":
+            requeue.append(evt)
+    for evt in requeue:
+        completion_queue.put(evt)
+    return watch_events
 
 
 # Module-level weak reference to the active GatewayRunner instance.
@@ -3086,6 +3158,7 @@ class GatewayRunner:
         # cannot grow unbounded over a long-running gateway lifetime.
         self._session_sources: "OrderedDict[str, SessionSource]" = OrderedDict()
         self._session_sources_max = 512
+        self._async_completion_seen: set[str] = set()
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -4060,6 +4133,18 @@ class GatewayRunner:
         else:
             pending_slot[session_key] = queued_event
 
+    def _enqueue_internal_completion(
+        self,
+        session_key: str,
+        event: "MessageEvent",
+    ) -> None:
+        """Queue a synthetic completion as its own turn after real pending input."""
+        queued_events = getattr(self, "_queued_events", None)
+        if queued_events is None:
+            queued_events = {}
+            self._queued_events = queued_events
+        queued_events.setdefault(session_key, []).append(event)
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -4494,6 +4579,58 @@ class GatewayRunner:
         return mode
 
     @staticmethod
+    def _session_has_pending_background_workers(
+        session_key: str,
+        *,
+        exclude_delegation_id: Optional[str] = None,
+    ) -> bool:
+        if not session_key:
+            return False
+        try:
+            from tools.async_delegation import pending_count
+
+            return pending_count(
+                kind="coding_worker",
+                session_key=session_key,
+                exclude_delegation_id=exclude_delegation_id,
+            ) > 0
+        except Exception:
+            return False
+
+    def _install_background_worker_reaction_gate(self, adapter: Any) -> None:
+        """Keep Discord action reactions pending while detached workers remain."""
+        platform = getattr(adapter, "platform", None)
+        platform_value = getattr(platform, "value", platform)
+        if str(platform_value or "").lower() != "discord":
+            return
+        if getattr(adapter, "_hermes_background_worker_reaction_gate", False):
+            return
+        original_complete = getattr(adapter, "on_processing_complete", None)
+        original_start = getattr(adapter, "on_processing_start", None)
+        if not callable(original_complete):
+            return
+
+        async def _gated_processing_complete(event: MessageEvent, outcome: Any) -> None:
+            try:
+                session_key = self._session_key_for_source(event.source)
+            except Exception:
+                session_key = ""
+            completion_id = str(
+                getattr(event, "background_completion_id", "") or ""
+            ) or None
+            if self._session_has_pending_background_workers(
+                session_key,
+                exclude_delegation_id=completion_id,
+            ):
+                if callable(original_start):
+                    await original_start(event)
+                return
+            await original_complete(event, outcome)
+
+        adapter.on_processing_complete = _gated_processing_complete
+        adapter._hermes_background_worker_reaction_gate = True
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
@@ -4655,6 +4792,14 @@ class GatewayRunner:
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        # Completion events are fresh internal turns, never steering input.
+        # Keep them in the FIFO overflow instead of the adapter's mergeable
+        # pending slot so a simultaneously queued user message cannot be folded
+        # into the trusted completion prompt.
+        if getattr(event, "internal", False):
+            self._enqueue_internal_completion(session_key, event)
+            return True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -5922,6 +6067,7 @@ class GatewayRunner:
                 success = await self._connect_adapter_with_timeout(adapter, platform)
                 if success:
                     self.adapters[platform] = adapter
+                    self._install_background_worker_reaction_gate(adapter)
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
                     self._update_platform_runtime_status(
@@ -6186,6 +6332,10 @@ class GatewayRunner:
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
+
+        # Detached subagents and coding workers complete through the shared
+        # process-registry queue and always re-enter as fresh serialized turns.
+        asyncio.create_task(self._async_delegation_watcher())
 
         logger.info("Press Ctrl+C to stop")
         
@@ -9329,6 +9479,7 @@ class GatewayRunner:
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                     if success:
                         self.adapters[platform] = adapter
+                        self._install_background_worker_reaction_gate(adapter)
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
@@ -9862,6 +10013,7 @@ class GatewayRunner:
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                 if success:
                     profile_map[platform] = adapter
+                    self._install_background_worker_reaction_gate(adapter)
                     connected += 1
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
                 else:
@@ -12078,6 +12230,9 @@ class GatewayRunner:
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        _background_completion_id = str(
+            getattr(event, "background_completion_id", "") or ""
+        )
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
             try:
@@ -12805,7 +12960,15 @@ class GatewayRunner:
                 session_cwd_override=session_cwd,
                 visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
                 visual_qa_config=getattr(event, "visual_qa_config", None),
+                completed_worker_run=getattr(event, "completed_worker_run", None),
             )
+
+            _pending_background_workers = self._session_has_pending_background_workers(
+                session_key,
+                exclude_delegation_id=_background_completion_id or None,
+            )
+            if _pending_background_workers:
+                event.defer_work_completion = True
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -12983,7 +13146,11 @@ class GatewayRunner:
                 response = _append_runtime_footer(response, _footer_line)
 
             work_item_id = self._discord_work_item_id_for_event(event, session_key)
-            if work_item_id and source.platform == Platform.DISCORD:
+            if (
+                work_item_id
+                and source.platform == Platform.DISCORD
+                and not _pending_background_workers
+            ):
                 try:
                     title = None
                     if session_entry.session_id and self._session_db and not getattr(event, "feature_summary", None):
@@ -13058,13 +13225,7 @@ class GatewayRunner:
             # response after the original turn is already complete.
             try:
                 from tools.process_registry import process_registry as _pr
-                _watch_events = []
-                while not _pr.completion_queue.empty():
-                    evt = _pr.completion_queue.get_nowait()
-                    evt_type = evt.get("type", "completion")
-                    if evt_type in {"watch_match", "watch_disabled"}:
-                        _watch_events.append(evt)
-                    # else: completion events are handled by the watcher task
+                _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
                 for evt in _watch_events:
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
@@ -13257,9 +13418,13 @@ class GatewayRunner:
 
             if _already_sent and not agent_result.get("failed"):
                 work_item_id = getattr(event, "work_item_id", None)
-                summary_status = self._discord_ledger_summary_status(
-                    work_item_id,
-                    self._discord_summary_status(agent_result),
+                summary_status = (
+                    "Running"
+                    if _pending_background_workers
+                    else self._discord_ledger_summary_status(
+                        work_item_id,
+                        self._discord_summary_status(agent_result),
+                    )
                 )
                 summary_ok = await self._update_discord_summaries(
                     source=source,
@@ -13270,7 +13435,12 @@ class GatewayRunner:
                     session_id=session_entry.session_id,
                     runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
                 )
-                if work_item_id and source.platform == Platform.DISCORD and summary_ok:
+                if (
+                    work_item_id
+                    and source.platform == Platform.DISCORD
+                    and summary_ok
+                    and not _pending_background_workers
+                ):
                     try:
                         self._ledger().mark_summary_updated(str(work_item_id))
                         self._ledger().mark_completed(str(work_item_id))
@@ -13398,6 +13568,17 @@ class GatewayRunner:
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if _background_completion_id:
+                try:
+                    from tools.async_delegation import mark_completion_delivered
+
+                    mark_completion_delivered(_background_completion_id)
+                except Exception:
+                    logger.debug(
+                        "Could not acknowledge async completion %s",
+                        _background_completion_id,
+                        exc_info=True,
+                    )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -15882,25 +16063,42 @@ class GatewayRunner:
         adapter = self.adapters.get(Platform.DISCORD)
         if not adapter or not hasattr(adapter, "register_post_delivery_callback"):
             return
-        status = self._discord_summary_status(agent_result)
+        completion_id = str(
+            getattr(event, "background_completion_id", "") or ""
+        ) or None
+        pending_background = self._session_has_pending_background_workers(
+            session_key,
+            exclude_delegation_id=completion_id,
+        )
+        status = (
+            "Running"
+            if pending_background
+            else self._discord_summary_status(agent_result)
+        )
         work_item_id = self._discord_work_item_id_for_event(event, session_key)
         feature_summary = getattr(event, "feature_summary", None)
         project_summary = getattr(event, "project_summary", None)
         if not feature_summary and not project_summary:
             return
-        status = self._discord_ledger_summary_status(work_item_id, status)
+        if not pending_background:
+            status = self._discord_ledger_summary_status(work_item_id, status)
+        summary_response = (
+            "Coding workers are still running; completion will arrive in a follow-up turn."
+            if pending_background
+            else final_response
+        )
 
         async def _deliver():
             summary_ok = await self._update_discord_summaries(
                 source=source,
                 feature_summary=feature_summary,
                 project_summary=project_summary,
-                final_response=final_response,
+                final_response=summary_response,
                 status=status,
                 session_id=session_id,
                 runtime_breakdown=(agent_result or {}).get("runtime_breakdown") if isinstance(agent_result, dict) else None,
             )
-            if summary_ok and work_item_id:
+            if summary_ok and work_item_id and not pending_background:
                 try:
                     self._ledger().mark_summary_updated(str(work_item_id))
                     self._ledger().mark_completed(str(work_item_id))
@@ -19988,6 +20186,207 @@ class GatewayRunner:
         except Exception as e:
             logger.error("Watch notification delivery error: %s", e)
 
+    def _enrich_async_delegation_routing(self, evt: dict) -> None:
+        """Derive completion-turn routing from the originating session key."""
+        if evt.get("platform"):
+            return
+        parsed = _parse_session_key(str(evt.get("session_key") or ""))
+        if not parsed:
+            return
+        evt["platform"] = parsed.get("platform", "")
+        evt["chat_type"] = parsed.get("chat_type", "")
+        evt["chat_id"] = parsed.get("chat_id", "")
+        if parsed.get("thread_id"):
+            evt["thread_id"] = parsed["thread_id"]
+
+    def _async_completion_notification_enabled(self, evt: dict) -> bool:
+        mode = self._load_background_notifications_mode()
+        if mode == "off":
+            return False
+        if mode != "error":
+            return True
+        result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+        return not bool(
+            evt.get("status") in {"completed", "success"}
+            and result.get("success", True)
+        )
+
+    async def _inject_async_delegation_completion(
+        self,
+        synth_text: str,
+        evt: dict,
+    ) -> bool:
+        """Forge a fresh internal turn for one detached completion event."""
+        source = self._build_process_event_source(evt)
+        if not source:
+            logger.warning(
+                "Dropping async completion with no routing metadata: %s",
+                evt.get("delegation_id", "unknown"),
+            )
+            return False
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            logger.warning(
+                "Dropping async completion with no adapter for %s",
+                getattr(source.platform, "value", source.platform),
+            )
+            return False
+
+        synth_event = MessageEvent(
+            text=synth_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            message_id=str(evt.get("message_id") or "").strip() or None,
+        )
+        synth_event.background_completion_id = str(
+            evt.get("delegation_id") or ""
+        )
+        synth_event.completed_worker_run = (
+            dict(evt.get("worker_run") or {})
+            if evt.get("kind") == "coding_worker"
+            else None
+        )
+        if source.platform == Platform.DISCORD:
+            self._hydrate_discord_continuation_event_from_work_item(
+                synth_event,
+                str(evt.get("session_key") or ""),
+                allow_session_fallback=True,
+            )
+        await adapter.handle_message(synth_event)
+        return True
+
+    async def _finalize_suppressed_async_completion(self, evt: dict) -> None:
+        """Finalize visible Discord state when notification config suppresses a turn."""
+        delegation_id = str(evt.get("delegation_id") or "")
+        session_key = str(evt.get("session_key") or "")
+        try:
+            from tools.async_delegation import mark_completion_delivered
+
+            mark_completion_delivered(delegation_id)
+        except Exception:
+            pass
+        source = self._build_process_event_source(evt)
+        if source is None or source.platform != Platform.DISCORD:
+            return
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        event = MessageEvent(
+            text="",
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+        )
+        event.background_completion_id = delegation_id
+        self._hydrate_discord_continuation_event_from_work_item(
+            event,
+            str(evt.get("session_key") or ""),
+            allow_session_fallback=True,
+        )
+        try:
+            from gateway.platforms.base import ProcessingOutcome
+
+            result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+            success = bool(
+                evt.get("status") in {"completed", "success"}
+                and result.get("success", True)
+            )
+            outcome = (
+                ProcessingOutcome.SUCCESS
+                if success
+                else ProcessingOutcome.FAILURE
+            )
+            await adapter.on_processing_complete(event, outcome)
+            pending_background = self._session_has_pending_background_workers(
+                session_key,
+                exclude_delegation_id=delegation_id or None,
+            )
+            work_item_id = getattr(event, "work_item_id", None)
+            final_status = "Complete" if success else "Failed"
+            if not pending_background:
+                final_status = self._discord_ledger_summary_status(
+                    work_item_id,
+                    final_status,
+                )
+            summary_ok = await self._update_discord_summaries(
+                source=source,
+                feature_summary=getattr(event, "feature_summary", None),
+                project_summary=getattr(event, "project_summary", None),
+                final_response=(
+                    "Coding workers are still running; completion will arrive "
+                    "in a follow-up turn."
+                    if pending_background
+                    else str(result.get("summary") or result.get("error") or "")
+                ),
+                status=(
+                    "Running"
+                    if pending_background
+                    else final_status
+                ),
+            )
+            if summary_ok and work_item_id and not pending_background:
+                try:
+                    self._ledger().mark_summary_updated(str(work_item_id))
+                    self._ledger().mark_completed(str(work_item_id))
+                except Exception:
+                    logger.debug(
+                        "Suppressed async ledger finalization failed",
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.debug("Suppressed async reaction finalization failed", exc_info=True)
+
+    async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
+        """Drain shared async completions and serialize them as fresh turns."""
+        await asyncio.sleep(min(3.0, max(0.0, interval)))
+        from tools.process_registry import process_registry as _pr
+
+        while self._running:
+            try:
+                requeue: list[dict] = []
+                async_events: list[dict] = []
+                while not _pr.completion_queue.empty():
+                    try:
+                        evt = _pr.completion_queue.get_nowait()
+                    except Exception:
+                        break
+                    if evt.get("type") == "async_delegation":
+                        async_events.append(evt)
+                    else:
+                        requeue.append(evt)
+                for evt in requeue:
+                    _pr.completion_queue.put(evt)
+
+                seen = getattr(self, "_async_completion_seen", None)
+                if not isinstance(seen, set):
+                    seen = set()
+                    self._async_completion_seen = seen
+                for evt in async_events:
+                    delegation_id = str(evt.get("delegation_id") or "")
+                    if delegation_id and delegation_id in seen:
+                        continue
+                    self._enrich_async_delegation_routing(evt)
+                    if not self._async_completion_notification_enabled(evt):
+                        await self._finalize_suppressed_async_completion(evt)
+                        if delegation_id:
+                            seen.add(delegation_id)
+                        continue
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    accepted = await self._inject_async_delegation_completion(
+                        synth_text,
+                        evt,
+                    )
+                    if accepted and delegation_id:
+                        seen.add(delegation_id)
+                if len(seen) > 1000:
+                    self._async_completion_seen = set(list(seen)[-500:])
+            except Exception:
+                logger.debug("Async delegation watcher error", exc_info=True)
+            await asyncio.sleep(interval)
+
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
         Periodically check a background process and push updates to the user.
@@ -21096,6 +21495,7 @@ class GatewayRunner:
         session_cwd_override: Optional[str] = None,
         visual_qa_requirement: Optional[Dict[str, Any]] = None,
         visual_qa_config: Optional[Dict[str, Any]] = None,
+        completed_worker_run: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -22138,6 +22538,8 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.session_cwd = session_cwd
             agent.terminal_cwd = session_cwd
+            if isinstance(completed_worker_run, dict) and completed_worker_run:
+                agent.turn_worker_runs = [dict(completed_worker_run)]
             # Per-turn rather than constructor state: cached agents must not
             # carry a previous Discord work item's requirement into a later
             # message. The agent/tool executor owns receipt collection.

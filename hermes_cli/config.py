@@ -1625,6 +1625,10 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "max_workers": 3,
         },
+        "background": {
+            "enabled": True,
+            "max_concurrent": 3,
+        },
         "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",
         "complex_build_reasoning_level": "medium",

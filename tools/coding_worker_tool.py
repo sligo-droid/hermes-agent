@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
@@ -31,6 +31,9 @@ from tools.registry import registry, tool_error
 DEFAULT_CODING_WORKER_GIT_SSH_COMMAND = "ssh -F /dev/null"
 _PARALLEL_MERGE_LOCKS: dict[str, threading.Lock] = {}
 _PARALLEL_MERGE_LOCKS_GUARD = threading.Lock()
+_BACKGROUND_PARALLEL_WORKERS: set[str] = set()
+_BACKGROUND_PARALLEL_RESULTS: dict[str, dict[str, Any]] = {}
+_BACKGROUND_PARALLEL_WORKERS_GUARD = threading.Lock()
 _TURN_WORKER_RUNS_LOCK = threading.Lock()
 _CODING_WORKER_FALLBACK_ENV_KEYS = frozenset({
     "ALL_PROXY",
@@ -44,6 +47,7 @@ _CODING_WORKER_FALLBACK_ENV_KEYS = frozenset({
     "PATH",
     "SSH_AUTH_SOCK",
 })
+_BACKGROUND_ROUTE_MARKER = "_hermes_background_coding_worker"
 
 
 def check_coding_worker_requirements() -> bool:
@@ -108,6 +112,71 @@ def get_coding_worker_parallel_max_workers(config: Optional[dict[str, Any]] = No
         return 3
 
 
+def is_coding_worker_background_enabled(config: Optional[dict[str, Any]] = None) -> bool:
+    """Return whether detached coding-worker dispatch is enabled."""
+    background_cfg = _coding_worker_config(config).get("background") or {}
+    if not isinstance(background_cfg, dict):
+        return True
+    return bool(background_cfg.get("enabled", True))
+
+
+def get_coding_worker_background_max_concurrent(
+    config: Optional[dict[str, Any]] = None,
+) -> int:
+    """Return the detached coding-worker concurrency cap with a floor of one."""
+    background_cfg = _coding_worker_config(config).get("background") or {}
+    value = (
+        background_cfg.get("max_concurrent", 3)
+        if isinstance(background_cfg, dict)
+        else 3
+    )
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 3
+
+
+@dataclass
+class _BackgroundCodingStartup:
+    """Handshake between synchronous trusted preflight and detached execution."""
+
+    task: str
+    context_pack: dict[str, Any]
+    parallel_group: Optional[dict[str, Any]] = None
+    ready: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+    preflight_result: Optional[str] = None
+    worker_cwd: str = ""
+    worker_tier: str = "default"
+    scope_paths: list[str] = field(default_factory=list)
+    backend: str = ""
+    worker_run: Optional[dict[str, Any]] = None
+
+    def mark_ready(
+        self,
+        *,
+        worker_cwd: str,
+        worker_tier: Optional[str],
+        scope_paths: Optional[list[str]],
+        backend: str,
+        worker_run: Optional[dict[str, Any]],
+    ) -> None:
+        """Publish deterministic dispatch metadata, then await parent release."""
+        if not self.ready.is_set():
+            self.worker_cwd = str(worker_cwd or "")
+            self.worker_tier = str(worker_tier or "default")
+            self.scope_paths = list(scope_paths or [])
+            self.backend = str(backend or "")
+            self.worker_run = worker_run
+            if self.parallel_group and self.worker_cwd:
+                registry_key = str(Path(self.worker_cwd).expanduser().resolve())
+                with _BACKGROUND_PARALLEL_WORKERS_GUARD:
+                    _BACKGROUND_PARALLEL_RESULTS.pop(registry_key, None)
+                    _BACKGROUND_PARALLEL_WORKERS.add(registry_key)
+            self.ready.set()
+        self.release.wait()
+
+
 def _codex_reasoning_args(reasoning_level: str) -> list[str]:
     level = str(reasoning_level or "").strip().lower()
     if not level:
@@ -138,6 +207,7 @@ def _start_worker_run(
     model: str,
     reasoning: str,
     tier: Optional[str],
+    background: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Append a best-effort per-turn worker record before execution starts."""
     record: dict[str, Any] = {
@@ -147,6 +217,8 @@ def _start_worker_run(
         "tier": str(tier).strip() if tier else None,
         "failed": True,
     }
+    if background:
+        record["background"] = True
     try:
         with _TURN_WORKER_RUNS_LOCK:
             runs = getattr(parent_agent, "turn_worker_runs", None)
@@ -363,10 +435,24 @@ def merge_parallel_worker_result(
     group_id: str,
 ) -> dict[str, Any]:
     """Apply one isolated worker diff to the turn workspace under a group lock."""
+    resolved_worker_cwd = str(Path(worker_cwd).expanduser().resolve())
+    with _BACKGROUND_PARALLEL_WORKERS_GUARD:
+        completed = _BACKGROUND_PARALLEL_RESULTS.pop(resolved_worker_cwd, None)
+        if completed is not None:
+            return dict(completed)
+        if resolved_worker_cwd in _BACKGROUND_PARALLEL_WORKERS:
+            return {
+                "group_id": str(group_id),
+                "worker_cwd": resolved_worker_cwd,
+                "merged": False,
+                "merge_pending": True,
+                "merge_conflicts": [],
+                "worktree_kept": True,
+            }
     with _parallel_merge_lock_for(str(group_id)):
         return _merge_parallel_worker_result_locked(
             str(Path(base_cwd).expanduser().resolve()),
-            str(Path(worker_cwd).expanduser().resolve()),
+            resolved_worker_cwd,
             str(group_id),
         )
 
@@ -650,6 +736,18 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
     )
     args["task"] = task_text
     args["context"] = context_text
+    if bool(args.get("background")) and not (
+        isinstance(args.get("route_decision"), dict)
+        and args["route_decision"].get(_BACKGROUND_ROUTE_MARKER) is True
+    ):
+        # ``run_agent.AIAgent._dispatch_coding_task`` predates the public
+        # background field and intentionally forwards only its bounded argument
+        # allowlist. Carry the request through its already-forwarded
+        # route_decision slot, then unwrap it inside this owned tool module.
+        args["route_decision"] = {
+            _BACKGROUND_ROUTE_MARKER: True,
+            "value": args.get("route_decision"),
+        }
     if not task_text:
         return DelegateCodingTaskPreflight(
             args=args,
@@ -711,6 +809,18 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
             "Create or select a Hermes worktree and retry with cwd set to that absolute path."
         ),
     )
+
+
+def _unwrap_background_route_decision(
+    background: bool,
+    route_decision: Any,
+) -> tuple[bool, Any]:
+    if (
+        isinstance(route_decision, dict)
+        and route_decision.get(_BACKGROUND_ROUTE_MARKER) is True
+    ):
+        return True, route_decision.get("value")
+    return bool(background), route_decision
 
 
 def _workspace_fallback_for_missing_cwd(workdir: str) -> tuple[str, dict[str, str]] | tuple[None, None]:
@@ -1425,6 +1535,7 @@ def _delegate_coding_task_impl(
     parent_agent: Any = None,
     parent_messages: Optional[list[dict]] = None,
     _parallel_request: Optional[dict[str, Any]] = None,
+    _background_startup: Optional[_BackgroundCodingStartup] = None,
 ) -> str:
     """Run a bounded coding task in the configured coding worker backend."""
     if parent_agent is None:
@@ -1885,7 +1996,20 @@ def _delegate_coding_task_impl(
             model=ui_route_metadata.get("selected_model") or "claude-fable-5",
             reasoning="medium",
             tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+            background=_background_startup is not None,
         )
+        if _background_startup is not None:
+            _background_startup.mark_ready(
+                worker_cwd=workdir,
+                worker_tier=(
+                    selected_worker_tier.name
+                    if selected_worker_tier is not None
+                    else None
+                ),
+                scope_paths=normalized_scope_paths,
+                backend="claude_code",
+                worker_run=specialist_run,
+            )
         specialist_result = json.loads(_run_ui_specialist(
             prompt=worker_prompt,
             workdir=workdir,
@@ -1980,7 +2104,20 @@ def _delegate_coding_task_impl(
             model=opencode_runtime.get(f"{opencode_pass}_model") or "",
             reasoning=opencode_runtime.get(f"{opencode_pass}_reasoning_level") or "",
             tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+            background=_background_startup is not None,
         )
+        if _background_startup is not None:
+            _background_startup.mark_ready(
+                worker_cwd=workdir,
+                worker_tier=(
+                    selected_worker_tier.name
+                    if selected_worker_tier is not None
+                    else None
+                ),
+                scope_paths=normalized_scope_paths,
+                backend="opencode",
+                worker_run=opencode_run,
+            )
         result = _call_opencode_task(
             run_opencode_task,
             worker_prompt,
@@ -2197,7 +2334,20 @@ def _delegate_coding_task_impl(
                 model=_attempt_model(initial_pass),
                 reasoning=pass_cfg[f"{initial_pass}_reasoning_level"],
                 tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+                background=_background_startup is not None,
             )
+            if _background_startup is not None:
+                _background_startup.mark_ready(
+                    worker_cwd=workdir,
+                    worker_tier=(
+                        selected_worker_tier.name
+                        if selected_worker_tier is not None
+                        else None
+                    ),
+                    scope_paths=normalized_scope_paths,
+                    backend="codex",
+                    worker_run=codex_run,
+                )
 
             if needs_plan:
                 agents.append("plan")
@@ -2393,6 +2543,271 @@ def _delegate_coding_task_impl(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _background_context_error(parent_agent: Any) -> str:
+    platform = str(getattr(parent_agent, "platform", "") or "").strip().lower()
+    if platform == "cron" or os.environ.get("HERMES_CRON_SESSION"):
+        return (
+            "delegate_coding_task(background=true) is unavailable in cron sessions "
+            "because the short-lived parent cannot receive the completion turn. "
+            "Run the worker synchronously instead."
+        )
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return (
+            "delegate_coding_task(background=true) is unavailable in Kanban worker "
+            "sessions because the parent worker cannot receive a later completion "
+            "turn. Run the coding worker synchronously instead."
+        )
+    try:
+        from gateway.session_context import async_delivery_supported
+
+        delivery_supported = async_delivery_supported()
+    except Exception:
+        delivery_supported = True
+    if not delivery_supported:
+        return (
+            "delegate_coding_task(background=true) is unavailable in this session "
+            "because it cannot receive a completion turn after the current response. "
+            "Run the coding worker synchronously instead."
+        )
+    return ""
+
+
+def _background_context_pack(
+    *,
+    context: Optional[str],
+    relevant_files: Optional[list[dict[str, str]]],
+    approach: Optional[str],
+    constraints: Optional[str],
+    verification: Optional[str],
+) -> dict[str, Any]:
+    return {
+        "context": str(context or "").strip(),
+        "relevant_files": list(relevant_files or []),
+        "approach": str(approach or "").strip(),
+        "constraints": str(constraints or "").strip(),
+        "verification": str(verification or "").strip(),
+    }
+
+
+def _background_result_status(payload: dict[str, Any]) -> str:
+    if payload.get("success") is True:
+        parallel_merge = payload.get("parallel_merge")
+        if not (
+            isinstance(parallel_merge, dict)
+            and (
+                parallel_merge.get("recovery_required")
+                or parallel_merge.get("error")
+            )
+        ):
+            return "completed"
+    return str(payload.get("status") or "partial")
+
+
+def _complete_background_parallel_result(
+    payload: dict[str, Any],
+    startup: _BackgroundCodingStartup,
+) -> None:
+    group = startup.parallel_group
+    if not group or not startup.worker_cwd:
+        return
+    resolved_worker_cwd = str(Path(startup.worker_cwd).expanduser().resolve())
+    group_id = str(group.get("group_id") or "")
+    base_cwd = str(Path(str(group.get("base_cwd") or "")).expanduser().resolve())
+    try:
+        # Keep the worker marked active until merge-back and result caching are
+        # complete. A dispatch-turn observer that races completion therefore
+        # receives merge_pending instead of attempting a second merge.
+        with _parallel_merge_lock_for(group_id):
+            merge_result = _merge_parallel_worker_result_locked(
+                base_cwd,
+                resolved_worker_cwd,
+                group_id,
+            )
+        payload["parallel_merge"] = merge_result
+    except Exception as exc:
+        payload["parallel_merge"] = {
+            "success": False,
+            "recovery_required": True,
+            "worker_cwd": resolved_worker_cwd,
+            "worktree_kept": True,
+            "error": f"Parallel coding-worker merge-back failed: {exc}",
+            "next_action": (
+                "Inspect the isolated worker worktree and recover or retry the "
+                "merge-back before continuing."
+            ),
+        }
+    with _BACKGROUND_PARALLEL_WORKERS_GUARD:
+        _BACKGROUND_PARALLEL_RESULTS[resolved_worker_cwd] = dict(
+            payload["parallel_merge"]
+        )
+        _BACKGROUND_PARALLEL_WORKERS.discard(resolved_worker_cwd)
+        while len(_BACKGROUND_PARALLEL_RESULTS) > 100:
+            _BACKGROUND_PARALLEL_RESULTS.pop(next(iter(_BACKGROUND_PARALLEL_RESULTS)))
+
+
+def _dispatch_background_coding_task(
+    *,
+    call_kwargs: dict[str, Any],
+    parallel_group: Optional[dict[str, Any]],
+    loaded_config: dict[str, Any],
+) -> str:
+    parent_agent = call_kwargs.get("parent_agent")
+    context_error = _background_context_error(parent_agent)
+    if context_error:
+        return tool_error(context_error)
+    if not is_coding_worker_background_enabled(loaded_config):
+        return tool_error(
+            "Background coding workers are disabled by "
+            "coding_worker.background.enabled=false. Run synchronously with "
+            "background=false or enable the setting."
+        )
+    if parallel_group is not None and _is_fable_implementation_parent(parent_agent):
+        return tool_error(
+            "Background Fable coding workers do not yet support _parallel_group. "
+            "Run the grouped Fable workers synchronously, or dispatch one "
+            "background Fable worker without a parallel group."
+        )
+
+    task_text, context_text, _inferred = _normalize_task_and_context(
+        call_kwargs.get("task"),
+        call_kwargs.get("context"),
+    )
+    startup = _BackgroundCodingStartup(
+        task=task_text,
+        context_pack=_background_context_pack(
+            context=context_text,
+            relevant_files=call_kwargs.get("relevant_files"),
+            approach=call_kwargs.get("approach"),
+            constraints=call_kwargs.get("constraints"),
+            verification=call_kwargs.get("verification"),
+        ),
+        parallel_group=(
+            dict(parallel_group) if isinstance(parallel_group, dict) else None
+        ),
+    )
+
+    try:
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="")
+    except Exception:
+        session_key = ""
+    session_key = str(
+        session_key
+        or getattr(parent_agent, "gateway_session_key", "")
+        or getattr(parent_agent, "session_key", "")
+        or ""
+    )
+
+    def _runner() -> dict[str, Any]:
+        try:
+            raw_result = delegate_coding_task(
+                **call_kwargs,
+                background=False,
+                _parallel_group=parallel_group,
+                _background_startup=startup,
+            )
+        except Exception as exc:
+            raw_result = tool_error(f"background coding worker failed: {exc}")
+
+        if not startup.ready.is_set():
+            startup.preflight_result = raw_result
+            startup.ready.set()
+            startup.release.wait()
+            return {"status": "cancelled", "summary": ""}
+
+        try:
+            payload = json.loads(raw_result)
+        except (TypeError, ValueError):
+            payload = {
+                "success": False,
+                "status": "partial",
+                "summary": "",
+                "error": str(raw_result),
+            }
+        _complete_background_parallel_result(payload, startup)
+        worker_run = dict(startup.worker_run or {})
+        return {
+            "status": _background_result_status(payload),
+            "summary": payload.get("summary"),
+            "error": payload.get("error"),
+            "duration_seconds": payload.get("duration_seconds", 0),
+            "model": worker_run.get("model") or "",
+            "result": payload,
+            "_async_coding_worker": {
+                "task": startup.task,
+                "context_pack": startup.context_pack,
+                "worker_cwd": startup.worker_cwd,
+                "worker_tier": startup.worker_tier,
+                "scope_paths": startup.scope_paths,
+                "worker_run": worker_run,
+                "parallel_group": startup.parallel_group,
+            },
+        }
+
+    from tools.async_delegation import (
+        discard_async_delegation,
+        dispatch_async_delegation,
+    )
+
+    dispatch = dispatch_async_delegation(
+        goal=task_text,
+        context=context_text,
+        toolsets=["coding_worker"],
+        role="coding_worker",
+        model=str(call_kwargs.get("worker_tier") or ""),
+        session_key=session_key,
+        runner=_runner,
+        max_async_children=get_coding_worker_background_max_concurrent(loaded_config),
+        kind="coding_worker",
+    )
+    if dispatch.get("status") != "dispatched":
+        error = str(
+            dispatch.get("error")
+            or "Background coding worker could not be scheduled."
+        )
+        if "capacity reached" in error.lower():
+            limit = get_coding_worker_background_max_concurrent(loaded_config)
+            error = (
+                f"Background coding-worker capacity reached ({limit} running). "
+                "Wait for a completion turn or run this task synchronously with "
+                "background=false. Raise coding_worker.background.max_concurrent "
+                "in config.yaml to allow more concurrent workers."
+            )
+        return tool_error(
+            error
+        )
+
+    delegation_id = str(dispatch["delegation_id"])
+    startup.ready.wait()
+    if startup.preflight_result is not None:
+        discard_async_delegation(delegation_id)
+        startup.release.set()
+        return startup.preflight_result
+
+    handle: dict[str, Any] = {
+        "success": True,
+        "background": True,
+        "delegation_id": delegation_id,
+        "worker_cwd": startup.worker_cwd,
+        "worker_tier": startup.worker_tier,
+        "scope_paths": list(startup.scope_paths),
+        "note": "worker running; completion will arrive as a follow-up turn",
+    }
+    if startup.parallel_group:
+        handle["parallel"] = {
+            "group_id": str(startup.parallel_group.get("group_id") or ""),
+            "worker_cwd": startup.worker_cwd,
+            "merged": False,
+            "merge_pending": True,
+            "merge_conflicts": [],
+            "worktree_kept": True,
+            "background": True,
+        }
+    startup.release.set()
+    return json.dumps(handle, ensure_ascii=False)
+
+
 def delegate_coding_task(
     task: Optional[str] = None,
     context: Optional[str] = None,
@@ -2404,14 +2819,20 @@ def delegate_coding_task(
     constraints: Optional[str] = None,
     verification: Optional[str] = None,
     scope_paths: Optional[list[str]] = None,
+    background: bool = False,
     allow_git_pr_lifecycle: bool = False,
     trusted_allow_git_pr_lifecycle: bool = False,
     route_decision: Any = None,
     parent_agent: Any = None,
     parent_messages: Optional[list[dict]] = None,
     _parallel_group: Optional[dict[str, Any]] = None,
+    _background_startup: Optional[_BackgroundCodingStartup] = None,
 ) -> str:
     """Run a coding worker, isolating trusted parallel calls in linked worktrees."""
+    background, route_decision = _unwrap_background_route_decision(
+        background,
+        route_decision,
+    )
     call_kwargs = {
         "task": task,
         "context": context,
@@ -2429,6 +2850,20 @@ def delegate_coding_task(
         "parent_agent": parent_agent,
         "parent_messages": parent_messages,
     }
+    if _background_startup is not None:
+        call_kwargs["_background_startup"] = _background_startup
+    if background:
+        try:
+            from hermes_cli.config import load_config
+
+            loaded_config = load_config() or {}
+        except Exception:
+            loaded_config = {}
+        return _dispatch_background_coding_task(
+            call_kwargs=call_kwargs,
+            parallel_group=_parallel_group,
+            loaded_config=loaded_config,
+        )
     if _parallel_group is None:
         return _delegate_coding_task_impl(**call_kwargs)
 
@@ -2586,6 +3021,15 @@ CODING_WORKER_SCHEMA = {
                 ),
                 "items": {"type": "string"},
             },
+            "background": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Run the worker in the background and report completion in a "
+                    "later turn; use for long or batchable work when the user "
+                    "should not wait."
+                ),
+            },
             "route_decision": {
                 "type": "object",
                 "description": (
@@ -2645,6 +3089,7 @@ registry.register(
         constraints=args.get("constraints"),
         verification=args.get("verification"),
         scope_paths=args.get("scope_paths"),
+        background=bool(args.get("background", False)),
         allow_git_pr_lifecycle=False,
         trusted_allow_git_pr_lifecycle=False,
         route_decision=args.get("route_decision"),
