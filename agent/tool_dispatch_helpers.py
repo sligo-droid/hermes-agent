@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from agent.tool_result_classification import (
@@ -58,6 +58,9 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
+
+_CODING_WORKER_TOOL = "delegate_coding_task"
+_DEFAULT_CODING_WORKER_PARALLEL_MAX_WORKERS = 3
 
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(
@@ -122,7 +125,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
         return False
 
-    reserved_paths: list[Path] = []
+    parsed_calls: list[tuple[str, dict]] = []
     for tool_call in tool_calls:
         tool_name = tool_call.function.name
         try:
@@ -141,6 +144,22 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
                 type(function_args).__name__,
             )
             return False
+        parsed_calls.append((tool_name, function_args))
+
+    coding_call_count = sum(
+        1 for tool_name, _function_args in parsed_calls
+        if tool_name == _CODING_WORKER_TOOL
+    )
+    if coding_call_count:
+        # Coding workers require a shared worktree/merge-back handshake that
+        # only the coding-only concurrent path installs. Keep mixed batches
+        # sequential even when every non-coding tool is otherwise safe.
+        if coding_call_count != len(parsed_calls):
+            return False
+        return _should_parallelize_coding_worker_batch(parsed_calls)
+
+    reserved_paths: list[Path] = []
+    for tool_name, function_args in parsed_calls:
 
         if tool_name in _PATH_SCOPED_TOOLS:
             scoped_path = _extract_parallel_scope_path(tool_name, function_args)
@@ -156,6 +175,80 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             if not _is_mcp_tool_parallel_safe(tool_name):
                 return False
 
+    return True
+
+
+def _coding_worker_parallel_settings() -> tuple[bool, int]:
+    """Resolve coding-worker parallel gates without importing config at module load."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except Exception:
+        config = {}
+
+    coding_worker = config.get("coding_worker") or {}
+    parallel = coding_worker.get("parallel") or {}
+
+    raw_enabled = parallel.get("enabled", True)
+    if isinstance(raw_enabled, str):
+        enabled = raw_enabled.strip().lower() not in {"0", "false", "no", "off"}
+    else:
+        enabled = bool(raw_enabled)
+
+    raw_max_workers = parallel.get(
+        "max_workers", _DEFAULT_CODING_WORKER_PARALLEL_MAX_WORKERS
+    )
+    try:
+        max_workers = int(raw_max_workers)
+    except (TypeError, ValueError):
+        max_workers = _DEFAULT_CODING_WORKER_PARALLEL_MAX_WORKERS
+    return enabled, max_workers
+
+
+def _normalize_coding_worker_scope_paths(function_args: dict) -> Optional[list[Path]]:
+    """Normalize coding-worker scopes consistently with the worker tool."""
+    raw_scope_paths = function_args.get("scope_paths")
+    if not isinstance(raw_scope_paths, list) or not raw_scope_paths:
+        return None
+
+    normalized: list[Path] = []
+    rendered_paths: set[str] = set()
+    for raw_path in raw_scope_paths:
+        value = str(raw_path or "").strip().replace("\\", "/")
+        path = PurePosixPath(value)
+        if not value or path.is_absolute() or ".." in path.parts:
+            return None
+        rendered = str(path)
+        if rendered in rendered_paths:
+            continue
+        rendered_paths.add(rendered)
+        # Anchor relative prefixes at a synthetic common root. This preserves
+        # the existing _paths_overlap prefix rule and makes "." overlap every
+        # other workdir-relative scope, matching the worker's scope semantics.
+        normalized.append(Path("/").joinpath(*path.parts))
+    return normalized or None
+
+
+def _should_parallelize_coding_worker_batch(
+    parsed_calls: list[tuple[str, dict]],
+) -> bool:
+    enabled, max_workers = _coding_worker_parallel_settings()
+    if not enabled or len(parsed_calls) > max_workers:
+        return False
+
+    reserved_paths: list[Path] = []
+    for _tool_name, function_args in parsed_calls:
+        scope_paths = _normalize_coding_worker_scope_paths(function_args)
+        if scope_paths is None:
+            return False
+        if any(
+            _paths_overlap(scoped_path, existing)
+            for scoped_path in scope_paths
+            for existing in reserved_paths
+        ):
+            return False
+        reserved_paths.extend(scope_paths)
     return True
 
 

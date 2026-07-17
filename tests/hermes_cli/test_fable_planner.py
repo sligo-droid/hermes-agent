@@ -330,6 +330,10 @@ def test_build_fable_implementation_instruction_requires_codex_delegation():
     assert "Codex coding worker" in packet
     assert "Choose `worker_tier` deliberately" in packet
     assert "Front-load what you learned into `relevant_files`" in packet
+    assert "several `delegate_coding_task` calls in one response" in packet
+    assert "non-overlapping `scope_paths`" in packet
+    assert "Never parallelize coupled edits" in packet
+    assert "review the merged result afterward" in packet
     assert "Do not fall back to OpenCode" in packet
     assert "`fable_git_result.recovery_required`" in packet
     assert "call `delegate_coding_task` again with the same `cwd`" in packet

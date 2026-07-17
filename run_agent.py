@@ -4825,15 +4825,24 @@ class AIAgent:
         )
 
         parent_messages = function_args.get("_parent_messages")
-        return _delegate_coding_task(
+        dispatch_args = dict(
             task=function_args.get("task"),
             context=function_args.get("context"),
             cwd=function_args.get("cwd"),
             turn_timeout_seconds=function_args.get("turn_timeout_seconds"),
+            worker_tier=function_args.get("worker_tier"),
+            relevant_files=function_args.get("relevant_files"),
+            approach=function_args.get("approach"),
+            constraints=function_args.get("constraints"),
+            verification=function_args.get("verification"),
+            scope_paths=function_args.get("scope_paths"),
             route_decision=function_args.get("route_decision"),
             parent_agent=self,
             parent_messages=parent_messages,
         )
+        if function_args.get("_parallel_group") is not None:
+            dispatch_args["_parallel_group"] = function_args["_parallel_group"]
+        return _delegate_coding_task(**dispatch_args)
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
