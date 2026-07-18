@@ -1053,6 +1053,52 @@ async def test_feature_summary_update_skips_unchanged_embed(adapter, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_feature_summary_update_preserves_existing_artifacts_when_omitted(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Ship trace links",
+    )
+    artifact = {
+        "kind": "external_url",
+        "label": "Agent Trace",
+        "url": "https://artifacts.example.test/runs/abc",
+    }
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Done.",
+        status="Complete",
+        title="Trace links",
+        artifacts=[artifact],
+    )
+    message = handle["_message_obj"]
+    message.edit.reset_mock()
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Board sync updated the outcome.",
+        status="Blocked",
+        title="Trace links",
+    )
+
+    fields = {
+        field.name: field.value
+        for field in message.edit.await_args.kwargs["embed"].fields
+    }
+    assert fields["Agent Trace"] == (
+        "[Open link](https://artifacts.example.test/runs/abc)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_feature_summary_update_backs_off_after_rate_limit(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
@@ -3208,6 +3254,155 @@ async def test_discord_feature_summary_title_uses_request_not_stale_session_titl
         status="Complete",
         title="investigate and fix thread 1507755696501030933",
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_feature_summary_collects_transient_session_artifacts(monkeypatch):
+    from hermes_cli import plugins as plugin_api
+
+    artifacts = [
+        {
+            "kind": "external_url",
+            "label": "Execution trace",
+            "url": "https://artifacts.example.test/runs/abc",
+        }
+    ]
+    collect = MagicMock(return_value=artifacts)
+    monkeypatch.setattr(plugin_api, "collect_session_artifacts", collect)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    adapter = SimpleNamespace(update_feature_summary=AsyncMock(return_value=True))
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="200", chat_type="thread")
+    feature_summary = {
+        "message_id": "300",
+        "initial_request": "Ship the trace links",
+        "kanban_board": None,
+    }
+    original_summary = dict(feature_summary)
+
+    assert await runner._update_discord_summaries(
+        source=source,
+        feature_summary=feature_summary,
+        final_response="Shipped.",
+        status="Blocked: awaiting operator approval",
+        session_id="session-1",
+    )
+
+    collect.assert_called_once_with(
+        "session-1",
+        surface="discord_feature_summary",
+    )
+    adapter.update_feature_summary.assert_awaited_once_with(
+        feature_summary,
+        final_response="Shipped.",
+        status="Blocked: awaiting operator approval",
+        title="Ship the trace links",
+        artifacts=artifacts,
+    )
+    assert feature_summary == original_summary
+    assert "artifacts" not in feature_summary
+
+
+@pytest.mark.asyncio
+async def test_running_feature_summary_does_not_collect_session_artifacts(monkeypatch):
+    from hermes_cli import plugins as plugin_api
+
+    collect = MagicMock(return_value=[])
+    monkeypatch.setattr(plugin_api, "collect_session_artifacts", collect)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    adapter = SimpleNamespace(update_feature_summary=AsyncMock(return_value=True))
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="200", chat_type="thread")
+
+    assert await runner._update_discord_summaries(
+        source=source,
+        feature_summary={"message_id": "300", "initial_request": "Keep working"},
+        final_response="Still working.",
+        status="Running",
+        session_id="session-1",
+    )
+
+    collect.assert_not_called()
+    assert "artifacts" not in adapter.update_feature_summary.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_feature_summary_artifact_provider_failure_is_fail_open(monkeypatch):
+    from hermes_cli import plugins as plugin_api
+
+    collect = MagicMock(side_effect=RuntimeError("provider failed"))
+    monkeypatch.setattr(plugin_api, "collect_session_artifacts", collect)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    adapter = SimpleNamespace(update_feature_summary=AsyncMock(return_value=True))
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="200", chat_type="thread")
+
+    assert await runner._update_discord_summaries(
+        source=source,
+        feature_summary={"message_id": "300", "initial_request": "Ship it"},
+        final_response="Done.",
+        status="Complete",
+        session_id="session-1",
+    )
+
+    collect.assert_called_once()
+    adapter.update_feature_summary.assert_awaited_once()
+    assert "artifacts" not in adapter.update_feature_summary.await_args.kwargs
+
+
+def test_feature_summary_renders_only_safe_artifact_links_between_runtime_and_kanban(adapter):
+    valid = {
+        "kind": "external_url",
+        "label": "Execution trace",
+        "url": "https://artifacts.example.test/runs/abc(1)",
+    }
+    artifacts = [
+        None,
+        {"kind": "trace", "label": "Wrong kind", "url": "https://example.test/run"},
+        {"kind": "external_url", "label": "Credentials", "url": "https://u:p@example.test/run"},
+        {"kind": "external_url", "label": "Whitespace", "url": "https://example.test/a b"},
+        {"kind": "external_url", "label": "Control", "url": "https://example.test/a\n"},
+        {"kind": "external_url", "label": "Scheme", "url": "ftp://example.test/a"},
+        {"kind": "external_url", "label": "Bad port", "url": "https://example.test:99999/a"},
+        {
+            "kind": "external_url",
+            "label": "Overlong",
+            "url": "https://example.test/" + "a" * 1000,
+        },
+        valid,
+        dict(valid),
+    ]
+
+    embed = adapter._build_feature_summary_embed(
+        initial_request="Ship it",
+        status="Complete",
+        outcome="Done",
+        title="Artifact links",
+        metadata={"branch": None, "pr_url": None},
+        runtime_breakdown={"wall_s": 12},
+        artifacts=artifacts,
+        kanban_url="https://kanban.example.test/workers/200",
+    )
+
+    field_names = [field.name for field in embed.fields]
+    assert field_names.index("Time Spent") < field_names.index("Execution trace")
+    assert field_names.index("Execution trace") < field_names.index("Kanban Board")
+    assert field_names.count("Execution trace") == 1
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["Execution trace"] == (
+        "[Open link](https://artifacts.example.test/runs/abc%281%29)"
+    )
+    assert "Wrong kind" not in fields
+    assert "Credentials" not in fields
+    assert "Whitespace" not in fields
+    assert "Control" not in fields
+    assert "Scheme" not in fields
+    assert "Bad port" not in fields
+    assert "Overlong" not in fields
+    assert not fields["Execution trace"].endswith("...")
 
 
 @pytest.mark.asyncio

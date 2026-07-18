@@ -46,6 +46,15 @@ _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 _DISCORD_MAX_APP_COMMANDS = 100
 _DISCORD_FEATURE_SUMMARY_EDIT_BACKOFF_SECONDS = 30.0
+_DISCORD_EMBED_MAX_FIELDS = 25
+_DISCORD_EMBED_FIELD_VALUE_LIMIT = 1024
+_DISCORD_SESSION_ARTIFACT_KIND_LIMIT = 64
+_DISCORD_SESSION_ARTIFACT_LABEL_LIMIT = 100
+_DISCORD_SESSION_ARTIFACT_URL_LIMIT = 2048
+_DISCORD_SESSION_ARTIFACT_MARKDOWN_RE = re.compile(
+    r"^\[Open link\]\((https?://[^\s]+)\)$",
+    flags=re.IGNORECASE,
+)
 _DISCORD_AUDIO_EXTENSIONS = frozenset({
     ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
     ".oga", ".ogg", ".opus", ".wav", ".webm",
@@ -1774,6 +1783,106 @@ class DiscordAdapter(BasePlatformAdapter):
         public_url = self._normalize_absolute_public_url(url)
         return f"[{text}]({public_url})" if public_url else text
 
+    def _feature_summary_artifact_fields(
+        self,
+        artifacts: Optional[List[Dict[str, Any]]],
+        *,
+        limit: int,
+    ) -> List[Tuple[str, str, bool]]:
+        """Return independently validated external-link embed fields."""
+        if not isinstance(artifacts, list) or limit <= 0:
+            return []
+
+        fields: List[Tuple[str, str, bool]] = []
+        seen: set[Tuple[str, str]] = set()
+        for artifact in artifacts:
+            if len(fields) >= limit:
+                break
+            if not isinstance(artifact, dict):
+                continue
+            kind = artifact.get("kind")
+            label = artifact.get("label")
+            url = artifact.get("url")
+            if not all(isinstance(value, str) for value in (kind, label, url)):
+                continue
+            kind = kind.strip()
+            label = label.strip()
+            if kind != "external_url" or not label or not url:
+                continue
+            if len(kind) > _DISCORD_SESSION_ARTIFACT_KIND_LIMIT:
+                continue
+            if len(label) > _DISCORD_SESSION_ARTIFACT_LABEL_LIMIT:
+                continue
+            if len(url) > _DISCORD_SESSION_ARTIFACT_URL_LIMIT:
+                continue
+            if any(ord(char) < 32 or ord(char) == 127 for char in kind + label):
+                continue
+            if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
+                continue
+            try:
+                parsed = urlparse(url)
+                if parsed.scheme.lower() not in {"http", "https"}:
+                    continue
+                if not parsed.netloc or not parsed.hostname:
+                    continue
+                if parsed.username is not None or parsed.password is not None:
+                    continue
+                parsed.port
+            except (TypeError, ValueError):
+                continue
+
+            field_name = self._clean_summary_text(
+                label,
+                limit=_DISCORD_SESSION_ARTIFACT_LABEL_LIMIT,
+                default="",
+            )
+            if not field_name:
+                continue
+            rendered_url = quote(url, safe=":/?#[]@!$&'*+,;=%~._-")
+            markdown = f"[Open link]({rendered_url})"
+            if len(markdown) > _DISCORD_EMBED_FIELD_VALUE_LIMIT:
+                continue
+            identity = (field_name, rendered_url)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            fields.append((field_name, markdown, False))
+        return fields
+
+    def _feature_summary_existing_artifacts(
+        self,
+        message: Any,
+    ) -> List[Dict[str, str]]:
+        """Recover artifact links already present in a Discord summary message."""
+        artifacts: List[Dict[str, str]] = []
+        for embed in getattr(message, "embeds", None) or []:
+            if isinstance(embed, dict):
+                fields = embed.get("fields") or []
+            else:
+                fields = getattr(embed, "fields", None) or []
+            for field in fields:
+                if len(artifacts) >= _DISCORD_EMBED_MAX_FIELDS:
+                    return artifacts
+                if isinstance(field, dict):
+                    name = field.get("name")
+                    value = field.get("value")
+                else:
+                    name = getattr(field, "name", None)
+                    value = getattr(field, "value", None)
+                if not isinstance(name, str) or not isinstance(value, str):
+                    continue
+                match = _DISCORD_SESSION_ARTIFACT_MARKDOWN_RE.fullmatch(value.strip())
+                if not match:
+                    continue
+                artifacts.append(
+                    {
+                        "kind": "external_url",
+                        "label": name,
+                        "url": match.group(1),
+                    }
+                )
+        return artifacts
+
     def _same_feature_summary_url(self, left: Optional[str], right: Optional[str]) -> bool:
         left_url = self._normalize_absolute_public_url(left)
         right_url = self._normalize_absolute_public_url(right)
@@ -2369,6 +2478,7 @@ class DiscordAdapter(BasePlatformAdapter):
         source_discord_thread_url: Optional[str] = None,
         hide_source_links: bool = False,
         runtime_breakdown: Optional[Dict[str, Any]] = None,
+        artifacts: Optional[List[Dict[str, Any]]] = None,
     ):
         metadata = metadata or self._collect_discord_project_metadata()
         embed_kwargs = {
@@ -2401,6 +2511,7 @@ class DiscordAdapter(BasePlatformAdapter):
         runtime_text = render_runtime_breakdown_text(runtime_breakdown, compact=True)
         if runtime_text:
             fields.append(("Time Spent", runtime_text, False))
+        kanban_field = None
         if kanban_url:
             if source_board:
                 duplicates_source_url = any(
@@ -2409,14 +2520,25 @@ class DiscordAdapter(BasePlatformAdapter):
                     for source_url in (source_kanban_url, source_task_url)
                 )
                 if not duplicates_source_url:
-                    fields.append(("Foreman Kanban", kanban_url, False))
+                    kanban_field = ("Foreman Kanban", kanban_url, False)
             else:
-                fields.append(("Kanban Board", kanban_url, False))
+                kanban_field = ("Kanban Board", kanban_url, False)
+        artifact_limit = max(
+            0,
+            _DISCORD_EMBED_MAX_FIELDS - len(fields) - (1 if kanban_field else 0),
+        )
+        fields.extend(self._feature_summary_artifact_fields(artifacts, limit=artifact_limit))
+        if kanban_field:
+            fields.append(kanban_field)
         for name, value, inline in fields:
             try:
                 embed.add_field(
                     name=name,
-                    value=self._truncate_summary_value(value, limit=1024, default="pending"),
+                    value=self._truncate_summary_value(
+                        value,
+                        limit=_DISCORD_EMBED_FIELD_VALUE_LIMIT,
+                        default="pending",
+                    ),
                     inline=inline,
                 )
             except Exception:
@@ -2672,6 +2794,7 @@ class DiscordAdapter(BasePlatformAdapter):
         title: Optional[str] = None,
         kanban_sync: bool = False,
         runtime_breakdown: Optional[Dict[str, Any]] = None,
+        artifacts: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         if not handle:
             return False
@@ -2730,6 +2853,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:
                     logger.debug("[%s] Discord feature summary message fetch failed", self.name, exc_info=True)
                 return False
+        if artifacts is None:
+            artifacts = self._feature_summary_existing_artifacts(msg)
         try:
             embed = self._build_feature_summary_embed(
                 initial_request=str(handle.get("initial_request") or ""),
@@ -2751,6 +2876,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_discord_thread_url=str(handle.get("source_discord_thread_url") or "") or None,
                 hide_source_links=bool(handle.get("hide_source_links")),
                 runtime_breakdown=runtime_breakdown,
+                artifacts=artifacts,
             )
             edit_key = self._feature_summary_edit_cache_key(handle, msg)
             payload = self._feature_summary_embed_payload(embed)

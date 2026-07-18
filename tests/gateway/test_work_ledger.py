@@ -1649,6 +1649,65 @@ async def test_startup_updates_agent_done_summary_without_final_response(tmp_pat
     assert runner.work_ledger.get(item["id"])["status"] == "completed"
 
 
+@pytest.mark.asyncio
+async def test_startup_replay_recollects_transient_discord_summary_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import plugins as plugin_api
+
+    artifacts = [
+        {
+            "kind": "trace",
+            "label": "Execution trace",
+            "url": "https://artifacts.example.test/runs/replayed",
+        }
+    ]
+    collect = MagicMock(return_value=artifacts)
+    monkeypatch.setattr(plugin_api, "collect_session_artifacts", collect)
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner._background_tasks = set()
+    runner._session_db = None
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
+        _send_with_retry=AsyncMock(),
+        update_feature_summary=AsyncMock(return_value=True),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _discord_event(message_id="m1")
+    event.feature_summary = {
+        "message_id": "summary-1",
+        "initial_request": "do the work",
+    }
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response="",
+        session_id="session-1",
+        summary_status="Complete",
+        feature_summary=event.feature_summary,
+    )
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    if runner._background_tasks:
+        await asyncio.gather(*runner._background_tasks)
+
+    assert scheduled == 1
+    collect.assert_called_once_with(
+        "session-1",
+        surface="discord_feature_summary",
+    )
+    adapter.update_feature_summary.assert_awaited_once()
+    assert adapter.update_feature_summary.await_args.kwargs["artifacts"] == artifacts
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "completed"
+    assert "artifacts" not in stored["feature_summary"]
+
+
 def test_discord_worker_reference_context_resolves_bare_message_ids(monkeypatch):
     from hermes_cli import discord_worker_boards as dwb
 

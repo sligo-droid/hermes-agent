@@ -270,6 +270,7 @@ def register(ctx):
 - `ctx.register_hook()` subscribes to lifecycle events
 - `ctx.register_cli_command()` registers a CLI subcommand (e.g. `hermes my-plugin <subcommand>`)
 - `ctx.register_command()` registers an in-session slash command (e.g. `/myplugin <args>` inside CLI / gateway chat) — see [Register slash commands](#register-slash-commands) below
+- `ctx.register_session_artifact_provider()` exposes safe links associated with a Hermes session to supported surfaces
 - `ctx.dispatch_tool(name, arguments)` — call any other tool (built-in or from another plugin) with the parent agent's context (approvals, credentials, task_id) wired up automatically. Useful from slash-command handlers that need to invoke `terminal`, `read_file`, or any other tool as if the model had called it directly.
 - If this function crashes, the plugin is disabled but Hermes continues fine
 
@@ -291,6 +292,40 @@ def register(ctx):
 ```
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
+
+### Register session artifact providers
+
+Plugins can expose links to reports, dashboards, recordings, or other artifacts
+associated with a Hermes session. Register a synchronous callback that accepts
+the `session_id` and `surface` keyword arguments:
+
+```python
+def session_artifacts(session_id: str, surface: str):
+    report_url = find_report_url(session_id)
+    if not report_url:
+        return []
+    return {
+        "kind": "report",
+        "label": "Open session report",
+        "url": report_url,
+    }
+
+def register(ctx):
+    ctx.register_session_artifact_provider(session_artifacts)
+```
+
+A provider may return one mapping or an iterable of mappings. Each mapping must
+contain string `kind`, `label`, and `url` fields. Hermes keeps registration
+order, removes exact duplicates, and returns at most 20 artifacts. `kind` is
+limited to 64 characters, `label` to 100, and `url` to 2048. URLs must be
+absolute HTTP(S) links without embedded credentials, control characters, or
+whitespace. Invalid entries are skipped, and an exception from one provider
+does not prevent later providers from contributing links.
+
+Providers are synchronous and should perform only bounded local lookups. Use
+`surface` to return links appropriate for the caller; the current default is
+`"discord_feature_summary"`. Keep the callback vendor-neutral so the same
+artifact can be surfaced by other integrations later.
 
 ## Step 6: Test it
 

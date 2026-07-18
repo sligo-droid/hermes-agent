@@ -42,10 +42,12 @@ import os
 import sys
 import threading
 import types
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
+from urllib.parse import urlsplit
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled
@@ -194,6 +196,12 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_completed",
     "kanban_task_blocked",
 }
+
+_MAX_SESSION_ARTIFACTS = 20
+_MAX_SESSION_ARTIFACT_CANDIDATES_PER_PROVIDER = 100
+_MAX_SESSION_ARTIFACT_KIND_LENGTH = 64
+_MAX_SESSION_ARTIFACT_LABEL_LENGTH = 100
+_MAX_SESSION_ARTIFACT_URL_LENGTH = 2048
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
@@ -1059,6 +1067,44 @@ class PluginContext:
             action_id,
         )
 
+    # -- session artifact provider registration ----------------------------
+
+    def register_session_artifact_provider(self, provider: Callable) -> None:
+        """Register a synchronous callback that exposes session artifact links.
+
+        Hermes calls providers with ``session_id`` and ``surface`` keyword
+        arguments. A provider may return one mapping or an iterable of mappings
+        with ``kind``, ``label``, and ``url`` fields. Invalid entries and
+        provider failures are isolated by :func:`collect_session_artifacts`.
+
+        Providers run synchronously in registration order. They should perform
+        only bounded local lookups; network work belongs outside this callback.
+
+        Raises:
+            ValueError: if *provider* is not callable or is asynchronous.
+        """
+        call_method = getattr(provider, "__call__", None)
+        if not callable(provider):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a session "
+                "artifact provider with a non-callable callback."
+            )
+        if inspect.iscoroutinefunction(provider) or inspect.iscoroutinefunction(
+            call_method
+        ):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register an async "
+                "session artifact provider; providers must be synchronous."
+            )
+        self._manager._session_artifact_providers.append(
+            (provider, self.manifest.name)
+        )
+        logger.debug(
+            "Plugin %s registered session artifact provider: %s",
+            self.manifest.name,
+            getattr(provider, "__name__", provider.__class__.__name__),
+        )
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -1290,6 +1336,10 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Synchronous callbacks that expose safe links to artifacts associated
+        # with a session. Entries are (callback, plugin_name) tuples and remain
+        # registration-ordered.
+        self._session_artifact_providers: List[tuple] = []
 
     # -----------------------------------------------------------------------
     # Public
@@ -1323,6 +1373,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
+            self._session_artifact_providers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
@@ -1963,6 +2014,69 @@ class PluginManager:
         return list(self._slack_action_handlers)
 
     # -----------------------------------------------------------------------
+    # Session artifact collection
+    # -----------------------------------------------------------------------
+
+    def collect_session_artifacts(
+        self,
+        session_id: str,
+        surface: str = "discord_feature_summary",
+    ) -> List[Dict[str, str]]:
+        """Collect normalized artifact links from registered providers."""
+        artifacts: List[Dict[str, str]] = []
+        seen: Set[tuple] = set()
+
+        for provider, plugin_name in self._session_artifact_providers:
+            if len(artifacts) >= _MAX_SESSION_ARTIFACTS:
+                break
+            try:
+                supplied = provider(session_id=session_id, surface=surface)
+                if inspect.isawaitable(supplied):
+                    close = getattr(supplied, "close", None)
+                    if callable(close):
+                        close()
+                    logger.warning(
+                        "Session artifact provider from plugin '%s' returned "
+                        "an awaitable; providers must be synchronous.",
+                        plugin_name,
+                    )
+                    continue
+                if isinstance(supplied, Mapping):
+                    candidates: Iterable[Any] = (supplied,)
+                elif isinstance(supplied, Iterable) and not isinstance(
+                    supplied, (str, bytes, bytearray)
+                ):
+                    candidates = supplied
+                else:
+                    continue
+
+                for index, candidate in enumerate(candidates):
+                    if index >= _MAX_SESSION_ARTIFACT_CANDIDATES_PER_PROVIDER:
+                        break
+                    normalized = _normalize_session_artifact(candidate)
+                    if normalized is None:
+                        continue
+                    identity = (
+                        normalized["kind"],
+                        normalized["label"],
+                        normalized["url"],
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    artifacts.append(normalized)
+                    if len(artifacts) >= _MAX_SESSION_ARTIFACTS:
+                        break
+            except Exception as exc:
+                logger.warning(
+                    "Session artifact provider from plugin '%s' raised: %s",
+                    plugin_name,
+                    exc,
+                )
+
+        return artifacts
+
+    # -----------------------------------------------------------------------
     # Introspection
     # -----------------------------------------------------------------------
 
@@ -2033,6 +2147,64 @@ def discover_plugins(force: bool = False) -> None:
     manifests and reload state in the current process.
     """
     get_plugin_manager().discover_and_load(force=force)
+
+
+def _normalize_session_artifact(candidate: Any) -> Optional[Dict[str, str]]:
+    """Return one safe session artifact mapping, or ``None`` when invalid."""
+    if not isinstance(candidate, Mapping):
+        return None
+
+    kind = candidate.get("kind")
+    label = candidate.get("label")
+    url = candidate.get("url")
+    if not all(isinstance(value, str) for value in (kind, label, url)):
+        return None
+
+    if any(ord(char) < 32 or ord(char) == 127 for char in kind + label):
+        return None
+    kind = kind.strip()
+    label = label.strip()
+    if not kind or not label or not url:
+        return None
+    if len(kind) > _MAX_SESSION_ARTIFACT_KIND_LENGTH:
+        return None
+    if len(label) > _MAX_SESSION_ARTIFACT_LABEL_LENGTH:
+        return None
+    if len(url) > _MAX_SESSION_ARTIFACT_URL_LENGTH:
+        return None
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
+        return None
+
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return None
+        if not parsed.netloc or not parsed.hostname:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        # Access validates malformed and out-of-range ports.
+        parsed.port
+    except (TypeError, ValueError):
+        return None
+
+    return {"kind": kind, "label": label, "url": url}
+
+
+def collect_session_artifacts(
+    session_id: str,
+    surface: str = "discord_feature_summary",
+) -> List[Dict[str, str]]:
+    """Return safe plugin-provided artifact links for a session and surface.
+
+    Discovery is lazy and idempotent. Providers are invoked synchronously in
+    registration order, and one provider cannot prevent later providers from
+    contributing artifacts.
+    """
+    return _ensure_plugins_discovered().collect_session_artifacts(
+        session_id,
+        surface,
+    )
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:

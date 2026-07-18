@@ -321,6 +321,7 @@ async def test_last_suppressed_completion_finalizes_summary_and_ledger():
 
     def hydrate(event, *args, **kwargs):
         event.work_item_id = "work-1"
+        event.session_id = "session-1"
         event.feature_summary = {"thread_id": "222"}
 
     runner._hydrate_discord_continuation_event_from_work_item = hydrate
@@ -335,6 +336,8 @@ async def test_last_suppressed_completion_finalizes_summary_and_ledger():
 
     await runner._finalize_suppressed_async_completion(_coding_event())
 
-    assert runner._update_discord_summaries.await_args.kwargs["status"] == "Complete"
+    summary_kwargs = runner._update_discord_summaries.await_args.kwargs
+    assert summary_kwargs["status"] == "Complete"
+    assert summary_kwargs["session_id"] == "session-1"
     ledger.mark_summary_updated.assert_called_once_with("work-1")
     ledger.mark_completed.assert_called_once_with("work-1")

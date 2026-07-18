@@ -5538,6 +5538,9 @@ class GatewayRunner:
         if work_id:
             event.work_item_id = work_id
             event.work_replay = True
+        session_id = str(item.get("session_id") or "").strip()
+        if session_id:
+            event.session_id = session_id
         feature_summary = item.get("feature_summary")
         project_summary = item.get("project_summary")
         if not preserve_event_context or not isinstance(
@@ -16152,6 +16155,22 @@ class GatewayRunner:
                 }
                 if runtime_breakdown is not None:
                     update_kwargs["runtime_breakdown"] = runtime_breakdown
+                if session_id and str(status or "").strip().lower() != "running":
+                    try:
+                        from hermes_cli.plugins import collect_session_artifacts
+
+                        artifacts = await asyncio.to_thread(
+                            collect_session_artifacts,
+                            session_id,
+                            surface="discord_feature_summary",
+                        )
+                        if artifacts:
+                            update_kwargs["artifacts"] = artifacts
+                    except Exception:
+                        logger.debug(
+                            "Discord feature summary artifact collection failed",
+                            exc_info=True,
+                        )
                 result = await adapter.update_feature_summary(
                     feature_summary,
                     **update_kwargs,
@@ -20443,6 +20462,10 @@ class GatewayRunner:
                     "Running"
                     if pending_background
                     else final_status
+                ),
+                session_id=(
+                    str(getattr(event, "session_id", "") or "").strip()
+                    or None
                 ),
             )
             if summary_ok and work_item_id and not pending_background:
