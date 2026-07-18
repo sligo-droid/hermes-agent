@@ -2172,32 +2172,22 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _resolve_explicit_anthropic_token() -> Optional[str]:
-    """Return only credentials explicitly configured for Hermes/Anthropic.
-
-    Compression fallback chains must not opportunistically adopt Claude Code's
-    OAuth environment or credential files.  Hermes-managed ``ANTHROPIC_TOKEN``
-    and ``ANTHROPIC_API_KEY`` values remain valid, including values stored in
-    the active profile's ``.env``.
-    """
+def _resolve_explicit_anthropic_env_value(key: str) -> str:
+    """Resolve one explicitly allowed Hermes/Anthropic environment value."""
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
     try:
         from hermes_cli.config import get_env_value
-    except ImportError:
-        get_env_value = None
 
-    for key in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY"):
-        value = os.getenv(key, "").strip()
-        if not value and get_env_value is not None:
-            try:
-                value = str(get_env_value(key) or "").strip()
-            except Exception:
-                value = ""
-        if value:
-            return value
-    return None
+        return str(get_env_value(key) or "").strip()
+    except Exception:
+        return ""
 
 
-def _select_explicit_anthropic_pool_entry() -> Tuple[bool, Optional[Any]]:
+def _select_explicit_anthropic_pool_entry(
+    source_filter: Optional[str] = None,
+) -> Tuple[bool, Optional[Any]]:
     """Read a Hermes-managed Anthropic pool entry without external discovery.
 
     ``load_pool("anthropic")`` can seed from Claude Code credential files when
@@ -2229,6 +2219,8 @@ def _select_explicit_anthropic_pool_entry() -> Tuple[bool, Optional[Any]]:
         source = str(getattr(entry, "source", "") or "").strip()
         if source in implicit_sources:
             continue
+        if source_filter is not None and source != source_filter:
+            continue
         if str(getattr(entry, "last_status", "") or "").lower() in {"dead", "exhausted"}:
             continue
         expires_at_ms = getattr(entry, "expires_at_ms", None)
@@ -2236,7 +2228,33 @@ def _select_explicit_anthropic_pool_entry() -> Tuple[bool, Optional[Any]]:
             continue
         if _pool_runtime_api_key(entry):
             return True, entry
+        if source in {"env:ANTHROPIC_TOKEN", "env:ANTHROPIC_API_KEY"}:
+            token = _resolve_explicit_anthropic_env_value(source.removeprefix("env:"))
+            if token:
+                entry.access_token = token
+                return True, entry
     return True, None
+
+
+def _resolve_explicit_anthropic_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a strict Anthropic credential together with its endpoint."""
+    for key in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY"):
+        token = _resolve_explicit_anthropic_env_value(key)
+        if not token:
+            continue
+        base_url = _resolve_explicit_anthropic_env_value("ANTHROPIC_BASE_URL")
+        if not base_url:
+            _pool_present, entry = _select_explicit_anthropic_pool_entry(
+                source_filter=f"env:{key}"
+            )
+            if entry is not None and _pool_runtime_api_key(entry) == token:
+                base_url = _pool_runtime_base_url(entry)
+        return token, base_url.rstrip("/") if base_url else None
+
+    _pool_present, entry = _select_explicit_anthropic_pool_entry()
+    if entry is None:
+        return None, None
+    return _pool_runtime_api_key(entry) or None, _pool_runtime_base_url(entry) or None
 
 
 def _try_anthropic(
@@ -2262,20 +2280,21 @@ def _try_anthropic(
             token = explicit_api_key or resolve_anthropic_token()
     else:
         entry = None
-        token = explicit_api_key or _resolve_explicit_anthropic_token()
-        if not token:
-            pool_present, entry = _select_explicit_anthropic_pool_entry()
-            if pool_present:
-                if entry is None:
-                    return None, None
-                token = _pool_runtime_api_key(entry)
+        if explicit_api_key:
+            token = explicit_api_key
+            credential_base_url = None
+        else:
+            token, credential_base_url = _resolve_explicit_anthropic_credentials()
     if not token:
         return None, None
 
     # Allow base URL override from config.yaml model.base_url, but only
     # when the configured provider is anthropic — otherwise a non-Anthropic
     # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
-    base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
+    if allow_implicit_credentials:
+        base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
+    else:
+        base_url = credential_base_url or _ANTHROPIC_DEFAULT_BASE_URL
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -4237,7 +4256,10 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
+            client, default_model = _try_anthropic(
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=explicit_base_url,
+            )
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None

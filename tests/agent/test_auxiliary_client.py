@@ -71,7 +71,8 @@ def _clean_env(monkeypatch):
     for key in (
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
-        "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -1872,6 +1873,129 @@ class TestCompressionProviderOutageFallback:
         assert entry.source == "hermes_pkce"
         assert entry.runtime_api_key == "hermes-token"
         read_claude_code.assert_not_called()
+
+    def test_compression_anthropic_chain_pairs_env_key_with_env_base_url(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "proxy-anthropic-key")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8317/")
+        real_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+                ]
+            },
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=real_client,
+        ) as build_client:
+            client, model, label = _try_configured_fallback_chain(
+                "compression", "openai-codex", reason="provider service outage"
+            )
+
+        assert client is not None
+        assert client.base_url == "http://127.0.0.1:8317"
+        assert model == "claude-sonnet-4-6"
+        assert label == "fallback_chain[0](anthropic)"
+        build_client.assert_called_once_with(
+            "proxy-anthropic-key", "http://127.0.0.1:8317"
+        )
+
+    def test_compression_anthropic_chain_pairs_profile_key_with_profile_base_url(self):
+        real_client = MagicMock()
+        profile_values = {
+            "ANTHROPIC_API_KEY": "profile-anthropic-key",
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+        }
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+                ]
+            },
+        ), patch(
+            "hermes_cli.config.get_env_value",
+            side_effect=lambda key: profile_values.get(key),
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=real_client,
+        ) as build_client:
+            client, model, label = _try_configured_fallback_chain(
+                "compression", "openai-codex", reason="provider service outage"
+            )
+
+        assert client is not None
+        assert model == "claude-sonnet-4-6"
+        assert label == "fallback_chain[0](anthropic)"
+        build_client.assert_called_once_with(
+            "profile-anthropic-key", "http://127.0.0.1:8317"
+        )
+
+    def test_explicit_anthropic_pool_selector_rehydrates_env_reference(self, monkeypatch):
+        from agent.auxiliary_client import _select_explicit_anthropic_pool_entry
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "rehydrated-anthropic-key")
+        persisted = [
+            {
+                "source": "env:ANTHROPIC_API_KEY",
+                "auth_type": "api_key",
+                "priority": 0,
+                "base_url": "http://127.0.0.1:8317",
+            }
+        ]
+
+        with patch("hermes_cli.auth.read_credential_pool", return_value=persisted):
+            present, entry = _select_explicit_anthropic_pool_entry()
+
+        assert present is True
+        assert entry.runtime_api_key == "rehydrated-anthropic-key"
+        assert entry.runtime_base_url == "http://127.0.0.1:8317"
+
+    def test_compression_anthropic_chain_uses_pool_base_url_for_env_reference(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "rehydrated-anthropic-key")
+        real_client = MagicMock()
+        persisted = [
+            {
+                "source": "manual:other-anthropic",
+                "auth_type": "api_key",
+                "priority": 0,
+                "access_token": "other-anthropic-key",
+                "base_url": "https://api.anthropic.com",
+            },
+            {
+                "source": "env:ANTHROPIC_API_KEY",
+                "auth_type": "api_key",
+                "priority": 1,
+                "base_url": "http://127.0.0.1:8317",
+            },
+        ]
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+                ]
+            },
+        ), patch(
+            "hermes_cli.auth.read_credential_pool", return_value=persisted
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=real_client,
+        ) as build_client:
+            client, model, label = _try_configured_fallback_chain(
+                "compression", "openai-codex", reason="provider service outage"
+            )
+
+        assert client is not None
+        assert model == "claude-sonnet-4-6"
+        assert label == "fallback_chain[0](anthropic)"
+        build_client.assert_called_once_with(
+            "rehydrated-anthropic-key", "http://127.0.0.1:8317"
+        )
 
     def test_non_compression_anthropic_chain_keeps_existing_resolver_semantics(self):
         client = MagicMock()
@@ -4172,8 +4296,8 @@ class TestAnthropicExplicitApiKey:
         assert client is not None
         assert mock_build.call_args.args[0] == "env-fallback-key"
 
-    def test_resolve_provider_client_passes_explicit_api_key_to_anthropic(self):
-        """resolve_provider_client(provider='anthropic', explicit_api_key=...) must propagate the key."""
+    def test_resolve_provider_client_passes_explicit_anthropic_credentials(self):
+        """Explicit Anthropic key and endpoint must reach the native client."""
         with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-key"), \
              patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
              patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
@@ -4181,10 +4305,11 @@ class TestAnthropicExplicitApiKey:
             client, model = resolve_provider_client(
                 provider="anthropic",
                 explicit_api_key="explicit-fallback-key",
+                explicit_base_url="http://127.0.0.1:8317/",
             )
         assert client is not None
-        assert mock_build.call_args.args[0] == "explicit-fallback-key", (
-            "resolve_provider_client must forward explicit_api_key to _try_anthropic()"
+        mock_build.assert_called_once_with(
+            "explicit-fallback-key", "http://127.0.0.1:8317"
         )
 
 

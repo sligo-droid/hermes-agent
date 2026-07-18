@@ -35,6 +35,7 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
     """Real compression should recover through configured native Anthropic."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8317")
     monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
@@ -132,7 +133,7 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
     ), patch(
         "agent.anthropic_adapter.build_anthropic_client",
         return_value=native_anthropic,
-    ):
+    ) as build_anthropic:
         result = agent.run_conversation(
             "Please continue from the compacted context.",
             conversation_history=history,
@@ -142,6 +143,9 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
     assert result["final_response"] == "Conversation continued after compression."
     assert agent.context_compressor.compression_count == 1
     assert gpt_auxiliary.chat.completions.create.call_count == 1
+    build_anthropic.assert_called_once_with(
+        "test-anthropic-key", "http://127.0.0.1:8317"
+    )
     assert native_anthropic.messages.create.call_count == 1
     assert native_anthropic.messages.create.call_args.kwargs["model"] == "claude-sonnet-4-6"
     assert any(
