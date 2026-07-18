@@ -22,7 +22,10 @@ The operator-managed local tunnel configuration is `/home/droid/.cloudflared/sli
 2. `sligo.sligolabs.com` trace paths to loopback port `8788`.
 3. The remaining `sligo.sligolabs.com` traffic to loopback port `9119`.
 4. `claw.sligolabs.com` to loopback port `8720`.
-5. A terminal `http_status:404` rule.
+5. The pre-existing, currently unpublished `pid.sligolabs.com` ingress to loopback port `5173`.
+6. A terminal `http_status:404` rule.
+
+The PID ingress is already present in the local tunnel configuration, but the hostname has no public DNS record. This rollout does not create or publish PID DNS; the exact Access Bypass is a precedence guard for any future publication.
 
 `hermes.sligolabs.com` reaches the dashboard through a separately managed remote tunnel. Do not pretend that route is present in the local YAML. Verify it manually or provide the validator a sanitized route-only export.
 

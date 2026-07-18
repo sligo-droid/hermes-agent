@@ -26,6 +26,7 @@ DEFAULT_EXPECTED = ROOT / "docs" / "runbooks" / "sligolabs-cloudflare-access.exp
 VALID_ACTIONS = {"allow", "bypass", "service_auth"}
 _POLICY_METADATA_KEYS = {
     "id",
+    "uid",
     "name",
     "created_at",
     "updated_at",
