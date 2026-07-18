@@ -900,6 +900,9 @@ DEFAULT_CONFIG = {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        # Per-page request before the deterministic 90K aggregate allocation.
+        # Public/runtime range: 2,000–90,000 characters.
+        "extract_char_limit": 15_000,
     },
 
     "browser": {
@@ -1160,11 +1163,13 @@ DEFAULT_CONFIG = {
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
         "web_extract": {
+            # Legacy key retained for browser snapshot text summarization.
+            # The web_extract tool itself does not call an auxiliary model.
             "provider": "auto",
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
+            "timeout": 360,        # seconds — browser text summarization timeout
             "extra_body": {},
         },
         "compression": {
@@ -6362,7 +6367,7 @@ def show_config():
     auxiliary = config.get('auxiliary', {})
     aux_tasks = {
         "Vision":      auxiliary.get('vision', {}),
-        "Web extract": auxiliary.get('web_extract', {}),
+        "Browser text": auxiliary.get('web_extract', {}),
     }
     has_overrides = any(
         t.get('provider', 'auto') != 'auto' or t.get('model', '')

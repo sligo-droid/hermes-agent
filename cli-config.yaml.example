@@ -517,7 +517,8 @@ prompt_caching:
 #     download_timeout: 30   # Image HTTP download timeout (seconds)
 #                            # Increase for slow connections or self-hosted image servers
 #
-#   # Web page scraping / summarization + browser page text extraction
+#   # Browser page snapshot text summarization (legacy key; web_extract itself
+#   # uses deterministic truncation and does not call an auxiliary model)
 #   web_extract:
 #     provider: "auto"
 #     model: ""

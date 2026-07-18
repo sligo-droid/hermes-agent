@@ -960,7 +960,7 @@ auxiliary:
 ```
 
 :::tip
-Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
+Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, browser text summarization (legacy key `web_extract`) 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. The `web_extract` tool itself does not call an auxiliary model. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
 :::
 
 :::info
@@ -1108,10 +1108,10 @@ Auxiliary models can also be configured via environment variables. However, `con
 | Vision model | `AUXILIARY_VISION_MODEL` |
 | Vision endpoint | `AUXILIARY_VISION_BASE_URL` |
 | Vision API key | `AUXILIARY_VISION_API_KEY` |
-| Web extract provider | `AUXILIARY_WEB_EXTRACT_PROVIDER` |
-| Web extract model | `AUXILIARY_WEB_EXTRACT_MODEL` |
-| Web extract endpoint | `AUXILIARY_WEB_EXTRACT_BASE_URL` |
-| Web extract API key | `AUXILIARY_WEB_EXTRACT_API_KEY` |
+| Browser text provider (legacy name) | `AUXILIARY_WEB_EXTRACT_PROVIDER` |
+| Browser text model (legacy name) | `AUXILIARY_WEB_EXTRACT_MODEL` |
+| Browser text endpoint (legacy name) | `AUXILIARY_WEB_EXTRACT_BASE_URL` |
+| Browser text API key (legacy name) | `AUXILIARY_WEB_EXTRACT_API_KEY` |
 
 Compression and fallback model settings are config.yaml-only.
 
@@ -1694,6 +1694,10 @@ web:
   # Or use per-capability keys to mix providers (e.g. free search + paid extract):
   search_backend: "searxng"
   extract_backend: "firecrawl"
+
+  # Per-page request for web_extract. Runtime range: 2,000–90,000.
+  # Calls also share a deterministic 90,000-character aggregate content budget.
+  extract_char_limit: 15000
 ```
 
 | Backend | Env Var | Search | Extract |
@@ -1705,6 +1709,8 @@ web:
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ |
 
 **Backend selection:** If `web.backend` is not set, the backend is auto-detected from available API keys. If only `SEARXNG_URL` is set, SearXNG is used. If only `EXA_API_KEY` is set, Exa is used. If only `TAVILY_API_KEY` is set, Tavily is used. If only `PARALLEL_API_KEY` is set, Parallel is used. Otherwise Firecrawl is the default.
+
+`web_extract` returns clean provider text without an auxiliary LLM call. Long pages use deterministic head/tail truncation; omitted middle text is not stored.
 
 **SearXNG** is a free, self-hosted, privacy-respecting metasearch engine that queries 70+ search engines. No API key needed — just set `SEARXNG_URL` to your instance (e.g., `http://localhost:8080`). SearXNG is search-only; `web_extract` requires a separate extract provider (set `web.extract_backend`). See the [Web Search setup guide](/user-guide/features/web-search) for Docker setup instructions.
 

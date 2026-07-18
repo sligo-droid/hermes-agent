@@ -142,7 +142,7 @@ Codex uses a separate Responses API path:
 Auxiliary tasks such as:
 
 - vision
-- web extraction summarization
+- browser snapshot text summarization (legacy task key: `web_extract`)
 - context compression summaries
 - skills hub operations
 - MCP helper operations

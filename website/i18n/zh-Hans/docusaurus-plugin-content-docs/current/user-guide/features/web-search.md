@@ -39,39 +39,21 @@ Brave Search、DDGS 和 xAI 均为**仅搜索**——如果同时需要 `web_ext
 
 ## `web_extract` 如何处理长页面
 
-后端返回的原始页面 markdown 可能非常庞大（论坛帖子、文档站点、带嵌入评论的新闻文章）。为保持上下文窗口可用并降低成本，`web_extract` 在将内容交给 agent 之前，会通过 **`web_extract` 辅助模型**对返回内容进行处理。行为完全由大小决定：
+`web_extract` 不会调用辅助 LLM。内容未超限时，直接返回清理后的提供商文本。内联 base64 图片会压缩为 `[IMAGE: alt]` 证据，普通 HTTP(S) 图片链接保持不变。
 
-| 页面大小（字符数） | 处理方式 |
-|------------------------|--------------|
-| 5 000 以下 | 原样返回——不调用 LLM，完整 markdown 直达 agent |
-| 5 000 – 500 000 | 通过 `web_extract` 辅助模型单次摘要，输出上限约 5 000 字符 |
-| 500 000 – 2 000 000 | 分块处理：拆分为 10 万字符的块，并行摘要每块，再合成最终摘要（约 5 000 字符） |
-| 超过 2 000 000 | 拒绝处理，并提示使用更具体的来源 URL |
+长页面使用确定性的头尾截断（约 75% 头部、25% 尾部），并包含一个 `[TRUNCATED]` 标记。省略的中间文本**不会写入磁盘**。页脚会建议在公开上限内提高 `char_limit`、使用更具体的 URL，或改用 `browser_navigate`。
 
-摘要保留引用、代码块和关键事实的原始格式——它是内容压缩器，而非改写器。如果摘要失败或超时，Hermes 会回退到原始内容的前约 5 000 字符，而非返回无用的错误信息。
-
-### 哪个模型负责摘要？
-
-`web_extract` 辅助任务。默认情况下（`auxiliary.web_extract.provider: "auto"`），使用您的**主聊天模型**——与 `hermes model` 相同的提供商和模型。对大多数配置而言这没问题，但在昂贵的推理模型（Opus、MiniMax M2.7 等）上，每次长页面提取都会产生可观的成本。
-
-若要将提取摘要路由到廉价快速的模型，无论主模型是什么：
+默认单页请求上限为 15,000 个字符，可在 `web` 下配置：
 
 ```yaml
 # ~/.hermes/config.yaml
-auxiliary:
-  web_extract:
-    provider: openrouter
-    model: google/gemini-3-flash-preview
-    timeout: 360       # 秒；如果遇到摘要超时，请调大此值
+web:
+  extract_char_limit: 15000   # 允许范围：2000–90000
 ```
 
-或交互式选择：`hermes model` → **Configure auxiliary models** → `web_extract`。
+每次调用还共享 90,000 个字符的内联内容总预算，为 JSON 和页脚预留低于工具 100,000 字符结果上限的空间。预算按提供商结果顺序确定性分配，因此五个 URL 不会各自返回 90,000 个字符。单次调用的 `char_limit` 会覆盖配置值，但不会突破总预算。
 
-完整参考和按任务覆盖模式，请参阅[辅助模型](/user-guide/configuration#auxiliary-models)。
-
-### 摘要处理不适用的情况
-
-如果您明确需要原始、未经摘要的页面内容——例如正在抓取结构化页面，LLM 摘要会丢失重要字段——请改用 `browser_navigate` + `browser_snapshot`。浏览器工具返回实时无障碍树，不经辅助模型改写（在超大页面上受其自身 8 000 字符快照上限约束）。
+提供商控制的元数据会转换为 JSON 安全文本，并按每条结果确定性限制：URL 4,096 个字符、标题 1,024、错误 2,048，`blocked_by_policy` 的每个值 512。超限字段以 `...[TRUNCATED]` 结尾；结果数量和顺序保持不变。
 
 ---
 
@@ -421,13 +403,9 @@ web:
 
 切换到自托管实例（参见上方[方案 A](#option-a--self-host-with-docker-recommended)）。使用 Docker，您自己的实例没有速率限制。
 
-### `web_extract` 返回截断内容并附有"summarization timed out"提示
+### `web_extract` 返回 `[TRUNCATED]` 标记
 
-辅助模型未能在配置的超时时间内完成摘要。可以：
-
-- 在 `config.yaml` 中调大 `auxiliary.web_extract.timeout`（新安装默认 360 秒，若键缺失则为 30 秒）
-- 将 `web_extract` 辅助任务切换到更快的模型（例如 `google/gemini-3-flash-preview`）——参见 [`web_extract` 如何处理长页面](#how-web_extract-handles-long-pages)
-- 对于摘要处理不适用的页面，改用 `browser_navigate`
+清理后的提供商文本超过了单页或总内联预算。省略的中间文本不会存储。可提高 `web.extract_char_limit` 或单次调用的 `char_limit`（最大 90,000），使用更具体的 URL，或改用 `browser_navigate`。
 
 ---
 

@@ -250,7 +250,7 @@ def _get_vision_model() -> Optional[str]:
 
 
 def _get_extraction_model() -> Optional[str]:
-    """Model for page snapshot text summarization — same as web_extract."""
+    """Model for page snapshot text summarization (legacy config key)."""
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 

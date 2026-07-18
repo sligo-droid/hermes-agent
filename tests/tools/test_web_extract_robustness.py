@@ -1,54 +1,110 @@
-"""Tests for web_extract truncate-store robustness (findings from #54843 review).
+"""Focused post-fetch and truncation robustness regressions."""
 
-Covers two robustness gaps left unaddressed when #54843 merged:
-  1. _store_full_text bounded by MAX_STORED_TEXT_CHARS (no unbounded disk write).
-  2. _truncate_with_footer emits a CONCRETE read_file offset for the omitted
-     middle (was a literal `offset=<line>` placeholder the model had to guess).
-"""
 from __future__ import annotations
 
-import re
+import asyncio
+import json
 
-import tools.web_tools as wt
-
-
-def test_store_full_text_is_bounded(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    # Force the cache dir under the temp home.
-    from hermes_constants import get_hermes_dir  # noqa: F401
-    huge = "x\n" * (wt.MAX_STORED_TEXT_CHARS)  # > MAX_STORED_TEXT_CHARS chars
-    assert len(huge) > wt.MAX_STORED_TEXT_CHARS
-    path = wt._store_full_text("https://example.com/big", huge)
-    assert path is not None
-    stored = open(path, encoding="utf-8").read()
-    # Stored copy capped (+ short marker), not the full unbounded blob.
-    assert len(stored) <= wt.MAX_STORED_TEXT_CHARS + 200
-    assert "stored copy truncated" in stored
+from tools import web_tools
 
 
-def test_truncate_footer_gives_concrete_offset(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    # Build content well over the limit with many lines so head has a known count.
-    content = "\n".join(f"line {i}" for i in range(5000))
-    model_text, truncated = wt._truncate_with_footer(
-        content, "https://example.com/page", char_limit=4000
+class _Provider:
+    name = "fake"
+    display_name = "Fake"
+
+    def __init__(self, result):
+        self.result = result
+
+    def supports_extract(self):
+        return True
+
+    async def extract(self, urls, **kwargs):
+        return [self.result]
+
+
+def _configure(monkeypatch, result, safety, policy=lambda _url: None):
+    provider = _Provider(result)
+    monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+    monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "fake")
+    monkeypatch.setattr("agent.web_search_registry.get_provider", lambda _name: provider)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+    monkeypatch.setattr(web_tools, "async_is_safe_url", safety)
+    monkeypatch.setattr(web_tools, "check_website_access", policy)
+
+
+def test_safe_metadata_source_cannot_mask_private_result_url(monkeypatch):
+    requested = "https://example.com/start"
+    private = "http://127.0.0.1/final"
+
+    async def safety(url):
+        return url != private
+
+    _configure(
+        monkeypatch,
+        {
+            "url": private,
+            "title": "Unsafe actual target",
+            "content": "must not escape",
+            "metadata": {"sourceURL": requested},
+        },
+        safety,
     )
-    assert truncated
-    # Footer must contain a real integer offset, NOT the <line> placeholder.
-    assert "offset=<line>" not in model_text
-    m = re.search(r"offset=(\d+) limit=\d+", model_text)
-    assert m, f"no concrete offset in footer: {model_text[-400:]}"
-    offset = int(m.group(1))
-    # Offset should point past the head we showed (head is ~75% of 4000 chars).
-    assert offset > 1
+    parsed = json.loads(asyncio.run(web_tools.web_extract_tool([requested])))
+
+    assert parsed["results"][0]["url"] == private
+    assert parsed["results"][0]["content"] == ""
+    assert "private or internal" in parsed["results"][0]["error"]
 
 
-def test_small_page_not_truncated_no_footer(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    content = "short page\nwith a few lines\n"
-    model_text, truncated = wt._truncate_with_footer(
-        content, "https://example.com/s", char_limit=15000
+def test_every_distinct_returned_target_must_pass_policy(monkeypatch):
+    requested = "https://example.com/start"
+    blocked = "https://blocked.example/redirect"
+
+    async def safety(_url):
+        return True
+
+    def policy(url):
+        if url == blocked:
+            return {
+                "host": "blocked.example",
+                "rule": "blocked.example",
+                "source": "config",
+                "message": "Blocked by website policy",
+            }
+        return None
+
+    _configure(
+        monkeypatch,
+        {
+            "url": requested,
+            "actual_url": "https://example.com/actual",
+            "final_url": "https://example.com/final",
+            "redirectURL": blocked,
+            "canonical_url": "https://canonical.example/hint",
+            "title": "Multiple targets",
+            "content": "must not escape",
+        },
+        safety,
+        policy,
     )
-    assert not truncated
-    assert model_text == content
-    assert "[TRUNCATED]" not in model_text
+    parsed = json.loads(asyncio.run(web_tools.web_extract_tool([requested])))
+
+    result = parsed["results"][0]
+    assert result["url"] == blocked
+    assert result["content"] == ""
+    assert result["blocked_by_policy"]["rule"] == "blocked.example"
+
+
+def test_line_boundary_snapping_keeps_one_truthful_marker():
+    content = "\n".join(f"record {index}: " + "x" * 70 for index in range(2_000))
+    bounded, truncated = web_tools._truncate_with_footer(
+        content, "https://example.com/records", 5_000
+    )
+
+    assert truncated is True
+    assert len(bounded) <= 5_000
+    assert bounded.count("[TRUNCATED") == 1
+    assert "record 0:" in bounded
+    assert "record 1999:" in bounded
+    assert "record 1000:" not in bounded
+    assert "omitted and not stored" in bounded

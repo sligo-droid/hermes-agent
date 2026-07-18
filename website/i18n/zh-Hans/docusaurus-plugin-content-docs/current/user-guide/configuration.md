@@ -857,7 +857,7 @@ auxiliary:
 ```
 
 :::tip
-每个辅助任务都有可配置的 `timeout`（秒）。默认值：vision 120s、web_extract 360s、approval 30s、compression 120s。如果您为辅助任务使用慢速本地模型，请增加这些值。Vision 还有单独的 `download_timeout`（默认 30s）用于 HTTP 图像下载 —— 对于慢速连接或自托管图像服务器，请增加此值。
+每个辅助任务都有可配置的 `timeout`（秒）。默认值：vision 120s、浏览器文本摘要（保留键 `web_extract`）360s、approval 30s、compression 120s。如果您为辅助任务使用慢速本地模型，请增加这些值。`web_extract` 工具本身不调用辅助模型。Vision 还有单独的 `download_timeout`（默认 30s）用于 HTTP 图像下载 —— 对于慢速连接或自托管图像服务器，请增加此值。
 :::
 
 :::info
@@ -1005,10 +1005,10 @@ auxiliary:
 | Vision 模型 | `AUXILIARY_VISION_MODEL` |
 | Vision 端点 | `AUXILIARY_VISION_BASE_URL` |
 | Vision API 密钥 | `AUXILIARY_VISION_API_KEY` |
-| Web 提取 provider | `AUXILIARY_WEB_EXTRACT_PROVIDER` |
-| Web 提取模型 | `AUXILIARY_WEB_EXTRACT_MODEL` |
-| Web 提取端点 | `AUXILIARY_WEB_EXTRACT_BASE_URL` |
-| Web 提取 API 密钥 | `AUXILIARY_WEB_EXTRACT_API_KEY` |
+| 浏览器文本 provider（保留名称） | `AUXILIARY_WEB_EXTRACT_PROVIDER` |
+| 浏览器文本模型（保留名称） | `AUXILIARY_WEB_EXTRACT_MODEL` |
+| 浏览器文本端点（保留名称） | `AUXILIARY_WEB_EXTRACT_BASE_URL` |
+| 浏览器文本 API 密钥（保留名称） | `AUXILIARY_WEB_EXTRACT_API_KEY` |
 
 压缩和回退模型设置仅限 config.yaml。
 
@@ -1426,6 +1426,9 @@ web:
   # 或使用每功能键混合 provider（例如免费搜索 + 付费提取）：
   search_backend: "searxng"
   extract_backend: "firecrawl"
+
+  # web_extract 单页请求范围为 2,000–90,000；每次调用共享 90,000 字符总预算。
+  extract_char_limit: 15000
 ```
 
 | 后端 | 环境变量 | 搜索 | 提取 |
@@ -1437,6 +1440,8 @@ web:
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ |
 
 **后端选择：** 如果未设置 `web.backend`，后端从可用的 API 密钥自动检测。如果仅设置了 `SEARXNG_URL`，使用 SearXNG。如果仅设置了 `EXA_API_KEY`，使用 Exa。如果仅设置了 `TAVILY_API_KEY`，使用 Tavily。如果仅设置了 `PARALLEL_API_KEY`，使用 Parallel。否则 Firecrawl 是默认值。
+
+`web_extract` 不调用辅助 LLM，直接返回清理后的提供商文本。长页面使用确定性的头尾截断；省略的中间文本不会存储。
 
 **SearXNG** 是一个免费、自托管、尊重隐私的元搜索引擎，查询 70+ 个搜索引擎。无需 API 密钥 —— 只需将 `SEARXNG_URL` 设置为您的实例（例如 `http://localhost:8080`）。SearXNG 仅限搜索；`web_extract` 需要单独的提取 provider（设置 `web.extract_backend`）。Docker 设置说明请参阅 [Web 搜索设置指南](/user-guide/features/web-search)。
 

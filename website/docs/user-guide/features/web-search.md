@@ -39,39 +39,21 @@ If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, 
 
 ## How `web_extract` handles long pages
 
-Backends return raw page markdown, which can be huge (forum threads, docs sites, news articles with embedded comments). To keep your context window usable and your costs down, `web_extract` runs returned content through the **`web_extract` auxiliary model** before handing it to the agent. Behavior is purely size-driven:
+`web_extract` makes no auxiliary LLM calls. It returns clean provider text directly when it fits the configured limit. Inline base64 images become compact `[IMAGE: alt]` evidence; normal HTTP(S) image links remain intact.
 
-| Page size (characters) | What happens |
-|------------------------|--------------|
-| Under 5 000 | Returned as-is — no LLM call, full markdown reaches the agent |
-| 5 000 – 500 000 | Single-pass summary via the `web_extract` auxiliary model, capped at ~5 000 chars of output |
-| 500 000 – 2 000 000 | Chunked: split into 100 k-char chunks, summarize each in parallel, then synthesize a final summary (~5 000 chars) |
-| Over 2 000 000 | Refused with a hint to use a more focused source URL |
+Long pages use deterministic head/tail truncation (approximately 75% head and 25% tail) with a single `[TRUNCATED]` footer. The omitted middle is **not stored on disk**. The footer suggests raising `char_limit` within the public ceiling, using a more specific URL, or switching to `browser_navigate`.
 
-The summary keeps quotes, code blocks, and key facts in their original formatting — it's a content compressor, not a paraphraser. If summarization fails or times out, Hermes falls back to the first ~5 000 chars of raw content rather than a useless error.
-
-### Which model does the summarizing?
-
-The `web_extract` auxiliary task. By default (`auxiliary.web_extract.provider: "auto"`), this is your **main chat model** — same provider, same model as `hermes model`. That's fine for most setups, but on expensive reasoning models (Opus, MiniMax M2.7, etc.) every long-page extract adds meaningful cost.
-
-To route extraction summaries to a cheap, fast model regardless of your main:
+The default per-page request is 15,000 characters and can be configured under `web`:
 
 ```yaml
 # ~/.hermes/config.yaml
-auxiliary:
-  web_extract:
-    provider: openrouter
-    model: google/gemini-3-flash-preview
-    timeout: 360       # seconds; raise if you hit summarization timeouts
+web:
+  extract_char_limit: 15000   # allowed range: 2000–90000
 ```
 
-Or pick interactively: `hermes model` → **Configure auxiliary models** → `web_extract`.
+Each call also has a 90,000-character aggregate inline-content budget below the tool's registered 100,000-character result ceiling. Budget is allocated deterministically in provider-result order, so a five-URL call cannot return five independent 90,000-character pages. A per-call `char_limit` overrides the configured value, but not the aggregate budget.
 
-See [Auxiliary Models](/user-guide/configuration#auxiliary-models) for the full reference and per-task override patterns.
-
-### When summarization gets in the way
-
-If you specifically need raw, unsummarized page content — for example, you're scraping a structured page where the LLM summary would drop important fields — use `browser_navigate` + `browser_snapshot` instead. The browser tool returns the live accessibility tree without auxiliary-model rewriting (subject to its own 8 000-char snapshot cap on huge pages).
+Provider-controlled metadata is converted to JSON-safe text and deterministically bounded per result: URL 4,096 characters, title 1,024, error 2,048, and each `blocked_by_policy` value 512. Oversized fields end with `...[TRUNCATED]`; result count and order are preserved.
 
 ---
 
@@ -388,13 +370,9 @@ Some public instances disable certain search engines or categories. Try:
 
 Switch to a self-hosted instance (see [Option A](#option-a--self-host-with-docker-recommended) above). With Docker, your own instance has no rate limits.
 
-### `web_extract` returns truncated content with a "summarization timed out" note
+### `web_extract` returns a `[TRUNCATED]` marker
 
-The auxiliary model didn't finish summarizing within the configured timeout. Either:
-
-- Raise `auxiliary.web_extract.timeout` in `config.yaml` (default 360s on fresh installs, 30s if the key is missing)
-- Switch the `web_extract` auxiliary task to a faster model (e.g. `google/gemini-3-flash-preview`) — see [How `web_extract` handles long pages](#how-web_extract-handles-long-pages)
-- For pages where summarization is the wrong tool, use `browser_navigate` instead
+The clean provider text exceeded the per-page or aggregate inline budget. The omitted middle is not stored. Raise `web.extract_char_limit` or the per-call `char_limit` (maximum 90,000), use a more specific URL, or use `browser_navigate` for interactive access.
 
 ---
 
