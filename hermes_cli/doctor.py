@@ -1533,12 +1533,14 @@ def run_doctor(args):
     # Check SQLite session store
     state_db_path = hermes_home / "state.db"
     if state_db_path.exists():
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(str(state_db_path))
             cursor = conn.execute("SELECT COUNT(*) FROM sessions")
             count = cursor.fetchone()[0]
             conn.close()
+            conn = None
             check_ok(f"{_DHH}/state.db exists ({count} sessions)")
 
             # FTS write-health probe (#50502): `SELECT COUNT(*)` above succeeds
@@ -1581,7 +1583,75 @@ def run_doctor(args):
                         "(or 'hermes sessions repair') to rebuild the FTS index"
                     )
         except Exception as e:
-            check_warn(f"{_DHH}/state.db exists but has issues: {e}")
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            from hermes_state import is_malformed_db_error, repair_state_db_schema
+
+            if is_malformed_db_error(e):
+                # sqlite_master itself is malformed (for example, duplicate
+                # messages_fts rows), so even the first ordinary query fails.
+                # This must be repaired before the readable-DB FTS health path
+                # above can run.
+                check_warn(
+                    f"{_DHH}/state.db schema is malformed "
+                    "(sessions hidden until repaired)",
+                    f"({e})",
+                )
+                if should_fix:
+                    report = repair_state_db_schema(state_db_path)
+                    if report.get("repaired"):
+                        try:
+                            verify_conn = sqlite3.connect(str(state_db_path))
+                            try:
+                                recovered_count = verify_conn.execute(
+                                    "SELECT COUNT(*) FROM sessions"
+                                ).fetchone()[0]
+                            finally:
+                                verify_conn.close()
+                        except Exception as verify_error:
+                            check_warn(
+                                "state.db schema repair completed but session "
+                                "verification failed",
+                                f"({verify_error}; backup: "
+                                f"{report.get('backup_path')})",
+                            )
+                            issues.append(
+                                "state.db schema repair could not verify recovered "
+                                "sessions — restore from the backup copy beside state.db"
+                            )
+                        else:
+                            backup_name = (
+                                Path(report["backup_path"]).name
+                                if report.get("backup_path") else "n/a"
+                            )
+                            check_ok(
+                                "Repaired state.db schema "
+                                f"({recovered_count} sessions recovered)",
+                                f"(strategy: {report.get('strategy')}; "
+                                f"backup: {backup_name})",
+                            )
+                            fixed_count += 1
+                    else:
+                        check_warn(
+                            "state.db schema repair did not recover automatically",
+                            f"({report.get('error')}; "
+                            f"backup: {report.get('backup_path')})",
+                        )
+                        issues.append(
+                            "state.db schema malformed and auto-repair failed — "
+                            "restore from the backup copy beside state.db"
+                        )
+                else:
+                    issues.append(
+                        "state.db schema malformed — run 'hermes doctor --fix' "
+                        "(or 'hermes sessions repair') to recover hidden sessions"
+                    )
+            else:
+                check_warn(f"{_DHH}/state.db exists but has issues: {e}")
     else:
         check_info(f"{_DHH}/state.db not created yet (will be created on first session)")
 

@@ -215,6 +215,32 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _enforce_worker_board_boundary(args: dict) -> Optional[str]:
+    """Reject per-call board routing from dispatcher-scoped workers.
+
+    The dispatcher pins workers to the board/database selected at spawn time
+    through trusted environment variables.  Passing ``board=`` to the DB
+    connector has higher precedence than those pins, so accepting it here
+    would let a worker cross the board isolation boundary.  Orchestrator and
+    default-intake contexts have no ``HERMES_KANBAN_TASK`` and retain explicit
+    board routing.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    if "board" not in args or args.get("board") is None:
+        return None
+    return tool_error(
+        "dispatcher-scoped workers cannot override the pinned Kanban board; "
+        "omit board to use the spawn-time board",
+        evidence={
+            "code": "worker_board_override_rejected",
+            "field": "board",
+            "worker_scoped": True,
+            "required_resolution": "spawn_time_pin",
+        },
+    )
+
+
 def _goal_judge_available() -> bool:
     """Return whether the auxiliary goal judge is configured.
 
@@ -410,6 +436,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -485,6 +514,9 @@ def _handle_show(args: dict, **kw) -> str:
 
 def _handle_list(args: dict, **kw) -> str:
     """List task summaries with the same core filters as the CLI."""
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     guard = _require_orchestrator_tool("kanban_list")
     if guard:
         return guard
@@ -546,6 +578,9 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -698,6 +733,9 @@ def _handle_complete(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -757,6 +795,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
     """
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -800,6 +841,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     tid = args.get("task_id")
     if not tid:
         return tool_error(
@@ -929,6 +973,9 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1035,6 +1082,9 @@ def _handle_create(args: dict, **kw) -> str:
 
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task back to ready."""
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
@@ -1063,6 +1113,9 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
+    board_err = _enforce_worker_board_boundary(args)
+    if board_err:
+        return board_err
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -1098,7 +1151,8 @@ _DESC_BOARD = (
     "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
     "home → 'default'. Pass an explicit slug only when the caller (e.g. "
     "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "board for this one call. Dispatcher-scoped task workers must omit this "
+    "field and use their spawn-time board pin."
 )
 
 

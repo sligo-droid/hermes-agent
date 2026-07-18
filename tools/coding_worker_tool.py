@@ -2545,7 +2545,13 @@ def _delegate_coding_task_impl(
 
 def _background_context_error(parent_agent: Any) -> str:
     platform = str(getattr(parent_agent, "platform", "") or "").strip().lower()
-    if platform == "cron" or os.environ.get("HERMES_CRON_SESSION"):
+    try:
+        from gateway.session_context import is_cron_execution
+
+        cron_execution = is_cron_execution()
+    except Exception:
+        cron_execution = bool(os.environ.get("HERMES_CRON_SESSION"))
+    if platform == "cron" or cron_execution:
         return (
             "delegate_coding_task(background=true) is unavailable in cron sessions "
             "because the short-lived parent cannot receive the completion turn. "

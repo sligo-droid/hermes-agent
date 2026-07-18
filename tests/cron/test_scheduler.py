@@ -1,5 +1,6 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import asyncio
 import json
 import logging
 import os
@@ -38,6 +39,64 @@ class TestTickState:
         with pytest.raises(RuntimeError, match="boom"):
             scheduler.tick(verbose=False)
         assert scheduler.is_tick_running() is False
+
+
+class TestCronExecutionContext:
+    def test_run_job_scopes_cron_identity_and_resets_after_success(self, monkeypatch):
+        from gateway.session_context import is_cron_execution
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        seen = []
+
+        def fake_run(job):
+            seen.append(is_cron_execution())
+            return True, "output", "response", None
+
+        monkeypatch.setattr(scheduler, "_run_job_impl", fake_run)
+
+        assert run_job({"id": "scoped-success"}) == (
+            True,
+            "output",
+            "response",
+            None,
+        )
+        assert seen == [True]
+        assert is_cron_execution() is False
+        assert "HERMES_CRON_SESSION" not in os.environ
+
+    @pytest.mark.parametrize("exc_type", [RuntimeError, asyncio.CancelledError])
+    def test_run_job_resets_cron_identity_after_error_or_cancellation(
+        self, monkeypatch, exc_type
+    ):
+        from gateway.session_context import is_cron_execution
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+
+        def fail(job):
+            assert is_cron_execution() is True
+            raise exc_type("stop")
+
+        monkeypatch.setattr(scheduler, "_run_job_impl", fail)
+
+        with pytest.raises(exc_type, match="stop"):
+            run_job({"id": "scoped-failure"})
+        assert is_cron_execution() is False
+        assert "HERMES_CRON_SESSION" not in os.environ
+
+    def test_standalone_env_marker_remains_compatible(self, monkeypatch):
+        from gateway.session_context import is_cron_execution
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setattr(
+            scheduler,
+            "_run_job_impl",
+            lambda job: (True, "output", "response", None),
+        )
+
+        run_job({"id": "legacy-env"})
+
+        assert is_cron_execution() is True
+        assert os.environ["HERMES_CRON_SESSION"] == "1"
 
 
 class TestResolveOrigin:
@@ -1010,6 +1069,13 @@ class TestRunJobSessionPersistence:
             "prompt": "hello",
         }
         fake_db = MagicMock()
+        cron_identity_seen = []
+
+        def run_conversation(*args, **kwargs):
+            from gateway.session_context import is_cron_execution
+
+            cron_identity_seen.append(is_cron_execution())
+            return {"final_response": "ok"}
 
         with patch.dict(os.environ, {"HERMES_MODEL": ""}), \
              patch("cron.scheduler._hermes_home", tmp_path), \
@@ -1027,7 +1093,7 @@ class TestRunJobSessionPersistence:
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent.run_conversation.side_effect = run_conversation
             mock_agent_cls.return_value = mock_agent
 
             success, output, final_response, error = run_job(job)
@@ -1036,6 +1102,7 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "ok"
         assert "ok" in output
+        assert cron_identity_seen == [True]
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is fake_db

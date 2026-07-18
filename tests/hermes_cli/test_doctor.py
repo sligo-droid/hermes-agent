@@ -1988,6 +1988,90 @@ class TestDoctorStaleMaxIterationsDrift:
         assert "shadows" not in out
 
 
+class TestDoctorMalformedStateDBRepair:
+    class _StopAfterStateDB(Exception):
+        pass
+
+    @staticmethod
+    def _build_malformed_db(db_path):
+        import sqlite3
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=db_path)
+        db.create_session(session_id="doctor-repair-session", source="cli")
+        db.close()
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) "
+            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
+            "WHERE name='messages_fts'"
+        )
+        conn.commit()
+        conn.close()
+
+    def _run_to_state_check(self, monkeypatch, home, *, fix):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        captured_issues = []
+
+        def stop_after_state_db(issues):
+            captured_issues.extend(issues)
+            raise self._StopAfterStateDB
+
+        # This hook is the first call after the state.db and WAL checks. Stop
+        # there so the test exercises the real run_doctor path without running
+        # unrelated external-tool and API diagnostics.
+        monkeypatch.setattr(
+            doctor_mod,
+            "_check_gateway_service_linger",
+            stop_after_state_db,
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), pytest.raises(self._StopAfterStateDB):
+            doctor_mod.run_doctor(Namespace(fix=fix))
+        return output.getvalue(), captured_issues
+
+    def test_warns_with_actionable_guidance_without_fix(self, monkeypatch, tmp_path):
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        state_db = home / "state.db"
+        self._build_malformed_db(state_db)
+
+        output, issues = self._run_to_state_check(monkeypatch, home, fix=False)
+
+        assert "state.db schema is malformed" in output
+        assert "sessions hidden until repaired" in output
+        assert any("run 'hermes doctor --fix'" in issue for issue in issues)
+        assert not list(home.glob("state.db.malformed-backup-*"))
+
+    def test_fix_repairs_and_reports_recovered_sessions(self, monkeypatch, tmp_path):
+        import sqlite3
+
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        state_db = home / "state.db"
+        self._build_malformed_db(state_db)
+
+        output, issues = self._run_to_state_check(monkeypatch, home, fix=True)
+
+        assert "Repaired state.db schema (1 sessions recovered)" in output
+        assert "strategy: dedup_schema" in output
+        assert "backup: state.db.malformed-backup-" in output
+        assert not any("state.db schema malformed" in issue for issue in issues)
+        assert list(home.glob("state.db.malformed-backup-*"))
+
+        conn = sqlite3.connect(str(state_db))
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            conn.close()
+
+
 def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path):
     """`hermes doctor` must not hand users `npm audit fix --workspace <name>`:
     that exact form crashes npm with "Cannot read properties of null (reading
