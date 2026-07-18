@@ -523,6 +523,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     end_reason TEXT,
     message_count INTEGER DEFAULT 0,
     tool_call_count INTEGER DEFAULT 0,
+    transcript_revision INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
@@ -2181,12 +2182,15 @@ class SessionDB:
         platform_message_id: str = None,
         observed: bool = False,
         timestamp: Any = None,
-    ) -> int:
+        return_transcript_revision: bool = False,
+    ) -> int | Tuple[int, int]:
         """
         Append a message to a session. Returns the message row ID.
 
         Also increments the session's message_count (and tool_call_count
-        if role is 'tool' or tool_calls is present).
+        if role is 'tool' or tool_calls is present). When
+        ``return_transcript_revision`` is true, returns ``(message_id, revision)``
+        with the durable revision committed by the same transaction.
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -2248,31 +2252,75 @@ class SessionDB:
             )
             msg_id = cursor.lastrowid
 
-            # Update counters
+            # Update counters and advance the durable transcript generation in
+            # the same transaction as the inserted row.
             if num_tool_calls > 0:
                 conn.execute(
                     """UPDATE sessions SET message_count = message_count + 1,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
+                       tool_call_count = tool_call_count + ?,
+                       transcript_revision = transcript_revision + 1 WHERE id = ?""",
                     (num_tool_calls, session_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                    """UPDATE sessions SET message_count = message_count + 1,
+                       transcript_revision = transcript_revision + 1 WHERE id = ?""",
                     (session_id,),
                 )
+            if return_transcript_revision:
+                row = conn.execute(
+                    "SELECT transcript_revision FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                revision = int(row[0]) if row is not None else 0
+                return msg_id, revision
             return msg_id
 
         return self._execute_write(_do)
 
-    def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+    def append_message_with_revision(self, *args, **kwargs) -> Tuple[int, int]:
+        """Append a message and return its row ID plus committed revision."""
+        kwargs["return_transcript_revision"] = True
+        result = self.append_message(*args, **kwargs)
+        message_id, revision = result
+        return int(message_id), int(revision)
+
+    def replace_messages(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        expected_message_count: int | None = None,
+        expected_transcript_revision: int | None = None,
+    ) -> bool:
         """Atomically replace every message for a session.
 
         Used by transcript-rewrite flows such as /retry, /undo, and /compress.
         The delete + reinsert sequence must commit as one transaction so a
         mid-rewrite failure does not leave SQLite with a partial transcript.
+        ``expected_transcript_revision`` provides an ABA-safe compare-and-swap;
+        ``expected_message_count`` remains available for compatibility with
+        callers that only need the older count guard.
         """
 
         def _do(conn):
+            if expected_transcript_revision is not None:
+                row = conn.execute(
+                    "SELECT transcript_revision FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                current_revision = int(row[0]) if row is not None else None
+                if current_revision != int(expected_transcript_revision):
+                    return False
+            if expected_message_count is not None:
+                current_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                )
+                if current_count != max(0, int(expected_message_count)):
+                    return False
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
@@ -2342,11 +2390,13 @@ class SessionDB:
                 now_ts += 1e-6
 
             conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                """UPDATE sessions SET message_count = ?, tool_call_count = ?,
+                   transcript_revision = transcript_revision + 1 WHERE id = ?""",
                 (total_messages, total_tool_calls, session_id),
             )
+            return True
 
-        self._execute_write(_do)
+        return bool(self._execute_write(_do))
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by insertion order."""
@@ -3247,7 +3297,8 @@ class SessionDB:
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
             conn.execute(
-                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                """UPDATE sessions SET message_count = 0, tool_call_count = 0,
+                   transcript_revision = transcript_revision + 1 WHERE id = ?""",
                 (session_id,),
             )
         self._execute_write(_do)

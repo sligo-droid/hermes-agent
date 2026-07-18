@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
+from agent.runtime_spans import finish_agent_runtime_span, start_agent_runtime_span
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,6 +267,16 @@ def run_codex_app_server_turn(
         _ensure_codex_session()
 
         codex_api_start = time.perf_counter()
+        runtime_span = start_agent_runtime_span(
+            agent,
+            "model_attempt",
+            phase="model",
+            attempt_id=f"codex-app-server-{api_call_count}",
+            metadata={
+                "model": getattr(agent, "model", ""),
+                "provider": getattr(agent, "provider", ""),
+            },
+        )
         try:
             turn = agent._codex_session.run_turn(
                 user_input=codex_input,
@@ -273,10 +285,12 @@ def run_codex_app_server_turn(
             _record_codex_app_server_runtime(
                 agent, time.perf_counter() - codex_api_start
             )
+            finish_agent_runtime_span(agent, runtime_span, status="ok")
         except Exception as exc:
             _record_codex_app_server_runtime(
                 agent, time.perf_counter() - codex_api_start
             )
+            finish_agent_runtime_span(agent, runtime_span, status="error")
             logger.exception("codex app-server turn failed")
             # Crash -> unconditionally drop the session so the next turn
             # respawns from scratch instead of reusing a dead client.

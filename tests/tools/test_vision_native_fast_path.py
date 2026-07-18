@@ -248,8 +248,8 @@ class TestHandleVisionAnalyzeFastPath:
         assert not (isinstance(result, dict) and result.get("_multimodal") is True), \
             "Fast path fired for unknown provider; should have fallen through"
 
-    def test_supports_vision_override_bypasses_provider_allowlist(self, tmp_path):
-        """supports_vision=true enables the fast path on an unlisted provider."""
+    def test_supports_vision_override_does_not_invent_transport_support(self, tmp_path):
+        """Model image support alone cannot enable an unknown tool transport."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
 
@@ -270,8 +270,8 @@ class TestHandleVisionAnalyzeFastPath:
         finally:
             clear_runtime_main()
 
-        assert isinstance(result, dict) and result.get("_multimodal") is True
-        mock_aux.assert_not_called()
+        assert result == '{"sentinel": "aux-path"}'
+        mock_aux.assert_called_once()
 
     def test_text_mode_wins_over_supports_vision_override(self, tmp_path):
         """Explicit text routing blocks the fast path even with supports_vision."""

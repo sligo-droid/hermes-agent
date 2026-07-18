@@ -14,13 +14,15 @@ concurrently under distinct configurations).
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from utils import atomic_json_write
 
 if sys.platform == "win32":
@@ -39,6 +41,81 @@ _gateway_lock_handle = None
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
+_FULL_SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+SourceCommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True)
+class GatewaySourceIdentity:
+    source_commit: str
+    source_identity_kind: str
+    source_root: str
+    source_dirty: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source_commit": self.source_commit,
+            "source_identity_kind": self.source_identity_kind,
+            "source_root": self.source_root,
+            "source_dirty": self.source_dirty,
+        }
+
+
+def compute_gateway_source_identity(
+    *,
+    source_file: Path | None = None,
+    build_sha: str | None = None,
+    run: SourceCommandRunner | None = None,
+) -> GatewaySourceIdentity:
+    """Resolve immutable build metadata or the actual gateway source checkout."""
+
+    source = (source_file or Path(__file__)).resolve(strict=False)
+    fallback_root = source.parents[1]
+    baked = str(build_sha or "").strip().lower()
+    if build_sha is None:
+        try:
+            from hermes_cli.build_info import get_build_sha
+
+            baked = str(get_build_sha(short=0) or "").strip().lower()
+        except Exception:
+            baked = ""
+    if _FULL_SHA_RE.fullmatch(baked):
+        return GatewaySourceIdentity(baked, "build_env", str(fallback_root), False)
+
+    def execute(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+        if run is not None:
+            return run(args, cwd=cwd, timeout=10)
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+
+    try:
+        root_result = execute(["git", "rev-parse", "--show-toplevel"], cwd=fallback_root)
+        root = Path(root_result.stdout.strip()).resolve(strict=False) if root_result.returncode == 0 else fallback_root
+        # Do not trust a repository discovered outside the actual loaded source.
+        source.relative_to(root)
+        head_result = execute(["git", "rev-parse", "HEAD"], cwd=root)
+        commit = str(head_result.stdout or "").strip().lower()
+        status_result = execute(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=root,
+        )
+        if head_result.returncode != 0 or not _FULL_SHA_RE.fullmatch(commit):
+            commit = ""
+        dirty = status_result.returncode != 0 or bool((status_result.stdout or "").strip()) or not commit
+        return GatewaySourceIdentity(commit, "git", str(root), dirty)
+    except Exception:
+        return GatewaySourceIdentity("", "git", str(fallback_root), True)
+
+
+_GATEWAY_SOURCE_IDENTITY = compute_gateway_source_identity()
 
 
 def _get_pid_path() -> Path:
@@ -211,6 +288,7 @@ def _build_pid_record() -> dict:
 
 def _build_runtime_status_record() -> dict[str, Any]:
     payload = _build_pid_record()
+    payload.update(_GATEWAY_SOURCE_IDENTITY.as_dict())
     payload.update({
         "gateway_state": "starting",
         "exit_reason": None,
@@ -521,6 +599,7 @@ def write_runtime_status(
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
+    payload.update(_GATEWAY_SOURCE_IDENTITY.as_dict())
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:

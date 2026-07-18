@@ -236,6 +236,8 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     kind: str = "delegation",
+    origin_work_item_id: str = "",
+    closeout_id: str = "",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -282,6 +284,8 @@ def dispatch_async_delegation(
         "interrupt_fn": interrupt_fn,
         "kind": str(kind or "delegation"),
         "delivery_pending": False,
+        "origin_work_item_id": str(origin_work_item_id or "")[:240],
+        "closeout_id": str(closeout_id or "")[:240],
     }
     record.update(_capture_session_routing())
     # Capacity check and record insert under ONE lock hold — checking
@@ -423,6 +427,16 @@ def _push_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
+        "origin_work_item_id": record.get("origin_work_item_id", ""),
+        "closeout_id": (
+            (
+                deterministic_result.get("fable_git_result", {}).get("closeout_id")
+                if isinstance(deterministic_result, dict)
+                and isinstance(deterministic_result.get("fable_git_result"), dict)
+                else ""
+            )
+            or record.get("closeout_id", "")
+        ),
     }
     for field in (
         "platform",

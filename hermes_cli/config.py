@@ -745,11 +745,17 @@ DEFAULT_CONFIG = {
         # Bounded visual-QA receipts for explicit rendered UI/artifact work.
         # ``shadow`` is the non-enforcing default; ``off`` disables the
         # feature and ``enforce_explicit`` may request one focused follow-up.
-        # The runtime intentionally clamps both budgets to one.
+        # The runtime enforces hard ceilings even when config asks for more.
         "visual_qa": {
             "mode": "shadow",
             "max_receipts_per_turn": 1,
             "max_followup_turns": 1,
+            "max_attempts": 2,
+            "max_assertions": 6,
+            "max_vision_calls": 1,
+            "attempt_timeout_s": 30,
+            "total_timeout_s": 60,
+            "max_output_chars": 6000,
         },
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
@@ -814,7 +820,31 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
-    
+    # Trusted lifecycle closeout is storage-neutral and disabled from enforcing
+    # by default. Surfaces may collect shadow state without blocking delivery;
+    # repositories must opt in explicitly to deployment/restart requirements.
+    "closeout": {
+        "mode": "shadow",
+        "surfaces": {
+            "kanban": False,
+            "fable": True,
+            "direct": True,
+        },
+        "early_draft_pr": False,
+        "poll_seconds": 30,
+        "lease_seconds": 120,
+        "max_concurrency": 2,
+        "post_merge_requirements": {
+            "canonical_sync": False,
+            "ci": False,
+            "deployment": False,
+            "production_qa": False,
+            "restart": False,
+        },
+        "green_unmerged_overdue_seconds": 0,
+        "repositories": {},
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
@@ -2341,7 +2371,9 @@ DEFAULT_CONFIG = {
                 # legacy per-role reasoning value remains supported only when
                 # the role's tier is disabled or invalid.
                 "planner": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
-                "dev": {"model_tier": "intermediate", "service_tier": "auto", "max_runtime_seconds": 3600},
+                # ``worker_tier`` only controls tier-aware UI skill breadth;
+                # it does not override the Kanban role's model or reasoning.
+                "dev": {"model_tier": "intermediate", "worker_tier": "", "service_tier": "auto", "max_runtime_seconds": 3600},
                 "foreman": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
                 "reviewer": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
             },

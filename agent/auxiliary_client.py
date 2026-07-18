@@ -40,6 +40,7 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import contextvars
 import json
 import logging
 import os
@@ -1014,6 +1015,16 @@ class AsyncCodexAuxiliaryClient:
         # gateway restarts.
         self._real_client = sync_wrapper._real_client
 
+    def with_options(self, **kwargs: Any) -> "AsyncCodexAuxiliaryClient":
+        """Clone the wrapped SDK client without mutating the cached route."""
+
+        real_client = self._real_client.with_options(**kwargs)
+        sync_adapter = self.chat.completions._sync
+        wrapper = CodexAuxiliaryClient(real_client, sync_adapter._model)
+        if hasattr(self, "_hermes_provider"):
+            wrapper._hermes_provider = self._hermes_provider
+        return AsyncCodexAuxiliaryClient(wrapper)
+
 
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
@@ -1158,6 +1169,22 @@ class AsyncAnthropicAuxiliaryClient:
         # See AsyncCodexAuxiliaryClient: mirror _real_client so cache
         # eviction on a poisoned underlying client also drops this entry.
         self._real_client = sync_wrapper._real_client
+
+    def with_options(self, **kwargs: Any) -> "AsyncAnthropicAuxiliaryClient":
+        """Clone the wrapped SDK client without mutating the cached route."""
+
+        real_client = self._real_client.with_options(**kwargs)
+        sync_adapter = self.chat.completions._sync
+        wrapper = AnthropicAuxiliaryClient(
+            real_client,
+            sync_adapter._model,
+            self.api_key,
+            self.base_url,
+            is_oauth=sync_adapter._is_oauth,
+        )
+        if hasattr(self, "_hermes_provider"):
+            wrapper._hermes_provider = self._hermes_provider
+        return AsyncAnthropicAuxiliaryClient(wrapper)
 
 
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
@@ -1742,6 +1769,27 @@ def _try_nous(
     )
 
 
+_RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[tuple[str, str, str, str, str]] = (
+    contextvars.ContextVar(
+        "hermes_runtime_main",
+        default=("", "", "", "", ""),
+    )
+)
+
+
+def get_runtime_main() -> Dict[str, str]:
+    """Return the task-local active main route without logging credentials."""
+
+    provider, model, base_url, api_key, api_mode = _RUNTIME_MAIN_CONTEXT.get()
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "api_key": api_key,
+        "api_mode": api_mode,
+    }
+
+
 def _read_main_model() -> str:
     """Read the user's configured main model from config.yaml.
 
@@ -1754,7 +1802,7 @@ def _read_main_model() -> str:
     that gate on "the active main model" (e.g. ``vision_analyze``'s native
     fast path) see the live runtime, not the persisted config default.
     """
-    override = _RUNTIME_MAIN_MODEL
+    override = get_runtime_main()["model"]
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
@@ -1772,6 +1820,26 @@ def _read_main_model() -> str:
     return ""
 
 
+def _read_main_api_mode() -> str:
+    """Read the active main route's API mode without exposing credentials."""
+
+    override = get_runtime_main()["api_mode"]
+    if isinstance(override, str) and override.strip():
+        return override.strip().lower()
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, dict):
+            api_mode = model_cfg.get("api_mode", "")
+            if isinstance(api_mode, str) and api_mode.strip():
+                return api_mode.strip().lower()
+    except Exception:
+        pass
+    return ""
+
+
 def _read_main_provider() -> str:
     """Read the user's configured main provider from config.yaml.
 
@@ -1781,7 +1849,7 @@ def _read_main_provider() -> str:
     Runtime override: see ``_read_main_model`` — same mechanism for the
     provider half of the runtime tuple.
     """
-    override = _RUNTIME_MAIN_PROVIDER
+    override = get_runtime_main()["provider"]
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
     try:
@@ -1795,15 +1863,6 @@ def _read_main_provider() -> str:
     except Exception:
         pass
     return ""
-
-
-# Process-local override set by AIAgent at session/turn start. Single-threaded
-# per turn — no lock needed. Cleared by ``clear_runtime_main()``.
-_RUNTIME_MAIN_PROVIDER: str = ""
-_RUNTIME_MAIN_MODEL: str = ""
-_RUNTIME_MAIN_BASE_URL: str = ""
-_RUNTIME_MAIN_API_KEY: str = ""
-_RUNTIME_MAIN_API_MODE: str = ""
 
 
 def set_runtime_main(
@@ -1825,24 +1884,32 @@ def set_runtime_main(
     recorded so that ``_resolve_auto`` can construct a valid client in
     Step 1 instead of falling through to the aggregator chain.
     """
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
-    _RUNTIME_MAIN_MODEL = (model or "").strip()
-    _RUNTIME_MAIN_BASE_URL = (base_url or "").strip()
-    _RUNTIME_MAIN_API_KEY = api_key.strip() if isinstance(api_key, str) else ""
-    _RUNTIME_MAIN_API_MODE = (api_mode or "").strip()
+    _RUNTIME_MAIN_CONTEXT.set(
+        (
+            (provider or "").strip().lower(),
+            (model or "").strip(),
+            (base_url or "").strip(),
+            api_key.strip() if isinstance(api_key, str) else "",
+            (api_mode or "").strip().lower(),
+        )
+    )
+
+
+def publish_runtime_main(agent: Any) -> None:
+    """Publish an agent's fully activated five-field route task-locally."""
+
+    set_runtime_main(
+        getattr(agent, "provider", "") or "",
+        getattr(agent, "model", "") or "",
+        base_url=getattr(agent, "base_url", "") or "",
+        api_key=getattr(agent, "api_key", "") or "",
+        api_mode=getattr(agent, "api_mode", "") or "",
+    )
 
 
 def clear_runtime_main() -> None:
     """Clear the runtime override (e.g. on session end)."""
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    _RUNTIME_MAIN_PROVIDER = ""
-    _RUNTIME_MAIN_MODEL = ""
-    _RUNTIME_MAIN_BASE_URL = ""
-    _RUNTIME_MAIN_API_KEY = ""
-    _RUNTIME_MAIN_API_MODE = ""
+    _RUNTIME_MAIN_CONTEXT.set(("", "", "", "", ""))
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -3567,17 +3634,21 @@ def _resolve_auto(
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
 
-    # Fall back to process-local globals when main_runtime dict was not
-    # provided or was incomplete.  ``set_runtime_main()`` now records
-    # base_url/api_key/api_mode alongside provider/model, so custom:
-    # providers get the full credential surface in Step 1 of the
-    # auto-detect chain.
-    if not runtime_base_url and _RUNTIME_MAIN_BASE_URL:
-        runtime_base_url = _RUNTIME_MAIN_BASE_URL
-    if not runtime_api_key and _RUNTIME_MAIN_API_KEY:
-        runtime_api_key = _RUNTIME_MAIN_API_KEY
-    if not runtime_api_mode and _RUNTIME_MAIN_API_MODE:
-        runtime_api_mode = _RUNTIME_MAIN_API_MODE
+    # Fall back to the task-local active route when main_runtime was omitted
+    # or incomplete. ContextVars isolate concurrent gateway sessions while the
+    # existing tool-thread context propagation keeps the route available to
+    # async handlers.
+    active_runtime = get_runtime_main()
+    if not runtime_provider:
+        runtime_provider = active_runtime["provider"]
+    if not runtime_model:
+        runtime_model = active_runtime["model"]
+    if not runtime_base_url:
+        runtime_base_url = active_runtime["base_url"]
+    if not runtime_api_key:
+        runtime_api_key = active_runtime["api_key"]
+    if not runtime_api_mode:
+        runtime_api_mode = active_runtime["api_mode"]
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -3803,6 +3874,18 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     if isinstance(resolved_provider, str) and resolved_provider:
         _annotate_resolved_provider(async_client, resolved_provider)
     return async_client, model
+
+
+def _single_attempt_async_client(client: Any) -> Any:
+    """Return a task-local SDK view with provider retries disabled."""
+
+    with_options = getattr(client, "with_options", None)
+    if callable(with_options):
+        return with_options(max_retries=0)
+    # Native adapters without ``with_options`` issue one HTTP request per
+    # create call. Hermes-level retry and fallback branches are separately
+    # disabled by ``single_attempt`` in ``async_call_llm``.
+    return client
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -4661,6 +4744,7 @@ def resolve_vision_provider_client(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
     async_mode: bool = False,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
@@ -4673,6 +4757,8 @@ def resolve_vision_provider_client(
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
     )
+    if isinstance(api_mode, str) and api_mode.strip():
+        resolved_api_mode = api_mode.strip().lower()
     requested = _normalize_vision_provider(requested)
 
     def _finalize(resolved_provider: str, sync_client: Any, default_model: Optional[str]):
@@ -4719,9 +4805,10 @@ def resolve_vision_provider_client(
             runtime_api_key = ""
             runtime_api_mode = resolved_api_mode
             if main_provider == "custom" or main_provider.startswith("custom:"):
-                runtime_base_url = _RUNTIME_MAIN_BASE_URL
-                runtime_api_key = _RUNTIME_MAIN_API_KEY
-                runtime_api_mode = _RUNTIME_MAIN_API_MODE or resolved_api_mode
+                active_runtime = get_runtime_main()
+                runtime_base_url = active_runtime["base_url"]
+                runtime_api_key = active_runtime["api_key"]
+                runtime_api_mode = active_runtime["api_mode"] or resolved_api_mode
                 if not runtime_base_url:
                     runtime_base_url, runtime_api_key, runtime_api_mode = _resolve_custom_runtime()
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
@@ -6073,7 +6160,9 @@ async def async_call_llm(
     model: str = None,
     base_url: str = None,
     api_key: str = None,
+    api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    single_attempt: bool = False,
     messages: list,
     temperature: float = None,
     max_tokens: int = None,
@@ -6084,9 +6173,13 @@ async def async_call_llm(
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
+    ``single_attempt`` disables all provider retries and fallbacks so a trusted
+    caller's attempt budget equals one outbound request.
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    if isinstance(api_mode, str) and api_mode.strip():
+        resolved_api_mode = api_mode.strip().lower()
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -6096,9 +6189,15 @@ async def async_call_llm(
             model=resolved_model or model,
             base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key,
+            api_mode=resolved_api_mode or api_mode,
             async_mode=True,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not single_attempt
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -6149,6 +6248,9 @@ async def async_call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    if single_attempt:
+        client = _single_attempt_async_client(client)
+
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
@@ -6168,6 +6270,8 @@ async def async_call_llm(
         return _validate_llm_response(
             await client.chat.completions.create(**kwargs), task)
     except Exception as first_err:
+        if single_attempt:
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)

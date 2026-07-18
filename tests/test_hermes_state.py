@@ -529,6 +529,26 @@ class TestMessageStorage:
         assert "data:image" not in msgs[0]["content"]
         assert msgs[1]["content"] == "I see a screenshot."
 
+    def test_transcript_revision_changes_for_every_mutation(self, db):
+        db.create_session(session_id="s1", source="cli")
+        assert db.get_session("s1")["transcript_revision"] == 0
+
+        message_id, revision = db.append_message_with_revision(
+            "s1", role="user", content="first"
+        )
+        assert message_id > 0
+        assert revision == 1
+
+        assert db.replace_messages(
+            "s1",
+            [{"role": "user", "content": "replacement"}],
+            expected_transcript_revision=revision,
+        ) is True
+        assert db.get_session("s1")["transcript_revision"] == 2
+
+        db.clear_messages("s1")
+        assert db.get_session("s1")["transcript_revision"] == 3
+
     def test_get_messages_as_conversation(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")
@@ -2091,7 +2111,13 @@ class TestSchemaInit:
             r[1]
             for r in migrated_db._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
+        session_cols = {
+            r[1]
+            for r in migrated_db._conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
         assert "reasoning_content" in msg_cols
+        assert "transcript_revision" in session_cols
+        assert migrated_db.get_session("s1")["transcript_revision"] == 0
 
         # The query that used to crash must now work
         cursor = migrated_db._conn.execute(

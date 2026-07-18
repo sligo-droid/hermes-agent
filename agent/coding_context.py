@@ -71,19 +71,21 @@ CODING_TOOLSET = "coding"
 # in a group is not pair-programming.
 INTERACTIVE_CODING_PLATFORMS = {"cli", "tui", "acp", "desktop", ""}
 
+# Agent-instruction files surfaced separately from manifests in the snapshot.
+_CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md", ".cursorrules")
+
 # Project-root signals that mark a directory as a code workspace even when it
-# isn't (yet) a git repo. Cheap filename checks — no parsing.
-_PROJECT_MARKERS = (
+# isn't (yet) a git repo. Cheap filename checks — no parsing. Instruction files
+# remain fallback markers for non-Git directories, but never replace an actual
+# Git/project root when they appear in a nested directory.
+_PROJECT_ROOT_MARKERS = (
     "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
     "package.json", "tsconfig.json", "deno.json",
     "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
     "Gemfile", "composer.json", "mix.exs", "pubspec.yaml",
     "CMakeLists.txt", "Makefile", "Dockerfile",
-    "AGENTS.md", "CLAUDE.md", ".cursorrules",
 )
-
-# Agent-instruction files surfaced separately from manifests in the snapshot.
-_CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md", ".cursorrules")
+_PROJECT_MARKERS = (*_PROJECT_ROOT_MARKERS, *_CONTEXT_FILES)
 
 # Source-file extensions that make a git repo a *code* workspace even with no
 # manifest. Without this, `git init` on a notes/writing/research folder (a huge
@@ -390,7 +392,12 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 def _git_root(cwd: Path) -> Optional[Path]:
     current = cwd.resolve()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
+        marker = parent / ".git"
+        # A valid checkout uses either a gitdir file (worktree/submodule) or a
+        # directory containing HEAD. Ignore stale/empty `.git` directories in
+        # ancestors; treating mere existence as a repository can make every
+        # temporary workspace inherit an unrelated false root.
+        if marker.is_file() or (marker.is_dir() and (marker / "HEAD").is_file()):
             return parent
     return None
 
@@ -402,22 +409,28 @@ def _home() -> Optional[Path]:
         return None
 
 
-def _marker_root(cwd: Path) -> Optional[Path]:
+def _marker_root(
+    cwd: Path,
+    *,
+    include_context_files: bool = True,
+) -> Optional[Path]:
     """Nearest ancestor that looks like a project root, or ``None``.
 
     Walks up at most a few levels so a manifest in the workspace root counts
     even when the user is in a subdirectory. ``$HOME`` itself is skipped — a
     Makefile or AGENTS.md sitting in the home directory is global user config,
-    not a project-root signal.
+    not a project-root signal. Callers resolving facts inside Git may exclude
+    instruction-only files so nested context cannot hide the real project root.
     """
     current = cwd.resolve()
     home = _home()
+    markers = _PROJECT_MARKERS if include_context_files else _PROJECT_ROOT_MARKERS
     for depth, parent in enumerate([current, *current.parents]):
         if depth > 6:
             break
         if parent == home:
             continue
-        for marker in _PROJECT_MARKERS:
+        for marker in markers:
             if (parent / marker).exists():
                 return parent
     return None
@@ -770,7 +783,7 @@ def detect_project_facts(root: Path) -> ProjectFacts:
     of truth for both the prompt snapshot (:func:`_project_facts`) and the
     gateway's ``project.facts`` — so the UI never re-sniffs verify commands.
     """
-    manifests = [m for m in _PROJECT_MARKERS if m not in _CONTEXT_FILES and (root / m).is_file()]
+    manifests = [m for m in _PROJECT_ROOT_MARKERS if (root / m).is_file()]
     package_managers = list(
         dict.fromkeys(pm for lock, pm in (*_PY_LOCKFILES, *_JS_LOCKFILES) if (root / lock).is_file())
     )
@@ -826,6 +839,24 @@ def _project_facts(root: Path) -> list[str]:
     return facts
 
 
+def _project_facts_root(cwd: Path) -> Optional[Path]:
+    """Prefer a nearer manifest root without promoting nested instructions."""
+
+    git_root = _git_root(cwd)
+    marker_root = _marker_root(
+        cwd,
+        include_context_files=git_root is None,
+    )
+    if marker_root is not None and git_root is not None and marker_root != git_root:
+        try:
+            marker_root.relative_to(git_root)
+        except ValueError:
+            pass
+        else:
+            return marker_root
+    return git_root or marker_root
+
+
 def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, Any]]:
     """Structured project facts for ``cwd`` — ``None`` outside a workspace.
 
@@ -834,7 +865,7 @@ def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, An
     re-derive "are we coding?" or duplicate the verify-command sniffing.
     """
     resolved = _resolve_cwd(cwd)
-    root = _git_root(resolved) or _marker_root(resolved)
+    root = _project_facts_root(resolved)
     if root is None:
         return None
 

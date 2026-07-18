@@ -6,11 +6,49 @@ import json
 import pytest
 
 from hermes_cli.config import DEFAULT_CONFIG
-from hermes_cli.ui_work_routing import resolve_ui_work_route
+from hermes_cli.ui_work_routing import resolve_ui_work_route, ui_specialist_skills_for_tier
 
 
 def _cfg():
     return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def test_ui_specialist_skills_vary_by_known_worker_tier():
+    assert ui_specialist_skills_for_tier("quick") == ("taste-skill",)
+    assert ui_specialist_skills_for_tier("standard") == (
+        "taste-skill",
+        "claude-design",
+    )
+    for tier in ("thorough", "deep", "max"):
+        assert ui_specialist_skills_for_tier(tier) == (
+            "taste-skill",
+            "claude-design",
+            "popular-web-designs",
+        )
+
+
+def test_ui_specialist_unknown_or_omitted_tier_keeps_all_skills():
+    expected = ("taste-skill", "claude-design", "popular-web-designs")
+    assert ui_specialist_skills_for_tier(None) == expected
+    assert ui_specialist_skills_for_tier("") == expected
+    assert ui_specialist_skills_for_tier("third-party-ultra") == expected
+
+
+def test_route_metadata_uses_resolved_worker_tier_without_changing_runtime():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Polish the responsive dashboard layout.",
+        backend="opencode",
+        worker_tier="quick",
+        route_decision="ui_visual_specialist",
+    )
+
+    metadata = decision.metadata()
+    assert metadata["worker_tier"] == "quick"
+    assert metadata["recommended_skills"] == ["taste-skill"]
+    assert decision.backend == "opencode"
+    assert decision.provider == ""
+    assert decision.model == ""
 
 
 @pytest.mark.parametrize(

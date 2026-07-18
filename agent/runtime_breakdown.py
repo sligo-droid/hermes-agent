@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from agent.runtime_spans import sanitize_runtime_spans, summarize_span_intervals
 from agent.visual_qa import sanitize_visual_receipt
 
 
@@ -66,7 +67,7 @@ def _visual_qa_summary(stats: dict[str, Any], receipts: list[dict[str, Any]]) ->
         status = "missing"
     else:
         status = str(latest.get("status") or "missing").lower()
-        if status not in {"passed", "failed", "blocked"}:
+        if status not in {"passed", "failed", "blocked", "uncertain"}:
             status = "missing"
     # The executor increments this only when a tagged receipt is accepted.
     duration = _seconds(stats.get("visual_qa_check_duration_s")) if latest is not None else 0.0
@@ -75,6 +76,37 @@ def _visual_qa_summary(stats: dict[str, Any], receipts: list[dict[str, Any]]) ->
         "receipt_status": status,
         "followup_count": min(1, _count(stats.get("visual_qa_followup_count"))),
         "check_duration_s": duration,
+    }
+
+
+def _trusted_span_breakdown(stats: dict[str, Any]) -> dict[str, Any]:
+    spans = sanitize_runtime_spans(stats.get("phase_spans"), max_spans=200)
+    summary = summarize_span_intervals(spans)
+    phase_rows = [
+        {
+            "name": name,
+            "duration_s": item["union_s"],
+            "summed_s": item["summed_s"],
+            "overlap_s": item["overlap_s"],
+            "count": item["count"],
+        }
+        for name, item in summary["phases"].items()
+    ]
+    phase_rows.sort(key=lambda item: item["duration_s"], reverse=True)
+    if spans:
+        span_window = max(span["ended_at"] for span in spans) - min(
+            span["started_at"] for span in spans
+        )
+    else:
+        span_window = 0.0
+    return {
+        "phase_spans": spans,
+        "active_s": summary["union_s"],
+        "summed_active_s": summary["summed_s"],
+        "overlap_s": summary["overlap_s"],
+        "max_concurrency": summary["peak_concurrency"],
+        "span_window_s": round(max(0.0, span_window), 6),
+        "phases": phase_rows[:12],
     }
 
 
@@ -93,7 +125,11 @@ def build_turn_runtime_breakdown(
             wall = ended - started
     model = _seconds(stats.get("api_duration_s"))
     tools = _seconds(stats.get("tool_duration_s"))
-    active = model + tools
+    trusted = _trusted_span_breakdown(stats)
+    has_trusted_spans = bool(trusted["phase_spans"])
+    active = trusted["active_s"] if has_trusted_spans else model + tools
+    summed_active = trusted["summed_active_s"] if has_trusted_spans else model + tools
+    overlap = trusted["overlap_s"] if has_trusted_spans else max(0.0, summed_active - active)
     overhead = max(0.0, wall - active) if wall else 0.0
     if wall and active > wall:
         overhead = 0.0
@@ -129,13 +165,19 @@ def build_turn_runtime_breakdown(
     visual_qa = _visual_qa_summary(stats, visual_receipts)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": _clean_name(scope, limit=48),
         "wall_s": wall,
         "model_s": model,
         "tools_s": tools,
         "overhead_s": overhead,
         "active_s": active,
+        "summed_active_s": summed_active,
+        "overlap_s": overlap,
+        "max_concurrency": trusted["max_concurrency"] if has_trusted_spans else 1 if active else 0,
+        "span_window_s": trusted["span_window_s"],
+        "phase_spans": trusted["phase_spans"],
+        "phases": trusted["phases"],
         "api_calls": _count(stats.get("api_calls")),
         "tool_calls": _count(stats.get("tool_calls")),
         "tool_errors": _count(stats.get("tool_errors")),
@@ -152,9 +194,11 @@ def build_turn_runtime_breakdown(
         "verification_evidence": list(stats.get("verification_evidence") or [])[:20]
         if isinstance(stats.get("verification_evidence"), list)
         else [],
+        "mutation_generation": _count(stats.get("mutation_generation")),
+        "mutation_boundary": _count(stats.get("mutation_boundary")),
         "visual_qa_receipts": visual_receipts,
         "visual_qa": visual_qa,
-        "active_exceeds_wall": bool(wall and active > wall + 0.25),
+        "active_exceeds_wall": bool(wall and summed_active > wall + 0.25),
     }
 
 
@@ -166,18 +210,26 @@ def merge_runtime_breakdowns(
     """Accumulate turn breakdowns without carrying sensitive raw details."""
     phases: dict[str, dict[str, Any]] = {}
     merged: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": _clean_name(scope, limit=48),
         "wall_s": 0.0,
         "model_s": 0.0,
         "tools_s": 0.0,
         "overhead_s": 0.0,
         "active_s": 0.0,
+        "summed_active_s": 0.0,
+        "overlap_s": 0.0,
+        "max_concurrency": 0,
+        "span_window_s": 0.0,
+        "phase_spans": [],
         "api_calls": 0,
         "tool_calls": 0,
         "tool_errors": 0,
         "tool_blocked": 0,
         "top_tools": [],
+        "verification_evidence": [],
+        "mutation_generation": 0,
+        "mutation_boundary": 0,
         "visual_qa_receipts": [],
         "visual_qa": {
             "level": "none",
@@ -194,8 +246,28 @@ def merge_runtime_breakdowns(
             continue
         for key in ("wall_s", "model_s", "tools_s", "overhead_s", "active_s"):
             merged[key] += _seconds(item.get(key))
+        merged["summed_active_s"] += _seconds(
+            item.get("summed_active_s", item.get("active_s"))
+        )
+        merged["overlap_s"] += _seconds(item.get("overlap_s"))
+        merged["max_concurrency"] = max(
+            _count(merged.get("max_concurrency")),
+            _count(item.get("max_concurrency")),
+        )
+        merged["span_window_s"] += _seconds(item.get("span_window_s"))
+        merged["phase_spans"].extend(
+            sanitize_runtime_spans(item.get("phase_spans"), max_spans=200)
+        )
         for key in ("api_calls", "tool_calls", "tool_errors", "tool_blocked"):
             merged[key] += _count(item.get(key))
+        if isinstance(item.get("verification_evidence"), list):
+            merged["verification_evidence"].extend(
+                evidence
+                for evidence in item["verification_evidence"]
+                if isinstance(evidence, dict)
+            )
+        merged["mutation_generation"] = _count(item.get("mutation_generation"))
+        merged["mutation_boundary"] = _count(item.get("mutation_boundary"))
         merged["active_exceeds_wall"] = bool(merged["active_exceeds_wall"] or item.get("active_exceeds_wall"))
         for phase in item.get("phases") or []:
             if not isinstance(phase, dict):
@@ -232,11 +304,23 @@ def merge_runtime_breakdowns(
         merged["visual_qa"]["check_duration_s"] += _seconds(visual.get("check_duration_s"))
     merged["top_tools"] = sorted(tools.values(), key=lambda item: item["duration_s"], reverse=True)[:5]
     merged["phases"] = sorted(phases.values(), key=lambda item: item["duration_s"], reverse=True)[:6]
+    merged["verification_evidence"] = merged["verification_evidence"][-20:]
     merged["visual_qa_receipts"] = merged["visual_qa_receipts"][-20:]
     if merged["visual_qa_receipts"]:
         merged["visual_qa"]["receipt_status"] = str(
             merged["visual_qa_receipts"][-1].get("status") or "missing"
         ).lower()
+    merged["phase_spans"] = sanitize_runtime_spans(
+        merged["phase_spans"], max_spans=200
+    )
+    if merged["phase_spans"]:
+        trusted = _trusted_span_breakdown({"phase_spans": merged["phase_spans"]})
+        merged["active_s"] = trusted["active_s"]
+        merged["summed_active_s"] = trusted["summed_active_s"]
+        merged["overlap_s"] = trusted["overlap_s"]
+        merged["max_concurrency"] = trusted["max_concurrency"]
+        merged["span_window_s"] = trusted["span_window_s"]
+        merged["phases"] = trusted["phases"]
     return merged
 
 
@@ -283,13 +367,13 @@ def render_runtime_breakdown_text(breakdown: dict[str, Any] | None, compact: boo
             for receipt in (breakdown.get("visual_qa_receipts") or [])
             if isinstance(receipt, dict)
         ]
+        visual = breakdown.get("visual_qa") if isinstance(breakdown.get("visual_qa"), dict) else {}
         if visual_receipts:
             receipt = visual_receipts[-1]
             lines.append(
-                f"Visual QA: {_clean_name(receipt.get('level'), limit=16)} — "
+                f"Visual QA: {_clean_name(visual.get('level'), limit=16)} — "
                 f"{_clean_name(receipt.get('status'), limit=16)}"
             )
-        visual = breakdown.get("visual_qa") if isinstance(breakdown.get("visual_qa"), dict) else {}
         visual_level = str(visual.get("level") or "none").lower()
         visual_active = bool(
             visual_receipts

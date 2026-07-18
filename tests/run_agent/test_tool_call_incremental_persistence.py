@@ -250,3 +250,96 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+def test_final_budget_and_steer_mutations_replace_incremental_sqlite_rows(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    agent = _make_agent()
+    agent._session_db = db
+    agent.session_id = "final-rewrite"
+    agent._session_db_created = False
+    agent._last_flushed_db_idx = 0
+    agent._ensure_db_session()
+    agent._pending_steer = "keep the final guidance"
+
+    tool_call = _mock_tool_call(name="web_search", call_id="c1")
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    messages: list = []
+
+    def _budget(tool_messages, **_kwargs):
+        tool_messages[-1]["content"] = "aggregate-budgeted-result"
+        return tool_messages
+
+    with (
+        patch("run_agent.handle_function_call", return_value="unbudgeted-result"),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+        patch("agent.tool_executor.enforce_turn_budget", side_effect=_budget),
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    rows = db.get_messages(agent.session_id)
+    assert len(rows) == 1
+    assert rows[0]["content"] == (
+        "aggregate-budgeted-result\n\nUser guidance: keep the final guidance"
+    )
+
+
+def test_final_rewrite_preserves_concurrent_external_sqlite_append(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    agent = _make_agent()
+    agent._session_db = db
+    agent.session_id = "final-rewrite-cas"
+    agent._session_db_created = False
+    agent._last_flushed_db_idx = 0
+    agent._ensure_db_session()
+
+    messages = [{"role": "tool", "content": "original", "tool_call_id": "c1"}]
+    agent._flush_messages_to_session_db(messages)
+    db.append_message(
+        session_id=agent.session_id,
+        role="user",
+        content="external concurrent row",
+    )
+    messages[0]["content"] = "rewritten"
+
+    agent._rewrite_messages_to_session_db(messages)
+
+    rows = db.get_messages(agent.session_id)
+    assert [row["content"] for row in rows] == ["original", "external concurrent row"]
+
+
+def test_final_rewrite_rejects_same_count_concurrent_sqlite_replacement(tmp_path):
+    """A stale final rewrite must not pass a same-row-count ABA change."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    agent = _make_agent()
+    agent._session_db = db
+    agent.session_id = "final-rewrite-revision-cas"
+    agent._session_db_created = False
+    agent._last_flushed_db_idx = 0
+    agent._ensure_db_session()
+
+    messages = [{"role": "tool", "content": "original", "tool_call_id": "c1"}]
+    agent._flush_messages_to_session_db(messages)
+    stale_token = agent._last_flushed_db_snapshot_token
+
+    assert db.replace_messages(
+        agent.session_id,
+        [{"role": "tool", "content": "concurrent rewrite", "tool_call_id": "c1"}],
+    ) is True
+    assert db.message_count(agent.session_id) == len(messages)
+
+    messages[0]["content"] = "stale final rewrite"
+    agent._rewrite_messages_to_session_db(messages)
+
+    rows = db.get_messages(agent.session_id)
+    assert [row["content"] for row in rows] == ["concurrent rewrite"]
+    assert agent._last_flushed_db_snapshot_token == stale_token

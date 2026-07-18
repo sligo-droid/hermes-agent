@@ -4,8 +4,11 @@ import json
 from types import SimpleNamespace
 
 from agent import conversation_loop, tool_executor
+from agent.visual_assertions import visual_assertion_contract_id
+from agent.visual_qa import visual_requirement_id
 from agent.verification_evidence import (
     claim_constraints_for_text,
+    classify_tool_visual_receipt,
     downgrade_final_response_for_evidence,
     latest_evidence_by_surface,
 )
@@ -36,6 +39,49 @@ def test_terminal_production_browser_timeout_blocks_matching_shipped_claim():
     assert "worker_frontend_smoke" in blocked["production_browser"]["check_name"]
 
 
+def test_successful_terminal_evidence_binds_host_snapshot_to_mutation_boundary():
+    head_sha = "a" * 40
+    agent = SimpleNamespace(
+        _turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0),
+        _turn_mutation_generation=3,
+        _turn_mutation_boundary=7,
+    )
+    result = json.dumps(
+        {
+            "output": "passed",
+            "exit_code": 0,
+            "error": None,
+            "verification_evidence": {
+                "status": "passed",
+                "kind": "test",
+                "scope": "targeted",
+                "canonical_command": "scripts/run_tests.sh",
+                "repository_root": "/repo/worktree",
+                "verified_head_sha": head_sha,
+            },
+        }
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, False)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": "scripts/run_tests.sh tests/gateway/test_work_ledger.py"},
+        result,
+        False,
+    )
+
+    evidence = latest_evidence_by_surface(
+        agent._turn_runtime_stats["verification_evidence"]
+    )["ci"]
+    assert evidence["repository_root"] == "/repo/worktree"
+    assert evidence["canonical_command"] == "scripts/run_tests.sh"
+    assert evidence["scope"] == "targeted"
+    assert evidence["mutation_generation"] == 3
+    assert evidence["mutation_boundary"] == 7
+    assert evidence["verified_head_sha"] == head_sha
+
+
 def test_untagged_successful_browser_navigation_is_not_visual_qa_receipt():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     result = json.dumps({"success": True, "output": "page loaded"})
@@ -48,7 +94,7 @@ def test_untagged_successful_browser_navigation_is_not_visual_qa_receipt():
     assert agent._turn_runtime_stats.get("visual_qa_receipts", []) == []
 
 
-def test_explicit_tagged_visual_check_records_distinct_safe_receipt():
+def test_dedicated_visual_tool_records_distinct_safe_receipt():
     requirement = {
         "level": "surface",
         "target": "mobile-toolbar",
@@ -59,23 +105,101 @@ def test_explicit_tagged_visual_check_records_distinct_safe_receipt():
         visual_qa_requirement=requirement,
         visual_qa_config={"mode": "enforce_explicit"},
     )
-    result = json.dumps({"success": True, "output": "inspection completed"})
-    args = {
-        "command": "npm run browser:inspect",
-        "visual_qa_receipt": {
-            **requirement,
-            "check": "mobile-browser-inspection",
-            "status": "passed",
-            "evidence_ref": "mobile viewport inspection recorded",
-        },
+    assertions = [
+        {
+            "id": "toolbar-check",
+            "kind": "no_horizontal_overflow",
+            "locator": {"by": "test_id", "value": "mobile-toolbar"},
+        }
+    ]
+    receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": visual_assertion_contract_id(assertions),
+        "assertion_ids": ["toolbar-check"],
+        "status": "passed",
+        "attempts": 1,
+        "vision_calls": 0,
+        "duration_ms": 100,
+        "diagnostic_codes": ["no_horizontal_overflow_satisfied"],
     }
+    result = json.dumps({"status": "passed", "visual_qa_receipt": receipt})
+    args = {"assertions": assertions}
 
-    tool_executor._record_turn_tool_runtime(agent, "terminal", 0.1, result, False)
-    tool_executor._record_turn_verification_evidence(agent, "terminal", args, result, False, 2.5)
+    tool_executor._record_turn_tool_runtime(agent, "visual_qa", 0.1, result, False)
+    tool_executor._record_turn_verification_evidence(agent, "visual_qa", args, result, False, 2.5)
 
     receipts = agent._turn_runtime_stats["visual_qa_receipts"]
-    assert receipts == [{**args["visual_qa_receipt"], "order": 1}]
+    assert receipts == [{**receipt, "order": 1}]
     assert agent._turn_runtime_stats["visual_qa_check_duration_s"] == 2.5
+
+
+def test_visual_receipt_rejects_contract_or_order_tampering():
+    assertions = [
+        {"id": "layout", "kind": "screenshot_appearance", "expectation": "layout is aligned"},
+        {"id": "copy", "kind": "text_present", "text": "Ready", "policy": "literal_request_text"},
+    ]
+    requirement = {"level": "surface", "target": "dashboard", "assertions": ["layout", "copy"]}
+    receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": visual_assertion_contract_id(assertions),
+        "assertion_ids": ["layout", "copy"],
+        "status": "passed",
+        "attempts": 1,
+        "vision_calls": 1,
+        "duration_ms": 10,
+        "diagnostic_codes": [],
+    }
+    tampered_receipts = [
+        {**receipt, "contract_id": "vac_" + ("a" * 24)},
+        {**receipt, "assertion_ids": ["layout"]},
+        {**receipt, "assertion_ids": ["copy", "layout"]},
+        {**receipt, "assertion_ids": ["layout", "other"]},
+    ]
+
+    for tampered in tampered_receipts:
+        result = {"status": "passed", "visual_qa_receipt": tampered}
+        assert classify_tool_visual_receipt(
+            "visual_qa",
+            {"assertions": assertions},
+            result,
+            False,
+            requirement=requirement,
+        ) is None
+
+
+def test_visual_receipt_rejects_invalid_assertion_or_stale_requirement():
+    assertions = [
+        {"id": "layout", "kind": "screenshot_appearance", "expectation": "layout is aligned"}
+    ]
+    requirement = {"level": "surface", "target": "dashboard", "assertions": ["layout"]}
+    receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": visual_assertion_contract_id(assertions),
+        "assertion_ids": ["layout"],
+        "status": "passed",
+        "attempts": 1,
+        "vision_calls": 1,
+        "duration_ms": 10,
+        "diagnostic_codes": [],
+    }
+    result = {"status": "passed", "visual_qa_receipt": receipt}
+
+    invalid_assertions = [*assertions, {"id": "bad", "kind": "arbitrary_javascript"}]
+    assert classify_tool_visual_receipt(
+        "visual_qa",
+        {"assertions": invalid_assertions},
+        result,
+        False,
+        requirement=requirement,
+    ) is None
+    stale_requirement = {"level": "surface", "target": "other", "assertions": ["layout"]}
+    assert classify_tool_visual_receipt(
+        "visual_qa",
+        {"assertions": assertions},
+        result,
+        False,
+        requirement=stale_requirement,
+    ) is None
 
 
 def test_later_success_supersedes_earlier_failed_browser_check():

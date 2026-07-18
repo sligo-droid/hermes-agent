@@ -58,10 +58,18 @@ def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
     agent._is_direct_openai_url = lambda url: "api.openai.com" in url
     agent._emit_status = lambda msg: None
 
-    result = agent._try_activate_fallback()
+    with patch("agent.auxiliary_client.set_runtime_main") as publish:
+        result = agent._try_activate_fallback()
 
     assert result is True
     assert agent._fallback_activated is True
+    publish.assert_called_once_with(
+        "openai",
+        "gpt-4o",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-fallback",
+        api_mode="codex_responses",
+    )
 
     c = agent.context_compressor
     assert c.model == "gpt-4o"

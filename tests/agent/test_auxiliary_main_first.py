@@ -688,9 +688,17 @@ class TestResolveVisionCustomProvider:
         """custom main with recorded runtime endpoint → Step 1 builds a client."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://my.endpoint.example/v1")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "sk-runtime-key")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "anthropic_messages")
+        monkeypatch.setattr(
+            aux,
+            "get_runtime_main",
+            lambda: {
+                "provider": "custom",
+                "model": "claude-opus-4-8",
+                "base_url": "https://my.endpoint.example/v1",
+                "api_key": "sk-runtime-key",
+                "api_mode": "anthropic_messages",
+            },
+        )
 
         with patch(
             "agent.auxiliary_client._read_main_provider", return_value="custom",
@@ -723,9 +731,17 @@ class TestResolveVisionCustomProvider:
         """A ``custom:<name>`` provider id also forwards the runtime endpoint."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://named.example/v1")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "sk-named")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "")
+        monkeypatch.setattr(
+            aux,
+            "get_runtime_main",
+            lambda: {
+                "provider": "custom:copilot-gateway",
+                "model": "claude-opus-4-8",
+                "base_url": "https://named.example/v1",
+                "api_key": "sk-named",
+                "api_mode": "",
+            },
+        )
 
         with patch(
             "agent.auxiliary_client._read_main_provider",
@@ -756,9 +772,17 @@ class TestResolveVisionCustomProvider:
         """No recorded runtime endpoint → resolve the configured custom endpoint."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "")
+        monkeypatch.setattr(
+            aux,
+            "get_runtime_main",
+            lambda: {
+                "provider": "custom",
+                "model": "claude-opus-4-8",
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            },
+        )
 
         with patch(
             "agent.auxiliary_client._read_main_provider", return_value="custom",

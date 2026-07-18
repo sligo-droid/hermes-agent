@@ -379,6 +379,277 @@ def test_non_action_gateway_route_keeps_existing_cwd(tmp_path, monkeypatch):
     assert not (tmp_path / "workspaces").exists()
 
 
+def test_resolved_action_workspace_is_persisted_separately_before_activation(tmp_path):
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    captured = {}
+
+    class Ledger:
+        def get(self, work_id):
+            return {"id": work_id, "closeout": {"mode": "off"}}
+
+        def attach_closeout_workspace(self, work_id, **kwargs):
+            captured.update(work_id=work_id, **kwargs)
+            return {"mode": kwargs["mode"], "workspace": {"path": kwargs["workspace_path"]}}
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = Ledger()
+    runner.trusted_closeout_watcher = None
+    event = SimpleNamespace(work_item_id="work-1")
+
+    state = runner._persist_action_closeout_workspace(
+        event,
+        mutable_path=str(mutable),
+        canonical_path=str(canonical),
+        config={"closeout": {"repositories": {}}},
+        source="direct",
+        mode="off",
+    )
+
+    assert state["mode"] == "off"
+    assert captured["workspace_path"] == str(mutable.resolve())
+    assert captured["canonical_path"] == str(canonical)
+    assert captured["branch"] == "discord/action-test"
+    assert captured["base_branch"] == "main"
+    assert captured["source"] == "direct"
+
+
+def _direct_closeout_runner(
+    mutable,
+    *,
+    mode="shadow",
+    require_visual_qa=False,
+):
+    captured = {}
+    item = {
+        "id": "work-1",
+        "closeout_authoritative": False,
+        "closeout": {
+            "revision": 4,
+            "source": "direct",
+            "mode": mode,
+            "workspace": {
+                "path": str(mutable),
+                "repository": "acme/example",
+                "branch": "discord/action-test",
+                "base_branch": "main",
+            },
+            "policy": {"require_visual_qa": require_visual_qa},
+        },
+        "visual_qa_requirement": {"id": "trusted-requirement"},
+    }
+
+    class Ledger:
+        def get(self, work_id):
+            return item if work_id == item["id"] else None
+
+        def activate_closeout(self, work_id, state, *, expected_revision):
+            captured.update(
+                work_id=work_id,
+                state=state,
+                expected_revision=expected_revision,
+            )
+            return {**state, "revision": expected_revision + 1}
+
+    notifications = []
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = Ledger()
+    runner.trusted_closeout_watcher = SimpleNamespace(
+        notify=lambda work_id: notifications.append(work_id)
+    )
+    return runner, captured, notifications
+
+
+def _successful_verification_result(mutable, *, mutation_generation=0, mutation_boundary=0):
+    head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+    return {
+        "runtime_breakdown": {
+            "mutation_generation": mutation_generation,
+            "mutation_boundary": mutation_boundary,
+            "verification_evidence": [
+                {
+                    "surface": "verification",
+                    "status": "success",
+                    "order": 1,
+                    "repository_root": str(mutable.resolve()),
+                    "canonical_command": "scripts/run_tests.sh",
+                    "scope": "full",
+                    "mutation_generation": mutation_generation,
+                    "mutation_boundary": mutation_boundary,
+                    "verified_head_sha": head_sha,
+                }
+            ],
+        }
+    }
+
+
+def test_direct_closeout_does_not_activate_without_verification(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(mutable)
+
+    assert runner._activate_direct_closeout_after_checkpoint("work-1", {}) is None
+    assert captured == {}
+    assert notifications == []
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "repository_root",
+        "canonical_command",
+        "scope",
+        "mutation_generation",
+        "mutation_boundary",
+        "verified_head_sha",
+    ],
+)
+def test_direct_closeout_rejects_incomplete_trusted_verification_evidence(
+    tmp_path,
+    monkeypatch,
+    missing_field,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(mutable)
+    result = _successful_verification_result(mutable)
+    result["runtime_breakdown"]["verification_evidence"][0].pop(missing_field)
+
+    assert runner._activate_direct_closeout_after_checkpoint("work-1", result) is None
+    assert captured == {}
+    assert notifications == []
+
+
+def test_direct_closeout_rejects_evidence_from_other_root_or_mutation_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(mutable)
+
+    wrong_root = _successful_verification_result(mutable)
+    wrong_root["runtime_breakdown"]["verification_evidence"][0]["repository_root"] = str(canonical)
+    assert runner._activate_direct_closeout_after_checkpoint("work-1", wrong_root) is None
+
+    stale_mutation = _successful_verification_result(
+        mutable,
+        mutation_generation=1,
+        mutation_boundary=2,
+    )
+    stale_mutation["runtime_breakdown"]["mutation_generation"] = 2
+    stale_mutation["runtime_breakdown"]["mutation_boundary"] = 3
+    assert runner._activate_direct_closeout_after_checkpoint("work-1", stale_mutation) is None
+    assert captured == {}
+    assert notifications == []
+
+
+def test_direct_closeout_never_infers_verification_from_later_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(mutable)
+    result = _successful_verification_result(mutable)
+
+    (mutable / "after-verification.txt").write_text("later head\n", encoding="utf-8")
+    _run(mutable, "add", "after-verification.txt")
+    _run(mutable, "commit", "-m", "later head")
+
+    assert runner._activate_direct_closeout_after_checkpoint("work-1", result) is None
+    assert captured == {}
+    assert notifications == []
+
+
+def test_direct_closeout_does_not_activate_dirty_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    (mutable / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    runner, captured, notifications = _direct_closeout_runner(mutable, mode="enforce")
+
+    assert runner._activate_direct_closeout_after_checkpoint(
+        "work-1",
+        _successful_verification_result(mutable),
+    ) is None
+    assert captured == {}
+    assert notifications == []
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_direct_closeout_activates_clean_verified_exact_head(
+    tmp_path,
+    monkeypatch,
+    mode,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(mutable, mode=mode)
+    head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+
+    activated = runner._activate_direct_closeout_after_checkpoint(
+        "work-1",
+        _successful_verification_result(mutable),
+    )
+
+    assert activated is not None
+    assert captured["expected_revision"] == 4
+    assert captured["state"]["mode"] == mode
+    assert captured["state"]["local_verification"] == {
+        "status": "passed",
+        "head_sha": head_sha,
+    }
+    assert captured["state"]["pr"]["head_sha"] == head_sha
+    assert captured["state"]["ci"]["head_sha"] == head_sha
+    assert notifications == ["work-1"]
+
+
+def test_direct_closeout_binds_required_visual_receipt_to_exact_head(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, _notifications = _direct_closeout_runner(
+        mutable,
+        mode="enforce",
+        require_visual_qa=True,
+    )
+    monkeypatch.setattr(
+        "agent.visual_qa.visual_receipt_completion",
+        lambda requirement, receipts, *, min_order: {"status": "passed"},
+    )
+    result = _successful_verification_result(mutable)
+    result["visual_qa"] = {"receipts": [{"status": "passed"}], "min_receipt_order": 1}
+    head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+
+    assert runner._activate_direct_closeout_after_checkpoint("work-1", result) is not None
+    assert captured["state"]["visual_qa"] == {
+        "status": "passed",
+        "head_sha": head_sha,
+    }
+
+
 def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunner:
     runner = gateway_run.GatewayRunner(GatewayConfig())
     runner.adapters = {}

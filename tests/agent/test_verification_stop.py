@@ -173,7 +173,7 @@ def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
     _node_project(tmp_path)
     changed = str(tmp_path / "src" / "app.ts")
 
-    record_terminal_result(
+    evidence = record_terminal_result(
         command="pnpm test",
         cwd=tmp_path,
         session_id="s1",
@@ -181,6 +181,7 @@ def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
         output="green",
     )
 
+    assert evidence is not None
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
 
 
@@ -198,7 +199,7 @@ def test_visual_stop_nudge_is_independent_from_generic_messaging_default():
     )
 
     assert nudge is not None
-    assert "visual_qa_receipt" in nudge
+    assert "call the `visual_qa` tool" in nudge
     assert build_visual_qa_stop_nudge(
         requirement=requirement,
         changed_paths=["src/toolbar.tsx"],

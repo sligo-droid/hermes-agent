@@ -6371,7 +6371,31 @@ def clear_subgoals(board: str) -> int:
     return count
 
 
-def _completed_approved_reviewer_task(conn: Any, tasks: list[Any]) -> Optional[Any]:
+def _current_reviewer_evidence_head(worker: dict[str, Any]) -> str:
+    """Return the exact current implementation/PR head used by review gates."""
+
+    for key in (
+        "pr_ci_head_sha",
+        "early_draft_pushed_head_sha",
+        "trusted_local_verification_head",
+        "review_approved_head",
+    ):
+        head = str(worker.get(key) or "").strip().lower()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head):
+            return head
+    return ""
+
+
+def _completed_approved_reviewer_task(
+    conn: Any,
+    tasks: list[Any],
+    worker: dict[str, Any],
+) -> Optional[Any]:
+    current_head = _current_reviewer_evidence_head(worker)
+    approved_head = str(worker.get("review_approved_head") or "").strip().lower()
+    if not current_head or approved_head != current_head:
+        return None
+
     completed_reviewers = [
         task
         for task in tasks
@@ -6640,6 +6664,40 @@ def _block_after_pr_finalizer_failure(board: str, worker: dict[str, Any], blocke
     persist_board_run_summary(board)
 
 
+def _invalidate_stale_reviewer_evidence(
+    board: str,
+    worker: dict[str, Any],
+) -> bool:
+    """Reactivate review when repair or refresh advances the implementation head."""
+
+    current_head = _current_reviewer_evidence_head(worker)
+    approved_head = str(worker.get("review_approved_head") or "").strip().lower()
+    if not current_head or approved_head == current_head:
+        return False
+
+    closeout = dict(worker.get("closeout") or {}) if isinstance(worker.get("closeout"), dict) else {}
+    if closeout:
+        closeout["review"] = {
+            "status": "stale",
+            "head_sha": approved_head,
+        }
+        worker["closeout"] = closeout
+    worker.update(
+        {
+            "phase": "reviewing",
+            "goal_status": "active",
+            "blocked_reason": "",
+            "pr_blocker": "",
+            "pr_error": None,
+            "pr_finalizer_recovery_state": "review_required",
+            "pr_finalizer_recovery_blocker": "",
+        }
+    )
+    _clear_board_run_summary(board, worker)
+    _update_worker_meta(board, worker)
+    return True
+
+
 def _leave_approved_reviewer_waiting_for_ci(board: str, worker: dict[str, Any]) -> None:
     """Keep an approved board visible and active while its stable CI gate runs."""
     worker.update(
@@ -6671,26 +6729,56 @@ def _pr_finalization_waiting_for_ci(outcome: Any) -> bool:
     return outcome == PRFinalizationOutcome.WAITING_FOR_CI
 
 
+def _pr_finalization_post_merge_pending(outcome: Any) -> bool:
+    from hermes_cli.kanban_codex_worker import PRFinalizationOutcome
+
+    return outcome == PRFinalizationOutcome.POST_MERGE_PENDING
+
+
+def _leave_approved_reviewer_post_merge_pending(board: str, worker: dict[str, Any]) -> None:
+    worker.update(
+        {
+            "phase": "reviewing",
+            "goal_status": "active",
+            "blocked_reason": "",
+            "pr_blocker": "",
+            "pr_error": None,
+            "pr_finalizer_recovery_state": "post_merge_pending",
+            "pr_finalizer_recovery_blocker": "",
+        }
+    )
+    _clear_board_run_summary(board, worker)
+    _update_worker_meta(board, worker)
+
+
 def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], conn: Any, tasks: list[Any]) -> Optional[str]:
     if str(worker.get("phase") or "").strip().lower() not in {"active", "reviewing", "review"}:
         return None
     if str(worker.get("goal_status") or "").strip().lower() != "active":
         return None
-    if _completed_approved_reviewer_task(conn, tasks) is None:
+    if _completed_approved_reviewer_task(conn, tasks, worker) is None:
         return None
 
     from hermes_cli import kanban_codex_worker
 
     outcome = kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or ""))
+    metadata = kanban_db.read_board_metadata(board)
+    refreshed = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if _completed_approved_reviewer_task(conn, tasks, refreshed) is None:
+        if _invalidate_stale_reviewer_evidence(board, refreshed):
+            worker.clear()
+            worker.update(refreshed)
+            return None
     if _pr_finalization_merged(outcome):
         kanban_codex_worker._update_phase(board, "complete", goal_status="done")
         return "approved_reviewer_finalized"
 
-    metadata = kanban_db.read_board_metadata(board)
-    refreshed = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     if _pr_finalization_waiting_for_ci(outcome):
         _leave_approved_reviewer_waiting_for_ci(board, refreshed)
         return "approved_reviewer_waiting_for_ci"
+    if _pr_finalization_post_merge_pending(outcome):
+        _leave_approved_reviewer_post_merge_pending(board, refreshed)
+        return "approved_reviewer_post_merge_pending"
     blocker = str(refreshed.get("pr_blocker") or refreshed.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(refreshed):
         if _pr_finalizer_failure_is_pr_body_check_only(refreshed):
@@ -6763,7 +6851,7 @@ def _recover_blocked_approved_reviewer_finalizer(
         return None
     if worker.get("execution_mode") != "kanban_pipeline" or _worker_source_message_too_old(worker):
         return None
-    if _completed_approved_reviewer_task(conn, tasks) is None:
+    if _completed_approved_reviewer_task(conn, tasks, worker) is None:
         return None
     if (
         str(worker.get("pr_finalizer_recovery_state") or "") == "operator_blocked"
@@ -6784,15 +6872,23 @@ def _recover_blocked_approved_reviewer_finalizer(
 
     if finalizer_blocked_reason or finalizer_failure_evidence or finalizer_blocker:
         outcome = kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or ""))
+        metadata = kanban_db.read_board_metadata(board)
+        refreshed = dict(metadata.get(DISCORD_WORKER_META_KEY) or worker)
+        worker.clear()
+        worker.update(refreshed)
+        if _completed_approved_reviewer_task(conn, tasks, worker) is None:
+            if _invalidate_stale_reviewer_evidence(board, worker):
+                return None
         if _pr_finalization_merged(outcome):
             _update_worker_meta(board, {"blocked_reason": "", "pr_blocker": "", "pr_error": None})
             kanban_codex_worker._update_phase(board, "complete", goal_status="done")
             return "approved_reviewer_finalized"
-        metadata = kanban_db.read_board_metadata(board)
-        worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or worker)
         if _pr_finalization_waiting_for_ci(outcome):
             _leave_approved_reviewer_waiting_for_ci(board, worker)
             return "approved_reviewer_waiting_for_ci"
+        if _pr_finalization_post_merge_pending(outcome):
+            _leave_approved_reviewer_post_merge_pending(board, worker)
+            return "approved_reviewer_post_merge_pending"
 
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(worker):
@@ -6952,6 +7048,48 @@ def _pre_review_readiness_for_completed_dev_runs(conn: sqlite3.Connection) -> Op
     }
 
 
+def _early_draft_checkpoint_before_review(
+    board: str,
+    worker: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Open or refresh an enabled draft PR without delaying reviewer work."""
+
+    try:
+        from hermes_cli.kanban_codex_worker import _ensure_early_draft_pr
+
+        result = _ensure_early_draft_pr(
+            board,
+            str(worker.get("worktree_path") or ""),
+        )
+    except Exception:
+        return {
+            "status": "blocked",
+            "head_sha": "",
+            "diagnostic_code": "early_draft_checkpoint_failed",
+        }
+    if not isinstance(result, dict) or result.get("status") == "disabled":
+        return None
+    safe: dict[str, Any] = {
+        "status": re.sub(
+            r"[^a-z0-9_-]",
+            "",
+            str(result.get("status") or "blocked").strip().lower(),
+        )[:48]
+        or "blocked"
+    }
+    head_sha = str(result.get("head_sha") or "").strip().lower()
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head_sha):
+        safe["head_sha"] = head_sha
+    code = re.sub(
+        r"[^A-Za-z0-9_.-]",
+        "_",
+        str(result.get("diagnostic_code") or "").strip(),
+    )[:80]
+    if code:
+        safe["diagnostic_code"] = code
+    return safe
+
+
 def reconcile_board(board: str) -> Optional[str]:
     """Advance deterministic Discord worker board phases.
 
@@ -7013,7 +7151,13 @@ def reconcile_board(board: str) -> Optional[str]:
         if ROLE_PLANNER in active_roles or ROLE_DEV in active_roles or ROLE_REVIEWER in active_roles:
             return None
         if goal_status == "blocked":
-            return _recover_blocked_approved_reviewer_finalizer(board, worker, conn, tasks)
+            recovered = _recover_blocked_approved_reviewer_finalizer(board, worker, conn, tasks)
+            if recovered:
+                return recovered
+            worker = _read_worker_meta(board)
+            goal_status = str(worker.get("goal_status") or "").strip().lower()
+            if goal_status == "blocked":
+                return None
         if not tasks:
             _ensure_planner_task(board, worker)
             return "planner_created"
@@ -7039,6 +7183,7 @@ def reconcile_board(board: str) -> Optional[str]:
         worker["review_loop_count"] = loops
         worker["phase"] = "reviewing"
         _update_worker_meta(board, worker)
+        early_draft_checkpoint = _early_draft_checkpoint_before_review(board, worker)
         reviewer_payload = {
             "role": ROLE_REVIEWER,
             "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
@@ -7051,6 +7196,8 @@ def reconcile_board(board: str) -> Optional[str]:
         pre_review_readiness = _pre_review_readiness_for_completed_dev_runs(conn)
         if pre_review_readiness:
             reviewer_payload["pre_review_readiness"] = pre_review_readiness
+        if early_draft_checkpoint:
+            reviewer_payload["early_draft_checkpoint"] = early_draft_checkpoint
         kanban_db.create_task(
             conn,
             title=format_role_round_title("Review Discord implementation", loops),

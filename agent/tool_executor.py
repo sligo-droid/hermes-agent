@@ -25,6 +25,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.runtime_phase_classification import classify_runtime_phase
+from agent.runtime_spans import finish_agent_runtime_span, start_agent_runtime_span
 from agent.display import (
     KawaiiSpinner,
     build_tool_preview as _build_tool_preview,
@@ -68,7 +70,80 @@ def _storage_safe_tool_args(tool_name: str, args: dict) -> dict:
         }
     if tool_name == "browser_type" and "text" in safe_args:
         safe_args = {**safe_args, "text": "[REDACTED_BROWSER_INPUT]"}
+    if tool_name == "visual_qa":
+        assertions = []
+        for raw in safe_args.get("assertions") if isinstance(safe_args.get("assertions"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            assertion_id = str(raw.get("id") or "")[:48]
+            kind = str(raw.get("kind") or "")[:48]
+            if assertion_id and kind:
+                assertions.append({"id": assertion_id, "kind": kind})
+            if len(assertions) >= 6:
+                break
+        safe_args = {"assertions": assertions}
     return safe_args
+
+
+def storage_safe_tool_calls(tool_calls: Any) -> list[dict[str, Any]] | None:
+    """Return a durable copy of tool calls with sensitive arguments removed."""
+
+    if not isinstance(tool_calls, list):
+        return None
+    safe_calls: list[dict[str, Any]] = []
+    for raw in tool_calls:
+        if isinstance(raw, dict):
+            call = dict(raw)
+            function = call.get("function")
+            if isinstance(function, dict):
+                safe_function = dict(function)
+                name = str(safe_function.get("name") or "")
+                arguments = safe_function.get("arguments")
+                try:
+                    parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    safe_parsed = _storage_safe_tool_args(name, parsed)
+                    safe_function["arguments"] = json.dumps(
+                        safe_parsed,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                call["function"] = safe_function
+            elif "name" in call and "arguments" in call:
+                name = str(call.get("name") or "")
+                arguments = call.get("arguments")
+                try:
+                    parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    call["arguments"] = json.dumps(
+                        _storage_safe_tool_args(name, parsed),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+            safe_calls.append(call)
+            continue
+        function = getattr(raw, "function", None)
+        name = str(getattr(function, "name", "") or "")
+        arguments = getattr(function, "arguments", "{}")
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+        safe_calls.append(
+            {
+                "name": name,
+                "arguments": json.dumps(
+                    _storage_safe_tool_args(name, parsed if isinstance(parsed, dict) else {}),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+    return safe_calls
 
 
 def _current_session_cwd(agent: Any = None) -> str:
@@ -398,6 +473,46 @@ def _record_turn_verification_evidence(
             order=order,
         )
         if evidence:
+            trusted: dict[str, Any] = {}
+            if function_name == "terminal" and not is_error:
+                try:
+                    result_data = result if isinstance(result, dict) else json.loads(str(result))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result_data = {}
+                candidate = (
+                    result_data.get("verification_evidence")
+                    if isinstance(result_data, dict)
+                    else None
+                )
+                if isinstance(candidate, dict) and str(candidate.get("status") or "") == "passed":
+                    repository_root = str(candidate.get("repository_root") or "").strip()
+                    canonical_command = str(candidate.get("canonical_command") or "").strip()
+                    scope = str(candidate.get("scope") or "").strip()
+                    verified_head_sha = str(candidate.get("verified_head_sha") or "").strip().lower()
+                    if repository_root and canonical_command and scope and re.fullmatch(
+                        r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                        verified_head_sha,
+                    ):
+                        trusted = {
+                            "repository_root": repository_root,
+                            "canonical_command": canonical_command,
+                            "scope": scope,
+                            "mutation_generation": int(
+                                getattr(agent, "_turn_mutation_generation", 0) or 0
+                            ),
+                            "mutation_boundary": int(
+                                getattr(agent, "_turn_mutation_boundary", 0) or 0
+                            ),
+                            "verified_head_sha": verified_head_sha,
+                        }
+            if trusted:
+                for item in evidence:
+                    if (
+                        isinstance(item, dict)
+                        and str(item.get("status") or "") == "success"
+                        and str(item.get("surface") or "") in {"verification", "ci"}
+                    ):
+                        item.update(trusted)
             stats.setdefault("verification_evidence", []).extend(evidence)
         # Visual QA is a distinct, opt-in receipt channel.  In particular, do
         # not derive it from ordinary browser evidence: navigation, snapshots,
@@ -438,6 +553,7 @@ def _record_visual_qa_edit_order(
     function_name: str,
     function_result: Any,
     *,
+    task_id: str = "",
     tool_runtime_recorded: bool = False,
 ) -> None:
     """Remember the last landed edit's tool order for receipt freshness."""
@@ -448,7 +564,17 @@ def _record_visual_qa_edit_order(
             return
         stats = getattr(agent, "_turn_runtime_stats", None)
         prior_calls = int(stats.get("tool_calls") or 0) if isinstance(stats, dict) else 0
-        agent._visual_qa_last_edit_order = prior_calls if tool_runtime_recorded else prior_calls + 1
+        mutation_boundary = prior_calls if tool_runtime_recorded else prior_calls + 1
+        agent._visual_qa_last_edit_order = mutation_boundary
+        mutation_generation = int(getattr(agent, "_turn_mutation_generation", 0) or 0) + 1
+        agent._turn_mutation_generation = mutation_generation
+        agent._turn_mutation_boundary = mutation_boundary
+        if isinstance(stats, dict):
+            stats["mutation_generation"] = mutation_generation
+            stats["mutation_boundary"] = mutation_boundary
+        from tools.visual_assertion_runner import record_trusted_visual_mutation
+
+        record_trusted_visual_mutation(task_id or getattr(agent, "_current_task_id", ""))
     except Exception:
         logger.debug("visual QA edit-order accounting failed", exc_info=True)
 
@@ -699,10 +825,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     if not agent.quiet_mode:
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
         for i, (tc, name, args, storage_args, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
-            args_str = json.dumps(args, ensure_ascii=False)
+            args_str = json.dumps(storage_args, ensure_ascii=False)
             if agent.verbose_logging:
-                print(f"  📞 Tool {i}: {name}({list(args.keys())})")
-                print(agent._wrap_verbose("Args: ", json.dumps(args, indent=2, ensure_ascii=False)))
+                print(f"  📞 Tool {i}: {name}({list(storage_args.keys())})")
+                print(agent._wrap_verbose("Args: ", json.dumps(storage_args, indent=2, ensure_ascii=False)))
             else:
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
@@ -739,11 +865,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             args["_parallel_group"] = dict(parallel_coding_group)
 
     # ── Concurrent execution ─────────────────────────────────────────
+    concurrency_group_id = f"tool-batch-{uuid.uuid4().hex[:12]}"
     # Each slot holds (function_name, execution_args, storage_args, result, duration, error_flag, blocked_flag)
     results = [None] * num_tools
     for i, (tc, name, args, storage_args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, storage_args, block_result, 0.0, True, True)
+            blocked_span = start_agent_runtime_span(
+                agent,
+                name,
+                phase=classify_runtime_phase("tool", tool_name=name),
+                attempt_id=str(tc.id or ""),
+                concurrency_id=concurrency_group_id,
+                metadata={"tool": name},
+            )
+            finish_agent_runtime_span(agent, blocked_span, status="blocked")
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
@@ -780,6 +916,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
+        runtime_span = start_agent_runtime_span(
+            agent,
+            function_name,
+            phase=classify_runtime_phase("tool", tool_name=function_name),
+            attempt_id=str(tool_call.id or ""),
+            concurrency_id=concurrency_group_id,
+            metadata={"tool": function_name},
+        )
+        span_status = "cancelled"
         try:
             try:
                 result = agent._invoke_tool(
@@ -795,6 +940,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            span_status = "error" if is_error else "ok"
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -809,6 +955,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 False,
             )
         finally:
+            finish_agent_runtime_span(agent, runtime_span, status=span_status)
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
             # starts with a clean slate.  This MUST be in a finally block
@@ -979,7 +1126,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     agent._record_file_mutation_result(
                         function_name, result_storage_args, function_result, is_error,
                     )
-                    _record_visual_qa_edit_order(agent, function_name, function_result)
+                    _record_visual_qa_edit_order(
+                        agent,
+                        function_name,
+                        function_result,
+                        task_id=effective_task_id,
+                    )
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
@@ -1065,11 +1217,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
         messages.append(make_tool_result_message(name, _tool_content, tc.id))
+        agent._flush_messages_to_session_db(messages)
 
         # ── Per-tool /steer drain ───────────────────────────────────
-        # Same as the sequential path: drain between each collected
-        # result so the steer lands as early as possible.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
+        # Drain between results, but defer the final result until after
+        # aggregate budgeting so the user guidance cannot be truncated.
+        if i < num_tools - 1:
+            agent._apply_pending_steer_to_tool_results(messages, 1)
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
@@ -1083,6 +1237,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # so the steer marker is never truncated. See steer() for details.
     if num_tools > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools)
+        rewrite_messages = getattr(agent, "_rewrite_messages_to_session_db", None)
+        if callable(rewrite_messages):
+            rewrite_messages(messages)
 
 
 
@@ -1181,10 +1338,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             agent._iters_since_skill = 0
 
         if not agent.quiet_mode:
-            args_str = json.dumps(function_args, ensure_ascii=False)
+            args_str = json.dumps(storage_args, ensure_ascii=False)
             if agent.verbose_logging:
-                print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())})")
-                print(agent._wrap_verbose("Args: ", json.dumps(function_args, indent=2, ensure_ascii=False)))
+                print(f"  📞 Tool {i}: {function_name}({list(storage_args.keys())})")
+                print(agent._wrap_verbose("Args: ", json.dumps(storage_args, indent=2, ensure_ascii=False)))
             else:
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
@@ -1241,6 +1398,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        runtime_span = start_agent_runtime_span(
+            agent,
+            function_name,
+            phase=classify_runtime_phase("tool", tool_name=function_name),
+            attempt_id=str(tool_call.id or ""),
+            metadata={"tool": function_name},
+        )
         _hooks_applied_by_dispatch = False
 
         if _preflight_block_result is not None:
@@ -1546,6 +1710,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+        finish_agent_runtime_span(
+            agent,
+            runtime_span,
+            status=(
+                "blocked"
+                if _execution_blocked
+                else "error"
+                if _is_error_result
+                else "ok"
+            ),
+        )
         _record_turn_tool_runtime(
             agent,
             function_name,
@@ -1569,7 +1744,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name, storage_args, function_result, _is_error_result,
                 )
                 _record_visual_qa_edit_order(
-                    agent, function_name, function_result, tool_runtime_recorded=True,
+                    agent,
+                    function_name,
+                    function_result,
+                    task_id=effective_task_id,
+                    tool_runtime_recorded=True,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -1624,12 +1803,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         messages.append(make_tool_result_message(function_name, _tool_content, tool_call.id))
+        agent._flush_messages_to_session_db(messages)
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Drain pending steer BETWEEN individual tool calls so the
-        # injection lands as soon as a tool finishes — not after the
-        # entire batch.  The model sees it on the next API iteration.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
+        # injection lands as soon as a tool finishes. Defer the final
+        # tool until after aggregate budgeting so guidance is not truncated.
+        if i < len(assistant_message.tool_calls):
+            agent._apply_pending_steer_to_tool_results(messages, 1)
 
         if not agent.quiet_mode:
             if agent.verbose_logging:
@@ -1665,6 +1846,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # applied to sequential execution as well.
     if num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+        rewrite_messages = getattr(agent, "_rewrite_messages_to_session_db", None)
+        if callable(rewrite_messages):
+            rewrite_messages(messages)
 
 
 

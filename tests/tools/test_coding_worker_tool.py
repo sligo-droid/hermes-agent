@@ -1511,7 +1511,70 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
         mode="merge",
         task="land the requested change",
         worker_summary="Changed src/app.py and ran pytest.",
+        closeout_mode="shadow",
     )
+
+
+def test_fable_closeout_persists_before_worker_completion_and_notifies():
+    calls = []
+
+    class Ledger:
+        def get(self, work_id):
+            return {"id": work_id, "closeout": {"revision": 4}}
+
+        def activate_closeout(self, work_id, state, *, expected_revision):
+            calls.append(("activate", work_id, expected_revision, state))
+            return {**state, "revision": 5}
+
+    notifications = []
+    parent = SimpleNamespace(
+        _origin_work_item_id="work-1",
+        _closeout_ledger=Ledger(),
+        _closeout_notify=lambda work_id: notifications.append(work_id),
+    )
+    state = {
+        "id": "closeout-1",
+        "source": "fable",
+        "mode": "shadow",
+        "workspace": {
+            "path": "/mutable/worktree",
+            "canonical_path": "/canonical",
+            "repository": "acme/example",
+            "branch": "feature/test",
+            "base_branch": "main",
+        },
+        "policy": {"merge": "auto"},
+    }
+
+    persisted, error = cwt._persist_fable_closeout(
+        parent,
+        state,
+        {
+            "closeout": {
+                "mode": "shadow",
+                "surfaces": {"fable": True},
+                "post_merge_requirements": {"ci": True},
+            }
+        },
+    )
+
+    assert error == ""
+    assert persisted["revision"] == 5
+    assert [call[0] for call in calls] == ["activate"]
+    assert calls[0][2] == 4
+    assert calls[0][3]["policy"]["post_merge_requirements"]["ci"] is True
+    assert notifications == ["work-1"]
+
+
+def test_fable_closeout_fails_closed_without_durable_work_item():
+    persisted, error = cwt._persist_fable_closeout(
+        SimpleNamespace(),
+        {"id": "closeout-1", "workspace": {"path": "/mutable"}},
+        {"closeout": {"mode": "shadow", "surfaces": {"fable": True}}},
+    )
+
+    assert persisted is None
+    assert "durable closeout work item" in error
 
 
 def test_background_fable_completion_contains_trusted_git_evidence(monkeypatch, tmp_path):

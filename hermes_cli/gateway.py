@@ -854,7 +854,76 @@ def _runtime_has_connected_configured_platform(state: dict | None) -> bool:
         return bool(connected)
     if not configured:
         return True
-    return bool(connected & configured)
+    return configured.issubset(connected)
+
+
+def _expected_gateway_source_commit() -> str:
+    """Return the exact clean source commit the replacement should load."""
+
+    try:
+        from gateway.status import compute_gateway_source_identity
+
+        identity = compute_gateway_source_identity()
+    except Exception:
+        return ""
+    if identity.source_dirty:
+        return ""
+    commit = str(identity.source_commit or "").strip().lower()
+    if len(commit) not in {40, 64}:
+        return ""
+    try:
+        int(commit, 16)
+    except ValueError:
+        return ""
+    return commit
+
+
+def _gateway_replacement_proof(
+    runtime_state: dict | None,
+    *,
+    manager_pid: int | None,
+    previous_pid: int | None,
+    previous_start_time: int | None,
+    actual_start_time: int | None,
+    expected_source_commit: str = "",
+) -> tuple[bool, str]:
+    """Validate replacement process, runtime, source, and readiness evidence."""
+
+    state = runtime_state if isinstance(runtime_state, dict) else {}
+    try:
+        runtime_pid = int(state.get("pid") or 0)
+        runtime_start = int(state.get("start_time"))
+    except (TypeError, ValueError):
+        return False, "runtime_process_identity_missing"
+    if runtime_pid <= 0 or manager_pid != runtime_pid:
+        return False, "runtime_pid_mismatch"
+    if previous_pid is not None and runtime_pid == previous_pid:
+        return False, "replacement_pid_not_changed"
+    if actual_start_time is None or runtime_start != actual_start_time:
+        return False, "runtime_start_time_mismatch"
+    if previous_pid is not None and previous_start_time is not None:
+        if (runtime_pid, runtime_start) == (previous_pid, previous_start_time):
+            return False, "replacement_process_not_changed"
+    if state.get("kind") != "hermes-gateway" or not isinstance(state.get("argv"), list):
+        return False, "runtime_identity_inconsistent"
+    if state.get("gateway_state") != "running":
+        return False, "gateway_not_running"
+    if bool(state.get("restart_requested")):
+        return False, "restart_request_not_cleared"
+    expected = str(expected_source_commit or "").strip().lower()
+    if expected:
+        source_commit = str(state.get("source_commit") or "").strip().lower()
+        if source_commit != expected:
+            return False, "source_commit_mismatch"
+        if state.get("source_identity_kind") not in {"build_env", "git"}:
+            return False, "source_identity_kind_invalid"
+        if not str(state.get("source_root") or "").strip():
+            return False, "source_root_missing"
+        if state.get("source_dirty") is not False:
+            return False, "source_checkout_dirty"
+    if not _runtime_has_connected_configured_platform(state):
+        return False, "platform_not_ready"
+    return True, "passed"
 
 
 def _format_restart_blocker_evidence(evidence) -> str:
@@ -868,6 +937,8 @@ def _wait_for_systemd_service_restart(
     *,
     system: bool = False,
     previous_pid: int | None = None,
+    previous_start_time: int | None = None,
+    expected_source_commit: str = "",
     timeout: float = 60.0,
 ) -> bool:
     """Wait for the gateway service to become active after a restart handoff."""
@@ -885,10 +956,11 @@ def _wait_for_systemd_service_restart(
         sub_state = props.get("SubState", "")
         new_pid = None
         try:
-            from gateway.status import get_running_pid
+            from gateway.status import get_process_start_time, get_running_pid
 
             new_pid = get_running_pid()
         except Exception:
+            get_process_start_time = lambda _pid: None
             new_pid = None
         if not new_pid:
             new_pid = _systemd_main_pid_from_props(props)
@@ -909,22 +981,29 @@ def _wait_for_systemd_service_restart(
             return False
 
         if active_state == "active":
-            if new_pid and (previous_pid is None or new_pid != previous_pid):
-                gateway_state = (runtime_state or {}).get("gateway_state")
-                restart_requested = bool((runtime_state or {}).get("restart_requested"))
-                if (
-                    gateway_state == "running"
-                    and not restart_requested
-                    and _runtime_has_connected_configured_platform(runtime_state)
-                ):
+            if new_pid:
+                actual_start_time = get_process_start_time(new_pid)
+                proven, proof_code = _gateway_replacement_proof(
+                    runtime_state,
+                    manager_pid=new_pid,
+                    previous_pid=previous_pid,
+                    previous_start_time=previous_start_time,
+                    actual_start_time=actual_start_time,
+                    expected_source_commit=expected_source_commit,
+                )
+                if proven:
                     print(f"✓ {scope_label} service restarted (PID {new_pid})")
                     return True
+                gateway_state = (runtime_state or {}).get("gateway_state")
                 if gateway_state == "startup_failed":
                     reason = (runtime_state or {}).get("exit_reason") or "startup failed"
                     print(f"⚠ {scope_label} service process restarted (PID {new_pid}), but gateway startup failed: {reason}")
                     return False
                 if not printed_runtime_wait:
-                    print(f"⏳ {scope_label} service process started (PID {new_pid}); waiting for gateway runtime...")
+                    print(
+                        f"⏳ {scope_label} service process started (PID {new_pid}); "
+                        f"waiting for gateway runtime proof ({proof_code})..."
+                    )
                     printed_runtime_wait = True
 
         if active_state == "activating" and sub_state == "auto-restart":
@@ -986,7 +1065,12 @@ def _print_systemd_start_limit_wait(system: bool = False) -> None:
     print(f"  Check logs: {journal_prefix}-u {svc} -l --since '5 min ago'")
 
 
-def _recover_pending_systemd_restart(system: bool = False, previous_pid: int | None = None) -> bool:
+def _recover_pending_systemd_restart(
+    system: bool = False,
+    previous_pid: int | None = None,
+    *,
+    expected_source_commit: str = "",
+) -> bool:
     """Recover a planned service restart that is stuck in systemd state."""
     props = _read_systemd_unit_properties(system=system)
     if not props:
@@ -1011,6 +1095,7 @@ def _recover_pending_systemd_restart(system: bool = False, previous_pid: int | N
         return _wait_for_systemd_service_restart(
             system=system,
             previous_pid=previous_pid,
+            expected_source_commit=expected_source_commit,
         )
 
     if active_state == "failed" and (
@@ -1035,6 +1120,7 @@ def _recover_pending_systemd_restart(system: bool = False, previous_pid: int | N
         return _wait_for_systemd_service_restart(
             system=system,
             previous_pid=previous_pid,
+            expected_source_commit=expected_source_commit,
         )
 
     return False
@@ -2805,7 +2891,11 @@ def systemd_stop(system: bool = False):
 
 
 
-def systemd_restart(system: bool = False):
+def systemd_restart(
+    system: bool = False,
+    *,
+    expected_source_commit: str = "",
+):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("restart")
@@ -2814,9 +2904,14 @@ def systemd_restart(system: bool = False):
     _require_service_installed("restart", system=system)
     refresh_systemd_unit_if_needed(system=system)
     _sync_hermes_home_from_systemd_unit(system=system)
-    from gateway.status import get_running_pid
+    expected_source_commit = (
+        str(expected_source_commit or "").strip().lower()
+        or _expected_gateway_source_commit()
+    )
+    from gateway.status import get_process_start_time, get_running_pid
 
     pid = get_running_pid() or _systemd_main_pid(system=system)
+    previous_start_time = get_process_start_time(pid) if pid is not None else None
     if pid is not None:
         scope_label = _service_scope_label(system).capitalize()
         svc = get_service_name()
@@ -2840,7 +2935,12 @@ def systemd_restart(system: bool = False):
                 check=False,
                 timeout=90,
             )
-            if _wait_for_systemd_service_restart(system=system, previous_pid=pid):
+            if _wait_for_systemd_service_restart(
+                system=system,
+                previous_pid=pid,
+                previous_start_time=previous_start_time,
+                expected_source_commit=expected_source_commit,
+            ):
                 return
             if _systemd_service_is_start_limited(system=system):
                 return
@@ -2870,10 +2970,19 @@ def systemd_restart(system: bool = False):
                 "check `hermes gateway status` or logs for final state."
             )
             return
-        _wait_for_systemd_service_restart(system=system, previous_pid=pid)
+        _wait_for_systemd_service_restart(
+            system=system,
+            previous_pid=pid,
+            previous_start_time=previous_start_time,
+            expected_source_commit=expected_source_commit,
+        )
         return
 
-    if _recover_pending_systemd_restart(system=system, previous_pid=pid):
+    if _recover_pending_systemd_restart(
+        system=system,
+        previous_pid=pid,
+        expected_source_commit=expected_source_commit,
+    ):
         return
 
     _run_systemctl(
@@ -2896,7 +3005,12 @@ def systemd_restart(system: bool = False):
             "check `hermes gateway status` or logs for final state."
         )
         return
-    _wait_for_systemd_service_restart(system=system, previous_pid=pid)
+    _wait_for_systemd_service_restart(
+        system=system,
+        previous_pid=pid,
+        previous_start_time=previous_start_time,
+        expected_source_commit=expected_source_commit,
+    )
 
 
 

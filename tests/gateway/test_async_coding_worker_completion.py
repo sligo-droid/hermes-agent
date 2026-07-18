@@ -54,6 +54,55 @@ def _reset_async_state():
         process_registry.completion_queue.get_nowait()
 
 
+class _OverlappingWorkLedger:
+    def __init__(self, *, include_origin: bool = True):
+        self.items = {
+            "work-b": {
+                "id": "work-b",
+                "session_key": "agent:main:discord:thread:111:222",
+                "platform": "discord",
+                "status": "agent_running",
+                "updated_at": 20,
+                "feature_summary": {"initial_request": "Later work B"},
+                "channel_prompt": "Later work instructions",
+            }
+        }
+        if include_origin:
+            self.items["work-a"] = {
+                "id": "work-a",
+                "session_key": "agent:main:discord:thread:111:222",
+                "platform": "discord",
+                "status": "agent_running",
+                "updated_at": 10,
+                "feature_summary": {"initial_request": "Original work A"},
+                "channel_prompt": "Original work instructions",
+            }
+        self.mutation_attempts = []
+
+    def id_for_event(self, _event, _session_key):
+        return None
+
+    def get(self, work_id):
+        return self.items.get(work_id)
+
+    def incomplete_items(self):
+        return list(self.items.values())
+
+    def mark_summary_updated(self, work_id):
+        self.mutation_attempts.append(("summary", work_id))
+        if work_id not in self.items:
+            return False
+        self.items[work_id]["status"] = "summary_updated"
+        return True
+
+    def mark_completed(self, work_id):
+        self.mutation_attempts.append(("completed", work_id))
+        if work_id not in self.items:
+            return False
+        self.items[work_id]["status"] = "completed"
+        return True
+
+
 def test_coding_worker_completion_message_is_self_contained():
     text = _format_gateway_process_notification(_coding_event())
 
@@ -100,6 +149,28 @@ async def test_completion_turn_targets_original_discord_thread_and_carries_worke
     assert synth_event.background_completion_id == "deleg_worker1"
     assert synth_event.completed_worker_run["background"] is True
     assert synth_event.completed_worker_run["model"] == "gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
+async def test_visible_completion_uses_exact_origin_with_overlapping_work_items():
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    ledger = _OverlappingWorkLedger()
+    runner._adapter_for_source = lambda source: adapter
+    runner._ledger = lambda: ledger
+    event = _coding_event(origin_work_item_id="work-a")
+    runner._enrich_async_delegation_routing(event)
+
+    assert await runner._inject_async_delegation_completion(
+        _format_gateway_process_notification(event),
+        event,
+    )
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.work_item_id == "work-a"
+    assert synth_event.feature_summary == {"initial_request": "Original work A"}
+    assert synth_event.channel_prompt == "Original work instructions"
+    assert synth_event.feature_summary != ledger.items["work-b"]["feature_summary"]
 
 
 @pytest.mark.asyncio
@@ -282,6 +353,31 @@ async def test_feature_summary_stays_running_while_background_worker_is_pending(
     kwargs = runner._update_discord_summaries.await_args.kwargs
     assert kwargs["status"] == "Running"
     assert "workers are still running" in kwargs["final_response"]
+
+
+@pytest.mark.asyncio
+async def test_suppressed_completion_missing_origin_cannot_mutate_later_work_item():
+    runner = object.__new__(GatewayRunner)
+    ledger = _OverlappingWorkLedger(include_origin=False)
+    adapter = SimpleNamespace(on_processing_complete=AsyncMock())
+    runner._adapter_for_source = lambda source: adapter
+    runner._ledger = lambda: ledger
+    runner._session_has_pending_background_workers = lambda *args, **kwargs: False
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+    event = _coding_event(origin_work_item_id="work-a")
+    runner._enrich_async_delegation_routing(event)
+
+    await runner._finalize_suppressed_async_completion(event)
+
+    completion_event = adapter.on_processing_complete.await_args.args[0]
+    assert completion_event.work_item_id == "work-a"
+    assert completion_event.feature_summary is None
+    assert completion_event.channel_prompt is None
+    assert ledger.items["work-b"]["status"] == "agent_running"
+    assert ledger.mutation_attempts == [
+        ("summary", "work-a"),
+        ("completed", "work-a"),
+    ]
 
 
 @pytest.mark.asyncio

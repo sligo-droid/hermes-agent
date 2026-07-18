@@ -1539,6 +1539,11 @@ class AIAgent:
                 self._ensure_db_session()
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
+            append_with_revision = getattr(
+                type(self._session_db), "append_message_with_revision", None
+            )
+            wrote_message = False
+            latest_revision = None
             for msg in messages[flush_from:]:
                 if _is_ephemeral_scaffolding(msg):
                     continue
@@ -1552,30 +1557,98 @@ class AIAgent:
                 else:
                     content = sanitize_history_content(content)
                 tool_calls_data = None
+                from agent.tool_executor import storage_safe_tool_calls
+
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
-                    tool_calls_data = [
-                        {"name": tc.function.name, "arguments": tc.function.arguments}
-                        for tc in msg.tool_calls
-                    ]
+                    tool_calls_data = storage_safe_tool_calls(msg.tool_calls)
                 elif isinstance(msg.get("tool_calls"), list):
-                    tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
-                    session_id=self.session_id,
-                    role=role,
-                    content=content,
-                    tool_name=msg.get("tool_name"),
-                    tool_calls=tool_calls_data,
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning") if role == "assistant" else None,
-                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
-                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
-                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
-                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    tool_calls_data = storage_safe_tool_calls(msg["tool_calls"])
+                append_kwargs = {
+                    "session_id": self.session_id,
+                    "role": role,
+                    "content": content,
+                    "tool_name": msg.get("tool_name"),
+                    "tool_calls": tool_calls_data,
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "finish_reason": msg.get("finish_reason"),
+                    "reasoning": msg.get("reasoning") if role == "assistant" else None,
+                    "reasoning_content": msg.get("reasoning_content") if role == "assistant" else None,
+                    "reasoning_details": msg.get("reasoning_details") if role == "assistant" else None,
+                    "codex_reasoning_items": msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    "codex_message_items": msg.get("codex_message_items") if role == "assistant" else None,
+                }
+                if callable(append_with_revision):
+                    _, latest_revision = append_with_revision(
+                        self._session_db, **append_kwargs
+                    )
+                else:
+                    self._session_db.append_message(**append_kwargs)
+                    latest_revision = None
+                wrote_message = True
+            if wrote_message:
+                self._last_flushed_db_snapshot_token = (
+                    (self.session_id, int(latest_revision))
+                    if latest_revision is not None
+                    else None
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+
+    def _rewrite_messages_to_session_db(self, messages: List[Dict]) -> None:
+        """Atomically persist the final post-budget/post-steer transcript."""
+
+        if not self._session_db or not callable(getattr(self._session_db, "replace_messages", None)):
+            return
+        try:
+            from agent.tool_executor import storage_safe_tool_calls
+
+            safe_messages: list[dict[str, Any]] = []
+            for raw in messages:
+                if not isinstance(raw, dict) or _is_ephemeral_scaffolding(raw):
+                    continue
+                msg = dict(raw)
+                content = msg.get("content")
+                if _is_multimodal_tool_result(content):
+                    msg["content"] = _multimodal_text_summary(content)
+                else:
+                    msg["content"] = sanitize_history_content(content)
+                if isinstance(msg.get("tool_calls"), list):
+                    msg["tool_calls"] = storage_safe_tool_calls(msg["tool_calls"])
+                safe_messages.append(msg)
+            snapshot_token = getattr(
+                self, "_last_flushed_db_snapshot_token", None
+            )
+            expected_revision = None
+            if (
+                isinstance(snapshot_token, tuple)
+                and len(snapshot_token) == 2
+                and snapshot_token[0] == self.session_id
+            ):
+                expected_revision = int(snapshot_token[1])
+            replace_kwargs = {
+                "expected_message_count": len(safe_messages),
+            }
+            if expected_revision is not None:
+                replace_kwargs["expected_transcript_revision"] = expected_revision
+            replaced = self._session_db.replace_messages(
+                self.session_id,
+                safe_messages,
+                **replace_kwargs,
+            )
+            if replaced is False:
+                logger.warning(
+                    "Session DB transcript changed during final rewrite; preserving concurrent rows"
+                )
+                return
+            self._last_flushed_db_snapshot_token = (
+                (self.session_id, expected_revision + 1)
+                if expected_revision is not None
+                else None
+            )
+            self._last_flushed_db_idx = len(messages)
+        except Exception as e:
+            logger.warning("Session DB replace_messages failed: %s", e)
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -1919,7 +1992,9 @@ class AIAgent:
             if Path(getattr(self, "session_log_file")) != expected_log_file:
                 self.session_log_file = expected_log_file
 
-            # Clean assistant content for session logs
+            # Clean assistant content and tool-call arguments for session logs.
+            from agent.tool_executor import storage_safe_tool_calls
+
             cleaned = []
             for msg in messages:
                 if _is_ephemeral_scaffolding(msg):
@@ -1935,6 +2010,9 @@ class AIAgent:
                 if "content" in msg:
                     msg = dict(msg)
                     msg["content"] = self._redact_message_content(msg.get("content"))
+                if isinstance(msg.get("tool_calls"), list):
+                    msg = dict(msg)
+                    msg["tool_calls"] = storage_safe_tool_calls(msg["tool_calls"])
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.

@@ -18,42 +18,41 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  basic:
-    name: basic
+  classify:
+    name: classify
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      python: ${{ steps.changes.outputs.python }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+      site: ${{ steps.changes.outputs.site }}
+      docker_meta: ${{ steps.changes.outputs.docker_meta }}
+      scan: ${{ steps.changes.outputs.scan }}
+      deps: ${{ steps.changes.outputs.deps }}
+      mcp_catalog: ${{ steps.changes.outputs.mcp_catalog }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Classify changed surfaces
-        id: changes
+      - name: Resolve bounded changed range
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          python scripts/ci/resolve_changed_range.py \
+            --event-name "$EVENT_NAME" \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" > /tmp/hermes-changed-paths.txt
 
-          if [[ "$EVENT_NAME" != "pull_request" ]] \
-            || [[ -z "$BASE_SHA" || -z "$HEAD_SHA" ]] \
-            || [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]] \
-            || ! git cat-file -e "$BASE_SHA^{commit}" \
-            || ! git cat-file -e "$HEAD_SHA^{commit}"; then
-            # No reliable range is deliberately fail-open: the classifier's
-            # empty input enables every lane rather than silently skipping CI.
-            printf '\n' | python scripts/ci/classify_changes.py
-          else
-            git diff --name-only "$BASE_SHA...$HEAD_SHA" | python scripts/ci/classify_changes.py
-          fi
+      - name: Classify changed surfaces
+        id: changes
+        run: python scripts/ci/classify_changes.py < /tmp/hermes-changed-paths.txt
 
       - name: Run source-CI preflight
-        if: >-
-          steps.changes.outputs.python == 'true' ||
-          steps.changes.outputs.frontend == 'true' ||
-          steps.changes.outputs.site == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -65,50 +64,66 @@ jobs:
             --head "$HEAD_SHA" \
             --pr-number "$PR_NUMBER"
 
+  python:
+    name: python
+    needs: classify
+    if: needs.classify.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+
       - name: Install uv
-        if: steps.changes.outputs.python == 'true' || steps.changes.outputs.site == 'true'
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
 
       - name: Set up Python 3.11
-        if: steps.changes.outputs.python == 'true' || steps.changes.outputs.site == 'true'
         run: uv python install 3.11
 
       - name: Install Python dependencies
-        if: steps.changes.outputs.python == 'true' || steps.changes.outputs.site == 'true'
         run: |
           uv venv .venv --python 3.11
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
       - name: Compile core Python packages
-        if: steps.changes.outputs.python == 'true'
         run: |
           source .venv/bin/activate
           python -m compileall hermes_cli gateway plugins tools agent -q
 
       - name: Run fork smoke suite
-        if: steps.changes.outputs.python == 'true'
         run: scripts/run_tests.sh --smoke -q --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+  frontend:
+    name: frontend
+    needs: classify
+    if: needs.classify.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+
       - name: Set up Node 22
-        if: steps.changes.outputs.frontend == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Install frontend dependencies
-        if: steps.changes.outputs.frontend == 'true'
         run: |
           npm install -g npm@11.14.1
           npm ci
 
       - name: Run frontend typechecks and desktop build
-        if: steps.changes.outputs.frontend == 'true'
         run: |
           npm run --workspace ui-tui typecheck
           npm run --workspace web typecheck
@@ -117,16 +132,81 @@ jobs:
           npm run --workspace apps/shared typecheck
           npm run --workspace apps/desktop build
 
+  site:
+    name: site
+    needs: classify
+    if: needs.classify.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install Python dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
       - name: Check generated English skill docs
-        if: steps.changes.outputs.site == 'true'
         run: |
           source .venv/bin/activate
           python website/scripts/generate-skill-docs.py --check
 
       - name: Run docs and skill source tests
-        if: steps.changes.outputs.site == 'true'
         run: scripts/run_tests.sh tests/skills/test_shipped_skill_source_hygiene.py tests/website/test_generate_skill_docs.py -q --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+  basic:
+    name: basic
+    if: always()
+    needs: [classify, python, frontend, site]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify conditional lane results
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          PYTHON_REQUIRED: ${{ needs.classify.outputs.python }}
+          PYTHON_RESULT: ${{ needs.python.result }}
+          FRONTEND_REQUIRED: ${{ needs.classify.outputs.frontend }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          SITE_REQUIRED: ${{ needs.classify.outputs.site }}
+          SITE_RESULT: ${{ needs.site.result }}
+        run: |
+          set -euo pipefail
+          [[ "$CLASSIFY_RESULT" == "success" ]] || {
+            echo "classify failed: $CLASSIFY_RESULT" >&2
+            exit 1
+          }
+          verify_lane() {
+            local name="$1" required="$2" result="$3"
+            if [[ "$required" == "true" ]]; then
+              [[ "$result" == "success" ]] || {
+                echo "$name was required but finished as $result" >&2
+                exit 1
+              }
+            elif [[ "$required" == "false" ]]; then
+              [[ "$result" == "skipped" || "$result" == "success" ]] || {
+                echo "$name was irrelevant but finished as $result" >&2
+                exit 1
+              }
+            else
+              echo "$name classifier output was invalid: ${required:-<empty>}" >&2
+              exit 1
+            fi
+          }
+          verify_lane python "$PYTHON_REQUIRED" "$PYTHON_RESULT"
+          verify_lane frontend "$FRONTEND_REQUIRED" "$FRONTEND_RESULT"
+          verify_lane site "$SITE_REQUIRED" "$SITE_RESULT"

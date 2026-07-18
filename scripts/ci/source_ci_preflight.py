@@ -101,14 +101,23 @@ def _diff_reference(
     options: tuple[str, ...] = (),
     paths: tuple[str, ...] = (),
 ) -> tuple[str, bool]:
-    """Read a three-dot diff, falling back to a root diff if history is absent."""
+    """Read a commit range, falling back to HEAD's tree versus the empty tree."""
+
     suffix = ["--", *paths] if paths else []
     if base and head and not set(base) == {"0"}:
         code, output, _error = _git_output(root, ["diff", *options, f"{base}...{head}", *suffix])
         if code == 0:
             return output, True
     if head:
-        code, output, _error = _git_output(root, ["diff", *options, "--root", head, *suffix])
+        # ``git diff --root <commit>`` compares the commit to the working tree
+        # and can return an empty scan for a clean checkout. ``diff-tree
+        # --root`` is the commit-to-tree operation: for a root commit it uses
+        # the empty tree, and for any other commit it scans the committed tree
+        # against its parent without consulting mutable workspace state.
+        code, output, _error = _git_output(
+            root,
+            ["diff-tree", "--root", "--no-commit-id", "-r", *options, head, *suffix],
+        )
         if code == 0:
             return output, True
     return "", False

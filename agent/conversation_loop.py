@@ -57,6 +57,11 @@ from agent.model_metadata import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.runtime_breakdown import build_turn_runtime_breakdown
+from agent.runtime_spans import (
+    RuntimeSpanRecorder,
+    finish_agent_runtime_span,
+    start_agent_runtime_span,
+)
 from agent.retry_utils import jittered_backoff
 from agent.runtime_context_budget import (
     RuntimeContextPart,
@@ -194,7 +199,13 @@ def _current_turn_runtime_breakdown(agent: Any, total_elapsed_s: float, scope: s
     if not isinstance(stats, dict):
         return {}
     try:
-        return build_turn_runtime_breakdown(stats, total_elapsed_s=total_elapsed_s, scope=scope)
+        runtime_stats = dict(stats)
+        recorder = getattr(agent, "_turn_runtime_span_recorder", None)
+        if isinstance(recorder, RuntimeSpanRecorder):
+            runtime_stats["phase_spans"] = recorder.export()
+        return build_turn_runtime_breakdown(
+            runtime_stats, total_elapsed_s=total_elapsed_s, scope=scope
+        )
     except Exception:
         logger.debug("turn runtime breakdown build failed", exc_info=True)
         return {}
@@ -792,23 +803,6 @@ def run_conversation(
 
     agent._ensure_db_session()
 
-    # Tell auxiliary_client what the live main provider/model are for
-    # this turn. Used by tools whose behaviour depends on the active
-    # main model (e.g. vision_analyze's native fast path) so they see
-    # the CLI/gateway override instead of the stale config.yaml
-    # default. Idempotent — fine to call every turn.
-    try:
-        from agent.auxiliary_client import set_runtime_main
-        set_runtime_main(
-            getattr(agent, "provider", "") or "",
-            getattr(agent, "model", "") or "",
-            base_url=getattr(agent, "base_url", "") or "",
-            api_key=getattr(agent, "api_key", "") or "",
-            api_mode=getattr(agent, "api_mode", "") or "",
-        )
-    except Exception:
-        pass
-
     # Tag all log records on this thread with the session ID so
     # ``hermes logs --session <id>`` can filter a single conversation.
     set_session_context(agent.session_id)
@@ -825,6 +819,15 @@ def run_conversation(
     # runtime so this turn gets a fresh attempt with the preferred model.
     # No-op when _fallback_activated is False (gateway, first turn, etc.).
     agent._restore_primary_runtime()
+
+    # Publish only after restoration so task-local vision/auxiliary routing
+    # cannot retain the previous turn's fallback endpoint or credentials.
+    try:
+        from agent.auxiliary_client import publish_runtime_main
+
+        publish_runtime_main(agent)
+    except Exception:
+        pass
 
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
@@ -1217,15 +1220,26 @@ def run_conversation(
 
     # Main conversation loop
     _turn_runtime_started_at = time.perf_counter()
-    agent._turn_runtime_stats = _new_turn_runtime_stats(_turn_runtime_started_at)
+    agent._turn_runtime_stats = _new_turn_runtime_stats(time.time())
+    agent._turn_runtime_span_recorder = RuntimeSpanRecorder(
+        work_id=effective_task_id,
+        max_spans=200,
+    )
+    agent._turn_mutation_generation = 0
+    agent._turn_mutation_boundary = 0
     agent._visual_qa_last_edit_order = 0
     agent._visual_qa_followup_turns = 0
     try:
-        from agent.visual_qa import normalize_visual_requirement
+        from agent.visual_qa import (
+            normalize_visual_requirement,
+            set_active_visual_requirement,
+        )
 
-        agent._turn_runtime_stats["visual_qa_level"] = normalize_visual_requirement(
+        active_visual_requirement = normalize_visual_requirement(
             getattr(agent, "visual_qa_requirement", None)
-        )["level"]
+        )
+        set_active_visual_requirement(active_visual_requirement)
+        agent._turn_runtime_stats["visual_qa_level"] = active_visual_requirement["level"]
     except Exception:
         logger.debug("visual QA runtime classification accounting failed", exc_info=True)
     api_call_count = 0
@@ -1809,6 +1823,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _model_attempt_sequence = 0
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -1956,13 +1971,30 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
-                if _use_streaming:
-                    response = agent._interruptible_streaming_api_call(
-                        api_kwargs, on_first_delta=_stop_spinner
-                    )
+                _model_attempt_sequence += 1
+                _model_span = start_agent_runtime_span(
+                    agent,
+                    "model_attempt",
+                    phase="model",
+                    attempt_id=f"model-{api_call_count + 1}-{_model_attempt_sequence}",
+                    metadata={
+                        "model": getattr(agent, "model", ""),
+                        "provider": getattr(agent, "provider", ""),
+                    },
+                )
+                try:
+                    if _use_streaming:
+                        response = agent._interruptible_streaming_api_call(
+                            api_kwargs, on_first_delta=_stop_spinner
+                        )
+                    else:
+                        response = agent._interruptible_api_call(api_kwargs)
+                except BaseException:
+                    finish_agent_runtime_span(agent, _model_span, status="error")
+                    raise
                 else:
-                    response = agent._interruptible_api_call(api_kwargs)
-                
+                    finish_agent_runtime_span(agent, _model_span, status="ok")
+
                 api_duration = time.time() - api_start_time
                 
                 # Stop thinking spinner silently -- the response box or tool
@@ -4736,6 +4768,7 @@ def run_conversation(
 
                 messages.append(assistant_msg)
                 agent._emit_interim_assistant_message(assistant_msg)
+                agent._flush_messages_to_session_db(messages, conversation_history)
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may

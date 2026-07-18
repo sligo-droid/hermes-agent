@@ -3,18 +3,21 @@ so that _resolve_auto() can route custom: providers in Step 1.
 
 Fixes https://github.com/NousResearch/hermes-agent/issues/34777
 """
+import contextvars
+
 import pytest
 from unittest.mock import patch, MagicMock
 
 
-def _get_globals(mod):
-    """Read runtime globals without triggering redaction."""
+def _get_runtime(mod):
+    """Read the current task-local runtime without logging credentials."""
+    runtime = mod.get_runtime_main()
     return {
-        "provider": mod._RUNTIME_MAIN_PROVIDER,
-        "model": mod._RUNTIME_MAIN_MODEL,
-        "base_url": mod._RUNTIME_MAIN_BASE_URL,
-        "cred": mod._RUNTIME_MAIN_API_KEY,  # renamed to avoid redaction
-        "api_mode": mod._RUNTIME_MAIN_API_MODE,
+        "provider": runtime["provider"],
+        "model": runtime["model"],
+        "base_url": runtime["base_url"],
+        "cred": runtime["api_key"],
+        "api_mode": runtime["api_mode"],
     }
 
 
@@ -34,7 +37,7 @@ class TestSetRuntimeMainCustomProvider:
                 api_key="sk-test-key",
                 api_mode="chat_completions",
             )
-            g = _get_globals(mod)
+            g = _get_runtime(mod)
             assert g["provider"] == "custom:my-router"
             assert g["model"] == "glm-5.1"
             assert g["base_url"] == "https://my-server.example.com/v1"
@@ -54,9 +57,25 @@ class TestSetRuntimeMainCustomProvider:
             api_mode="chat_completions",
         )
         mod.clear_runtime_main()
-        g = _get_globals(mod)
+        g = _get_runtime(mod)
         for v in g.values():
             assert v == "", f"Expected empty, got {v!r}"
+
+    def test_runtime_routes_are_context_local(self):
+        import agent.auxiliary_client as mod
+
+        mod.set_runtime_main("openrouter", "outer")
+        isolated = contextvars.Context()
+
+        def _inner():
+            mod.set_runtime_main("custom:inner", "inner")
+            return mod.get_runtime_main()
+
+        inner = isolated.run(_inner)
+
+        assert inner["provider"] == "custom:inner"
+        assert mod.get_runtime_main()["provider"] == "openrouter"
+        mod.clear_runtime_main()
 
     def test_resolve_auto_uses_globals_for_custom_provider(self):
         """_resolve_auto reads base_url/api_key from globals when main_runtime is None."""
@@ -119,7 +138,7 @@ class TestSetRuntimeMainCustomProvider:
         mod.clear_runtime_main()
         try:
             mod.set_runtime_main("openrouter", "gpt-4o")
-            g = _get_globals(mod)
+            g = _get_runtime(mod)
             assert g["provider"] == "openrouter"
             assert g["model"] == "gpt-4o"
             assert g["base_url"] == ""

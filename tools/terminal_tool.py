@@ -2770,6 +2770,8 @@ def terminal_tool(
                         "kind": evidence.get("kind"),
                         "scope": evidence.get("scope"),
                         "canonical_command": evidence.get("canonical_command"),
+                        "repository_root": evidence.get("repository_root"),
+                        "verified_head_sha": evidence.get("verified_head_sha"),
                     }
             except Exception:
                 logger.debug("verification evidence recording failed", exc_info=True)

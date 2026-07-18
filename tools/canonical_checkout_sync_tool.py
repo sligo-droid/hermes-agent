@@ -16,7 +16,7 @@ from typing import Any
 from tools.registry import registry, tool_error
 
 
-_MERGE_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_MERGE_COMMIT_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 
 
 SYNC_CANONICAL_CHECKOUT_SCHEMA = {
@@ -91,7 +91,7 @@ def sync_canonical_checkout_tool(
         return tool_error(denied)
     commit = str(merge_commit or "").strip()
     if not _MERGE_COMMIT_RE.fullmatch(commit):
-        return tool_error("merge_commit must be a 7-64 character hexadecimal Git SHA")
+        return tool_error("merge_commit must be an exact 40- or 64-character hexadecimal Git SHA")
     root, validation_error = _canonical_root(project_path, branch)
     if validation_error:
         return tool_error(validation_error)
