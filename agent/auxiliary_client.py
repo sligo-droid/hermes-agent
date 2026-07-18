@@ -2185,6 +2185,20 @@ def _resolve_explicit_anthropic_env_value(key: str) -> str:
         return ""
 
 
+def _resolve_explicit_anthropic_base_url() -> str:
+    """Resolve the endpoint paired with an explicit Hermes Anthropic key."""
+    base_url = _resolve_explicit_anthropic_env_value("ANTHROPIC_BASE_URL")
+    if base_url:
+        return base_url.rstrip("/")
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        return str(config.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+    except Exception:
+        return ""
+
+
 def _select_explicit_anthropic_pool_entry(
     source_filter: Optional[str] = None,
 ) -> Tuple[bool, Optional[Any]]:
@@ -2242,7 +2256,7 @@ def _resolve_explicit_anthropic_credentials() -> Tuple[Optional[str], Optional[s
         token = _resolve_explicit_anthropic_env_value(key)
         if not token:
             continue
-        base_url = _resolve_explicit_anthropic_env_value("ANTHROPIC_BASE_URL")
+        base_url = _resolve_explicit_anthropic_base_url()
         if not base_url:
             _pool_present, entry = _select_explicit_anthropic_pool_entry(
                 source_filter=f"env:{key}"

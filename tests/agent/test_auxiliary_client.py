@@ -1934,6 +1934,39 @@ class TestCompressionProviderOutageFallback:
             "profile-anthropic-key", "http://127.0.0.1:8317"
         )
 
+    def test_compression_anthropic_chain_pairs_profile_key_with_config_base_url(self):
+        real_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+                ]
+            },
+        ), patch(
+            "hermes_cli.config.get_env_value",
+            side_effect=lambda key: (
+                "profile-anthropic-key" if key == "ANTHROPIC_API_KEY" else None
+            ),
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317/"},
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=real_client,
+        ) as build_client:
+            client, model, label = _try_configured_fallback_chain(
+                "compression", "openai-codex", reason="provider service outage"
+            )
+
+        assert client is not None
+        assert model == "claude-sonnet-4-6"
+        assert label == "fallback_chain[0](anthropic)"
+        build_client.assert_called_once_with(
+            "profile-anthropic-key", "http://127.0.0.1:8317"
+        )
+
     def test_explicit_anthropic_pool_selector_rehydrates_env_reference(self, monkeypatch):
         from agent.auxiliary_client import _select_explicit_anthropic_pool_entry
 
