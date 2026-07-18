@@ -59,7 +59,7 @@ def test_default_routes_reference_resolvable_tiers():
         "basic": "high",
         "intermediate": "max",
         "advanced": "xhigh",
-        "discord_action": "high",
+        "discord_action": "medium",
     }
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).model

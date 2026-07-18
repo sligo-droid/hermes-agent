@@ -2006,7 +2006,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_model_tier": "discord_action", # Ordinary Discord action requests use Sol/high
+        "action_request_model_tier": "discord_action", # Ordinary Discord action requests use Sol/medium
         "action_request_complex_model_tier": "advanced", # Complex/risky initial requests use shared Sol/xhigh
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort

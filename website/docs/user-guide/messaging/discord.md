@@ -318,7 +318,7 @@ discord:
   voice_auto_tag: false           # Native Discord voice messages still need @mention
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
-  action_request_model_tier: discord_action          # Simple/ordinary actions: Sol/high
+  action_request_model_tier: discord_action          # Simple/ordinary actions: Sol/medium
   action_request_complex_model_tier: advanced        # Complex/risky actions: Sol/xhigh
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
@@ -337,7 +337,7 @@ group_sessions_per_user: true     # Isolate sessions per user in shared channels
 ```
 
 Normal Discord action threads use the `discord_action` tier
-(`gpt-5.6-sol`, `high`). If the thread's initial request is classified as
+(`gpt-5.6-sol`, `medium`). If the thread's initial request is classified as
 complex or risky, Hermes uses the shared `advanced` tier
 (`gpt-5.6-sol`, `xhigh`) instead.
 

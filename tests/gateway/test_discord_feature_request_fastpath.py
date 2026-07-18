@@ -155,14 +155,14 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     )
 
     assert result["final_response"] == "ok"
-    assert result["reasoning_effort"] == "high"
+    assert result["reasoning_effort"] == "medium"
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
     cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
     audit = cached_agent._runtime_audit_context
     assert audit["model_tier"] == "discord_action"
@@ -210,7 +210,7 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
 @pytest.mark.parametrize(
     ("initial_request", "expected_tier", "expected_effort"),
     [
-        ("Fix a typo in the README", "discord_action", "high"),
+        ("Fix a typo in the README", "discord_action", "medium"),
         ("Migrate the production auth schema", "advanced", "xhigh"),
     ],
 )
@@ -271,10 +271,10 @@ async def test_invalid_or_disabled_complex_tier_falls_back_atomically_to_routine
     )
 
     assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
-    assert result["reasoning_effort"] == "high"
+    assert result["reasoning_effort"] == "medium"
     assert _CapturingAgent.last_init["reasoning_config"] == {
         "enabled": True,
-        "effort": "high",
+        "effort": "medium",
     }
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
     assert audit["model_tier"] == "discord_action"

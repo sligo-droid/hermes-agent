@@ -200,7 +200,7 @@ model_tiers:
   discord_action:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol
-    reasoning_effort: high
+    reasoning_effort: medium
 
 # =============================================================================
 # Git Worktree Isolation
@@ -878,7 +878,7 @@ platform_toolsets:
 #   require_mention: true            # Require @mention in server channels (default: true)
 #   auto_thread: true                # Auto-create thread on @mention (default: true)
 #   free_response_channels: ""       # Channel IDs where no mention is needed
-#   action_request_model_tier: discord_action          # Simple/ordinary actions: Sol/high
+#   action_request_model_tier: discord_action          # Simple/ordinary actions: Sol/medium
 #   action_request_complex_model_tier: advanced        # Complex/risky actions: Sol/xhigh
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)

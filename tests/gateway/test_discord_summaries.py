@@ -277,7 +277,7 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert (tier.name, tier.model, tier.reasoning_effort) == (
         "discord_action",
         "gpt-5.6-sol",
-        "high",
+        "medium",
     )
     assert event.text == "Build a deploy dashboard"
     assert event.message_type == MessageType.TEXT
@@ -2724,9 +2724,9 @@ async def test_reply_native_voice_existing_action_thread_classifies_transcript(
 @pytest.mark.parametrize(
     ("trigger", "transcript", "expected_tier", "expected_effort"),
     [
-        ("auto", "Build the approved parser", "discord_action", "high"),
+        ("auto", "Build the approved parser", "discord_action", "medium"),
         ("mention", "Migrate the production auth schema", "advanced", "xhigh"),
-        ("reply", "Add parser telemetry", "discord_action", "high"),
+        ("reply", "Add parser telemetry", "discord_action", "medium"),
         ("action_channel", "Audit the production permission model", "advanced", "xhigh"),
     ],
 )
@@ -3012,7 +3012,7 @@ async def test_unmentioned_voice_action_followup_classifies_transcript(adapter, 
 @pytest.mark.parametrize(
     ("transcript", "expected_tier", "expected_effort"),
     [
-        ("Build a deploy dashboard", "discord_action", "high"),
+        ("Build a deploy dashboard", "discord_action", "medium"),
         ("Migrate the production auth schema", "advanced", "xhigh"),
     ],
 )

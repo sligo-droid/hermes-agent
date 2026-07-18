@@ -43,7 +43,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
     },
 }
 

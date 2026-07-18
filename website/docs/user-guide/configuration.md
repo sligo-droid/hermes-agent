@@ -1151,7 +1151,7 @@ choose a model and reasoning effort.
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
 | `basic` | GPT-5.6 Terra | `high` | Ordinary gateway sessions |
 | `intermediate` | GPT-5.6 Terra | `max` | Coding-worker build passes and Kanban `dev` |
-| `discord_action` | GPT-5.6 Sol | `high` | Simple and ordinary Discord action requests |
+| `discord_action` | GPT-5.6 Sol | `medium` | Simple and ordinary Discord action requests |
 | `advanced` | GPT-5.6 Sol | `xhigh` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
 These defaults are runtime-aware: routine routes use lower effort, build passes
@@ -1180,7 +1180,7 @@ model_tiers:
   discord_action:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol
-    reasoning_effort: high
+    reasoning_effort: medium
 
 gateway:
   model_tier: basic
