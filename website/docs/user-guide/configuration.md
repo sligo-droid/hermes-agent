@@ -1224,10 +1224,10 @@ raw model/reasoning values override the corresponding pass tier; an explicit
 per-worker pass tier overrides the configured pass tier. The compatibility
 `coding_worker.model_tier` field overrides all three pass tiers when non-empty.
 Set it to `disabled` to turn off tier routing globally and use the legacy raw
-OpenCode model and per-pass reasoning fields. The UI visual specialist remains
-an independent Claude Code route pinned to Claude Fable 5 at medium effort. It
-uses Claude Code's supported Anthropic OAuth login and does not inherit
-coding-worker tiers or `/fable`'s execution policy.
+OpenCode model and per-pass reasoning fields. The UI visual specialist is a
+model-neutral behavioral profile: it adds UI-focused skills and route evidence,
+then uses the configured Codex or OpenCode coding-worker backend. Explicit
+`worker_tier` selection and the normal coding-worker pass-tier precedence apply.
 OpenCode's `max` variant is forwarded literally as `reasoning.effort=max`; it is
 not normalized or aliased to `xhigh`.
 
@@ -1908,16 +1908,14 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 }
 ```
 
-Supported routes are `default_coding_worker`, `ui_visual_specialist`, `review_only_no_worker`, and `ask_human`. The UI specialist provider/model is used only for an explicit `ui_visual_specialist` route and only when the `ui_work` config guardrails allow it. Keyword detection remains advisory metadata and fallback evidence; a route of `default_coding_worker` keeps the default coding worker even when visual UI keywords appear.
+Supported routes are `default_coding_worker`, `ui_visual_specialist`, `review_only_no_worker`, and `ask_human`. An explicit `ui_visual_specialist` route adds the bundled `taste-skill`, `claude-design`, and `popular-web-designs` guidance while keeping the configured coding-worker backend and its normal pass tiers. Keyword detection remains advisory metadata; a route of `default_coding_worker` keeps the ordinary coding-worker behavior even when visual UI keywords appear.
 
 ```yaml
 ui_work:
   enabled: true
-  provider: openrouter
-  model: z-ai/glm-5.2
-  fallback:
-    allow_default_worker: true
 ```
+
+Legacy `ui_work.provider`, `model`, `route`, `reasoning_effort`, `specialist_backend`, `claude_code`, `codex`, and `fallback` keys are ignored and can be removed. Configure runtime model and reasoning selection under `coding_worker` instead.
 
 ## Clarify
 

@@ -6,11 +6,7 @@ import json
 import pytest
 
 from hermes_cli.config import DEFAULT_CONFIG
-from hermes_cli.ui_work_routing import (
-    codex_ui_work_extra_args,
-    opencode_ui_work_worker_config,
-    resolve_ui_work_route,
-)
+from hermes_cli.ui_work_routing import resolve_ui_work_route
 
 
 def _cfg():
@@ -25,7 +21,7 @@ def _cfg():
         "Redesign Command Center card footer visuals and responsive styling.",
     ],
 )
-def test_matches_new_visual_web_ui_development_and_overlay_args(task):
+def test_explicit_visual_route_selects_behavioral_profile(task):
     decision = resolve_ui_work_route(
         _cfg(),
         task=task,
@@ -44,8 +40,8 @@ def test_matches_new_visual_web_ui_development_and_overlay_args(task):
     assert decision.route_decision_confidence == 0.91
     assert decision.route_decision_rationale == "visual implementation"
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.selected_provider == "anthropic"
-    assert decision.selected_model == "claude-fable-5"
+    assert decision.selected_provider == ""
+    assert decision.selected_model == ""
     assert decision.metadata()["recommended_skills"] == [
         "taste-skill",
         "claude-design",
@@ -53,18 +49,13 @@ def test_matches_new_visual_web_ui_development_and_overlay_args(task):
     ]
     assert decision.advisory_matched is True
     assert "visual ui work" in decision.advisory_reason
-    assert decision.provider == "anthropic"
-    assert decision.model == "claude-fable-5"
-    assert decision.backend_config == {
-        "specialist_backend": "claude_code",
-        "binary": "claude",
-    }
-    assert codex_ui_work_extra_args(decision) == [
-        "-c", 'model_provider="anthropic"', "-c", 'model="claude-fable-5"'
-    ]
+    assert decision.provider == ""
+    assert decision.model == ""
+    assert decision.backend == "codex"
+    assert decision.backend_config == {}
 
 
-def test_visual_specialist_supports_opencode_backend_config():
+def test_visual_specialist_preserves_configured_opencode_backend():
     decision = resolve_ui_work_route(
         _cfg(),
         task="Implement Command Center card footer visuals and responsive styling.",
@@ -79,12 +70,11 @@ def test_visual_specialist_supports_opencode_backend_config():
     assert decision.matched is True
     assert decision.selected_route == "ui_visual_specialist"
     assert decision.backend == "opencode"
-    assert decision.selected_provider == "anthropic"
-    assert decision.selected_model == "claude-fable-5"
-    assert codex_ui_work_extra_args(decision) == []
-    assert opencode_ui_work_worker_config(decision) == {
-        "opencode": {"model": "anthropic/claude-fable-5"}
-    }
+    assert decision.selected_provider == ""
+    assert decision.selected_model == ""
+    assert decision.provider == ""
+    assert decision.model == ""
+    assert decision.backend_config == {}
 
 
 def test_visual_specialist_accepts_json_encoded_route_decision():
@@ -109,8 +99,8 @@ def test_visual_specialist_accepts_json_encoded_route_decision():
     assert decision.route_decision_confidence == 0.97
     assert decision.route_decision_rationale == "Command Center UI task"
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.selected_provider == "anthropic"
-    assert decision.selected_model == "claude-fable-5"
+    assert decision.selected_provider == ""
+    assert decision.selected_model == ""
 
 
 def test_tui_terminal_rendering_work_does_not_route():
@@ -148,7 +138,7 @@ def test_explicit_ui_route_overrides_review_keyword_veto():
     assert decision.matched is True
     assert decision.enabled is True
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.selected_provider == "anthropic"
+    assert decision.selected_provider == ""
     assert decision.route_decision_source == "orchestrator"
     assert decision.route_decision_confidence == 0.8
     assert decision.route_decision_rationale == "review feedback requires visual implementation"
@@ -171,7 +161,6 @@ def test_visual_keywords_without_route_are_advisory_only():
     assert decision.route_decision_confidence is None
     assert decision.advisory_matched is True
     assert "visual ui work" in decision.advisory_reason
-    assert codex_ui_work_extra_args(decision) == []
 
 
 def test_command_center_polish_smoke_is_visual_advisory_only_without_route():
@@ -328,60 +317,37 @@ def test_disabled_config_reports_match_without_overlay():
     assert decision.selected_route == "default_coding_worker"
     assert decision.fallback_used is True
     assert "ui_work.enabled" in decision.fallback_reason
-    assert codex_ui_work_extra_args(decision) == []
 
 
-def test_missing_model_errors_when_fallback_disabled():
+def test_legacy_ui_runtime_config_is_ignored():
     cfg = _cfg()
-    cfg["ui_work"]["model"] = ""
-    cfg["ui_work"]["fallback"]["allow_default_worker"] = False
+    cfg["ui_work"].update(
+        {
+            "specialist_backend": "claude_code",
+            "provider": "openrouter",
+            "model": "anthropic/claude-fable-5",
+            "route": "api_key",
+            "reasoning_effort": "high",
+            "fallback": {"allow_default_worker": False},
+        }
+    )
 
     decision = resolve_ui_work_route(
         cfg,
         task="Polish frontend chart labels.",
+        backend="opencode",
         route_decision="ui_visual_specialist",
     )
 
     assert decision.matched is True
-    assert decision.error
-    assert "provider and ui_work.model" in decision.error
-
-
-def test_missing_model_falls_back_when_fallback_allowed():
-    cfg = _cfg()
-    cfg["ui_work"]["model"] = ""
-    cfg["ui_work"]["fallback"]["allow_default_worker"] = True
-
-    decision = resolve_ui_work_route(
-        cfg,
-        task="Polish frontend chart labels.",
-        route_decision="ui_visual_specialist",
-    )
-
-    assert decision.matched is True
-    assert decision.fallback_allowed is True
+    assert decision.enabled is True
     assert decision.error == ""
-    assert "falling back to default worker" in decision.reason
-    assert decision.fallback_used is True
-    assert decision.selected_route == "default_coding_worker"
-    assert decision.backend_config == {}
-
-
-def test_stale_non_fable_ui_config_fails_closed_explicitly():
-    cfg = _cfg()
-    cfg["ui_work"]["provider"] = "openrouter"
-    cfg["ui_work"]["model"] = "anthropic/claude-sonnet-4.6"
-    cfg["ui_work"]["route"] = "api_key"
-
-    decision = resolve_ui_work_route(
-        cfg,
-        task="Polish frontend chart labels.",
-        route_decision="ui_visual_specialist",
-    )
-
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.error == (
-        "ui_work specialist must use Claude Code with Anthropic OAuth, "
-        "provider=anthropic, model=claude-fable-5, and reasoning_effort=medium"
-    )
+    assert decision.backend == "opencode"
+    assert decision.provider == ""
+    assert decision.model == ""
+    assert decision.selected_provider == ""
+    assert decision.selected_model == ""
+    assert decision.backend_config == {}
+    assert decision.fallback_allowed is False
     assert decision.fallback_used is False

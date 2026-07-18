@@ -5,14 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping
-
-
-_OPENROUTER_PROVIDER_CONFIG_ARGS = {
-    "model_providers.openrouter.name": "openrouter",
-    "model_providers.openrouter.base_url": "https://openrouter.ai/api/v1",
-    "model_providers.openrouter.env_key": "OPENROUTER_API_KEY",
-}
+from typing import Any
 
 _BROAD_SURFACE_KEYWORDS = {
     "app interface",
@@ -227,11 +220,6 @@ class _RouteDecisionInput:
 
 _DEFAULT_ROUTE = "default_coding_worker"
 _UI_SPECIALIST_ROUTE = "ui_visual_specialist"
-UI_SPECIALIST_PROVIDER = "anthropic"
-UI_SPECIALIST_MODEL = "claude-fable-5"
-UI_SPECIALIST_AUTH_ROUTE = "anthropic_oauth"
-UI_SPECIALIST_REASONING_EFFORT = "medium"
-UI_SPECIALIST_BACKEND = "claude_code"
 UI_SPECIALIST_SKILLS = ("taste-skill", "claude-design", "popular-web-designs")
 _NO_WORKER_ROUTES = {"review_only_no_worker", "ask_human"}
 _ROUTE_ALIASES = {
@@ -445,8 +433,6 @@ def resolve_ui_work_route(
     """
     ui_cfg = _as_dict((loaded_config or {}).get("ui_work"))
     enabled = bool(ui_cfg.get("enabled", False))
-    fallback_cfg = _as_dict(ui_cfg.get("fallback"))
-    fallback_allowed = bool(fallback_cfg.get("allow_default_worker", True))
     advisory_matched, advisory_reason = _classify_ui_work(
         config=ui_cfg,
         task=task,
@@ -455,16 +441,11 @@ def resolve_ui_work_route(
         cwd=cwd,
         project=project,
     )
-    provider = str(ui_cfg.get("provider") or "").strip()
-    model = str(ui_cfg.get("model") or "").strip()
     requested = _normalize_route_decision(route_decision)
     normalized_backend = str(backend or "opencode").strip().lower() or "opencode"
 
     base_fields = {
-        "provider": provider,
-        "model": model,
         "backend": normalized_backend,
-        "fallback_allowed": fallback_allowed,
         "route_decision": requested.route,
         "route_decision_source": requested.source,
         "route_decision_confidence": requested.confidence,
@@ -518,114 +499,11 @@ def resolve_ui_work_route(
             fallback_reason="ui_work.enabled is false",
             **base_fields,
         )
-    if not provider or not model:
-        error = "ui_work routing matched but ui_work.provider and ui_work.model must both be configured"
-        if fallback_allowed:
-            return UIWorkRouteDecision(
-                matched=True,
-                enabled=True,
-                reason="missing provider/model; falling back to default worker",
-                selected_route=_DEFAULT_ROUTE,
-                fallback_used=True,
-                fallback_reason="ui_work.provider or ui_work.model is missing",
-                **base_fields,
-            )
-        return UIWorkRouteDecision(
-            matched=True,
-            enabled=True,
-            reason="missing provider/model",
-            selected_route=_UI_SPECIALIST_ROUTE,
-            error=error,
-            **base_fields,
-        )
-
-    route = str(ui_cfg.get("route") or "").strip().lower()
-    reasoning_effort = str(ui_cfg.get("reasoning_effort") or "").strip().lower()
-    specialist_backend = str(ui_cfg.get("specialist_backend") or "").strip().lower()
-    if (
-        provider.lower() != UI_SPECIALIST_PROVIDER
-        or model != UI_SPECIALIST_MODEL
-        or route != UI_SPECIALIST_AUTH_ROUTE
-        or reasoning_effort != UI_SPECIALIST_REASONING_EFFORT
-        or specialist_backend != UI_SPECIALIST_BACKEND
-    ):
-        error = (
-            "ui_work specialist must use Claude Code with Anthropic OAuth, "
-            "provider=anthropic, model=claude-fable-5, and reasoning_effort=medium"
-        )
-        return UIWorkRouteDecision(
-            matched=True,
-            enabled=True,
-            reason="invalid ui specialist runtime",
-            selected_route=_UI_SPECIALIST_ROUTE,
-            error=error,
-            **base_fields,
-        )
-
-    route_backend_config = {
-        "specialist_backend": specialist_backend,
-        **_as_dict(ui_cfg.get(specialist_backend)),
-    }
 
     return UIWorkRouteDecision(
         matched=True,
         enabled=True,
         reason="orchestrator route selected ui visual specialist",
-        backend_config=route_backend_config,
         selected_route=_UI_SPECIALIST_ROUTE,
-        selected_provider=provider,
-        selected_model=model,
         **base_fields,
     )
-
-
-def codex_ui_work_extra_args(decision: UIWorkRouteDecision) -> list[str]:
-    """Build Codex CLI ``-c`` overrides for an enabled UI route."""
-    if not decision.matched or not decision.enabled or decision.backend != "codex":
-        return []
-    cfg = decision.backend_config
-    if not cfg:
-        return []
-    provider_key = str(cfg.get("provider_config_key") or "model_provider").strip()
-    model_key = str(cfg.get("model_config_key") or "model").strip()
-    args: list[str] = []
-    for key, value in (
-        (provider_key, decision.provider),
-        (model_key, decision.model),
-    ):
-        if key and value:
-            args.extend(["-c", f"{key}={json.dumps(value)}"])
-    if decision.provider.strip().lower() == "openrouter":
-        for key, value in _OPENROUTER_PROVIDER_CONFIG_ARGS.items():
-            args.extend(["-c", f"{key}={json.dumps(value)}"])
-    args.extend(str(item) for item in cfg.get("extra_args") or [])
-    return args
-
-
-def opencode_ui_work_worker_config(decision: UIWorkRouteDecision) -> dict[str, Any]:
-    """Build OpenCode worker_config overrides for an enabled UI route."""
-    if not decision.matched or not decision.enabled or decision.backend != "opencode":
-        return {}
-    provider = str(decision.provider or "").strip()
-    model = str(decision.model or "").strip()
-    if not provider or not model:
-        return {}
-    return {"opencode": {"model": f"{provider}/{model}"}}
-
-
-def resolve_ui_specialist_runtime(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Resolve the pinned specialist's independent Claude Code backend."""
-    if config is None:
-        from hermes_cli.config import load_config
-
-        config = load_config()
-    ui_cfg = _as_dict(config.get("ui_work") if isinstance(config, Mapping) else None)
-    backend = str(ui_cfg.get("specialist_backend") or UI_SPECIALIST_BACKEND).strip().lower()
-    backend_cfg = _as_dict(ui_cfg.get(backend))
-    return {
-        "backend": backend,
-        "binary": str(backend_cfg.get("binary") or "claude").strip(),
-        "provider": UI_SPECIALIST_PROVIDER,
-        "model": UI_SPECIALIST_MODEL,
-        "reasoning_effort": UI_SPECIALIST_REASONING_EFFORT,
-    }

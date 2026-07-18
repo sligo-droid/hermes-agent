@@ -1658,25 +1658,11 @@ DEFAULT_CONFIG = {
         },
     },
 
-    # UI-work routing for coding workers. delegate_coding_task only applies the
-    # configurable specialist provider/model when the orchestrator passes an
-    # explicit route_decision.route=ui_visual_specialist. Keyword detection is
-    # retained as advisory metadata/default guardrail evidence.
+    # UI-work routing for coding workers. An explicit ui_visual_specialist route
+    # adds UI-focused skills and provenance while using the normal configured
+    # coding-worker backend and model tiers. Keyword detection remains advisory.
     "ui_work": {
         "enabled": True,
-        "specialist_backend": "claude_code",
-        "provider": "anthropic",
-        "model": "claude-fable-5",
-        "route": "anthropic_oauth",
-        "reasoning_effort": "medium",
-        "claude_code": {
-            "binary": "claude",
-        },
-        "codex": {
-            "provider_config_key": "model_provider",
-            "model_config_key": "model",
-            "extra_args": [],
-        },
         "detection": {
             "action_keywords": [
                 "implement",
@@ -1878,12 +1864,6 @@ DEFAULT_CONFIG = {
                 "review comment",
                 "review feedback",
             ],
-        },
-        "fallback": {
-            # If the specialist route is unavailable (for example OpenRouter
-            # billing/credentials are not enabled), keep the work moving with
-            # the normal coding-worker model instead of failing the whole task.
-            "allow_default_worker": True,
         },
         "route_delegate_task": False,
     },
