@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import threading
 from pathlib import Path
@@ -12,8 +13,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
+from hermes_cli.proxy.adapters import ADAPTERS, get_adapter, list_adapter_names
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy.adapters.configured import ConfiguredProviderAdapter
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 from hermes_cli.proxy.adapters.openai_codex import OpenAICodexAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
@@ -55,6 +57,213 @@ def test_get_adapter_case_insensitive():
 def test_get_adapter_unknown_provider_raises():
     with pytest.raises(ValueError, match="anthropic"):
         get_adapter("anthropic")  # not yet implemented
+
+
+def test_registry_discovers_configured_provider_dynamically(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.load_config",
+        lambda: {"providers": {}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.get_compatible_custom_providers",
+        lambda _config: [
+            {
+                "provider_key": "corp-gateway",
+                "name": "Corp Gateway",
+                "base_url": "https://gateway.example.com/v1",
+                "key_env": "CORP_GATEWAY_KEY",
+            }
+        ],
+    )
+
+    assert "corp-gateway" in list_adapter_names()
+    assert "corp-gateway" in ADAPTERS
+    adapter = get_adapter("custom:corp-gateway")
+    assert isinstance(adapter, ConfiguredProviderAdapter)
+    assert adapter.name == "corp-gateway"
+    assert adapter.display_name == "Corp Gateway"
+    assert adapter.auth_hint == "set CORP_GATEWAY_KEY in the active Hermes profile"
+
+
+def test_registry_gives_builtin_adapter_precedence(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.get_compatible_custom_providers",
+        lambda _config: [
+            {
+                "provider_key": "nous",
+                "name": "Shadow Nous",
+                "base_url": "https://shadow.example.com/v1",
+            }
+        ],
+    )
+    monkeypatch.setattr("hermes_cli.proxy.adapters.load_config", lambda: {})
+
+    assert isinstance(get_adapter("nous"), NousPortalAdapter)
+    assert list_adapter_names().count("nous") == 1
+
+
+def test_configured_adapter_metadata_and_runtime_resolution(monkeypatch):
+    resolver = MagicMock(return_value={
+        "api_key": "configured-secret",
+        "base_url": "https://gateway.example.com/v1/",
+        "expires_at": "2099-01-01T00:00:00Z",
+    })
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.configured.resolve_runtime_provider",
+        resolver,
+    )
+    adapter = ConfiguredProviderAdapter("corp", display_name="Corp Gateway")
+    monkeypatch.setattr(
+        adapter,
+        "_configured_entry",
+        lambda: {
+            "name": "Corp Gateway",
+            "base_url": "https://gateway.example.com/v1",
+            "api_key": "configured-secret",
+        },
+    )
+
+    assert adapter.allowed_paths == frozenset({
+        "/chat/completions",
+        "/responses",
+        "/messages",
+        "/models",
+    })
+    assert adapter.is_authenticated()
+    cred = adapter.get_credential()
+    assert cred.bearer == "configured-secret"
+    assert cred.base_url == "https://gateway.example.com/v1"
+    resolver.assert_called_with(requested="custom:corp")
+
+
+def test_configured_adapter_supports_intentionally_unauthenticated_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.configured.resolve_runtime_provider",
+        MagicMock(return_value={
+            "api_key": "no-key-required",
+            "base_url": "http://127.0.0.1:11434/v1",
+        }),
+    )
+
+    cred = ConfiguredProviderAdapter("local").get_credential()
+
+    assert cred.bearer == ""
+    assert cred.base_url == "http://127.0.0.1:11434/v1"
+
+
+def test_configured_adapter_uses_bearer_for_cli_proxy_anthropic_wire(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.configured.resolve_runtime_provider",
+        MagicMock(return_value={
+            "api_key": "proxy-key",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_mode": "anthropic_messages",
+            "extra_headers": {"CF-Access-Client-Id": "client-id"},
+        }),
+    )
+
+    cred = ConfiguredProviderAdapter("cli-proxy-api").get_credential()
+
+    assert cred.bearer == "proxy-key"
+    assert cred.headers == {"CF-Access-Client-Id": "client-id"}
+
+
+def test_configured_adapter_uses_x_api_key_for_anthropic_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.configured.resolve_runtime_provider",
+        MagicMock(return_value={
+            "api_key": "anthropic-key",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_mode": "anthropic_messages",
+        }),
+    )
+
+    cred = ConfiguredProviderAdapter("anthropic-relay").get_credential()
+
+    assert cred.bearer == ""
+    assert cred.headers["x-api-key"] == "anthropic-key"
+
+
+def test_configured_adapter_uses_api_key_for_azure_openai(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.configured.resolve_runtime_provider",
+        MagicMock(return_value={
+            "api_key": "azure-key",
+            "base_url": "https://resource.openai.azure.com/openai/v1",
+            "api_mode": "chat_completions",
+        }),
+    )
+
+    cred = ConfiguredProviderAdapter("azure-relay").get_credential()
+
+    assert cred.bearer == ""
+    assert cred.headers["api-key"] == "azure-key"
+
+
+def test_configured_adapter_errors_do_not_expose_resolver_secret(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.configured.resolve_runtime_provider",
+        MagicMock(side_effect=RuntimeError("failed with sk-secret-value")),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ConfiguredProviderAdapter("corp").get_credential()
+
+    assert "sk-secret-value" not in str(exc_info.value)
+
+
+def test_configured_adapter_readiness_peeks_without_selecting_pool(monkeypatch):
+    adapter = ConfiguredProviderAdapter("corp")
+    pool = MagicMock()
+    pool.peek.return_value = SimpleNamespace(runtime_api_key="pooled-key")
+    monkeypatch.setattr(
+        adapter,
+        "_configured_entry",
+        lambda: {
+            "name": "Corp",
+            "base_url": "https://gateway.example.com/v1",
+        },
+    )
+    monkeypatch.setattr(adapter, "_load_pool", lambda _entry: pool)
+
+    assert adapter.is_authenticated()
+    pool.peek.assert_called_once_with()
+    pool.select.assert_not_called()
+
+
+def test_configured_adapter_rotates_custom_pool_on_429(monkeypatch):
+    adapter = ConfiguredProviderAdapter("corp")
+    pool = MagicMock()
+    pool.mark_exhausted_and_rotate.return_value = SimpleNamespace(
+        runtime_api_key="second-key",
+        base_url="https://gateway.example.com/v1",
+        expires_at=None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_configured_entry",
+        lambda: {
+            "name": "Corp",
+            "base_url": "https://gateway.example.com/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(adapter, "_load_pool", lambda _entry: pool)
+
+    retry = adapter.get_retry_credential(
+        failed_credential=UpstreamCredential(
+            bearer="first-key",
+            base_url="https://gateway.example.com/v1",
+        ),
+        status_code=429,
+    )
+
+    assert retry is not None
+    assert retry.bearer == "second-key"
+    pool.mark_exhausted_and_rotate.assert_called_once_with(
+        status_code=429,
+        api_key_hint="first-key",
+    )
 
 
 def test_nous_adapter_auth_helper_import_smoke():
@@ -1295,12 +1504,13 @@ class FakeAdapter(UpstreamAdapter):
 
     def __init__(self, base_url: str, bearer: str = "test-bearer",
                  allowed=None, raise_on_credential=False,
-                 retry_bearer: str | None = None):
+                 retry_bearer: str | None = None, headers=None):
         self._base_url = base_url
         self._bearer = bearer
         self._allowed = frozenset(allowed or ["/chat/completions"])
         self._raise = raise_on_credential
         self._retry_bearer = retry_bearer
+        self._headers = dict(headers or {})
         self.calls = 0
         self.retry_calls = 0
 
@@ -1321,6 +1531,7 @@ class FakeAdapter(UpstreamAdapter):
             raise RuntimeError("simulated auth failure")
         return UpstreamCredential(
             bearer=self._bearer, base_url=self._base_url,
+            headers=self._headers,
             expires_at="2099-01-01T00:00:00Z",
         )
 
@@ -1332,6 +1543,7 @@ class FakeAdapter(UpstreamAdapter):
         return UpstreamCredential(
             bearer=self._retry_bearer,
             base_url=self._base_url,
+            headers=self._headers,
             expires_at="2099-01-01T00:00:00Z",
         )
 
@@ -1354,7 +1566,12 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
             "method": request.method,
             "path": request.path,
             "auth": request.headers.get("Authorization"),
-            "body": body.decode("utf-8") if body else "",
+            "proxy_auth": request.headers.get("Proxy-Authorization"),
+            "x_api_key": request.headers.get("x-api-key"),
+            "api_key": request.headers.get("api-key"),
+            "cf_access_id": request.headers.get("CF-Access-Client-Id"),
+            "body": body.decode("utf-8", errors="replace") if body else "",
+            "raw_body": body,
         })
         return web.json_response({"echoed": True, "path": request.path})
 
@@ -1476,7 +1693,7 @@ def test_server_rejects_disallowed_path():
     asyncio.run(run())
 
 
-def test_server_returns_401_when_adapter_fails():
+def test_server_returns_401_when_adapter_fails(caplog):
     async def run():
         adapter = FakeAdapter("http://unused.example/v1", raise_on_credential=True)
         runner, base = await _start_runner(create_app(adapter))
@@ -1486,11 +1703,13 @@ def test_server_returns_401_when_adapter_fails():
                     assert resp.status == 401
                     body = await resp.json()
                     assert body["error"]["type"] == "upstream_auth_failed"
-                    assert "simulated auth failure" in body["error"]["message"]
+                    assert body["error"]["message"] == "upstream credential resolution failed"
+                    assert "simulated auth failure" not in body["error"]["message"]
         finally:
             await runner.cleanup()
 
     asyncio.run(run())
+    assert "simulated auth failure" not in caplog.text
 
 
 def test_server_health_endpoint():
@@ -1534,8 +1753,134 @@ def test_server_streams_sse():
     asyncio.run(run())
 
 
-def test_server_strips_client_auth_header():
-    """The client's Authorization header MUST NOT reach the upstream."""
+def test_server_preserves_generic_request_and_response_bytes():
+    async def run():
+        request_bytes = b"\x00\xffraw-request\x80"
+        response_bytes = gzip.compress(b"\x00\xffraw-response\x80")
+        captured: Dict[str, Any] = {}
+
+        async def raw_echo(request):
+            captured["body"] = await request.read()
+            captured["raw_path"] = request.raw_path
+            return web.Response(
+                body=response_bytes,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Encoding": "gzip",
+                },
+            )
+
+        upstream_app = web.Application()
+        upstream_app.router.add_post("/v1/responses", raw_echo)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            allowed=["/responses"],
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession(auto_decompress=False) as session:
+                async with session.post(
+                    aiohttp.client.URL(
+                        f"{proxy_base}/v1/responses?opaque=%2Fvalue",
+                        encoded=True,
+                    ),
+                    data=request_bytes,
+                    headers={"Content-Type": "application/octet-stream"},
+                ) as resp:
+                    proxied_bytes = await resp.read()
+                    assert resp.headers["Content-Encoding"] == "gzip"
+                    assert resp.headers["Content-Length"] == str(len(response_bytes))
+            assert captured["body"] == request_bytes
+            assert captured["raw_path"] == "/v1/responses?opaque=%2Fvalue"
+            assert proxied_bytes == response_bytes
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_preserves_compressed_request_bytes():
+    async def run():
+        request_bytes = gzip.compress(b'{"model":"gpt-5.5","input":"hello"}')
+        captured: Dict[str, Any] = {}
+
+        async def raw_echo(request):
+            captured["body"] = await request.read()
+            captured["content_encoding"] = request.headers.get("Content-Encoding")
+            return web.Response(body=b"ok")
+
+        upstream_app = web.Application(handler_args={"auto_decompress": False})
+        upstream_app.router.add_post("/v1/responses", raw_echo)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            allowed=["/responses"],
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    data=request_bytes,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Encoding": "gzip",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    assert await resp.read() == b"ok"
+            assert captured == {
+                "body": request_bytes,
+                "content_encoding": "gzip",
+            }
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_merges_base_and_request_query_parameters_without_reencoding():
+    async def run():
+        captured: Dict[str, Any] = {}
+
+        async def echo_raw_path(request):
+            captured["raw_path"] = request.raw_path
+            return web.json_response({"ok": True})
+
+        upstream_app = web.Application()
+        upstream_app.router.add_post("/v1/responses", echo_raw_path)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1?api-version=2026-01-01",
+            allowed=["/responses"],
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    aiohttp.client.URL(
+                        f"{proxy_base}/v1/responses?opaque=%2Fvalue",
+                        encoded=True,
+                    ),
+                    data=b"{}",
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.read()
+            assert captured["raw_path"] == (
+                "/v1/responses?api-version=2026-01-01&opaque=%2Fvalue"
+            )
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_strips_all_inbound_credential_headers():
+    """Caller credentials must never reach a configured upstream."""
     async def run():
         captured: Dict[str, Any] = {"requests": []}
         upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
@@ -1546,11 +1891,125 @@ def test_server_strips_client_auth_header():
                 async with session.post(
                     f"{proxy_base}/v1/chat/completions",
                     json={},
-                    headers={"Authorization": "Bearer SHOULD_NOT_LEAK"},
+                    headers={
+                        "Authorization": "Bearer SHOULD_NOT_LEAK",
+                        "Proxy-Authorization": "Basic ALSO_PRIVATE",
+                        "x-api-key": "PRIVATE_ANTHROPIC_KEY",
+                        "api-key": "PRIVATE_AZURE_KEY",
+                    },
                 ) as resp:
                     await resp.read()
-            assert captured["requests"][0]["auth"] == "Bearer ours"
-            assert "SHOULD_NOT_LEAK" not in captured["requests"][0]["auth"]
+            upstream_request = captured["requests"][0]
+            assert upstream_request["auth"] == "Bearer ours"
+            assert upstream_request["proxy_auth"] is None
+            assert upstream_request["x_api_key"] is None
+            assert upstream_request["api_key"] is None
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_drops_client_credentials_for_no_auth_upstream():
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={
+                        "Authorization": "Bearer SHOULD_NOT_LEAK",
+                        "x-api-key": "PRIVATE_ANTHROPIC_KEY",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.read()
+            upstream_request = captured["requests"][0]
+            assert upstream_request["auth"] is None
+            assert upstream_request["x_api_key"] is None
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_replaces_caller_credentials_with_trusted_provider_headers():
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            bearer="",
+            headers={
+                "x-api-key": "trusted-anthropic-key",
+                "CF-Access-Client-Id": "trusted-client-id",
+            },
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={
+                        "Authorization": "Bearer CALLER_KEY",
+                        "x-api-key": "CALLER_ANTHROPIC_KEY",
+                        "api-key": "CALLER_AZURE_KEY",
+                        "CF-Access-Client-Id": "caller-client-id",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.read()
+            upstream_request = captured["requests"][0]
+            assert upstream_request["auth"] is None
+            assert upstream_request["x_api_key"] == "trusted-anthropic-key"
+            assert upstream_request["api_key"] is None
+            assert upstream_request["cf_access_id"] == "trusted-client-id"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_strips_upstream_credential_response_headers():
+    async def run():
+        async def respond(_request):
+            return web.Response(
+                body=b"ok",
+                headers={
+                    "Authorization": "Bearer UPSTREAM_SECRET",
+                    "x-api-key": "UPSTREAM_ANTHROPIC_SECRET",
+                    "api-key": "UPSTREAM_AZURE_SECRET",
+                    "X-Safe-Header": "preserved",
+                },
+            )
+
+        upstream_app = web.Application()
+        upstream_app.router.add_get("/v1/models", respond)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            allowed=["/models"],
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{proxy_base}/v1/models") as resp:
+                    assert resp.status == 200
+                    assert await resp.read() == b"ok"
+                    assert resp.headers.get("Authorization") is None
+                    assert resp.headers.get("x-api-key") is None
+                    assert resp.headers.get("api-key") is None
+                    assert resp.headers["X-Safe-Header"] == "preserved"
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
@@ -1573,7 +2032,7 @@ def test_cmd_proxy_status_runs(capsys, tmp_path, monkeypatch):
     out = capsys.readouterr().out
     assert "nous" in out
     assert "Nous Portal" in out
-    assert "not logged in" in out
+    assert "not ready" in out
 
 
 def test_cmd_proxy_providers_runs(capsys):
@@ -1585,6 +2044,35 @@ def test_cmd_proxy_providers_runs(capsys):
     out = capsys.readouterr().out
     assert "nous" in out
     assert "Nous Portal" in out
+
+
+def test_cmd_proxy_providers_enumerates_configured_adapters(capsys, monkeypatch):
+    from hermes_cli.proxy import cli as proxy_cli
+
+    configured = ConfiguredProviderAdapter("corp", display_name="Corp Gateway")
+    monkeypatch.setattr(proxy_cli, "list_adapter_names", lambda: ["corp"])
+    monkeypatch.setattr(proxy_cli, "get_adapter", lambda _name: configured)
+
+    assert proxy_cli.cmd_proxy_list_providers(MagicMock()) == 0
+    out = capsys.readouterr().out
+    assert "corp" in out
+    assert "Corp Gateway" in out
+
+
+def test_cmd_proxy_status_does_not_print_credential_errors(capsys, monkeypatch):
+    from hermes_cli.proxy import cli as proxy_cli
+
+    adapter = MagicMock()
+    adapter.display_name = "Corp Gateway"
+    adapter.is_authenticated.return_value = True
+    adapter.get_credential.side_effect = RuntimeError("secret=do-not-print")
+    monkeypatch.setattr(proxy_cli, "list_adapter_names", lambda: ["corp"])
+    monkeypatch.setattr(proxy_cli, "get_adapter", lambda _name: adapter)
+
+    assert proxy_cli.cmd_proxy_status(MagicMock()) == 0
+    out = capsys.readouterr().out
+    assert "not ready" in out
+    assert "do-not-print" not in out
 
 
 def test_cmd_proxy_start_refuses_unknown_provider(capsys):

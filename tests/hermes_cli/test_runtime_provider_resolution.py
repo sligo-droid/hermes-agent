@@ -981,6 +981,138 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
     assert resolved["requested_provider"] == "mycorp-proxy"
     assert resolved["source"] == "custom_provider:MyCorp Proxy"
     assert resolved["model"] == "acme-large"
+    assert resolved["key_env"] == "MYCORP_API_KEY"
+
+
+def test_providers_dict_display_name_preserves_declared_key_env(monkeypatch):
+    monkeypatch.setenv("MYCORP_API_KEY", "display-name-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "mycorp-proxy": {
+                    "base_url": "https://proxy.example.com/v1",
+                    "key_env": "MYCORP_API_KEY",
+                    "name": "Corporate Gateway",
+                }
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="Corporate Gateway")
+
+    assert resolved["api_key"] == "display-name-secret"
+    assert resolved["key_env"] == "MYCORP_API_KEY"
+
+
+def test_named_custom_provider_missing_declared_key_env_fails_closed(monkeypatch):
+    monkeypatch.delenv("MYCORP_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "wrong-openai-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "wrong-openrouter-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "mycorp-proxy": {
+                    "base_url": "https://proxy.example.com/v1",
+                    "key_env": "MYCORP_API_KEY",
+                    "name": "MyCorp Proxy",
+                }
+            }
+        },
+    )
+
+    with pytest.raises(rp.AuthError, match="MYCORP_API_KEY") as exc_info:
+        rp.resolve_runtime_provider(requested="mycorp-proxy")
+
+    message = str(exc_info.value)
+    assert "wrong-openai-secret" not in message
+    assert "wrong-openrouter-secret" not in message
+
+
+def test_named_custom_provider_explicit_key_overrides_missing_declared_key_env(monkeypatch):
+    monkeypatch.delenv("MYCORP_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "mycorp-proxy": {
+                    "base_url": "https://proxy.example.com/v1",
+                    "key_env": "MYCORP_API_KEY",
+                    "name": "MyCorp Proxy",
+                }
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="mycorp-proxy",
+        explicit_api_key="one-shot-key",
+    )
+
+    assert resolved["api_key"] == "one-shot-key"
+    assert resolved["key_env"] == "MYCORP_API_KEY"
+
+
+def test_named_custom_provider_inline_key_can_satisfy_declared_key_env(monkeypatch):
+    monkeypatch.delenv("MYCORP_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "mycorp-proxy": {
+                    "base_url": "https://proxy.example.com/v1",
+                    "key_env": "MYCORP_API_KEY",
+                    "api_key": "inline-provider-key",
+                    "name": "MyCorp Proxy",
+                }
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="mycorp-proxy")
+
+    assert resolved["api_key"] == "inline-provider-key"
+    assert resolved["key_env"] == "MYCORP_API_KEY"
+
+
+def test_named_custom_provider_pool_can_satisfy_declared_key_env(monkeypatch):
+    monkeypatch.delenv("MYCORP_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "mycorp-proxy": {
+                    "base_url": "https://proxy.example.com/v1",
+                    "key_env": "MYCORP_API_KEY",
+                    "name": "MyCorp Proxy",
+                }
+            }
+        },
+    )
+    pool = object()
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *args, **kwargs: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://proxy.example.com/v1",
+            "api_key": "pooled-provider-key",
+            "source": "pool:mycorp",
+            "credential_pool": pool,
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="mycorp-proxy")
+
+    assert resolved["api_key"] == "pooled-provider-key"
+    assert resolved["credential_pool"] is pool
 
 
 def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monkeypatch):

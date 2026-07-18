@@ -3113,6 +3113,8 @@ def _retry_same_provider_sync(
         timeout=effective_timeout,
         extra_body=effective_extra_body,
         base_url=retry_base or resolved_base_url,
+        task=task,
+        client=retry_client,
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
@@ -3170,6 +3172,8 @@ async def _retry_same_provider_async(
         timeout=effective_timeout,
         extra_body=effective_extra_body,
         base_url=retry_base or resolved_base_url,
+        task=task,
+        client=retry_client,
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
@@ -4120,7 +4124,10 @@ def resolve_provider_client(
 
     # ── Named custom providers (config.yaml providers dict / custom_providers list) ───
     try:
-        from hermes_cli.runtime_provider import _get_named_custom_provider
+        from hermes_cli.runtime_provider import (
+            _get_named_custom_provider,
+            _resolve_named_custom_runtime,
+        )
         # When the raw requested name is an alias (``kimi`` → ``kimi-coding``)
         # and the user defined a ``custom_providers`` entry under that alias
         # name, the custom entry is the intended target — the built-in alias
@@ -4129,16 +4136,24 @@ def resolve_provider_client(
         # entries that coincidentally match a canonical provider (e.g. ``nous``)
         # still defer to the built-in per `_get_named_custom_provider`'s guard.
         custom_entry = None
+        custom_requested = provider
         if original_provider and original_provider != provider:
             custom_entry = _get_named_custom_provider(original_provider)
+            if custom_entry is not None:
+                custom_requested = original_provider
         if custom_entry is None:
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
-            custom_base = custom_entry.get("base_url", "").strip()
-            custom_key = custom_entry.get("api_key", "").strip()
-            custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
-            if not custom_key and custom_key_env:
-                custom_key = os.getenv(custom_key_env, "").strip()
+            # Use the shared profile-aware runtime resolver so key_env, inline
+            # credentials, and custom pools have identical behavior across the
+            # main agent, auxiliary tasks, and the local proxy.
+            custom_runtime = _resolve_named_custom_runtime(
+                requested_provider=custom_requested,
+            )
+            if custom_runtime is None:
+                return None, None
+            custom_base = str(custom_runtime.get("base_url") or "").strip()
+            custom_key = str(custom_runtime.get("api_key") or "").strip()
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
@@ -4149,10 +4164,16 @@ def resolve_provider_client(
                 )
             # An explicit per-task api_mode override (from _resolve_task_provider_model)
             # wins; otherwise fall back to what the provider entry declared.
-            entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()
+            entry_api_mode = (
+                api_mode
+                or custom_runtime.get("api_mode")
+                or custom_entry.get("api_mode")
+                or ""
+            ).strip()
             if custom_base:
                 final_model = _normalize_resolved_model(
                     model
+                    or custom_runtime.get("model")
                     or custom_entry.get("model")
                     or (main_runtime.get("model") if main_runtime else None)
                     or _read_main_model()
@@ -4171,6 +4192,9 @@ def resolve_provider_client(
                     raw_base_for_wrap = custom_base
                 _clean_base2, _dq2 = _extract_url_query_params(openai_base)
                 _extra2 = {"default_query": _dq2} if _dq2 else {}
+                runtime_headers = custom_runtime.get("extra_headers")
+                if isinstance(runtime_headers, dict) and runtime_headers:
+                    _extra2["default_headers"] = dict(runtime_headers)
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s, api_mode=%s)",
                     provider, final_model, entry_api_mode or "chat_completions")
@@ -4193,6 +4217,8 @@ def resolve_provider_client(
                         _fallback_base = _to_openai_base_url(custom_base)
                         _fb_clean, _fb_dq = _extract_url_query_params(_fallback_base)
                         _fb_extra = {"default_query": _fb_dq} if _fb_dq else {}
+                        if isinstance(runtime_headers, dict) and runtime_headers:
+                            _fb_extra["default_headers"] = dict(runtime_headers)
                         client = OpenAI(api_key=custom_key, base_url=_fb_clean, **_fb_extra)
                         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                                 else (client, final_model))
@@ -5334,22 +5360,23 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     return {}
 
 
-def _is_codex_auxiliary_client(client: Any) -> bool:
-    """Return True for Codex auxiliary wrappers and Codex app-server clients."""
-    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
-        return True
-    return base_url_host_matches(str(getattr(client, "base_url", "") or ""), "chatgpt.com")
+def _is_native_codex_auxiliary_client(client: Any) -> bool:
+    """Return True only for clients calling the native ChatGPT Codex endpoint."""
+    return base_url_host_matches(
+        str(getattr(client, "base_url", "") or ""),
+        "chatgpt.com",
+    )
 
 
-def _default_compression_reasoning_if_codex(
+def _extra_body_for_client_call(
     task: Optional[str],
     client: Any,
     extra_body: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Disable Codex reasoning for compression unless the user configured it."""
+    """Shape provider-neutral ``extra_body`` for one concrete client call."""
     if task != "compression":
         return extra_body
-    if not _is_codex_auxiliary_client(client):
+    if not _is_native_codex_auxiliary_client(client):
         return extra_body
     if "reasoning" in extra_body:
         return extra_body
@@ -5437,8 +5464,11 @@ def _build_call_kwargs(
     timeout: float = 30.0,
     extra_body: Optional[dict] = None,
     base_url: Optional[str] = None,
+    *,
+    task: Optional[str] = None,
+    client: Any = None,
 ) -> dict:
-    """Build kwargs for .chat.completions.create() with model/provider adjustments."""
+    """Build kwargs for one concrete .chat.completions.create() call."""
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -5505,8 +5535,14 @@ def _build_call_kwargs(
             _deduped.append(_t)
         kwargs["tools"] = _deduped
 
-    # Provider-specific extra_body
-    merged_extra = dict(extra_body or {})
+    # Keep configured/caller extra_body provider-neutral until the concrete
+    # client is known. Native Codex compression gets its default reasoning
+    # policy only for this call, so request-time fallbacks cannot inherit it.
+    merged_extra = _extra_body_for_client_call(
+        task,
+        client,
+        dict(extra_body or {}),
+    )
     if provider == "nous" or auxiliary_is_nous:
         merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
     if merged_extra:
@@ -5648,12 +5684,6 @@ def call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
-    effective_extra_body = _default_compression_reasoning_if_codex(
-        task,
-        client,
-        effective_extra_body,
-    )
-
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     if task:
@@ -5668,7 +5698,7 @@ def call_llm(
         resolved_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        base_url=_base_info or resolved_base_url)
+        base_url=_base_info or resolved_base_url, task=task, client=client)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
@@ -5908,7 +5938,8 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                    base_url=str(getattr(fb_client, "base_url", "") or ""),
+                    task=task, client=fb_client)
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
 
@@ -5951,7 +5982,8 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                    base_url=str(getattr(fb_client, "base_url", "") or ""),
+                    task=task, client=fb_client)
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — emit a single user-visible
@@ -6118,12 +6150,6 @@ async def async_call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
-    effective_extra_body = _default_compression_reasoning_if_codex(
-        task,
-        client,
-        effective_extra_body,
-    )
-
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
@@ -6132,7 +6158,7 @@ async def async_call_llm(
         resolved_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        base_url=_client_base or resolved_base_url)
+        base_url=_client_base or resolved_base_url, task=task, client=client)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
@@ -6346,18 +6372,17 @@ async def async_call_llm(
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                 task, resolved_provider or "auto", reason="authentication error")
             if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    _fallback_call_provider(fb_client, fb_label),
-                    fb_model or "", messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
-                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
-                    fb_kwargs["model"] = async_fb_model
+                fb_kwargs = _build_call_kwargs(
+                    _fallback_call_provider(async_fb, fb_label),
+                    async_fb_model or fb_model or "", messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(async_fb, "base_url", "") or ""),
+                    task=task, client=async_fb)
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
 
@@ -6390,19 +6415,19 @@ async def async_call_llm(
             )
 
             if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    _fallback_call_provider(fb_client, fb_label),
-                    fb_model or "", messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
-                # Convert sync fallback client to async
+                # Convert the fallback first, then shape request fields for the
+                # concrete async client that will actually receive the call.
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
-                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
-                    fb_kwargs["model"] = async_fb_model
+                fb_kwargs = _build_call_kwargs(
+                    _fallback_call_provider(async_fb, fb_label),
+                    async_fb_model or fb_model or "", messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(async_fb, "base_url", "") or ""),
+                    task=task, client=async_fb)
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — warn before re-raising. (#26882)

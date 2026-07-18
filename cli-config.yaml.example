@@ -139,6 +139,47 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
+# Named Configured Provider + Local Inference Proxy
+# =============================================================================
+# Named providers keep a base URL, credential source, default model, and default
+# wire protocol together. key_env is the NAME of an environment variable; put
+# the credential in the active profile's .env, not in this YAML example.
+#
+# When key_env is declared, Hermes fails closed if no provider-associated key
+# can be resolved. It does not silently borrow OPENAI_API_KEY or
+# OPENROUTER_API_KEY for that named route.
+#
+# providers:
+#   cli-proxy-api:
+#     name: "CLIProxyAPI"
+#     base_url: "http://127.0.0.1:8317/v1"
+#     key_env: "CLI_PROXY_API_KEY"
+#     api_mode: "codex_responses"
+#     default_model: "gpt-5.6-luna"
+#
+# Select the same named route for the main agent with:
+#   model:
+#     provider: "cli-proxy-api"
+#     default: "gpt-5.6-luna"
+#     api_mode: "codex_responses"
+#
+# This provider can also be exposed to another trusted local application:
+#   hermes proxy start --provider cli-proxy-api
+#
+# The configured-provider proxy preserves request/response bytes and allows:
+#   /v1/chat/completions  /v1/responses  /v1/messages  /v1/models
+# It does not transform payloads. Built-in adapters are separate and may be
+# specialized; openai-codex translates Chat Completions to native Responses.
+#
+# SECURITY: the proxy has no caller authentication. It strips inbound
+# Authorization, Proxy-Authorization, and x-api-key before attaching the
+# configured upstream credential. Keep the default 127.0.0.1 bind. If Docker
+# requires --host 0.0.0.0, publish the host port on 127.0.0.1 unless intentional
+# LAN access is protected by a firewall, VPN, or authenticated reverse proxy.
+# GET /health is local liveness only. Treat /v1/models plus a representative
+# inference request as readiness.
+
+# =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
 # =============================================================================
 # Control how requests are routed across providers on OpenRouter.
@@ -484,10 +525,9 @@ prompt_caching:
 # checks the standard auxiliary fallback providers. You do NOT need to change
 # anything here for normal usage.
 #
-# WARNING: Overriding these with providers other than OpenRouter or Nous Portal
-# is EXPERIMENTAL and may not work.  Not all models/providers support vision,
-# produce usable summaries, or accept the same API format.  Change at your own
-# risk — if things break, reset to "auto" / empty values.
+# Not every model supports every auxiliary task. Match model capabilities and
+# wire protocol to the task; if a route is misconfigured, reset it to "auto" /
+# empty values.
 #
 # Each task has its own provider + model pair so you can mix providers.
 # For example: OpenRouter for vision (needs multimodal), but your main
@@ -503,6 +543,12 @@ prompt_caching:
 #   "codex"       - Force Codex OAuth (requires: hermes model → Codex).
 #                  Uses gpt-5.3-codex which supports vision.
 #   "main"       - Use the configured main provider/model for this task.
+#   Any named entry under top-level providers: (for example "cli-proxy-api").
+#
+# api_mode: optional per-task wire protocol override. Supported values include
+# "chat_completions", "codex_responses", and "anthropic_messages". Leave it
+# empty to use provider/model detection. Each fallback_chain entry may set its
+# own api_mode independently.
 #
 # Model: leave empty to use the provider's default.  When empty, OpenRouter
 # uses "google/gemini-3-flash-preview" and Nous uses "gemini-3-flash".
@@ -523,16 +569,17 @@ prompt_caching:
 #     provider: "auto"
 #     model: ""
 #
-#   # Context compression. On payment, rate-limit, connection/timeout, or
-#   # provider-service outage, this ordered chain runs before other fallback
-#   # handling. Explicit routes retain the main-agent model as a final safety
-#   # net; auto routes continue through the generic auto fallback chain.
+#   # Context compression. This example uses the named CLIProxyAPI route through
+#   # Chat Completions first, then explicitly falls back to native Codex OAuth.
+#   # The task-level api_mode overrides providers.cli-proxy-api.api_mode only for
+#   # compression. Fallback entries can independently declare api_mode too.
 #   compression:
-#     provider: "auto"
-#     model: ""
+#     provider: "cli-proxy-api"
+#     model: "claude-sonnet-4-6"
+#     api_mode: "chat_completions"
 #     fallback_chain:
-#       - provider: "anthropic"     # Uses explicitly configured Hermes Anthropic credentials
-#         model: "claude-sonnet-4-6"
+#       - provider: "openai-codex"  # Native ChatGPT/Codex OAuth Responses route
+#         model: "gpt-5.4"
 #
 #   # Gemini 3.1 TTS hidden audio-tag insertion
 #   tts_audio_tags:

@@ -1,203 +1,231 @@
 ---
 sidebar_position: 15
 title: "Subscription Proxy"
-description: "Use your Nous Portal subscription (or other OAuth provider) as an OpenAI-compatible endpoint for external apps"
+description: "Expose Hermes-managed built-in or configured providers through a local inference proxy"
 ---
 
 # Subscription Proxy
 
-The subscription proxy is a local HTTP server that lets external apps —
-OpenViking, Karakeep, Open WebUI, anything that speaks OpenAI-compatible
-chat completions — use your Hermes-managed provider subscription as their
-LLM endpoint. The proxy attaches the right credentials (refreshing them
-automatically) so the app never needs a static API key.
+The subscription proxy is a small HTTP server that lets another application use
+an inference provider already configured in Hermes. It supports:
+
+- **Built-in specialized adapters** for Nous Portal, xAI Grok OAuth, and OpenAI
+  Codex OAuth.
+- A **named configured-provider adapter** for entries under `providers:` in
+  `config.yaml`.
+
+The proxy resolves the upstream `base_url` and credential through Hermes, removes
+caller-supplied provider credentials, and sends the request using the configured
+upstream credential.
 
 This is different from the [API server](./api-server.md):
 
 | | API server | Subscription proxy |
 |---|---|---|
-| What it serves | Your agent (full toolset, memory, skills) | Raw model inference |
-| Use case | "Use Hermes as a chat backend" | "Use my Portal sub from another app" |
-| Auth | Your `API_SERVER_KEY` | Any bearer (proxy attaches the real one) |
-| Tool calls | Yes — the agent runs tools | No — passthrough only |
+| What it serves | The Hermes agent, including tools, memory, and skills | Model inference routes |
+| Use case | Use Hermes as a chat backend | Let another client use a Hermes-managed provider |
+| Authentication | `API_SERVER_KEY` | No inbound authentication; Hermes attaches the upstream credential |
+| Payload handling | Runs the agent loop | Configured providers preserve payload bytes; specialized adapters may translate protocols |
 
-Use the API server when you want the **agent** as a backend. Use the
-proxy when you just want **the model** through your subscription.
+:::warning Trusted boundary only
+The proxy does not authenticate callers. A client token such as `sk-unused` is
+only a placeholder and is not an access-control mechanism. Keep the listener on
+localhost, or put it behind authentication and network controls you trust.
+:::
 
-## Quick Start
+## Quick start with a built-in adapter
 
-### 1. Log into your provider (one-time)
-
-```bash
-hermes portal
-```
-
-This opens your browser for the Nous Portal OAuth flow. Hermes stores
-the refresh token in `~/.hermes/auth.json` — the same place all Hermes
-provider logins live.
-
-### 2. Start the proxy
+Log into a supported provider, then start the proxy. For Nous Portal:
 
 ```bash
-hermes proxy start
+hermes auth add nous
+hermes proxy start --provider nous
 ```
 
-```
-Starting Hermes proxy for Nous Portal
-  Listening on:  http://127.0.0.1:8645/v1
-  Forwarding to: (resolved per-request from your subscription)
-  Use any bearer token in the client — the proxy attaches your real credential.
-```
+The default listener is `http://127.0.0.1:8645/v1`. An OpenAI-compatible client
+can use:
 
-Leave this running in the foreground. Use `tmux`, `nohup`, or a systemd
-unit if you want it to survive logout.
-
-### 3. Point your app at it
-
-Any OpenAI-compatible app config takes the same triple:
-
-```
-Base URL:   http://127.0.0.1:8645/v1
-API key:    anything (e.g. "sk-unused")
-Model:      Hermes-4-70B    # or Hermes-4.3-36B, Hermes-4-405B
+```text
+Base URL: http://127.0.0.1:8645/v1
+API key:  sk-unused
+Model:    Hermes-4-70B
 ```
 
-The proxy ignores the `Authorization` header from your app and attaches
-your real Portal credential to the upstream request. Refreshes happen
-automatically when the bearer approaches expiry.
+The client key is discarded. Hermes resolves and attaches the real upstream
+credential for each request.
 
-## Available providers
+## Proxy a named configured provider
+
+Named providers use the same `providers:` entries as normal Hermes model
+routing. Define the upstream URL and the environment variable that holds its
+credential:
+
+```yaml
+# config.yaml
+providers:
+  cli-proxy-api:
+    name: CLIProxyAPI
+    base_url: "http://127.0.0.1:8317/v1"
+    key_env: "CLI_PROXY_API_KEY"
+    api_mode: "codex_responses"
+    default_model: "gpt-5.6-luna"
+```
+
+Set `CLI_PROXY_API_KEY` in the active Hermes profile's environment or `.env`,
+then confirm discovery and start it by name:
+
+```bash
+hermes proxy providers
+hermes proxy status
+hermes proxy start --provider cli-proxy-api
+```
+
+`base_url` and `key_env` are the load-bearing fields for an authenticated
+configured provider. If `key_env` is declared but no provider-associated key can
+be resolved, startup fails closed; Hermes does not silently borrow
+`OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+
+The configured-provider proxy is byte-preserving. It does not inspect or convert
+Chat Completions, Responses, or Anthropic Messages bodies. The provider entry's
+`api_mode` is used by Hermes when that provider is selected for Hermes inference;
+it does not make the proxy transform payloads.
+
+## Providers and adapter behavior
+
+List the currently available names:
 
 ```bash
 hermes proxy providers
 ```
 
-Currently shipped: `nous` (Nous Portal) and `xai` (xAI / Grok). More
-OAuth providers can be added by implementing the `UpstreamAdapter`
-interface in `hermes_cli/proxy/adapters/`.
+The built-ins are:
 
-## Check status
+| Provider | Adapter behavior |
+|---|---|
+| `nous` | Attaches refreshed Nous Portal credentials and forwards supported Nous inference routes. |
+| `xai` | Attaches xAI OAuth pool credentials and can rotate them after supported auth/rate-limit failures. |
+| `openai-codex` | Specialized adapter: exposes OpenAI-style `/v1/chat/completions`, translates it to the native Codex Responses API, then normalizes the result back to Chat Completions. |
+
+Configured entries are discovered dynamically from `providers:` (and compatible
+legacy custom-provider configuration). Built-in names take precedence if a
+configured entry uses the same name.
+
+The proxy is not uniformly passthrough: the configured-provider adapter is
+byte-preserving, while `openai-codex` is intentionally a protocol-translating
+specialized adapter.
+
+## Supported paths
+
+### Configured providers
+
+A named configured-provider adapter accepts exactly these paths:
+
+| Local path | Upstream path |
+|---|---|
+| `/v1/chat/completions` | `<base_url>/chat/completions` |
+| `/v1/responses` | `<base_url>/responses` |
+| `/v1/messages` | `<base_url>/messages` |
+| `/v1/models` | `<base_url>/models` |
+
+Request body bytes, raw query encoding, response body bytes, content encoding,
+and streaming data are preserved. Unsupported paths return a local 404 rather
+than being sent upstream.
+
+### Built-in providers
+
+Built-in adapters expose only the paths their implementation supports:
+
+| Provider | Paths |
+|---|---|
+| `nous` | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` |
+| `xai` | `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/embeddings`, `/v1/models` |
+| `openai-codex` | `/v1/chat/completions`, `/v1/models` |
+
+## Header handling
+
+Before forwarding a generic request, the proxy strips hop-by-hop headers and all
+caller-supplied provider credentials, including:
+
+- `Authorization`
+- `Proxy-Authorization`
+- `x-api-key`
+
+If the selected upstream has a credential, the proxy adds its own
+`Authorization` header. This prevents a key supplied by the calling application
+from leaking to the configured upstream.
+
+## Liveness and readiness
+
+`GET /health` is a **local liveness** endpoint. It confirms that the proxy process
+is serving requests and reports the adapter's local authentication view, but it
+does not call `/v1/models` or perform inference. A 200 from `/health` is not
+upstream readiness proof.
+
+Use both of these for readiness:
+
+```bash
+# Credential plus upstream route check
+curl http://127.0.0.1:8645/v1/models \
+  -H 'Authorization: Bearer sk-unused'
+
+# Representative inference check; choose a path and body the selected upstream supports
+curl http://127.0.0.1:8645/v1/chat/completions \
+  -H 'Authorization: Bearer sk-unused' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"your-model","messages":[{"role":"user","content":"Reply with ready."}]}'
+```
+
+For a Responses-only or Messages-only configured route, make the representative
+call to `/v1/responses` or `/v1/messages` instead. Readiness means the model list
+and the actual inference shape your application uses both succeed.
+
+## Local, Docker, and LAN trust boundaries
+
+### Local host
+
+The default `--host 127.0.0.1` limits access to processes on the same host. That
+is the recommended default, but every local process that can reach the port can
+use the upstream credential indirectly.
+
+### Docker
+
+Inside a container, bind the proxy to `0.0.0.0` only when container networking
+requires it. Keep host publication loopback-only when the client is also local:
+
+```bash
+# Example publication policy: host-local only
+# docker run ... -p 127.0.0.1:8645:8645 ...
+hermes proxy start --provider cli-proxy-api --host 0.0.0.0 --port 8645
+```
+
+Publishing with `-p 8645:8645` commonly exposes the port on every host
+interface, subject to Docker and firewall rules. Treat that as LAN exposure, not
+as a harmless container detail.
+
+### LAN or remote access
+
+```bash
+hermes proxy start --provider cli-proxy-api --host 0.0.0.0 --port 8645
+```
+
+Anyone who can reach that socket can consume the selected upstream account. Use
+a firewall, private VPN, or authenticated reverse proxy, and do not expose the
+listener directly to the public internet.
+
+## Status and troubleshooting
 
 ```bash
 hermes proxy status
 ```
 
-```
-Hermes proxy upstream adapters
+- `not ready` means Hermes cannot currently resolve usable credentials for that
+  adapter.
+- If a configured provider declares `key_env`, set that variable in the active
+  profile and restart the proxy.
+- If `/health` works but `/v1/models` fails, investigate upstream URL,
+  credentials, network access, and path support.
+- If `/v1/models` works but inference fails, test the exact protocol, model, and
+  request shape your application sends.
 
-  [nous    ] Nous Portal — ready (bearer expires 2026-05-15T06:43:21Z)
-```
-
-If you see `not logged in`, run `hermes portal`. If you see
-`credentials need attention`, your refresh token was revoked (rare —
-happens if you signed out from the Portal web UI) — just re-run
-`hermes portal`.
-
-## Allowed paths
-
-The proxy only forwards paths the upstream actually serves. For Nous
-Portal:
-
-| Path | Purpose |
-|------|---------|
-| `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
-| `/v1/completions` | Legacy text completions |
-| `/v1/embeddings` | Embeddings |
-| `/v1/models` | Model list |
-
-Other paths (`/v1/images/generations`, `/v1/audio/speech`, etc.) return
-404 with a clear error pointing at the allowed paths. This keeps stray
-clients from leaking weird requests to the upstream.
-
-## Configuring OpenViking to use Portal
-
-[OpenViking](https://github.com/volcengine/OpenViking) is a context
-database that needs an LLM provider for its VLM (vision/language model
-used to extract memories) and embedding model. With the proxy, you can
-point its `vlm.api_base` at your local proxy:
-
-Edit `~/.openviking/ov.conf`:
-
-```json
-{
-  "vlm": {
-    "provider": "openai",
-    "model": "Hermes-4-70B",
-    "api_base": "http://127.0.0.1:8645/v1",
-    "api_key": "unused-proxy-attaches-real-creds"
-  }
-}
-```
-
-Then start your proxy in a terminal alongside `openviking-server`:
-
-```bash
-# Terminal 1
-hermes proxy start
-
-# Terminal 2
-openviking-server
-```
-
-OpenViking's VLM calls now flow through your Portal subscription. The
-embedding model side still needs its own provider — Portal does serve
-`/v1/embeddings` but the model selection depends on what your tier
-supports; check `portal.nousresearch.com/models`.
-
-## Configuring Karakeep (or any bookmark/summarizer app)
-
-[Karakeep](https://karakeep.app/) takes an OpenAI-compatible API for
-bookmark summarization. In its config:
-
-```bash
-# Karakeep .env
-OPENAI_API_BASE_URL=http://127.0.0.1:8645/v1
-OPENAI_API_KEY=any-non-empty-string
-INFERENCE_TEXT_MODEL=Hermes-4-70B
-```
-
-Same pattern works for Open WebUI, LobeChat, NextChat, or any other
-OpenAI-compatible client.
-
-## Exposing on LAN
-
-By default the proxy binds `127.0.0.1` (localhost only). To let other
-machines on your network use it:
-
-```bash
-hermes proxy start --host 0.0.0.0 --port 8645
-```
-
-⚠ **Be aware:** anyone on your network can now use your Portal
-subscription. The proxy has no auth of its own — it accepts any bearer.
-Use a firewall, VPN, or reverse proxy with proper auth if you expose
-this beyond your trusted network.
-
-## Rate limits
-
-Your Portal tier's RPM/TPM limits apply across the whole proxy. The
-proxy doesn't fan out or pool — it's a single bearer with your full
-subscription quota. Monitor usage at
-[portal.nousresearch.com](https://portal.nousresearch.com).
-
-## Architecture
-
-The proxy is intentionally minimal. Per request:
-
-1. Receive `POST /v1/chat/completions` from your app
-2. Look up the adapter's current credential (refresh if expiring)
-3. Forward the request body verbatim, with `Authorization: Bearer <minted-key>`
-4. Stream the response back unchanged (SSE preserved)
-
-No transformation. No logging of request bodies. No agent loop. The
-proxy is a credential-attaching pass-through.
-
-## Future: more OAuth providers
-
-The adapter system is pluggable. Adding a new provider (e.g.
-HuggingFace, GitHub Copilot's chat endpoint, Anthropic via OAuth)
-requires implementing `UpstreamAdapter` in
-`hermes_cli/proxy/adapters/<provider>.py` and registering it in
-`adapters/__init__.py`. Providers that aren't OpenAI-compatible at the
-protocol level (Anthropic Messages API, for example) would need a
-transformation layer, which is out of scope for the current shape.
+The proxy does not log request bodies. Normal upstream rate limits and quotas
+still apply.

@@ -2685,9 +2685,10 @@ def _save_aux_choice(
 ) -> None:
     """Persist an auxiliary task's provider/model to config.yaml.
 
-    Only writes the four routing fields — timeout, download_timeout, and any
-    other task-specific settings are preserved untouched. The main model
-    config (``model.default``/``model.provider``) is never modified.
+    Only writes the routing fields — timeout, download_timeout, and any other
+    task-specific settings are preserved untouched. Switching providers clears
+    stale ``api_mode`` so the newly selected route can use its own transport.
+    The main model config (``model.default``/``model.provider``) is never modified.
     """
     from hermes_cli.config import load_config, save_config
 
@@ -2700,10 +2701,18 @@ def _save_aux_choice(
     if not isinstance(entry, dict):
         entry = {}
         aux[task] = entry
+    new_base_url = base_url or ""
+    route_changed = (
+        str(entry.get("provider") or "") != provider
+        or str(entry.get("base_url") or "").rstrip("/")
+        != new_base_url.rstrip("/")
+    )
     entry["provider"] = provider
     entry["model"] = model or ""
-    entry["base_url"] = base_url or ""
+    entry["base_url"] = new_base_url
     entry["api_key"] = api_key or ""
+    if route_changed:
+        entry["api_mode"] = ""
     save_config(cfg)
 
 
@@ -2730,7 +2739,7 @@ def _reset_aux_to_auto() -> int:
         if entry.get("provider") not in {None, "", "auto"}:
             entry["provider"] = "auto"
             changed = True
-        for field in ("model", "base_url", "api_key"):
+        for field in ("model", "base_url", "api_key", "api_mode"):
             if entry.get(field):
                 entry[field] = ""
                 changed = True
@@ -11740,19 +11749,18 @@ def main():
     )
 
     # =========================================================================
-    # proxy command — local OpenAI-compatible proxy that attaches the user's
-    # OAuth-authenticated provider credentials to outbound requests. Lets
-    # external apps (OpenViking, Karakeep, Open WebUI, ...) ride a logged-in
-    # subscription without copy-pasting static API keys.
+    # proxy command — local inference proxy that attaches Hermes-managed
+    # provider credentials to outbound requests. External apps can use built-in
+    # subscription adapters or named configured providers without holding the
+    # upstream credential.
     # =========================================================================
     proxy_parser = subparsers.add_parser(
         "proxy",
-        help="Local OpenAI-compatible proxy to OAuth providers",
+        help="Local proxy to built-in or configured inference providers",
         description=(
-            "Run a local HTTP server that forwards OpenAI-compatible requests "
-            "to an OAuth-authenticated provider (e.g. Nous Portal). External "
-            "apps can point at the proxy with any bearer token; the proxy "
-            "attaches your real credentials."
+            "Run a local HTTP server that forwards supported inference requests "
+            "to a built-in or configured provider. External apps can use any "
+            "bearer token; the proxy attaches the Hermes-managed credential."
         ),
     )
     proxy_subparsers = proxy_parser.add_subparsers(dest="proxy_command")
@@ -11763,7 +11771,10 @@ def main():
     proxy_start.add_argument(
         "--provider",
         default="nous",
-        help="Upstream provider: nous or xai (default: nous). See `hermes proxy providers`.",
+        help=(
+            "Built-in or configured provider name (default: nous). "
+            "See `hermes proxy providers`."
+        ),
     )
     proxy_start.add_argument(
         "--host",

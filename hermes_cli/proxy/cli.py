@@ -7,7 +7,7 @@ import logging
 import sys
 from typing import Any
 
-from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
+from hermes_cli.proxy.adapters import get_adapter, list_adapter_names
 from hermes_cli.proxy.server import (
     AIOHTTP_AVAILABLE,
     DEFAULT_HOST,
@@ -46,8 +46,7 @@ def cmd_proxy_start(args: Any) -> int:
     if not adapter.is_authenticated():
         auth_hint = getattr(adapter, "auth_hint", f"hermes auth add {adapter.name}")
         print(
-            f"Not logged into {adapter.display_name}. "
-            f"Run `{auth_hint}` first.",
+            f"{adapter.display_name} is not ready. Required action: {auth_hint}.",
             file=sys.stderr,
         )
         return 2
@@ -58,8 +57,8 @@ def cmd_proxy_start(args: Any) -> int:
     print(
         f"Starting Hermes proxy for {adapter.display_name}\n"
         f"  Listening on:  http://{host}:{port}/v1\n"
-        f"  Forwarding to: (resolved per-request from your subscription)\n"
-        f"  Use any bearer token in the client — the proxy attaches your real credential.\n"
+        f"  Forwarding to: (resolved per-request from Hermes configuration)\n"
+        f"  Use any bearer token in the client — the proxy attaches the configured credential.\n"
         f"\n"
         f"Press Ctrl+C to stop.",
         file=sys.stderr,
@@ -78,18 +77,12 @@ def cmd_proxy_start(args: Any) -> int:
 def cmd_proxy_status(args: Any) -> int:
     """Print the status of each configured upstream adapter."""
     print("Hermes proxy upstream adapters\n")
-    for name in sorted(ADAPTERS):
+    for name in list_adapter_names():
         adapter = get_adapter(name)
-        if not adapter.is_authenticated():
-            print(f"  [{name:8s}] {adapter.display_name} — not logged in")
-            continue
         try:
             cred = adapter.get_credential()
-        except Exception as exc:
-            print(
-                f"  [{name:8s}] {adapter.display_name} — credentials need attention "
-                f"({exc})"
-            )
+        except Exception:
+            print(f"  [{name:8s}] {adapter.display_name} — not ready")
             continue
         expires = f" (bearer expires {cred.expires_at})" if cred.expires_at else ""
         print(f"  [{name:8s}] {adapter.display_name} — ready{expires}")
@@ -102,7 +95,7 @@ def cmd_proxy_status(args: Any) -> int:
 def cmd_proxy_list_providers(args: Any) -> int:
     """List available proxy upstream providers."""
     print("Available proxy upstream providers:")
-    for name in sorted(ADAPTERS):
+    for name in list_adapter_names():
         adapter = get_adapter(name)
         print(f"  {name}  — {adapter.display_name}")
     return 0
@@ -119,11 +112,11 @@ def cmd_proxy(args: Any) -> int:
         return cmd_proxy_list_providers(args)
     # No subcommand → print short help.
     print(
-        "hermes proxy — local OpenAI-compatible proxy that attaches your\n"
-        "OAuth-authenticated provider credentials to outbound requests.\n"
+        "hermes proxy — local inference proxy that attaches Hermes-managed\n"
+        "provider credentials to outbound requests.\n"
         "\n"
         "Subcommands:\n"
-        "  hermes proxy start [--provider nous|xai] [--host 127.0.0.1] [--port 8645]\n"
+        "  hermes proxy start [--provider <name>] [--host 127.0.0.1] [--port 8645]\n"
         "      Run the proxy in the foreground.\n"
         "  hermes proxy status\n"
         "      Show which upstream adapters are ready.\n"

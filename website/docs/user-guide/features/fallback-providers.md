@@ -86,13 +86,30 @@ Each entry requires both `provider` and `model`. Entries missing either field ar
 
 ### Custom Endpoint Fallback
 
-For a custom OpenAI-compatible endpoint, add `base_url` and optionally `key_env`:
+For a custom endpoint, add `base_url` and optionally `key_env`. A named provider from the top-level `providers:` section can also be used directly:
+
+```yaml
+providers:
+  inference-gateway:
+    name: Inference Gateway
+    base_url: "http://127.0.0.1:8317/v1"
+    key_env: "INFERENCE_GATEWAY_KEY"
+    api_mode: "codex_responses"
+
+fallback_providers:
+  - provider: inference-gateway
+    model: gpt-5.6-luna
+```
+
+A declared `key_env` is authoritative. If its provider-associated credential cannot be resolved, Hermes fails closed instead of silently borrowing `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+
+For an anonymous custom entry, the equivalent shape is:
 
 ```yaml
 fallback_providers:
   - provider: custom
     model: my-local-model
-    base_url: http://localhost:8000/v1
+    base_url: http://127.0.0.1:8000/v1
     key_env: MY_LOCAL_KEY            # env var name containing the API key
 ```
 
@@ -226,21 +243,25 @@ Each task can be configured independently in `config.yaml`:
 ```yaml
 auxiliary:
   vision:
-    provider: "auto"              # auto | openrouter | nous | codex | main | anthropic
+    provider: "auto"              # auto | openrouter | nous | openai-codex | main | anthropic
     model: ""                     # e.g. "openai/gpt-4o"
     base_url: ""                  # direct endpoint (takes precedence over provider)
     api_key: ""                   # API key for base_url
+    api_mode: ""                  # optional: chat_completions | codex_responses | anthropic_messages
 
   web_extract:
     provider: "auto"
     model: ""
+    api_mode: ""
 
   compression:
     provider: "auto"
     model: ""
+    api_mode: ""
     fallback_chain:              # optional, task-specific fallback policy
       - provider: openrouter
         model: inclusionai/ring-2.6-1t:free
+        api_mode: chat_completions
 
   skills_hub:
     provider: "auto"
@@ -251,19 +272,32 @@ auxiliary:
     model: ""
 ```
 
-Every task above follows the same **provider / model / base_url** pattern. Each task can also declare its own `fallback_chain`; if omitted, `provider: auto` uses the top-level `fallback_providers` chain before Hermes' built-in auxiliary discovery chain.
+Every task above follows the same **provider / model / base_url / api_mode** pattern. `api_mode` is optional and selects the wire protocol for that auxiliary route. Each task can also declare its own `fallback_chain`; each fallback entry may independently set `api_mode`. If the chain is omitted, `provider: auto` uses the top-level `fallback_providers` chain before Hermes' built-in auxiliary discovery chain.
 
-Context compression is configured under `auxiliary.compression`:
+Context compression is configured under `auxiliary.compression`. This example uses the named CLIProxyAPI provider through Chat Completions first, then explicitly falls back to native OpenAI Codex OAuth:
 
 ```yaml
+providers:
+  cli-proxy-api:
+    name: CLIProxyAPI
+    base_url: "http://127.0.0.1:8317/v1"
+    key_env: "CLI_PROXY_API_KEY"
+    api_mode: "codex_responses"       # provider default for normal Hermes routing
+    default_model: "gpt-5.6-luna"
+
 auxiliary:
   compression:
-    provider: main                                    # Same provider options as other auxiliary tasks
-    model: google/gemini-3-flash-preview
-    base_url: null                                    # Custom OpenAI-compatible endpoint
+    provider: cli-proxy-api
+    model: claude-sonnet-4-6
+    api_mode: chat_completions         # task-level override for this primary route
+    fallback_chain:
+      - provider: openai-codex         # native ChatGPT/Codex OAuth route
+        model: gpt-5.4
 ```
 
-And the primary fallback chain uses:
+The task-level `api_mode` overrides the named provider's default for the primary compression call. Fallback entries can also declare their own `api_mode`; the built-in `openai-codex` provider already selects its native Responses transport, so the explicit provider and model are sufficient here.
+
+The primary agent fallback chain uses:
 
 ```yaml
 fallback_providers:
@@ -318,7 +352,7 @@ For users on `provider: auto` (no explicit aux provider), the existing auto-dete
 
 ### Optional: per-task fallback chain
 
-If you want a different fallback ordering than "main agent model first", configure `fallback_chain` explicitly. Each entry needs at least `provider`; `model`, `base_url`, and `api_key` are optional.
+If you want a different fallback ordering than "main agent model first", configure `fallback_chain` explicitly. Each entry needs at least `provider`; `model`, `base_url`, `api_key`, and `api_mode` are optional. Use `api_mode` when the fallback route must speak a different protocol than the task's primary route.
 
 ```yaml
 auxiliary:
@@ -359,8 +393,10 @@ Context compression uses the `auxiliary.compression` config block to control whi
 ```yaml
 auxiliary:
   compression:
-    provider: "auto"                              # auto | openrouter | nous | main
+    provider: "auto"
     model: "google/gemini-3-flash-preview"
+    api_mode: ""                                  # optional protocol override
+    fallback_chain: []                            # entries may set their own api_mode
 ```
 
 :::info Legacy migration

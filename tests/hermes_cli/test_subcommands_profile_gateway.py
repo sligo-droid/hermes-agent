@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 
@@ -84,6 +86,24 @@ def test_gateway_and_proxy_dispatch():
     px = p.parse_args(["proxy"])
     assert px.command == "proxy"
     assert px.func is _h_proxy
+
+
+def test_proxy_start_accepts_configured_provider_and_generic_help(capsys):
+    parser = _gateway_parser()
+
+    ns = parser.parse_args([
+        "proxy", "start", "--provider", "cli-proxy-api",
+    ])
+    assert ns.proxy_command == "start"
+    assert ns.provider == "cli-proxy-api"
+    assert ns.func is _h_proxy
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["proxy", "start", "--help"])
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "Built-in or configured provider name" in help_text
+    assert "nous or xai" not in help_text
 
 
 def test_gateway_accept_hooks_flag():
