@@ -1,0 +1,58 @@
+# Secret-free desired topology. Keep account/application/policy IDs, identities,
+# service-token metadata, tunnel IDs, credentials-file values, and secrets out.
+contract_version: 1
+zone: sligolabs.com
+
+access:
+  wildcard_human:
+    domain: "*.sligolabs.com"
+    action: allow
+    same_human_policy_as: claw.sligolabs.com
+
+  # Exact applications take precedence over the first-level wildcard.
+  exact_applications:
+    - domain: claw.sligolabs.com
+      action: allow
+    - domain: pid.sligolabs.com
+      action: bypass
+
+  # Keep these entries aligned with the hosts actually used by monitoring and
+  # Chronos. Add/remove host-specific entries here; do not broaden their paths.
+  path_applications:
+    - domain: sligo.sligolabs.com/webhooks/*
+      action: bypass
+    - domain: hermes.sligolabs.com/api/status
+      action: bypass
+    - domain: hermes.sligolabs.com/api/cron/fire
+      action: bypass
+    - domain: sligo.sligolabs.com/traces*
+      action: allow
+      same_human_policy_as: claw.sligolabs.com
+
+  # A first-level *.sligolabs.com Access application does not cover this deeper
+  # namespace. It is deliberately outside this rollout and must not be added.
+  excluded_host_patterns:
+    - "*.dev.sligolabs.com"
+
+# The validator checks route shape/order and requires loopback origins on these
+# ports. The operator-supplied cloudflared file may contain credentials-file,
+# but that field is never read
+# into output. The Hermes hostname is on a separately managed remote tunnel.
+tunnels:
+  local:
+    ingress:
+      - hostname: sligo.sligolabs.com
+        path: /webhooks/*
+        service: port:8644
+      - hostname: sligo.sligolabs.com
+        path: ^/traces(?:/.*)?$
+        service: port:8788
+      - hostname: sligo.sligolabs.com
+        service: port:9119
+      - hostname: claw.sligolabs.com
+        service: port:8720
+      - service: http_status:404
+
+  remote_hermes:
+    hostname: hermes.sligolabs.com
+    service: port:9119

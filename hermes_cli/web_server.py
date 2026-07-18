@@ -11,8 +11,10 @@ Usage:
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import importlib.util
+import ipaddress
 import json
 import logging
 import os
@@ -287,6 +289,69 @@ def _require_dashboard_request(request: Request) -> None:
 _LOOPBACK_HOST_VALUES: frozenset = frozenset({
     "localhost", "127.0.0.1", "::1",
 })
+_PUBLIC_GATEWAY_PLATFORM_STATES = frozenset({
+    "connected",
+    "connecting",
+    "disconnected",
+    "disabled",
+    "error",
+    "failed",
+    "retrying",
+    "starting",
+    "stopped",
+})
+
+
+def _is_loopback_host(value: str) -> bool:
+    """Return whether a host/address value is unambiguously loopback."""
+    raw = (value or "").strip().strip('"').lower()
+    if not raw:
+        return False
+
+    normalized = raw
+    if raw.startswith("["):
+        close = raw.find("]")
+        normalized = raw[1:close] if close >= 0 else raw.strip("[]")
+    else:
+        try:
+            return ipaddress.ip_address(raw).is_loopback
+        except ValueError:
+            # A single colon can only be a hostname/IPv4 port separator. Keep
+            # multi-colon values intact so bare IPv6 addresses remain parseable.
+            if raw.count(":") == 1:
+                host, port = raw.rsplit(":", 1)
+                if port.isdigit():
+                    normalized = host
+
+    if normalized in _LOOPBACK_HOST_VALUES:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _status_request_is_direct_loopback(request: Request) -> bool:
+    """Return whether ``/api/status`` may expose host-local details.
+
+    Host paths, process IDs, and internal gateway URLs are useful locally but
+    unnecessary deployment reconnaissance on a public dashboard. Only an
+    unambiguously loopback request keeps those fields. Forwarding and edge
+    headers are treated as redaction signals, never as proof that a request is
+    local, so spoofing them can only reduce the response.
+    """
+    for name in request.headers.keys():
+        normalized = name.lower()
+        if (
+            normalized.startswith(("cf-", "x-forwarded-"))
+            or normalized in {"forwarded", "true-client-ip", "cdn-loop", "x-real-ip"}
+        ):
+            return False
+
+    direct_client = request.client.host if request.client else ""
+    return _is_loopback_host(direct_client) and _is_loopback_host(
+        request.headers.get("host", "")
+    )
 
 
 def should_require_auth(host: str, allow_public: bool) -> bool:
@@ -422,7 +487,11 @@ async def auth_middleware(request: Request, call_next):
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         if not _has_valid_session_token(request):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-    if _dashboard_basic_auth_required(request) and not _has_dashboard_access(request):
+    if (
+        path not in _PUBLIC_API_PATHS
+        and _dashboard_basic_auth_required(request)
+        and not _has_dashboard_access(request)
+    ):
         return _basic_auth_challenge()
     return await call_next(request)
 
@@ -1012,7 +1081,7 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
 
 
 @app.get("/api/status")
-async def get_status():
+async def get_status(request: Request):
     current_ver, latest_ver = check_config_version()
 
     # --- Gateway liveness detection ---
@@ -1102,7 +1171,7 @@ async def get_status():
     # and which providers are registered so ``hermes status`` and the
     # SPA's StatusPage can show "OAuth gate ON via Nous Research" or
     # "loopback only — no auth gate" with no extra round trips.
-    auth_required = bool(getattr(app.state, "auth_required", False))
+    auth_required = bool(getattr(request.app.state, "auth_required", False))
     auth_providers: list[str] = []
     try:
         from hermes_cli.dashboard_auth import list_providers as _list_providers
@@ -1111,25 +1180,42 @@ async def get_status():
         # Module not importable yet (early startup) — leave as [].
         pass
 
-    return {
+    public_gateway_platforms = {}
+    for platform_name, details in gateway_platforms.items():
+        if not isinstance(details, dict):
+            continue
+        state = str(details.get("state") or "").strip().lower()
+        public_gateway_platforms[platform_name] = {
+            "state": state if state in _PUBLIC_GATEWAY_PLATFORM_STATES else "unknown"
+        }
+
+    status = {
         "version": __version__,
         "release_date": __release_date__,
-        "hermes_home": str(get_hermes_home()),
-        "config_path": str(get_config_path()),
-        "env_path": str(get_env_path()),
         "config_version": current_ver,
         "latest_config_version": latest_ver,
         "gateway_running": gateway_running,
-        "gateway_pid": gateway_pid,
-        "gateway_health_url": _GATEWAY_HEALTH_URL,
         "gateway_state": gateway_state,
-        "gateway_platforms": gateway_platforms,
-        "gateway_exit_reason": gateway_exit_reason,
+        "gateway_platforms": public_gateway_platforms,
+        "gateway_exit_reason": None,
         "gateway_updated_at": gateway_updated_at,
         "active_sessions": active_sessions,
         "auth_required": auth_required,
         "auth_providers": auth_providers,
     }
+    if _status_request_is_direct_loopback(request):
+        status.update(
+            {
+                "hermes_home": str(get_hermes_home()),
+                "config_path": str(get_config_path()),
+                "env_path": str(get_env_path()),
+                "gateway_pid": gateway_pid,
+                "gateway_health_url": _GATEWAY_HEALTH_URL,
+                "gateway_platforms": gateway_platforms,
+                "gateway_exit_reason": gateway_exit_reason,
+            }
+        )
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -3216,6 +3302,38 @@ class CronJobUpdate(BaseModel):
 
 
 _CRON_PROFILE_LOCK = threading.RLock()
+_CRON_FIRE_STATE_LOCK = threading.Lock()
+_CRON_FIRE_ACTIVE: set[tuple[str, str]] = set()
+_CRON_FIRE_TOKEN_EXPIRY: dict[str, float] = {}
+_CRON_FIRE_REPLAY_CACHE_SECONDS = 300
+_CRON_FIRE_SAFE_ENV_KEYS = frozenset(
+    {
+        "COLORTERM",
+        "CONDA_PREFIX",
+        "CURL_CA_BUNDLE",
+        "FORCE_COLOR",
+        "HOME",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "PYTHONIOENCODING",
+        "PYTHONUNBUFFERED",
+        "REQUESTS_CA_BUNDLE",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "USER",
+        "VIRTUAL_ENV",
+    }
+)
 
 
 def _cron_profile_dicts() -> List[Dict[str, Any]]:
@@ -3284,15 +3402,29 @@ def _call_cron_for_profile(profile: Optional[str], func_name: str, *args, **kwar
     return result
 
 
-def _find_cron_job_profile(job_id: str) -> Optional[str]:
+def _cron_profile_names() -> List[str]:
+    """Return the configured profile names once, without empty duplicates."""
+    names: List[str] = []
     for profile in _cron_profile_dicts():
         name = str(profile.get("name") or "")
-        if not name:
-            continue
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _find_cron_job_profiles(job_id: str) -> List[str]:
+    """Return every profile containing an exact job ID match."""
+    matches: List[str] = []
+    for name in _cron_profile_names():
         jobs = _call_cron_for_profile(name, "list_jobs", True)
-        if any(j.get("id") == job_id or j.get("name") == job_id for j in jobs):
-            return name
-    return None
+        if any(j.get("id") == job_id for j in jobs):
+            matches.append(name)
+    return matches
+
+
+def _find_cron_job_profile(job_id: str) -> Optional[str]:
+    matches = _find_cron_job_profiles(job_id)
+    return matches[0] if matches else None
 
 
 @app.get("/api/cron/jobs")
@@ -3410,6 +3542,272 @@ async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     if not removed:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"ok": True}
+
+
+def _cron_fire_worker_env(profile_name: str, home: Path) -> dict[str, str]:
+    """Build a worker environment without leaking another profile's secrets."""
+    try:
+        same_profile = home.resolve() == get_hermes_home().resolve()
+    except OSError:
+        same_profile = False
+
+    if same_profile:
+        env = os.environ.copy()
+    else:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.environments.local import hermes_subprocess_env
+
+        override = set_hermes_home_override(home)
+        try:
+            sanitized = hermes_subprocess_env(inherit_credentials=False)
+        finally:
+            reset_hermes_home_override(override)
+        env = {
+            key: value
+            for key, value in sanitized.items()
+            if key in _CRON_FIRE_SAFE_ENV_KEYS or key.startswith("LC_")
+        }
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_PROFILE"] = profile_name
+    return env
+
+
+def _verify_cron_fire_token_for_profile(
+    token: str,
+    profile: str,
+) -> dict[str, Any] | None:
+    from cron.scheduler_provider import verify_cron_fire_token
+
+    _profile_name, home = _cron_profile_home(profile)
+    return verify_cron_fire_token(token, hermes_home=str(home))
+
+
+def _verify_cron_fire_token_for_profiles(
+    token: str,
+    profiles: List[str],
+) -> List[tuple[str, dict[str, Any]]]:
+    """Return every profile whose configured provider accepts the credential."""
+    verified: List[tuple[str, dict[str, Any]]] = []
+    for profile in profiles:
+        claims = _verify_cron_fire_token_for_profile(token, profile)
+        if claims is not None:
+            verified.append((profile, claims))
+    return verified
+
+
+def _cron_fire_matches_current_occurrence(
+    profile: str,
+    job_id: str,
+    fire_at: str,
+) -> bool:
+    """Return whether a callback still names the profile's armed occurrence."""
+    from cron.jobs import _parse_cron_timestamp
+
+    job = _call_cron_for_profile(profile, "get_job", job_id)
+    stored_fire_at = _parse_cron_timestamp(job.get("next_run_at")) if job else None
+    expected_fire_at = _parse_cron_timestamp(fire_at)
+    return bool(
+        stored_fire_at is not None
+        and expected_fire_at is not None
+        and stored_fire_at == expected_fire_at
+    )
+
+
+def _start_cron_job_for_profile(
+    profile: str,
+    job_id: str,
+    fire_at: str,
+) -> subprocess.Popen:
+    """Start one due cron job in a process isolated to its storage profile."""
+    profile_name, home = _cron_profile_home(profile)
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.cron_fire_worker",
+            job_id,
+            fire_at,
+        ],
+        env=_cron_fire_worker_env(profile_name, home),
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def _start_reserved_cron_fire(
+    token: str,
+    claims: dict[str, Any],
+    profile: str,
+    job_id: str,
+    fire_at: str,
+) -> tuple[subprocess.Popen | None, str, tuple[str, str]]:
+    """Reserve a token/job pair and confirm its worker process started."""
+    now = time.time()
+    token_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    fire_key = (profile, job_id)
+    raw_expiry = claims.get("exp")
+    expiry = (
+        float(raw_expiry) + 30
+        if isinstance(raw_expiry, (int, float))
+        else now + _CRON_FIRE_REPLAY_CACHE_SECONDS
+    )
+
+    with _CRON_FIRE_STATE_LOCK:
+        expired = [
+            key
+            for key, cached_expiry in _CRON_FIRE_TOKEN_EXPIRY.items()
+            if cached_expiry <= now
+        ]
+        for key in expired:
+            _CRON_FIRE_TOKEN_EXPIRY.pop(key, None)
+
+        if token_key in _CRON_FIRE_TOKEN_EXPIRY or fire_key in _CRON_FIRE_ACTIVE:
+            _CRON_FIRE_TOKEN_EXPIRY[token_key] = max(expiry, now + 1)
+            return None, token_key, fire_key
+
+        _CRON_FIRE_TOKEN_EXPIRY[token_key] = max(expiry, now + 1)
+        _CRON_FIRE_ACTIVE.add(fire_key)
+        try:
+            process = _start_cron_job_for_profile(profile, job_id, fire_at)
+        except Exception:
+            _CRON_FIRE_ACTIVE.discard(fire_key)
+            _CRON_FIRE_TOKEN_EXPIRY.pop(token_key, None)
+            raise
+        return process, token_key, fire_key
+
+
+def _release_cron_fire(
+    token_key: str,
+    fire_key: tuple[str, str],
+    *,
+    forget_token: bool = False,
+) -> None:
+    with _CRON_FIRE_STATE_LOCK:
+        _CRON_FIRE_ACTIVE.discard(fire_key)
+        if forget_token:
+            _CRON_FIRE_TOKEN_EXPIRY.pop(token_key, None)
+
+
+def _watch_cron_fire_process(
+    process: subprocess.Popen,
+    token_key: str,
+    fire_key: tuple[str, str],
+) -> None:
+    try:
+        returncode = process.wait()
+        if returncode != 0:
+            _log.warning(
+                "Cron fire worker exited with status %s for job %s",
+                returncode,
+                fire_key[1],
+            )
+    finally:
+        _release_cron_fire(token_key, fire_key)
+
+
+@app.post("/api/cron/fire")
+async def cron_fire_webhook(request: Request):
+    """Accept a provider fire after verifying its bearer credential."""
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw_job_id = (body or {}).get("job_id") if isinstance(body, dict) else None
+    job_id = raw_job_id.strip() if isinstance(raw_job_id, str) else ""
+    job_profiles = (
+        await asyncio.to_thread(_find_cron_job_profiles, job_id)
+        if job_id
+        else []
+    )
+    profiles_to_verify = job_profiles or await asyncio.to_thread(
+        _cron_profile_names
+    )
+    verified_profiles = await asyncio.to_thread(
+        _verify_cron_fire_token_for_profiles,
+        token,
+        profiles_to_verify,
+    )
+    if not verified_profiles:
+        return JSONResponse({"error": "invalid fire token"}, status_code=401)
+
+    if not job_id:
+        return JSONResponse({"error": "missing job_id"}, status_code=400)
+    if len(verified_profiles) > 1 and job_profiles:
+        _log.error("Cron fire job ID exists in multiple authorized profiles: %s", job_id)
+        return JSONResponse(
+            {"error": "ambiguous cron job profile"},
+            status_code=409,
+        )
+    profile, claims = verified_profiles[0]
+    fire_at = (body or {}).get("fire_at") if isinstance(body, dict) else None
+    if not isinstance(fire_at, str) or not fire_at.strip():
+        return JSONResponse({"error": "missing fire_at"}, status_code=400)
+    fire_at = fire_at.strip()
+
+    if not job_profiles:
+        # A cancelled/completed job is intentionally gone; do not invite NAS
+        # to retry a fire that can no longer be claimed. The credential was
+        # still checked against every configured profile so a retry from a
+        # non-default profile reaches this terminal response.
+        return JSONResponse({"status": "gone", "job_id": job_id}, status_code=200)
+
+    if not await asyncio.to_thread(
+        _cron_fire_matches_current_occurrence,
+        profile,
+        job_id,
+        fire_at,
+    ):
+        # Persisted state already advanced past this occurrence. A relay retry
+        # after a dashboard restart is accepted without starting another worker.
+        return JSONResponse(
+            {"status": "accepted", "job_id": job_id},
+            status_code=202,
+        )
+
+    try:
+        process, token_key, fire_key = await asyncio.to_thread(
+            _start_reserved_cron_fire,
+            token,
+            claims,
+            profile,
+            job_id,
+            fire_at,
+        )
+    except (OSError, subprocess.SubprocessError):
+        _log.exception("Failed to start cron fire worker for job %s", job_id)
+        return JSONResponse(
+            {"error": "cron worker unavailable"},
+            status_code=503,
+        )
+
+    if process is None:
+        return JSONResponse(
+            {"status": "accepted", "job_id": job_id},
+            status_code=202,
+        )
+
+    watcher = threading.Thread(
+        target=_watch_cron_fire_process,
+        args=(process, token_key, fire_key),
+        name=f"cron-fire-{job_id[:12]}",
+        daemon=True,
+    )
+    try:
+        watcher.start()
+    except RuntimeError:
+        process.terminate()
+        _release_cron_fire(token_key, fire_key, forget_token=True)
+        _log.exception("Failed to monitor cron fire worker for job %s", job_id)
+        return JSONResponse(
+            {"error": "cron worker unavailable"},
+            status_code=503,
+        )
+    return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
 
 
 # ---------------------------------------------------------------------------

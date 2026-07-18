@@ -31,7 +31,11 @@ def gated_client():
     web_server.app.state.bound_host = "fly-app.fly.dev"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
-    client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    client = TestClient(
+        web_server.app,
+        base_url="https://fly-app.fly.dev",
+        client=("192.0.2.25", 50000),
+    )
     yield client
     clear_providers()
     web_server.app.state.bound_host = prev_host
@@ -48,7 +52,11 @@ def loopback_client():
     web_server.app.state.bound_host = "127.0.0.1"
     web_server.app.state.bound_port = 8080
     web_server.app.state.auth_required = False
-    client = TestClient(web_server.app, base_url="http://127.0.0.1:8080")
+    client = TestClient(
+        web_server.app,
+        base_url="http://127.0.0.1:8080",
+        client=("127.0.0.1", 50000),
+    )
     yield client
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
@@ -120,12 +128,99 @@ def test_status_withholds_host_detail_in_gated_mode(gated_client):
     assert not leaked, f"/api/status leaked host detail under the gate: {leaked}"
 
 
+def test_public_status_sanitizes_platform_errors_and_exit_reason(
+    gated_client,
+    monkeypatch,
+):
+    import gateway.config as gateway_config
+
+    class GatewayConfig:
+        def get_connected_platforms(self):
+            return [type("Platform", (), {"value": "discord"})()]
+
+    monkeypatch.setattr(gateway_config, "load_gateway_config", GatewayConfig)
+    monkeypatch.setattr(web_server, "get_running_pid", lambda: 1234)
+    monkeypatch.setattr(
+        web_server,
+        "read_runtime_status",
+        lambda: {
+            "gateway_state": "running",
+            "platforms": {
+                "discord": {
+                    "state": "connected",
+                    "error_message": "credential-shaped-private-detail",
+                }
+            },
+            "exit_reason": "private-upstream-response-body",
+        },
+    )
+
+    body = gated_client.get("/api/status").json()
+
+    assert body["gateway_platforms"] == {"discord": {"state": "connected"}}
+    assert body["gateway_exit_reason"] is None
+    assert "credential-shaped-private-detail" not in str(body)
+    assert "private-upstream-response-body" not in str(body)
+
+
 def test_status_includes_host_detail_in_loopback_mode(loopback_client):
-    """Counterpart to the gated case: a loopback bind is local-only, so the
-    full payload (including host paths and PID) is still served — preserving
-    the StatusPage / ``hermes status`` experience for local operators."""
+    """A direct loopback request preserves the full local operator payload."""
     r = loopback_client.get("/api/status")
     assert r.status_code == 200
     body = r.json()
     missing = _HOST_DETAIL_FIELDS - set(body.keys())
     assert not missing, f"loopback /api/status should keep host detail: {missing}"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["localhost", "localhost:8080", "127.0.0.1:8080", "::1", "[::1]:8080"],
+)
+def test_status_loopback_host_detection_supports_ports_and_ipv6(value):
+    assert web_server._is_loopback_host(value) is True
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Forwarded-Host": "agent.example.com"},
+        {"X-Forwarded-Host": "127.0.0.1:8080"},
+        {"X-Forwarded-For": "203.0.113.7"},
+        {"X-Forwarded-For": "127.0.0.1"},
+        {"X-Forwarded-Proto": "http"},
+        {"Forwarded": "for=203.0.113.7;host=agent.example.com"},
+        {"CF-Ray": "8f00-example"},
+        {"CF-Connecting-IP": "127.0.0.1"},
+        {"CF-Visitor": '{"scheme":"https"}'},
+    ],
+)
+def test_status_edge_or_non_loopback_forwarding_only_increases_redaction(
+    loopback_client,
+    headers,
+):
+    """Untrusted proxy/edge metadata can redact, but never grant local detail."""
+    r = loopback_client.get("/api/status", headers=headers)
+    assert r.status_code == 200
+    leaked = _HOST_DETAIL_FIELDS & set(r.json())
+    assert not leaked, f"/api/status leaked host detail with headers {headers}: {leaked}"
+
+
+def test_status_non_loopback_peer_redacts_even_with_loopback_host():
+    """A spoofed loopback Host header cannot make a remote peer host-local."""
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.bound_host = "0.0.0.0"
+    web_server.app.state.auth_required = False
+    client = TestClient(
+        web_server.app,
+        base_url="http://127.0.0.1:8080",
+        client=("198.51.100.12", 50000),
+    )
+    try:
+        r = client.get("/api/status")
+        assert r.status_code == 200
+        assert not (_HOST_DETAIL_FIELDS & set(r.json()))
+    finally:
+        client.close()
+        web_server.app.state.bound_host = prev_host
+        web_server.app.state.auth_required = prev_required

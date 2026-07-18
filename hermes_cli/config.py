@@ -2168,6 +2168,12 @@ DEFAULT_CONFIG = {
         # Operator status grace for persisted next_run_at values. Jobs older
         # than this window are surfaced as missed without mutating cron state.
         "missed_run_grace_seconds": 300,
+        "chronos": {
+            "portal_url": "",
+            "callback_url": "",
+            "expected_audience": "",
+            "nas_jwks_url": "",
+        },
     },
 
     "self_improvement": {

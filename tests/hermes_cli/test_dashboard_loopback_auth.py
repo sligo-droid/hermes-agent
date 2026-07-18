@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
@@ -36,6 +36,14 @@ def dashboard_app(tmp_path, monkeypatch):
         @app.get("/api/sessions")
         async def api_sessions():
             return {"sessions": []}
+
+        @app.get("/api/status")
+        async def api_status():
+            return {"ok": True}
+
+        @app.post("/api/cron/fire")
+        async def api_cron_fire(request: Request):
+            return {"authorization": request.headers.get("Authorization")}
 
         web_server.mount_spa(app)
         return TestClient(app, base_url=f"http://{host}:9119")
@@ -91,3 +99,32 @@ def test_env_flag_forces_basic_auth_on_loopback(dashboard_app, monkeypatch):
 
     assert response.status_code == 401
     assert response.headers["WWW-Authenticate"].startswith("Basic")
+
+
+def test_forced_basic_auth_honors_public_status_path(dashboard_app, monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_REQUIRE_BASIC_AUTH", "1")
+
+    response = dashboard_app("127.0.0.1").get("/api/status")
+
+    assert response.status_code == 200
+    assert "WWW-Authenticate" not in response.headers
+
+
+def test_forced_basic_auth_keeps_private_api_protected(dashboard_app, monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_REQUIRE_BASIC_AUTH", "1")
+
+    response = dashboard_app("127.0.0.1").get("/api/sessions")
+
+    assert response.status_code == 401
+
+
+def test_forced_basic_auth_preserves_cron_bearer(dashboard_app, monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_REQUIRE_BASIC_AUTH", "1")
+
+    response = dashboard_app("127.0.0.1").post(
+        "/api/cron/fire",
+        headers={"Authorization": "Bearer nas-fire-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["authorization"] == "Bearer nas-fire-token"

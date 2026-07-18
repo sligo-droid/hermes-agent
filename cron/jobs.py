@@ -1549,14 +1549,20 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
-def claim_job_for_fire(job_id: str, claim_ttl_seconds: int = 600) -> bool:
+def claim_job_for_fire(
+    job_id: str,
+    claim_ttl_seconds: int = 600,
+    *,
+    expected_fire_at: str | None = None,
+) -> bool:
     """Atomically claim a due cron job fire.
 
     External schedulers and immediate/manual runs call this before executing a
     job outside the built-in ticker. The claim is a storage-level compare and
-    set: only a job whose ``next_run_at`` is currently due can be claimed. A
-    successful claim advances/clears ``next_run_at`` before execution so a
-    concurrent retry or gateway tick cannot run the same fire twice.
+    set: only the requested ``next_run_at`` occurrence can be claimed when
+    ``expected_fire_at`` is supplied. A successful claim advances/clears
+    ``next_run_at`` before execution so a concurrent retry or gateway tick
+    cannot run the same fire twice.
 
     Returns ``True`` when this caller owns the fire, otherwise ``False``.
     """
@@ -1590,6 +1596,11 @@ def claim_job_for_fire(job_id: str, claim_ttl_seconds: int = 600) -> bool:
             except (TypeError, ValueError):
                 logger.error("claim_job_for_fire: invalid next_run_at for job %s: %r", job_id, next_run)
                 return False
+
+            if expected_fire_at is not None:
+                expected_dt = _parse_cron_timestamp(expected_fire_at)
+                if expected_dt is None or expected_dt != next_run_dt:
+                    return False
 
             schedule = job.get("schedule", {}) if isinstance(job.get("schedule"), dict) else {}
             kind = schedule.get("kind")

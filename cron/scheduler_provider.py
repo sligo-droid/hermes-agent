@@ -82,9 +82,19 @@ class CronScheduler(ABC):
         Built-in: no-op (it re-reads jobs.json on every tick)."""
         return None
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
-        """Run a single job NOW via the shared orchestrator. Called by the
-        inbound fire webhook when an external scheduler signals a job is due.
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        fire_at: str | None = None,
+        adapters: Any = None,
+        loop: Any = None,
+    ) -> bool:
+        """Run a single externally scheduled occurrence via the orchestrator.
+
+        Called by the inbound fire webhook when an external scheduler signals a
+        job is due. The optional ``fire_at`` binds the callback to the occurrence
+        that the external provider armed.
 
         The default claims the job with a store-level compare-and-set
         (multi-machine at-most-once), then runs it via the shared
@@ -97,7 +107,7 @@ class CronScheduler(ABC):
         from cron.jobs import claim_job_for_fire, get_job
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
+        if not claim_job_for_fire(job_id, expected_fire_at=fire_at):
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
@@ -109,6 +119,37 @@ class CronScheduler(ABC):
         arm missing one-shots, cancel orphaned ones, re-arm changed times.
         Built-in: no-op."""
         return None
+
+    def verify_fire_token(self, token: str) -> dict[str, Any] | None:
+        """Verify a provider-specific inbound fire credential.
+
+        Providers that expose an inbound fire endpoint override this hook. The
+        default fails closed so selecting the built-in provider (or falling back
+        to it) can never authorize a remote fire.
+        """
+        return None
+
+
+def verify_cron_fire_token(
+    token: str,
+    *,
+    hermes_home: str | None = None,
+) -> dict[str, Any] | None:
+    """Verify a fire token through the provider configured for one profile."""
+    override = None
+    try:
+        if hermes_home is not None:
+            from hermes_constants import set_hermes_home_override
+
+            override = set_hermes_home_override(hermes_home)
+        return resolve_cron_scheduler().verify_fire_token(token)
+    except Exception:
+        return None
+    finally:
+        if override is not None:
+            from hermes_constants import reset_hermes_home_override
+
+            reset_hermes_home_override(override)
 
 
 def resolve_cron_scheduler() -> "CronScheduler":

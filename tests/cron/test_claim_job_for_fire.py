@@ -32,6 +32,19 @@ def test_claim_succeeds_once_then_blocks(temp_home):
     assert get_job(jid)["next_run_at"] != before
 
 
+def test_claim_expected_fire_only_matches_current_occurrence(temp_home):
+    from cron.jobs import create_job, claim_job_for_fire, get_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="bound")
+    fire_at = get_job(job["id"])["next_run_at"]
+
+    assert claim_job_for_fire(
+        job["id"],
+        expected_fire_at="2099-01-01T00:00:00+00:00",
+    ) is False
+    assert claim_job_for_fire(job["id"], expected_fire_at=fire_at) is True
+
+
 def test_claim_oneshot_cannot_be_double_claimed(temp_home):
     """A one-shot can't be double-claimed (the fresh claim blocks the retry)."""
     from cron.jobs import create_job, claim_job_for_fire

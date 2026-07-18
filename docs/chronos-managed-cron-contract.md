@@ -132,7 +132,7 @@ public HTTP surface on hosted deployments (the gateway may be idle/scaled down);
 it is in `PUBLIC_API_PATHS` so the dashboard cookie gate lets the bearer-JWT
 callback through to the verifier. (Also registered on the optional
 `APIServerAdapter` for self-host API-server deployments.) The verifier is
-`plugins/cron/chronos/verify.py`.
+`plugins/cron_providers/chronos/verify.py`.
 
 - **Auth:** `Authorization: Bearer <NAS-minted JWT>`. The agent verifies:
   - signature against the NAS JWKS (`cron.chronos.nas_jwks_url`),
@@ -142,18 +142,22 @@ callback through to the verifier. (Also registered on the optional
   - `exp` / `nbf` (30s leeway),
   - `purpose == "cron_fire"` — a general agent JWT (no/other purpose) is
     rejected so it can't be replayed against this endpoint.
-- **Body:** `{"job_id": "ab12cd34", "fire_at": "..."}` (only `job_id` is used).
+- **Body:** `{"job_id": "ab12cd34", "fire_at": "..."}`. Both fields are
+  required; `fire_at` binds retries to the exact armed occurrence so a fresh
+  relay token cannot advance the next recurrence.
 - **Behavior:**
   - invalid/missing/forged/expired/wrong-aud/wrong-purpose token → **401**, no
     execution.
-  - missing `job_id` → **400**.
-  - valid → **202 `{"status": "accepted", "job_id": "..."}`** immediately, and
-    the job runs in the background. 202-before-run means a long agent turn never
-    trips the relay's HTTP timeout.
-- **At-most-once:** the agent claims the job with a store-level compare-and-set
-  (`claim_job_for_fire`) before running. A relay/scheduler retry that arrives
-  while the first fire is in flight (or after it completed) loses the claim and
-  does not double-run.
+  - missing `job_id` or `fire_at` → **400**.
+  - valid → start the isolated profile worker, then return **202
+    `{"status": "accepted", "job_id": "..."}`** while the job continues in the
+    background. A worker-start failure returns retryable **503** instead of
+    acknowledging a fire that never started.
+- **At-most-once:** exact token replays and concurrent fires for the same job are
+  coalesced before starting another worker. The worker then claims the job with
+  a store-level compare-and-set (`claim_job_for_fire`) before running, so a
+  relay/scheduler retry that arrives after the worker exits also loses the claim
+  and does not double-run.
 
 ---
 
