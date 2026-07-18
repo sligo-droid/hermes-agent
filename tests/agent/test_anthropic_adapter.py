@@ -92,6 +92,19 @@ class TestBuildAnthropicClient:
             assert "interleaved-thinking-2025-05-14" in betas
             assert "fine-grained-tool-streaming-2025-05-14" in betas
 
+    def test_setup_token_uses_bearer_auth_through_custom_proxy(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "sk-ant-oat01-" + "x" * 60,
+                base_url="http://127.0.0.1:8317",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+
+        assert kwargs["auth_token"].startswith("sk-ant-oat01-")
+        assert "api_key" not in kwargs
+        assert kwargs["base_url"] == "http://127.0.0.1:8317"
+        assert kwargs["default_headers"]["x-app"] == "cli"
+
     def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client("sk-ant-api03-something")

@@ -797,18 +797,11 @@ def build_anthropic_client(
         kwargs["auth_token"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
-    elif _is_third_party_anthropic_endpoint(base_url):
-        # Third-party proxies (Microsoft Foundry, AWS Bedrock, etc.) use their
-        # own API keys with x-api-key auth. Skip OAuth detection — their keys
-        # don't follow Anthropic's sk-ant-* prefix convention and would be
-        # misclassified as OAuth tokens.
-        kwargs["api_key"] = api_key
-        if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
-        # Anthropic routes OAuth requests based on user-agent and headers;
-        # without Claude Code's fingerprint, requests get intermittent 500s.
+        # Preserve this token-defined auth mode through Anthropic-compatible
+        # proxies such as CLIProxyAPI; sending an Anthropic OAuth token as an
+        # x-api-key makes the proxy reject an otherwise valid subscription.
         all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
@@ -816,6 +809,12 @@ def build_anthropic_client(
             "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
             "x-app": "cli",
         }
+    elif _is_third_party_anthropic_endpoint(base_url):
+        # Other third-party proxies (Microsoft Foundry, AWS Bedrock, etc.) use
+        # their own regular API keys with x-api-key auth.
+        kwargs["api_key"] = api_key
+        if common_betas:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     else:
         # Regular API key → x-api-key header + common betas
         kwargs["api_key"] = api_key
