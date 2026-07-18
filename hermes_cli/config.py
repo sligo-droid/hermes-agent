@@ -1158,6 +1158,7 @@ DEFAULT_CONFIG = {
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
             "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
+            "api_mode": "",        # optional wire protocol override for base_url/provider
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
@@ -1169,6 +1170,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 360,        # seconds — browser text summarization timeout
             "extra_body": {},
         },
@@ -1177,6 +1179,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "fallback_chain": [],  # ordered routes tried before generic/main fallback handling
@@ -1190,6 +1193,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 30,
             "extra_body": {},
         },
@@ -1198,6 +1202,7 @@ DEFAULT_CONFIG = {
             "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 30,
             "extra_body": {},
         },
@@ -1206,6 +1211,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 30,
             "extra_body": {},
         },
@@ -1214,6 +1220,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 30,
             "extra_body": {},
         },
@@ -1222,6 +1229,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 15,
             "extra_body": {},
         },
@@ -1230,6 +1238,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 4,
             "extra_body": {},
         },
@@ -1238,6 +1247,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 30,
             "extra_body": {},
         },
@@ -1251,6 +1261,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 120,
             "extra_body": {},
         },
@@ -1264,6 +1275,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 180,
             "extra_body": {},
         },
@@ -1276,6 +1288,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 60,
             "extra_body": {},
         },
@@ -1289,6 +1302,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_mode": "",
             "timeout": 600,
             "extra_body": {},
         },
@@ -4122,9 +4136,13 @@ def get_compatible_custom_providers(
     custom_providers = config.get("custom_providers")
     if custom_providers is not None:
         if not isinstance(custom_providers, list):
-            return []
-        for entry in custom_providers:
-            _append_if_new(_normalize_custom_provider_entry(entry))
+            logger.warning(
+                "custom_providers in config.yaml is not a list; ignoring the "
+                "malformed legacy field while loading providers"
+            )
+        else:
+            for entry in custom_providers:
+                _append_if_new(_normalize_custom_provider_entry(entry))
 
     for entry in providers_dict_to_custom_providers(config.get("providers")):
         _append_if_new(entry)

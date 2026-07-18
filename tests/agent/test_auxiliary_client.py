@@ -72,7 +72,7 @@ def _clean_env(monkeypatch):
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN", "CLI_PROXY_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -658,6 +658,57 @@ class TestResolveProviderClientUniversalModelFallback:
         assert model == "grok-4.20-multi-agent"
         mock_read_main.assert_not_called()
         assert mock_build.call_args.args[0] == "grok-4.20-multi-agent"
+
+
+class TestNamedCustomProviderResolution:
+    def test_uses_profile_scoped_declared_key_and_runtime_headers(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        entry = {
+            "name": "CLIProxyAPI",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "key_env": "CLI_PROXY_API_KEY",
+            "api_mode": "chat_completions",
+            "model": "gpt-5.5",
+            "extra_headers": {"CF-Access-Client-Id": "profile-client"},
+        }
+        monkeypatch.setenv("CLI_PROXY_API_KEY", "wrong-global-key")
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda _provider: dict(entry),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._try_resolve_from_custom_pool",
+            lambda *args, **kwargs: None,
+        )
+        openai = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("agent.auxiliary_client.OpenAI", openai)
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope(
+            {"CLI_PROXY_API_KEY": "profile-scoped-key"}
+        )
+        try:
+            client, model = resolve_provider_client(
+                "cli-proxy-api",
+                "gpt-5.5",
+                api_mode="chat_completions",
+            )
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        assert client is openai.return_value
+        assert model == "gpt-5.5"
+        assert openai.call_args.kwargs == {
+            "api_key": "profile-scoped-key",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "default_headers": {
+                "CF-Access-Client-Id": "profile-client",
+            },
+        }
 
 
 class TestExpiredCodexFallback:
@@ -2964,6 +3015,31 @@ class TestAuxiliaryTaskExtraBody:
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
 
+    def test_compression_proxy_responses_wrapper_does_not_get_native_codex_default(self):
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        real_client = MagicMock()
+        real_client.api_key = "proxy-key"
+        real_client.base_url = "http://127.0.0.1:8317/v1"
+        client = CodexAuxiliaryClient(real_client, "gpt-5.6-luna")
+        response = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="summary"))
+        ])
+        client.chat.completions.create = MagicMock(return_value=response)
+
+        with patch("hermes_cli.config.load_config", return_value={"auxiliary": {}}), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "gpt-5.6-luna"),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result is response
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert "extra_body" not in kwargs or "reasoning" not in kwargs["extra_body"]
+
     def test_compression_codex_preserves_explicit_reasoning(self):
         client = MagicMock()
         client.base_url = "https://chatgpt.com/backend-api/codex"
@@ -3017,6 +3093,201 @@ class TestAuxiliaryTaskExtraBody:
 
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
+
+    def test_compression_native_codex_outage_proxy_chat_fallback_drops_default_reasoning(self):
+        outage = Exception("Service Unavailable")
+        outage.status_code = 503
+
+        native_codex = MagicMock()
+        native_codex.base_url = "https://chatgpt.com/backend-api/codex"
+        native_codex.chat.completions.create.side_effect = outage
+
+        proxy_chat = MagicMock()
+        proxy_chat.base_url = "http://127.0.0.1:8317/v1"
+        proxy_chat._hermes_provider = "cli-proxy-api"
+        proxy_chat.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="proxy summary"))
+        ])
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("openai-codex", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(native_codex, "gpt-5.4"),
+        ), patch(
+            "agent.auxiliary_client._try_error_fallback",
+            return_value=(
+                proxy_chat,
+                "claude-sonnet-4-6",
+                "fallback_chain[0](cli-proxy-api)",
+                "openai-codex",
+            ),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                extra_body={"metadata": {"source": "test"}},
+            )
+
+        assert result.choices[0].message.content == "proxy summary"
+        native_extra = native_codex.chat.completions.create.call_args.kwargs["extra_body"]
+        assert native_extra["reasoning"] == {"enabled": False}
+        assert native_extra["metadata"] == {"source": "test"}
+        proxy_extra = proxy_chat.chat.completions.create.call_args.kwargs["extra_body"]
+        assert "reasoning" not in proxy_extra
+        assert proxy_extra["metadata"] == {"source": "test"}
+
+    def test_compression_proxy_chat_outage_native_codex_fallback_adds_default_reasoning(self):
+        outage = Exception("Service Unavailable")
+        outage.status_code = 503
+
+        proxy_chat = MagicMock()
+        proxy_chat.base_url = "http://127.0.0.1:8317/v1"
+        proxy_chat._hermes_provider = "cli-proxy-api"
+        proxy_chat.chat.completions.create.side_effect = outage
+
+        native_codex = MagicMock()
+        native_codex.base_url = "https://chatgpt.com/backend-api/codex"
+        native_codex._hermes_provider = "openai-codex"
+        native_codex.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="native summary"))
+        ])
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "cli-proxy-api",
+                "claude-sonnet-4-6",
+                None,
+                None,
+                "chat_completions",
+            ),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(proxy_chat, "claude-sonnet-4-6"),
+        ), patch(
+            "agent.auxiliary_client._try_error_fallback",
+            return_value=(
+                native_codex,
+                "gpt-5.4",
+                "fallback_chain[0](openai-codex)",
+                "cli-proxy-api",
+            ),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                extra_body={"metadata": {"source": "test"}},
+            )
+
+        assert result.choices[0].message.content == "native summary"
+        proxy_extra = proxy_chat.chat.completions.create.call_args.kwargs["extra_body"]
+        assert "reasoning" not in proxy_extra
+        assert proxy_extra["metadata"] == {"source": "test"}
+        native_extra = native_codex.chat.completions.create.call_args.kwargs["extra_body"]
+        assert native_extra["reasoning"] == {"enabled": False}
+        assert native_extra["metadata"] == {"source": "test"}
+
+    def test_compression_native_codex_auth_retry_gets_default_reasoning(self):
+        auth_error = Exception("Unauthorized")
+        auth_error.status_code = 401
+
+        stale_codex = MagicMock()
+        stale_codex.base_url = "https://chatgpt.com/backend-api/codex"
+        stale_codex.chat.completions.create.side_effect = auth_error
+
+        refreshed_codex = MagicMock()
+        refreshed_codex.base_url = "https://chatgpt.com/backend-api/codex"
+        refreshed_codex.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="retry summary"))
+        ])
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("openai-codex", "gpt-5.4", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            side_effect=[
+                (stale_codex, "gpt-5.4"),
+                (refreshed_codex, "gpt-5.4"),
+            ],
+        ), patch(
+            "agent.auxiliary_client._refresh_provider_credentials",
+            return_value=True,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "retry summary"
+        assert stale_codex.chat.completions.create.call_args.kwargs["extra_body"][
+            "reasoning"
+        ] == {"enabled": False}
+        assert refreshed_codex.chat.completions.create.call_args.kwargs["extra_body"][
+            "reasoning"
+        ] == {"enabled": False}
+
+    @pytest.mark.asyncio
+    async def test_async_compression_proxy_chat_outage_native_codex_fallback_adds_default_reasoning(self):
+        outage = Exception("Service Unavailable")
+        outage.status_code = 503
+
+        proxy_chat = MagicMock()
+        proxy_chat.base_url = "http://127.0.0.1:8317/v1"
+        proxy_chat._hermes_provider = "cli-proxy-api"
+        proxy_chat.chat.completions.create = AsyncMock(side_effect=outage)
+
+        native_codex = MagicMock()
+        native_codex.base_url = "https://chatgpt.com/backend-api/codex"
+        native_codex._hermes_provider = "openai-codex"
+
+        async_native_codex = MagicMock()
+        async_native_codex.base_url = "https://chatgpt.com/backend-api/codex"
+        async_native_codex._hermes_provider = "openai-codex"
+        async_native_codex.chat.completions.create = AsyncMock(return_value=MagicMock(
+            choices=[MagicMock(message=MagicMock(content="async native summary"))]
+        ))
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "cli-proxy-api",
+                "claude-sonnet-4-6",
+                None,
+                None,
+                "chat_completions",
+            ),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(proxy_chat, "claude-sonnet-4-6"),
+        ), patch(
+            "agent.auxiliary_client._try_error_fallback",
+            return_value=(
+                native_codex,
+                "gpt-5.4",
+                "fallback_chain[0](openai-codex)",
+                "cli-proxy-api",
+            ),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_native_codex, "gpt-5.4"),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                extra_body={"metadata": {"source": "test"}},
+            )
+
+        assert result.choices[0].message.content == "async native summary"
+        proxy_extra = proxy_chat.chat.completions.create.call_args.kwargs["extra_body"]
+        assert "reasoning" not in proxy_extra
+        native_extra = async_native_codex.chat.completions.create.call_args.kwargs[
+            "extra_body"
+        ]
+        assert native_extra["reasoning"] == {"enabled": False}
+        assert native_extra["metadata"] == {"source": "test"}
 
     def test_auto_cache_key_distinguishes_compression_task(self):
         from agent.auxiliary_client import _client_cache_key

@@ -15,6 +15,7 @@ import asyncio
 import logging
 import signal
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     import aiohttp
@@ -44,7 +45,39 @@ _HOP_BY_HOP_HEADERS = frozenset(
         "trailers",
         "transfer-encoding",
         "upgrade",
-        "authorization",  # we replace this one
+        "authorization",  # replaced from the resolved provider credential
+        "x-api-key",  # never forward caller-supplied provider credentials
+        "api-key",
+    }
+)
+_RESPONSE_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        # Never disclose upstream credential headers to an unauthenticated client.
+        "authorization",
+        "x-api-key",
+        "api-key",
+    }
+)
+_CONFIGURED_HEADER_BLOCKLIST = frozenset(
+    {
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
     }
 )
 
@@ -69,15 +102,42 @@ def _filter_request_headers(headers: "aiohttp.typedefs.LooseHeaders") -> dict:
 
 
 def _filter_response_headers(headers) -> dict:
-    """Strip hop-by-hop headers from the upstream response."""
+    """Strip hop-by-hop and credential headers from the upstream response."""
     out = {}
     for key, value in headers.items():
-        if key.lower() in _HOP_BY_HOP_HEADERS:
+        if key.lower() in _RESPONSE_HOP_BY_HOP_HEADERS:
             continue
-        # aiohttp recomputes Content-Encoding/Content-Length on stream — let it.
-        if key.lower() in {"content-encoding", "content-length"}:
+        # The upstream client disables automatic decompression, so entity
+        # headers and body bytes can pass through unchanged.
+        out[key] = value
+    return out
+
+
+def _build_upstream_url(base_url: str, rel_path: str, raw_query: str) -> str:
+    """Append a proxy path while preserving base and request query parameters."""
+    parsed = urlsplit(base_url)
+    path = f"{parsed.path.rstrip('/')}{rel_path}"
+    query = "&".join(part for part in (parsed.query, raw_query) if part)
+    return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
+
+
+def _build_upstream_headers(
+    request_headers: "aiohttp.typedefs.LooseHeaders",
+    credential: UpstreamCredential,
+) -> dict:
+    """Replace caller credentials with trusted provider-specific headers."""
+    out = _filter_request_headers(request_headers)
+    for key, value in credential.headers.items():
+        if key.lower() in _CONFIGURED_HEADER_BLOCKLIST:
             continue
         out[key] = value
+    if credential.bearer:
+        for key in list(out):
+            if key.lower() == "authorization":
+                del out[key]
+        out["Authorization"] = (
+            f"{credential.token_type} {credential.bearer}"
+        )
     return out
 
 
@@ -89,7 +149,9 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             "pip install 'hermes-agent[messaging]' or `pip install aiohttp`."
         )
 
-    app = web.Application()
+    # Disable request decompression so compressed payload bytes and their
+    # Content-Encoding header remain consistent end to end.
+    app = web.Application(handler_args={"auto_decompress": False})
     # AppKey ensures forward-compat with future aiohttp versions that strip
     # bare-string keys.
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
@@ -125,8 +187,15 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         try:
             cred = adapter.get_credential()
         except Exception as exc:
-            logger.warning("proxy: credential resolution failed: %s", exc)
-            return _json_error(401, str(exc), code="upstream_auth_failed")
+            logger.warning(
+                "proxy: credential resolution failed (%s)",
+                type(exc).__name__,
+            )
+            return _json_error(
+                401,
+                "upstream credential resolution failed",
+                code="upstream_auth_failed",
+            )
 
         # Forward body verbatim. Read into memory once — request bodies for
         # chat/completions/embeddings are small (<1MB typically). If we ever
@@ -137,28 +206,39 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
         async def _send_upstream(active_cred: UpstreamCredential):
-            upstream_url = f"{active_cred.base_url.rstrip('/')}{rel_path}"
-            # Preserve query string verbatim.
-            if request.query_string:
-                upstream_url = f"{upstream_url}?{request.query_string}"
-
-            fwd_headers = _filter_request_headers(request.headers)
-            fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            # Preserve the raw encoded query string rather than aiohttp's
+            # decoded ``request.query_string`` representation.
+            _, separator, raw_query = request.raw_path.partition("?")
+            upstream_url = _build_upstream_url(
+                active_cred.base_url,
+                rel_path,
+                raw_query if separator else "",
+            )
+            fwd_headers = _build_upstream_headers(
+                request.headers,
+                active_cred,
+            )
 
             logger.debug(
-                "proxy: forwarding %s %s -> %s (body=%d bytes)",
-                request.method, rel_path, upstream_url, len(body),
+                "proxy: forwarding %s %s to %s (body=%d bytes)",
+                request.method,
+                rel_path,
+                adapter.display_name,
+                len(body),
             )
 
             try:
-                session = aiohttp.ClientSession(timeout=timeout)
+                session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    auto_decompress=False,
+                )
             except Exception as exc:  # pragma: no cover - aiohttp setup issue
-                raise RuntimeError(f"proxy session init failed: {exc}") from exc
+                raise RuntimeError("proxy session initialization failed") from exc
 
             try:
                 upstream_resp = await session.request(
                     request.method,
-                    upstream_url,
+                    aiohttp.client.URL(upstream_url, encoded=True),
                     data=body if body else None,
                     headers=fwd_headers,
                     allow_redirects=False,
@@ -172,13 +252,20 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             try:
                 return await _send_upstream(active_cred)
             except RuntimeError as exc:
-                return _json_error(500, str(exc)), None
+                logger.warning(
+                    "proxy: upstream client setup failed (%s)",
+                    type(exc).__name__,
+                )
+                return _json_error(500, "proxy client setup failed"), None
             except aiohttp.ClientError as exc:
-                logger.warning("proxy: upstream connection failed: %s", exc)
+                logger.warning(
+                    "proxy: upstream connection failed (%s)",
+                    type(exc).__name__,
+                )
                 return (
                     _json_error(
                         502,
-                        f"upstream connection failed: {exc}",
+                        "upstream connection failed",
                         code="upstream_unreachable",
                     ),
                     None,
@@ -205,7 +292,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                     status_code=upstream_resp.status,
                 )
             except Exception as exc:
-                logger.warning("proxy: retry credential resolution failed: %s", exc)
+                logger.warning(
+                    "proxy: retry credential resolution failed (%s)",
+                    type(exc).__name__,
+                )
                 retry_cred = None
 
             if retry_cred is not None:
@@ -228,7 +318,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 if chunk:
                     await resp.write(chunk)
         except (aiohttp.ClientError, asyncio.CancelledError) as exc:
-            logger.warning("proxy: streaming interrupted: %s", exc)
+            logger.warning(
+                "proxy: streaming interrupted (%s)",
+                type(exc).__name__,
+            )
         finally:
             upstream_resp.release()
             await session.close()

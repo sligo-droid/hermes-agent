@@ -118,6 +118,7 @@ auxiliary:
     model: google/gemini-2.5-flash
     base_url: ''
     api_key: ''
+    api_mode: ''       # optional wire-protocol override
     timeout: 120
     extra_body: {}
     download_timeout: 30
@@ -130,6 +131,7 @@ auxiliary:
     provider: auto
     model: ''
     base_url: ''
+    api_mode: ''
     # ... other fields unchanged
 ```
 
@@ -145,9 +147,10 @@ auxiliary:
     fallback_chain:
       - provider: openrouter
         model: inclusionai/ring-2.6-1t:free
+        api_mode: chat_completions
 ```
 
-When `fallback_chain` is absent, `auto` uses the top-level `fallback_providers` chain before the built-in auxiliary discovery chain.
+Auxiliary routes can set `api_mode` on the primary task and independently on each `fallback_chain` entry. Supported inference modes include `chat_completions`, `codex_responses`, and `anthropic_messages`; leave it empty to use provider/model detection. When `fallback_chain` is absent, `auto` uses the top-level `fallback_providers` chain before the built-in auxiliary discovery chain.
 
 ## When does it take effect?
 
@@ -233,6 +236,37 @@ To list providers/models without launching the picker, use the dashboard or the 
 ### Direct config edit
 
 Edit `~/.hermes/config.yaml` and restart whatever reads it. See the [Configuration reference](./configuration.md) for the full schema.
+
+A named configured provider keeps its endpoint, credential source, default model, and default wire protocol together:
+
+```yaml
+providers:
+  cli-proxy-api:
+    name: CLIProxyAPI
+    base_url: "http://127.0.0.1:8317/v1"
+    key_env: "CLI_PROXY_API_KEY"
+    api_mode: "codex_responses"
+    default_model: "gpt-5.6-luna"
+```
+
+`key_env` names an environment variable; do not put the secret value in this block. If a declared `key_env` cannot be resolved from that provider's environment/credential pool/explicit key, Hermes fails closed instead of borrowing a global OpenAI or OpenRouter key.
+
+The same named provider can use a different protocol for one auxiliary task. This compression route uses CLIProxyAPI Chat Completions first and explicitly falls back to native OpenAI Codex OAuth:
+
+```yaml
+auxiliary:
+  compression:
+    provider: cli-proxy-api
+    model: claude-sonnet-4-6
+    api_mode: chat_completions
+    fallback_chain:
+      - provider: openai-codex
+        model: gpt-5.4
+```
+
+The task-level `api_mode` overrides the provider default only for compression. Fallback entries can carry their own `api_mode`; `openai-codex` already selects the native Codex Responses transport.
+
+To expose a configured provider to a separate local application, use `hermes proxy start --provider cli-proxy-api`. Its configured-provider adapter forwards `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models` without transforming payload bytes. See [Subscription Proxy](./features/subscription-proxy.md) for its trust boundary and readiness checks.
 
 ### REST API
 

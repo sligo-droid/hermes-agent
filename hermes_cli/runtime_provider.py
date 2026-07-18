@@ -31,7 +31,11 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.config import (
+    get_compatible_custom_providers,
+    load_config,
+    normalize_extra_headers,
+)
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
@@ -471,14 +475,13 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         for ep_name, entry in providers.items():
             if not isinstance(entry, dict):
                 continue
-            # Match exact name or normalized name
+            # Match exact name or normalized name. Preserve key_env as a
+            # declaration rather than resolving it here: the runtime resolver
+            # treats a declared env var as authoritative and fails closed when
+            # it is missing instead of borrowing an unrelated global key.
             name_norm = _normalize_custom_provider_name(ep_name)
-            # Resolve the API key from the env var name stored in key_env
             key_env = str(entry.get("key_env", "") or "").strip()
-            resolved_api_key = _getenv(key_env, "").strip() if key_env else ""
-            # Fall back to inline api_key when key_env is absent or unresolvable
-            if not resolved_api_key:
-                resolved_api_key = str(entry.get("api_key", "") or "").strip()
+            inline_api_key = str(entry.get("api_key", "") or "").strip()
 
             if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
                 # Found match by provider key
@@ -487,9 +490,14 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     result = {
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
-                        "api_key": resolved_api_key,
+                        "api_key": inline_api_key,
                         "model": entry.get("default_model", ""),
                     }
+                    if key_env:
+                        result["key_env"] = key_env
+                    extra_headers = normalize_extra_headers(entry.get("extra_headers"))
+                    if extra_headers:
+                        result["extra_headers"] = extra_headers
                     # The v11→v12 migration writes the API mode under the new
                     # ``transport`` field, but hand-edited configs may still
                     # use the legacy ``api_mode`` spelling.  Accept both —
@@ -512,9 +520,11 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         result = {
                             "name": display_name,
                             "base_url": base_url.strip(),
-                            "api_key": resolved_api_key,
+                            "api_key": inline_api_key,
                             "model": entry.get("default_model", ""),
                         }
+                        if key_env:
+                            result["key_env"] = key_env
                         api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                         if api_mode:
                             result["api_mode"] = api_mode
@@ -564,6 +574,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         model_name = str(entry.get("model", "") or "").strip()
         if model_name:
             result["model"] = model_name
+        extra_headers = normalize_extra_headers(entry.get("extra_headers"))
+        if extra_headers:
+            result["extra_headers"] = extra_headers
         return result
 
     return None
@@ -630,24 +643,61 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
-    # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
-    if pool_result:
-        # Propagate the model name even when using pooled credentials —
-        # the pool doesn't know about the custom_providers model field.
-        model_name = custom_provider.get("model")
-        if model_name:
-            pool_result["model"] = model_name
-        return pool_result
+    explicit_key = (explicit_api_key or "").strip()
+    inline_key = str(custom_provider.get("api_key", "") or "").strip()
+    key_env = str(custom_provider.get("key_env", "") or "").strip()
+    declared_key = _getenv(key_env, "").strip() if key_env else ""
 
-    api_key_candidates = [
-        (explicit_api_key or "").strip(),
-        str(custom_provider.get("api_key", "") or "").strip(),
-        _getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
-        _getenv("OPENAI_API_KEY", "").strip(),
-        _getenv("OPENROUTER_API_KEY", "").strip(),
-    ]
-    api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
+    # Preserve the historical custom-provider precedence: an explicit one-shot
+    # override wins, then a provider-associated credential pool, then the saved
+    # provider's declared environment or inline credential.
+    api_key = explicit_key if has_usable_secret(explicit_key) else ""
+    if not api_key:
+        pool_result = _try_resolve_from_custom_pool(
+            base_url,
+            "custom",
+            custom_provider.get("api_mode"),
+            provider_name=custom_provider.get("name"),
+        )
+        if pool_result:
+            # Propagate the model name even when using pooled credentials —
+            # the pool doesn't know about the custom_providers model field.
+            model_name = custom_provider.get("model")
+            if model_name:
+                pool_result["model"] = model_name
+            extra_headers = custom_provider.get("extra_headers")
+            if extra_headers:
+                pool_result["extra_headers"] = dict(extra_headers)
+            if key_env:
+                pool_result["key_env"] = key_env
+            return pool_result
+
+    if not api_key:
+        api_key = next(
+            (
+                candidate
+                for candidate in (declared_key, inline_key)
+                if has_usable_secret(candidate)
+            ),
+            "",
+        )
+
+    if key_env and not api_key:
+        provider_name = custom_provider.get("name", requested_provider)
+        raise AuthError(
+            f"Configured provider {provider_name!r} requires environment variable "
+            f"{key_env}, but it is not set."
+        )
+
+    if not api_key:
+        api_key_candidates = [
+            _getenv("OPENAI_API_KEY", "").strip(),
+            _getenv("OPENROUTER_API_KEY", "").strip(),
+        ]
+        api_key = next(
+            (candidate for candidate in api_key_candidates if has_usable_secret(candidate)),
+            "",
+        )
 
     result = {
         "provider": "custom",
@@ -662,6 +712,11 @@ def _resolve_named_custom_runtime(
     # provider name differs from the actual model string the API expects.
     if custom_provider.get("model"):
         result["model"] = custom_provider["model"]
+    if key_env:
+        result["key_env"] = key_env
+    extra_headers = custom_provider.get("extra_headers")
+    if extra_headers:
+        result["extra_headers"] = dict(extra_headers)
     return result
 
 

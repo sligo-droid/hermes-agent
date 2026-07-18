@@ -58,6 +58,11 @@ def test_aux_tasks_keys_all_exist_in_default_config():
     )
 
 
+def test_all_builtin_auxiliary_defaults_have_empty_api_mode():
+    for task, task_cfg in DEFAULT_CONFIG["auxiliary"].items():
+        assert task_cfg["api_mode"] == "", task
+
+
 # ── _format_aux_current ─────────────────────────────────────────────────────
 
 
@@ -116,6 +121,7 @@ def test_save_aux_choice_persists_to_config_yaml(tmp_path, monkeypatch):
     assert v["model"] == "google/gemini-2.5-flash"
     assert v["base_url"] == ""
     assert v["api_key"] == ""
+    assert v["api_mode"] == ""
 
 
 def test_save_aux_choice_preserves_timeout(tmp_path, monkeypatch):
@@ -135,6 +141,63 @@ def test_save_aux_choice_preserves_timeout(tmp_path, monkeypatch):
     assert cfg_after["auxiliary"]["vision"]["timeout"] == default_timeout
     # download_timeout also preserved for vision
     assert cfg_after["auxiliary"]["vision"].get("download_timeout") == 30
+
+
+def test_save_aux_choice_clears_stale_api_mode_and_preserves_non_routing_settings(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+    from hermes_cli.config import save_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (tmp_path / ".hermes").mkdir(exist_ok=True)
+
+    cfg = load_config()
+    cfg["auxiliary"]["compression"]["api_mode"] = "codex_responses"
+    cfg["auxiliary"]["compression"]["extra_body"] = {
+        "metadata": {"source": "operator"}
+    }
+    cfg["auxiliary"]["compression"]["timeout"] = 240
+    save_config(cfg)
+
+    _save_aux_choice(
+        "compression",
+        provider="cli-proxy-api",
+        model="claude-sonnet-4-6",
+    )
+
+    compression = load_config()["auxiliary"]["compression"]
+    assert compression["api_mode"] == ""
+    assert compression["timeout"] == 240
+    assert compression["extra_body"] == {"metadata": {"source": "operator"}}
+
+
+def test_save_aux_choice_preserves_api_mode_when_route_is_unchanged(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+    from hermes_cli.config import save_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (tmp_path / ".hermes").mkdir(exist_ok=True)
+
+    cfg = load_config()
+    compression = cfg["auxiliary"]["compression"]
+    compression["provider"] = "cli-proxy-api"
+    compression["model"] = "claude-sonnet-4-6"
+    compression["api_mode"] = "chat_completions"
+    save_config(cfg)
+
+    _save_aux_choice(
+        "compression",
+        provider="cli-proxy-api",
+        model="claude-sonnet-4-6",
+    )
+
+    compression = load_config()["auxiliary"]["compression"]
+    assert compression["api_mode"] == "chat_completions"
 
 
 def test_save_aux_choice_does_not_touch_main_model(tmp_path, monkeypatch):
@@ -207,6 +270,8 @@ def test_reset_aux_to_auto_clears_routing_preserves_timeouts(tmp_path, monkeypat
 
     cfg = load_config()
     cfg["auxiliary"]["vision"]["timeout"] = 300  # user-tuned
+    cfg["auxiliary"]["vision"]["api_mode"] = "codex_responses"
+    cfg["auxiliary"]["vision"]["extra_body"] = {"metadata": {"keep": True}}
     save_config(cfg)
 
     n = _reset_aux_to_auto()
@@ -219,8 +284,12 @@ def test_reset_aux_to_auto_clears_routing_preserves_timeouts(tmp_path, monkeypat
         assert v["model"] == ""
         assert v["base_url"] == ""
         assert v["api_key"] == ""
-    # User-tuned timeout survives reset
+        assert v["api_mode"] == ""
+    # User-tuned non-routing settings survive reset
     assert cfg["auxiliary"]["vision"]["timeout"] == 300
+    assert cfg["auxiliary"]["vision"]["extra_body"] == {
+        "metadata": {"keep": True}
+    }
     # Default compression timeout preserved
     assert cfg["auxiliary"]["compression"]["timeout"] == 120
 

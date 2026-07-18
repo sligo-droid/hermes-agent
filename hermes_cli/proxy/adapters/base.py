@@ -14,8 +14,8 @@ The proxy server is otherwise provider-agnostic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from dataclasses import dataclass, field
+from typing import FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -23,13 +23,16 @@ class UpstreamCredential:
     """A resolved bearer + base URL ready to forward to."""
 
     bearer: str
-    """Authorization header value to send upstream (token only, no ``Bearer`` prefix)."""
+    """Authorization token to send upstream, or empty for a no-auth endpoint."""
 
     base_url: str
     """Upstream base URL, e.g. ``https://inference-api.nousresearch.com/v1``."""
 
     token_type: str = "Bearer"
-    """Auth scheme — currently always ``Bearer`` for supported providers."""
+    """Authorization scheme used when ``bearer`` is non-empty."""
+
+    headers: Mapping[str, str] = field(default_factory=dict)
+    """Trusted provider headers to add after stripping caller credentials."""
 
     expires_at: Optional[str] = None
     """ISO-8601 expiry timestamp for the bearer, when known. Informational."""

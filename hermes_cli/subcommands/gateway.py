@@ -298,19 +298,18 @@ def build_gateway_parser(
     gateway_enroll.set_defaults(func=cmd_gateway_enroll)
 
     # =========================================================================
-    # proxy command — local OpenAI-compatible proxy that attaches the user's
-    # OAuth-authenticated provider credentials to outbound requests. Lets
-    # external apps (OpenViking, Karakeep, Open WebUI, ...) ride a logged-in
-    # subscription without copy-pasting static API keys.
+    # proxy command — local inference proxy that attaches Hermes-managed
+    # provider credentials to outbound requests. External apps can use built-in
+    # subscription adapters or named configured providers without holding the
+    # upstream credential.
     # =========================================================================
     proxy_parser = subparsers.add_parser(
         "proxy",
-        help="Local OpenAI-compatible proxy to OAuth providers",
+        help="Local proxy to built-in or configured inference providers",
         description=(
-            "Run a local HTTP server that forwards OpenAI-compatible requests "
-            "to an OAuth-authenticated provider (e.g. Nous Portal). External "
-            "apps can point at the proxy with any bearer token; the proxy "
-            "attaches your real credentials."
+            "Run a local HTTP server that forwards supported inference requests "
+            "to a built-in or configured provider. External apps can use any "
+            "bearer token; the proxy attaches the Hermes-managed credential."
         ),
     )
     proxy_subparsers = proxy_parser.add_subparsers(dest="proxy_command")
@@ -321,7 +320,10 @@ def build_gateway_parser(
     proxy_start.add_argument(
         "--provider",
         default="nous",
-        help="Upstream provider: nous or xai (default: nous). See `hermes proxy providers`.",
+        help=(
+            "Built-in or configured provider name (default: nous). "
+            "See `hermes proxy providers`."
+        ),
     )
     proxy_start.add_argument(
         "--host",

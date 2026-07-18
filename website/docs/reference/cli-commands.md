@@ -40,7 +40,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes model` | Interactively choose the default provider and model. |
 | `hermes fallback` | Manage fallback providers tried when the primary model errors. |
 | `hermes gateway` | Run or manage the messaging gateway service. |
-| `hermes proxy` | Local OpenAI-compatible proxy that attaches OAuth provider credentials. See [Subscription Proxy](../user-guide/features/subscription-proxy.md). |
+| `hermes proxy` | Local inference proxy for built-in adapters and named configured providers. It attaches Hermes-managed upstream credentials; configured-provider routes preserve payload bytes. See [Subscription Proxy](../user-guide/features/subscription-proxy.md). |
 | `hermes lsp` | Manage Language Server Protocol integration (semantic diagnostics for write_file/patch). |
 | `hermes setup` | Interactive setup wizard for all or part of the configuration. |
 | `hermes whatsapp` | Configure and pair the WhatsApp bridge. |
@@ -429,13 +429,17 @@ Common flags for migration subcommands:
 hermes proxy <subcommand>
 ```
 
-Run a local OpenAI-compatible HTTP server that forwards requests to an OAuth-authenticated upstream provider (e.g. Nous Portal, xAI). External apps can point at the proxy with any bearer token; the proxy attaches your real OAuth credentials on the way out. See [Subscription Proxy](../user-guide/features/subscription-proxy.md) for the full guide.
+Run a local HTTP inference proxy against either a built-in specialized adapter (`nous`, `xai`, `openai-codex`) or a named provider from `config.yaml`'s `providers:` section. Hermes resolves and attaches the upstream credential. The configured-provider adapter preserves request and response bytes for `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`; specialized adapters may expose a narrower surface or translate protocols. In particular, `openai-codex` translates Chat Completions to the native Codex Responses API.
+
+The listener has no caller authentication. Inbound `Authorization`, `Proxy-Authorization`, and `x-api-key` values are stripped rather than trusted. Keep the default loopback bind unless you have a deliberate Docker/LAN access-control boundary. See [Subscription Proxy](../user-guide/features/subscription-proxy.md) for configuration, readiness checks, and deployment guidance.
 
 | Subcommand | Description |
 |------------|-------------|
-| `start` | Run the proxy in the foreground. Flags: `--provider <nous\|xai>` (default `nous`), `--host <addr>` (default `127.0.0.1`; use `0.0.0.0` to expose on LAN), `--port <int>` (default `8645`). |
-| `status` | Show which proxy upstreams are ready (credentials present, OAuth valid). |
-| `providers` | List available proxy upstream providers. |
+| `start` | Run the proxy in the foreground. Flags: `--provider <name>` (default `nous`; accepts a built-in or configured provider shown by `providers`), `--host <addr>` (default `127.0.0.1`), `--port <int>` (default `8645`). |
+| `status` | Show whether each adapter can resolve local credentials. This is not an upstream readiness probe. |
+| `providers` | List built-in adapters plus named configured providers currently discovered from configuration. |
+
+`GET /health` is local liveness only. For readiness, verify `/v1/models` and a representative inference request using the path and payload shape your application will send.
 
 
 ## `hermes security`
