@@ -105,6 +105,25 @@ class TestBuildAnthropicClient:
         assert kwargs["base_url"] == "http://127.0.0.1:8317"
         assert kwargs["default_headers"]["x-app"] == "cli"
 
+    def test_cli_proxy_api_key_uses_bearer_auth(self):
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "providers": {
+                    "cli-proxy-api": {"base_url": "http://127.0.0.1:8317/v1"}
+                }
+            },
+        ), patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "proxy-access-key",
+                base_url="http://127.0.0.1:8317",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+
+        assert kwargs["auth_token"] == "proxy-access-key"
+        assert "api_key" not in kwargs
+        assert kwargs["base_url"] == "http://127.0.0.1:8317"
+
     def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client("sk-ant-api03-something")

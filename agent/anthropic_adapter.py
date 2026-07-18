@@ -533,13 +533,29 @@ def _is_deepseek_anthropic_endpoint(base_url: str | None) -> bool:
     return "/anthropic" in normalized.rstrip("/").lower()
 
 
+def _is_configured_cli_proxy_api_endpoint(base_url: str | None) -> bool:
+    """Return True when *base_url* is the configured CLIProxyAPI endpoint."""
+    normalized = _normalize_base_url_text(base_url).rstrip("/").lower()
+    if not normalized:
+        return False
+    try:
+        from hermes_cli.config import load_config
+
+        provider = ((load_config().get("providers") or {}).get("cli-proxy-api") or {})
+        configured = str(provider.get("base_url") or "").strip().rstrip("/").lower()
+    except Exception:
+        return False
+    configured_root = configured.removesuffix("/v1")
+    return bool(configured_root) and normalized.removesuffix("/v1") == configured_root
+
+
 def _requires_bearer_auth(base_url: str | None) -> bool:
     """Return True for Anthropic-compatible providers that require Bearer auth.
 
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
-    MiniMax's global and China Anthropic-compatible endpoints, and Azure AI
-    Foundry's Anthropic-style endpoint follow this pattern.
+    MiniMax's global and China Anthropic-compatible endpoints, Azure AI
+    Foundry, and CLIProxyAPI's Anthropic endpoint follow this pattern.
     """
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
@@ -548,6 +564,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
         or "azure.com" in normalized
+        or _is_configured_cli_proxy_api_endpoint(normalized)
     )
 
 
