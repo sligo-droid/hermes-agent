@@ -795,6 +795,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent typing indicator loops per channel/thread. Discord typing
         # expires quickly, so active work must refresh before the expiry window.
         self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._typing_ready: Dict[str, asyncio.Future[None]] = {}
         self._typing_aliases: Dict[str, set[str]] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
@@ -3773,6 +3774,20 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        client = self._client
+        self._client = None
+        self._running = False
+
+        typing_tasks = set(self._typing_tasks.values())
+        self._typing_tasks.clear()
+        self._typing_ready.clear()
+        self._typing_aliases.clear()
+        for task in typing_tasks:
+            if not task.done():
+                task.cancel()
+        if typing_tasks:
+            await asyncio.gather(*typing_tasks, return_exceptions=True)
+
         if self._root_mention_recovery_task and not self._root_mention_recovery_task.done():
             self._root_mention_recovery_task.cancel()
             try:
@@ -3787,9 +3802,9 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
 
-        if self._client:
+        if client:
             try:
-                await self._client.close()
+                await client.close()
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[%s] Error during disconnect: %s", self.name, e, exc_info=True)
 
@@ -3807,8 +3822,6 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
 
-        self._running = False
-        self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
         self._thread_backfill_task = None
@@ -6474,20 +6487,30 @@ class DiscordAdapter(BasePlatformAdapter):
         if target_id != str(chat_id):
             self._typing_aliases.setdefault(str(chat_id), set()).add(target_id)
 
-        # Don't start a duplicate loop
+        # Register ownership before the first network await so concurrent callers
+        # cannot both create persistent loops for the same Discord target.
         existing_task = self._typing_tasks.get(target_id)
         if existing_task and not existing_task.done():
+            ready = self._typing_ready.get(target_id)
+            if ready:
+                await asyncio.shield(ready)
             return
         if existing_task:
             self._typing_tasks.pop(target_id, None)
+            self._typing_ready.pop(target_id, None)
 
-        try:
-            await self.send_typing_once(target_id)
-        except Exception as e:
-            logger.debug("Discord typing indicator failed for %s: %s", target_id, e)
+        ready = asyncio.get_running_loop().create_future()
 
         async def _typing_loop() -> None:
             try:
+                try:
+                    await self.send_typing_once(target_id)
+                except Exception as e:
+                    logger.debug("Discord typing indicator failed for %s: %s", target_id, e)
+                finally:
+                    if not ready.done():
+                        ready.set_result(None)
+
                 while True:
                     await asyncio.sleep(_DISCORD_TYPING_REFRESH_SECONDS)
                     try:
@@ -6499,26 +6522,52 @@ class DiscordAdapter(BasePlatformAdapter):
                         continue
             except asyncio.CancelledError:
                 pass
-            finally:
-                self._typing_tasks.pop(target_id, None)
-                for aliases in self._typing_aliases.values():
-                    aliases.discard(target_id)
 
-        self._typing_tasks[target_id] = asyncio.create_task(_typing_loop())
+        def _typing_done(task: asyncio.Task) -> None:
+            if not ready.done():
+                ready.set_result(None)
+            if self._typing_tasks.get(target_id) is not task:
+                return
+            self._typing_tasks.pop(target_id, None)
+            if self._typing_ready.get(target_id) is ready:
+                self._typing_ready.pop(target_id, None)
+            for alias, aliases in list(self._typing_aliases.items()):
+                aliases.discard(target_id)
+                if not aliases:
+                    self._typing_aliases.pop(alias, None)
+
+        task = asyncio.create_task(_typing_loop())
+        self._typing_tasks[target_id] = task
+        self._typing_ready[target_id] = ready
+        task.add_done_callback(_typing_done)
+        try:
+            await asyncio.shield(ready)
+        except asyncio.CancelledError:
+            if self._typing_tasks.get(target_id) is task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Stop the persistent typing indicator for a channel."""
         target_id = self._typing_target_id(chat_id, metadata=metadata)
         targets = {target_id}
         targets.update(self._typing_aliases.pop(str(chat_id), set()))
+        for alias, aliases in list(self._typing_aliases.items()):
+            aliases.difference_update(targets)
+            if not aliases:
+                self._typing_aliases.pop(alias, None)
+
+        tasks = set()
         for target in targets:
             task = self._typing_tasks.pop(target, None)
+            self._typing_ready.pop(target, None)
             if task:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                tasks.add(task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
