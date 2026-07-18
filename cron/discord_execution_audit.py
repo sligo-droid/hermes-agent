@@ -45,6 +45,19 @@ _KNOWN_TOOL_PREFIXES = (
     "web",
     "write",
 )
+_ACTIONABLE_FAILURE_TOOLS = frozenset(
+    {
+        "browser",
+        "computer",
+        "cron",
+        "delegate",
+        "discord",
+        "github",
+        "kanban",
+        "memory",
+        "send_message",
+    }
+)
 _HARD_TERMINAL_STATUSES = frozenset({"blocked", "failed", "errored", "expired"})
 _SEVERE_COMPLETION_REASONS = frozenset(
     {
@@ -398,7 +411,7 @@ def _candidate(
     share = affected_count / max(1, total_requests)
     safe_subtype = _safe_slug(subtype)
     key = f"{IDEMPOTENCY_PREFIX}{_safe_slug(category)}:{safe_subtype}"
-    impact = attributable_s + hard_terminal_count * 600.0 + error_count * 120.0 + affected_count * 60.0
+    impact = attributable_s + hard_terminal_count * 1800.0 + error_count * 120.0 + affected_count * 60.0
     return BottleneckCandidate(
         category=_safe_slug(category),
         subtype=safe_subtype,
@@ -486,6 +499,8 @@ def build_candidates(
     tool_groups: dict[tuple[str, str], list[tuple[RequestFact, ToolFact]]] = defaultdict(list)
     for fact in facts:
         for tool in fact.top_tools:
+            if tool.name not in _ACTIONABLE_FAILURE_TOOLS:
+                continue
             if tool.errors:
                 tool_groups[(tool.name, "errors")].append((fact, tool))
             if tool.blocked:

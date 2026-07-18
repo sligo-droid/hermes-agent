@@ -235,6 +235,7 @@ def test_repeated_tool_errors_and_runtime_dominance_are_aggregated(monkeypatch, 
     keys = {candidate.idempotency_key for candidate in candidates}
     assert "hermes-discord-execution:tool_failure:discord_errors" in keys
     assert "hermes-discord-execution:runtime:model_latency" in keys
+    assert "hermes-discord-execution:tool_failure:web_errors" not in keys
     candidate_text = json.dumps([candidate.to_dict() for candidate in candidates])
     assert "acme" not in candidate_text
     assert "payroll" not in candidate_text

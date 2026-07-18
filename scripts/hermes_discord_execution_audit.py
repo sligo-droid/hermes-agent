@@ -245,6 +245,7 @@ def install_live(*, job_id: str | None = DEFAULT_JOB_ID, dry_run: bool = False) 
 
     source_sha = sha256_file(REPO_SCRIPT)
     live_sha = sha256_file(LIVE_SCRIPT)
+    had_live_script = LIVE_SCRIPT.is_file()
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     archive_dir = HERMES_HOME / "scripts" / "archive"
     script_backup = archive_dir / f"{SCRIPT_NAME}.{stamp}.bak"
@@ -270,7 +271,7 @@ def install_live(*, job_id: str | None = DEFAULT_JOB_ID, dry_run: bool = False) 
     archive_dir.mkdir(parents=True, exist_ok=True)
     LIVE_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(CRON_JOBS, jobs_backup)
-    if LIVE_SCRIPT.exists():
+    if had_live_script:
         shutil.copy2(LIVE_SCRIPT, script_backup)
     shutil.copy2(REPO_SCRIPT, LIVE_SCRIPT)
     LIVE_SCRIPT.chmod(LIVE_SCRIPT.stat().st_mode | 0o111)
@@ -291,7 +292,7 @@ def install_live(*, job_id: str | None = DEFAULT_JOB_ID, dry_run: bool = False) 
 
     print(f"installed_live_sha256={installed_sha}")
     print("installed_matches_source=true")
-    print(f"rollback_script={script_backup}")
+    print(f"rollback_script={script_backup if had_live_script else 'none (no prior live script)'}")
     print(f"rollback_jobs={jobs_backup}")
     return 0
 

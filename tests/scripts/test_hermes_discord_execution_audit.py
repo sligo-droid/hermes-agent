@@ -153,6 +153,20 @@ def test_install_live_backs_up_and_migrates_job_without_losing_runtime_state(
     assert "installed_matches_source=true" in capsys.readouterr().out
 
 
+def test_install_live_reports_no_script_rollback_when_no_prior_live_script(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _repo, home, _source, live, _jobs = _setup(monkeypatch, tmp_path)
+    live.unlink()
+
+    assert entrypoint.install_live() == 0
+
+    assert list((home / "scripts" / "archive").glob(f"{entrypoint.SCRIPT_NAME}.*.bak")) == []
+    assert "rollback_script=none (no prior live script)" in capsys.readouterr().out
+
+
 def test_install_live_rejects_unknown_job_without_changes(tmp_path, monkeypatch, capsys):
     _repo, _home, _source, live, jobs = _setup(
         monkeypatch,
