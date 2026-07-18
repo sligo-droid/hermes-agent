@@ -74,6 +74,7 @@ def _tunnel() -> dict:
             },
             {"hostname": "sligo.sligolabs.com", "service": "http://127.0.0.1:9119"},
             {"hostname": "claw.sligolabs.com", "service": "http://127.0.0.1:8720"},
+            {"hostname": "pid.sligolabs.com", "service": "http://127.0.0.1:5173"},
             {"service": "http_status:404"},
         ],
     }
@@ -114,6 +115,18 @@ def test_conforming_topology_succeeds_and_reports_remote_tunnel_unverified(tmp_p
 
 def test_cloudflare_result_wrapper_is_accepted(tmp_path, capsys):
     result, stdout, _stderr = _run(tmp_path, _applications(), capsys, wrapper=True)
+
+    assert result == 0
+    assert "RESULT conforming" in stdout
+
+
+def test_cloudflare_policy_uids_are_ignored_as_metadata(tmp_path, capsys):
+    apps = _applications()
+    for index, app in enumerate(apps):
+        for policy in app["policies"]:
+            policy["uid"] = f"cloudflare-generated-policy-uid-{index}"
+
+    result, stdout, _stderr = _run(tmp_path, apps, capsys)
 
     assert result == 0
     assert "RESULT conforming" in stdout
