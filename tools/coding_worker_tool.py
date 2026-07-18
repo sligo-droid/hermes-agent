@@ -10,7 +10,6 @@ import inspect
 import json
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -455,55 +454,6 @@ def merge_parallel_worker_result(
             resolved_worker_cwd,
             str(group_id),
         )
-
-
-_UI_ROUTE_DEFAULT_FALLBACK_HINTS = (
-    "model provider",
-    "not found",
-    "not configured",
-    "missing api key",
-    "api key required",
-    "invalid api key",
-    "authentication failed",
-    "authorization failed",
-    "payment required",
-    "insufficient credit",
-    "insufficient credits",
-    "insufficient funds",
-    "no usable credits",
-    "balance_depleted",
-    "billing",
-    "credit balance",
-    "top up",
-    "quota exceeded",
-    "402",
-    "401",
-    "403",
-)
-
-
-def _should_fallback_ui_route_error(error: Any) -> bool:
-    """Return True for specialist provider failures safe to retry on default model."""
-    text = str(error or "").lower()
-    if not text:
-        return False
-    if "openrouter" in text and any(hint in text for hint in _UI_ROUTE_DEFAULT_FALLBACK_HINTS):
-        return True
-    if "model provider" in text and any(
-        hint in text for hint in ("not found", "not configured", "missing")
-    ):
-        return True
-    return False
-
-
-def _mark_ui_route_fallback(metadata: dict[str, Any], reason: str) -> dict[str, Any]:
-    updated = dict(metadata)
-    updated["fallback_used"] = True
-    updated["fallback_reason"] = str(reason or "specialist route unavailable")
-    updated["selected_route"] = "default_coding_worker"
-    updated["selected_provider"] = ""
-    updated["selected_model"] = ""
-    return updated
 
 
 def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
@@ -1007,94 +957,6 @@ def _coding_worker_basic_env(parent_agent: Any) -> dict[str, str]:
     for secret_key in ("GH_TOKEN", "GITHUB_TOKEN"):
         env.pop(secret_key, None)
     return env
-
-
-def _allow_ui_route_provider_env(env: dict[str, str], ui_route: Any) -> None:
-    """Allow only the provider credential required by an explicit UI route."""
-    if (
-        ui_route is None
-        or not getattr(ui_route, "matched", False)
-        or not getattr(ui_route, "enabled", False)
-        or str(getattr(ui_route, "provider", "") or "").strip().lower() != "openrouter"
-    ):
-        return
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if not key:
-        return
-    env["_HERMES_FORCE_OPENROUTER_API_KEY"] = key
-
-
-def _run_ui_specialist(
-    *,
-    prompt: str,
-    workdir: str,
-    timeout: float,
-    parent_agent: Any,
-    route_metadata: dict[str, Any],
-) -> str:
-    """Run UI implementation through its independent Claude Code backend."""
-    started = time.monotonic()
-    try:
-        from hermes_cli.fable_planner import fable_claude_code_env
-        from hermes_cli.ui_work_routing import resolve_ui_specialist_runtime
-
-        runtime = resolve_ui_specialist_runtime()
-        if runtime["backend"] != "claude_code":
-            raise RuntimeError(f"Unsupported UI specialist backend: {runtime['backend']}")
-        binary = shutil.which(runtime["binary"])
-        if not binary:
-            raise RuntimeError(f"Claude Code CLI not found in PATH: {runtime['binary']}")
-        proc = subprocess.run(
-            [
-                binary,
-                "--print",
-                "--output-format",
-                "text",
-                "--model",
-                runtime["model"],
-                "--effort",
-                runtime["reasoning_effort"],
-                "--permission-mode",
-                "acceptEdits",
-                "--no-session-persistence",
-                prompt,
-            ],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-            env=fable_claude_code_env(),
-        )
-        final_text = proc.stdout.strip()
-        error = proc.stderr.strip() if proc.returncode else ""
-        success = proc.returncode == 0 and bool(final_text)
-    except Exception as exc:
-        final_text = ""
-        error = str(exc)
-        success = False
-
-    actual_route = dict(route_metadata)
-    actual_route["actual_provider"] = "anthropic"
-    actual_route["actual_model"] = "claude-fable-5"
-    actual_route["actual_reasoning_effort"] = "medium"
-    return json.dumps(
-        {
-            "success": success,
-            "status": "completed" if success else "error",
-            "summary": final_text,
-            "error": error,
-            "duration_seconds": round(time.monotonic() - started, 2),
-            "cwd": workdir,
-            "backend": "claude_code",
-            "agents": ["ui_visual_specialist"],
-            "plan_used": False,
-            "ui_work_route": actual_route,
-        },
-        ensure_ascii=False,
-    )
 
 
 def _trusted_git_pr_lifecycle_enabled(
@@ -1809,9 +1671,6 @@ def _delegate_coding_task_impl(
             },
             ensure_ascii=False,
         )
-    if ui_route is not None and ui_route.matched and ui_route.enabled and ui_route.backend == "codex":
-        backend = "codex"
-
     repo_specific_preflight = cwd_fallback_metadata is None
     project_context = _worker_project_context(workdir) if repo_specific_preflight else ""
     skill_context = _parent_skill_context(
@@ -1984,61 +1843,12 @@ def _delegate_coding_task_impl(
         )
     worker_prompt = "\n".join(worker_prompt_parts)
 
-    if (
-        ui_route is not None
-        and ui_route.matched
-        and ui_route.enabled
-        and ui_route.selected_route == "ui_visual_specialist"
-    ):
-        specialist_run = _start_worker_run(
-            parent_agent,
-            backend="claude_code",
-            model=ui_route_metadata.get("selected_model") or "claude-fable-5",
-            reasoning="medium",
-            tier=selected_worker_tier.name if selected_worker_tier is not None else None,
-            background=_background_startup is not None,
-        )
-        if _background_startup is not None:
-            _background_startup.mark_ready(
-                worker_cwd=workdir,
-                worker_tier=(
-                    selected_worker_tier.name
-                    if selected_worker_tier is not None
-                    else None
-                ),
-                scope_paths=normalized_scope_paths,
-                backend="claude_code",
-                worker_run=specialist_run,
-            )
-        specialist_result = json.loads(_run_ui_specialist(
-            prompt=worker_prompt,
-            workdir=workdir,
-            timeout=timeout,
-            parent_agent=parent_agent,
-            route_metadata=ui_route_metadata,
-        ))
-        _finish_worker_run(
-            specialist_run,
-            failed=not bool(specialist_result.get("success"))
-            or bool(specialist_result.get("error")),
-        )
-        specialist_result["task_inferred_from_context"] = task_inferred_from_context
-        if cwd_fallback_metadata is not None:
-            specialist_result["cwd_fallback"] = cwd_fallback_metadata
-        if normalized_scope_paths is not None:
-            specialist_result["scope_check"] = _scope_check(
-                workdir,
-                normalized_scope_paths,
-            )
-        return json.dumps(specialist_result, ensure_ascii=False)
-
     classification_context = f"{task_text}\n{context_text}"
     worker_env = (
         _coding_worker_git_lifecycle_env(workdir, parent_agent)
         if allow_git_pr_lifecycle
         else _coding_worker_basic_env(parent_agent)
     )
-    _allow_ui_route_provider_env(worker_env, ui_route)
 
     if backend == BACKEND_OPENCODE:
         try:
@@ -2049,11 +1859,6 @@ def _delegate_coding_task_impl(
             )
         except Exception as exc:
             return tool_error(f"could not import OpenCode worker backend: {exc}")
-
-        try:
-            from hermes_cli.ui_work_routing import opencode_ui_work_worker_config
-        except Exception:
-            opencode_ui_work_worker_config = None
 
         def _touch_opencode_activity(event: dict) -> None:
             try:
@@ -2073,24 +1878,10 @@ def _delegate_coding_task_impl(
             "title": "Hermes delegated coding task",
             "on_event": _touch_opencode_activity,
         }
-        opencode_worker_config = None
-        if opencode_ui_work_worker_config is not None and ui_route is not None:
-            ui_opencode_config = opencode_ui_work_worker_config(ui_route)
-            if ui_opencode_config:
-                # The visual specialist is an explicit independent route, not
-                # an ordinary feature-worker tier. Preserve its own pass
-                # configuration while its model override is active.
-                ui_opencode_config["model_tier"] = "disabled"
-                opencode_worker_config = ui_opencode_config
-        opencode_worker_config = _merge_worker_config(
-            opencode_worker_config,
-            worker_tier_config,
-        )
+        opencode_worker_config = _merge_worker_config(None, worker_tier_config)
         if opencode_worker_config is not None:
             opencode_kwargs["worker_config"] = opencode_worker_config
         if allow_git_pr_lifecycle:
-            opencode_kwargs["env"] = worker_env
-        elif ui_route is not None and ui_route.matched and ui_route.enabled:
             opencode_kwargs["env"] = worker_env
         opencode_runtime = load_opencode_config(worker_config=opencode_worker_config)
         opencode_needs_plan = looks_complex_or_risky(
@@ -2098,11 +1889,13 @@ def _delegate_coding_task_impl(
             classification_context,
         )
         opencode_pass = "complex_build" if opencode_needs_plan else "simple_build"
+        actual_model = opencode_runtime.get(f"{opencode_pass}_model") or ""
+        actual_reasoning = opencode_runtime.get(f"{opencode_pass}_reasoning_level") or ""
         opencode_run = _start_worker_run(
             parent_agent,
             backend="opencode",
-            model=opencode_runtime.get(f"{opencode_pass}_model") or "",
-            reasoning=opencode_runtime.get(f"{opencode_pass}_reasoning_level") or "",
+            model=actual_model,
+            reasoning=actual_reasoning,
             tier=selected_worker_tier.name if selected_worker_tier is not None else None,
             background=_background_startup is not None,
         )
@@ -2134,12 +1927,21 @@ def _delegate_coding_task_impl(
             profile_index = min(max(executed_passes - 1, 0), len(profile_passes) - 1)
             actual_pass = profile_passes[profile_index]
             if isinstance(actual_pass, dict):
+                actual_model = actual_pass.get("model") or actual_model
+                actual_reasoning = actual_pass.get("reasoning") or actual_reasoning
                 _update_worker_run(
                     opencode_run,
-                    model=actual_pass.get("model"),
-                    reasoning=actual_pass.get("reasoning"),
+                    model=actual_model,
+                    reasoning=actual_reasoning,
                 )
         _finish_worker_run(opencode_run, failed=not success)
+        if ui_route_metadata.get("selected_route") == "ui_visual_specialist":
+            ui_route_metadata = {
+                **ui_route_metadata,
+                "actual_backend": "opencode",
+                "actual_model": actual_model,
+                "actual_reasoning_effort": actual_reasoning,
+            }
         payload = {
             "success": success,
             "status": "completed" if success else "partial",
@@ -2179,22 +1981,6 @@ def _delegate_coding_task_impl(
     except Exception as exc:
         return tool_error(f"could not import Codex app-server session: {exc}")
     try:
-        from hermes_cli.ui_work_routing import codex_ui_work_extra_args
-    except Exception as exc:
-        if (
-            ui_route is not None
-            and ui_route.matched
-            and ui_route.enabled
-            and ui_route.backend == "codex"
-            and not ui_route.fallback_allowed
-        ):
-            return tool_error(
-                "ui_work routing matched but Codex route args could not be built: "
-                f"{exc}"
-            )
-        codex_ui_work_extra_args = None
-
-    try:
         from tools.terminal_tool import _get_approval_callback
 
         approval_callback = _get_approval_callback()
@@ -2233,11 +2019,6 @@ def _delegate_coding_task_impl(
     agents: list[str] = []
     plan_text = ""
     turns = []
-    ui_codex_args = (
-        codex_ui_work_extra_args(ui_route)
-        if codex_ui_work_extra_args is not None and ui_route is not None
-        else []
-    )
     if selected_worker_tier is not None:
         default_profiles = {
             pass_name: {"codex_model": selected_worker_tier.model}
@@ -2247,19 +2028,6 @@ def _delegate_coding_task_impl(
         default_profiles = load_coding_worker_pass_profiles()
     turn = None
     codex_run = None
-    if (
-        ui_route is not None
-        and ui_route.matched
-        and ui_route.enabled
-        and ui_route.backend == "codex"
-        and not ui_route.fallback_allowed
-        and not ui_codex_args
-    ):
-        return tool_error(
-            "ui_work routing matched but Codex route args were empty; "
-            "refusing to fall back to the default coding worker."
-        )
-
     try:
         default_pass_cfg = (
             {
@@ -2270,59 +2038,20 @@ def _delegate_coding_task_impl(
             if selected_worker_tier is not None
             else load_coding_worker_pass_config()
         )
-        ui_worker_config = _merge_worker_config(
-            {"model_tier": "disabled"}
-            if ui_route is not None
-            and ui_route.matched
-            and ui_route.enabled
-            and ui_route.backend == "codex"
-            else None,
-            worker_tier_config,
-        )
-        ui_pass_cfg = (
-            load_coding_worker_pass_config(worker_config=ui_worker_config)
-            if ui_worker_config is not None and selected_worker_tier is None
+        worker_config = _merge_worker_config(None, worker_tier_config)
+        pass_cfg = (
+            load_coding_worker_pass_config(worker_config=worker_config)
+            if worker_config is not None and selected_worker_tier is None
             else default_pass_cfg
         )
-        route_attempts = [
-            (
-                ui_codex_args,
-                ui_pass_cfg,
-                default_profiles if selected_worker_tier is not None else None,
-            )
-            if ui_codex_args
-            else ([], default_pass_cfg, default_profiles)
-        ]
-        if (
-            ui_codex_args
-            and ui_route is not None
-            and ui_route.matched
-            and ui_route.enabled
-            and ui_route.backend == "codex"
-            and ui_route.fallback_allowed
-        ):
-            route_attempts.append(([], default_pass_cfg, default_profiles))
-        if (
-            not ui_codex_args
-            and ui_route is not None
-            and ui_route.matched
-            and ui_route.enabled
-            and ui_route.backend == "codex"
-            and ui_route.fallback_allowed
-        ):
-            ui_route_metadata = _mark_ui_route_fallback(
-                ui_route_metadata,
-                ui_route.reason,
-            )
+        route_attempts = [([], pass_cfg, default_profiles)]
 
-        for attempt_index, (active_ui_codex_args, pass_cfg, pass_profiles) in enumerate(route_attempts):
+        for active_ui_codex_args, pass_cfg, pass_profiles in route_attempts:
             agents = []
             turns = []
             plan_text = ""
 
             def _attempt_model(pass_name: str) -> str:
-                if active_ui_codex_args and ui_route is not None:
-                    return str(ui_route.model or "").strip()
                 if pass_profiles:
                     return str(pass_profiles[pass_name]["codex_model"] or "").strip()
                 return ""
@@ -2372,18 +2101,6 @@ def _delegate_coding_task_impl(
                     )
                 turns.append(plan_turn)
                 if plan_turn.error or plan_turn.interrupted:
-                    if (
-                        attempt_index == 0
-                        and len(route_attempts) > 1
-                        and plan_turn.error
-                        and _should_fallback_ui_route_error(plan_turn.error)
-                    ):
-                        ui_route_metadata = _mark_ui_route_fallback(
-                            ui_route_metadata,
-                            plan_turn.error,
-                        )
-                        _finish_worker_run(codex_run, failed=True)
-                        continue
                     duration = round(time.monotonic() - started, 2)
                     payload = {
                         "success": False,
@@ -2449,18 +2166,6 @@ def _delegate_coding_task_impl(
                     turn_timeout=timeout,
                 )
             turns.append(turn)
-            if (
-                attempt_index == 0
-                and len(route_attempts) > 1
-                and turn.error
-                and _should_fallback_ui_route_error(turn.error)
-            ):
-                ui_route_metadata = _mark_ui_route_fallback(
-                    ui_route_metadata,
-                    turn.error,
-                )
-                _finish_worker_run(codex_run, failed=True)
-                continue
             break
     finally:
         if codex_home is not None and inherited_credential_id:
@@ -2515,6 +2220,13 @@ def _delegate_coding_task_impl(
     projected_message_count = sum(
         len(getattr(item, "projected_messages", []) or []) for item in turns
     )
+    if ui_route_metadata.get("selected_route") == "ui_visual_specialist":
+        ui_route_metadata = {
+            **ui_route_metadata,
+            "actual_backend": "codex",
+            "actual_model": _attempt_model(build_pass),
+            "actual_reasoning_effort": reasoning_level,
+        }
     payload = {
         "success": success,
         "status": "completed" if success else "partial",

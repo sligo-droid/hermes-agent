@@ -48,7 +48,6 @@ from hermes_cli.github_remote import (
 from hermes_cli.pr_body_format import check_project_state_requirement
 from hermes_cli.ui_work_routing import (
     UIWorkRouteDecision,
-    codex_ui_work_extra_args,
     resolve_ui_work_route,
     ui_specialist_skill_prompt,
 )
@@ -1239,29 +1238,9 @@ def _ui_work_route_env(decision: UIWorkRouteDecision | None) -> dict[str, str]:
         "HERMES_UI_WORK_ROUTE_DECISION": metadata.get("route_decision"),
         "HERMES_UI_WORK_ROUTE_DECISION_SOURCE": metadata.get("route_decision_source"),
         "HERMES_UI_WORK_ROUTE_DECISION_RATIONALE": metadata.get("route_decision_rationale"),
-        "HERMES_UI_WORK_SELECTED_PROVIDER": metadata.get("selected_provider"),
-        "HERMES_UI_WORK_SELECTED_MODEL": metadata.get("selected_model"),
         "HERMES_UI_WORK_FALLBACK_USED": str(bool(metadata.get("fallback_used"))).lower(),
     }
     return {key: str(value) for key, value in values.items() if value not in (None, "")}
-
-
-def _ui_work_route_provider_env(decision: UIWorkRouteDecision | None) -> dict[str, str]:
-    """Return intentionally scoped provider credentials for a selected UI route."""
-    if decision is None or not decision.matched or not decision.enabled:
-        return {}
-    provider = str(decision.selected_provider or decision.provider or "").strip().lower()
-    if provider != "openrouter":
-        return {}
-    try:
-        from hermes_cli.config import get_env_value
-        from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
-    except Exception:
-        return {}
-    value = str(get_env_value("OPENROUTER_API_KEY") or "").strip()
-    if not value:
-        return {}
-    return {f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}OPENROUTER_API_KEY": value}
 
 
 def _ui_work_route_prompt(decision: UIWorkRouteDecision | None) -> str:
@@ -1271,8 +1250,6 @@ def _ui_work_route_prompt(decision: UIWorkRouteDecision | None) -> str:
     return (
         "UI specialist route metadata for this worker launch:\n"
         f"- selected_route: {metadata.get('selected_route') or ''}\n"
-        f"- selected_provider: {metadata.get('selected_provider') or ''}\n"
-        f"- selected_model: {metadata.get('selected_model') or ''}\n"
         f"- recommended_skills: {', '.join(metadata.get('recommended_skills') or [])}\n"
         f"- route_decision_source: {metadata.get('route_decision_source') or ''}\n"
         f"- route_decision_rationale: {metadata.get('route_decision_rationale') or ''}\n"
@@ -1298,11 +1275,27 @@ def _record_ui_work_route(task_id: str, *, board: Optional[str], decision: UIWor
         pass
 
 
-def _attach_ui_work_route(result: Any, decision: UIWorkRouteDecision | None) -> None:
+def _attach_ui_work_route(
+    result: Any,
+    decision: UIWorkRouteDecision | None,
+    *,
+    backend: str,
+) -> None:
     if decision is None:
         return
+    metadata = decision.metadata()
+    if decision.selected_route == "ui_visual_specialist":
+        passes = (getattr(result, "run_profile", None) or {}).get("passes") or []
+        actual_pass = passes[-1] if passes and isinstance(passes[-1], dict) else {}
+        metadata.update(
+            {
+                "actual_backend": backend,
+                "actual_model": actual_pass.get("model") or "",
+                "actual_reasoning_effort": actual_pass.get("reasoning") or "",
+            }
+        )
     try:
-        setattr(result, "ui_work_route", decision.metadata())
+        setattr(result, "ui_work_route", metadata)
     except Exception:
         pass
 
@@ -1326,39 +1319,10 @@ def _run_role_backend(
         workspace=workspace,
         backend="opencode" if uses_opencode else "codex",
     )
-    if ui_work_route is not None and ui_work_route.matched and ui_work_route.enabled and ui_work_route.backend == "codex":
-        uses_opencode = False
     route_prompt = _ui_work_route_prompt(ui_work_route)
     if route_prompt:
         prompt = f"{prompt.rstrip()}\n\n{route_prompt}"
     _record_ui_work_route(task_id, board=board, decision=ui_work_route)
-    if (
-        ui_work_route is not None
-        and ui_work_route.matched
-        and ui_work_route.enabled
-        and ui_work_route.selected_route == "ui_visual_specialist"
-    ):
-        from tools.coding_worker_tool import _run_ui_specialist
-
-        payload = json.loads(
-            _run_ui_specialist(
-                prompt=prompt,
-                workdir=workspace,
-                timeout=_role_timeout(role),
-                parent_agent=None,
-                route_metadata=ui_work_route.metadata(),
-            )
-        )
-        result = SimpleNamespace(
-            final_text=payload.get("summary", ""),
-            error=payload.get("error") or None,
-            ui_work_route=payload.get("ui_work_route"),
-        )
-        try:
-            record_codex_worker_result(task_id, board=board, result=result)
-        except Exception:
-            pass
-        return result
     if uses_opencode:
         return _run_opencode(
             prompt,
@@ -1397,8 +1361,6 @@ def _run_codex(
     ui_work_route: UIWorkRouteDecision | None = None,
 ):
     extra_args = _role_extra_args(role)
-    if ui_work_route is not None:
-        extra_args.extend(codex_ui_work_extra_args(ui_work_route))
 
     def on_event(note: dict) -> None:
         try:
@@ -1412,7 +1374,6 @@ def _run_codex(
         **guard_env,
         **_role_read_only_discord_env(role),
         **_ui_work_route_env(ui_work_route),
-        **_ui_work_route_provider_env(ui_work_route),
     }
     try:
         attempt = 0
@@ -1436,7 +1397,7 @@ def _run_codex(
             try:
                 result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
                 _attach_scheduled_runtime(result, role)
-                _attach_ui_work_route(result, ui_work_route)
+                _attach_ui_work_route(result, ui_work_route, backend="codex")
                 try:
                     record_codex_worker_result(task_id, board=board, result=result)
                 except Exception:
@@ -1561,7 +1522,6 @@ def _run_opencode(
         **guard_env,
         **_role_read_only_discord_env(role),
         **_ui_work_route_env(ui_work_route),
-        **_ui_work_route_provider_env(ui_work_route),
     }
     old_env = {key: os.environ.get(key) for key in runtime_env}
     os.environ.update(runtime_env)
@@ -1601,7 +1561,7 @@ def _run_opencode(
         _restore_environ(old_env)
         _cleanup_pr_mutation_guard(guard_dir)
     _attach_scheduled_runtime(result, role)
-    _attach_ui_work_route(result, ui_work_route)
+    _attach_ui_work_route(result, ui_work_route, backend="opencode")
     try:
         record_codex_worker_result(task_id, board=board, result=result)
     except Exception:

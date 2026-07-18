@@ -60,23 +60,6 @@ def _default_codex_backend(monkeypatch):
 
     monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: "codex")
 
-    def fake_specialist(**kwargs):
-        return json.dumps(
-            {
-                "success": True,
-                "status": "completed",
-                "summary": "Changed src/app.py and ran pytest.",
-                "error": "",
-                "cwd": kwargs["workdir"],
-                "backend": "claude_code",
-                "agents": ["ui_visual_specialist"],
-                "plan_used": False,
-                "ui_work_route": kwargs["route_metadata"],
-            }
-        )
-
-    monkeypatch.setattr(cwt, "_run_ui_specialist", fake_specialist)
-
 
 def _parent(tmp_path, api_mode="chat_completions"):
     return SimpleNamespace(
@@ -326,11 +309,15 @@ def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
         cwt.delegate_coding_task(
             task="fix the production auth race",
             worker_tier="thorough",
+            route_decision={"route": "ui_visual_specialist"},
             parent_agent=parent,
         )
     )
 
     assert result["success"] is True
+    assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
+    assert result["ui_work_route"]["actual_model"] == "gpt-5.6-sol"
+    assert result["ui_work_route"]["actual_reasoning_effort"] == "high"
     assert [session.kwargs["extra_args"] for session in FakeSession.instances] == [
         [
             "-c",
@@ -1228,18 +1215,18 @@ def test_delegate_preserves_json_route_decision_with_missing_cwd_fallback(monkey
     assert route["route_decision_confidence"] == 0.97
     assert route["route_decision_rationale"] == "Command Center UI task"
     assert route["selected_route"] == "ui_visual_specialist"
-    assert route["selected_provider"] == "anthropic"
-    assert route["selected_model"] == "claude-fable-5"
-    assert result["backend"] == "claude_code"
+    assert route["selected_provider"] == ""
+    assert route["selected_model"] == ""
+    assert result["backend"] == "codex"
+    assert FakeSession.instances
 
 
-def test_ui_specialist_route_does_not_launch_codex(monkeypatch, tmp_path):
+def test_ui_specialist_route_uses_normal_codex_backend_and_skills(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["coding_worker"]["backend"] = "codex"
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-secret")
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
@@ -1255,19 +1242,24 @@ def test_ui_specialist_route_does_not_launch_codex(monkeypatch, tmp_path):
     )
 
     assert result["success"] is True
-    assert result["backend"] == "claude_code"
-    assert FakeSession.instances == []
+    assert result["backend"] == "codex"
+    assert len(FakeSession.instances) == 1
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "UI specialist skill loading" in prompt
+    assert "`taste-skill`" in prompt
+    assert "`claude-design`" in prompt
+    assert "`popular-web-designs`" in prompt
     assert parent.turn_worker_runs == [
         {
-            "backend": "claude_code",
-            "model": "claude-fable-5",
-            "reasoning": "medium",
+            "backend": "codex",
+            "model": "gpt-5.6-terra",
+            "reasoning": "max",
             "tier": None,
         },
     ]
 
 
-def test_ui_opencode_route_uses_independent_specialist_backend(monkeypatch, tmp_path):
+def test_ui_specialist_route_uses_normal_opencode_backend(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -1278,10 +1270,10 @@ def test_ui_opencode_route_uses_independent_specialist_backend(monkeypatch, tmp_
         "load_coding_worker_backend",
         lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
     )
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-secret")
     seen = {}
 
     def fake_run(prompt, workspace, **kwargs):
+        seen["prompt"] = prompt
         seen.update(kwargs)
         return SimpleNamespace(
             final_text="Changed src/app.py and ran npm test.",
@@ -1305,13 +1297,17 @@ def test_ui_opencode_route_uses_independent_specialist_backend(monkeypatch, tmp_
     )
 
     assert result["success"] is True
-    assert result["backend"] == "claude_code"
+    assert result["backend"] == "opencode"
     route = result["ui_work_route"]
     assert route["matched"] is True
     assert route["backend"] == "opencode"
-    assert route["selected_provider"] == "anthropic"
-    assert route["selected_model"] == "claude-fable-5"
-    assert seen == {}
+    assert route["selected_provider"] == ""
+    assert route["selected_model"] == ""
+    assert route["actual_backend"] == "opencode"
+    assert route["actual_model"]
+    assert route["actual_reasoning_effort"]
+    assert "UI specialist skill loading" in seen["prompt"]
+    assert "worker_config" not in seen
 
 
 def test_default_opencode_route_keeps_openrouter_key_scrubbed(monkeypatch, tmp_path):
@@ -1848,7 +1844,7 @@ def test_worker_env_fallback_does_not_leak_secrets(monkeypatch):
     assert "GITHUB_TOKEN" not in env
 
 
-def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
+def test_ui_work_uses_normal_codex_model_tier(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -1877,18 +1873,18 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
     assert route["matched"] is True
     assert route["enabled"] is True
     assert route["reason"] == "orchestrator route selected ui visual specialist"
-    assert route["provider"] == "anthropic"
-    assert route["model"] == "claude-fable-5"
+    assert route["provider"] == ""
+    assert route["model"] == ""
     assert route["backend"] == "codex"
-    assert route["fallback_allowed"] is True
+    assert route["fallback_allowed"] is False
     assert route["error"] == ""
     assert route["route_decision"] == "ui_visual_specialist"
     assert route["route_decision_source"] == "orchestrator"
     assert route["route_decision_confidence"] == 0.86
     assert route["route_decision_rationale"] == "review feedback requires visual implementation"
     assert route["selected_route"] == "ui_visual_specialist"
-    assert route["selected_provider"] == "anthropic"
-    assert route["selected_model"] == "claude-fable-5"
+    assert route["selected_provider"] == ""
+    assert route["selected_model"] == ""
     assert route["fallback_used"] is False
     assert route["fallback_reason"] == ""
     assert route["advisory_matched"] is False
@@ -1898,11 +1894,21 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
         "claude-design",
         "popular-web-designs",
     ]
-    assert result["backend"] == "claude_code"
-    assert FakeSession.instances == []
+    assert route["actual_backend"] == "codex"
+    assert route["actual_model"] == "gpt-5.6-terra"
+    assert route["actual_reasoning_effort"] == "max"
+    assert result["backend"] == "codex"
+    assert len(FakeSession.instances) == 1
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
+    ]
+    assert "UI specialist skill loading" in FakeSession.instances[0].run_calls[0]["user_input"]
 
 
-def test_ui_work_smoke_title_uses_codex_model_overlay(monkeypatch, tmp_path):
+def test_ui_work_smoke_title_uses_normal_codex_backend(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -1926,11 +1932,11 @@ def test_ui_work_smoke_title_uses_codex_model_overlay(monkeypatch, tmp_path):
     route = result["ui_work_route"]
     assert route["matched"] is True
     assert route["selected_route"] == "ui_visual_specialist"
-    assert route["selected_provider"] == "anthropic"
-    assert route["selected_model"] == "claude-fable-5"
+    assert route["selected_provider"] == ""
+    assert route["selected_model"] == ""
     assert route["advisory_matched"] is True
     assert "visual ui work" in route["advisory_reason"]
-    assert FakeSession.instances == []
+    assert len(FakeSession.instances) == 1
 
 
 def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monkeypatch, tmp_path):
@@ -2008,93 +2014,24 @@ def test_unknown_route_decision_errors_before_worker_launch(monkeypatch, tmp_pat
     assert FakeSession.instances == []
 
 
-def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch, tmp_path):
+def test_legacy_ui_runtime_settings_do_not_change_codex_execution(monkeypatch, tmp_path):
     FakeSession.instances = []
-    FakeSession.results = [
-        TurnResult(
-            error="codex app-server startup failed: Model provider `openrouter` not found",
-            should_retire=True,
-        ),
-        TurnResult(
-            final_text="Changed src/app.py and ran pytest.",
-            thread_id="thread-default",
-            turn_id="turn-default",
-            tool_iterations=1,
-        ),
-    ]
+    FakeSession.results = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["coding_worker"]["backend"] = "codex"
-    cfg["ui_work"]["fallback"]["allow_default_worker"] = True
+    cfg["ui_work"].update(
+        {
+            "specialist_backend": "claude_code",
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "route": "anthropic_oauth",
+            "reasoning_effort": "medium",
+        }
+    )
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
-    )
-    monkeypatch.setattr(
-        cwt,
-        "_run_ui_specialist",
-        lambda **kwargs: json.dumps(
-            {
-                "success": False,
-                "status": "error",
-                "summary": "",
-                "error": "Claude Code Fable capacity exhausted",
-                "backend": "claude_code",
-                "ui_work_route": kwargs["route_metadata"],
-            }
-        ),
-    )
-
-    result = json.loads(
-        cwt.delegate_coding_task(
-            task="Implement the frontend dashboard layout polish",
-            context="Keep the Command Center responsive.",
-            route_decision={"route": "ui_visual_specialist"},
-            parent_agent=_parent(tmp_path),
-        )
-    )
-
-    assert result["success"] is False
-    assert "capacity exhausted" in result["error"]
-    assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
-    assert FakeSession.instances == []
-
-
-def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monkeypatch, tmp_path):
-    FakeSession.instances = []
-    cfg = copy.deepcopy(DEFAULT_CONFIG)
-    cfg["coding_worker"]["backend"] = "codex"
-    cfg["ui_work"]["fallback"]["allow_default_worker"] = False
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
-    monkeypatch.setattr(
-        "agent.transports.codex_app_server_session.CodexAppServerSession",
-        FakeSession,
-    )
-    monkeypatch.setattr(cwt, "codex_ui_work_extra_args", None, raising=False)
-
-    import builtins
-
-    real_import = builtins.__import__
-
-    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "hermes_cli.ui_work_routing" and "codex_ui_work_extra_args" in fromlist:
-            raise ImportError("overlay helper unavailable")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", blocked_import)
-    monkeypatch.setattr(
-        cwt,
-        "_run_ui_specialist",
-        lambda **kwargs: json.dumps(
-            {
-                "success": False,
-                "status": "error",
-                "summary": "",
-                "error": "Claude Code unavailable",
-                "backend": "claude_code",
-                "ui_work_route": kwargs["route_metadata"],
-            }
-        ),
     )
 
     result = json.loads(
@@ -2105,9 +2042,17 @@ def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monke
         )
     )
 
-    assert result["error"]
-    assert "Claude Code unavailable" in result["error"]
-    assert FakeSession.instances == []
+    assert result["success"] is True
+    assert result["backend"] == "codex"
+    assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
+    assert result["ui_work_route"]["selected_model"] == ""
+    assert len(FakeSession.instances) == 1
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model="gpt-5.6-terra"',
+        "-c",
+        'model_reasoning_effort="max"',
+    ]
 
 
 def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
@@ -2139,11 +2084,12 @@ def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
     ]
 
 
-def test_ui_work_missing_model_fails_before_worker(monkeypatch, tmp_path):
+def test_ui_work_missing_legacy_model_still_launches_worker(monkeypatch, tmp_path):
     FakeSession.instances = []
+    FakeSession.results = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["ui_work"]["model"] = ""
-    cfg["ui_work"]["fallback"]["allow_default_worker"] = False
+    cfg["ui_work"]["fallback"] = {"allow_default_worker": False}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
@@ -2158,8 +2104,9 @@ def test_ui_work_missing_model_fails_before_worker(monkeypatch, tmp_path):
         )
     )
 
-    assert "ui_work.provider and ui_work.model" in result["error"]
-    assert FakeSession.instances == []
+    assert result["success"] is True
+    assert result["backend"] == "codex"
+    assert len(FakeSession.instances) == 1
 
 
 def test_delegate_prefers_hermes_md_context_over_agents(monkeypatch, tmp_path):
