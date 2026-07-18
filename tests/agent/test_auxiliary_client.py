@@ -2060,6 +2060,39 @@ class TestCompressionProviderOutageFallback:
             model="claude-sonnet-4-6",
             explicit_base_url="https://compat.example/anthropic",
             explicit_api_key="compat-key",
+            api_mode=None,
+        )
+
+    def test_compression_chain_overrides_named_provider_api_mode(self):
+        client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "cli-proxy-api",
+                        "model": "claude-sonnet-4-6",
+                        "api_mode": "chat_completions",
+                    }
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(client, "claude-sonnet-4-6"),
+        ) as resolve:
+            resolved_client, model, label = _try_configured_fallback_chain(
+                "compression", "openai-codex", reason="provider service outage"
+            )
+
+        assert resolved_client is client
+        assert model == "claude-sonnet-4-6"
+        assert label == "fallback_chain[0](cli-proxy-api)"
+        resolve.assert_called_once_with(
+            provider="cli-proxy-api",
+            model="claude-sonnet-4-6",
+            explicit_base_url="",
+            explicit_api_key="",
+            api_mode="chat_completions",
         )
 
     def test_compression_anthropic_chain_honors_explicit_base_url(self, monkeypatch):

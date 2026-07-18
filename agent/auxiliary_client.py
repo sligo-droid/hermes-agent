@@ -3373,7 +3373,7 @@ def _try_configured_fallback_chain(
 
     Reads auxiliary.<task>.fallback_chain from config.yaml and tries each
     entry in order.  Each entry must have at least ``provider``; ``model``,
-    ``base_url``, and ``api_key`` are optional.
+    ``base_url``, ``api_key``, and ``api_mode`` are optional.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -3398,6 +3398,7 @@ def _try_configured_fallback_chain(
         fb_model = str(entry.get("model", "")).strip() or None
         fb_base_url = str(entry.get("base_url", "")).strip() or None
         fb_api_key = str(entry.get("api_key", "")).strip() or None
+        fb_api_mode = str(entry.get("api_mode", "")).strip() or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
 
@@ -3407,6 +3408,7 @@ def _try_configured_fallback_chain(
                 fb_model,
                 fb_base_url,
                 fb_api_key,
+                api_mode=fb_api_mode,
                 strict_anthropic_credentials=(task == "compression"),
             )
         except Exception:
@@ -3486,6 +3488,7 @@ def _resolve_single_provider(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     *,
+    api_mode: Optional[str] = None,
     strict_anthropic_credentials: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve a single provider entry from fallback_chain to an OpenAI client.
@@ -3513,6 +3516,7 @@ def _resolve_single_provider(
         model=model or "",
         explicit_base_url=base_url or "",
         explicit_api_key=api_key or "",
+        api_mode=api_mode,
     )
     _annotate_resolved_provider(client, provider)
     return client, resolved_model

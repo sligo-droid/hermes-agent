@@ -21,23 +21,12 @@ def _chat_response(text: str):
     )
 
 
-def _anthropic_response(text: str):
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)],
-        stop_reason="end_turn",
-        usage=None,
-    )
-
-
-def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
+def test_compression_gpt_outage_uses_proxy_chat_fallback_and_continues(
     monkeypatch, tmp_path
 ):
-    """Real compression should recover through configured native Anthropic."""
+    """Real compression should recover through proxy Chat Completions."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8317")
-    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLI_PROXY_API_KEY", "test-proxy-key")
 
     with patch("run_agent.get_tool_definitions", return_value=[]), patch(
         "run_agent.check_toolset_requirements", return_value={}
@@ -84,8 +73,9 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
     gpt_auxiliary.base_url = "https://chatgpt.com/backend-api/codex"
     gpt_auxiliary.chat.completions.create.side_effect = outage
 
-    native_anthropic = MagicMock()
-    native_anthropic.messages.create.return_value = _anthropic_response(
+    proxy_chat = MagicMock()
+    proxy_chat.base_url = "http://127.0.0.1:8317/v1"
+    proxy_chat.chat.completions.create.return_value = _chat_response(
         "## Active Task\nContinue the current conversation safely."
     )
 
@@ -94,6 +84,15 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
             "provider": "custom",
             "model": "main-model",
         },
+        "providers": {
+            "cli-proxy-api": {
+                "name": "CLIProxyAPI",
+                "base_url": "http://127.0.0.1:8317/v1",
+                "key_env": "CLI_PROXY_API_KEY",
+                "api_mode": "codex_responses",
+                "default_model": "gpt-5.6-luna",
+            }
+        },
         "auxiliary": {
             "compression": {
                 "provider": "openai-codex",
@@ -101,8 +100,9 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
                 "timeout": 30,
                 "fallback_chain": [
                     {
-                        "provider": "anthropic",
+                        "provider": "cli-proxy-api",
                         "model": "claude-sonnet-4-6",
+                        "api_mode": "chat_completions",
                     }
                 ],
             }
@@ -125,15 +125,13 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
         )
 
     with patch("hermes_cli.config.load_config", return_value=config), patch(
+        "hermes_cli.runtime_provider.load_config", return_value=config
+    ), patch(
         "agent.auxiliary_client._build_codex_client",
         return_value=(gpt_auxiliary, "gpt-5.4"),
     ), patch(
-        "agent.auxiliary_client._select_explicit_anthropic_pool_entry",
-        return_value=(False, None),
-    ), patch(
-        "agent.anthropic_adapter.build_anthropic_client",
-        return_value=native_anthropic,
-    ) as build_anthropic:
+        "agent.auxiliary_client.OpenAI", return_value=proxy_chat
+    ) as build_proxy_chat:
         result = agent.run_conversation(
             "Please continue from the compacted context.",
             conversation_history=history,
@@ -143,11 +141,11 @@ def test_compression_gpt_outage_falls_back_to_native_anthropic_and_continues(
     assert result["final_response"] == "Conversation continued after compression."
     assert agent.context_compressor.compression_count == 1
     assert gpt_auxiliary.chat.completions.create.call_count == 1
-    build_anthropic.assert_called_once_with(
-        "test-anthropic-key", "http://127.0.0.1:8317"
+    build_proxy_chat.assert_called_once_with(
+        api_key="test-proxy-key", base_url="http://127.0.0.1:8317/v1"
     )
-    assert native_anthropic.messages.create.call_count == 1
-    assert native_anthropic.messages.create.call_args.kwargs["model"] == "claude-sonnet-4-6"
+    assert proxy_chat.chat.completions.create.call_count == 1
+    assert proxy_chat.chat.completions.create.call_args.kwargs["model"] == "claude-sonnet-4-6"
     assert any(
         SUMMARY_PREFIX in str(message.get("content", ""))
         and "Continue the current conversation safely" in str(message.get("content", ""))
