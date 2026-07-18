@@ -61,6 +61,7 @@ tests/hermes_cli/test_discord_cli.py
 tests/hermes_cli/test_discord_worker_boards.py
 tests/hermes_cli/test_discord_worker_dispatch.py
 tests/gateway/test_discord_summaries.py
+tests/gateway/test_discord_typing.py
 tests/gateway/test_kanban_notifier.py
 tests/gateway/test_work_ledger.py
 tests/gateway/test_session_env.py
