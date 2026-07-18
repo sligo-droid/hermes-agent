@@ -48,6 +48,33 @@ def test_default_config_contains_pid_self_improvement_prongs():
     assert DEFAULT_CONFIG["self_improvement"]["projects"]["pid"]["prongs"]["airflow_scraper_doctor"]["max_cards_per_run"] == 5
 
 
+def _hermes_discord_audit_payload(card_count):
+    payload = _fixture("proposal_run_pid_valid.json")
+    payload["project"] = "hermes"
+    payload["prong"] = "discord_execution_audit"
+    template = payload["cards"][0]
+    payload["cards"] = []
+    for index in range(card_count):
+        card = json.loads(json.dumps(template))
+        card["idempotency_key"] = f"hermes-discord-execution:test:{index}"
+        card["title"] = f"Hermes Discord audit candidate {index}"
+        payload["cards"].append(card)
+    return payload
+
+
+def test_hermes_discord_audit_prong_accepts_zero_or_one_card():
+    prong = DEFAULT_CONFIG["self_improvement"]["projects"]["hermes"]["prongs"]["discord_execution_audit"]
+
+    assert prong["max_cards_per_run"] == 1
+    assert validate_proposal_run(_hermes_discord_audit_payload(0))["cards"] == []
+    assert len(validate_proposal_run(_hermes_discord_audit_payload(1))["cards"]) == 1
+
+
+def test_hermes_discord_audit_prong_rejects_two_cards():
+    with pytest.raises(ProposalValidationError, match="cards must contain at most 1 items"):
+        validate_proposal_run(_hermes_discord_audit_payload(2))
+
+
 def test_self_improvement_discord_channel_lookup_accepts_aliases(monkeypatch):
     for key in ("discord_channel_id", "discord_project_channel_id", "project_discord_channel_id"):
         monkeypatch.setattr(

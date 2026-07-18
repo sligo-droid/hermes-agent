@@ -24,6 +24,57 @@ def _first_card() -> dict:
     return cards[0]
 
 
+def _hermes_audit_payload(*, cards=True, run_id="hermes-audit-run") -> dict:
+    payload = _fixture_payload()
+    payload["project"] = "hermes"
+    payload["prong"] = "discord_execution_audit"
+    payload["run"]["run_id"] = run_id
+    payload["run"]["cron_job_id"] = "9832b5241a0d"
+    payload["run"]["cron_job_name"] = "Daily Hermes Discord execution audit"
+    payload["cards"][0]["idempotency_key"] = "hermes-discord-execution:terminal:runtime_handoff_unverified"
+    payload["cards"][0]["title"] = "Verify deferred Discord runtime handoffs"
+    if not cards:
+        payload["cards"] = []
+    return payload
+
+
+def test_discord_audit_card_routes_once_to_hermes_and_never_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    result = proposal_storage.ingest_proposal_output(
+        json.dumps(_hermes_audit_payload()),
+        source={"source_key": "cron:9832b5241a0d:valid"},
+    )
+    card = proposal_storage.list_cards()["cards"][0]
+
+    hermes = command_center.build_command_center_snapshot(project="hermes")
+    pid = command_center.build_command_center_snapshot(project="pid")
+
+    matching = [item for item in hermes["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}"]
+    assert result["status"] == "valid"
+    assert len(matching) == 1
+    assert matching[0]["project"] == "hermes"
+    assert matching[0]["source"]["kind"] == "self_improvement"
+    assert matching[0]["source"]["id"] == f"source:self-improvement-proposal:{card['proposal_id']}"
+    assert not any(item["id"] == matching[0]["id"] for item in pid["work_items"])
+
+
+def test_empty_discord_audit_run_creates_source_but_no_work_item(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    result = proposal_storage.ingest_proposal_output(
+        json.dumps(_hermes_audit_payload(cards=False, run_id="hermes-audit-empty")),
+        source={"source_key": "cron:9832b5241a0d:empty"},
+    )
+
+    hermes = command_center.build_command_center_snapshot(project="hermes")
+
+    assert result["status"] == "empty"
+    assert not any(item["source"]["kind"] == "self_improvement" for item in hermes["work_items"])
+    run_sources = [source for source in hermes["sources"] if source["kind"] == "self_improvement_run"]
+    assert len(run_sources) == 1
+    assert run_sources[0]["project"] == "hermes"
+    assert run_sources[0]["status"] == "empty"
+
+
 def _ingest_cards(monkeypatch, tmp_path, count: int) -> list[dict]:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     payload = _fixture_payload()

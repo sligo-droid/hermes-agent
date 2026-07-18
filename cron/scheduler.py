@@ -1788,18 +1788,28 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 # silent skip — do not pollute the prompt with error messages
 
     # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+    # delivery works. Proposal jobs must preserve an auditable empty run;
+    # ordinary cron jobs retain the legacy silent-delivery escape hatch.
+    if proposal is not None:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled self-improvement proposal job. "
+            "DELIVERY: Your final response will be automatically handled by the system — "
+            "do NOT use send_message or try to deliver it yourself. Always return the "
+            "required proposal contract. If there is nothing worth proposing, return a "
+            "valid proposal payload with `cards: []`. Do not return [SILENT].]\n\n"
+        )
+    else:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
     _scan_assembled_cron_prompt(cron_hint + user_prompt, job, has_skills=False)
     prompt = cron_hint + prompt
     if skills is None:
@@ -2508,6 +2518,22 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok and _is_self_improvement_proposal_job(job):
+            logger.error(
+                "Job '%s' (ID: %s): proposal data-collection script failed; agent skipped",
+                job_name,
+                job_id,
+            )
+            failed_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** FAILED\n\n"
+                "The self-improvement proposal data-collection script failed before "
+                "the agent run. No proposal output was generated or ingested.\n"
+            )
+            error = "self-improvement proposal data-collection script failed"
+            return False, failed_doc, "", error
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",

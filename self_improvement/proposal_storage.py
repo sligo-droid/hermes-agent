@@ -48,6 +48,48 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def list_active_idempotency_keys(
+    *,
+    project: str,
+    prong: str,
+    prefix: str | None = None,
+    db_path: Path | None = None,
+) -> set[str]:
+    """Return active proposal keys without creating or migrating storage."""
+
+    path = Path(db_path) if db_path is not None else proposals_db_path()
+    if not path.is_file():
+        return set()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise RuntimeError("proposal storage unavailable for active duplicate lookup") from exc
+    try:
+        query = """
+            SELECT idempotency_key
+            FROM proposal_cards
+            WHERE project = ?
+              AND prong = ?
+              AND status IN ('proposed', 'approved', 'recovery_needed')
+              AND idempotency_key IS NOT NULL
+              AND idempotency_key != ''
+        """
+        params: list[Any] = [str(project), str(prong)]
+        if prefix is not None:
+            query += " AND idempotency_key LIKE ? ESCAPE '\\'"
+            escaped = str(prefix).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.append(f"{escaped}%")
+        return {
+            str(row[0])
+            for row in conn.execute(query, params)
+            if row[0] is not None and str(row[0]).strip()
+        }
+    except sqlite3.Error as exc:
+        raise RuntimeError("proposal storage unavailable for active duplicate lookup") from exc
+    finally:
+        conn.close()
+
+
 def init_db(db_path: Path | None = None) -> None:
     conn = connect(db_path)
     try:

@@ -2196,6 +2196,15 @@ DEFAULT_CONFIG = {
                         "focus": "Hermes runtime health, gateway reliability, worker orchestration, and operational diagnostics.",
                         "max_cards_per_run": 5,
                     },
+                    "discord_execution_audit": {
+                        "label": "Daily Discord execution audit",
+                        "focus": (
+                            "One actionable Hermes system bottleneck derived from the previous "
+                            "local calendar day's structured Discord execution evidence, or zero "
+                            "cards when the evidence is smooth, weak, ambiguous, or duplicated."
+                        ),
+                        "max_cards_per_run": 1,
+                    },
                 },
             },
             "pid": {

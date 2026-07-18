@@ -106,6 +106,137 @@ def test_profile_safe_db_path_and_initialization(tmp_path, monkeypatch):
     assert proposal_storage.proposals_db_path().exists()
 
 
+def _insert_proposal_key(db_path, *, proposal_id, project, prong, status, key):
+    proposal_storage.init_db(db_path)
+    conn = proposal_storage.connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO proposal_runs(
+                    source_key, status, card_count, human_markdown, source_markdown,
+                    source_ref_json, ingested_at, updated_at
+                ) VALUES (?, 'valid', 1, '', '', '{}', '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')
+                """,
+                (f"source:{proposal_id}",),
+            )
+            run_id = conn.execute(
+                "SELECT id FROM proposal_runs WHERE source_key = ?",
+                (f"source:{proposal_id}",),
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO proposal_cards(
+                    proposal_id, run_db_id, project, prong, title, summary, body,
+                    rationale, priority, status, idempotency_key, created_at,
+                    source_excerpts_json, kanban_task_json, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, 'title', 'summary', 'body', 'rationale',
+                          'high', ?, ?, '2026-07-18T00:00:00Z', '[]', '{}', '{}',
+                          '2026-07-18T00:00:00Z')
+                """,
+                (proposal_id, run_id, project, prong, status, key),
+            )
+    finally:
+        conn.close()
+
+
+def test_active_idempotency_lookup_does_not_create_missing_db(tmp_path):
+    db_path = tmp_path / "missing" / "proposals.db"
+
+    keys = proposal_storage.list_active_idempotency_keys(
+        project="hermes",
+        prong="discord_execution_audit",
+        db_path=db_path,
+    )
+
+    assert keys == set()
+    assert not db_path.parent.exists()
+
+
+def test_active_idempotency_lookup_fails_closed_on_invalid_database(tmp_path):
+    db_path = tmp_path / "proposals.db"
+    db_path.write_text("not sqlite", encoding="utf-8")
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="proposal storage unavailable"):
+        proposal_storage.list_active_idempotency_keys(
+            project="hermes",
+            prong="discord_execution_audit",
+            db_path=db_path,
+        )
+
+
+def test_active_idempotency_lookup_filters_state_scope_and_prefix(tmp_path):
+    db_path = tmp_path / "proposals.db"
+    rows = [
+        ("active-proposed", "hermes", "discord_execution_audit", "proposed", "audit:terminal"),
+        ("active-approved", "hermes", "discord_execution_audit", "approved", "audit:provider"),
+        ("active-recovery", "hermes", "discord_execution_audit", "recovery_needed", "audit:worker"),
+        ("historical-completed", "hermes", "discord_execution_audit", "completed", "audit:completed"),
+        ("historical-rejected", "hermes", "discord_execution_audit", "rejected", "audit:rejected"),
+        ("historical-archived", "hermes", "discord_execution_audit", "archived", "audit:archived"),
+        ("other-prong", "hermes", "system-doctor", "proposed", "audit:other-prong"),
+        ("other-project", "pid", "airflow_scraper_doctor", "proposed", "audit:other-project"),
+        ("other-prefix", "hermes", "discord_execution_audit", "proposed", "different:key"),
+    ]
+    for proposal_id, project, prong, status, key in rows:
+        _insert_proposal_key(
+            db_path,
+            proposal_id=proposal_id,
+            project=project,
+            prong=prong,
+            status=status,
+            key=key,
+        )
+
+    keys = proposal_storage.list_active_idempotency_keys(
+        project="hermes",
+        prong="discord_execution_audit",
+        prefix="audit:",
+        db_path=db_path,
+    )
+
+    assert keys == {"audit:terminal", "audit:provider", "audit:worker"}
+
+
+def test_active_idempotency_lookup_uses_profile_scoped_default(tmp_path, monkeypatch):
+    first_home = tmp_path / "first"
+    second_home = tmp_path / "second"
+    first_db = first_home / "self_improvement" / "proposals.db"
+    second_db = second_home / "self_improvement" / "proposals.db"
+    _insert_proposal_key(
+        first_db,
+        proposal_id="first-key",
+        project="hermes",
+        prong="discord_execution_audit",
+        status="proposed",
+        key="audit:first",
+    )
+    _insert_proposal_key(
+        second_db,
+        proposal_id="second-key",
+        project="hermes",
+        prong="discord_execution_audit",
+        status="proposed",
+        key="audit:second",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(first_home))
+    first = proposal_storage.list_active_idempotency_keys(
+        project="hermes",
+        prong="discord_execution_audit",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(second_home))
+    second = proposal_storage.list_active_idempotency_keys(
+        project="hermes",
+        prong="discord_execution_audit",
+    )
+
+    assert first == {"audit:first"}
+    assert second == {"audit:second"}
+
+
 def test_ingest_valid_run_is_idempotent_and_replaces_cards(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 

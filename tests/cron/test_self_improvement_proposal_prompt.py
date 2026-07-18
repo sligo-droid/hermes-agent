@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from cron.scheduler import _build_job_prompt, tick
+from cron.scheduler import _build_job_prompt, run_job, tick
 from hermes_cli import kanban_db
 from hermes_cli.config import DEFAULT_CONFIG
 from self_improvement import proposal_storage
@@ -40,9 +40,13 @@ def test_hermes_self_improvement_prongs_are_valid_for_cron_prompts():
     hermes = DEFAULT_CONFIG["self_improvement"]["projects"]["hermes"]
 
     assert hermes["label"] == "Hermes"
-    assert set(hermes["prongs"]) >= {"daily-retrospective", "system-doctor"}
+    assert set(hermes["prongs"]) >= {
+        "daily-retrospective",
+        "system-doctor",
+        "discord_execution_audit",
+    }
 
-    for prong in ("daily-retrospective", "system-doctor"):
+    for prong in ("daily-retrospective", "system-doctor", "discord_execution_audit"):
         prompt = _build_job_prompt(
             {
                 "id": f"hermes-{prong}",
@@ -59,6 +63,39 @@ def test_hermes_self_improvement_prongs_are_valid_for_cron_prompts():
         assert CONTRACT_VERSION in prompt
         assert '"project": "hermes"' in prompt
         assert f'"prong": "{prong}"' in prompt
+
+
+def test_discord_audit_prompt_is_one_card_hermes_only_and_not_silent():
+    from cron.discord_execution_audit import AUDIT_PROPOSAL_PROMPT
+
+    prompt = _build_job_prompt(
+        {
+            "id": "discord-audit",
+            "name": "Daily Hermes Discord execution audit",
+            "prompt": AUDIT_PROPOSAL_PROMPT,
+            "script": "hermes_discord_execution_audit.py",
+            "self_improvement_proposal": {
+                "project": "hermes",
+                "prong": "discord_execution_audit",
+            },
+        },
+        prerun_script=(True, '{"selected_candidate":null}'),
+    )
+
+    assert "at most 1 proposal cards" in prompt
+    assert "Project: `hermes`" in prompt
+    assert "Prong: `discord_execution_audit`" in prompt
+    assert "valid proposal payload with `cards: []`" in prompt
+    assert "Do not return [SILENT]" in prompt
+    assert "route anything to PID" in prompt
+    assert "exactly one Hermes proposal card" in prompt
+    assert "respond with exactly \"[SILENT]\"" not in prompt
+
+
+def test_non_proposal_cron_prompt_keeps_silent_guidance():
+    prompt = _build_job_prompt({"prompt": "Routine cron report."})
+
+    assert "respond with exactly \"[SILENT]\"" in prompt
 
 
 def test_cron_job_prompt_includes_scoped_feedback_context(tmp_path, monkeypatch):
@@ -208,6 +245,22 @@ def _proposal_job(**overrides):
     }
     job.update(overrides)
     return job
+
+
+def test_proposal_job_fails_without_agent_when_collector_script_fails():
+    job = _proposal_job(script="collector.py")
+
+    with patch(
+        "cron.scheduler._run_job_script",
+        return_value=(False, '{"source":{"ledger_status":"malformed"}}'),
+    ), patch("run_agent.AIAgent") as agent_class:
+        success, output, final_response, error = run_job(job)
+
+    assert success is False
+    assert "data-collection script failed" in output
+    assert final_response == ""
+    assert error == "self-improvement proposal data-collection script failed"
+    agent_class.assert_not_called()
 
 
 def _run_tick_with_response(tmp_path, monkeypatch, job, final_response):
