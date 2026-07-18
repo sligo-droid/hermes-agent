@@ -190,6 +190,12 @@ def test_default_config_cron_provider_is_empty():
     from hermes_cli.config import DEFAULT_CONFIG
 
     assert DEFAULT_CONFIG["cron"]["provider"] == ""
+    assert DEFAULT_CONFIG["cron"]["chronos"] == {
+        "portal_url": "",
+        "callback_url": "",
+        "expected_audience": "",
+        "nas_jwks_url": "",
+    }
 
 
 def test_discover_cron_schedulers_returns_list():
@@ -328,6 +334,52 @@ def test_builtin_inherits_hook_defaults():
     assert p.reconcile() is None
     # built-in does not override fire_due; it simply isn't called for built-in.
     assert hasattr(p, "fire_due")
+    assert p.verify_fire_token("anything") is None
+
+
+def test_verify_cron_fire_token_uses_active_provider(monkeypatch):
+    from cron import scheduler_provider as sp
+
+    class Verifier:
+        def verify_fire_token(self, token):
+            return {"token": token}
+
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: Verifier())
+    assert sp.verify_cron_fire_token("nas-jwt") == {"token": "nas-jwt"}
+
+
+def test_verify_cron_fire_token_scopes_provider_to_profile(monkeypatch, tmp_path):
+    from cron import scheduler_provider as sp
+    from hermes_constants import get_hermes_home
+
+    seen = []
+
+    class Verifier:
+        def verify_fire_token(self, token):
+            return {"token": token}
+
+    def resolve():
+        seen.append(get_hermes_home())
+        return Verifier()
+
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", resolve)
+
+    assert sp.verify_cron_fire_token(
+        "nas-jwt",
+        hermes_home=str(tmp_path),
+    ) == {"token": "nas-jwt"}
+    assert seen == [tmp_path]
+
+
+def test_verify_cron_fire_token_fails_closed_on_provider_error(monkeypatch):
+    from cron import scheduler_provider as sp
+
+    monkeypatch.setattr(
+        sp,
+        "resolve_cron_scheduler",
+        lambda: (_ for _ in ()).throw(RuntimeError("broken provider")),
+    )
+    assert sp.verify_cron_fire_token("nas-jwt") is None
 
 
 def test_fire_due_default_claims_then_runs(monkeypatch):
@@ -337,12 +389,27 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
+    claims = []
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda jid, **kwargs: claims.append((jid, kwargs)) or True,
+        raising=False,
+    )
     monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
-    assert InProcessCronScheduler().fire_due("j1") is True
+    assert InProcessCronScheduler().fire_due(
+        "j1",
+        fire_at="2026-07-18T12:00:00+00:00",
+    ) is True
+    assert claims == [
+        (
+            "j1",
+            {"expected_fire_at": "2026-07-18T12:00:00+00:00"},
+        )
+    ]
     assert ran == ["j1"]
 
 
@@ -354,7 +421,7 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: False, raising=False)
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid, **kwargs: False, raising=False)
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("j1") is False
@@ -369,7 +436,7 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid, **kwargs: True, raising=False)
     monkeypatch.setattr(jobs, "get_job", lambda jid: None)
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 

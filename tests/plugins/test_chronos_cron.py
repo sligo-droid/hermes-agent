@@ -61,6 +61,48 @@ def test_is_available_false_without_config(temp_home, monkeypatch):
     assert ChronosCronScheduler().is_available() is False
 
 
+def test_is_available_false_without_fire_verification_config(temp_home, monkeypatch):
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    values = {
+        "portal_url": "https://portal.test",
+        "callback_url": "https://agent.test/api/cron/fire",
+        "expected_audience": "",
+        "nas_jwks_url": "",
+    }
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos._cfg",
+        lambda *keys, default="": values.get(keys[-1], default),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda pid: {"access_token": "tok"},
+    )
+
+    assert ChronosCronScheduler().is_available() is False
+
+
+def test_is_available_false_with_http_jwks(temp_home, monkeypatch):
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    values = {
+        "portal_url": "https://portal.test",
+        "callback_url": "https://agent.test/api/cron/fire",
+        "expected_audience": "agent:instance",
+        "nas_jwks_url": "http://portal.test/.well-known/jwks.json",
+    }
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos._cfg",
+        lambda *keys, default="": values.get(keys[-1], default),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda pid: {"access_token": "tok"},
+    )
+
+    assert ChronosCronScheduler().is_available() is False
+
+
 def test_is_available_true_with_config_and_token(temp_home, monkeypatch):
     import plugins.cron_providers.chronos as mod
     from plugins.cron_providers.chronos import ChronosCronScheduler
@@ -86,6 +128,40 @@ def test_is_available_makes_no_network(temp_home, monkeypatch):
 
     monkeypatch.setattr(p, "_get_client", explode)
     assert p.is_available() is True  # did not call _get_client
+
+
+def test_verify_fire_token_uses_chronos_config(monkeypatch):
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    values = {
+        "expected_audience": "agent:instance",
+        "nas_jwks_url": "https://portal.test/.well-known/jwks.json",
+        "portal_url": "https://portal.test/",
+    }
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos._cfg",
+        lambda *keys, default="": values.get(keys[-1], default),
+    )
+    seen = {}
+
+    def verify(**kwargs):
+        seen.update(kwargs)
+        return {"purpose": "cron_fire"}
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: verify,
+    )
+
+    assert ChronosCronScheduler().verify_fire_token("nas-jwt") == {
+        "purpose": "cron_fire"
+    }
+    assert seen == {
+        "token": "nas-jwt",
+        "expected_audience": "agent:instance",
+        "jwks_or_key": "https://portal.test/.well-known/jwks.json",
+        "issuer": "https://portal.test",
+    }
 
 
 # -- arming -------------------------------------------------------------------
@@ -170,13 +246,29 @@ def test_reconcile_skips_already_armed_same_time(temp_home, chronos, monkeypatch
 
 def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
     prov, fake = chronos
+    seen = []
     # super().fire_due runs the job; stub the ABC default to "ran".
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: True)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.fire_due",
+        lambda self, jid, **kw: seen.append((jid, kw)) or True,
+    )
     monkeypatch.setattr("cron.jobs.get_job",
                         lambda jid: {"id": jid, "enabled": True, "next_run_at": "2026-06-18T12:05:00+00:00"})
 
-    assert prov.fire_due("j1") is True
+    assert prov.fire_due(
+        "j1",
+        fire_at="2026-06-18T12:00:00+00:00",
+    ) is True
+    assert seen == [
+        (
+            "j1",
+            {
+                "fire_at": "2026-06-18T12:00:00+00:00",
+                "adapters": None,
+                "loop": None,
+            },
+        )
+    ]
     assert [p["job_id"] for p in fake.provisions] == ["j1"]
     assert fake.provisions[0]["fire_at"] == "2026-06-18T12:05:00+00:00"
 
@@ -193,11 +285,21 @@ def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
     assert fake.provisions == []
 
 
-def test_fire_due_no_rearm_when_claim_lost(chronos, monkeypatch):
-    """If the run didn't happen (claim lost), don't re-arm."""
+def test_fire_due_rearms_after_failed_attempt(chronos, monkeypatch):
+    """A failed run must not permanently consume the recurring one-shot."""
     prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: False)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.fire_due",
+        lambda self, jid, **kw: False,
+    )
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda jid: {
+            "id": jid,
+            "enabled": True,
+            "next_run_at": "2026-06-18T12:05:00+00:00",
+        },
+    )
 
     assert prov.fire_due("j1") is False
-    assert fake.provisions == []
+    assert [item["job_id"] for item in fake.provisions] == ["j1"]

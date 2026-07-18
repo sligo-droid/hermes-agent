@@ -64,12 +64,22 @@ class ChronosCronScheduler(CronScheduler):
     def is_available(self) -> bool:
         """Config presence only — NO network.
 
-        Chronos needs a portal base URL, the agent's own publicly-reachable
-        callback URL (for NAS→agent fires), and a usable Nous token (the agent
-        is logged into the portal). If any is missing, resolve_cron_scheduler
-        falls back to the built-in ticker.
+        Chronos needs a portal base URL, the agent's publicly reachable callback
+        URL, the expected JWT audience and NAS JWKS URL, plus a usable Nous token.
+        If any is missing, resolve_cron_scheduler falls back to the built-in.
         """
-        if not (_cfg("cron", "chronos", "portal_url") and _cfg("cron", "chronos", "callback_url")):
+        required = {
+            key: str(_cfg("cron", "chronos", key) or "").strip()
+            for key in (
+                "portal_url",
+                "callback_url",
+                "expected_audience",
+                "nas_jwks_url",
+            )
+        }
+        if not all(required.values()):
+            return False
+        if not required["nas_jwks_url"].startswith("https://"):
             return False
         return self._have_nous_token()
 
@@ -212,23 +222,50 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def verify_fire_token(self, token: str) -> dict[str, Any] | None:
+        """Verify the NAS-minted credential for an inbound Chronos fire."""
+        from .verify import get_fire_verifier
+
+        return get_fire_verifier()(
+            token=token,
+            expected_audience=str(
+                _cfg("cron", "chronos", "expected_audience") or ""
+            ),
+            jwks_or_key=str(_cfg("cron", "chronos", "nas_jwks_url") or "")
+            or None,
+            issuer=str(_cfg("cron", "chronos", "portal_url") or "").rstrip("/")
+            or None,
+        )
+
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        fire_at: str | None = None,
+        adapters: Any = None,
+        loop: Any = None,
+    ) -> bool:
         """Run the due job (claim + run_one_job via the ABC default), then
         re-arm the NEXT one-shot through NAS.
 
-        Re-arm happens AFTER the run so next_run_at reflects the completed fire.
-        If the job is gone (one-shot completed / repeat-N exhausted), get_job
-        returns None → nothing to re-arm (the schedule naturally stops).
+        Re-arm happens AFTER the attempt so next_run_at reflects the claimed
+        fire even when execution failed. If the job is gone (one-shot completed /
+        repeat-N exhausted), get_job returns None and the schedule stops.
         """
-        ran = super().fire_due(job_id, adapters=adapters, loop=loop)
-        if ran:
-            from cron.jobs import get_job
-            job = get_job(job_id)
-            if job and job.get("enabled") and job.get("next_run_at"):
-                try:
-                    self._arm_one_shot(job)
-                except Exception as e:
-                    logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
+        ran = super().fire_due(
+            job_id,
+            fire_at=fire_at,
+            adapters=adapters,
+            loop=loop,
+        )
+        from cron.jobs import get_job
+
+        job = get_job(job_id)
+        if job and job.get("enabled") and job.get("next_run_at"):
+            try:
+                self._arm_one_shot(job)
+            except Exception as e:
+                logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
         return ran
 
 

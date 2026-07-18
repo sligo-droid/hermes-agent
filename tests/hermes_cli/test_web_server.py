@@ -111,7 +111,11 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
 
-        self.client = TestClient(app)
+        self.client = TestClient(
+            app,
+            base_url="http://127.0.0.1",
+            client=("127.0.0.1", 50000),
+        )
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
     def test_get_status(self):
@@ -312,7 +316,7 @@ class TestWebServerEndpoints:
             pass  # Not JSON — that's fine (SPA HTML)
 
     def test_unauthenticated_api_blocked(self):
-        """API requests without the session token should be rejected."""
+        """Private APIs require a token; the shared status probe stays public."""
         from starlette.testclient import TestClient
         from hermes_cli.web_server import app
         # Create a client WITHOUT the dashboard session header
@@ -322,7 +326,8 @@ class TestWebServerEndpoints:
         resp = unauth_client.get("/api/config")
         assert resp.status_code == 401
         resp = unauth_client.get("/api/status")
-        assert resp.status_code == 401
+        assert resp.status_code == 200
+        assert "version" in resp.json()
 
     def test_unauthenticated_spa_html_blocked(self):
         """The root page must not expose the injected dashboard session token."""
@@ -1651,7 +1656,11 @@ class TestStatusRemoteGateway:
             pytest.skip("fastapi/starlette not installed")
 
         from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
-        self.client = TestClient(app)
+        self.client = TestClient(
+            app,
+            base_url="http://127.0.0.1",
+            client=("127.0.0.1", 50000),
+        )
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
     def test_status_falls_back_to_remote_probe(self, monkeypatch):
