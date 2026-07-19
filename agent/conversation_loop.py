@@ -219,6 +219,36 @@ def _attach_runtime_breakdown(result: dict[str, Any], agent: Any, total_elapsed_
     return result
 
 
+def _begin_visual_stop_followup(agent: Any, *, total_elapsed_s: float) -> None:
+    """Notify one trusted host before the synthetic visual follow-up starts.
+
+    The callback receives only the same bounded runtime breakdown returned at
+    turn end. It runs synchronously at the stop boundary so a host can persist
+    an exact verified checkpoint before the next model call performs visual QA.
+    """
+
+    callback = getattr(agent, "_visual_qa_stop_callback", None)
+    if callable(callback):
+        try:
+            callback(
+                _current_turn_runtime_breakdown(
+                    agent,
+                    total_elapsed_s,
+                    scope="agent_turn",
+                )
+            )
+        except Exception:
+            logger.debug("visual QA stop-boundary callback failed", exc_info=True)
+    agent._visual_qa_followup_turns = (
+        getattr(agent, "_visual_qa_followup_turns", 0) + 1
+    )
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if isinstance(stats, dict):
+        stats["visual_qa_followup_count"] = int(
+            stats.get("visual_qa_followup_count") or 0
+        ) + 1
+
+
 def _downgrade_final_response_for_turn_evidence(agent: Any, final_response: str | None) -> tuple[str | None, bool, dict[str, Any]]:
     if not final_response:
         return final_response, False, {}
@@ -5252,14 +5282,12 @@ def run_conversation(
                         )
                     if visual_nudge:
                         _verify_nudge = visual_nudge
-                        agent._visual_qa_followup_turns = (
-                            getattr(agent, "_visual_qa_followup_turns", 0) + 1
+                        _begin_visual_stop_followup(
+                            agent,
+                            total_elapsed_s=(
+                                time.perf_counter() - _turn_runtime_started_at
+                            ),
                         )
-                        stats = getattr(agent, "_turn_runtime_stats", None)
-                        if isinstance(stats, dict):
-                            stats["visual_qa_followup_count"] = int(
-                                stats.get("visual_qa_followup_count") or 0
-                            ) + 1
                     elif verify_on_stop_enabled(verify_config):
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),

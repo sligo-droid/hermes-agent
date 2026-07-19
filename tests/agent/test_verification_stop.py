@@ -1,6 +1,7 @@
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from agent.verification_stop import (
     build_visual_qa_stop_nudge,
     verify_on_stop_enabled,
 )
+from agent.conversation_loop import _begin_visual_stop_followup
 
 
 def _node_project(root: Path) -> None:
@@ -206,6 +208,44 @@ def test_visual_stop_nudge_is_independent_from_generic_messaging_default():
         receipts=[],
         attempts=1,
     ) is None
+
+
+def test_visual_stop_callback_runs_before_followup_counter_advances():
+    seen = []
+    evidence = {
+        "surface": "verification",
+        "status": "success",
+        "canonical_command": "scripts/run_tests.sh",
+        "scope": "targeted",
+        "repository_root": "/repo",
+        "mutation_generation": 2,
+        "mutation_boundary": 4,
+        "verified_head_sha": "a" * 40,
+    }
+    agent = SimpleNamespace(
+        _visual_qa_followup_turns=0,
+        _visual_qa_stop_callback=lambda breakdown: seen.append(
+            (agent._visual_qa_followup_turns, breakdown)
+        ),
+        _turn_runtime_span_recorder=None,
+        _turn_runtime_stats={
+            "started_at": 1.0,
+            "verification_evidence": [evidence],
+            "mutation_generation": 2,
+            "mutation_boundary": 4,
+            "visual_qa_receipts": [],
+            "visual_qa_followup_count": 0,
+        },
+    )
+
+    _begin_visual_stop_followup(agent, total_elapsed_s=3.0)
+
+    assert seen[0][0] == 0
+    assert seen[0][1]["verification_evidence"] == [evidence]
+    assert seen[0][1]["mutation_generation"] == 2
+    assert seen[0][1]["mutation_boundary"] == 4
+    assert agent._visual_qa_followup_turns == 1
+    assert agent._turn_runtime_stats["visual_qa_followup_count"] == 1
 
 
 def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):

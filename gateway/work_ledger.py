@@ -57,6 +57,10 @@ _RUN_STATE_INT_LIMIT = (1 << 63) - 1
 _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 _MAX_CONFIRMED_MESSAGE_IDS = 128
 _MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
+_CLOSEOUT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_CLOSEOUT_VISUAL_STATUSES = frozenset(
+    {"passed", "failed", "blocked", "uncertain", "missing"}
+)
 
 
 def _bounded_delivery_message_ids(
@@ -351,6 +355,50 @@ def _positive_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _closeout_expects_head(state: dict[str, Any], expected_head_sha: str) -> bool:
+    """Return whether every active exact-head closeout receipt still targets H."""
+
+    if not _CLOSEOUT_SHA_RE.fullmatch(expected_head_sha):
+        return False
+    if state.get("policy", {}).get("require_visual_qa") is not True:
+        return False
+    return (
+        str(state.get("pr", {}).get("head_sha") or "").strip().lower()
+        == expected_head_sha
+        and str(state.get("local_verification", {}).get("head_sha") or "")
+        .strip()
+        .lower()
+        == expected_head_sha
+    )
+
+
+def _pending_closeout_visual_completion(item: dict[str, Any]) -> dict[str, str] | None:
+    raw = item.get("closeout_visual_completion")
+    if not isinstance(raw, dict):
+        return None
+    status = str(raw.get("status") or "").strip().lower()
+    head_sha = str(raw.get("head_sha") or "").strip().lower()
+    if status not in _CLOSEOUT_VISUAL_STATUSES or not _CLOSEOUT_SHA_RE.fullmatch(head_sha):
+        return None
+    return {"status": status, "head_sha": head_sha}
+
+
+def _merge_pending_closeout_visual_completion(
+    item: dict[str, Any],
+    state: dict[str, Any],
+) -> bool:
+    """Merge one leased visual result only if reconciliation still expects H."""
+
+    pending = _pending_closeout_visual_completion(item)
+    item.pop("closeout_visual_completion", None)
+    if pending is None or not _closeout_expects_head(state, pending["head_sha"]):
+        return False
+    if state.get("visual_qa") == pending:
+        return False
+    state["visual_qa"] = pending
+    return True
 
 
 def _bounded_run_state_text(value: Any, *, limit: int = _RUN_STATE_TEXT_LIMIT) -> str:
@@ -1125,9 +1173,79 @@ class GatewayWorkLedger:
             state["telemetry"] = telemetry
             state["revision"] = revision + 1
             item["closeout"] = state
+            item.pop("closeout_visual_completion", None)
             item["closeout_authoritative"] = state["mode"] == "enforce"
             item["closeout_activated_at"] = self._now()
             item["updated_at"] = item["closeout_activated_at"]
+            self._write(data)
+            return dict(state)
+
+    def apply_closeout_visual_completion(
+        self,
+        work_id: str,
+        *,
+        expected_head_sha: str,
+        receipts: Any,
+        min_receipt_order: int = 0,
+    ) -> dict[str, Any] | None:
+        """Apply one sanitized visual result while the latest closeout expects H.
+
+        An active watcher lease keeps its revision. The sanitized result waits
+        beside the leased state and is merged atomically when that revision is
+        released; an H2 reconciliation discards a late H receipt instead.
+        """
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        expected_head = str(expected_head_sha or "").strip().lower()
+        if not _CLOSEOUT_SHA_RE.fullmatch(expected_head):
+            return None
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            state = normalize_closeout_state(item["closeout"])
+            if not _closeout_expects_head(state, expected_head):
+                return None
+            visual_config, visual_requirement = _visual_qa_state_for_item(item)
+            if visual_requirement["level"] == "none":
+                return None
+            safe_receipts = _visual_qa_receipts(
+                receipts,
+                visual_requirement,
+                limit=visual_config["max_receipts_per_turn"],
+            )
+            completion = visual_receipt_completion(
+                visual_requirement,
+                safe_receipts,
+                min_order=_positive_int(min_receipt_order),
+            )
+            status = str(completion.get("status") or "missing").strip().lower()
+            if status not in _CLOSEOUT_VISUAL_STATUSES:
+                status = "missing"
+            visual = {"status": status, "head_sha": expected_head}
+            now = self._now()
+            lease = state.get("lease") if isinstance(state.get("lease"), dict) else {}
+            if str(lease.get("owner") or "") and float(lease.get("until") or 0) > now:
+                item["closeout_visual_completion"] = visual
+                item["updated_at"] = now
+                self._write(data)
+                return dict(state)
+            if state.get("visual_qa") == visual:
+                if item.pop("closeout_visual_completion", None) is not None:
+                    item["updated_at"] = now
+                    self._write(data)
+                return dict(state)
+            state["visual_qa"] = visual
+            state["next_due_at"] = now
+            state["revision"] = min(
+                2_147_483_647,
+                int(state.get("revision") or 0) + 1,
+            )
+            item["closeout"] = state
+            item.pop("closeout_visual_completion", None)
+            item["updated_at"] = now
             self._write(data)
             return dict(state)
 
@@ -1206,6 +1324,7 @@ class GatewayWorkLedger:
             next_due = float(state.get("next_due_at") or 0)
             if next_due > now:
                 return None
+            _merge_pending_closeout_visual_completion(item, state)
             state["lease_generation"] = min(
                 2_147_483_647,
                 int(state.get("lease_generation") or 0) + 1,
@@ -1390,6 +1509,7 @@ class GatewayWorkLedger:
             ):
                 return None
             state = normalize_closeout_state(closeout_state if closeout_state is not None else current)
+            _merge_pending_closeout_visual_completion(item, state)
             state["lease_generation"] = int(expected_generation)
             state["lease"] = {"owner": "", "until": None}
             state["revision"] = int(expected_revision) + 1
@@ -1439,6 +1559,7 @@ class GatewayWorkLedger:
             ):
                 return None
             state = normalize_closeout_state(closeout_state)
+            _merge_pending_closeout_visual_completion(item, state)
             state["lease_generation"] = int(expected_generation)
             state["lease"] = {"owner": "", "until": None}
             state["revision"] = int(expected_revision) + 1
@@ -1526,6 +1647,7 @@ class GatewayWorkLedger:
             ):
                 return None
             state = normalize_closeout_state(closeout_state)
+            _merge_pending_closeout_visual_completion(item, state)
             state["lease_generation"] = int(expected_generation)
             state["lease"] = {"owner": "", "until": None}
             state["revision"] = int(expected_revision) + 1
@@ -1959,6 +2081,7 @@ class GatewayWorkLedger:
             "summary_status",
             "summary_updated_at",
             "terminal_delivery",
+            "closeout_visual_completion",
             "visual_qa_code_mutation_observed",
             "visual_qa_min_receipt_order",
         ):

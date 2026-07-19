@@ -88,6 +88,67 @@ def test_closeout_raw_config_normalizes_non_mapping_sections():
         {"repositories": {"owner/repo": "gateway-self"}},
         "owner/repo",
     ) == {}
+
+
+def test_closeout_repository_overrides_are_generic_and_nested():
+    effective = gateway_run._effective_closeout_repository_config(
+        {
+            "mode": "shadow",
+            "surfaces": {"direct": False, "fable": True},
+            "early_draft_pr": False,
+            "post_merge_requirements": {"ci": False, "restart": False},
+            "repositories": {
+                "acme/pid": {
+                    "mode": "enforce",
+                    "surfaces": {"direct": True},
+                    "early_draft_pr": True,
+                    "visual_qa": {"mode": "enforce_explicit"},
+                    "post_merge_requirements": {"ci": True},
+                }
+            },
+        },
+        "acme/pid",
+    )
+
+    assert effective["mode"] == "enforce"
+    assert effective["surfaces"] == {"direct": True, "fable": True}
+    assert effective["early_draft_pr"] is True
+    assert effective["visual_qa"] == {"mode": "enforce_explicit"}
+    assert effective["post_merge_requirements"] == {
+        "ci": True,
+        "restart": False,
+    }
+
+
+def test_discord_acceptance_applies_repository_visual_override(tmp_path, monkeypatch):
+    config = {
+        "agent": {"visual_qa": {"mode": "shadow", "max_followup_turns": 1}},
+        "closeout": {
+            "repositories": {
+                "acme/pid": {"visual_qa": {"mode": "enforce_explicit"}}
+            }
+        },
+    }
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "ledger.json")
+    source = _source(tmp_path)
+    source.project_github_url = "https://github.com/acme/pid"
+    event = MessageEvent(
+        text="Build a responsive dashboard with a mobile sidebar.",
+        source=source,
+        message_id="repo-visual-override",
+    )
+
+    item = runner._accept_discord_work_item(
+        event,
+        "agent:main:discord:thread:thread-123",
+    )
+
+    assert item is not None
+    assert item["visual_qa_config"]["mode"] == "enforce_explicit"
+    assert event.visual_qa_config["mode"] == "enforce_explicit"
+    assert event.visual_qa_requirement["level"] == "surface"
     assert gateway_run._closeout_repository_config(
         {"repositories": ["owner/repo"]},
         "owner/repo",
@@ -436,6 +497,7 @@ def _direct_closeout_runner(
     *,
     mode="shadow",
     require_visual_qa=False,
+    activated=False,
 ):
     captured = {}
     item = {
@@ -455,6 +517,17 @@ def _direct_closeout_runner(
         },
         "visual_qa_requirement": {"id": "trusted-requirement"},
     }
+    if activated:
+        item["closeout_activated_at"] = 100.0
+        item["closeout"]["pr"] = {
+            "head_sha": _run(mutable, "rev-parse", "HEAD").stdout.strip(),
+            "url": "https://github.com/acme/example/pull/1",
+        }
+        item["closeout"]["local_verification"] = {
+            "status": "passed",
+            "head_sha": item["closeout"]["pr"]["head_sha"],
+        }
+        item["closeout"]["status"] = "waiting_for_ci"
 
     class Ledger:
         def get(self, work_id):
@@ -467,6 +540,29 @@ def _direct_closeout_runner(
                 expected_revision=expected_revision,
             )
             return {**state, "revision": expected_revision + 1}
+
+        def apply_closeout_visual_completion(
+            self,
+            work_id,
+            *,
+            expected_head_sha,
+            receipts,
+            min_receipt_order,
+        ):
+            captured.update(
+                work_id=work_id,
+                applied_head_sha=expected_head_sha,
+                receipts=receipts,
+                min_receipt_order=min_receipt_order,
+            )
+            state = dict(item["closeout"])
+            state["visual_qa"] = {
+                "status": "passed",
+                "head_sha": expected_head_sha,
+            }
+            state["revision"] = int(state.get("revision") or 0) + 1
+            item["closeout"] = state
+            return state
 
     notifications = []
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -731,6 +827,69 @@ def test_direct_closeout_binds_required_visual_receipt_to_exact_head(
         "status": "passed",
         "head_sha": head_sha,
     }
+
+
+def test_direct_closeout_activates_visual_pending_before_followup(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(
+        mutable,
+        mode="enforce",
+        require_visual_qa=True,
+    )
+    head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+
+    activated = runner._activate_direct_closeout_after_checkpoint(
+        "work-1",
+        _successful_verification_result(mutable),
+        visual_pending=True,
+    )
+
+    assert activated is not None
+    assert captured["state"]["visual_qa"] == {
+        "status": "pending",
+        "head_sha": head_sha,
+    }
+    assert notifications == ["work-1"]
+
+
+def test_final_direct_closeout_applies_visual_to_latest_activated_revision(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(
+        mutable,
+        mode="enforce",
+        require_visual_qa=True,
+        activated=True,
+    )
+    result = _successful_verification_result(mutable)
+    result["visual_qa"] = {
+        "receipts": [{"status": "passed"}],
+        "min_receipt_order": 5,
+    }
+    head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+
+    applied = runner._activate_direct_closeout_after_checkpoint("work-1", result)
+
+    assert applied is not None
+    assert captured["applied_head_sha"] == head_sha
+    assert captured["min_receipt_order"] == 5
+    assert applied["status"] == "waiting_for_ci"
+    assert applied["pr"]["url"].endswith("/1")
+    assert applied["visual_qa"] == {"status": "passed", "head_sha": head_sha}
+    assert notifications == ["work-1"]
 
 
 def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunner:
