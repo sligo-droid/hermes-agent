@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent.visual_qa import normalize_visual_requirement, visual_requirement_id
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import Platform, SessionSource, build_session_key
@@ -23,7 +24,7 @@ from gateway.work_ledger import GatewayWorkLedger
 from hermes_cli.closeout_execution import run_closeout_command
 
 
-def _event(message_id="m1"):
+def _event(message_id="m1", text="ship the change"):
     source = SessionSource(
         platform=Platform.DISCORD,
         chat_id="thread-1",
@@ -35,11 +36,26 @@ def _event(message_id="m1"):
         message_id=message_id,
     )
     return MessageEvent(
-        text="ship the change",
+        text=text,
         message_type=MessageType.TEXT,
         source=source,
         message_id=message_id,
     )
+
+
+def _visual_receipt(requirement, *, order=3, status="passed"):
+    normalized = normalize_visual_requirement(requirement)
+    return {
+        "requirement_id": visual_requirement_id(normalized),
+        "contract_id": "vac_" + ("a" * 24),
+        "assertion_ids": [item["id"] for item in normalized["assertions"]],
+        "status": status,
+        "attempts": 1,
+        "vision_calls": 0,
+        "duration_ms": 25,
+        "diagnostic_codes": ["no_horizontal_overflow_satisfied"],
+        "order": order,
+    }
 
 
 def _install_blocking_git(monkeypatch, tmp_path: Path) -> Path:
@@ -158,6 +174,45 @@ def _blocked_item(
     return blocked
 
 
+def _pending_visual_item(ledger: GatewayWorkLedger):
+    event = _event(
+        message_id="visual-pending",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    head_sha = "a" * 40
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        repository="acme/example",
+        branch="feature/visual",
+        mode="enforce",
+        policy={
+            "merge": "auto",
+            "require_local_verification": True,
+            "require_visual_qa": True,
+        },
+    )
+    assert attached is not None
+    attached["local_verification"] = {"status": "passed", "head_sha": head_sha}
+    attached["visual_qa"] = {"status": "pending", "head_sha": head_sha}
+    attached["pr"]["head_sha"] = head_sha
+    attached["ci"]["head_sha"] = head_sha
+    state = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    assert state is not None
+    return item, state, head_sha
+
+
 def test_dirty_marker_is_bounded_identifier_only(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -200,6 +255,67 @@ async def test_watcher_leases_reconciles_and_releases_revision(monkeypatch, tmp_
     assert stored["closeout"]["next_due_at"] == 130.0
     assert stored["closeout"]["lease"] == {"owner": "", "until": None}
     assert stored["closeout"]["revision"] == state["revision"] + 2
+
+
+@pytest.mark.asyncio
+async def test_visual_receipt_during_watcher_lease_merges_without_losing_revision(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, state, head_sha = _pending_visual_item(ledger)
+    reconcile_started = threading.Event()
+    allow_reconcile = threading.Event()
+
+    def reconcile(value, **_kwargs):
+        reconcile_started.set()
+        assert allow_reconcile.wait(timeout=2)
+        updated = dict(value)
+        updated["status"] = "waiting_for_ci"
+        updated["next_due_at"] = 130.0
+        updated["pr"] = {
+            **updated["pr"],
+            "url": "https://github.com/acme/example/pull/11",
+        }
+        return SimpleNamespace(state=updated)
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        config={"poll_seconds": 30, "lease_seconds": 20},
+        reconcile=reconcile,
+        owner="watcher-visual",
+    )
+    task = asyncio.create_task(watcher.run_once())
+    assert await asyncio.to_thread(reconcile_started.wait, 1)
+
+    queued = await asyncio.to_thread(
+        ledger.apply_closeout_visual_completion,
+        item["id"],
+        expected_head_sha=head_sha,
+        receipts=[_visual_receipt(item["visual_qa_requirement"], order=4)],
+        min_receipt_order=4,
+    )
+    assert queued is not None
+    during = ledger.get(item["id"])
+    assert during["closeout"]["revision"] == state["revision"] + 1
+    assert during["closeout_visual_completion"] == {
+        "status": "passed",
+        "head_sha": head_sha,
+    }
+
+    allow_reconcile.set()
+    assert await task == 1
+
+    stored = ledger.get(item["id"])
+    assert stored["closeout"]["revision"] == state["revision"] + 2
+    assert stored["closeout"]["status"] == "waiting_for_ci"
+    assert stored["closeout"]["pr"]["url"].endswith("/11")
+    assert stored["closeout"]["visual_qa"] == {
+        "status": "passed",
+        "head_sha": head_sha,
+    }
+    assert "closeout_visual_completion" not in stored
 
 
 @pytest.mark.asyncio

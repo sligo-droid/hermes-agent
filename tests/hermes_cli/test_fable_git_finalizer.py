@@ -123,6 +123,11 @@ def test_finalize_commits_pushes_draft_pr_and_returns_durable_closeout_without_w
         task="update the lifecycle behavior",
         worker_summary="Changed tracked.txt and ran focused checks.",
         closeout_mode="enforce",
+        visual_qa_requirement={
+            "level": "surface",
+            "target": "responsive dashboard",
+            "assertions": ["dashboard has no horizontal overflow"],
+        },
     )
 
     assert result.success is True
@@ -145,6 +150,11 @@ def test_finalize_commits_pushes_draft_pr_and_returns_durable_closeout_without_w
     assert state["pr"]["head_sha"] == result.commit
     assert state["pr"]["is_draft"] is True
     assert state["local_verification"] == {"status": "pending"}
+    assert state["policy"]["require_visual_qa"] is True
+    assert state["visual_qa"] == {
+        "status": "pending",
+        "head_sha": result.commit,
+    }
     spans = state["telemetry"]["phase_spans"]
     root_span = next(span for span in spans if span["name"] == "fable_finalization")
     assert root_span["attempt_id"].startswith("att_")
@@ -353,6 +363,8 @@ def test_pr_only_lifecycle_returns_terminal_unmerged_closeout(monkeypatch, tmp_p
     assert result.checks_status == "not_waited"
     assert result.closeout_state["status"] == "pr_open"
     assert result.closeout_state["policy"]["merge"] == "never"
+    assert result.closeout_state["policy"]["require_visual_qa"] is False
+    assert result.closeout_state["visual_qa"] == {"status": "not_required"}
 
 
 def test_existing_pr_conflict_is_delegated_then_handed_to_closeout(monkeypatch, tmp_path):

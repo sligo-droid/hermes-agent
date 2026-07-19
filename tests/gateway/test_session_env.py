@@ -6,7 +6,9 @@ import pytest
 from gateway.config import Platform
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
+    bind_project_inspection_candidates,
     get_session_env,
+    reset_project_inspection_candidates,
     set_session_vars,
     clear_session_vars,
     _VAR_MAP,
@@ -86,31 +88,76 @@ def test_set_session_env_sets_project_contextvars(monkeypatch):
         chat_id="thread-1",
         chat_name="Sligo Labs / #pid / feature",
         chat_type="thread",
+        project_key="pid",
         project_name="PID",
         project_path="/home/droid/.hermes/workspace/PID",
         project_github_url="https://github.com/sligo-labs/pid",
         project_channel_id="chan-1",
+        project_inspection_candidates=[
+            {
+                "url": "http://localhost:3000",
+                "environment": "development",
+                "location": "local",
+            }
+        ],
     )
     context = SessionContext(source=source, connected_platforms=[], home_channels={})
 
     for name in (
+        "HERMES_PROJECT_KEY",
         "HERMES_PROJECT_PATH",
         "HERMES_PROJECT_NAME",
         "HERMES_PROJECT_GITHUB_URL",
         "HERMES_PROJECT_CHANNEL_ID",
+        "HERMES_PROJECT_INSPECTION_CANDIDATES",
     ):
         monkeypatch.delenv(name, raising=False)
 
     tokens = runner._set_session_env(context)
 
+    assert get_session_env("HERMES_PROJECT_KEY") == "pid"
     assert get_session_env("HERMES_PROJECT_PATH") == "/home/droid/.hermes/workspace/PID"
     assert get_session_env("HERMES_PROJECT_NAME") == "PID"
     assert get_session_env("HERMES_PROJECT_GITHUB_URL") == "https://github.com/sligo-labs/pid"
     assert get_session_env("HERMES_PROJECT_CHANNEL_ID") == "chan-1"
+    assert get_session_env("HERMES_PROJECT_INSPECTION_CANDIDATES") == (
+        '[{"url":"http://localhost:3000/","environment":"development","location":"local"}]'
+    )
 
     runner._clear_session_env(tokens)
+    assert get_session_env("HERMES_PROJECT_KEY") == ""
     assert get_session_env("HERMES_PROJECT_PATH") == ""
     assert get_session_env("HERMES_PROJECT_NAME") == ""
+    assert get_session_env("HERMES_PROJECT_INSPECTION_CANDIDATES") == ""
+
+
+def test_project_inspection_candidate_binding_is_task_local_and_resettable():
+    outer = bind_project_inspection_candidates(
+        [{"url": "https://outer.example", "environment": "production"}]
+    )
+    inner = bind_project_inspection_candidates(
+        [{"url": "http://localhost:3000", "environment": "development"}]
+    )
+
+    assert "localhost:3000" in get_session_env("HERMES_PROJECT_INSPECTION_CANDIDATES")
+    reset_project_inspection_candidates(inner)
+    assert "outer.example" in get_session_env("HERMES_PROJECT_INSPECTION_CANDIDATES")
+    reset_project_inspection_candidates(outer)
+
+
+def test_set_and_clear_session_vars_cover_project_inspection_candidates():
+    tokens = set_session_vars(
+        project_key="example",
+        project_inspection_candidates=[
+            {"url": "http://localhost:3000", "environment": "development"}
+        ]
+    )
+
+    assert get_session_env("HERMES_PROJECT_KEY") == "example"
+    assert "localhost:3000" in get_session_env("HERMES_PROJECT_INSPECTION_CANDIDATES")
+    clear_session_vars(tokens)
+    assert get_session_env("HERMES_PROJECT_KEY") == ""
+    assert get_session_env("HERMES_PROJECT_INSPECTION_CANDIDATES") == ""
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):

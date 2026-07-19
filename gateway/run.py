@@ -2848,6 +2848,73 @@ def _closeout_repository_config(closeout_config: Any, repository: str) -> dict[s
     return _closeout_mapping(repositories.get(repository))
 
 
+def _effective_closeout_repository_config(
+    closeout_config: Any,
+    repository: str,
+) -> dict[str, Any]:
+    """Overlay one repository's generic closeout policy onto global defaults."""
+
+    closeout = _closeout_mapping(closeout_config)
+    repository_config = _closeout_repository_config(closeout, repository)
+    effective = {
+        key: value
+        for key, value in closeout.items()
+        if key != "repositories"
+    }
+    for key, value in repository_config.items():
+        if key in {"surfaces", "post_merge_requirements", "visual_qa"}:
+            effective[key] = {
+                **_closeout_mapping(effective.get(key)),
+                **_closeout_mapping(value),
+            }
+        else:
+            effective[key] = value
+    return effective
+
+
+def _gateway_repository_for_source(source: Any) -> str:
+    """Resolve one configured Discord project's normalized GitHub identity."""
+
+    try:
+        from hermes_cli.github_remote import (
+            github_origin_repo,
+            github_repo_from_value,
+        )
+
+        configured = github_repo_from_value(
+            getattr(source, "project_github_url", "")
+        )
+        if configured:
+            return str(configured)
+        project_path = str(getattr(source, "project_path", "") or "").strip()
+        if project_path:
+            repository = github_origin_repo(project_path)
+            if repository:
+                return str(repository)
+        return ""
+    except Exception:
+        return ""
+
+
+def _repository_visual_qa_config(
+    config: Any,
+    repository: str,
+) -> dict[str, Any]:
+    """Return global visual limits with an optional repository mode override."""
+
+    root = _closeout_mapping(config)
+    agent_config = _closeout_mapping(root.get("agent"))
+    visual_config = _closeout_mapping(agent_config.get("visual_qa"))
+    closeout_config = _effective_closeout_repository_config(
+        root.get("closeout"),
+        repository,
+    )
+    return {
+        **visual_config,
+        **_closeout_mapping(closeout_config.get("visual_qa")),
+    }
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -4912,8 +4979,10 @@ class GatewayRunner:
         self,
         work_item_id: str,
         agent_result: Dict[str, Any],
+        *,
+        visual_pending: bool = False,
     ) -> dict[str, Any] | None:
-        """Activate configured direct closeout only after a settled verified head."""
+        """Activate or advance direct closeout at one clean verified exact head."""
 
         if not work_item_id or not isinstance(agent_result, dict) or agent_result.get("failed"):
             return None
@@ -4921,15 +4990,53 @@ class GatewayRunner:
         item = ledger.get(work_item_id)
         if (
             not isinstance(item, dict)
-            or item.get("closeout_authoritative") is True
             or not isinstance(item.get("closeout"), dict)
         ):
             return None
         from hermes_cli.trusted_closeout import normalize_closeout_state
 
         state = normalize_closeout_state(item["closeout"])
-        if state["mode"] == "off" or state["source"] != "direct":
+        if state["mode"] == "off":
             return None
+
+        def notify_closeout() -> None:
+            try:
+                from gateway.trusted_closeout_watcher import mark_closeout_dirty
+
+                mark_closeout_dirty(work_item_id)
+            except Exception:
+                pass
+            watcher = getattr(self, "trusted_closeout_watcher", None)
+            if watcher is not None:
+                watcher.notify(work_item_id)
+
+        already_activated = bool(
+            item.get("closeout_authoritative") is True
+            or item.get("closeout_activated_at") is not None
+        )
+        if state["source"] != "direct":
+            if (
+                state["source"] != "fable"
+                or not already_activated
+                or visual_pending
+                or not state["policy"]["require_visual_qa"]
+            ):
+                return None
+            visual_result = (
+                agent_result.get("visual_qa")
+                if isinstance(agent_result.get("visual_qa"), dict)
+                else {}
+            )
+            applied = ledger.apply_closeout_visual_completion(
+                work_item_id,
+                expected_head_sha=str(state["pr"].get("head_sha") or ""),
+                receipts=visual_result.get("receipts"),
+                min_receipt_order=int(visual_result.get("min_receipt_order") or 0),
+            )
+            if applied is not None:
+                notify_closeout()
+            return applied
+
         runtime_breakdown = (
             agent_result.get("runtime_breakdown")
             if isinstance(agent_result.get("runtime_breakdown"), dict)
@@ -5040,29 +5147,48 @@ class GatewayRunner:
         ):
             return None
 
+        if already_activated:
+            if not state["policy"]["require_visual_qa"] or visual_pending:
+                return state
+            visual_result = (
+                agent_result.get("visual_qa")
+                if isinstance(agent_result.get("visual_qa"), dict)
+                else {}
+            )
+            applied = ledger.apply_closeout_visual_completion(
+                work_item_id,
+                expected_head_sha=verified_head_sha,
+                receipts=visual_result.get("receipts"),
+                min_receipt_order=int(visual_result.get("min_receipt_order") or 0),
+            )
+            if applied is not None:
+                notify_closeout()
+            return applied
+
         state["status"] = "pending"
         state["local_verification"] = {"status": "passed", "head_sha": verified_head_sha}
         state["pr"]["head_sha"] = verified_head_sha
         state["ci"]["head_sha"] = verified_head_sha
         if state["policy"]["require_visual_qa"]:
-            try:
-                from agent.visual_qa import visual_receipt_completion
+            completion = {"status": "pending"}
+            if not visual_pending:
+                try:
+                    from agent.visual_qa import visual_receipt_completion
 
-                completion = visual_receipt_completion(
-                    item.get("visual_qa_requirement"),
-                    agent_result.get("visual_qa", {}).get("receipts")
-                    if isinstance(agent_result.get("visual_qa"), dict)
-                    else [],
-                    min_order=int(
-                        agent_result.get("visual_qa", {}).get("min_receipt_order") or 0
+                    visual_result = (
+                        agent_result.get("visual_qa")
+                        if isinstance(agent_result.get("visual_qa"), dict)
+                        else {}
                     )
-                    if isinstance(agent_result.get("visual_qa"), dict)
-                    else 0,
-                )
-            except Exception:
-                completion = {"status": "missing"}
+                    completion = visual_receipt_completion(
+                        item.get("visual_qa_requirement"),
+                        visual_result.get("receipts"),
+                        min_order=int(visual_result.get("min_receipt_order") or 0),
+                    )
+                except Exception:
+                    completion = {"status": "missing"}
             state["visual_qa"] = {
-                "status": "passed" if completion.get("status") == "passed" else "blocked",
+                "status": str(completion.get("status") or "missing"),
                 "head_sha": verified_head_sha,
             }
         activated = ledger.activate_closeout(
@@ -5071,16 +5197,31 @@ class GatewayRunner:
             expected_revision=int(state.get("revision") or 0),
         )
         if activated is None:
-            return None
-        try:
-            from gateway.trusted_closeout_watcher import mark_closeout_dirty
-
-            mark_closeout_dirty(work_item_id)
-        except Exception:
-            pass
-        watcher = getattr(self, "trusted_closeout_watcher", None)
-        if watcher is not None:
-            watcher.notify(work_item_id)
+            latest = ledger.get(work_item_id)
+            if not isinstance(latest, dict) or not isinstance(latest.get("closeout"), dict):
+                return None
+            latest_state = normalize_closeout_state(latest["closeout"])
+            if (
+                latest.get("closeout_authoritative") is not True
+                and latest.get("closeout_activated_at") is None
+            ):
+                return None
+            if visual_pending or not latest_state["policy"]["require_visual_qa"]:
+                return latest_state
+            visual_result = (
+                agent_result.get("visual_qa")
+                if isinstance(agent_result.get("visual_qa"), dict)
+                else {}
+            )
+            activated = ledger.apply_closeout_visual_completion(
+                work_item_id,
+                expected_head_sha=verified_head_sha,
+                receipts=visual_result.get("receipts"),
+                min_receipt_order=int(visual_result.get("min_receipt_order") or 0),
+            )
+            if activated is None:
+                return None
+        notify_closeout()
         return activated
 
     def _accept_discord_work_item(
@@ -5095,9 +5236,11 @@ class GatewayRunner:
         if getattr(event.source, "platform", None) != Platform.DISCORD:
             return None
         ledger = self._ledger()
+        gateway_config = _load_gateway_config()
+        repository = _gateway_repository_for_source(getattr(event, "source", None))
         _, visual_qa_config = _normalize_gateway_visual_qa_contract(
             None,
-            _load_gateway_config(),
+            _repository_visual_qa_config(gateway_config, repository),
         )
         item = ledger.accept_event(
             event,
@@ -13232,7 +13375,18 @@ class GatewayRunner:
                 "was not used as the agent working directory."
             )
         if action_worktree_cwd:
-            closeout_cfg = _pcfg.get("closeout") if isinstance(_pcfg.get("closeout"), dict) else {}
+            repository = _gateway_repository_for_source(source)
+            if not repository:
+                try:
+                    from hermes_cli.github_remote import github_origin_repo
+
+                    repository = str(github_origin_repo(action_worktree_cwd) or "")
+                except Exception:
+                    repository = ""
+            closeout_cfg = _effective_closeout_repository_config(
+                _pcfg.get("closeout"),
+                repository,
+            )
             closeout_surfaces = (
                 closeout_cfg.get("surfaces")
                 if isinstance(closeout_cfg.get("surfaces"), dict)
@@ -13262,6 +13416,8 @@ class GatewayRunner:
                 "require_visual_qa": bool(
                     isinstance(visual_requirement, dict)
                     and visual_requirement.get("level") in {"surface", "artifact"}
+                    and isinstance(getattr(event, "visual_qa_config", None), dict)
+                    and event.visual_qa_config.get("mode") == "enforce_explicit"
                 ),
                 "post_merge_requirements": _closeout_mapping(
                     closeout_cfg.get("post_merge_requirements")
@@ -20837,10 +20993,12 @@ class GatewayRunner:
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             session_cwd=session_cwd,
+            project_key=str(context.source.project_key) if context.source.project_key else "",
             project_path=str(context.source.project_path) if context.source.project_path else "",
             project_name=str(context.source.project_name) if context.source.project_name else "",
             project_github_url=str(context.source.project_github_url) if context.source.project_github_url else "",
             project_channel_id=str(context.source.project_channel_id) if context.source.project_channel_id else "",
+            project_inspection_candidates=context.source.project_inspection_candidates,
             guild_id=str(context.source.guild_id) if context.source.guild_id else "",
             parent_chat_id=str(context.source.parent_chat_id) if context.source.parent_chat_id else "",
             kanban_default_intake=(
@@ -23622,6 +23780,26 @@ class GatewayRunner:
             agent.visual_qa_requirement = visual_qa_requirement
             agent.visual_qa_config = visual_qa_config
             agent._visual_qa_last_edit_order = 0
+            agent._visual_qa_stop_callback = None
+            if (
+                origin_work_item_id
+                and discord_action_runtime
+                and not fable_implementation
+                and visual_qa_config.get("mode") == "enforce_explicit"
+                and visual_qa_requirement.get("level") in {"surface", "artifact"}
+            ):
+                def _visual_qa_stop_callback(
+                    runtime_breakdown: dict[str, Any],
+                ) -> dict[str, Any] | None:
+                    if not _run_still_current():
+                        return None
+                    return self._activate_direct_closeout_after_checkpoint(
+                        str(origin_work_item_id),
+                        {"runtime_breakdown": runtime_breakdown},
+                        visual_pending=True,
+                    )
+
+                agent._visual_qa_stop_callback = _visual_qa_stop_callback
             # Fable proxy credentials are not OAuth tokens, but the trusted
             # proxy route can terminate against Claude Code OAuth upstream.
             # Reset this on every turn so a cached agent cannot leak the wire

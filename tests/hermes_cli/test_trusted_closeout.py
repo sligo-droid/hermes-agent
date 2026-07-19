@@ -1094,6 +1094,34 @@ def test_draft_becomes_ready_only_after_current_head_gates(monkeypatch, tmp_path
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
 
 
+@pytest.mark.parametrize("visual_status", ["pending", "stale", "failed"])
+def test_incomplete_visual_gate_never_readies_or_merges(
+    monkeypatch,
+    tmp_path,
+    visual_status,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["visual_qa"] = {"status": visual_status, "head_sha": HEAD_SHA}
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "waiting_for_gates"
+    assert transition.terminal is False
+    assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
 def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
     _patch_identity_passthrough(monkeypatch)
@@ -1346,7 +1374,7 @@ def test_uncertain_pr_create_adopts_fenced_sha_after_local_branch_advances(
     assert not any(args[:2] == ["git", "push"] for args in calls)
 
 
-def test_uncertain_push_reobserves_configured_branch_not_checkout_head(
+def test_uncertain_push_reobserves_fenced_exact_head_not_moving_branch(
     monkeypatch,
     tmp_path,
 ):
@@ -1367,9 +1395,6 @@ def test_uncertain_push_reobserves_configured_branch_not_checkout_head(
             return _completed(args)
         if args[:3] == ["gh", "pr", "list"]:
             return _completed(args, stdout="[]")
-        if args[:2] == ["git", "rev-parse"]:
-            assert args == ["git", "rev-parse", "refs/heads/feature/test"]
-            return _completed(args, stdout=HEAD_SHA + "\n")
         if args[:2] == ["git", "ls-remote"]:
             return _completed(
                 args,
@@ -1385,9 +1410,82 @@ def test_uncertain_push_reobserves_configured_branch_not_checkout_head(
     transition = closeout.reconcile_trusted_closeout(state, now=101, run=run)
 
     assert transition.outcome == "pr_pending"
-    assert ["git", "rev-parse", "refs/heads/feature/test"] in calls
-    assert ["git", "rev-parse", "HEAD"] not in calls
+    assert not any(args[:2] == ["git", "rev-parse"] for args in calls)
     assert not any(args[:2] == ["git", "push"] for args in calls)
+
+
+def test_new_closeout_pushes_immutable_head_refspec_without_force(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"] = {"title": "Test PR", "head_sha": HEAD_SHA}
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(args, stdout="[]")
+        if args[:2] == ["git", "push"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "create"]:
+            return _completed(
+                args,
+                stdout="https://github.com/acme/example/pull/12\n",
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_pending"
+    push_calls = [args for args in calls if args[:2] == ["git", "push"]]
+    assert push_calls == [
+        [
+            "git",
+            "push",
+            "-u",
+            "origin",
+            f"{HEAD_SHA}:refs/heads/feature/test",
+        ]
+    ]
+    assert not any("--force" in arg or arg.startswith("+") for arg in push_calls[0])
+    assert not any(args[:2] == ["git", "rev-parse"] for args in calls)
+
+
+def test_required_visual_pending_forces_initial_draft_publication(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["policy"]["early_draft_pr"] = False
+    state["visual_qa"] = {"status": "pending", "head_sha": HEAD_SHA}
+    state["pr"] = {"title": "Visual PR", "head_sha": HEAD_SHA}
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(args, stdout="[]")
+        if args[:2] == ["git", "push"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "create"]:
+            return _completed(
+                args,
+                stdout="https://github.com/acme/example/pull/13\n",
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_pending"
+    create = next(args for args in calls if args[:3] == ["gh", "pr", "create"])
+    assert "--draft" in create
 
 
 def test_uncertain_merge_is_reobserved_before_any_duplicate_mutation(

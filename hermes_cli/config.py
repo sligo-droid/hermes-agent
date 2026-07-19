@@ -677,6 +677,9 @@ DEFAULT_CONFIG = {
     # profile owns a separate HERMES_HOME/session/credential tree.
     "model_tiers": copy.deepcopy(DEFAULT_MODEL_TIERS),
     "providers": {},
+    # Optional project metadata used to resolve safe, ordered inspection URLs.
+    # Core ships no project-specific entries; operators add their own.
+    "projects": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],

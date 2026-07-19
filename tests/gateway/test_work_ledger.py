@@ -71,6 +71,38 @@ def _visual_receipt(requirement, *, order=3, status="passed", evidence_ref=""):
     return receipt
 
 
+def _activated_visual_closeout(
+    ledger: GatewayWorkLedger,
+    item: dict,
+    *,
+    head_sha: str,
+) -> dict:
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        repository="acme/example",
+        branch="feature/visual",
+        mode="enforce",
+        policy={
+            "merge": "auto",
+            "require_local_verification": True,
+            "require_visual_qa": True,
+        },
+    )
+    assert attached is not None
+    attached["local_verification"] = {"status": "passed", "head_sha": head_sha}
+    attached["visual_qa"] = {"status": "pending", "head_sha": head_sha}
+    attached["pr"]["head_sha"] = head_sha
+    attached["ci"]["head_sha"] = head_sha
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    assert activated is not None
+    return activated
+
+
 def test_ledger_deduplicates_discord_message_ids(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="m1")
@@ -2325,6 +2357,155 @@ def test_discord_worker_reference_context_resolves_bare_message_ids(monkeypatch)
     assert refs[0]["id"] == "1507176047022575776"
     assert refs[0]["channel_id"] == "parent-1"
     assert refs[0]["content"] == "reported bug details"
+
+
+def test_visual_completion_updates_latest_closeout_revision_without_clobbering_watcher_state(
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(
+        message_id="closeout-visual-latest",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    head_sha = "a" * 40
+    activated = _activated_visual_closeout(ledger, item, head_sha=head_sha)
+    watcher_state = dict(activated)
+    watcher_state["status"] = "waiting_for_ci"
+    watcher_state["next_due_at"] = 130.0
+    watcher_state["pr"] = {
+        **watcher_state["pr"],
+        "url": "https://github.com/acme/example/pull/9",
+    }
+    updated = ledger.update_closeout(
+        item["id"],
+        watcher_state,
+        expected_revision=activated["revision"],
+    )
+    assert updated is not None
+
+    applied = ledger.apply_closeout_visual_completion(
+        item["id"],
+        expected_head_sha=head_sha,
+        receipts=[_visual_receipt(item["visual_qa_requirement"], order=4)],
+        min_receipt_order=4,
+    )
+
+    assert applied is not None
+    assert applied["revision"] == updated["revision"] + 1
+    assert applied["status"] == "waiting_for_ci"
+    assert applied["pr"]["url"].endswith("/9")
+    assert applied["visual_qa"] == {"status": "passed", "head_sha": head_sha}
+    assert applied["next_due_at"] == 100.0
+
+
+def test_visual_completion_is_sanitized_and_late_h_receipt_is_rejected_after_h2(
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(
+        message_id="closeout-visual-stale",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    head_sha = "b" * 40
+    activated = _activated_visual_closeout(ledger, item, head_sha=head_sha)
+    unsafe_receipt = {
+        **_visual_receipt(item["visual_qa_requirement"], order=4),
+        "evidence_ref": "https://example.test/?token=do-not-store",
+    }
+
+    sanitized = ledger.apply_closeout_visual_completion(
+        item["id"],
+        expected_head_sha=head_sha,
+        receipts=[unsafe_receipt],
+        min_receipt_order=4,
+    )
+
+    assert sanitized is not None
+    assert sanitized["visual_qa"] == {"status": "missing", "head_sha": head_sha}
+    assert "do-not-store" not in str(ledger.get(item["id"]))
+
+    head_sha_2 = "c" * 40
+    advanced = dict(sanitized)
+    advanced["pr"] = {**advanced["pr"], "head_sha": head_sha_2}
+    advanced["local_verification"] = {"status": "passed", "head_sha": head_sha_2}
+    advanced["visual_qa"] = {"status": "stale"}
+    advanced_state = ledger.update_closeout(
+        item["id"],
+        advanced,
+        expected_revision=sanitized["revision"],
+    )
+    assert advanced_state is not None
+    before = ledger.get(item["id"])
+
+    assert ledger.apply_closeout_visual_completion(
+        item["id"],
+        expected_head_sha=head_sha,
+        receipts=[_visual_receipt(item["visual_qa_requirement"], order=5)],
+        min_receipt_order=5,
+    ) is None
+    assert ledger.get(item["id"]) == before
+
+
+def test_leased_h_receipt_is_discarded_when_watcher_reconciles_h2(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(
+        message_id="closeout-visual-h2-race",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    head_sha = "d" * 40
+    activated = _activated_visual_closeout(ledger, item, head_sha=head_sha)
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-h2",
+        lease_seconds=30,
+        expected_revision=activated["revision"],
+    )
+    assert leased is not None
+    assert ledger.apply_closeout_visual_completion(
+        item["id"],
+        expected_head_sha=head_sha,
+        receipts=[_visual_receipt(item["visual_qa_requirement"], order=4)],
+        min_receipt_order=4,
+    ) is not None
+
+    head_sha_2 = "e" * 40
+    reconciled = dict(leased["closeout"])
+    reconciled["pr"] = {**reconciled["pr"], "head_sha": head_sha_2}
+    reconciled["local_verification"] = {"status": "stale"}
+    reconciled["visual_qa"] = {"status": "stale"}
+    released = ledger.release_closeout(
+        item["id"],
+        owner="watcher-h2",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=reconciled,
+    )
+
+    assert released is not None
+    assert released["pr"]["head_sha"] == head_sha_2
+    assert released["visual_qa"] == {"status": "stale"}
+    assert "closeout_visual_completion" not in ledger.get(item["id"])
 
 
 def test_closeout_workspace_attachment_revision_leases_and_pending_scan(tmp_path):

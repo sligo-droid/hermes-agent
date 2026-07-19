@@ -7,11 +7,16 @@ import os
 import re
 import subprocess
 from fnmatch import fnmatch
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli.config import cfg_get, load_config
+from hermes_cli.project_inspection import (
+    ProjectInspectionCandidate,
+    project_inspection_candidates_to_dicts,
+    resolve_project_inspection,
+)
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
 
@@ -31,9 +36,10 @@ class DiscordProjectContext:
     github_url: Optional[str]
     mapping_source: str
     resolved: bool = True
+    inspection_candidates: tuple[ProjectInspectionCandidate, ...] = ()
 
-    def to_dict(self) -> dict[str, Optional[str] | bool]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        result = {
             "guild_id": self.guild_id,
             "project_channel_id": self.channel_id,
             "parent_channel_id": self.parent_channel_id,
@@ -46,6 +52,11 @@ class DiscordProjectContext:
             "project_mapping_source": self.mapping_source,
             "project_mapping_resolved": self.resolved,
         }
+        if self.inspection_candidates:
+            result["project_inspection_candidates"] = (
+                project_inspection_candidates_to_dicts(self.inspection_candidates)
+            )
+        return result
 
 
 def resolve_discord_project_context(
@@ -87,7 +98,7 @@ def resolve_discord_project_context(
         if db is not None:
             row = db.get_discord_project_mapping(guild_id=guild_id, channel_id=channel_id)
             if row:
-                return _context_from_row(row)
+                return _with_inspection_candidates(_context_from_row(row), cfg)
 
         configured = _context_from_configured_channel_cwd(
             target,
@@ -96,7 +107,7 @@ def resolve_discord_project_context(
             config=cfg,
         )
         if configured is not None:
-            return configured
+            return _with_inspection_candidates(configured, cfg)
 
         bootstrapped = _bootstrap_from_workspace(
             target,
@@ -105,7 +116,7 @@ def resolve_discord_project_context(
             workspace_root=workspace_root,
         )
         if bootstrapped is None:
-            return DiscordProjectContext(
+            return _with_inspection_candidates(DiscordProjectContext(
                 guild_id=guild_id,
                 channel_id=channel_id,
                 parent_channel_id=_string_id(getattr(target, "parent_id", None)),
@@ -117,15 +128,15 @@ def resolve_discord_project_context(
                 github_url=None,
                 mapping_source="unresolved",
                 resolved=False,
-            )
+            ), cfg)
 
         if db is not None:
             try:
                 row = db.upsert_discord_project_mapping(**bootstrapped)
-                return _context_from_row(row)
+                return _with_inspection_candidates(_context_from_row(row), cfg)
             except Exception:
                 logger.debug("Failed to persist Discord project mapping", exc_info=True)
-        return DiscordProjectContext(
+        return _with_inspection_candidates(DiscordProjectContext(
             guild_id=bootstrapped["guild_id"],
             channel_id=bootstrapped["channel_id"],
             parent_channel_id=bootstrapped.get("parent_channel_id"),
@@ -137,7 +148,7 @@ def resolve_discord_project_context(
             github_url=bootstrapped.get("github_url"),
             mapping_source=bootstrapped["source"],
             resolved=True,
-        )
+        ), cfg)
     finally:
         if owns_db and db is not None:
             try:
@@ -159,6 +170,24 @@ def _context_from_row(row: dict[str, Any]) -> DiscordProjectContext:
         github_url=row.get("github_url"),
         mapping_source=row.get("source") or "manual",
         resolved=True,
+    )
+
+
+def _with_inspection_candidates(
+    context: DiscordProjectContext,
+    config: dict[str, Any],
+) -> DiscordProjectContext:
+    resolution = resolve_project_inspection(
+        config.get("projects"),
+        github_repo=context.github_url,
+        project_key=context.project_key,
+    )
+    if resolution.project_key is None:
+        return context
+    return replace(
+        context,
+        project_key=resolution.project_key,
+        inspection_candidates=resolution.candidates,
     )
 
 

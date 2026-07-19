@@ -66,6 +66,11 @@ from .whatsapp_identity import (
 )
 from agent.message_sanitization import sanitize_history_message, sanitize_history_messages
 from utils import atomic_replace
+from hermes_cli.project_inspection import (
+    ProjectInspectionCandidate,
+    normalize_project_inspection_candidates,
+    project_inspection_candidates_to_dicts,
+)
 
 
 @dataclass
@@ -92,16 +97,23 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    project_key: Optional[str] = None
     project_name: Optional[str] = None
     project_path: Optional[str] = None
     project_github_url: Optional[str] = None
     project_channel_id: Optional[str] = None
     project_mapping_source: Optional[str] = None
     project_mapping_resolved: Optional[bool] = None
+    project_inspection_candidates: tuple[ProjectInspectionCandidate, ...] = ()
     # Profile this inbound message is routed to in a multiplexing gateway.
     # None => active/default profile. Drives session-key namespacing and the
     # per-turn config/credential scope.
     profile: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.project_inspection_candidates = normalize_project_inspection_candidates(
+            self.project_inspection_candidates
+        )
     
     @property
     def description(self) -> str:
@@ -145,6 +157,8 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.project_key:
+            d["project_key"] = self.project_key
         if self.project_name:
             d["project_name"] = self.project_name
         if self.project_path:
@@ -157,6 +171,10 @@ class SessionSource:
             d["project_mapping_source"] = self.project_mapping_source
         if self.project_mapping_resolved is not None:
             d["project_mapping_resolved"] = self.project_mapping_resolved
+        if self.project_inspection_candidates:
+            d["project_inspection_candidates"] = project_inspection_candidates_to_dicts(
+                self.project_inspection_candidates
+            )
         if self.profile:
             d["profile"] = self.profile
         return d
@@ -177,12 +195,16 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            project_key=data.get("project_key"),
             project_name=data.get("project_name"),
             project_path=data.get("project_path"),
             project_github_url=data.get("project_github_url"),
             project_channel_id=data.get("project_channel_id"),
             project_mapping_source=data.get("project_mapping_source"),
             project_mapping_resolved=data.get("project_mapping_resolved"),
+            project_inspection_candidates=normalize_project_inspection_candidates(
+                data.get("project_inspection_candidates")
+            ),
             profile=data.get("profile"),
         )
     
@@ -330,6 +352,8 @@ def build_session_context_prompt(
         if src.project_path:
             lines.append("")
             lines.append("**Mapped Project:**")
+            if src.project_key:
+                lines.append(f"  - Key: `{src.project_key}`")
             if src.project_name:
                 lines.append(f"  - Name: {src.project_name}")
             lines.append(f"  - Path: `{src.project_path}`")
@@ -345,6 +369,31 @@ def build_session_context_prompt(
             lines.append(
                 "  - Working directory: Gateway tools may start from Hermes home; "
                 "use this project path explicitly for project files and commands."
+            )
+            if src.project_inspection_candidates:
+                lines.append("  - Inspection targets, in required order:")
+                for candidate in src.project_inspection_candidates:
+                    label = (
+                        "local development"
+                        if candidate.environment == "development" and candidate.location == "local"
+                        else "external development"
+                        if candidate.environment == "development"
+                        else "production fallback"
+                    )
+                    lines.append(f"    - {label}: {candidate.url}")
+                lines.append(
+                    "  - Inspection rule: use development targets first, preferring local "
+                    "development before external development. Use a production target only "
+                    "when navigation to every development target is unavailable. A defect, "
+                    "failed assertion, or unexpected page on a reachable development target "
+                    "is not navigation unavailability and does not permit production fallback."
+                )
+            else:
+                lines.append("  - Inspection targets: none configured.")
+            lines.append(
+                "  - Local preview fallback: if navigation to every configured inspection "
+                "target is unavailable, start a repository-local preview server from the "
+                "mapped project path, report the command and local URL, then inspect that URL."
             )
         elif src.project_mapping_resolved is False:
             lines.append("")

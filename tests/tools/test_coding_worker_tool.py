@@ -261,6 +261,96 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     ]
 
 
+def test_worker_prompt_preserves_visual_requirement_and_dev_first_inspection(
+    monkeypatch,
+    tmp_path,
+):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+    parent.visual_qa_requirement = {
+        "level": "surface",
+        "target": "responsive dashboard",
+        "assertions": ["dashboard has no horizontal overflow"],
+    }
+    parent.project_inspection_candidates = [
+        {
+            "url": "http://127.0.0.1:5173/",
+            "environment": "development",
+            "location": "local",
+        },
+        {
+            "url": "https://dev.example.test/",
+            "environment": "development",
+            "location": "external",
+        },
+        {
+            "url": "https://prod.example.test/",
+            "environment": "production",
+            "location": "external",
+        },
+    ]
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the responsive dashboard.",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Originating trusted visual-QA requirement" in prompt
+    assert '"level":"surface"' in prompt
+    assert "without adding a URL to the receipt" in prompt
+    local = prompt.index("http://127.0.0.1:5173/")
+    external = prompt.index("https://dev.example.test/")
+    production = prompt.index("https://prod.example.test/")
+    assert local < external < production
+    assert "Inspection order is dev-first" in prompt
+    assert "only when connection, DNS, or navigation is unavailable" in prompt
+    assert "Do not switch to production" in prompt
+    assert "repository-local preview server" in prompt
+
+
+def test_worker_reads_serialized_task_local_inspection_candidates(monkeypatch):
+    from gateway import session_context
+
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda name, default="": (
+            json.dumps(
+                [
+                    {
+                        "url": "https://dev.example.test/",
+                        "environment": "development",
+                        "location": "external",
+                    }
+                ]
+            )
+            if name == "HERMES_PROJECT_INSPECTION_CANDIDATES"
+            else default
+        ),
+    )
+
+    candidates = cwt._originating_project_inspection_candidates(
+        SimpleNamespace(),
+    )
+
+    assert candidates == [
+        {
+            "url": "https://dev.example.test/",
+            "environment": "development",
+            "location": "external",
+        }
+    ]
+
+
 def test_context_pack_is_injected_before_task(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
@@ -1513,6 +1603,7 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
         worker_summary="Changed src/app.py and ran pytest.",
         closeout_mode="shadow",
         verification_runtime_breakdown=None,
+        visual_qa_requirement={"level": "none", "target": "", "assertions": []},
     )
 
 

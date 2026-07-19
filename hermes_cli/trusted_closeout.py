@@ -1333,6 +1333,33 @@ def _reconcile_trusted_closeout_impl(
         nonlocal local_branch_head
         if local_branch_head:
             return local_branch_head, subprocess.CompletedProcess([], 0, local_branch_head, "")
+        uncertainty = (
+            state.get("mutation_uncertainty")
+            if isinstance(state.get("mutation_uncertainty"), Mapping)
+            else {}
+        )
+        fenced_head = (
+            str(uncertainty.get("head_sha") or "").strip().lower()
+            if uncertain_operation() == "git_push"
+            else ""
+        )
+        persisted_head = str(state.get("pr", {}).get("head_sha") or "").strip().lower()
+        immutable_head = fenced_head or persisted_head
+        if immutable_head:
+            if not _SHA_RE.fullmatch(immutable_head):
+                return "", subprocess.CompletedProcess(
+                    [],
+                    1,
+                    "",
+                    "Persisted closeout head is not an exact Git SHA",
+                )
+            local_branch_head = immutable_head
+            return local_branch_head, subprocess.CompletedProcess(
+                [],
+                0,
+                local_branch_head,
+                "",
+            )
         result = execute(
             ["git", "rev-parse", f"refs/heads/{branch}"],
             cwd=root,
@@ -1341,6 +1368,7 @@ def _reconcile_trusted_closeout_impl(
         candidate = str(result.stdout or "").strip().lower()
         if result.returncode == 0 and _SHA_RE.fullmatch(candidate):
             local_branch_head = candidate
+            state["pr"]["head_sha"] = candidate
         return local_branch_head, result
 
     try:
@@ -1653,7 +1681,13 @@ def _reconcile_trusted_closeout_impl(
         if push_required:
             try:
                 pushed = execute(
-                    ["git", "push", "-u", "origin", branch],
+                    [
+                        "git",
+                        "push",
+                        "-u",
+                        "origin",
+                        f"{local_head}:refs/heads/{branch}",
+                    ],
                     cwd=root,
                     timeout=300,
                     github=True,
@@ -1679,7 +1713,15 @@ def _reconcile_trusted_closeout_impl(
             "--body",
             state["pr"]["body"] or "Trusted Hermes closeout.",
         ]
-        if policy["early_draft_pr"]:
+        visual_publication_pending = (
+            policy["require_visual_qa"]
+            and not _gate_passed(
+                state["visual_qa"],
+                required=True,
+                head_sha=local_head,
+            )
+        )
+        if policy["early_draft_pr"] or visual_publication_pending:
             create_args.append("--draft")
         try:
             created = execute(create_args, cwd=root, timeout=120, github=True)

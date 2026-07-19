@@ -47,6 +47,50 @@ def test_existing_db_mapping_wins_over_workspace_scan(tmp_path):
     db.close()
 
 
+def test_existing_mapping_is_dynamically_enriched_without_schema_change(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.upsert_discord_project_mapping(
+        guild_id="guild-1",
+        channel_id="chan-1",
+        channel_name="example",
+        guild_name="Sligo Labs",
+        project_key="legacy-key",
+        project_name="Example",
+        project_path="/canonical/example",
+        github_url="git@github.com:sligo-labs/example.git",
+        source="manual",
+    )
+
+    ctx = resolve_discord_project_context(
+        FakeChannel(channel_id="chan-1", name="example", guild=_guild()),
+        session_db=db,
+        workspace_root=tmp_path / "empty",
+        config={
+            "projects": {
+                "example": {
+                    "repository": "SLIGO-LABS/EXAMPLE",
+                    "inspection": {
+                        "development_urls": ["http://localhost:3000"],
+                        "production_urls": ["https://example.test"],
+                    },
+                }
+            }
+        },
+    )
+
+    assert ctx is not None
+    assert ctx.project_key == "example"
+    assert [candidate.url for candidate in ctx.inspection_candidates] == [
+        "http://localhost:3000/",
+        "https://example.test/",
+    ]
+    assert ctx.to_dict()["project_inspection_candidates"][0]["location"] == "local"
+    assert ctx.to_dict()["project_key"] == "example"
+    persisted = db.get_discord_project_mapping(guild_id="guild-1", channel_id="chan-1")
+    assert "inspection_candidates" not in persisted
+    db.close()
+
+
 def test_bootstraps_unique_workspace_directory(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     workspace = tmp_path / "workspace"
