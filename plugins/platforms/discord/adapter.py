@@ -5214,14 +5214,19 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             error_text = str(e)
+            retryable = bool(not message_ids and self._is_retryable_error(error_text))
             return SendResult(
                 success=False,
                 message_id=message_ids[0] if message_ids else None,
                 error=error_text,
                 raw_response={"message_ids": list(message_ids)} if message_ids else None,
-                retryable=bool(not message_ids and self._is_retryable_error(error_text)),
+                retryable=retryable,
                 confirmed_message_ids=tuple(message_ids),
-                retry_safe=bool(not message_ids and not self._is_timeout_error(error_text)),
+                retry_safe=bool(
+                    not message_ids
+                    and not retryable
+                    and not self._is_timeout_error(error_text)
+                ),
             )
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
@@ -5250,11 +5255,15 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
             error_text = f"Forum thread creation failed: {e}"
+            retryable = self._is_retryable_error(error_text)
             return SendResult(
                 success=False,
                 error=error_text,
-                retryable=self._is_retryable_error(error_text),
-                retry_safe=not self._is_timeout_error(error_text),
+                retryable=retryable,
+                retry_safe=bool(
+                    not retryable
+                    and not self._is_timeout_error(error_text)
+                ),
             )
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -1119,7 +1120,7 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
     assert merge_calls[0][-2:] == ["--match-head-commit", HEAD_SHA]
     assert sum(args[:3] == ["gh", "pr", "view"] for args in calls) == 2
 
-    sync_calls = []
+    sync_record = tmp_path / "canonical-sync-record.json"
 
     def run_merged(args, **_kwargs):
         if args[:3] == ["gh", "auth", "status"]:
@@ -1133,7 +1134,10 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
 
     def sync(path, branch, sha, *, control):
         assert control.mutation_allowed()
-        sync_calls.append((path, branch, sha))
+        sync_record.write_text(
+            json.dumps([path, branch, sha, os.getpid()]),
+            encoding="utf-8",
+        )
         return {"state": "synced", "head": sha, "merge_commit": sha}
 
     second = closeout.reconcile_trusted_closeout(
@@ -1148,7 +1152,7 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
     assert second.state["canonical_sync"] == {"status": "pending"}
     assert second.state["telemetry"]["green_unmerged_since"] is None
     assert second.state["telemetry"]["green_unmerged_overdue"] is False
-    assert sync_calls == []
+    assert not sync_record.exists()
 
     third = closeout.reconcile_trusted_closeout(
         second.state,
@@ -1164,7 +1168,115 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
         "observed_sha": MERGE_SHA,
         "checked_at": 102,
     }
-    assert sync_calls == [(str(tmp_path / "canonical"), "main", MERGE_SHA)]
+    path, branch, sha, child_pid = json.loads(
+        sync_record.read_text(encoding="utf-8")
+    )
+    assert (path, branch, sha) == (str(tmp_path / "canonical"), "main", MERGE_SHA)
+    assert child_pid != os.getpid()
+
+
+def test_uncertain_pr_create_rejects_historical_branch_match(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_create",
+        "at": 200.0,
+        "head_sha": HEAD_SHA,
+        "branch": "feature/test",
+        "base_branch": "main",
+        "repository": "acme/example",
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:2] == ["git", "rev-parse"]:
+            assert args == ["git", "rev-parse", "refs/heads/feature/test"]
+            return _completed(args, stdout=HEAD_SHA + "\n")
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "number": 3,
+                            "url": "https://github.com/acme/example/pull/3",
+                            "state": "OPEN",
+                            "headRefOid": HEAD_SHA,
+                            "headRefName": "feature/test",
+                            "baseRefName": "main",
+                            "headRepository": {
+                                "name": "example",
+                                "nameWithOwner": "acme/example",
+                            },
+                            "headRepositoryOwner": {"login": "acme"},
+                            "createdAt": "1970-01-01T00:01:00Z",
+                        }
+                    ]
+                ),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=300, run=run)
+
+    assert transition.outcome == "pending"
+    assert transition.state["mutation_uncertainty"]["operation"] == "github_pr_create"
+    assert transition.state["errors"][-1]["code"] == (
+        "pr_create_reobservation_identity_mismatch"
+    )
+    assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+
+
+def test_uncertain_push_reobserves_configured_branch_not_checkout_head(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "git_push",
+        "at": 100.0,
+        "head_sha": HEAD_SHA,
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(args, stdout="[]")
+        if args[:2] == ["git", "rev-parse"]:
+            assert args == ["git", "rev-parse", "refs/heads/feature/test"]
+            return _completed(args, stdout=HEAD_SHA + "\n")
+        if args[:2] == ["git", "ls-remote"]:
+            return _completed(
+                args,
+                stdout=f"{HEAD_SHA}\trefs/heads/feature/test\n",
+            )
+        if args[:3] == ["gh", "pr", "create"]:
+            return _completed(
+                args,
+                stdout="https://github.com/acme/example/pull/8\n",
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=101, run=run)
+
+    assert transition.outcome == "pr_pending"
+    assert ["git", "rev-parse", "refs/heads/feature/test"] in calls
+    assert ["git", "rev-parse", "HEAD"] not in calls
+    assert not any(args[:2] == ["git", "push"] for args in calls)
 
 
 def test_uncertain_merge_is_reobserved_before_any_duplicate_mutation(
@@ -1354,6 +1466,76 @@ def test_same_head_premerge_refresh_reapplies_every_gate_and_prevents_merge(
     assert "mergeable" in requested
     assert "reviewDecision" in requested
     assert "statusCheckRollup" in requested
+
+
+def test_reobserved_adapter_fence_uncertainty_clears_after_exact_proof(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import post_merge_receipts
+
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    observed = tmp_path / "deployment-reobserved"
+
+    def adapter(*, target_sha, reobserve_only, **_kwargs):
+        observed.write_text(str(reobserve_only), encoding="utf-8")
+        return {"status": "passed", "observed_sha": target_sha}
+
+    post_merge_receipts.register_deployment_adapter(
+        "trusted-fenced-reobserve",
+        adapter,
+    )
+    state = _state(tmp_path)
+    state["workspace"]["canonical_path"] = ""
+    state["policy"]["post_merge_requirements"] = {"deployment": True}
+    state["post_merge"] = post_merge_receipts.initialize_post_merge_receipts(
+        state,
+        target_sha=MERGE_SHA,
+    )
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "post_merge_deployment",
+        "at": 100,
+        "head_sha": MERGE_SHA,
+    }
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
+                ),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        state,
+        now=101,
+        run=run,
+        post_merge_config={
+            "repositories": {
+                "acme/example": {
+                    "deployment_adapter": "trusted-fenced-reobserve"
+                }
+            }
+        },
+        mutation_started=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("re-observation must not start a new mutation")
+        ),
+    )
+
+    assert observed.exists(), transition
+    assert observed.read_text(encoding="utf-8") == "True"
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
+    assert transition.state["post_merge"]["deployment"] == {
+        "status": "passed",
+        "checked_at": 101,
+        "observed_sha": MERGE_SHA,
+    }
 
 
 def test_required_post_merge_receipts_return_distinct_pending_outcome(monkeypatch, tmp_path):

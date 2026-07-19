@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import json
 import multiprocessing
@@ -816,9 +817,209 @@ def test_overdue_adapter_stops_before_timeout_receipt_can_be_persisted(tmp_path)
         raise AssertionError("timed-out adapter process remained alive")
     assert time.monotonic() - began < 1
     assert gathered["deployment"] == {
-        "status": "blocked",
+        "status": "uncertain",
         "checked_at": 100,
-        "diagnostic_code": "collector_timeout",
+        "diagnostic_code": "adapter_outcome_uncertain",
+    }
+
+
+def test_mutation_adapter_is_fenced_before_process_start(tmp_path):
+    fenced = tmp_path / "adapter-fenced"
+    invoked = tmp_path / "adapter-invoked"
+    starts = []
+
+    def mutation_started(operation, context):
+        starts.append((operation, dict(context)))
+        fenced.write_text("fenced", encoding="utf-8")
+        return True
+
+    def adapter(*, target_sha, **_kwargs):
+        assert fenced.exists()
+        invoked.write_text("invoked", encoding="utf-8")
+        return {"status": "passed", "observed_sha": target_sha}
+
+    receipts.register_deployment_adapter("test-fenced-deploy", adapter)
+    state = _state(tmp_path, requirements={"deployment": True})
+    state["workspace"]["canonical_path"] = ""
+
+    gathered = receipts.collect_post_merge_receipts(
+        state,
+        config={
+            "repositories": {
+                "owner/repo": {"deployment_adapter": "test-fenced-deploy"}
+            }
+        },
+        mutation_started=mutation_started,
+        now=100,
+    )
+
+    assert invoked.read_text(encoding="utf-8") == "invoked"
+    assert len(starts) == 1
+    assert starts[0][0] == "post_merge_deployment"
+    assert starts[0][1]["head_sha"] == TARGET
+    assert gathered["deployment"]["status"] == "passed"
+
+
+def test_replacement_owner_fence_forces_adapter_reobservation_only(tmp_path):
+    observation = tmp_path / "fenced-adapter-reobservation"
+    starts = []
+
+    def adapter(*, target_sha, reobserve_only, **_kwargs):
+        observation.write_text(str(reobserve_only), encoding="utf-8")
+        return {"status": "passed", "observed_sha": target_sha}
+
+    receipts.register_deployment_adapter("test-fenced-reobserve", adapter)
+    state = _state(tmp_path, requirements={"deployment": True})
+    state["workspace"]["canonical_path"] = ""
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "post_merge_deployment",
+        "at": 99,
+        "head_sha": TARGET,
+    }
+
+    gathered = receipts.collect_post_merge_receipts(
+        state,
+        config={
+            "repositories": {
+                "owner/repo": {"deployment_adapter": "test-fenced-reobserve"}
+            }
+        },
+        mutation_started=lambda operation, context: starts.append(
+            (operation, dict(context))
+        )
+        or True,
+        now=100,
+    )
+
+    assert observation.read_text(encoding="utf-8") == "True"
+    assert starts == []
+    assert gathered["deployment"]["status"] == "passed"
+
+
+def test_new_mutation_adapters_are_fenced_one_per_atomic_collection(tmp_path):
+    deployment = tmp_path / "deployment-invoked"
+    restart = tmp_path / "restart-invoked"
+    starts = []
+
+    def deployment_adapter(*, target_sha, **_kwargs):
+        deployment.write_text("invoked", encoding="utf-8")
+        return {"status": "passed", "observed_sha": target_sha}
+
+    def restart_adapter(*, target_sha, **_kwargs):
+        restart.write_text("invoked", encoding="utf-8")
+        return {"status": "passed", "observed_sha": target_sha}
+
+    receipts.register_deployment_adapter(
+        "test-serialized-deployment",
+        deployment_adapter,
+    )
+    receipts.register_restart_adapter("test-serialized-restart", restart_adapter)
+    state = _state(
+        tmp_path,
+        requirements={"deployment": True, "restart": True},
+    )
+    state["workspace"]["canonical_path"] = ""
+    config = {
+        "repositories": {
+            "owner/repo": {
+                "deployment_adapter": "test-serialized-deployment",
+                "restart_adapter": "test-serialized-restart",
+            }
+        }
+    }
+
+    first = receipts.collect_post_merge_receipts(
+        state,
+        config=config,
+        mutation_started=lambda operation, _context: starts.append(operation)
+        or True,
+        now=100,
+    )
+
+    assert deployment.exists()
+    assert not restart.exists()
+    assert starts == ["post_merge_deployment"]
+    assert first["deployment"]["status"] == "passed"
+    assert first["restart"]["status"] == "pending"
+
+    state["post_merge"] = first
+    second = receipts.collect_post_merge_receipts(
+        state,
+        config=config,
+        mutation_started=lambda operation, _context: starts.append(operation)
+        or True,
+        now=101,
+    )
+
+    assert restart.exists()
+    assert starts == ["post_merge_deployment", "post_merge_restart"]
+    assert second["restart"]["status"] == "passed"
+
+
+def test_uncertain_mutation_adapter_requires_explicit_reobservation_contract(tmp_path):
+    invocations = tmp_path / "adapter-invocations"
+
+    def adapter(**_kwargs):
+        invocations.write_text("invoked", encoding="utf-8")
+        while True:
+            time.sleep(0.01)
+
+    receipts.register_deployment_adapter("test-uncertain-deploy", adapter)
+    state = _state(tmp_path, requirements={"deployment": True})
+    state["workspace"]["canonical_path"] = ""
+    config = {
+        "collector_timeout_s": 0.1,
+        "adapter_timeout_s": 0.1,
+        "repositories": {
+            "owner/repo": {"deployment_adapter": "test-uncertain-deploy"}
+        },
+    }
+    first = receipts.collect_post_merge_receipts(state, config=config, now=100)
+    assert first["deployment"]["status"] == "uncertain"
+    first_marker = invocations.stat().st_mtime_ns
+
+    recovered = copy.deepcopy(state)
+    recovered["post_merge"] = first
+    second = receipts.collect_post_merge_receipts(recovered, config=config, now=101)
+
+    assert invocations.stat().st_mtime_ns == first_marker
+    assert second["deployment"] == {
+        "status": "uncertain",
+        "checked_at": 101,
+        "diagnostic_code": "adapter_reobservation_unsupported",
+    }
+
+
+def test_uncertain_mutation_adapter_can_resolve_with_reobservation_only(tmp_path):
+    observation = tmp_path / "adapter-reobservation"
+
+    def adapter(*, target_sha, reobserve_only, **_kwargs):
+        observation.write_text(str(reobserve_only), encoding="utf-8")
+        return {"status": "passed", "observed_sha": target_sha}
+
+    receipts.register_deployment_adapter("test-reobserve-deploy", adapter)
+    state = _state(tmp_path, requirements={"deployment": True})
+    state["workspace"]["canonical_path"] = ""
+    state["post_merge"]["deployment"] = {
+        "status": "uncertain",
+        "diagnostic_code": "adapter_outcome_uncertain",
+    }
+    gathered = receipts.collect_post_merge_receipts(
+        state,
+        config={
+            "repositories": {
+                "owner/repo": {"deployment_adapter": "test-reobserve-deploy"}
+            }
+        },
+        now=102,
+    )
+
+    assert observation.read_text(encoding="utf-8") == "True"
+    assert gathered["deployment"] == {
+        "status": "passed",
+        "checked_at": 102,
+        "observed_sha": TARGET,
     }
 
 
@@ -863,12 +1064,19 @@ def test_cooperative_canonical_sync_is_classified_once_and_succeeds(
     tmp_path,
 ):
     signature_calls = []
-    observed = {}
+    observed = tmp_path / "cooperative-canonical.json"
     original_signature = receipts.inspect.signature
 
     def sync_canonical(_canonical_path, _branch, merge_sha, *, control):
-        observed["pid"] = os.getpid()
-        observed["control"] = control
+        observed.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "has_control": isinstance(control, receipts.PostMergeControl),
+                }
+            ),
+            encoding="utf-8",
+        )
         return {
             "state": "synced",
             "head": merge_sha,
@@ -888,12 +1096,48 @@ def test_cooperative_canonical_sync_is_classified_once_and_succeeds(
     )
 
     assert signature_calls == [sync_canonical]
-    assert observed["pid"] == os.getpid()
-    assert isinstance(observed["control"], receipts.PostMergeControl)
+    observation = json.loads(observed.read_text(encoding="utf-8"))
+    assert observation["pid"] != os.getpid()
+    assert observation["has_control"] is True
     assert gathered["canonical_sync"] == {
         "status": "passed",
         "checked_at": 100,
         "observed_sha": TARGET,
+    }
+
+
+def test_control_accepting_canonical_callback_cannot_wedge_timeout(tmp_path):
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    pid_path = canonical / "ignores-control-pid"
+    heartbeat = canonical / "ignores-control-heartbeat"
+
+    def sync_canonical(_canonical_path, _branch, _merge_sha, *, control):
+        pid_path.write_text(str(os.getpid()), encoding="utf-8")
+        counter = 0
+        while True:
+            counter += 1
+            heartbeat.write_text(str(counter), encoding="utf-8")
+            time.sleep(0.005)
+
+    began = time.monotonic()
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        config={"collector_timeout_s": 0.1},
+        sync_canonical=sync_canonical,
+        now=100,
+    )
+
+    child_pid = int(pid_path.read_text(encoding="utf-8"))
+    heartbeat_after_return = heartbeat.read_text(encoding="utf-8")
+    _assert_process_dead(child_pid)
+    time.sleep(0.05)
+    assert heartbeat.read_text(encoding="utf-8") == heartbeat_after_return
+    assert time.monotonic() - began < 1.5
+    assert gathered["canonical_sync"] == {
+        "status": "blocked",
+        "checked_at": 100,
+        "diagnostic_code": "collector_timeout",
     }
 
 
@@ -997,7 +1241,7 @@ def test_legacy_canonical_callback_exception_is_bounded_and_redacted(tmp_path):
     assert "protected.invalid" not in repr(gathered["canonical_sync"])
 
 
-def test_dynamic_legacy_canonical_callback_fails_closed_without_invocation(tmp_path):
+def test_dynamic_canonical_callback_runs_only_in_killable_child(tmp_path):
     called = []
 
     def dynamic_sync(_canonical_path, _branch, merge_sha):
@@ -1016,9 +1260,9 @@ def test_dynamic_legacy_canonical_callback_fails_closed_without_invocation(tmp_p
 
     assert called == []
     assert gathered["canonical_sync"] == {
-        "status": "blocked",
+        "status": "passed",
         "checked_at": 100,
-        "diagnostic_code": "canonical_sync_callback_not_picklable",
+        "observed_sha": TARGET,
     }
 
 

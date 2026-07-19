@@ -12,7 +12,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
 from gateway.session import Platform, SessionSource
@@ -1154,6 +1154,7 @@ class GatewayWorkLedger:
             state["revision"] = int(expected_revision) + 1
             item["closeout"] = state
             item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
             if state["mode"] != "enforce":
                 item["closeout_authoritative"] = False
             elif item.get("closeout_activated_at") is not None:
@@ -1185,9 +1186,12 @@ class GatewayWorkLedger:
             now = self._now()
             state = normalize_closeout_state(item["closeout"])
             pending_uncertainty = item.get("closeout_mutation_uncertainty")
-            if isinstance(pending_uncertainty, dict):
+            mutation_fence = item.get("closeout_mutation_fence")
+            for candidate in (pending_uncertainty, mutation_fence):
+                if not isinstance(candidate, dict):
+                    continue
                 normalized_uncertainty = normalize_closeout_state(
-                    {"mutation_uncertainty": pending_uncertainty}
+                    {"mutation_uncertainty": candidate}
                 )["mutation_uncertainty"]
                 if normalized_uncertainty.get("status") == "uncertain":
                     state["mutation_uncertainty"] = normalized_uncertainty
@@ -1213,6 +1217,7 @@ class GatewayWorkLedger:
             state["revision"] = revision + 1
             item["closeout"] = state
             item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
             item["closeout_last_claimed_at"] = now
             item["updated_at"] = now
             self._write(data)
@@ -1264,6 +1269,54 @@ class GatewayWorkLedger:
             self._write(data)
             return True
 
+    def record_closeout_mutation_start(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        operation: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Durably fence a remote mutation before its subprocess can start."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        raw_context = dict(context) if isinstance(context, Mapping) else {}
+        marker = normalize_closeout_state(
+            {
+                "mutation_uncertainty": {
+                    "status": "uncertain",
+                    "operation": operation,
+                    **raw_context,
+                }
+            }
+        )["mutation_uncertainty"]
+        if marker.get("status") != "uncertain":
+            return False
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return False
+            now = self._now()
+            current = normalize_closeout_state(item["closeout"])
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+                or str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
+                return False
+            marker["at"] = float(marker.get("at") or now)
+            item["closeout_mutation_fence"] = marker
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
     def record_closeout_mutation_uncertainty(
         self,
         work_id: str,
@@ -1309,6 +1362,7 @@ class GatewayWorkLedger:
         expected_revision: int,
         expected_generation: int,
         closeout_state: dict[str, Any] | None = None,
+        expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> dict[str, Any] | None:
         """Release an owned lease and optionally persist the reconciliation result."""
 
@@ -1318,6 +1372,8 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if not _run_state_matches(item, expected_run_state):
                 return None
             now = self._now()
             current = normalize_closeout_state(item["closeout"])
@@ -1339,6 +1395,7 @@ class GatewayWorkLedger:
             state["revision"] = int(expected_revision) + 1
             item["closeout"] = state
             item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
             item["closeout_authoritative"] = state["mode"] == "enforce"
             item["updated_at"] = now
             self._write(data)
@@ -1387,6 +1444,7 @@ class GatewayWorkLedger:
             state["revision"] = int(expected_revision) + 1
             response = str(final_response or "")
             item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
             item.update(
                 {
                     "closeout": state,
@@ -1425,6 +1483,94 @@ class GatewayWorkLedger:
             item.pop("claim_pid", None)
             _record_discord_board_final_response(item)
             _record_provider_progress(item, "ledger_status_blocked", status="blocked")
+            self._write(data)
+            return dict(item)
+
+    def finalize_successful_closeout(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        closeout_state: dict[str, Any],
+        final_response: str,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> dict[str, Any] | None:
+        """Atomically release terminal closeout authority and advance work state."""
+
+        from hermes_cli.trusted_closeout import (
+            closeout_terminal_eligible,
+            normalize_closeout_state,
+        )
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if not _run_state_matches(item, expected_run_state):
+                return None
+            now = self._now()
+            current = normalize_closeout_state(item["closeout"])
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
+                return None
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
+                return None
+            state = normalize_closeout_state(closeout_state)
+            state["lease_generation"] = int(expected_generation)
+            state["lease"] = {"owner": "", "until": None}
+            state["revision"] = int(expected_revision) + 1
+            if not closeout_terminal_eligible(state):
+                return None
+
+            item["closeout"] = state
+            item["closeout_authoritative"] = state["mode"] == "enforce"
+            item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
+            status = str(item.get("status") or "")
+            if status in {"accepted", "claimed", "agent_running"}:
+                item.update(
+                    {
+                        "status": "agent_done",
+                        "updated_at": now,
+                        "agent_done_at": now,
+                        "final_response": str(final_response or ""),
+                        "summary_status": "Complete",
+                        "active_run": None,
+                        "lease_until": None,
+                    }
+                )
+                item.pop("claim_pid", None)
+                gate = classify_delivery_completion(item)
+                item["completion_gate"] = gate
+                item["summary_status"] = str(
+                    gate.get("summary_status") or "Complete"
+                )
+                _record_discord_board_final_response(item)
+                _record_provider_progress(
+                    item,
+                    "ledger_status_agent_done",
+                    status="agent_done",
+                )
+            elif status == "summary_updated":
+                item["status"] = "completed"
+                item["updated_at"] = now
+                _record_provider_progress(
+                    item,
+                    "ledger_status_completed",
+                    status="completed",
+                )
+            else:
+                item["updated_at"] = now
             self._write(data)
             return dict(item)
 
@@ -1919,20 +2065,84 @@ class GatewayWorkLedger:
         return True
 
     @_locked_ledger_mutation
+    def mark_response_delivery_started(
+        self,
+        work_id: str,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
+        """Fence one non-idempotent logical send before platform I/O begins."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
+            return False
+        prior = (
+            item.get("delivery_attempt")
+            if isinstance(item.get("delivery_attempt"), dict)
+            else {}
+        )
+        if (
+            str(prior.get("status") or "") in {"sending", "uncertain"}
+            or str(item.get("delivery_outcome") or "")
+            in {"sending", "delivered", "uncertain"}
+            or str(item.get("status") or "") == "response_delivered"
+        ):
+            return False
+        now = self._now()
+        attempt_count = min(1000, int(prior.get("attempt_count") or 0) + 1)
+        item["delivery_attempt"] = {
+            "status": "sending",
+            "started_at": now,
+            "attempt_count": attempt_count,
+        }
+        item["delivery_outcome"] = "sending"
+        item["updated_at"] = now
+        self._write(data)
+        return True
+
+    @_locked_ledger_mutation
+    def release_response_delivery_attempt(
+        self,
+        work_id: str,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
+        """Clear a definitively side-effect-free send attempt for safe retry."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        attempt = item.get("delivery_attempt") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or not _run_state_matches(item, expected_run_state)
+            or not isinstance(attempt, dict)
+            or str(attempt.get("status") or "") != "sending"
+        ):
+            return False
+        item.pop("delivery_attempt", None)
+        item.pop("delivery_outcome", None)
+        item["updated_at"] = self._now()
+        self._write(data)
+        return True
+
+    @_locked_ledger_mutation
     def mark_response_delivered(
         self,
         work_id: str,
         *,
         result_message_id: str | None = None,
         confirmed_message_ids: Any = None,
+        expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         item["status"] = "response_delivered"
         item["updated_at"] = self._now()
         item["delivery_outcome"] = "delivered"
+        item.pop("delivery_attempt", None)
         item.pop("delivery_uncertain_at", None)
         confirmed_ids = _bounded_delivery_message_ids(
             confirmed_message_ids,
@@ -1960,12 +2170,13 @@ class GatewayWorkLedger:
         result_message_id: str | None = None,
         confirmed_message_ids: Any = None,
         reason: str = "send_attempt_outcome_unknown",
+        expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> bool:
         """Persist an unsafe logical send without allowing automatic replay."""
 
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         now = self._now()
         confirmed_ids = _bounded_delivery_message_ids(
@@ -1980,6 +2191,20 @@ class GatewayWorkLedger:
                 "updated_at": now,
                 "delivery_outcome": "uncertain",
                 "delivery_uncertain_at": now,
+                "delivery_attempt": {
+                    "status": "uncertain",
+                    "started_at": (
+                        item.get("delivery_attempt", {}).get("started_at")
+                        if isinstance(item.get("delivery_attempt"), dict)
+                        else now
+                    ),
+                    "attempt_count": min(
+                        1000,
+                        int(item.get("delivery_attempt", {}).get("attempt_count") or 1)
+                        if isinstance(item.get("delivery_attempt"), dict)
+                        else 1,
+                    ),
+                },
                 "confirmed_message_ids": list(confirmed_ids),
                 "summary_status": "Blocked",
                 "blocked_reason": str(reason or "send_attempt_outcome_unknown")[:120],

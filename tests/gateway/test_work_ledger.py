@@ -931,6 +931,33 @@ def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_pa
     assert ledger.incomplete_items() == []
 
 
+def test_delivery_start_fence_allows_only_one_inflight_logical_send(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="delivery-fence"),
+        session_key="delivery-fence",
+        freshness_seconds=60,
+    )
+    expected_run_state = ledger.run_state_snapshot(item)
+
+    assert ledger.mark_response_delivery_started(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    assert not ledger.mark_response_delivery_started(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    assert ledger.release_response_delivery_attempt(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    assert ledger.mark_response_delivery_started(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+
+
 def test_ledger_persists_all_bounded_confirmed_message_ids(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     item = ledger.accept_event(
@@ -2437,6 +2464,80 @@ def test_expired_closeout_lease_cannot_persist_stale_authoritative_result(tmp_pa
     assert ledger.get(item["id"]) == before
 
 
+def test_remote_mutation_fence_survives_replacement_lease_generation(tmp_path):
+    now = {"value": 100.0}
+    ledger = GatewayWorkLedger(
+        tmp_path / "work_ledger.json",
+        now_fn=lambda: now["value"],
+    )
+    event = _discord_event(message_id="closeout-mutation-fence")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        repository="acme/example",
+        branch="feature/test",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    first = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-old",
+        lease_seconds=1,
+        expected_revision=activated["revision"],
+    )
+    assert ledger.record_closeout_mutation_start(
+        item["id"],
+        owner="watcher-old",
+        expected_revision=first["closeout"]["revision"],
+        expected_generation=first["closeout"]["lease_generation"],
+        operation="github_pr_create",
+        context={
+            "at": 100.0,
+            "head_sha": "a" * 40,
+            "branch": "feature/test",
+            "base_branch": "main",
+            "repository": "acme/example",
+        },
+    )
+
+    now["value"] = 102.0
+    replacement = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-new",
+        lease_seconds=30,
+        expected_revision=first["closeout"]["revision"],
+    )
+
+    assert replacement is not None
+    assert replacement["closeout"]["lease_generation"] == 2
+    assert replacement["closeout"]["mutation_uncertainty"] == {
+        "status": "uncertain",
+        "operation": "github_pr_create",
+        "at": 100.0,
+        "head_sha": "a" * 40,
+        "branch": "feature/test",
+        "base_branch": "main",
+        "repository": "acme/example",
+    }
+    assert "closeout_mutation_fence" not in ledger.get(item["id"])
+    assert ledger.record_closeout_mutation_uncertainty(
+        item["id"],
+        owner="watcher-old",
+        expected_revision=first["closeout"]["revision"],
+        expected_generation=first["closeout"]["lease_generation"],
+        uncertainty={"status": "uncertain", "operation": "github_pr_create"},
+    ) is False
+
+
 def test_fable_shadow_activation_is_observational_not_authoritative(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     event = _discord_event(message_id="fable-shadow-closeout")
@@ -2674,6 +2775,62 @@ def test_blocked_closeout_finalization_is_one_atomic_cas(tmp_path):
         "confirmed_message_ids": [],
         "summary_updated_at": None,
     }
+
+
+def test_successful_closeout_finalization_is_one_atomic_cas(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="successful-closeout-cas")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=activated["revision"],
+    )
+    completed_state = dict(leased["closeout"])
+    completed_state["status"] = "completed"
+    expected = ledger.run_state_snapshot(leased)
+
+    winner = ledger.finalize_successful_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=completed_state,
+        final_response="Trusted closeout completed.",
+        expected_run_state=expected,
+    )
+    loser = ledger.finalize_successful_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=completed_state,
+        final_response="duplicate",
+        expected_run_state=expected,
+    )
+
+    assert winner is not None
+    assert loser is None
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_done"
+    assert stored["final_response"] == "Trusted closeout completed."
+    assert stored["closeout"]["status"] == "completed"
+    assert stored["closeout"]["lease"] == {"owner": "", "until": None}
 
 
 def test_blocked_closeout_run_state_cas_preserves_new_live_run_and_closeout(tmp_path):

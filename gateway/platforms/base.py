@@ -1527,6 +1527,9 @@ class SendResult:
     error: Optional[str] = None
     raw_response: Any = None
     retryable: bool = False  # True for transient connection errors — base may retry when replay is safe
+    # Server-requested retry delay in seconds (for example Telegram FloodWait).
+    # The next retry honors this once instead of the default backoff.
+    retry_after: Optional[float] = None
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -3265,9 +3268,15 @@ class BasePlatformAdapter(ABC):
             return result
 
         if is_network:
-            # Retry with exponential backoff for transient errors
+            # Retry with exponential backoff for transient errors. A provider
+            # retry_after is authoritative for the immediately following retry.
+            server_retry_after = result.retry_after
             for attempt in range(1, max_retries + 1):
-                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                if server_retry_after is not None:
+                    delay = server_retry_after + random.uniform(0, 1)
+                    server_retry_after = None
+                else:
+                    delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,
@@ -3283,6 +3292,8 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
+                if result.retry_after is not None:
+                    server_retry_after = result.retry_after
                 if not is_logical_send_retry_safe(result):
                     logger.warning(
                         "[%s] Retry produced a confirmed or ambiguous side effect; "
@@ -4037,6 +4048,47 @@ class BasePlatformAdapter(ABC):
         except Exception as exc:
             logger.warning("[%s] Failed to mark work item completed: %s", self.name, exc)
 
+    def _mark_work_item_delivery_started(self, event: MessageEvent) -> bool:
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return True
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            return GatewayWorkLedger().mark_response_delivery_started(
+                str(work_item_id),
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to fence work item delivery: %s", self.name, exc)
+            return False
+
+    def _release_work_item_delivery_attempt(self, event: MessageEvent) -> None:
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            GatewayWorkLedger().release_response_delivery_attempt(
+                str(work_item_id),
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to release work item delivery attempt: %s",
+                self.name,
+                exc,
+            )
+
     def _mark_work_item_response_delivered(self, event: MessageEvent, result=None) -> None:
         work_item_id = getattr(event, "work_item_id", None)
         if not work_item_id or getattr(event, "defer_work_completion", False):
@@ -4045,12 +4097,16 @@ class BasePlatformAdapter(ABC):
             from gateway.work_ledger import GatewayWorkLedger
 
             result_message_id = getattr(result, "message_id", None)
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
             delivered = GatewayWorkLedger().mark_response_delivered(
                 str(work_item_id),
                 result_message_id=str(result_message_id) if result_message_id else None,
                 confirmed_message_ids=get_confirmed_message_ids(result),
+                **kwargs,
             )
-            expected_run_state = getattr(event, "work_item_run_state", None)
             if delivered and isinstance(expected_run_state, dict):
                 event.work_item_run_state = {
                     **expected_run_state,
@@ -4078,13 +4134,17 @@ class BasePlatformAdapter(ABC):
                 else "send_attempt_outcome_unknown"
             )
             result_message_id = getattr(result, "message_id", None)
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
             persisted = GatewayWorkLedger().mark_response_delivery_uncertain(
                 str(work_item_id),
                 result_message_id=str(result_message_id) if result_message_id else None,
                 confirmed_message_ids=confirmed_ids,
                 reason=reason,
+                **kwargs,
             )
-            expected_run_state = getattr(event, "work_item_run_state", None)
             if persisted and isinstance(expected_run_state, dict):
                 event.work_item_run_state = {
                     **expected_run_state,
@@ -4098,6 +4158,7 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_fenced = False
         processing_outcome: Optional[ProcessingOutcome] = None
         completion_deferred = False
         handoff_spawned = False
@@ -4119,6 +4180,8 @@ class BasePlatformAdapter(ABC):
                 or self._is_timeout_error(error_text)
             ):
                 self._mark_work_item_delivery_uncertain(event, result)
+            else:
+                self._release_work_item_delivery_attempt(event)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -4250,6 +4313,26 @@ class BasePlatformAdapter(ABC):
                             _tts_path = tts_data.get("file_path")
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
+
+                has_response_delivery = bool(text_content)
+                if has_response_delivery:
+                    delivery_fenced = self._mark_work_item_delivery_started(event)
+                    if not delivery_fenced:
+                        logger.info(
+                            "[%s] Suppressing stale response after work-item delivery CAS failed",
+                            self.name,
+                        )
+                        if _tts_path:
+                            try:
+                                os.remove(_tts_path)
+                            except OSError:
+                                pass
+                        _tts_path = None
+                        response = None
+                        text_content = ""
+                        images = []
+                        media_files = []
+                        local_files = []
 
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
@@ -4480,6 +4563,8 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            if delivery_fenced and not delivery_succeeded:
+                self._mark_work_item_delivery_uncertain(event)
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:

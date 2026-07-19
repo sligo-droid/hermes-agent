@@ -6269,6 +6269,26 @@ class GatewayRunner:
             return
 
         status = str(item.get("status") or "")
+        delivery_attempt = (
+            item.get("delivery_attempt")
+            if isinstance(item.get("delivery_attempt"), dict)
+            else {}
+        )
+        if status == "agent_done" and str(delivery_attempt.get("status") or "") == "sending":
+            persisted = await asyncio.to_thread(
+                ledger.mark_response_delivery_uncertain,
+                work_id,
+                reason="send_attempt_outcome_unknown",
+                expected_run_state=expected_run_state,
+            )
+            if not persisted:
+                return
+            item = ledger.get(work_id) or item
+            status = str(item.get("status") or "")
+            expected_run_state = {
+                **expected_run_state,
+                "status": "response_delivered",
+            }
         if status == "blocked" and isinstance(item.get("terminal_delivery"), dict):
             delivery_owner = f"gateway-delivery:{os.getpid()}:{time.time_ns()}"
             claimed = await asyncio.to_thread(
@@ -6452,13 +6472,34 @@ class GatewayRunner:
                         reply_to = _reply_anchor_for_event(event)
                     except Exception:
                         reply_to = item.get("reply_to_message_id") or item.get("message_id")
+                    began = await asyncio.to_thread(
+                        ledger.mark_response_delivery_started,
+                        work_id,
+                        expected_run_state=expected_run_state,
+                    )
+                    if not began:
+                        return
                     result = await adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=final_response,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                except asyncio.CancelledError:
+                    await asyncio.to_thread(
+                        ledger.mark_response_delivery_uncertain,
+                        work_id,
+                        reason="send_attempt_outcome_unknown",
+                        expected_run_state=expected_run_state,
+                    )
+                    raise
                 except Exception as exc:
+                    await asyncio.to_thread(
+                        ledger.mark_response_delivery_uncertain,
+                        work_id,
+                        reason="send_attempt_outcome_unknown",
+                        expected_run_state=expected_run_state,
+                    )
                     logger.warning("Failed to deliver finished Discord work item %s: %s", work_id, exc)
                     return
                 if not getattr(result, "success", False):
@@ -6476,6 +6517,11 @@ class GatewayRunner:
                         or not is_logical_send_retry_safe(result)
                         or timed_out
                     ):
+                        await asyncio.to_thread(
+                            ledger.release_response_delivery_attempt,
+                            work_id,
+                            expected_run_state=expected_run_state,
+                        )
                         return
                     reason = (
                         "partial_send_confirmed"
@@ -6491,6 +6537,7 @@ class GatewayRunner:
                         ),
                         confirmed_message_ids=confirmed_ids,
                         reason=reason,
+                        expected_run_state=expected_run_state,
                     ):
                         return
                     item = ledger.get(work_id) or item
@@ -6502,6 +6549,7 @@ class GatewayRunner:
                     work_id,
                     result_message_id=str(getattr(result, "message_id", "") or "") or None,
                     confirmed_message_ids=get_confirmed_message_ids(result),
+                    expected_run_state=expected_run_state,
                 ):
                     expected_run_state = {
                         **expected_run_state,
@@ -14075,6 +14123,12 @@ class GatewayRunner:
                                 "active_run": None,
                             }
                         )
+                    else:
+                        logger.info(
+                            "Suppressing stale Discord response after agent_done CAS failed for %s",
+                            work_item_id,
+                        )
+                        response = None
                     if agent_done:
                         try:
                             from agent.provider_progress import record_provider_progress_signal

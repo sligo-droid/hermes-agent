@@ -253,12 +253,29 @@ class TrustedCloseoutWatcher:
                 for parameter in reconcile_parameters.values()
             )
 
+            def fence_remote_mutation(
+                operation: str,
+                context: dict[str, Any],
+            ) -> bool:
+                fenced = self.ledger.record_closeout_mutation_start(
+                    work_id,
+                    owner=self.owner,
+                    expected_revision=leased_revision,
+                    expected_generation=lease_generation,
+                    operation=operation,
+                    context=context,
+                )
+                if not fenced:
+                    guard.cancel("closeout mutation fence rejected")
+                return fenced
+
             async def reconcile_with_guard() -> Any:
                 kwargs: dict[str, Any] = {
                     "poll_seconds": self.poll_seconds,
                     "post_merge_config": self.post_merge_config,
                     "green_unmerged_overdue_seconds": self.green_unmerged_overdue_seconds,
                     "mutation_allowed": guard.mutation_allowed,
+                    "mutation_started": fence_remote_mutation,
                     "control": guard,
                 }
                 if not reconcile_accepts_kwargs:
@@ -363,6 +380,49 @@ class TrustedCloseoutWatcher:
                 if guard.cancelled():
                     await persist_mutation_uncertainty(next_state)
                     return False
+                if closeout_terminal_eligible(next_state):
+                    stored = self.ledger.get(work_id) or leased
+                    expected_run_state = self.ledger.run_state_snapshot(stored)
+                    if (
+                        stored.get("status") in {"claimed", "agent_running"}
+                        and self.is_agent_active(stored)
+                    ):
+                        # The live model turn still owns delivery. Persist only the
+                        # terminal closeout while its exact run state remains active.
+                        released = await asyncio.to_thread(
+                            self.ledger.release_closeout,
+                            work_id,
+                            owner=self.owner,
+                            expected_revision=leased_revision,
+                            expected_generation=lease_generation,
+                            closeout_state=next_state,
+                            expected_run_state=expected_run_state,
+                        )
+                        return released is not None
+                    status = str(next_state.get("status") or "completed")
+                    summary = (
+                        "Trusted closeout completed: the PR is open and intentionally unmerged under the configured policy."
+                        if status == "pr_open"
+                        else "Trusted closeout completed: the PR merge and all configured closeout gates passed."
+                    )
+                    finalized = await asyncio.to_thread(
+                        self.ledger.finalize_successful_closeout,
+                        work_id,
+                        owner=self.owner,
+                        expected_revision=leased_revision,
+                        expected_generation=lease_generation,
+                        closeout_state=next_state,
+                        final_response=summary,
+                        expected_run_state=expected_run_state,
+                    )
+                    if finalized is None:
+                        return False
+                    callback = self.on_terminal
+                    if callback is not None:
+                        callback_result = callback(finalized)
+                        if asyncio.iscoroutine(callback_result):
+                            await callback_result
+                    return True
                 released = await asyncio.to_thread(
                     self.ledger.release_closeout,
                     work_id,
@@ -375,47 +435,6 @@ class TrustedCloseoutWatcher:
                     return False
                 if wake_immediately:
                     self.wakeup.set()
-                if closeout_terminal_eligible(released):
-                    stored = self.ledger.get(work_id) or {}
-                    expected_run_state = self.ledger.run_state_snapshot(stored)
-                    if (
-                        stored.get("status") in {"claimed", "agent_running"}
-                        and self.is_agent_active(stored)
-                    ):
-                        # The model/worker still owns delivery. Persist terminal
-                        # closeout, but never synthesize completion over a live turn.
-                        return True
-                    if stored.get("status") in {"accepted", "claimed", "agent_running"}:
-                        status = str(released.get("status") or "completed")
-                        if status == "pr_open":
-                            summary = "Trusted closeout completed: the PR is open and intentionally unmerged under the configured policy."
-                        else:
-                            summary = "Trusted closeout completed: the PR merge and all configured closeout gates passed."
-                        finalized = await asyncio.to_thread(
-                            self.ledger.mark_agent_done,
-                            work_id,
-                            final_response=summary,
-                            summary_status="Complete",
-                            expected_run_state=expected_run_state,
-                        )
-                        if not finalized:
-                            return True
-                        stored = self.ledger.get(work_id) or stored
-                        expected_run_state = self.ledger.run_state_snapshot(stored)
-                    if stored.get("status") == "summary_updated":
-                        completed = await asyncio.to_thread(
-                            self.ledger.mark_completed,
-                            work_id,
-                            expected_run_state=expected_run_state,
-                        )
-                        if not completed:
-                            return True
-                        stored = self.ledger.get(work_id) or stored
-                    callback = self.on_terminal
-                    if callback is not None:
-                        callback_result = callback(stored)
-                        if asyncio.iscoroutine(callback_result):
-                            await callback_result
                 return True
             finally:
                 guard.cancel("closeout reconciliation finished")

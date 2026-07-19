@@ -8,6 +8,7 @@ state and schedule another pass at ``next_due_at`` when needed.
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import inspect
 import json
 import re
@@ -21,6 +22,7 @@ from typing import Any, Callable, Mapping
 from agent.runtime_phase_classification import classify_runtime_phase
 from agent.runtime_spans import RuntimeSpanRecorder, sanitize_runtime_spans
 from hermes_cli.closeout_execution import (
+    CommandEffect,
     RemoteMutationUncertain,
     classify_closeout_command,
     run_closeout_command,
@@ -201,6 +203,10 @@ def _normalize_mutation_uncertainty(value: Any) -> dict[str, Any]:
     head_sha = str(raw.get("head_sha") or "").strip().lower()
     if _SHA_RE.fullmatch(head_sha):
         result["head_sha"] = head_sha
+    for key in ("branch", "base_branch", "repository"):
+        text = _bounded_text(raw.get(key), limit=240)
+        if text:
+            result[key] = text
     return result
 
 
@@ -1129,6 +1135,7 @@ def _reconcile_trusted_closeout_impl(
     green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
+    mutation_started: Callable[[str, Mapping[str, Any]], bool] | None = None,
     control: Any | None = None,
     _span_recorder: RuntimeSpanRecorder | None = None,
     _span_parent_id: str = "",
@@ -1143,6 +1150,8 @@ def _reconcile_trusted_closeout_impl(
     runner = run or _default_run
     command_count = 0
     command_count_lock = threading.Lock()
+    remote_mutation_starts: dict[str, float] = {}
+    local_branch_head = ""
 
     def ownership_allows_mutation() -> bool:
         if mutation_allowed is not None:
@@ -1183,7 +1192,38 @@ def _reconcile_trusted_closeout_impl(
             over_budget = command_count > max(1, min(_MAX_COMMANDS, int(max_commands)))
         if over_budget:
             raise RuntimeError("closeout command budget exceeded")
-        classify_closeout_command(args)
+        classified = classify_closeout_command(args)
+        if classified.effect == CommandEffect.REMOTE_MUTATION:
+            started_at = time.time() if mutation_started is not None else current_time
+            mutation_context = {
+                "at": started_at,
+                "head_sha": local_branch_head
+                or str(state.get("pr", {}).get("head_sha") or ""),
+                "branch": str(state.get("workspace", {}).get("branch") or ""),
+                "base_branch": str(
+                    state.get("workspace", {}).get("base_branch") or "main"
+                ),
+                "repository": str(
+                    state.get("workspace", {}).get("repository") or ""
+                ),
+            }
+            if mutation_started is not None:
+                try:
+                    started = mutation_started(
+                        classified.operation,
+                        mutation_context,
+                    )
+                except Exception:
+                    started = False
+                if not started:
+                    cancel = getattr(control, "cancel", None)
+                    if callable(cancel):
+                        try:
+                            cancel("closeout mutation fence rejected")
+                        except TypeError:
+                            cancel()
+                    raise RuntimeError("closeout mutation fence rejected")
+            remote_mutation_starts[classified.operation] = started_at
         kwargs: dict[str, Any] = {
             "cwd": cwd,
             "timeout": timeout,
@@ -1208,12 +1248,22 @@ def _reconcile_trusted_closeout_impl(
     def remote_mutation_uncertain(
         exc: RemoteMutationUncertain,
     ) -> CloseoutTransition:
-        state["mutation_uncertainty"] = {
+        uncertainty = {
             "status": "uncertain",
             "operation": exc.operation,
-            "at": current_time,
-            "head_sha": str(state.get("pr", {}).get("head_sha") or ""),
+            "at": remote_mutation_starts.get(exc.operation, current_time),
+            "head_sha": local_branch_head
+            or str(state.get("pr", {}).get("head_sha") or ""),
         }
+        if exc.operation == "github_pr_create":
+            uncertainty.update(
+                {
+                    "branch": branch,
+                    "base_branch": base_branch,
+                    "repository": repo,
+                }
+            )
+        state["mutation_uncertainty"] = uncertainty
         return _blocked(
             original,
             state,
@@ -1271,6 +1321,20 @@ def _reconcile_trusted_closeout_impl(
             now=current_time,
         )
 
+    def resolve_local_branch_head() -> tuple[str, subprocess.CompletedProcess[str]]:
+        nonlocal local_branch_head
+        if local_branch_head:
+            return local_branch_head, subprocess.CompletedProcess([], 0, local_branch_head, "")
+        result = execute(
+            ["git", "rev-parse", f"refs/heads/{branch}"],
+            cwd=root,
+            timeout=20,
+        )
+        candidate = str(result.stdout or "").strip().lower()
+        if result.returncode == 0 and _SHA_RE.fullmatch(candidate):
+            local_branch_head = candidate
+        return local_branch_head, result
+
     try:
         auth = execute(["gh", "auth", "status"], cwd=root, timeout=30, github=True)
     except Exception as exc:
@@ -1292,9 +1356,21 @@ def _reconcile_trusted_closeout_impl(
 
     pr_ref = _pr_ref(state)
     if not pr_ref:
-        pr_list_state = (
-            "all" if uncertain_operation() == "github_pr_create" else "open"
-        )
+        uncertain_create = uncertain_operation() == "github_pr_create"
+        pr_list_state = "all" if uncertain_create else "open"
+        expected_create_head = ""
+        if uncertain_create:
+            expected_create_head, local_head_result = resolve_local_branch_head()
+            if local_head_result.returncode != 0 or not expected_create_head:
+                return _blocked(
+                    original,
+                    state,
+                    code="pr_create_reobservation_local_head_failed",
+                    message=_detail(local_head_result, "local branch head query failed"),
+                    now=current_time,
+                    retry=True,
+                    poll_seconds=poll,
+                )
         try:
             listed = execute(
                 [
@@ -1309,10 +1385,13 @@ def _reconcile_trusted_closeout_impl(
                     base_branch,
                     "--state",
                     pr_list_state,
+                    "--limit",
+                    "20",
                     "--json",
-                    "number,url",
-                    "--jq",
-                    ".[0]",
+                    (
+                        "number,url,state,headRefOid,headRefName,baseRefName,"
+                        "headRepository,headRepositoryOwner,createdAt"
+                    ),
                 ],
                 cwd=root,
                 timeout=30,
@@ -1331,12 +1410,83 @@ def _reconcile_trusted_closeout_impl(
                 poll_seconds=poll,
             )
         try:
-            listed_payload = json.loads(listed.stdout or "null")
+            listed_payload = json.loads(listed.stdout or "[]")
         except json.JSONDecodeError:
-            listed_payload = None
-        if isinstance(listed_payload, Mapping):
-            state["pr"]["url"] = str(listed_payload.get("url") or "")[:1200]
-            state["pr"]["number"] = _bounded_text(listed_payload.get("number"), limit=32)
+            listed_payload = []
+        candidates = (
+            [item for item in listed_payload[:20] if isinstance(item, Mapping)]
+            if isinstance(listed_payload, list)
+            else [listed_payload]
+            if isinstance(listed_payload, Mapping)
+            else []
+        )
+        selected: Mapping[str, Any] | None = candidates[0] if candidates else None
+        if uncertain_create:
+            uncertainty = state.get("mutation_uncertainty")
+            uncertainty_at = (
+                _safe_float(uncertainty.get("at"))
+                if isinstance(uncertainty, Mapping)
+                else None
+            )
+            def exact_uncertain_create_match(candidate: Mapping[str, Any]) -> bool:
+                if str(candidate.get("state") or "").strip().upper() != "OPEN":
+                    return False
+                if str(candidate.get("headRefOid") or "").strip().lower() != expected_create_head:
+                    return False
+                if str(candidate.get("headRefName") or "").strip() != branch:
+                    return False
+                if str(candidate.get("baseRefName") or "").strip() != base_branch:
+                    return False
+                head_repository = candidate.get("headRepository")
+                head_owner = candidate.get("headRepositoryOwner")
+                repository_identity = ""
+                if isinstance(head_repository, Mapping):
+                    repository_identity = str(
+                        head_repository.get("nameWithOwner") or ""
+                    ).strip()
+                    if not repository_identity:
+                        repository_name = str(head_repository.get("name") or "").strip()
+                        owner_login = (
+                            str(head_owner.get("login") or "").strip()
+                            if isinstance(head_owner, Mapping)
+                            else ""
+                        )
+                        if repository_name and owner_login:
+                            repository_identity = f"{owner_login}/{repository_name}"
+                if repository_identity.lower() != repo.lower():
+                    return False
+                if uncertainty_at is not None:
+                    created_text = str(candidate.get("createdAt") or "").strip()
+                    try:
+                        created_at = dt.datetime.fromisoformat(
+                            created_text.replace("Z", "+00:00")
+                        ).timestamp()
+                    except (TypeError, ValueError):
+                        return False
+                    if created_at + 2.0 < uncertainty_at:
+                        return False
+                return True
+
+            selected = next(
+                (candidate for candidate in candidates if exact_uncertain_create_match(candidate)),
+                None,
+            )
+            if candidates and selected is None:
+                return _blocked(
+                    original,
+                    state,
+                    code="pr_create_reobservation_identity_mismatch",
+                    message=(
+                        "Branch-matched PR history did not match the fenced create "
+                        "attempt identity"
+                    ),
+                    now=current_time,
+                    retry=True,
+                    poll_seconds=poll,
+                )
+        if isinstance(selected, Mapping):
+            state["pr"]["url"] = str(selected.get("url") or "")[:1200]
+            state["pr"]["number"] = _bounded_text(selected.get("number"), limit=32)
             pr_ref = _pr_ref(state)
         clear_uncertainty("github_pr_create")
         if pr_ref:
@@ -1353,14 +1503,20 @@ def _reconcile_trusted_closeout_impl(
                 next_due_at=current_time + poll,
                 terminal=False,
             )
+        local_head, local_head_result = resolve_local_branch_head()
+        if local_head_result.returncode != 0 or not local_head:
+            return _blocked(
+                original,
+                state,
+                code="local_branch_head_failed",
+                message=_detail(local_head_result, "local branch head query failed"),
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
         push_required = True
         if uncertain_operation() == "git_push":
             try:
-                local_head_result = execute(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=root,
-                    timeout=20,
-                )
                 remote_head_result = execute(
                     [
                         "git",
@@ -1383,22 +1539,16 @@ def _reconcile_trusted_closeout_impl(
                     retry=True,
                     poll_seconds=poll,
                 )
-            if local_head_result.returncode != 0 or remote_head_result.returncode != 0:
-                detail = (
-                    _detail(local_head_result, "local head query failed")
-                    if local_head_result.returncode != 0
-                    else _detail(remote_head_result, "remote branch query failed")
-                )
+            if remote_head_result.returncode != 0:
                 return _blocked(
                     original,
                     state,
                     code="push_reobservation_failed",
-                    message=detail,
+                    message=_detail(remote_head_result, "remote branch query failed"),
                     now=current_time,
                     retry=True,
                     poll_seconds=poll,
                 )
-            local_head = str(local_head_result.stdout or "").strip().lower()
             remote_line = next(
                 (
                     line.strip()
@@ -1609,10 +1759,24 @@ def _reconcile_trusted_closeout_impl(
             now=current_time,
             read_only=state["mode"] != "enforce",
             mutation_allowed=ownership_allows_mutation,
+            mutation_started=mutation_started,
             span_recorder=_span_recorder,
             span_parent_id=_span_parent_id,
             span_attempt_id=_span_attempt_id,
         )
+        for receipt_name in ("deployment", "restart"):
+            operation = f"post_merge_{receipt_name}"
+            receipt = state["post_merge"].get(receipt_name)
+            receipt_status = (
+                str(receipt.get("status") or "").strip().lower()
+                if isinstance(receipt, Mapping)
+                else ""
+            )
+            if uncertain_operation() == operation and receipt_status in {
+                "passed",
+                "failed",
+            }:
+                clear_uncertainty(operation)
         state["canonical_sync"] = dict(state["post_merge"]["canonical_sync"])
         required_post_merge = policy["post_merge_requirements"]
         pending_receipts: list[str] = []
@@ -2080,6 +2244,7 @@ def reconcile_trusted_closeout(
     green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
+    mutation_started: Callable[[str, Mapping[str, Any]], bool] | None = None,
     control: Any | None = None,
 ) -> CloseoutTransition:
     """Perform one bounded pass and attach trusted closeout/runtime spans."""
@@ -2163,6 +2328,7 @@ def reconcile_trusted_closeout(
             green_unmerged_overdue_seconds=green_unmerged_overdue_seconds,
             max_commands=max_commands,
             mutation_allowed=mutation_allowed,
+            mutation_started=mutation_started,
             control=control,
             _span_recorder=recorder,
             _span_parent_id=pass_span.id,

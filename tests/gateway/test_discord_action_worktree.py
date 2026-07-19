@@ -843,7 +843,7 @@ async def test_direct_agent_result_cas_does_not_overwrite_replacement_run(tmp_pa
         1,
     )
 
-    assert response.startswith("stale direct result")
+    assert response is None
     stored = runner.work_ledger.get(item["id"])
     assert stored["status"] == "agent_running"
     assert stored["active_run"]["generation"] == 2

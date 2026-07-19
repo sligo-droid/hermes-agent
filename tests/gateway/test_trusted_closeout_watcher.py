@@ -536,6 +536,61 @@ async def test_terminal_closeout_never_overwrites_live_agent(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_live_terminal_closeout_release_cas_rejects_replacement_run(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    ledger.claim(item["id"])
+    ledger.mark_agent_running(
+        item["id"],
+        session_id="session-live",
+        run_generation=1,
+        owner_pid=1111,
+        process_epoch="original-process",
+    )
+    session_key = str(item["session_key"])
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "completed"
+        updated["next_due_at"] = None
+        return SimpleNamespace(state=updated)
+
+    original_release = ledger.release_closeout
+    raced = False
+
+    def race_then_release(work_id, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            assert ledger.mark_agent_running(
+                work_id,
+                session_key=session_key,
+                run_generation=2,
+                owner_pid=2222,
+                process_epoch="replacement-process",
+            )
+        return original_release(work_id, **kwargs)
+
+    monkeypatch.setattr(ledger, "release_closeout", race_then_release)
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        is_agent_active=lambda _stored: True,
+    )
+
+    assert await watcher.run_once() == 0
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 2
+    assert stored["closeout"]["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_terminal_closeout_run_state_cas_rejects_run_started_before_agent_done(
     monkeypatch,
     tmp_path,
@@ -551,7 +606,7 @@ async def test_terminal_closeout_run_state_cas_rejects_run_started_before_agent_
         updated["next_due_at"] = None
         return SimpleNamespace(state=updated)
 
-    original_mark_agent_done = ledger.mark_agent_done
+    original_finalize = ledger.finalize_successful_closeout
     raced = False
 
     def race_then_finalize(work_id, **kwargs):
@@ -565,9 +620,9 @@ async def test_terminal_closeout_run_state_cas_rejects_run_started_before_agent_
                 owner_pid=4242,
                 process_epoch="replacement-process",
             )
-        return original_mark_agent_done(work_id, **kwargs)
+        return original_finalize(work_id, **kwargs)
 
-    monkeypatch.setattr(ledger, "mark_agent_done", race_then_finalize)
+    monkeypatch.setattr(ledger, "finalize_successful_closeout", race_then_finalize)
     watcher = TrustedCloseoutWatcher(
         ledger,
         reconcile=reconcile,
@@ -575,11 +630,11 @@ async def test_terminal_closeout_run_state_cas_rejects_run_started_before_agent_
         is_agent_active=lambda _stored: False,
     )
 
-    assert await watcher.run_once() == 1
+    assert await watcher.run_once() == 0
     stored = ledger.get(item["id"])
     assert stored["status"] == "agent_running"
     assert stored["active_run"]["generation"] == 2
-    assert stored["closeout"]["status"] == "completed"
+    assert stored["closeout"]["status"] == "pending"
     assert "final_response" not in stored
     assert "summary_status" not in stored
 
@@ -603,7 +658,7 @@ async def test_terminal_closeout_run_state_cas_rejects_run_started_before_comple
         updated["next_due_at"] = None
         return SimpleNamespace(state=updated)
 
-    original_mark_completed = ledger.mark_completed
+    original_finalize = ledger.finalize_successful_closeout
     raced = False
 
     def race_then_finalize(work_id, **kwargs):
@@ -617,9 +672,9 @@ async def test_terminal_closeout_run_state_cas_rejects_run_started_before_comple
                 owner_pid=4242,
                 process_epoch="replacement-process",
             )
-        return original_mark_completed(work_id, **kwargs)
+        return original_finalize(work_id, **kwargs)
 
-    monkeypatch.setattr(ledger, "mark_completed", race_then_finalize)
+    monkeypatch.setattr(ledger, "finalize_successful_closeout", race_then_finalize)
     watcher = TrustedCloseoutWatcher(
         ledger,
         reconcile=reconcile,
@@ -627,11 +682,11 @@ async def test_terminal_closeout_run_state_cas_rejects_run_started_before_comple
         is_agent_active=lambda _stored: False,
     )
 
-    assert await watcher.run_once() == 1
+    assert await watcher.run_once() == 0
     stored = ledger.get(item["id"])
     assert stored["status"] == "agent_running"
     assert stored["active_run"]["generation"] == 3
-    assert stored["closeout"]["status"] == "completed"
+    assert stored["closeout"]["status"] == "pending"
     assert "result_message_id" not in stored
 
 
@@ -1209,6 +1264,42 @@ async def test_partial_normal_delivery_is_blocked_and_restart_does_not_replay(
     assert stored["status"] == "blocked"
     assert stored["delivery_outcome"] == "uncertain"
     assert stored["confirmed_message_ids"] == ["chunk-1"]
+
+
+@pytest.mark.asyncio
+async def test_normal_delivery_sending_fence_recovers_uncertain_without_replay(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    event = _event(message_id="normal-send-fence")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert ledger.mark_agent_done(item["id"], final_response="final response")
+    agent_done = ledger.get(item["id"])
+    expected = ledger.run_state_snapshot(agent_done)
+    assert ledger.mark_response_delivery_started(
+        item["id"],
+        expected_run_state=expected,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(_send_with_retry=AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(ledger.get(item["id"]))
+
+    stored = ledger.get(item["id"])
+    adapter._send_with_retry.assert_not_awaited()
+    assert stored["delivery_outcome"] == "uncertain"
+    assert stored["status"] == "blocked"
+    assert stored["delivery_attempt"]["status"] == "uncertain"
 
 
 @pytest.mark.asyncio

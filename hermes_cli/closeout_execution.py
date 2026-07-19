@@ -197,14 +197,33 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
             except Exception:
                 pass
     try:
-        stdout, stderr = process.communicate(timeout=1.0)
-    except subprocess.TimeoutExpired:
+        stdout, stderr = process.communicate(timeout=0.5)
+        return stdout or "", stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.output or ""
+        stderr = exc.stderr or ""
+
+    # A descendant may have inherited the pipes and kept them open even after
+    # the process-group kill. Stop waiting for EOF, close our pipe endpoints,
+    # and reap only within a fixed deadline.
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    reap_deadline = time.monotonic() + 1.0
+    while process.poll() is None and time.monotonic() < reap_deadline:
         try:
-            process.kill()
-        except Exception:
-            pass
-        stdout, stderr = process.communicate()
-    return stdout or "", stderr or ""
+            process.wait(timeout=min(0.05, reap_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                _signal_process_group(process, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    if process.poll() is None:
+        raise RuntimeError("closeout process group could not be reaped")
+    return str(stdout or ""), str(stderr or "")
 
 
 def run_closeout_command(

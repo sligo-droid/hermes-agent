@@ -24,6 +24,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import SessionSource, build_session_key
+from gateway.work_ledger import GatewayWorkLedger
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,41 @@ class TestBaseInterruptSuppression:
         await adapter._process_message_background(event, session_key)
 
         assert any(s["content"] == "Valid response" for s in adapter.sent)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_logical_send_is_durably_uncertain(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        ledger = GatewayWorkLedger()
+        event = _make_event(text="request")
+        session_key = build_session_key(event.source)
+        item = ledger.accept_event(
+            event,
+            session_key=session_key,
+            freshness_seconds=60,
+        )
+        assert ledger.mark_agent_done(item["id"], final_response="final answer")
+        event.work_item_id = item["id"]
+        event.work_item_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
+
+        class CancellingAdapter(StubAdapter):
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                raise asyncio.CancelledError
+
+        adapter = CancellingAdapter()
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="final answer"))
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._process_message_background(event, session_key)
+
+        stored = ledger.get(item["id"])
+        assert stored["status"] == "response_delivered"
+        assert stored["delivery_outcome"] == "uncertain"
+        assert stored["delivery_attempt"]["status"] == "uncertain"
+        assert stored["blocked_reason"] == "send_attempt_outcome_unknown"
 
 
 # Test 2: run.py — partial streamed output must not suppress final send

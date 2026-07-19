@@ -29,8 +29,10 @@ from hermes_cli.closeout_execution import run_closeout_command
 
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _RECEIPT_NAMES = ("canonical_sync", "ci", "deployment", "production_qa", "restart")
-_TERMINAL_STATUSES = frozenset({"passed", "failed", "blocked", "not_configured"})
-_SAFE_PROCESS_START_METHODS = ("forkserver", "spawn")
+_TERMINAL_STATUSES = frozenset(
+    {"passed", "failed", "blocked", "not_configured", "uncertain"}
+)
+_SAFE_PROCESS_START_METHODS = ("fork", "forkserver", "spawn")
 _MAX_WORKERS = 5
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -66,7 +68,7 @@ class PostMergeControl:
 class _CanonicalSyncExecution:
     """One side-effect-free classification of canonical callback execution."""
 
-    cooperative: bool
+    accepts_control: bool
     process_context: Any | None = None
     failure_code: str = ""
 
@@ -181,6 +183,7 @@ def gateway_restart_adapter(
     now_utc: Callable[[], dt.datetime] | None = None,
     runtime_max_age_s: float = 900.0,
     prior_receipt: Mapping[str, Any] | None = None,
+    reobserve_only: bool = False,
 ) -> Mapping[str, Any]:
     """Two-phase self-restart adapter bound to trusted live runtime identity."""
 
@@ -337,7 +340,7 @@ def gateway_restart_adapter(
         # and source propagation are retryable observations. Never signal an
         # unproven or replacement process a second time.
         return {
-            "status": "pending",
+            "status": "uncertain" if reobserve_only else "pending",
             "diagnostic_code": "gateway_restart_replacement_not_observed",
             "baseline_pid": baseline_pid,
             "baseline_start_time": baseline_start,
@@ -351,7 +354,15 @@ def gateway_restart_adapter(
     if not proven:
         return {"status": "blocked", "diagnostic_code": proof_code}
     if restart_requested:
-        return {"status": "pending", "diagnostic_code": "gateway_restart_in_progress"}
+        return {
+            "status": "uncertain" if reobserve_only else "pending",
+            "diagnostic_code": "gateway_restart_in_progress",
+        }
+    if reobserve_only:
+        return {
+            "status": "uncertain",
+            "diagnostic_code": "gateway_restart_reobservation_inconclusive",
+        }
 
     # Re-read and re-prove the exact live (pid, start_time) immediately before
     # signalling so a stale status file or PID reuse can never redirect SIGUSR1.
@@ -574,7 +585,7 @@ def _safe_legacy_process_context() -> Any | None:
 
 
 def _classify_canonical_sync(sync_canonical: CanonicalSync) -> _CanonicalSyncExecution:
-    """Classify cancellation support once without invoking the callback."""
+    """Require killable process isolation regardless of callback signature."""
 
     try:
         parameters = inspect.signature(sync_canonical).parameters
@@ -584,23 +595,22 @@ def _classify_canonical_sync(sync_canonical: CanonicalSync) -> _CanonicalSyncExe
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
     )
-    if accepts_control:
-        return _CanonicalSyncExecution(cooperative=True)
-    try:
-        ForkingPickler.dumps(sync_canonical)
-    except Exception:
-        return _CanonicalSyncExecution(
-            cooperative=False,
-            failure_code="canonical_sync_callback_not_picklable",
-        )
     process_context = _safe_legacy_process_context()
     if process_context is None:
         return _CanonicalSyncExecution(
-            cooperative=False,
+            accepts_control=accepts_control,
             failure_code="canonical_sync_isolation_unavailable",
         )
+    if process_context.get_start_method() != "fork":
+        try:
+            ForkingPickler.dumps(sync_canonical)
+        except Exception:
+            return _CanonicalSyncExecution(
+                accepts_control=accepts_control,
+                failure_code="canonical_sync_callback_not_picklable",
+            )
     return _CanonicalSyncExecution(
-        cooperative=False,
+        accepts_control=accepts_control,
         process_context=process_context,
     )
 
@@ -643,7 +653,7 @@ def _collect_canonical(
     enforce: bool,
     sync_canonical: CanonicalSync,
     control: PostMergeControl,
-    cooperative: bool,
+    accepts_control: bool,
     now: float,
 ) -> dict[str, Any]:
     if not canonical_path:
@@ -652,7 +662,7 @@ def _collect_canonical(
     if not control.mutation_allowed():
         return _receipt("blocked", now=now, diagnostic_code="collector_cancelled")
     try:
-        if cooperative:
+        if accepts_control:
             result = sync_canonical(
                 canonical_path,
                 branch,
@@ -684,15 +694,42 @@ def _adapter_receipt(
     control: PostMergeControl,
     now: float,
     prior_receipt: Mapping[str, Any] | None = None,
+    mutation_capable: bool = False,
 ) -> dict[str, Any]:
+    prior = dict(prior_receipt or {})
+    reobserve_only = (
+        mutation_capable
+        and str(prior.get("status") or "").strip().lower() == "uncertain"
+    )
     adapter = registry.get(adapter_name.lower()) if adapter_name else None
     if adapter is None:
+        if reobserve_only:
+            return _receipt(
+                "uncertain",
+                now=now,
+                diagnostic_code="adapter_reobservation_unsupported",
+            )
         status = "failed" if required and enforce else "not_configured"
         code = "required_adapter_missing" if status == "failed" else ""
         return _receipt(status, now=now, diagnostic_code=code)
     if not control.mutation_allowed():
-        return _receipt("blocked", now=now, diagnostic_code="collector_cancelled")
+        return _receipt(
+            "uncertain" if reobserve_only else "blocked",
+            now=now,
+            diagnostic_code=(
+                "adapter_reobservation_cancelled"
+                if reobserve_only
+                else "collector_cancelled"
+            ),
+        )
     try:
+        parameters = inspect.signature(adapter).parameters
+        if reobserve_only and "reobserve_only" not in parameters:
+            return _receipt(
+                "uncertain",
+                now=now,
+                diagnostic_code="adapter_reobservation_unsupported",
+            )
         adapter_kwargs: dict[str, Any] = {
             "target_sha": target_sha,
             "repository": repository,
@@ -701,15 +738,24 @@ def _adapter_receipt(
             "timeout_s": min(timeout_s, max(0.1, control.remaining())),
             "control": control,
         }
-        parameters = inspect.signature(adapter).parameters
+        if reobserve_only:
+            adapter_kwargs["reobserve_only"] = True
         if "prior_receipt" in parameters or any(
             parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         ):
-            adapter_kwargs["prior_receipt"] = dict(prior_receipt or {})
+            adapter_kwargs["prior_receipt"] = prior
         raw = adapter(**adapter_kwargs)
     except Exception:
-        return _receipt("failed", now=now, diagnostic_code="adapter_failed")
+        return _receipt(
+            "uncertain" if reobserve_only else "failed",
+            now=now,
+            diagnostic_code=(
+                "adapter_reobservation_failed"
+                if reobserve_only
+                else "adapter_failed"
+            ),
+        )
     data = raw if isinstance(raw, Mapping) else {}
     status = str(data.get("status") or "blocked").strip().lower()
     if status not in _TERMINAL_STATUSES and status != "pending":
@@ -750,9 +796,11 @@ def _isolated_legacy_canonical_entry(
     required: bool,
     enforce: bool,
     now: float,
+    control: PostMergeControl,
+    accepts_control: bool,
     connection: Any,
 ) -> None:
-    """Run one legacy synchronizer in a killable, independently spawned child."""
+    """Run every canonical synchronizer in a killable spawned process group."""
 
     try:
         if hasattr(os, "setsid"):
@@ -764,8 +812,8 @@ def _isolated_legacy_canonical_entry(
             required=required,
             enforce=enforce,
             sync_canonical=sync_canonical,
-            control=PostMergeControl(deadline=float("inf")),
-            cooperative=False,
+            control=control,
+            accepts_control=accepts_control,
             now=now,
         )
         connection.send(("result", receipt))
@@ -820,14 +868,20 @@ def _terminate_isolated_collector(process: Any, *, deadline: float) -> None:
                 process.kill()
             except Exception:
                 pass
-    process.join(timeout=max(0.0, deadline - time.monotonic()))
+    reap_deadline = max(deadline, time.monotonic() + 1.0)
+    while process.is_alive() and time.monotonic() < reap_deadline:
+        process.join(timeout=min(0.05, reap_deadline - time.monotonic()))
+        if process.is_alive():
+            try:
+                if hasattr(os, "killpg") and process.pid:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
     if process.is_alive():
-        # Do not let a timeout receipt escape while mutation-capable code lives.
-        try:
-            process.kill()
-        except Exception:
-            pass
-        process.join()
+        raise RuntimeError("post-merge collector process could not be reaped")
+    process.join(timeout=0)
 
 
 def collect_post_merge_receipts(
@@ -840,15 +894,16 @@ def collect_post_merge_receipts(
     max_workers: int = _MAX_WORKERS,
     read_only: bool = False,
     mutation_allowed: Callable[[], bool] | None = None,
+    mutation_started: Callable[[str, Mapping[str, Any]], bool] | None = None,
     span_recorder: RuntimeSpanRecorder | None = None,
     span_parent_id: str = "",
     span_attempt_id: str = "",
 ) -> dict[str, Any]:
     """Collect independent receipts concurrently and return one gathered update.
 
-    Canonical callbacks that accept ``control`` remain cooperative in-process
-    workers. Legacy callbacks must be picklable for ``spawn``/``forkserver``
-    isolation; dynamic callbacks fail closed rather than running in a thread.
+    Every canonical callback runs in process-group isolation. Platforms without
+    ``fork`` require a picklable callback for ``spawn``/``forkserver`` and fail
+    closed rather than falling back to an unkillable thread.
     """
 
     _discover_registered_adapters()
@@ -888,7 +943,20 @@ def collect_post_merge_receipts(
     gathered["target_sha"] = target_sha
     jobs: dict[str, Callable[[PostMergeControl], dict[str, Any]]] = {}
     isolated_jobs: set[str] = set()
+    mutation_jobs: set[str] = set()
     canonical_execution: _CanonicalSyncExecution | None = None
+    mutation_uncertainty = (
+        snapshot.get("mutation_uncertainty")
+        if isinstance(snapshot.get("mutation_uncertainty"), Mapping)
+        else {}
+    )
+    fenced_operation = (
+        str(mutation_uncertainty.get("operation") or "").strip().lower()
+        if str(mutation_uncertainty.get("status") or "").strip().lower()
+        == "uncertain"
+        else ""
+    )
+    mutation_job_scheduled = False
 
     def exact_pass(name: str) -> bool:
         prior = post_merge.get(name) if isinstance(post_merge.get(name), Mapping) else {}
@@ -915,7 +983,7 @@ def collect_post_merge_receipts(
             enforce=enforce,
             sync_canonical=synchronizer,
             control=control,
-            cooperative=canonical_execution.cooperative,
+            accepts_control=canonical_execution.accepts_control,
             now=collected_at,
         )
     if requirements.get("ci") is True and not exact_pass("ci"):
@@ -951,8 +1019,30 @@ def collect_post_merge_receipts(
             if isinstance(post_merge.get(receipt_name), Mapping)
             else {}
         )
+        mutation_capable = receipt_name in {"deployment", "restart"}
+        operation = f"post_merge_{receipt_name}"
+        reobserve_only = mutation_capable and (
+            str(prior_receipt.get("status") or "").strip().lower()
+            == "uncertain"
+            or fenced_operation == operation
+        )
+        if fenced_operation == operation:
+            prior_receipt["status"] = "uncertain"
+            prior_receipt["diagnostic_code"] = "adapter_outcome_uncertain"
+        # Only one new side-effecting adapter may run per atomic collection.
+        # Otherwise a later start could overwrite the sole durable mutation
+        # fence before the earlier adapter receipt is persisted.
+        if (
+            mutation_capable
+            and not reobserve_only
+            and mutation_started is not None
+        ):
+            if mutation_job_scheduled:
+                continue
+            mutation_job_scheduled = True
+            mutation_jobs.add(receipt_name)
         isolated_jobs.add(receipt_name)
-        jobs[receipt_name] = lambda control, registry=registry, adapter_name=adapter_name, required=required, prior_receipt=prior_receipt: _adapter_receipt(
+        jobs[receipt_name] = lambda control, registry=registry, adapter_name=adapter_name, required=required, prior_receipt=prior_receipt, mutation_capable=mutation_capable: _adapter_receipt(
             registry=registry,
             adapter_name=adapter_name,
             required=required,
@@ -965,6 +1055,7 @@ def collect_post_merge_receipts(
             control=control,
             now=collected_at,
             prior_receipt=prior_receipt,
+            mutation_capable=mutation_capable,
         )
 
     if jobs:
@@ -979,14 +1070,22 @@ def collect_post_merge_receipts(
             process_context = multiprocessing.get_context("fork")
         except ValueError:
             process_context = None
-        event_factory = process_context.Event if process_context is not None else threading.Event
-        controls = {
-            name: PostMergeControl(
+        controls: dict[str, PostMergeControl] = {}
+        for name in jobs:
+            if (
+                name == "canonical_sync"
+                and canonical_execution is not None
+                and canonical_execution.process_context is not None
+            ):
+                cancel_event = canonical_execution.process_context.Event()
+            elif name in isolated_jobs and process_context is not None:
+                cancel_event = process_context.Event()
+            else:
+                cancel_event = threading.Event()
+            controls[name] = PostMergeControl(
                 deadline=execution_deadline,
-                _cancel_event=event_factory(),
+                _cancel_event=cancel_event,
             )
-            for name in jobs
-        }
         span_handles: dict[str, Any] = {}
         span_finished: set[str] = set()
         phase_by_name = {
@@ -1022,6 +1121,7 @@ def collect_post_merge_receipts(
                 "passed": "ok",
                 "not_configured": "ok",
                 "pending": "uncertain",
+                "uncertain": "uncertain",
                 "failed": "error",
                 "blocked": "blocked",
             }.get(receipt_status, "uncertain")
@@ -1068,11 +1168,7 @@ def collect_post_merge_receipts(
 
         def start_one(name: str) -> None:
             start_span(name)
-            if (
-                name == "canonical_sync"
-                and canonical_execution is not None
-                and not canonical_execution.cooperative
-            ):
+            if name == "canonical_sync" and canonical_execution is not None:
                 if canonical_execution.failure_code:
                     finish_receipt(
                         name,
@@ -1111,6 +1207,8 @@ def collect_post_merge_receipts(
                             requirements.get("canonical_sync") is True,
                             enforce,
                             collected_at,
+                            controls[name],
+                            canonical_execution.accepts_control,
                             send,
                         ),
                         name="post-merge-canonical-sync",
@@ -1164,6 +1262,30 @@ def collect_post_merge_receipts(
                     _receipt("blocked", now=collected_at, diagnostic_code="collector_isolation_unavailable"),
                 )
                 return
+            if name in mutation_jobs and mutation_started is not None:
+                try:
+                    fenced = mutation_started(
+                        f"post_merge_{name}",
+                        {
+                            "at": time.time(),
+                            "head_sha": target_sha,
+                            "base_branch": branch,
+                            "repository": repository,
+                        },
+                    )
+                except Exception:
+                    fenced = False
+                if not fenced:
+                    controls[name].cancel()
+                    finish_receipt(
+                        name,
+                        _receipt(
+                            "blocked",
+                            now=collected_at,
+                            diagnostic_code="mutation_fence_rejected",
+                        ),
+                    )
+                    return
             receive, send = process_context.Pipe(duplex=False)
             process = process_context.Process(
                 target=_isolated_collector_entry,
@@ -1238,20 +1360,20 @@ def collect_post_merge_receipts(
         for name, (kind, worker, channel) in list(running.items()):
             controls[name].cancel()
             if kind == "thread":
-                if name == "canonical_sync":
-                    # Cooperative canonical synchronization must finish active
-                    # process-group cleanup before collection returns.
-                    worker.join()
-                else:
-                    worker.join(timeout=max(0.0, hard_deadline - time.monotonic()))
+                worker.join(timeout=max(0.0, hard_deadline - time.monotonic()))
             else:
                 _terminate_isolated_collector(worker, deadline=hard_deadline)
                 channel.close()
             finish_span_once(name, "timeout")
+            mutation_outcome_uncertain = name in {"deployment", "restart"}
             gathered[name] = _receipt(
-                "blocked",
+                "uncertain" if mutation_outcome_uncertain else "blocked",
                 now=collected_at,
-                diagnostic_code="collector_timeout",
+                diagnostic_code=(
+                    "adapter_outcome_uncertain"
+                    if mutation_outcome_uncertain
+                    else "collector_timeout"
+                ),
             )
         for name in pending:
             start_span(name)

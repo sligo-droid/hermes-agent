@@ -215,7 +215,7 @@ async def test_send_preserves_confirmed_prefix_when_later_chunk_times_out():
 
 
 @pytest.mark.asyncio
-async def test_send_zero_confirmed_transient_failure_remains_retry_safe():
+async def test_send_zero_confirmed_transient_failure_is_ambiguous_and_not_retry_safe():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     channel = SimpleNamespace(
         send=AsyncMock(side_effect=RuntimeError("httpx.ConnectError: refused"))
@@ -230,7 +230,7 @@ async def test_send_zero_confirmed_transient_failure_remains_retry_safe():
     assert result.success is False
     assert result.confirmed_message_ids == ()
     assert result.retryable is True
-    assert result.retry_safe is True
+    assert result.retry_safe is False
 
 
 @pytest.mark.asyncio
@@ -416,6 +416,28 @@ async def test_send_to_forum_create_thread_failure():
     assert result.success is False
     assert "rate limited" in result.error
 
+
+@pytest.mark.asyncio
+async def test_send_to_forum_transient_create_failure_is_ambiguous() -> None:
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.name = "ideas"
+    forum_channel.create_thread = AsyncMock(
+        side_effect=RuntimeError("httpx.ConnectError: refused")
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("999", "Hello forum!")
+
+    assert result.success is False
+    assert result.confirmed_message_ids == ()
+    assert result.retryable is True
+    assert result.retry_safe is False
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -17,6 +19,7 @@ from hermes_cli.closeout_execution import (
     CommandEffect,
     RemoteMutationUncertain,
     UnsupportedCloseoutCommand,
+    _terminate_process_group,
     classify_closeout_command,
     run_closeout_command,
 )
@@ -89,6 +92,39 @@ def _pid_exists(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_terminate_process_group_is_bounded_when_pipe_writers_remain_open() -> None:
+    stdout_read_fd, stdout_write_fd = os.pipe()
+    stderr_read_fd, stderr_write_fd = os.pipe()
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=stdout_write_fd,
+        stderr=stderr_write_fd,
+        text=True,
+        start_new_session=True,
+    )
+    # Model descendants that inherited the write ends and outlive the leader.
+    # Popen normally owns the read ends when PIPE is requested, so attach the
+    # equivalent readers while deliberately retaining both writers here.
+    process.stdout = os.fdopen(stdout_read_fd, "r", encoding="utf-8")
+    process.stderr = os.fdopen(stderr_read_fd, "r", encoding="utf-8")
+
+    started = time.monotonic()
+    try:
+        stdout, stderr = _terminate_process_group(process)
+    finally:
+        os.close(stdout_write_fd)
+        os.close(stderr_write_fd)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=1)
+
+    assert time.monotonic() - started < 2
+    assert process.poll() is not None
+    assert stdout == ""
+    assert stderr == ""
 
 
 def test_syncs_clean_checkout_and_returns_persistable_state(tmp_path: Path) -> None:
