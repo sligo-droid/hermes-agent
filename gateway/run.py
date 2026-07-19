@@ -4996,8 +4996,47 @@ class GatewayRunner:
         from hermes_cli.trusted_closeout import normalize_closeout_state
 
         state = normalize_closeout_state(item["closeout"])
-        if state["mode"] == "off" or state["source"] != "direct":
+        if state["mode"] == "off":
             return None
+
+        def notify_closeout() -> None:
+            try:
+                from gateway.trusted_closeout_watcher import mark_closeout_dirty
+
+                mark_closeout_dirty(work_item_id)
+            except Exception:
+                pass
+            watcher = getattr(self, "trusted_closeout_watcher", None)
+            if watcher is not None:
+                watcher.notify(work_item_id)
+
+        already_activated = bool(
+            item.get("closeout_authoritative") is True
+            or item.get("closeout_activated_at") is not None
+        )
+        if state["source"] != "direct":
+            if (
+                state["source"] != "fable"
+                or not already_activated
+                or visual_pending
+                or not state["policy"]["require_visual_qa"]
+            ):
+                return None
+            visual_result = (
+                agent_result.get("visual_qa")
+                if isinstance(agent_result.get("visual_qa"), dict)
+                else {}
+            )
+            applied = ledger.apply_closeout_visual_completion(
+                work_item_id,
+                expected_head_sha=str(state["pr"].get("head_sha") or ""),
+                receipts=visual_result.get("receipts"),
+                min_receipt_order=int(visual_result.get("min_receipt_order") or 0),
+            )
+            if applied is not None:
+                notify_closeout()
+            return applied
+
         runtime_breakdown = (
             agent_result.get("runtime_breakdown")
             if isinstance(agent_result.get("runtime_breakdown"), dict)
@@ -5108,21 +5147,6 @@ class GatewayRunner:
         ):
             return None
 
-        def notify_closeout() -> None:
-            try:
-                from gateway.trusted_closeout_watcher import mark_closeout_dirty
-
-                mark_closeout_dirty(work_item_id)
-            except Exception:
-                pass
-            watcher = getattr(self, "trusted_closeout_watcher", None)
-            if watcher is not None:
-                watcher.notify(work_item_id)
-
-        already_activated = bool(
-            item.get("closeout_authoritative") is True
-            or item.get("closeout_activated_at") is not None
-        )
         if already_activated:
             if not state["policy"]["require_visual_qa"] or visual_pending:
                 return state

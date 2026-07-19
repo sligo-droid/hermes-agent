@@ -1446,6 +1446,7 @@ def test_new_closeout_pushes_immutable_head_refspec_without_force(
         [
             "git",
             "push",
+            "-u",
             "origin",
             f"{HEAD_SHA}:refs/heads/feature/test",
         ]

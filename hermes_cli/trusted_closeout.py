@@ -1684,6 +1684,7 @@ def _reconcile_trusted_closeout_impl(
                     [
                         "git",
                         "push",
+                        "-u",
                         "origin",
                         f"{local_head}:refs/heads/{branch}",
                     ],

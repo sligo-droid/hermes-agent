@@ -498,6 +498,7 @@ def _direct_closeout_runner(
     mode="shadow",
     require_visual_qa=False,
     activated=False,
+    source="direct",
 ):
     captured = {}
     item = {
@@ -505,7 +506,7 @@ def _direct_closeout_runner(
         "closeout_authoritative": False,
         "closeout": {
             "revision": 4,
-            "source": "direct",
+            "source": source,
             "mode": mode,
             "workspace": {
                 "path": str(mutable),
@@ -888,6 +889,39 @@ def test_final_direct_closeout_applies_visual_to_latest_activated_revision(
     assert captured["min_receipt_order"] == 5
     assert applied["status"] == "waiting_for_ci"
     assert applied["pr"]["url"].endswith("/1")
+    assert applied["visual_qa"] == {"status": "passed", "head_sha": head_sha}
+    assert notifications == ["work-1"]
+
+
+def test_final_fable_closeout_applies_parent_visual_to_published_exact_head(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(
+        mutable,
+        mode="enforce",
+        require_visual_qa=True,
+        activated=True,
+        source="fable",
+    )
+    result = {
+        "visual_qa": {
+            "receipts": [{"status": "passed"}],
+            "min_receipt_order": 7,
+        }
+    }
+    head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+
+    applied = runner._activate_direct_closeout_after_checkpoint("work-1", result)
+
+    assert applied is not None
+    assert captured["applied_head_sha"] == head_sha
+    assert captured["min_receipt_order"] == 7
     assert applied["visual_qa"] == {"status": "passed", "head_sha": head_sha}
     assert notifications == ["work-1"]
 
