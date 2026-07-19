@@ -1197,9 +1197,6 @@ def test_uncertain_pr_create_rejects_historical_branch_match(
         calls.append(args)
         if args[:3] == ["gh", "auth", "status"]:
             return _completed(args)
-        if args[:2] == ["git", "rev-parse"]:
-            assert args == ["git", "rev-parse", "refs/heads/feature/test"]
-            return _completed(args, stdout=HEAD_SHA + "\n")
         if args[:3] == ["gh", "pr", "list"]:
             return _completed(
                 args,
@@ -1231,6 +1228,120 @@ def test_uncertain_pr_create_rejects_historical_branch_match(
     assert transition.state["errors"][-1]["code"] == (
         "pr_create_reobservation_identity_mismatch"
     )
+    assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+    assert not any(args[:2] == ["git", "rev-parse"] for args in calls)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        ("[]", "pr_create_reobservation_empty"),
+        ("{malformed", "pr_create_reobservation_invalid_json"),
+    ],
+)
+def test_uncertain_pr_create_keeps_fence_on_inconclusive_discovery(
+    monkeypatch,
+    tmp_path,
+    payload,
+    expected_code,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_create",
+        "at": 200.0,
+        "head_sha": HEAD_SHA,
+        "branch": "feature/test",
+        "base_branch": "main",
+        "repository": "acme/example",
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(args, stdout=payload)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=300, run=run)
+
+    assert transition.outcome == "pending"
+    assert transition.state["mutation_uncertainty"]["operation"] == (
+        "github_pr_create"
+    )
+    assert transition.state["errors"][-1]["code"] == expected_code
+    assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+
+
+def test_uncertain_pr_create_adopts_fenced_sha_after_local_branch_advances(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["policy"]["merge"] = "manual"
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_create",
+        "at": 200.0,
+        "head_sha": HEAD_SHA,
+        "branch": "feature/test",
+        "base_branch": "main",
+        "repository": "acme/example",
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "number": 9,
+                            "url": "https://github.com/acme/example/pull/9",
+                            "state": "OPEN",
+                            "headRefOid": HEAD_SHA,
+                            "headRefName": "feature/test",
+                            "baseRefName": "main",
+                            "headRepository": {
+                                "name": "example",
+                                "nameWithOwner": "acme/example",
+                            },
+                            "headRepositoryOwner": {"login": "acme"},
+                            "createdAt": "1970-01-01T00:03:21Z",
+                        }
+                    ]
+                ),
+            )
+        if args[:3] == ["gh", "pr", "view"]:
+            payload = _pr_payload()
+            payload.update(
+                {
+                    "number": 9,
+                    "url": "https://github.com/acme/example/pull/9",
+                }
+            )
+            return _completed(args, stdout=json.dumps(payload))
+        if args[:2] == ["git", "rev-parse"]:
+            raise AssertionError("fenced create recovery must not read advanced branch")
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=300, run=run)
+
+    assert transition.state["pr"]["number"] == "9"
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
     assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
     assert not any(args[:2] == ["git", "push"] for args in calls)
 

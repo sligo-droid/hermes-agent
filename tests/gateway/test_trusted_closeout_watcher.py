@@ -1267,6 +1267,77 @@ async def test_partial_normal_delivery_is_blocked_and_restart_does_not_replay(
 
 
 @pytest.mark.asyncio
+async def test_normal_delivery_receipt_cas_loss_stops_before_summary_update(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    event = _event(message_id="normal-receipt-cas-race")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert ledger.claim(item["id"]) is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_id="session-1",
+        run_generation=1,
+        owner_pid=1111,
+        process_epoch="first-process",
+    )
+    expected = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="final response",
+        session_id="session-1",
+        feature_summary={"message_id": "summary-1"},
+        expected_run_state=expected,
+    )
+    agent_done = ledger.get(item["id"])
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="sent-once")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+    original_mark_delivered = ledger.mark_response_delivered
+    raced = False
+
+    def race_then_mark_delivered(work_id, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            assert ledger.mark_agent_running(
+                work_id,
+                session_key=str(item["session_key"]),
+                run_generation=2,
+                owner_pid=2222,
+                process_epoch="replacement-process",
+            )
+        return original_mark_delivered(work_id, **kwargs)
+
+    monkeypatch.setattr(
+        ledger,
+        "mark_response_delivered",
+        race_then_mark_delivered,
+    )
+
+    await runner._resume_finished_discord_work_item(agent_done)
+
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 2
+    assert "summary_updated_at" not in stored
+    runner._update_discord_summaries.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_normal_delivery_sending_fence_recovers_uncertain_without_replay(
     monkeypatch,
     tmp_path,

@@ -197,6 +197,114 @@ class TestBaseInterruptSuppression:
         assert stored["delivery_attempt"]["status"] == "uncertain"
         assert stored["blocked_reason"] == "send_attempt_outcome_unknown"
 
+    @pytest.mark.asyncio
+    async def test_stale_attachment_only_response_is_fenced(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        ledger = GatewayWorkLedger()
+        event = _make_event(text="request")
+        session_key = build_session_key(event.source)
+        item = ledger.accept_event(
+            event,
+            session_key=session_key,
+            freshness_seconds=60,
+        )
+        assert ledger.mark_agent_done(item["id"], final_response="attachment")
+        event.work_item_id = item["id"]
+        event.work_item_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
+        assert ledger.mark_agent_running(
+            item["id"],
+            session_key=session_key,
+            run_generation=2,
+            owner_pid=2222,
+            process_epoch="replacement-process",
+        )
+
+        class AttachmentAdapter(StubAdapter):
+            def __init__(self):
+                super().__init__()
+                self.image_batches = []
+
+            async def send_multiple_images(
+                self,
+                chat_id,
+                images,
+                metadata=None,
+                human_delay=0.0,
+            ):
+                self.image_batches.append((chat_id, images))
+
+        adapter = AttachmentAdapter()
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(
+                0,
+                result="![chart](https://example.invalid/chart.png)",
+            )
+        )
+
+        await adapter._process_message_background(event, session_key)
+
+        assert adapter.image_batches == []
+        assert ledger.get(item["id"])["active_run"]["generation"] == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_media_only_response_is_fenced(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        audio = tmp_path / "answer.ogg"
+        audio.write_bytes(b"audio")
+        ledger = GatewayWorkLedger()
+        event = _make_event(text="request")
+        session_key = build_session_key(event.source)
+        item = ledger.accept_event(
+            event,
+            session_key=session_key,
+            freshness_seconds=60,
+        )
+        assert ledger.mark_agent_done(item["id"], final_response="media")
+        event.work_item_id = item["id"]
+        event.work_item_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
+        assert ledger.mark_agent_running(
+            item["id"],
+            session_key=session_key,
+            run_generation=2,
+            owner_pid=2222,
+            process_epoch="replacement-process",
+        )
+
+        class MediaAdapter(StubAdapter):
+            def __init__(self):
+                super().__init__()
+                self.voices = []
+
+            async def send_voice(
+                self,
+                chat_id,
+                audio_path,
+                caption=None,
+                reply_to=None,
+                metadata=None,
+            ):
+                self.voices.append((chat_id, audio_path))
+                return SendResult(success=True, message_id="voice-1")
+
+        adapter = MediaAdapter()
+        adapter.filter_media_delivery_paths = lambda values: values
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(0, result=f"MEDIA:{audio}")
+        )
+
+        await adapter._process_message_background(event, session_key)
+
+        assert adapter.voices == []
+        assert ledger.get(item["id"])["active_run"]["generation"] == 2
+
 
 # Test 2: run.py — partial streamed output must not suppress final send
 # ===================================================================

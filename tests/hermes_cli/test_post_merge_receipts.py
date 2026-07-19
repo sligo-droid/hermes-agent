@@ -5,6 +5,8 @@ import datetime as dt
 import json
 import multiprocessing
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -565,6 +567,7 @@ def test_gateway_restart_adapter_requests_restart_then_observes_exact_target(tmp
     root = tmp_path / "canonical"
     root.mkdir()
     signals = []
+    fences = []
 
     def run(args, **_kwargs):
         if args == ["git", "rev-parse", "HEAD"]:
@@ -600,6 +603,10 @@ def test_gateway_restart_adapter_requests_restart_then_observes_exact_target(tmp
         get_running_pid=lambda: 1234,
         get_process_start_time=lambda _pid: 777,
         now_utc=lambda: now,
+        mutation_started=lambda operation, context: fences.append(
+            (operation, dict(context), list(signals))
+        )
+        or True,
     )
     assert first == {
         "status": "pending",
@@ -608,6 +615,19 @@ def test_gateway_restart_adapter_requests_restart_then_observes_exact_target(tmp
         "baseline_start_time": 777,
     }
     assert signals and signals[0][0] == 1234
+    assert fences == [
+        (
+            "post_merge_restart",
+            {
+                "at": fences[0][1]["at"],
+                "head_sha": TARGET,
+                "repository": "owner/repo",
+                "baseline_pid": 1234,
+                "baseline_start_time": 777,
+            },
+            [],
+        )
+    ]
 
     # The original process reporting the target is not replacement proof.
     runtime.update(source_commit=TARGET)
@@ -823,6 +843,61 @@ def test_overdue_adapter_stops_before_timeout_receipt_can_be_persisted(tmp_path)
     }
 
 
+def test_successful_isolated_collector_reaps_returned_descendants(tmp_path):
+    child_pid = tmp_path / "returned-child.pid"
+    heartbeat = tmp_path / "returned-child.heartbeat"
+
+    def adapter(*, target_sha, **_kwargs):
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, pathlib, sys, time; "
+                    "pid=pathlib.Path(sys.argv[1]); "
+                    "heartbeat=pathlib.Path(sys.argv[2]); "
+                    "pid.write_text(str(os.getpid()), encoding='utf-8'); "
+                    "i=0; "
+                    "\nwhile True:\n"
+                    " i += 1\n"
+                    " heartbeat.write_text(str(i), encoding='utf-8')\n"
+                    " time.sleep(0.01)\n"
+                ),
+                str(child_pid),
+                str(heartbeat),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not heartbeat.exists():
+            time.sleep(0.005)
+        assert child.pid > 0
+        assert heartbeat.exists()
+        return {"status": "passed", "observed_sha": target_sha}
+
+    receipts.register_deployment_adapter("test-returned-child", adapter)
+    state = _state(tmp_path, requirements={"deployment": True})
+    state["workspace"]["canonical_path"] = ""
+
+    gathered = receipts.collect_post_merge_receipts(
+        state,
+        config={
+            "repositories": {
+                "owner/repo": {"deployment_adapter": "test-returned-child"}
+            }
+        },
+        now=100,
+    )
+
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    heartbeat_after_return = heartbeat.read_text(encoding="utf-8")
+    time.sleep(0.05)
+    assert heartbeat.read_text(encoding="utf-8") == heartbeat_after_return
+    _assert_process_dead(pid)
+    assert gathered["deployment"]["status"] == "passed"
+
+
 def test_mutation_adapter_is_fenced_before_process_start(tmp_path):
     fenced = tmp_path / "adapter-fenced"
     invoked = tmp_path / "adapter-invoked"
@@ -895,6 +970,59 @@ def test_replacement_owner_fence_forces_adapter_reobservation_only(tmp_path):
     assert observation.read_text(encoding="utf-8") == "True"
     assert starts == []
     assert gathered["deployment"]["status"] == "passed"
+
+
+def test_restart_fence_baseline_is_forwarded_to_reobservation_adapter(tmp_path):
+    observation = tmp_path / "restart-baseline-reobservation.json"
+
+    def adapter(*, target_sha, reobserve_only, prior_receipt, **_kwargs):
+        observation.write_text(
+            json.dumps(
+                {
+                    "reobserve_only": reobserve_only,
+                    "baseline_pid": prior_receipt.get("baseline_pid"),
+                    "baseline_start_time": prior_receipt.get(
+                        "baseline_start_time"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"status": "passed", "observed_sha": target_sha}
+
+    receipts.register_restart_adapter("test-fenced-restart-reobserve", adapter)
+    state = _state(tmp_path, requirements={"restart": True})
+    state["workspace"]["canonical_path"] = ""
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "post_merge_restart",
+        "at": 99,
+        "head_sha": TARGET,
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
+    }
+
+    gathered = receipts.collect_post_merge_receipts(
+        state,
+        config={
+            "repositories": {
+                "owner/repo": {
+                    "restart_adapter": "test-fenced-restart-reobserve"
+                }
+            }
+        },
+        mutation_started=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("re-observation must not start a new mutation")
+        ),
+        now=100,
+    )
+
+    assert json.loads(observation.read_text(encoding="utf-8")) == {
+        "reobserve_only": True,
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
+    }
+    assert gathered["restart"]["status"] == "passed"
 
 
 def test_new_mutation_adapters_are_fenced_one_per_atomic_collection(tmp_path):

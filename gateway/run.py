@@ -6555,6 +6555,8 @@ class GatewayRunner:
                         **expected_run_state,
                         "status": "response_delivered",
                     }
+                else:
+                    return
 
         summary_ok = await self._update_discord_summaries(
             source=event.source,
@@ -6568,11 +6570,15 @@ class GatewayRunner:
         )
         if summary_ok:
             if item.get("feature_summary") or item.get("project_summary"):
-                if ledger.mark_summary_updated(work_id):
-                    expected_run_state = {
-                        **expected_run_state,
-                        "status": "summary_updated",
-                    }
+                if not ledger.mark_summary_updated(
+                    work_id,
+                    expected_run_state=expected_run_state,
+                ):
+                    return
+                expected_run_state = {
+                    **expected_run_state,
+                    "status": "summary_updated",
+                }
             gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
             if gate and not gate.get("allowed_to_complete"):
                 ledger.mark_blocked(work_id, reason=str(gate.get("reason") or "completion_gate"))

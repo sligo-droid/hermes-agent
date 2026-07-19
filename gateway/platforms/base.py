@@ -4158,30 +4158,38 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_uncertain = False
         delivery_fenced = False
+        delivery_complete = False
         processing_outcome: Optional[ProcessingOutcome] = None
         completion_deferred = False
         handoff_spawned = False
         post_delivery_ok = True
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_uncertain
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
+                if delivery_uncertain:
+                    return
                 delivery_succeeded = True
                 self._mark_work_item_response_delivered(event, result)
                 return
             error_text = str(getattr(result, "error", "") or "")
             if (
-                get_confirmed_message_ids(result)
+                delivery_succeeded
+                or get_confirmed_message_ids(result)
                 or getattr(result, "retry_safe", None) is False
                 or self._is_timeout_error(error_text)
             ):
+                delivery_succeeded = False
+                delivery_uncertain = True
                 self._mark_work_item_delivery_uncertain(event, result)
-            else:
-                self._release_work_item_delivery_attempt(event)
+            # Definitively side-effect-free failures are released only after all
+            # components of this logical response have finished. Another media
+            # or attachment component may already have produced a side effect.
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -4314,7 +4322,13 @@ class BasePlatformAdapter(ABC):
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
-                has_response_delivery = bool(text_content)
+                has_response_delivery = bool(
+                    text_content
+                    or _tts_path
+                    or images
+                    or media_files
+                    or local_files
+                )
                 if has_response_delivery:
                     delivery_fenced = self._mark_work_item_delivery_started(event)
                     if not delivery_fenced:
@@ -4354,6 +4368,7 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        _record_delivery(tts_result)
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -4414,7 +4429,15 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(batch_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -4456,7 +4479,15 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(batch_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 for media_path, is_voice in _non_image_media:
@@ -4483,9 +4514,17 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(media_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -4495,19 +4534,32 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            local_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            local_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        _record_delivery(local_result)
                     except Exception as file_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(file_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+                if delivery_fenced:
+                    if delivery_attempted and not delivery_succeeded and not delivery_uncertain:
+                        self._release_work_item_delivery_attempt(event)
+                    delivery_complete = True
 
             # Determine overall success for the processing hook.  The hook is
             # flushed after the pending-message checks so status reactions stay
@@ -4563,7 +4615,7 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
-            if delivery_fenced and not delivery_succeeded:
+            if delivery_fenced and not delivery_complete:
                 self._mark_work_item_delivery_uncertain(event)
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
@@ -4572,6 +4624,8 @@ class BasePlatformAdapter(ABC):
             processing_outcome = outcome
             raise
         except Exception as e:
+            if delivery_fenced and not delivery_complete:
+                self._mark_work_item_delivery_uncertain(event)
             processing_outcome = ProcessingOutcome.FAILURE
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence

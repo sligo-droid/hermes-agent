@@ -2224,10 +2224,15 @@ class GatewayWorkLedger:
         return True
 
     @_locked_ledger_mutation
-    def mark_summary_updated(self, work_id: str) -> bool:
+    def mark_summary_updated(
+        self,
+        work_id: str,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         item["status"] = "summary_updated"
         item["updated_at"] = self._now()

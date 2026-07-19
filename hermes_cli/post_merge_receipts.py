@@ -184,6 +184,7 @@ def gateway_restart_adapter(
     runtime_max_age_s: float = 900.0,
     prior_receipt: Mapping[str, Any] | None = None,
     reobserve_only: bool = False,
+    mutation_started: Callable[[str, Mapping[str, Any]], bool] | None = None,
 ) -> Mapping[str, Any]:
     """Two-phase self-restart adapter bound to trusted live runtime identity."""
 
@@ -387,6 +388,25 @@ def gateway_restart_adapter(
     sigusr1 = getattr(signal, "SIGUSR1", None)
     if sigusr1 is None:
         return {"status": "blocked", "diagnostic_code": "gateway_restart_signal_unavailable"}
+    if mutation_started is not None:
+        try:
+            fenced = mutation_started(
+                "post_merge_restart",
+                {
+                    "at": time.time(),
+                    "head_sha": target,
+                    "repository": repository,
+                    "baseline_pid": latest_pid,
+                    "baseline_start_time": latest_start,
+                },
+            )
+        except Exception:
+            fenced = False
+        if not fenced:
+            return {
+                "status": "blocked",
+                "diagnostic_code": "restart_mutation_fence_rejected",
+            }
     send_signal = signal_process or os.kill
     try:
         send_signal(latest_pid, sigusr1)
@@ -695,6 +715,7 @@ def _adapter_receipt(
     now: float,
     prior_receipt: Mapping[str, Any] | None = None,
     mutation_capable: bool = False,
+    mutation_started: Callable[[str, Mapping[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     prior = dict(prior_receipt or {})
     reobserve_only = (
@@ -740,6 +761,12 @@ def _adapter_receipt(
         }
         if reobserve_only:
             adapter_kwargs["reobserve_only"] = True
+        if (
+            not reobserve_only
+            and mutation_started is not None
+            and "mutation_started" in parameters
+        ):
+            adapter_kwargs["mutation_started"] = mutation_started
         if "prior_receipt" in parameters or any(
             parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
@@ -1029,6 +1056,9 @@ def collect_post_merge_receipts(
         if fenced_operation == operation:
             prior_receipt["status"] = "uncertain"
             prior_receipt["diagnostic_code"] = "adapter_outcome_uncertain"
+            for key in ("baseline_pid", "baseline_start_time"):
+                if key in mutation_uncertainty:
+                    prior_receipt[key] = mutation_uncertainty[key]
         # Only one new side-effecting adapter may run per atomic collection.
         # Otherwise a later start could overwrite the sole durable mutation
         # fence before the earlier adapter receipt is persisted.
@@ -1056,6 +1086,7 @@ def collect_post_merge_receipts(
             now=collected_at,
             prior_receipt=prior_receipt,
             mutation_capable=mutation_capable,
+            mutation_started=mutation_started,
         )
 
     if jobs:
@@ -1330,8 +1361,10 @@ def collect_post_merge_receipts(
                     if payload is None:
                         continue
                     worker.join(timeout=max(0.0, hard_deadline - time.monotonic()))
-                    if worker.is_alive() or payload[0] != "result":
-                        _terminate_isolated_collector(worker, deadline=hard_deadline)
+                    # Always kill/reap the process group after receiving a payload.
+                    # The collector leader may have returned success while leaving
+                    # mutation-capable descendants running in the same group.
+                    _terminate_isolated_collector(worker, deadline=hard_deadline)
                     channel.close()
                 completed_names.append(name)
                 if payload[0] == "result" and isinstance(payload[1], Mapping):

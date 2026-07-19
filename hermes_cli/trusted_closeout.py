@@ -207,6 +207,14 @@ def _normalize_mutation_uncertainty(value: Any) -> dict[str, Any]:
         text = _bounded_text(raw.get(key), limit=240)
         if text:
             result[key] = text
+    try:
+        baseline_pid = int(raw.get("baseline_pid"))
+        baseline_start = int(raw.get("baseline_start_time"))
+        if baseline_pid > 0 and baseline_start >= 0:
+            result["baseline_pid"] = baseline_pid
+            result["baseline_start_time"] = baseline_start
+    except (TypeError, ValueError):
+        pass
     return result
 
 
@@ -1360,17 +1368,40 @@ def _reconcile_trusted_closeout_impl(
         pr_list_state = "all" if uncertain_create else "open"
         expected_create_head = ""
         if uncertain_create:
-            expected_create_head, local_head_result = resolve_local_branch_head()
-            if local_head_result.returncode != 0 or not expected_create_head:
-                return _blocked(
-                    original,
-                    state,
-                    code="pr_create_reobservation_local_head_failed",
-                    message=_detail(local_head_result, "local branch head query failed"),
-                    now=current_time,
-                    retry=True,
-                    poll_seconds=poll,
-                )
+            uncertainty = (
+                state.get("mutation_uncertainty")
+                if isinstance(state.get("mutation_uncertainty"), Mapping)
+                else {}
+            )
+            fenced_head = str(uncertainty.get("head_sha") or "").strip().lower()
+            if fenced_head:
+                if not _SHA_RE.fullmatch(fenced_head):
+                    return _blocked(
+                        original,
+                        state,
+                        code="pr_create_reobservation_fenced_head_invalid",
+                        message="Fenced PR-create head SHA is invalid",
+                        now=current_time,
+                        retry=True,
+                        poll_seconds=poll,
+                    )
+                expected_create_head = fenced_head
+            else:
+                # Legacy uncertainty records may predate durable head capture.
+                expected_create_head, local_head_result = resolve_local_branch_head()
+                if local_head_result.returncode != 0 or not expected_create_head:
+                    return _blocked(
+                        original,
+                        state,
+                        code="pr_create_reobservation_local_head_failed",
+                        message=_detail(
+                            local_head_result,
+                            "local branch head query failed",
+                        ),
+                        now=current_time,
+                        retry=True,
+                        poll_seconds=poll,
+                    )
         try:
             listed = execute(
                 [
@@ -1411,7 +1442,17 @@ def _reconcile_trusted_closeout_impl(
             )
         try:
             listed_payload = json.loads(listed.stdout or "[]")
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            if uncertain_create:
+                return _blocked(
+                    original,
+                    state,
+                    code="pr_create_reobservation_invalid_json",
+                    message=exc,
+                    now=current_time,
+                    retry=True,
+                    poll_seconds=poll,
+                )
             listed_payload = []
         candidates = (
             [item for item in listed_payload[:20] if isinstance(item, Mapping)]
@@ -1420,6 +1461,18 @@ def _reconcile_trusted_closeout_impl(
             if isinstance(listed_payload, Mapping)
             else []
         )
+        if uncertain_create and not candidates:
+            return _blocked(
+                original,
+                state,
+                code="pr_create_reobservation_empty",
+                message=(
+                    "PR-create re-observation returned no authoritative candidates"
+                ),
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
         selected: Mapping[str, Any] | None = candidates[0] if candidates else None
         if uncertain_create:
             uncertainty = state.get("mutation_uncertainty")
@@ -1488,8 +1541,18 @@ def _reconcile_trusted_closeout_impl(
             state["pr"]["url"] = str(selected.get("url") or "")[:1200]
             state["pr"]["number"] = _bounded_text(selected.get("number"), limit=32)
             pr_ref = _pr_ref(state)
-        clear_uncertainty("github_pr_create")
+        if uncertain_create and not pr_ref:
+            return _blocked(
+                original,
+                state,
+                code="pr_create_reobservation_identity_incomplete",
+                message="Matched PR-create observation lacked a stable PR identity",
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
         if pr_ref:
+            clear_uncertainty("github_pr_create")
             clear_uncertainty("git_push")
 
     if not pr_ref:

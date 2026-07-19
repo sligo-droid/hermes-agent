@@ -816,7 +816,11 @@ def test_work_ledger_state_transitions_record_provider_progress(tmp_path):
     assert signal["reason"] == "ledger_status_agent_running"
     assert signal["metadata"] == {"work_id": item["id"], "status": "agent_running"}
 
-    assert ledger.mark_summary_updated(item["id"]) is True
+    expected_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_summary_updated(
+        item["id"],
+        expected_run_state=expected_run_state,
+    ) is True
     signal = latest_provider_progress_signal(session_key)
     assert signal is not None
     assert signal["reason"] == "ledger_status_summary_updated"
@@ -956,6 +960,32 @@ def test_delivery_start_fence_allows_only_one_inflight_logical_send(tmp_path):
         item["id"],
         expected_run_state=expected_run_state,
     )
+
+
+def test_summary_update_rejects_stale_run_state(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="summary-run-state-cas"),
+        session_key="summary-run-state-cas",
+        freshness_seconds=60,
+    )
+    assert ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    expected_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key="summary-run-state-cas",
+        run_generation=2,
+        owner_pid=2222,
+        process_epoch="replacement-process",
+    )
+
+    assert not ledger.mark_summary_updated(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 2
 
 
 def test_ledger_persists_all_bounded_confirmed_message_ids(tmp_path):
@@ -2499,13 +2529,13 @@ def test_remote_mutation_fence_survives_replacement_lease_generation(tmp_path):
         owner="watcher-old",
         expected_revision=first["closeout"]["revision"],
         expected_generation=first["closeout"]["lease_generation"],
-        operation="github_pr_create",
+        operation="post_merge_restart",
         context={
             "at": 100.0,
             "head_sha": "a" * 40,
-            "branch": "feature/test",
-            "base_branch": "main",
             "repository": "acme/example",
+            "baseline_pid": 1234,
+            "baseline_start_time": 777,
         },
     )
 
@@ -2521,12 +2551,12 @@ def test_remote_mutation_fence_survives_replacement_lease_generation(tmp_path):
     assert replacement["closeout"]["lease_generation"] == 2
     assert replacement["closeout"]["mutation_uncertainty"] == {
         "status": "uncertain",
-        "operation": "github_pr_create",
+        "operation": "post_merge_restart",
         "at": 100.0,
         "head_sha": "a" * 40,
-        "branch": "feature/test",
-        "base_branch": "main",
         "repository": "acme/example",
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
     }
     assert "closeout_mutation_fence" not in ledger.get(item["id"])
     assert ledger.record_closeout_mutation_uncertainty(
@@ -2534,7 +2564,7 @@ def test_remote_mutation_fence_survives_replacement_lease_generation(tmp_path):
         owner="watcher-old",
         expected_revision=first["closeout"]["revision"],
         expected_generation=first["closeout"]["lease_generation"],
-        uncertainty={"status": "uncertain", "operation": "github_pr_create"},
+        uncertainty={"status": "uncertain", "operation": "post_merge_restart"},
     ) is False
 
 
