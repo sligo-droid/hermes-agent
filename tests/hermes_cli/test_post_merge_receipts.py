@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_cli import post_merge_receipts as receipts
@@ -13,6 +14,51 @@ from hermes_cli import post_merge_receipts as receipts
 
 TARGET = "a" * 40
 OTHER = "b" * 40
+
+
+def _legacy_canonical_success(canonical_path, _branch, merge_sha):
+    root = Path(canonical_path)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "legacy-pid").write_text(str(os.getpid()), encoding="utf-8")
+    return {"state": "synced", "head": merge_sha, "merge_commit": merge_sha}
+
+
+def _legacy_canonical_result_object(_canonical_path, branch, merge_sha):
+    from hermes_cli.canonical_checkout_sync import CanonicalCheckoutSyncResult
+
+    return CanonicalCheckoutSyncResult(
+        state="synced",
+        error="",
+        path="/canonical",
+        branch=branch,
+        head=merge_sha,
+        merge_commit=merge_sha,
+        synced_at="2026-07-18T00:00:00Z",
+    )
+
+
+def _legacy_canonical_timeout(canonical_path, _branch, _merge_sha):
+    root = Path(canonical_path)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "legacy-timeout-pid").write_text(str(os.getpid()), encoding="utf-8")
+    heartbeat = root / "legacy-timeout-heartbeat"
+    counter = 0
+    while True:
+        counter += 1
+        heartbeat.write_text(str(counter), encoding="utf-8")
+        time.sleep(0.005)
+
+
+def _legacy_canonical_raises(_canonical_path, _branch, _merge_sha):
+    raise RuntimeError("token=must-not-escape https://protected.invalid/canonical")
+
+
+def _assert_process_dead(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    raise AssertionError(f"isolated canonical synchronizer {pid} remained alive")
 
 
 def _state(tmp_path, *, mode="enforce", requirements=None):
@@ -127,7 +173,7 @@ def test_exact_push_ci_uses_newest_rerun_and_basic_job(tmp_path):
     gathered = receipts.collect_post_merge_receipts(
         state,
         run=run,
-        sync_canonical=lambda *_args: {"state": "synced"},
+        sync_canonical=lambda *_args, **_kwargs: {"state": "synced"},
         now=100,
     )
 
@@ -197,7 +243,7 @@ def test_registered_adapters_require_exact_observed_sha(tmp_path):
                 }
             }
         },
-        sync_canonical=lambda *_args: {"state": "synced"},
+        sync_canonical=lambda *_args, **_kwargs: {"state": "synced"},
         now=100,
     )
 
@@ -214,12 +260,12 @@ def test_missing_required_adapter_blocks_only_enforce_mode(tmp_path):
 
     enforced = receipts.collect_post_merge_receipts(
         enforce,
-        sync_canonical=lambda *_args: {"state": "synced"},
+        sync_canonical=lambda *_args, **_kwargs: {"state": "synced"},
         now=100,
     )
     observed = receipts.collect_post_merge_receipts(
         shadow,
-        sync_canonical=lambda *_args: {"state": "synced"},
+        sync_canonical=lambda *_args, **_kwargs: {"state": "synced"},
         now=100,
     )
 
@@ -252,7 +298,7 @@ def test_independent_collectors_run_concurrently_and_return_one_update(tmp_path)
                 }
             }
         },
-        sync_canonical=lambda *_args: {"state": "synced"},
+        sync_canonical=lambda *_args, **_kwargs: {"state": "synced"},
         now=100,
         max_workers=2,
     )
@@ -279,7 +325,7 @@ def test_adapter_receives_exact_target_and_bounded_timeout(tmp_path):
             "adapter_timeout_s": 1.25,
             "repositories": {"owner/repo": {"restart_adapter": "test-restart-target"}},
         },
-        sync_canonical=lambda *_args: {
+        sync_canonical=lambda *_args, **_kwargs: {
             "state": "synced",
             "head": TARGET,
             "merge_commit": TARGET,
@@ -367,7 +413,7 @@ def test_shadow_collection_observes_ci_without_mutating_adapters(tmp_path):
             }
         },
         run=run,
-        sync_canonical=lambda *_args: (_ for _ in ()).throw(
+        sync_canonical=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("shadow synchronized canonical checkout")
         ),
         now=100,
@@ -752,7 +798,7 @@ def test_overdue_adapter_stops_before_timeout_receipt_can_be_persisted(tmp_path)
             "adapter_timeout_s": 0.1,
             "repositories": {"owner/repo": {"deployment_adapter": "test-timeout-deploy"}},
         },
-        sync_canonical=lambda *_args: {"state": "synced"},
+        sync_canonical=lambda *_args, **_kwargs: {"state": "synced"},
         now=100,
         max_workers=2,
     )
@@ -810,6 +856,196 @@ def test_plugin_discovery_failure_is_retryable(monkeypatch, tmp_path):
         "observed_sha": TARGET,
     }
     assert calls == ["discover", "discover"]
+
+
+def test_cooperative_canonical_sync_is_classified_once_and_succeeds(
+    monkeypatch,
+    tmp_path,
+):
+    signature_calls = []
+    observed = {}
+    original_signature = receipts.inspect.signature
+
+    def sync_canonical(_canonical_path, _branch, merge_sha, *, control):
+        observed["pid"] = os.getpid()
+        observed["control"] = control
+        return {
+            "state": "synced",
+            "head": merge_sha,
+            "merge_commit": merge_sha,
+        }
+
+    def counted_signature(callback):
+        if callback is sync_canonical:
+            signature_calls.append(callback)
+        return original_signature(callback)
+
+    monkeypatch.setattr(receipts.inspect, "signature", counted_signature)
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        sync_canonical=sync_canonical,
+        now=100,
+    )
+
+    assert signature_calls == [sync_canonical]
+    assert observed["pid"] == os.getpid()
+    assert isinstance(observed["control"], receipts.PostMergeControl)
+    assert gathered["canonical_sync"] == {
+        "status": "passed",
+        "checked_at": 100,
+        "observed_sha": TARGET,
+    }
+
+
+def test_legacy_canonical_sync_succeeds_in_reaped_isolated_process(tmp_path):
+    canonical = tmp_path / "canonical"
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        config={"collector_timeout_s": 3},
+        sync_canonical=_legacy_canonical_success,
+        now=100,
+    )
+
+    child_pid = int((canonical / "legacy-pid").read_text(encoding="utf-8"))
+    assert child_pid != os.getpid()
+    _assert_process_dead(child_pid)
+    assert gathered["canonical_sync"] == {
+        "status": "passed",
+        "checked_at": 100,
+        "observed_sha": TARGET,
+    }
+
+
+def test_legacy_canonical_result_object_normalization_remains_compatible(tmp_path):
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        config={"collector_timeout_s": 3},
+        sync_canonical=_legacy_canonical_result_object,
+        now=100,
+    )
+
+    assert gathered["canonical_sync"] == {
+        "status": "passed",
+        "checked_at": 100,
+        "observed_sha": TARGET,
+    }
+
+
+def test_legacy_canonical_timeout_reaps_child_before_return(tmp_path):
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    began = time.monotonic()
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        config={"collector_timeout_s": 1.5},
+        sync_canonical=_legacy_canonical_timeout,
+        now=100,
+    )
+
+    pid_path = canonical / "legacy-timeout-pid"
+    heartbeat = canonical / "legacy-timeout-heartbeat"
+    assert pid_path.exists()
+    assert heartbeat.exists()
+    child_pid = int(pid_path.read_text(encoding="utf-8"))
+    heartbeat_after_return = heartbeat.read_text(encoding="utf-8")
+    _assert_process_dead(child_pid)
+    time.sleep(0.05)
+    assert heartbeat.read_text(encoding="utf-8") == heartbeat_after_return
+    assert time.monotonic() - began < 3
+    assert gathered["canonical_sync"] == {
+        "status": "blocked",
+        "checked_at": 100,
+        "diagnostic_code": "collector_timeout",
+    }
+
+
+def test_legacy_canonical_cancellation_reaps_child_before_return(tmp_path):
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    started = canonical / "legacy-timeout-pid"
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        config={"collector_timeout_s": 3},
+        sync_canonical=_legacy_canonical_timeout,
+        now=100,
+        mutation_allowed=lambda: not started.exists(),
+    )
+
+    child_pid = int(started.read_text(encoding="utf-8"))
+    heartbeat = canonical / "legacy-timeout-heartbeat"
+    heartbeat_after_return = heartbeat.read_text(encoding="utf-8")
+    _assert_process_dead(child_pid)
+    time.sleep(0.05)
+    assert heartbeat.read_text(encoding="utf-8") == heartbeat_after_return
+    assert gathered["canonical_sync"]["status"] == "blocked"
+
+
+def test_legacy_canonical_callback_exception_is_bounded_and_redacted(tmp_path):
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        config={"collector_timeout_s": 3},
+        sync_canonical=_legacy_canonical_raises,
+        now=100,
+    )
+
+    assert gathered["canonical_sync"] == {
+        "status": "failed",
+        "checked_at": 100,
+        "diagnostic_code": "canonical_sync_failed",
+    }
+    assert "must-not-escape" not in repr(gathered["canonical_sync"])
+    assert "protected.invalid" not in repr(gathered["canonical_sync"])
+
+
+def test_dynamic_legacy_canonical_callback_fails_closed_without_invocation(tmp_path):
+    called = []
+
+    def dynamic_sync(_canonical_path, _branch, merge_sha):
+        called.append(merge_sha)
+        return {
+            "state": "synced",
+            "head": merge_sha,
+            "merge_commit": merge_sha,
+        }
+
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        sync_canonical=dynamic_sync,
+        now=100,
+    )
+
+    assert called == []
+    assert gathered["canonical_sync"] == {
+        "status": "blocked",
+        "checked_at": 100,
+        "diagnostic_code": "canonical_sync_callback_not_picklable",
+    }
+
+
+def test_legacy_canonical_fails_closed_without_safe_process_start(
+    monkeypatch,
+    tmp_path,
+):
+    original_get_context = receipts.multiprocessing.get_context
+
+    def get_context(method=None):
+        if method in receipts._SAFE_PROCESS_START_METHODS:
+            raise ValueError("safe process start unavailable")
+        return original_get_context(method)
+
+    monkeypatch.setattr(receipts.multiprocessing, "get_context", get_context)
+    gathered = receipts.collect_post_merge_receipts(
+        _state(tmp_path, requirements={"canonical_sync": True}),
+        sync_canonical=_legacy_canonical_success,
+        now=100,
+    )
+
+    assert not (tmp_path / "canonical" / "legacy-pid").exists()
+    assert gathered["canonical_sync"] == {
+        "status": "blocked",
+        "checked_at": 100,
+        "diagnostic_code": "canonical_sync_isolation_unavailable",
+    }
 
 
 def test_canonical_receipt_requires_exact_observed_head_and_merge_target(tmp_path):

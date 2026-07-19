@@ -13,6 +13,7 @@ import inspect
 import json
 import multiprocessing
 import os
+from multiprocessing.reduction import ForkingPickler
 import re
 import signal
 import subprocess
@@ -29,6 +30,7 @@ from hermes_cli.github_remote import github_cli_env
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _RECEIPT_NAMES = ("canonical_sync", "ci", "deployment", "production_qa", "restart")
 _TERMINAL_STATUSES = frozenset({"passed", "failed", "blocked", "not_configured"})
+_SAFE_PROCESS_START_METHODS = ("forkserver", "spawn")
 _MAX_WORKERS = 5
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -58,6 +60,15 @@ class PostMergeControl:
         """Return false immediately once collection no longer owns mutations."""
 
         return not self.cancelled() and not self.expired()
+
+
+@dataclass(frozen=True)
+class _CanonicalSyncExecution:
+    """One side-effect-free classification of canonical callback execution."""
+
+    cooperative: bool
+    process_context: Any | None = None
+    failure_code: str = ""
 
 
 class PostMergeAdapter(Protocol):
@@ -548,40 +559,68 @@ def _collect_ci(
     return _receipt("passed", now=now, target_sha=target_sha)
 
 
-def _collect_canonical(
-    *,
-    target_sha: str,
-    canonical_path: str,
-    branch: str,
-    required: bool,
-    enforce: bool,
-    sync_canonical: CanonicalSync,
-    control: PostMergeControl,
-    now: float,
-) -> dict[str, Any]:
-    if not canonical_path:
-        status = "failed" if required and enforce else "not_configured"
-        return _receipt(status, now=now, diagnostic_code="canonical_path_missing" if status == "failed" else "")
-    if not control.mutation_allowed():
-        return _receipt("blocked", now=now, diagnostic_code="collector_cancelled")
+def _safe_legacy_process_context() -> Any | None:
+    """Return a start method with killable process-group containment."""
+
+    if not (
+        hasattr(os, "setsid")
+        and hasattr(os, "killpg")
+        and hasattr(signal, "SIGKILL")
+    ):
+        return None
+    for method in _SAFE_PROCESS_START_METHODS:
+        try:
+            return multiprocessing.get_context(method)
+        except Exception:
+            continue
+    return None
+
+
+def _classify_canonical_sync(sync_canonical: CanonicalSync) -> _CanonicalSyncExecution:
+    """Classify cancellation support once without invoking the callback."""
+
     try:
         parameters = inspect.signature(sync_canonical).parameters
-        accepts_control = "control" in parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
-        if accepts_control:
-            result = sync_canonical(
-                canonical_path,
-                branch,
-                target_sha,
-                control=control,
-            )
-        else:
-            result = sync_canonical(canonical_path, branch, target_sha)
-        data = result.as_dict() if hasattr(result, "as_dict") else dict(result) if isinstance(result, Mapping) else {}
     except Exception:
-        return _receipt("failed", now=now, diagnostic_code="canonical_sync_failed")
+        parameters = {}
+    accepts_control = "control" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_control:
+        return _CanonicalSyncExecution(cooperative=True)
+    try:
+        ForkingPickler.dumps(sync_canonical)
+    except Exception:
+        return _CanonicalSyncExecution(
+            cooperative=False,
+            failure_code="canonical_sync_callback_not_picklable",
+        )
+    process_context = _safe_legacy_process_context()
+    if process_context is None:
+        return _CanonicalSyncExecution(
+            cooperative=False,
+            failure_code="canonical_sync_isolation_unavailable",
+        )
+    return _CanonicalSyncExecution(
+        cooperative=False,
+        process_context=process_context,
+    )
+
+
+def _canonical_receipt_from_result(
+    result: Any,
+    *,
+    target_sha: str,
+    now: float,
+) -> dict[str, Any]:
+    data = (
+        result.as_dict()
+        if hasattr(result, "as_dict")
+        else dict(result)
+        if isinstance(result, Mapping)
+        else {}
+    )
     sync_state = str(data.get("state") or "").strip().lower()
     if sync_state == "not_applicable":
         return _receipt("not_configured", now=now, diagnostic_code="canonical_not_applicable")
@@ -596,6 +635,42 @@ def _collect_canonical(
     if observed_merge != target_sha:
         return _receipt("failed", now=now, diagnostic_code="canonical_merge_target_mismatch")
     return _receipt("passed", now=now, target_sha=observed_head)
+
+
+def _collect_canonical(
+    *,
+    target_sha: str,
+    canonical_path: str,
+    branch: str,
+    required: bool,
+    enforce: bool,
+    sync_canonical: CanonicalSync,
+    control: PostMergeControl,
+    cooperative: bool,
+    now: float,
+) -> dict[str, Any]:
+    if not canonical_path:
+        status = "failed" if required and enforce else "not_configured"
+        return _receipt(status, now=now, diagnostic_code="canonical_path_missing" if status == "failed" else "")
+    if not control.mutation_allowed():
+        return _receipt("blocked", now=now, diagnostic_code="collector_cancelled")
+    try:
+        if cooperative:
+            result = sync_canonical(
+                canonical_path,
+                branch,
+                target_sha,
+                control=control,
+            )
+        else:
+            result = sync_canonical(canonical_path, branch, target_sha)
+        return _canonical_receipt_from_result(
+            result,
+            target_sha=target_sha,
+            now=now,
+        )
+    except Exception:
+        return _receipt("failed", now=now, diagnostic_code="canonical_sync_failed")
 
 
 def _adapter_receipt(
@@ -670,6 +745,45 @@ def _repository_config(config: Mapping[str, Any], repository: str) -> Mapping[st
     return entry if isinstance(entry, Mapping) else {}
 
 
+def _isolated_legacy_canonical_entry(
+    sync_canonical: CanonicalSync,
+    canonical_path: str,
+    branch: str,
+    target_sha: str,
+    required: bool,
+    enforce: bool,
+    now: float,
+    connection: Any,
+) -> None:
+    """Run one legacy synchronizer in a killable, independently spawned child."""
+
+    try:
+        if hasattr(os, "setsid"):
+            os.setsid()
+        receipt = _collect_canonical(
+            target_sha=target_sha,
+            canonical_path=canonical_path,
+            branch=branch,
+            required=required,
+            enforce=enforce,
+            sync_canonical=sync_canonical,
+            control=PostMergeControl(deadline=float("inf")),
+            cooperative=False,
+            now=now,
+        )
+        connection.send(("result", receipt))
+    except BaseException:
+        try:
+            connection.send(("error", None))
+        except BaseException:
+            pass
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
 def _isolated_collector_entry(
     collector: Callable[[PostMergeControl], dict[str, Any]],
     control: PostMergeControl,
@@ -694,21 +808,21 @@ def _isolated_collector_entry(
 
 
 def _terminate_isolated_collector(process: Any, *, deadline: float) -> None:
-    """Kill and reap a timed-out collector and descendants before returning."""
+    """Kill the process group and reap its leader before returning."""
 
-    if not process.is_alive():
-        process.join(timeout=0)
-        return
     try:
         if hasattr(os, "killpg") and process.pid:
+            # A dead group leader can still have live descendants, so never skip
+            # the group kill merely because ``process.is_alive()`` is false.
             os.killpg(process.pid, signal.SIGKILL)
-        else:
+        elif process.is_alive():
             process.kill()
     except (ProcessLookupError, PermissionError, OSError):
-        try:
-            process.kill()
-        except Exception:
-            pass
+        if process.is_alive():
+            try:
+                process.kill()
+            except Exception:
+                pass
     process.join(timeout=max(0.0, deadline - time.monotonic()))
     if process.is_alive():
         # Do not let a timeout receipt escape while mutation-capable code lives.
@@ -733,7 +847,12 @@ def collect_post_merge_receipts(
     span_parent_id: str = "",
     span_attempt_id: str = "",
 ) -> dict[str, Any]:
-    """Collect independent receipts concurrently and return one gathered update."""
+    """Collect independent receipts concurrently and return one gathered update.
+
+    Canonical callbacks that accept ``control`` remain cooperative in-process
+    workers. Legacy callbacks must be picklable for ``spawn``/``forkserver``
+    isolation; dynamic callbacks fail closed rather than running in a thread.
+    """
 
     _discover_registered_adapters()
     snapshot = copy.deepcopy(dict(state))
@@ -772,6 +891,7 @@ def collect_post_merge_receipts(
     gathered["target_sha"] = target_sha
     jobs: dict[str, Callable[[PostMergeControl], dict[str, Any]]] = {}
     isolated_jobs: set[str] = set()
+    canonical_execution: _CanonicalSyncExecution | None = None
 
     def exact_pass(name: str) -> bool:
         prior = post_merge.get(name) if isinstance(post_merge.get(name), Mapping) else {}
@@ -789,6 +909,7 @@ def collect_post_merge_receipts(
             diagnostic_code="shadow_not_executed",
         )
     elif canonical_configured and not canonical_already_proven:
+        canonical_execution = _classify_canonical_sync(synchronizer)
         jobs["canonical_sync"] = lambda control: _collect_canonical(
             target_sha=target_sha,
             canonical_path=canonical_path,
@@ -797,6 +918,7 @@ def collect_post_merge_receipts(
             enforce=enforce,
             sync_canonical=synchronizer,
             control=control,
+            cooperative=canonical_execution.cooperative,
             now=collected_at,
         )
     if requirements.get("ci") is True and not exact_pass("ci"):
@@ -915,8 +1037,113 @@ def collect_post_merge_receipts(
             restart_waiting = False
         running: dict[str, tuple[str, Any, Any]] = {}
 
+        def advance_restart_after_canonical() -> None:
+            nonlocal restart_waiting
+            if not restart_waiting:
+                return
+            canonical_receipt = gathered.get("canonical_sync")
+            canonical_status = (
+                str(canonical_receipt.get("status") or "").strip().lower()
+                if isinstance(canonical_receipt, Mapping)
+                else ""
+            )
+            canonical_ready = (
+                canonical_status == "passed"
+                and _safe_sha(canonical_receipt.get("observed_sha")) == target_sha
+            ) or (
+                canonical_status == "not_configured"
+                and canonical_receipt.get("diagnostic_code")
+                == "canonical_not_applicable"
+            )
+            if canonical_ready:
+                pending.append("restart")
+            else:
+                start_span("restart")
+                finish_receipt(
+                    "restart",
+                    _receipt(
+                        "pending",
+                        now=collected_at,
+                        diagnostic_code="canonical_sync_not_ready",
+                    ),
+                )
+            restart_waiting = False
+
         def start_one(name: str) -> None:
             start_span(name)
+            if (
+                name == "canonical_sync"
+                and canonical_execution is not None
+                and not canonical_execution.cooperative
+            ):
+                if canonical_execution.failure_code:
+                    finish_receipt(
+                        name,
+                        _receipt(
+                            "blocked",
+                            now=collected_at,
+                            diagnostic_code=canonical_execution.failure_code,
+                        ),
+                    )
+                    advance_restart_after_canonical()
+                    return
+                legacy_context = canonical_execution.process_context
+                if legacy_context is None:
+                    finish_receipt(
+                        name,
+                        _receipt(
+                            "blocked",
+                            now=collected_at,
+                            diagnostic_code="canonical_sync_isolation_unavailable",
+                        ),
+                    )
+                    advance_restart_after_canonical()
+                    return
+                receive = None
+                send = None
+                process = None
+                try:
+                    receive, send = legacy_context.Pipe(duplex=False)
+                    process = legacy_context.Process(
+                        target=_isolated_legacy_canonical_entry,
+                        args=(
+                            synchronizer,
+                            canonical_path,
+                            branch,
+                            target_sha,
+                            requirements.get("canonical_sync") is True,
+                            enforce,
+                            collected_at,
+                            send,
+                        ),
+                        name="post-merge-canonical-sync",
+                    )
+                    process.start()
+                    send.close()
+                    running[name] = ("canonical_process", process, receive)
+                except Exception:
+                    if send is not None:
+                        try:
+                            send.close()
+                        except Exception:
+                            pass
+                    if receive is not None:
+                        try:
+                            receive.close()
+                        except Exception:
+                            pass
+                    if process is not None and process.is_alive():
+                        _terminate_isolated_collector(process, deadline=hard_deadline)
+                    finish_receipt(
+                        name,
+                        _receipt(
+                            "blocked",
+                            now=collected_at,
+                            diagnostic_code="canonical_sync_isolation_failed",
+                        ),
+                    )
+                    advance_restart_after_canonical()
+                return
             if name not in isolated_jobs:
                 slot: dict[str, Any] = {}
 
@@ -984,52 +1211,36 @@ def collect_post_merge_receipts(
                     if payload is None:
                         continue
                     worker.join(timeout=max(0.0, hard_deadline - time.monotonic()))
-                    if worker.is_alive():
+                    if worker.is_alive() or payload[0] != "result":
                         _terminate_isolated_collector(worker, deadline=hard_deadline)
                     channel.close()
                 completed_names.append(name)
                 if payload[0] == "result" and isinstance(payload[1], Mapping):
                     finish_receipt(name, payload[1])
                 else:
+                    failure_code = (
+                        "canonical_sync_isolation_failed"
+                        if kind == "canonical_process"
+                        else "collector_failed"
+                    )
                     finish_receipt(
                         name,
-                        _receipt("blocked", now=collected_at, diagnostic_code="collector_failed"),
+                        _receipt(
+                            "blocked",
+                            now=collected_at,
+                            diagnostic_code=failure_code,
+                        ),
                     )
             for name in completed_names:
                 running.pop(name, None)
-                if name == "canonical_sync" and restart_waiting:
-                    canonical_receipt = gathered.get("canonical_sync")
-                    canonical_status = (
-                        str(canonical_receipt.get("status") or "").strip().lower()
-                        if isinstance(canonical_receipt, Mapping)
-                        else ""
-                    )
-                    canonical_ready = (
-                        canonical_status == "passed"
-                        and _safe_sha(canonical_receipt.get("observed_sha")) == target_sha
-                    ) or (
-                        canonical_status == "not_configured"
-                        and canonical_receipt.get("diagnostic_code") == "canonical_not_applicable"
-                    )
-                    if canonical_ready:
-                        pending.append("restart")
-                    else:
-                        start_span("restart")
-                        finish_receipt(
-                            "restart",
-                            _receipt(
-                                "pending",
-                                now=collected_at,
-                                diagnostic_code="canonical_sync_not_ready",
-                            ),
-                        )
-                    restart_waiting = False
+                if name == "canonical_sync":
+                    advance_restart_after_canonical()
             if not completed_names:
                 time.sleep(min(0.005, max(0.0, execution_deadline - time.monotonic())))
 
         for name, (kind, worker, channel) in list(running.items()):
             controls[name].cancel()
-            if kind == "process":
+            if kind != "thread":
                 _terminate_isolated_collector(worker, deadline=hard_deadline)
                 channel.close()
             finish_span_once(name, "timeout")

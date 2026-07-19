@@ -1131,7 +1131,8 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
             )
         raise AssertionError(args)
 
-    def sync(path, branch, sha):
+    def sync(path, branch, sha, *, control):
+        assert control.mutation_allowed()
         sync_calls.append((path, branch, sha))
         return {"state": "synced", "head": sha, "merge_commit": sha}
 
