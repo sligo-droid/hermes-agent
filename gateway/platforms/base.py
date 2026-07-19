@@ -1485,14 +1485,48 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+_MAX_CONFIRMED_MESSAGE_IDS = 128
+_MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
+
+
+def _normalize_delivery_message_ids(values: Any) -> tuple[str, ...]:
+    """Return bounded, de-duplicated platform IDs in confirmation order."""
+
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)):
+        values = (values,)
+    try:
+        candidates = iter(values)
+    except TypeError:
+        candidates = iter((values,))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        text = "".join(
+            char for char in text if char.isalnum() or char in {"-", "_", ".", ":"}
+        )[:_MAX_DELIVERY_MESSAGE_ID_LENGTH]
+        if not text or text in seen:
+            continue
+        normalized.append(text)
+        seen.add(text)
+        if len(normalized) >= _MAX_CONFIRMED_MESSAGE_IDS:
+            break
+    return tuple(normalized)
+
+
 @dataclass
 class SendResult:
-    """Result of sending a message."""
+    """Result of sending a logical message, including confirmed side effects."""
+
     success: bool
     message_id: Optional[str] = None
     error: Optional[str] = None
     raw_response: Any = None
-    retryable: bool = False  # True for transient connection errors — base will retry automatically
+    retryable: bool = False  # True for transient connection errors — base may retry when replay is safe
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -1500,6 +1534,45 @@ class SendResult:
     # made up the full payload, in send order.  Empty tuple for the common
     # single-message case.
     continuation_message_ids: tuple = ()
+    # Every platform message whose creation is confirmed for this logical send,
+    # in send order. The tuple is bounded and immutable so partial-delivery
+    # evidence can safely cross adapter and persistence boundaries.
+    confirmed_message_ids: tuple[str, ...] = ()
+    # False means replaying the whole logical message is unsafe. None preserves
+    # compatibility with adapters that predate this field; confirmed IDs always
+    # override it and make replay unsafe.
+    retry_safe: bool | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.continuation_message_ids, tuple):
+            self.continuation_message_ids = tuple(self.continuation_message_ids or ())
+        confirmed = _normalize_delivery_message_ids(self.confirmed_message_ids)
+        if not confirmed and self.message_id:
+            confirmed = _normalize_delivery_message_ids((self.message_id,))
+        self.confirmed_message_ids = confirmed
+        if confirmed:
+            self.retry_safe = False
+
+
+def get_confirmed_message_ids(result: Any) -> tuple[str, ...]:
+    """Extract bounded confirmed side-effect IDs from old or new send results."""
+
+    if result is None:
+        return ()
+    confirmed = _normalize_delivery_message_ids(
+        getattr(result, "confirmed_message_ids", ())
+    )
+    if confirmed:
+        return confirmed
+    return _normalize_delivery_message_ids((getattr(result, "message_id", None),))
+
+
+def is_logical_send_retry_safe(result: Any) -> bool:
+    """Return whether replaying the full logical message is still safe."""
+
+    if get_confirmed_message_ids(result):
+        return False
+    return getattr(result, "retry_safe", None) is not False
 
 
 class EphemeralReply(str):
@@ -3176,6 +3249,16 @@ class BasePlatformAdapter(ABC):
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
+        # Never replay or fall back after any confirmed side effect, or when the
+        # adapter explicitly reports that whole-message replay is unsafe.
+        if not is_logical_send_retry_safe(result):
+            logger.warning(
+                "[%s] Send failed after a confirmed or ambiguous side effect; "
+                "whole-message replay is disabled",
+                self.name,
+            )
+            return result
+
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
@@ -3200,6 +3283,13 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
+                if not is_logical_send_retry_safe(result):
+                    logger.warning(
+                        "[%s] Retry produced a confirmed or ambiguous side effect; "
+                        "stopping without replay",
+                        self.name,
+                    )
+                    return result
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
@@ -3938,6 +4028,7 @@ class BasePlatformAdapter(ABC):
             result_message_id = getattr(result, "message_id", None)
             kwargs: dict[str, Any] = {
                 "result_message_id": str(result_message_id) if result_message_id else None,
+                "confirmed_message_ids": get_confirmed_message_ids(result),
             }
             expected_run_state = getattr(event, "work_item_run_state", None)
             if isinstance(expected_run_state, dict):
@@ -3957,6 +4048,7 @@ class BasePlatformAdapter(ABC):
             delivered = GatewayWorkLedger().mark_response_delivered(
                 str(work_item_id),
                 result_message_id=str(result_message_id) if result_message_id else None,
+                confirmed_message_ids=get_confirmed_message_ids(result),
             )
             expected_run_state = getattr(event, "work_item_run_state", None)
             if delivered and isinstance(expected_run_state, dict):
@@ -3966,6 +4058,40 @@ class BasePlatformAdapter(ABC):
                 }
         except Exception as exc:
             logger.warning("[%s] Failed to mark work item response delivered: %s", self.name, exc)
+
+    def _mark_work_item_delivery_uncertain(self, event: MessageEvent, result=None) -> None:
+        """Persist an unsafe or partially confirmed logical-send outcome."""
+
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            confirmed_ids = get_confirmed_message_ids(result)
+            error_text = str(getattr(result, "error", "") or "")
+            reason = (
+                "partial_send_confirmed"
+                if confirmed_ids
+                else "send_timeout_outcome_unknown"
+                if self._is_timeout_error(error_text)
+                else "send_attempt_outcome_unknown"
+            )
+            result_message_id = getattr(result, "message_id", None)
+            persisted = GatewayWorkLedger().mark_response_delivery_uncertain(
+                str(work_item_id),
+                result_message_id=str(result_message_id) if result_message_id else None,
+                confirmed_message_ids=confirmed_ids,
+                reason=reason,
+            )
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            if persisted and isinstance(expected_run_state, dict):
+                event.work_item_run_state = {
+                    **expected_run_state,
+                    "status": "response_delivered",
+                }
+        except Exception as exc:
+            logger.warning("[%s] Failed to mark work item delivery uncertain: %s", self.name, exc)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
@@ -3985,6 +4111,14 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 delivery_succeeded = True
                 self._mark_work_item_response_delivered(event, result)
+                return
+            error_text = str(getattr(result, "error", "") or "")
+            if (
+                get_confirmed_message_ids(result)
+                or getattr(result, "retry_safe", None) is False
+                or self._is_timeout_error(error_text)
+            ):
+                self._mark_work_item_delivery_uncertain(event, result)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).

@@ -931,6 +931,73 @@ def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_pa
     assert ledger.incomplete_items() == []
 
 
+def test_ledger_persists_all_bounded_confirmed_message_ids(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="multi-result"),
+        session_key="multi-result",
+        freshness_seconds=60,
+    )
+
+    assert ledger.mark_response_delivered(
+        item["id"],
+        result_message_id="chunk-1",
+        confirmed_message_ids=("chunk-1", "chunk-2", "chunk-2", "bad id!"),
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["result_message_id"] == "chunk-1"
+    assert stored["confirmed_message_ids"] == ["chunk-1", "chunk-2", "badid"]
+    assert stored["delivery_outcome"] == "delivered"
+
+
+def test_ledger_bounds_confirmed_message_id_arrays(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="bounded-results"),
+        session_key="bounded-results",
+        freshness_seconds=60,
+    )
+
+    assert ledger.mark_response_delivered(
+        item["id"],
+        result_message_id="chunk-0",
+        confirmed_message_ids=(f"chunk-{index}" for index in range(200)),
+    )
+
+    stored = ledger.get(item["id"])
+    assert len(stored["confirmed_message_ids"]) == 128
+    assert stored["confirmed_message_ids"][0] == "chunk-0"
+    assert stored["confirmed_message_ids"][-1] == "chunk-127"
+
+
+def test_ledger_partial_delivery_is_durable_uncertain_and_cannot_complete(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    item = ledger.accept_event(
+        _discord_event(message_id="partial-result"),
+        session_key="partial-result",
+        freshness_seconds=60,
+    )
+
+    assert ledger.mark_response_delivery_uncertain(
+        item["id"],
+        result_message_id="chunk-1",
+        confirmed_message_ids=("chunk-1",),
+        reason="partial_send_confirmed",
+    )
+    uncertain = ledger.get(item["id"])
+    assert uncertain["status"] == "response_delivered"
+    assert uncertain["delivery_outcome"] == "uncertain"
+    assert uncertain["confirmed_message_ids"] == ["chunk-1"]
+    assert uncertain["completion_gate"]["allowed_to_complete"] is False
+
+    assert ledger.mark_completed(item["id"])
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    assert stored["delivery_outcome"] == "uncertain"
+    assert stored["confirmed_message_ids"] == ["chunk-1"]
+
+
 def test_ledger_records_discord_board_final_response_provenance(tmp_path, monkeypatch):
     import gateway.work_ledger as work_ledger
 
@@ -2540,6 +2607,7 @@ def test_blocked_closeout_finalization_is_one_atomic_cas(tmp_path):
         "send_started_at": None,
         "send_confirmed_at": None,
         "result_message_id": None,
+        "confirmed_message_ids": [],
         "summary_updated_at": None,
     }
 

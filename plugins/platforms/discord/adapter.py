@@ -5081,6 +5081,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        message_ids: list[str] = []
         try:
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
@@ -5110,7 +5111,6 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-            message_ids = []
             reference = None
             metadata_embed = _discord_embed_for_metadata(metadata)
             metadata_reply_to_mode = ""
@@ -5206,21 +5206,31 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response=raw_response
+                raw_response=raw_response,
+                confirmed_message_ids=tuple(message_ids),
+                retry_safe=False,
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            error_text = str(e)
+            return SendResult(
+                success=False,
+                message_id=message_ids[0] if message_ids else None,
+                error=error_text,
+                raw_response={"message_ids": list(message_ids)} if message_ids else None,
+                retryable=bool(not message_ids and self._is_retryable_error(error_text)),
+                confirmed_message_ids=tuple(message_ids),
+                retry_safe=bool(not message_ids and not self._is_timeout_error(error_text)),
+            )
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
         POST to /channels/{forum_id}/threads with a thread name derived from
-        the first line of the message.  Any follow-up chunk failures are
-        reported in ``raw_response['warnings']`` so the caller can surface
-        partial-send issues.
+        the first line of the message. A failed follow-up returns the confirmed
+        prefix as an unsafe partial delivery instead of reporting success.
         """
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
@@ -5239,25 +5249,37 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
-            return SendResult(success=False, error=f"Forum thread creation failed: {e}")
+            error_text = f"Forum thread creation failed: {e}"
+            return SendResult(
+                success=False,
+                error=error_text,
+                retryable=self._is_retryable_error(error_text),
+                retry_safe=not self._is_timeout_error(error_text),
+            )
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
 
-        # Send remaining chunks into the newly created thread.  Track any
-        # per-chunk failures so the caller sees partial-send outcomes.
+        # Send remaining chunks into the newly created thread. Stop at the
+        # first failure so the retained IDs describe one contiguous prefix.
         message_ids = [message_id]
-        warnings: list[str] = []
+        chunk_error: Exception | None = None
         for chunk in chunks[1:]:
             try:
                 msg = await thread_channel.send(content=chunk)
                 message_ids.append(str(msg.id))
-            except Exception as e:
-                warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
-                logger.warning("[%s] %s", self.name, warning)
-                warnings.append(warning)
+            except Exception as exc:
+                chunk_error = exc
+                logger.warning(
+                    "[%s] Failed to send follow-up chunk to forum thread %s after %d confirmed chunks: %s",
+                    self.name,
+                    thread_id,
+                    len(message_ids),
+                    exc,
+                )
+                break
 
         plan_artifact = self._persist_plan_artifact_for_send(
             channel=thread_channel,
@@ -5272,13 +5294,23 @@ class DiscordAdapter(BasePlatformAdapter):
         raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
         if plan_artifact:
             raw_response["plan_artifact"] = plan_artifact
-        if warnings:
-            raw_response["warnings"] = warnings
+        if chunk_error is not None:
+            raw_response["partial_delivery"] = True
+            return SendResult(
+                success=False,
+                message_id=message_ids[0],
+                error=f"Forum follow-up chunk failed: {chunk_error}",
+                raw_response=raw_response,
+                confirmed_message_ids=tuple(message_ids),
+                retry_safe=False,
+            )
 
         return SendResult(
             success=True,
             message_id=message_ids[0],
             raw_response=raw_response,
+            confirmed_message_ids=tuple(message_ids),
+            retry_safe=False,
         )
 
     async def _forum_post_file(

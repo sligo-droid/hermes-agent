@@ -792,7 +792,12 @@ async def test_blocked_terminal_callback_delivers_exactly_once(monkeypatch, tmp_
     runner.work_ledger = ledger
     adapter = SimpleNamespace(
         _send_with_retry=AsyncMock(
-            return_value=SimpleNamespace(success=True, message_id="blocked-result")
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="blocked-result",
+                confirmed_message_ids=("blocked-result", "blocked-result-2"),
+                retry_safe=False,
+            )
         )
     )
     runner.adapters = {Platform.DISCORD: adapter}
@@ -808,6 +813,11 @@ async def test_blocked_terminal_callback_delivers_exactly_once(monkeypatch, tmp_
     stored = ledger.get(item["id"])
     assert stored["status"] == "blocked"
     assert stored["result_message_id"] == "blocked-result"
+    assert stored["confirmed_message_ids"] == ["blocked-result", "blocked-result-2"]
+    assert stored["terminal_delivery"]["confirmed_message_ids"] == [
+        "blocked-result",
+        "blocked-result-2",
+    ]
     assert stored["terminal_delivery"]["status"] == "completed"
     assert ledger.incomplete_items() == []
 
@@ -904,6 +914,99 @@ async def test_ambiguous_terminal_send_timeout_is_not_retried(monkeypatch, tmp_p
     assert stored["terminal_delivery"]["status"] == "uncertain"
     assert stored["terminal_delivery"]["uncertain_reason"] == "send_timeout_outcome_unknown"
     assert stored["terminal_delivery"]["summary_updated_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_partial_terminal_delivery_persists_prefix_and_restart_does_not_replay(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    blocked = _blocked_item(ledger)
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._background_tasks = set()
+    runner._terminal_delivery_retry_tasks = {}
+    adapter = SimpleNamespace(
+        _is_timeout_error=lambda _error: False,
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id="chunk-1",
+                error="connection dropped after chunk 1",
+                confirmed_message_ids=("chunk-1",),
+                retry_safe=False,
+            )
+        ),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(blocked)
+    first = ledger.get(blocked["id"])
+    await runner._resume_finished_discord_work_item(first)
+
+    stored = ledger.get(blocked["id"])
+    adapter._send_with_retry.assert_awaited_once()
+    assert runner._terminal_delivery_retry_tasks == {}
+    assert stored["delivery_outcome"] == "uncertain"
+    assert stored["confirmed_message_ids"] == ["chunk-1"]
+    assert stored["terminal_delivery"]["confirmed_message_ids"] == ["chunk-1"]
+    assert stored["terminal_delivery"]["uncertain_reason"] == "partial_send_confirmed"
+    assert stored["terminal_delivery"]["status"] == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_partial_normal_delivery_is_blocked_and_restart_does_not_replay(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    event = _event(message_id="partial-normal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert ledger.claim(item["id"]) is not None
+    assert ledger.mark_agent_running(item["id"], session_id="session-1")
+    expected = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="a long final response",
+        session_id="session-1",
+        expected_run_state=expected,
+    )
+    agent_done = ledger.get(item["id"])
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _is_timeout_error=lambda _error: False,
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id="chunk-1",
+                error="later chunk failed",
+                confirmed_message_ids=("chunk-1",),
+                retry_safe=False,
+            )
+        ),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(agent_done)
+    first = ledger.get(item["id"])
+    await runner._resume_finished_discord_work_item(first)
+
+    stored = ledger.get(item["id"])
+    adapter._send_with_retry.assert_awaited_once()
+    assert stored["status"] == "blocked"
+    assert stored["delivery_outcome"] == "uncertain"
+    assert stored["confirmed_message_ids"] == ["chunk-1"]
 
 
 @pytest.mark.asyncio

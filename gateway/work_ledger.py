@@ -55,6 +55,50 @@ _RUN_STATE_TEXT_LIMIT = 240
 _RUN_STATE_EPOCH_LIMIT = 160
 _RUN_STATE_INT_LIMIT = (1 << 63) - 1
 _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
+_MAX_CONFIRMED_MESSAGE_IDS = 128
+_MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
+
+
+def _bounded_delivery_message_ids(
+    values: Any = None,
+    *,
+    primary: Any = None,
+) -> tuple[str, ...]:
+    """Sanitize and bound durable platform message IDs in confirmation order."""
+
+    if values is None:
+        values = ()
+    elif isinstance(values, (str, bytes)):
+        values = (values,)
+    try:
+        candidates = iter(values)
+    except TypeError:
+        candidates = iter((values,))
+
+    def _sanitize(value: Any) -> str:
+        text = str(value or "").strip()
+        return "".join(
+            char for char in text if char.isalnum() or char in {"-", "_", ".", ":"}
+        )[:_MAX_DELIVERY_MESSAGE_ID_LENGTH]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        text = _sanitize(value)
+        if not text or text in seen:
+            continue
+        normalized.append(text)
+        seen.add(text)
+        if len(normalized) >= _MAX_CONFIRMED_MESSAGE_IDS:
+            break
+    primary_text = _sanitize(primary)
+    if (
+        primary_text
+        and primary_text not in seen
+        and len(normalized) < _MAX_CONFIRMED_MESSAGE_IDS
+    ):
+        normalized.append(primary_text)
+    return tuple(normalized)
 
 
 _PROJECT_SOURCE_KEYS = frozenset(
@@ -1297,6 +1341,7 @@ class GatewayWorkLedger:
                         "send_started_at": None,
                         "send_confirmed_at": None,
                         "result_message_id": None,
+                        "confirmed_message_ids": [],
                         "summary_updated_at": None,
                     },
                 }
@@ -1340,6 +1385,7 @@ class GatewayWorkLedger:
             send_was_confirmed = bool(
                 delivery.get("send_confirmed_at")
                 or str(delivery.get("result_message_id") or "").strip()
+                or _bounded_delivery_message_ids(delivery.get("confirmed_message_ids"))
             )
             if status == "sending" and not send_was_confirmed:
                 next_delivery.update(
@@ -1381,6 +1427,7 @@ class GatewayWorkLedger:
                 or float(delivery.get("lease_until") or 0) <= now
                 or delivery.get("send_confirmed_at") is not None
                 or bool(str(delivery.get("result_message_id") or "").strip())
+                or bool(_bounded_delivery_message_ids(delivery.get("confirmed_message_ids")))
             ):
                 return False
             attempt_count = _positive_int(delivery.get("attempt_count")) + 1
@@ -1406,6 +1453,7 @@ class GatewayWorkLedger:
         *,
         owner: str,
         result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
     ) -> bool:
         with _ledger_file_lock(self.path):
             data = self._read()
@@ -1420,7 +1468,14 @@ class GatewayWorkLedger:
                 return False
             now = self._now()
             next_delivery = dict(delivery)
-            message_id = str(result_message_id or "").strip()
+            confirmed_ids = _bounded_delivery_message_ids(
+                confirmed_message_ids,
+                primary=result_message_id,
+            )
+            primary_ids = _bounded_delivery_message_ids((result_message_id,))
+            message_id = primary_ids[0] if primary_ids else confirmed_ids[0] if confirmed_ids else ""
+            next_delivery["confirmed_message_ids"] = list(confirmed_ids)
+            item["confirmed_message_ids"] = list(confirmed_ids)
             if message_id:
                 next_delivery["result_message_id"] = message_id
                 item["result_message_id"] = message_id
@@ -1444,6 +1499,8 @@ class GatewayWorkLedger:
         *,
         owner: str,
         reason: str = "send_attempt_outcome_unknown",
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
     ) -> bool:
         """Fail closed after an attempted send whose durable receipt is unavailable."""
 
@@ -1460,6 +1517,17 @@ class GatewayWorkLedger:
                 return False
             now = self._now()
             next_delivery = dict(delivery)
+            confirmed_ids = _bounded_delivery_message_ids(
+                confirmed_message_ids,
+                primary=result_message_id,
+            )
+            if confirmed_ids:
+                next_delivery["confirmed_message_ids"] = list(confirmed_ids)
+                item["confirmed_message_ids"] = list(confirmed_ids)
+                primary_ids = _bounded_delivery_message_ids((result_message_id,))
+                message_id = primary_ids[0] if primary_ids else confirmed_ids[0]
+                next_delivery["result_message_id"] = message_id
+                item["result_message_id"] = message_id
             next_delivery.update(
                 {
                     "status": "uncertain",
@@ -1660,6 +1728,9 @@ class GatewayWorkLedger:
             "blocked_at",
             "blocked_reason",
             "completion_gate",
+            "confirmed_message_ids",
+            "delivery_outcome",
+            "delivery_uncertain_at",
             "final_response",
             "provider_no_progress",
             "result_message_id",
@@ -1772,20 +1843,82 @@ class GatewayWorkLedger:
         return True
 
     @_locked_ledger_mutation
-    def mark_response_delivered(self, work_id: str, *, result_message_id: str | None = None) -> bool:
+    def mark_response_delivered(
+        self,
+        work_id: str,
+        *,
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+    ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
             return False
         item["status"] = "response_delivered"
         item["updated_at"] = self._now()
-        if result_message_id:
-            item["result_message_id"] = str(result_message_id)
+        item["delivery_outcome"] = "delivered"
+        item.pop("delivery_uncertain_at", None)
+        confirmed_ids = _bounded_delivery_message_ids(
+            confirmed_message_ids,
+            primary=result_message_id,
+        )
+        if confirmed_ids:
+            item["confirmed_message_ids"] = list(confirmed_ids)
+        primary_ids = _bounded_delivery_message_ids((result_message_id,))
+        message_id = primary_ids[0] if primary_ids else confirmed_ids[0] if confirmed_ids else ""
+        if message_id:
+            item["result_message_id"] = message_id
         _record_discord_board_final_response(
             item,
-            result_message_id=str(result_message_id) if result_message_id else None,
+            result_message_id=message_id or None,
         )
         _record_provider_progress(item, "ledger_status_response_delivered", status="response_delivered")
+        self._write(data)
+        return True
+
+    @_locked_ledger_mutation
+    def mark_response_delivery_uncertain(
+        self,
+        work_id: str,
+        *,
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+        reason: str = "send_attempt_outcome_unknown",
+    ) -> bool:
+        """Persist an unsafe logical send without allowing automatic replay."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return False
+        now = self._now()
+        confirmed_ids = _bounded_delivery_message_ids(
+            confirmed_message_ids,
+            primary=result_message_id,
+        )
+        primary_ids = _bounded_delivery_message_ids((result_message_id,))
+        message_id = primary_ids[0] if primary_ids else confirmed_ids[0] if confirmed_ids else ""
+        item.update(
+            {
+                "status": "response_delivered",
+                "updated_at": now,
+                "delivery_outcome": "uncertain",
+                "delivery_uncertain_at": now,
+                "confirmed_message_ids": list(confirmed_ids),
+                "summary_status": "Blocked",
+                "blocked_reason": str(reason or "send_attempt_outcome_unknown")[:120],
+                "completion_gate": {
+                    "allowed_to_complete": False,
+                    "summary_status": "Blocked",
+                    "terminal_status": "blocked",
+                    "reason": str(reason or "send_attempt_outcome_unknown")[:120],
+                },
+            }
+        )
+        if message_id:
+            item["result_message_id"] = message_id
+        _record_discord_board_final_response(item, result_message_id=message_id or None)
+        _record_provider_progress(item, "ledger_delivery_uncertain", status="response_delivered")
         self._write(data)
         return True
 
@@ -1808,12 +1941,21 @@ class GatewayWorkLedger:
         work_id: str,
         *,
         result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
         expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
+        confirmed_ids = _bounded_delivery_message_ids(
+            confirmed_message_ids,
+            primary=result_message_id,
+        )
+        if confirmed_ids:
+            item["confirmed_message_ids"] = list(confirmed_ids)
+            primary_ids = _bounded_delivery_message_ids((result_message_id,))
+            item["result_message_id"] = primary_ids[0] if primary_ids else confirmed_ids[0]
         if item.get("closeout_authoritative") is True and isinstance(item.get("closeout"), dict):
             from hermes_cli.trusted_closeout import closeout_terminal_eligible, normalize_closeout_state
 
@@ -1830,15 +1972,11 @@ class GatewayWorkLedger:
             item["summary_status"] = str(gate.get("summary_status") or "Blocked")
             item["updated_at"] = self._now()
             item["blocked_at"] = item["updated_at"]
-            if result_message_id:
-                item["result_message_id"] = str(result_message_id)
             _record_provider_progress(item, "ledger_status_blocked", status=str(item["status"]))
             self._write(data)
             return True
         item["status"] = "completed"
         item["updated_at"] = self._now()
-        if result_message_id:
-            item["result_message_id"] = str(result_message_id)
         _record_provider_progress(item, "ledger_status_completed", status="completed")
         self._write(data)
         return True

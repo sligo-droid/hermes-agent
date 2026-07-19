@@ -206,6 +206,54 @@ class TestSendWithRetryNetworkRetry:
         assert len(adapter._send_calls) == 3
         assert "plain text" in adapter._send_calls[-1][1].lower()
 
+    @pytest.mark.asyncio
+    async def test_confirmed_prefix_disables_retry_and_plaintext_fallback(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                message_id="chunk-1",
+                error="httpx.ConnectError: connection dropped",
+                retryable=True,
+                confirmed_message_ids=("chunk-1",),
+                retry_safe=False,
+            ),
+            SendResult(success=True, message_id="duplicate"),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "long response", max_retries=2)
+
+        assert result.success is False
+        assert result.confirmed_message_ids == ("chunk-1",)
+        assert len(adapter._send_calls) == 1
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_stops_if_retry_attempt_confirms_prefix(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="ConnectError", retryable=True),
+            SendResult(
+                success=False,
+                message_id="chunk-1",
+                error="ConnectError",
+                retryable=True,
+                confirmed_message_ids=("chunk-1",),
+                retry_safe=False,
+            ),
+            SendResult(success=True, message_id="duplicate"),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry(
+                "chat1", "long response", max_retries=2, base_delay=0
+            )
+
+        assert result.success is False
+        assert result.confirmed_message_ids == ("chunk-1",)
+        assert len(adapter._send_calls) == 2
+
 
 # ---------------------------------------------------------------------------
 # _send_with_retry — all retries exhausted → user notification

@@ -1790,6 +1790,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
+    get_confirmed_message_ids,
+    is_logical_send_retry_safe,
     merge_pending_message_event,
 )
 from gateway.restart import (
@@ -6283,6 +6285,7 @@ class GatewayRunner:
             send_confirmed = bool(
                 delivery.get("send_confirmed_at")
                 or str(delivery.get("result_message_id") or "").strip()
+                or delivery.get("confirmed_message_ids")
             )
             if final_response and delivery_status != "uncertain" and not send_confirmed:
                 began = await asyncio.to_thread(
@@ -6329,15 +6332,32 @@ class GatewayRunner:
                     if not getattr(result, "success", False):
                         error_text = str(getattr(result, "error", "") or "")
                         timeout_check = getattr(adapter, "_is_timeout_error", None)
-                        ambiguous_failure = bool(
+                        timed_out = bool(
                             callable(timeout_check) and timeout_check(error_text)
                         )
-                        if ambiguous_failure:
+                        confirmed_ids = get_confirmed_message_ids(result)
+                        unsafe_failure = bool(
+                            confirmed_ids
+                            or not is_logical_send_retry_safe(result)
+                            or timed_out
+                        )
+                        if unsafe_failure:
+                            reason = (
+                                "partial_send_confirmed"
+                                if confirmed_ids
+                                else "send_timeout_outcome_unknown"
+                                if timed_out
+                                else "send_attempt_outcome_unknown"
+                            )
                             uncertain = await asyncio.to_thread(
                                 ledger.mark_terminal_delivery_uncertain,
                                 work_id,
                                 owner=delivery_owner,
-                                reason="send_timeout_outcome_unknown",
+                                reason=reason,
+                                result_message_id=(
+                                    str(getattr(result, "message_id", "") or "") or None
+                                ),
+                                confirmed_message_ids=confirmed_ids,
                             )
                             if not uncertain:
                                 return
@@ -6363,6 +6383,7 @@ class GatewayRunner:
                                 result_message_id=(
                                     str(getattr(result, "message_id", "") or "") or None
                                 ),
+                                confirmed_message_ids=get_confirmed_message_ids(result),
                             )
                         except Exception:
                             # Crash-window injection and real persistence failures
@@ -6446,10 +6467,41 @@ class GatewayRunner:
                         work_id,
                         getattr(result, "error", None),
                     )
-                    return
-                if ledger.mark_response_delivered(
+                    error_text = str(getattr(result, "error", "") or "")
+                    timeout_check = getattr(adapter, "_is_timeout_error", None)
+                    timed_out = bool(callable(timeout_check) and timeout_check(error_text))
+                    confirmed_ids = get_confirmed_message_ids(result)
+                    if not (
+                        confirmed_ids
+                        or not is_logical_send_retry_safe(result)
+                        or timed_out
+                    ):
+                        return
+                    reason = (
+                        "partial_send_confirmed"
+                        if confirmed_ids
+                        else "send_timeout_outcome_unknown"
+                        if timed_out
+                        else "send_attempt_outcome_unknown"
+                    )
+                    if not ledger.mark_response_delivery_uncertain(
+                        work_id,
+                        result_message_id=(
+                            str(getattr(result, "message_id", "") or "") or None
+                        ),
+                        confirmed_message_ids=confirmed_ids,
+                        reason=reason,
+                    ):
+                        return
+                    item = ledger.get(work_id) or item
+                    expected_run_state = {
+                        **expected_run_state,
+                        "status": "response_delivered",
+                    }
+                elif ledger.mark_response_delivered(
                     work_id,
                     result_message_id=str(getattr(result, "message_id", "") or "") or None,
+                    confirmed_message_ids=get_confirmed_message_ids(result),
                 ):
                     expected_run_state = {
                         **expected_run_state,
