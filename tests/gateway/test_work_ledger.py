@@ -2460,6 +2460,97 @@ def test_visual_completion_is_sanitized_and_late_h_receipt_is_rejected_after_h2(
     assert ledger.get(item["id"]) == before
 
 
+def test_verified_h2_publication_invalidates_h_gates_and_active_lease(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(
+        message_id="closeout-publish-h2",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    head_sha = "d" * 40
+    activated = _activated_visual_closeout(ledger, item, head_sha=head_sha)
+    prior = dict(activated)
+    prior["policy"] = {**prior["policy"], "require_review": True}
+    prior["review"] = {"status": "approved", "head_sha": head_sha}
+    prior["visual_qa"] = {"status": "passed", "head_sha": head_sha}
+    prior["ci"] = {
+        **prior["ci"],
+        "head_sha": head_sha,
+        "status": "passed",
+        "wait_state": "complete",
+    }
+    prior["pr"] = {
+        **prior["pr"],
+        "head_sha": head_sha,
+        "merge_sha": "f" * 40,
+        "ready_at": 90.0,
+        "merge_attempted_head_sha": head_sha,
+    }
+    prior["post_merge"] = {
+        **prior["post_merge"],
+        "target_sha": "f" * 40,
+    }
+    prior["mutation_uncertainty"] = {
+        "operation": "git_push",
+        "head_sha": head_sha,
+        "started_at": 90.0,
+    }
+    updated = ledger.update_closeout(
+        item["id"],
+        prior,
+        expected_revision=activated["revision"],
+    )
+    assert updated is not None
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-h",
+        lease_seconds=30,
+        expected_revision=updated["revision"],
+    )
+    assert leased is not None
+    head_sha_2 = "e" * 40
+
+    published = ledger.publish_closeout_verified_head(
+        item["id"],
+        expected_head_sha=head_sha,
+        verified_head_sha=head_sha_2,
+    )
+
+    assert published is not None
+    assert published["revision"] == leased["closeout"]["revision"] + 1
+    assert published["lease_generation"] == leased["closeout"]["lease_generation"] + 1
+    assert published["lease"] == {"owner": "", "until": None}
+    assert published["local_verification"] == {
+        "status": "passed",
+        "head_sha": head_sha_2,
+    }
+    assert published["review"] == {"status": "stale"}
+    assert published["visual_qa"] == {"status": "pending", "head_sha": head_sha_2}
+    assert published["ci"]["head_sha"] == head_sha_2
+    assert published["ci"]["status"] == "not_checked"
+    assert published["pr"]["merge_sha"] == ""
+    assert published["pr"]["ready_at"] is None
+    assert published["post_merge"]["target_sha"] == ""
+    assert published["mutation_uncertainty"] == {}
+    assert ledger.publish_closeout_verified_head(
+        item["id"],
+        expected_head_sha=head_sha,
+        verified_head_sha="f" * 40,
+    ) is None
+    assert ledger.apply_closeout_visual_completion(
+        item["id"],
+        expected_head_sha=head_sha,
+        receipts=[_visual_receipt(item["visual_qa_requirement"], order=6)],
+        min_receipt_order=6,
+    ) is None
+
+
 def test_leased_h_receipt_is_discarded_when_watcher_reconciles_h2(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     event = _discord_event(

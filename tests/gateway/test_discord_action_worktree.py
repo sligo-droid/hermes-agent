@@ -542,6 +542,30 @@ def _direct_closeout_runner(
             )
             return {**state, "revision": expected_revision + 1}
 
+        def publish_closeout_verified_head(
+            self,
+            work_id,
+            *,
+            expected_head_sha,
+            verified_head_sha,
+        ):
+            captured.update(
+                work_id=work_id,
+                published_from_head_sha=expected_head_sha,
+                published_head_sha=verified_head_sha,
+            )
+            state = dict(item["closeout"])
+            state["local_verification"] = {
+                "status": "passed",
+                "head_sha": verified_head_sha,
+            }
+            state["pr"] = {**state["pr"], "head_sha": verified_head_sha}
+            state["ci"] = {"status": "not_checked", "head_sha": verified_head_sha}
+            state["visual_qa"] = {"status": "pending", "head_sha": verified_head_sha}
+            state["revision"] = int(state.get("revision") or 0) + 1
+            item["closeout"] = state
+            return state
+
         def apply_closeout_visual_completion(
             self,
             work_id,
@@ -891,6 +915,42 @@ def test_final_direct_closeout_applies_visual_to_latest_activated_revision(
     assert applied["pr"]["url"].endswith("/1")
     assert applied["visual_qa"] == {"status": "passed", "head_sha": head_sha}
     assert notifications == ["work-1"]
+
+
+def test_final_direct_closeout_publishes_new_verified_head_before_visual(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    runner, captured, notifications = _direct_closeout_runner(
+        mutable,
+        mode="enforce",
+        require_visual_qa=True,
+        activated=True,
+    )
+    first_head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+    (mutable / "visual-correction.txt").write_text("corrected\n", encoding="utf-8")
+    _run(mutable, "add", "visual-correction.txt")
+    _run(mutable, "commit", "-m", "visual correction")
+    second_head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+    result = _successful_verification_result(mutable)
+    result["visual_qa"] = {
+        "receipts": [{"status": "passed"}],
+        "min_receipt_order": 8,
+    }
+
+    applied = runner._activate_direct_closeout_after_checkpoint("work-1", result)
+
+    assert applied is not None
+    assert captured["published_from_head_sha"] == first_head_sha
+    assert captured["published_head_sha"] == second_head_sha
+    assert captured["applied_head_sha"] == second_head_sha
+    assert applied["visual_qa"] == {"status": "passed", "head_sha": second_head_sha}
+    assert notifications == ["work-1", "work-1"]
 
 
 def test_final_fable_closeout_applies_parent_visual_to_published_exact_head(
