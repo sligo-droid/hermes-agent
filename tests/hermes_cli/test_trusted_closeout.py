@@ -143,9 +143,47 @@ def _completed(args, returncode=0, *, stdout="", stderr=""):
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
 
 
+def _raw_required_check(
+    workflow,
+    name,
+    run_id,
+    *,
+    check_id=None,
+    conclusion="SUCCESS",
+    created_at="2026-07-18T00:00:00Z",
+    completed_at="2026-07-18T00:01:00Z",
+):
+    details_url = (
+        f"https://github.com/acme/example/actions/runs/{run_id}/job/"
+        f"{check_id or run_id}1"
+    )
+    return (
+        {
+            "workflowName": workflow,
+            "name": name,
+            "detailsUrl": details_url,
+        },
+        {
+            "id": check_id or int(run_id),
+            "name": name,
+            "head_sha": HEAD_SHA,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "created_at": created_at,
+            "started_at": created_at,
+            "completed_at": completed_at,
+            "details_url": details_url,
+            "app": {"slug": "github-actions"},
+        },
+    )
+
+
 def _patch_repo_boundary(monkeypatch):
     monkeypatch.setattr(closeout, "github_remote_preflight_error", lambda *_a, **_k: None)
     monkeypatch.setattr(closeout, "github_origin_repo", lambda *_a, **_k: "acme/example")
+
+
+def _patch_identity_passthrough(monkeypatch):
     monkeypatch.setattr(
         closeout,
         "enrich_required_check_identities",
@@ -341,7 +379,7 @@ def test_required_check_enrichment_is_order_independent_under_bounded_budget(
 
     check_runs = []
     raw_checks = []
-    for offset in range(10):
+    for offset in range(9):
         run_id = str(100 + offset)
         url = details(run_id, f"{run_id}1")
         raw_checks.append(
@@ -361,14 +399,16 @@ def test_required_check_enrichment_is_order_independent_under_bounded_budget(
                 "head_sha": HEAD_SHA,
                 "status": "COMPLETED",
                 "conclusion": "SUCCESS",
-                "completed_at": f"2026-07-18T00:00:{offset:02d}Z",
+                "created_at": f"2026-07-17T00:00:{offset:02d}Z",
+                "started_at": f"2026-07-17T00:01:{offset:02d}Z",
+                "completed_at": f"2026-07-19T00:00:{offset:02d}Z",
                 "details_url": url,
                 "app": {"slug": "github-actions"},
             }
         )
-    for check_id, conclusion, completed_at in (
-        (9001, "SUCCESS", "2026-07-18T00:05:00Z"),
-        (9002, "FAILURE", "2026-07-18T00:10:00Z"),
+    for check_id, conclusion, created_at, completed_at in (
+        (9001, "SUCCESS", "2026-07-18T00:04:00Z", "2026-07-18T00:05:00Z"),
+        (9002, "FAILURE", "2026-07-18T00:09:00Z", "2026-07-18T00:10:00Z"),
     ):
         url = details("900", str(check_id))
         raw_checks.append(
@@ -385,6 +425,8 @@ def test_required_check_enrichment_is_order_independent_under_bounded_budget(
                 "head_sha": HEAD_SHA,
                 "status": "COMPLETED",
                 "conclusion": conclusion,
+                "created_at": created_at,
+                "started_at": created_at,
                 "completed_at": completed_at,
                 "details_url": url,
                 "app": {"slug": "github-actions"},
@@ -405,6 +447,8 @@ def test_required_check_enrichment_is_order_independent_under_bounded_budget(
             "head_sha": HEAD_SHA,
             "status": "COMPLETED",
             "conclusion": "SUCCESS",
+            "created_at": "2026-07-18T00:08:00Z",
+            "started_at": "2026-07-18T00:08:00Z",
             "completed_at": "2026-07-18T00:09:00Z",
             "details_url": pr_body_url,
             "app": {"slug": "github-actions"},
@@ -461,6 +505,218 @@ def test_required_check_enrichment_is_order_independent_under_bounded_budget(
     assert "_required_check_identity_error" not in enriched
 
 
+def test_initial_identity_api_failure_is_retryable_with_durable_error(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "101")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "202")
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            return _completed(
+                args,
+                returncode=403,
+                stderr=(
+                    "token=should-not-persist denied at "
+                    "https://api.github.com/protected"
+                ),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.next_due_at == 130
+    assert transition.terminal is False
+    error = transition.state["errors"][-1]
+    assert error["code"] == "required_check_identity_failed"
+    assert "should-not-persist" not in error["message"]
+    assert "api.github.com" not in error["message"]
+    assert len(error["message"]) <= 600
+    assert transition.state["ci"]["status"] == "not_checked"
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_premerge_identity_api_failure_is_retryable_with_durable_error(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, basic_run = _raw_required_check("Basic Tests", "basic", "101")
+    raw_body, body_run = _raw_required_check("PR Body Format", "pr body", "202")
+    check_runs_calls = 0
+    calls = []
+
+    def run(args, **_kwargs):
+        nonlocal check_runs_calls
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            check_runs_calls += 1
+            if check_runs_calls == 2:
+                return _completed(
+                    args,
+                    returncode=403,
+                    stderr="password=should-not-persist identity endpoint denied",
+                )
+            return _completed(
+                args,
+                stdout=json.dumps({"check_runs": [basic_run, body_run]}),
+            )
+        if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
+            run_id = args[2].rsplit("/", 1)[-1]
+            path = {
+                "101": ".github/workflows/tests.yml",
+                "202": ".github/workflows/pr-body-format.yml",
+            }[run_id]
+            return _completed(
+                args,
+                stdout=json.dumps({"path": path, "head_sha": HEAD_SHA}),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.next_due_at == 130
+    error = transition.state["errors"][-1]
+    assert error["code"] == "premerge_required_check_identity_failed"
+    assert "should-not-persist" not in error["message"]
+    assert len(error["message"]) <= 600
+    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_default_command_budget_reaches_merge_after_maximum_identity_lookups(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    raw_checks = []
+    check_runs = []
+    workflow_paths = {}
+    for workflow, name, run_ids, expected_path in (
+        (
+            "Basic Tests",
+            "basic",
+            (1200, 1100, 1000, 900),
+            ".github/workflows/tests.yml",
+        ),
+        (
+            "PR Body Format",
+            "pr body",
+            (2200, 2100, 2000, 1900),
+            ".github/workflows/pr-body-format.yml",
+        ),
+    ):
+        for run_id in run_ids:
+            raw, check_run = _raw_required_check(workflow, name, str(run_id))
+            raw_checks.append(raw)
+            check_runs.append(check_run)
+            workflow_paths[str(run_id)] = (
+                expected_path
+                if run_id == run_ids[-1]
+                else f".github/workflows/spoof-{run_id}.yml"
+            )
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=raw_checks)),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            return _completed(
+                args,
+                stdout=json.dumps({"check_runs": check_runs}),
+            )
+        if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
+            run_id = args[2].rsplit("/", 1)[-1]
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    {"path": workflow_paths[run_id], "head_sha": HEAD_SHA}
+                ),
+            )
+        if args[:3] == ["gh", "pr", "merge"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.wake_immediately is True
+    assert transition.state["errors"] == []
+    assert len(calls) == 22
+    merge_calls = [args for args in calls if args[:3] == ["gh", "pr", "merge"]]
+    assert len(merge_calls) == 1
+    assert merge_calls[0][-2:] == ["--match-head-commit", HEAD_SHA]
+
+
+def test_command_budget_exhaustion_is_retryable_error_not_ci_wait(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "101")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "202")
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+        max_commands=2,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.outcome != "waiting_for_ci"
+    assert transition.next_due_at == 130
+    error = transition.state["errors"][-1]
+    assert error["code"] == "required_check_identity_failed"
+    assert "command budget exceeded" in error["message"]
+    assert transition.state["ci"]["status"] == "not_checked"
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
 def test_required_checks_classify_all_terminal_failure_conclusions():
     for conclusion in ("STALE", "STARTUP_FAILURE", "ERROR"):
         summary = closeout.summarize_required_checks(
@@ -477,6 +733,7 @@ def test_required_checks_classify_all_terminal_failure_conclusions():
 
 def test_head_change_atomically_invalidates_head_bound_receipts(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     state = _state(tmp_path)
     state["pr"]["head_sha"] = OLD_SHA
     state["local_verification"] = {"status": "passed", "head_sha": OLD_SHA}
@@ -507,6 +764,7 @@ def test_head_change_atomically_invalidates_head_bound_receipts(monkeypatch, tmp
 
 def test_failed_current_head_ci_requires_repair_without_polling(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     failed_checks = [
         _check("Basic Tests", "basic", conclusion="FAILURE"),
         _check("PR Body Format", "pr body", conclusion="SUCCESS"),
@@ -538,6 +796,7 @@ def test_failed_current_head_ci_requires_repair_without_polling(monkeypatch, tmp
 
 def test_shadow_ci_failure_is_diagnostic_only(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     failed_checks = [
         _check("Basic Tests", "basic", conclusion="FAILURE"),
         _check("PR Body Format", "pr body"),
@@ -565,6 +824,7 @@ def test_shadow_ci_failure_is_diagnostic_only(monkeypatch, tmp_path):
 
 def test_shadow_is_read_only_and_pending_is_not_terminal(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
     state = _state(tmp_path, mode="shadow")
     state["pr"] = {}
@@ -588,6 +848,7 @@ def test_shadow_is_read_only_and_pending_is_not_terminal(monkeypatch, tmp_path):
 
 def test_shadow_never_readies_or_merges(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
 
     def run(args, **_kwargs):
@@ -632,6 +893,7 @@ def test_shadow_never_readies_or_merges(monkeypatch, tmp_path):
 
 def test_draft_becomes_ready_only_after_current_head_gates(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
 
     def run(args, **_kwargs):
@@ -657,6 +919,7 @@ def test_draft_becomes_ready_only_after_current_head_gates(monkeypatch, tmp_path
 
 def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
 
     def run_open(args, **_kwargs):
@@ -729,6 +992,7 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
 
 def test_premerge_refresh_accepts_concurrent_external_merge(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
     views = iter(
         [
@@ -758,6 +1022,7 @@ def test_premerge_refresh_accepts_concurrent_external_merge(monkeypatch, tmp_pat
 
 def test_premerge_head_change_invalidates_gates_and_prevents_merge(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
     new_sha = "4" * 40
     views = iter(
@@ -803,6 +1068,7 @@ def test_same_head_premerge_refresh_reapplies_every_gate_and_prevents_merge(
     expected_outcome,
 ):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
     second = _pr_payload()
     if change == "closed":
@@ -852,6 +1118,7 @@ def test_same_head_premerge_refresh_reapplies_every_gate_and_prevents_merge(
 
 def test_required_post_merge_receipts_return_distinct_pending_outcome(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     state = _state(tmp_path)
     state["policy"]["post_merge_requirements"] = {"ci": True, "deployment": True}
 
@@ -895,6 +1162,7 @@ def test_terminal_required_post_merge_receipt_does_not_poll_forever(
     from hermes_cli import post_merge_receipts
 
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     state = _state(tmp_path)
     state["policy"]["post_merge_requirements"] = {"deployment": True}
     state["post_merge"] = post_merge_receipts.initialize_post_merge_receipts(
@@ -934,6 +1202,7 @@ def test_terminal_required_post_merge_receipt_does_not_poll_forever(
 
 def test_manual_merge_policy_allows_terminal_open_pr(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     state = _state(tmp_path)
     state["policy"]["merge"] = "manual"
 
@@ -955,6 +1224,7 @@ def test_manual_merge_policy_allows_terminal_open_pr(monkeypatch, tmp_path):
 
 def test_green_unmerged_telemetry_starts_immediately_and_becomes_overdue(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
 
     def run(args, **_kwargs):
         if args[:3] == ["gh", "auth", "status"]:
@@ -995,6 +1265,7 @@ def test_green_unmerged_telemetry_starts_immediately_and_becomes_overdue(monkeyp
 
 def test_draft_and_incomplete_gates_suppress_green_unmerged_telemetry(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     state = _state(tmp_path)
     state["telemetry"] = {
         "green_unmerged_since": 50,
@@ -1023,6 +1294,7 @@ def test_draft_and_incomplete_gates_suppress_green_unmerged_telemetry(monkeypatc
 
 def test_one_pass_never_sleeps_and_sanitizes_command_errors(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
 
     def run(args, **_kwargs):
         if args[:3] == ["gh", "auth", "status"]:
@@ -1045,6 +1317,7 @@ def test_one_pass_never_sleeps_and_sanitizes_command_errors(monkeypatch, tmp_pat
 
 def test_closeout_records_sanitized_git_github_and_transition_spans(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     state = _state(tmp_path)
     state["policy"]["merge"] = "manual"
 
@@ -1072,6 +1345,7 @@ def test_shadow_post_merge_finishes_without_mutating_collectors(monkeypatch, tmp
     from hermes_cli import post_merge_receipts
 
     _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
     calls = []
     post_merge_receipts.register_deployment_adapter(
         "shadow-forbidden",

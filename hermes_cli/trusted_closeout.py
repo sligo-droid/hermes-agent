@@ -63,6 +63,8 @@ _BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _MAX_ERRORS = 8
 _MAX_ERROR_CHARS = 600
 _MAX_CHECK_FAILURES = 8
+_DEFAULT_MAX_COMMANDS = 24
+_MAX_COMMANDS = 32
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 CanonicalSync = Callable[[str, str, str], Any]
@@ -573,19 +575,22 @@ def enrich_required_check_identities(
         run_id = match.group(2)
         grouped[identity].setdefault(run_id, []).append(dict(raw_check_run))
 
-    def check_run_sort_key(item: Mapping[str, Any]) -> tuple[str, int, str]:
-        timestamp = str(
-            item.get("completed_at")
-            or item.get("started_at")
-            or item.get("updated_at")
-            or item.get("created_at")
-            or ""
-        )
+    def check_run_sort_key(item: Mapping[str, Any]) -> tuple[int, str, str, str]:
         try:
-            numeric_id = int(item.get("id") or 0)
+            numeric_id = int(
+                item.get("id")
+                or item.get("database_id")
+                or item.get("databaseId")
+                or 0
+            )
         except (TypeError, ValueError):
             numeric_id = 0
-        return (timestamp, numeric_id, str(item.get("details_url") or ""))
+        return (
+            numeric_id,
+            str(item.get("created_at") or ""),
+            str(item.get("started_at") or ""),
+            str(item.get("details_url") or ""),
+        )
 
     queues: dict[tuple[str, str], list[tuple[str, list[dict[str, Any]]]]] = {}
     for identity in REQUIRED_PR_CHECKS:
@@ -959,7 +964,7 @@ def _reconcile_trusted_closeout_impl(
     sync_canonical: CanonicalSync | None = None,
     post_merge_config: Mapping[str, Any] | None = None,
     green_unmerged_overdue_seconds: float = 0.0,
-    max_commands: int = 12,
+    max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
     _span_recorder: RuntimeSpanRecorder | None = None,
     _span_parent_id: str = "",
@@ -988,7 +993,7 @@ def _reconcile_trusted_closeout_impl(
             raise RuntimeError("closeout lease ownership lost")
         with command_count_lock:
             command_count += 1
-            over_budget = command_count > max(1, min(32, int(max_commands)))
+            over_budget = command_count > max(1, min(_MAX_COMMANDS, int(max_commands)))
         if over_budget:
             raise RuntimeError("closeout command budget exceeded")
         return runner(args, cwd=cwd, timeout=timeout, github=github)
@@ -1200,6 +1205,19 @@ def _reconcile_trusted_closeout_impl(
         root=root,
         run=execute,
     )
+    identity_error = sanitize_closeout_error(
+        payload.pop("_required_check_identity_error", "")
+    )
+    if identity_error:
+        return _blocked(
+            original,
+            state,
+            code="required_check_identity_failed",
+            message=identity_error,
+            now=current_time,
+            retry=True,
+            poll_seconds=poll,
+        )
 
     pr = state["pr"]
     try:
@@ -1521,6 +1539,19 @@ def _reconcile_trusted_closeout_impl(
         root=root,
         run=execute,
     )
+    identity_error = sanitize_closeout_error(
+        premerge_payload.pop("_required_check_identity_error", "")
+    )
+    if identity_error:
+        return _blocked(
+            original,
+            state,
+            code="premerge_required_check_identity_failed",
+            message=identity_error,
+            now=current_time,
+            retry=True,
+            poll_seconds=poll,
+        )
     try:
         refreshed_head = _apply_pr_payload(state, premerge_payload)
     except ValueError as exc:
@@ -1715,7 +1746,7 @@ def reconcile_trusted_closeout(
     sync_canonical: CanonicalSync | None = None,
     post_merge_config: Mapping[str, Any] | None = None,
     green_unmerged_overdue_seconds: float = 0.0,
-    max_commands: int = 12,
+    max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
 ) -> CloseoutTransition:
     """Perform one bounded pass and attach trusted closeout/runtime spans."""

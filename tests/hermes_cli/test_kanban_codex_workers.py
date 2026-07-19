@@ -446,9 +446,11 @@ def test_refresh_pr_status_enriches_raw_checks_and_rejects_spoof_before_canonica
     assert state["pr_checks_failed"] == ["Basic Tests / basic"]
 
 
+@pytest.mark.parametrize("ordering", ["original", "reversed", "rotated"])
 def test_ensure_pr_merge_blocks_newest_failed_rerun_after_many_spoofs(
     monkeypatch,
     tmp_path,
+    ordering,
 ):
     from hermes_cli import kanban_codex_worker as worker
 
@@ -459,7 +461,7 @@ def test_ensure_pr_merge_blocks_newest_failed_rerun_after_many_spoofs(
 
     raw_checks = []
     check_runs = []
-    for offset in range(10):
+    for offset in range(9):
         run_id = str(100 + offset)
         url = details(run_id, f"{run_id}1")
         raw_checks.append(
@@ -472,14 +474,16 @@ def test_ensure_pr_merge_blocks_newest_failed_rerun_after_many_spoofs(
                 "head_sha": _TRUSTED_PR_HEAD,
                 "status": "COMPLETED",
                 "conclusion": "SUCCESS",
-                "completed_at": f"2026-07-18T00:00:{offset:02d}Z",
+                "created_at": f"2026-07-17T00:00:{offset:02d}Z",
+                "started_at": f"2026-07-17T00:01:{offset:02d}Z",
+                "completed_at": f"2026-07-19T00:00:{offset:02d}Z",
                 "details_url": url,
                 "app": {"slug": "github-actions"},
             }
         )
-    for check_id, conclusion, completed_at in (
-        (9001, "SUCCESS", "2026-07-18T00:05:00Z"),
-        (9002, "FAILURE", "2026-07-18T00:10:00Z"),
+    for check_id, conclusion, created_at, completed_at in (
+        (9001, "SUCCESS", "2026-07-18T00:04:00Z", "2026-07-18T00:05:00Z"),
+        (9002, "FAILURE", "2026-07-18T00:09:00Z", "2026-07-18T00:10:00Z"),
     ):
         url = details("900", str(check_id))
         raw_checks.append(
@@ -492,6 +496,8 @@ def test_ensure_pr_merge_blocks_newest_failed_rerun_after_many_spoofs(
                 "head_sha": _TRUSTED_PR_HEAD,
                 "status": "COMPLETED",
                 "conclusion": conclusion,
+                "created_at": created_at,
+                "started_at": created_at,
                 "completed_at": completed_at,
                 "details_url": url,
                 "app": {"slug": "github-actions"},
@@ -512,11 +518,19 @@ def test_ensure_pr_merge_blocks_newest_failed_rerun_after_many_spoofs(
             "head_sha": _TRUSTED_PR_HEAD,
             "status": "COMPLETED",
             "conclusion": "SUCCESS",
+            "created_at": "2026-07-18T00:08:00Z",
+            "started_at": "2026-07-18T00:08:00Z",
             "completed_at": "2026-07-18T00:09:00Z",
             "details_url": pr_body_url,
             "app": {"slug": "github-actions"},
         }
     )
+    if ordering == "reversed":
+        raw_checks.reverse()
+        check_runs.reverse()
+    elif ordering == "rotated":
+        raw_checks[:] = raw_checks[4:] + raw_checks[:4]
+        check_runs[:] = check_runs[6:] + check_runs[:6]
     calls = []
     queried_runs = []
 
