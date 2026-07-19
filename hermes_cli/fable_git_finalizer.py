@@ -895,6 +895,16 @@ def _trusted_local_verification_receipt(
     return {"status": "pending"}
 
 
+def _normalized_visual_requirement(value: Any) -> dict[str, Any]:
+    """Normalize the originating task contract without inferring from prose."""
+    try:
+        from agent.visual_qa import normalize_visual_requirement
+
+        return normalize_visual_requirement(value)
+    except Exception:
+        return {"level": "none", "target": "", "assertions": []}
+
+
 def _canonical_checkout(root: Path) -> Path | None:
     result = _run(["git", "rev-parse", "--git-common-dir"], cwd=root, timeout=10)
     raw = (result.stdout or "").strip()
@@ -942,6 +952,7 @@ def _finalize_fable_git_lifecycle_impl(
     worker_summary: str,
     closeout_mode: str,
     verification_runtime_breakdown: Mapping[str, Any] | None = None,
+    visual_qa_requirement: Mapping[str, Any] | None = None,
 ) -> FableGitFinalization:
     """Finalize through legacy authority or enforced structured closeout."""
     normalized_mode = str(mode or "").strip().lower()
@@ -1057,6 +1068,10 @@ def _finalize_fable_git_lifecycle_impl(
         result.error = error
         return result
     remote_head = str(pr_payload.get("headRefOid") or "").strip().lower()
+    normalized_visual_requirement = _normalized_visual_requirement(
+        visual_qa_requirement
+    )
+    require_visual_qa = normalized_visual_requirement["level"] != "none"
 
     if normalized_closeout_mode != "off":
         from hermes_cli.trusted_closeout import normalize_closeout_state
@@ -1084,7 +1099,7 @@ def _finalize_fable_git_lifecycle_impl(
                     "early_draft_pr": True,
                     "require_local_verification": True,
                     "require_review": False,
-                    "require_visual_qa": False,
+                    "require_visual_qa": require_visual_qa,
                     "post_merge_requirements": {},
                 },
                 "local_verification": _trusted_local_verification_receipt(
@@ -1093,7 +1108,11 @@ def _finalize_fable_git_lifecycle_impl(
                     verification_runtime_breakdown,
                 ),
                 "review": {"status": "not_required"},
-                "visual_qa": {"status": "not_required"},
+                "visual_qa": (
+                    {"status": "pending", "head_sha": remote_head}
+                    if require_visual_qa
+                    else {"status": "not_required"}
+                ),
                 "pr": {
                     "url": pr_url,
                     "title": title,
@@ -1251,6 +1270,7 @@ def finalize_fable_git_lifecycle(
     worker_summary: str,
     closeout_mode: str = "shadow",
     verification_runtime_breakdown: Mapping[str, Any] | None = None,
+    visual_qa_requirement: Mapping[str, Any] | None = None,
 ) -> FableGitFinalization:
     """Run trusted Fable finalization with bounded Git/GitHub spans."""
 
@@ -1279,6 +1299,7 @@ def finalize_fable_git_lifecycle(
             worker_summary=worker_summary,
             closeout_mode=closeout_mode,
             verification_runtime_breakdown=verification_runtime_breakdown,
+            visual_qa_requirement=visual_qa_requirement,
         )
     except Exception:
         recorder.finish(root_span, status="error")

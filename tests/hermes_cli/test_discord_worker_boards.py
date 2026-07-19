@@ -8,6 +8,7 @@ import sqlite3
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from types import SimpleNamespace
 
 
 DISCORD_EPOCH_SECONDS = 1_420_070_400.0
@@ -88,6 +89,109 @@ def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_pa
     assert worker["initial_request"] == "Build the thing"
     assert worker["worktree_path"].endswith("app-discord-12345")
     assert worker["code_island_pending"] is False
+
+
+def test_board_project_context_preserves_ordered_inspection_candidates(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    candidates = [
+        {
+            "url": "http://127.0.0.1:5173/",
+            "environment": "development",
+            "location": "local",
+        },
+        {
+            "url": "https://dev.example.test/",
+            "environment": "development",
+            "location": "external",
+        },
+        {
+            "url": "https://prod.example.test/",
+            "environment": "production",
+            "location": "external",
+        },
+    ]
+    board = dwb.ensure_discord_thread_board(
+        thread_id="inspection-context",
+        initial_request="Inspect the visual change",
+        project_context={
+            "project_key": "example",
+            "project_inspection_candidates": candidates,
+        },
+    )
+    dwb.ensure_discord_thread_board(
+        thread_id="inspection-context",
+        initial_request="Inspect the visual change",
+        project_context={"project_inspection_candidates": []},
+    )
+
+    context = kanban_db.read_board_metadata(board.slug)["discord_worker"]["project_context"]
+    assert context["project_key"] == "example"
+    assert context["project_inspection_candidates"] == candidates
+    prompt = dwb.project_inspection_prompt_for_context(context)
+    assert prompt.index(candidates[0]["url"]) < prompt.index(candidates[1]["url"])
+    assert prompt.index(candidates[1]["url"]) < prompt.index(candidates[2]["url"])
+    assert "only when connection, DNS, or navigation is unavailable" in prompt
+    assert "Do not switch to production" in prompt
+
+
+def test_gateway_event_carries_session_inspection_and_visual_context(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    source_candidates = [
+        SimpleNamespace(
+            url="http://127.0.0.1:5173/",
+            environment="development",
+            location="local",
+        ),
+        SimpleNamespace(
+            url="https://prod.example.test/",
+            environment="production",
+            location="external",
+        ),
+    ]
+    candidates = [
+        {
+            "url": candidate.url,
+            "environment": candidate.environment,
+            "location": candidate.location,
+        }
+        for candidate in source_candidates
+    ]
+    source = SimpleNamespace(
+        platform="discord",
+        chat_type="thread",
+        thread_id="session-inspection-context",
+        chat_id="session-inspection-context",
+        parent_chat_id="project-channel",
+        guild_id="guild-1",
+        project_key="example",
+        project_inspection_candidates=tuple(source_candidates),
+    )
+    event = SimpleNamespace(
+        source=source,
+        feature_summary=None,
+        message_id="message-1",
+        text="Implement the responsive dashboard",
+        visual_qa_requirement={
+            "level": "surface",
+            "target": "responsive dashboard",
+            "assertions": ["dashboard has no horizontal overflow"],
+        },
+        get_command=lambda: "",
+    )
+
+    board = dwb.board_for_gateway_event(event, create=True)
+
+    assert board is not None
+    context = board.worker["project_context"]
+    assert context["project_key"] == "example"
+    assert context["project_inspection_candidates"] == candidates
+    assert context["visual_qa_requirement"]["level"] == "surface"
+    assert context["visual_qa_requirement"]["target"].startswith("vtarget_")
 
 
 def test_worktree_base_start_ref_uses_remote_slash_branch(monkeypatch, tmp_path):

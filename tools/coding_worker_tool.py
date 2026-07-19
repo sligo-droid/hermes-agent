@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from hermes_cli.model_tiers import DEFAULT_WORKER_TIERS, resolve_worker_tier
 from tools.parallel_worker_worktrees import (
@@ -846,6 +847,143 @@ def _worker_project_context(workdir: str) -> str:
         return ""
 
 
+def _normalized_visual_requirement(value: Any) -> dict[str, Any]:
+    """Return the originating bounded visual contract when one is present."""
+    try:
+        from agent.visual_qa import normalize_visual_requirement
+
+        return normalize_visual_requirement(value)
+    except Exception:
+        return {"level": "none", "target": "", "assertions": []}
+
+
+def _originating_visual_requirement(
+    parent_agent: Any,
+    explicit: Any = None,
+) -> dict[str, Any]:
+    value = explicit
+    if value is None:
+        value = getattr(parent_agent, "visual_qa_requirement", None)
+    return _normalized_visual_requirement(value)
+
+
+def _bounded_project_inspection_candidates(value: Any) -> list[dict[str, str]]:
+    """Keep only the normalized task-local inspection contract fields."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(value, (list, tuple)):
+        value = [
+            item
+            if isinstance(item, dict)
+            else {
+                "url": getattr(item, "url", ""),
+                "environment": getattr(item, "environment", ""),
+                "location": getattr(item, "location", ""),
+            }
+            for item in value
+        ]
+    try:
+        from hermes_cli.project_inspection import (
+            normalize_project_inspection_candidates,
+            project_inspection_candidates_to_dicts,
+        )
+
+        return project_inspection_candidates_to_dicts(
+            normalize_project_inspection_candidates(value)
+        )
+    except Exception:
+        pass
+    if not isinstance(value, (list, tuple)):
+        return []
+    candidates: list[dict[str, str]] = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        environment = str(item.get("environment") or "").strip().lower()
+        location = str(item.get("location") or "").strip().lower()
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        if (
+            len(url) > 2048
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(ord(char) < 32 or ord(char) == 127 for char in url)
+            or environment not in {"development", "production"}
+            or location not in {"local", "external"}
+        ):
+            continue
+        candidates.append(
+            {
+                "url": url,
+                "environment": environment,
+                "location": location,
+            }
+        )
+    return candidates
+
+
+def _originating_project_inspection_candidates(
+    parent_agent: Any,
+    explicit: Any = None,
+) -> list[dict[str, str]]:
+    value = explicit
+    if value is None:
+        value = getattr(parent_agent, "project_inspection_candidates", None)
+    if not value:
+        try:
+            from gateway import session_context
+
+            getter = getattr(session_context, "get_project_inspection_candidates", None)
+            if callable(getter):
+                value = getter()
+            else:
+                get_session_env = getattr(session_context, "get_session_env", None)
+                if callable(get_session_env):
+                    value = get_session_env(
+                        "HERMES_PROJECT_INSPECTION_CANDIDATES",
+                        "",
+                    )
+        except Exception:
+            value = None
+    return _bounded_project_inspection_candidates(value)
+
+
+def _project_inspection_prompt_lines(candidates: Any) -> list[str]:
+    normalized = _bounded_project_inspection_candidates(candidates)
+    if not normalized:
+        return []
+    lines = [
+        "",
+        "Ordered project inspection candidates from the originating Hermes context:",
+    ]
+    for index, candidate in enumerate(normalized, start=1):
+        lines.append(
+            f"{index}. {candidate['url']} "
+            f"({candidate['location']} {candidate['environment']})"
+        )
+    lines.extend(
+        [
+            "Inspection order is dev-first: try the first development candidate, "
+            "then move to the next candidate only when connection, DNS, or navigation "
+            "is unavailable.",
+            "Once navigation succeeds, inspect that origin. Do not switch to production "
+            "because the reachable page shows login, an application error, unexpected "
+            "content, or a failed assertion.",
+            "If no configured candidate is reachable, start a repository-local preview "
+            "server and report the exact preview URL you used.",
+        ]
+    )
+    return lines
+
+
 def _repo_state_guard_notes(workdir: str) -> str:
     """Return a compact git-state warning block for worker prompts."""
     try:
@@ -1463,6 +1601,8 @@ def _delegate_coding_task_impl(
     allow_git_pr_lifecycle: bool = False,
     trusted_allow_git_pr_lifecycle: bool = False,
     route_decision: Any = None,
+    visual_qa_requirement: Optional[dict[str, Any]] = None,
+    project_inspection_candidates: Optional[list[dict[str, Any]]] = None,
     parent_agent: Any = None,
     parent_messages: Optional[list[dict]] = None,
     _parallel_request: Optional[dict[str, Any]] = None,
@@ -1471,6 +1611,15 @@ def _delegate_coding_task_impl(
     """Run a bounded coding task in the configured coding worker backend."""
     if parent_agent is None:
         return tool_error("delegate_coding_task requires a parent agent context.")
+
+    originating_visual_requirement = _originating_visual_requirement(
+        parent_agent,
+        visual_qa_requirement,
+    )
+    originating_inspection_candidates = _originating_project_inspection_candidates(
+        parent_agent,
+        project_inspection_candidates,
+    )
 
     if getattr(parent_agent, "api_mode", "") == "codex_app_server":
         return tool_error(
@@ -1831,6 +1980,22 @@ def _delegate_coding_task_impl(
             "remaining blockers.",
         ]
     )
+    if originating_visual_requirement["level"] != "none":
+        worker_prompt_parts.extend(
+            [
+                "",
+                "Originating trusted visual-QA requirement (opaque bounded contract):",
+                json.dumps(
+                    originating_visual_requirement,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "Treat this as explicit visual work. Complete the smallest relevant "
+                "assertion-driven rendered check and return the dedicated visual-QA "
+                "receipt without adding a URL to the receipt.",
+            ]
+        )
     if project_context:
         worker_prompt_parts.extend(
             [
@@ -1900,6 +2065,9 @@ def _delegate_coding_task_impl(
         worker_prompt_parts.extend(["", ui_skill_prompt])
     if repo_state_notes:
         worker_prompt_parts.extend(["", repo_state_notes])
+    worker_prompt_parts.extend(
+        _project_inspection_prompt_lines(originating_inspection_candidates)
+    )
     worker_prompt_parts.extend(_scope_prompt_lines(normalized_scope_paths))
     worker_prompt_parts.extend(
         _context_pack_lines(relevant_files, approach, constraints, verification)
@@ -2297,6 +2465,7 @@ def _delegate_coding_task_impl(
                 worker_summary=turn.final_text,
                 closeout_mode=configured_closeout_mode,
                 verification_runtime_breakdown=getattr(turn, "runtime_breakdown", None),
+                visual_qa_requirement=originating_visual_requirement,
             )
             fable_git_result = finalized.as_dict()
             closeout_state = getattr(finalized, "closeout_state", None)
@@ -2658,6 +2827,8 @@ def delegate_coding_task(
     allow_git_pr_lifecycle: bool = False,
     trusted_allow_git_pr_lifecycle: bool = False,
     route_decision: Any = None,
+    visual_qa_requirement: Optional[dict[str, Any]] = None,
+    project_inspection_candidates: Optional[list[dict[str, Any]]] = None,
     parent_agent: Any = None,
     parent_messages: Optional[list[dict]] = None,
     _parallel_group: Optional[dict[str, Any]] = None,
@@ -2682,6 +2853,8 @@ def delegate_coding_task(
         "allow_git_pr_lifecycle": allow_git_pr_lifecycle,
         "trusted_allow_git_pr_lifecycle": trusted_allow_git_pr_lifecycle,
         "route_decision": route_decision,
+        "visual_qa_requirement": visual_qa_requirement,
+        "project_inspection_candidates": project_inspection_candidates,
         "parent_agent": parent_agent,
         "parent_messages": parent_messages,
     }

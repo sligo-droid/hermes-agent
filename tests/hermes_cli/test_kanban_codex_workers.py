@@ -677,6 +677,8 @@ def test_legacy_kanban_fields_normalize_and_dual_write_shared_closeout(tmp_path)
     assert state["ci"]["status"] == "passed"
     assert state["policy"]["early_draft_pr"] is True
     assert state["policy"]["post_merge_requirements"]["ci"] is True
+    assert state["policy"]["require_visual_qa"] is False
+    assert state["visual_qa"] == {"status": "not_required"}
     assert state["review"] == {"status": "approved", "head_sha": head}
     assert state["telemetry"]["green_unmerged_since"] == 90
     assert state["telemetry"]["green_unmerged_overdue"] is True
@@ -693,6 +695,75 @@ def test_legacy_kanban_fields_normalize_and_dual_write_shared_closeout(tmp_path)
     assert flattened["pr_ci_next_poll_at"] == 123
     assert flattened["green_unmerged_since"] == 100
     assert flattened["green_unmerged_overdue"] is True
+
+
+def test_kanban_visual_gate_uses_structured_requirement_and_exact_checkpoint_head(tmp_path):
+    from agent.visual_qa import normalize_visual_requirement, visual_requirement_id
+    from hermes_cli import kanban_codex_worker as worker
+
+    head = "a" * 40
+    requirement = normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": "responsive dashboard",
+            "assertions": ["dashboard has no horizontal overflow"],
+        }
+    )
+    assertion_id = requirement["assertions"][0]["id"]
+    trusted_receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": "vac_" + ("b" * 24),
+        "assertion_ids": [assertion_id],
+        "status": "passed",
+        "attempts": 1,
+        "vision_calls": 0,
+        "duration_ms": 20,
+        "diagnostic_codes": ["no_horizontal_overflow_satisfied"],
+        "order": 3,
+    }
+    flattened = {
+        "project_path": str(tmp_path / "canonical"),
+        "pr_ci_head_sha": head,
+        "project_context": {
+            "visual_qa_requirement": requirement,
+            "visual_qa_receipts": [trusted_receipt],
+            "visual_qa_min_receipt_order": 3,
+        },
+    }
+
+    state = worker._legacy_worker_closeout_state(
+        flattened,
+        board="board-1",
+        workspace=str(tmp_path / "worktree"),
+        repo="owner/repo",
+        branch="worker/branch",
+        base="main",
+        config={"mode": "enforce", "early_draft_pr": True},
+    )
+
+    assert state["policy"]["require_visual_qa"] is True
+    assert state["visual_qa"] == {"status": "passed", "head_sha": head}
+
+    later_head = "c" * 40
+    flattened["closeout"] = state
+    flattened["pr_ci_head_sha"] = later_head
+    later = worker._legacy_worker_closeout_state(
+        flattened,
+        board="board-1",
+        workspace=str(tmp_path / "worktree"),
+        repo="owner/repo",
+        branch="worker/branch",
+        base="main",
+        config={"mode": "enforce", "early_draft_pr": True},
+    )
+    assert later["visual_qa"] == {"status": "pending", "head_sha": later_head}
+    assert flattened["trusted_visual_qa_receipt_binding"] == {
+        "receipt_key": (
+            f"{trusted_receipt['requirement_id']}:"
+            f"{trusted_receipt['contract_id']}:3"
+        ),
+        "head_sha": head,
+    }
 
 
 def test_shadow_kanban_closeout_cannot_take_ownership_from_legacy_finalizer(
@@ -810,6 +881,13 @@ def test_early_draft_checkpoint_pushes_exact_head_before_review(monkeypatch, tmp
         "project_path": str(tmp_path / "canonical"),
         "pr_open_policy": "after_review_approval",
         "merge_policy": "auto",
+        "project_context": {
+            "visual_qa_requirement": {
+                "level": "surface",
+                "target": "responsive dashboard",
+                "assertions": ["dashboard has no horizontal overflow"],
+            }
+        },
     }
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setattr(
@@ -860,6 +938,11 @@ def test_early_draft_checkpoint_pushes_exact_head_before_review(monkeypatch, tmp
     assert "trusted_local_verification_head" not in stored
     assert stored["closeout"]["local_verification"] == {"status": "pending"}
     assert stored["closeout"]["review"] == {
+        "status": "pending",
+        "head_sha": head,
+    }
+    assert stored["closeout"]["policy"]["require_visual_qa"] is True
+    assert stored["closeout"]["visual_qa"] == {
         "status": "pending",
         "head_sha": head,
     }
@@ -1140,6 +1223,63 @@ def test_dev_worker_prompt_requires_bounded_visual_qa_or_explicit_na(monkeypatch
     assert "Visual QA: N/A" in planner_schema
     assert "missing `handoff.visual_qa` receipt" in worker._schema_instructions(ROLE_REVIEWER)
     assert worker._visual_qa_handoff_prompt(ROLE_PLANNER) == ""
+
+
+def test_worker_prompt_renders_structured_dev_first_inspection_contract(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as boards
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    candidates = [
+        {
+            "url": "http://127.0.0.1:5173/",
+            "environment": "development",
+            "location": "local",
+        },
+        {
+            "url": "https://dev.example.test/",
+            "environment": "development",
+            "location": "external",
+        },
+        {
+            "url": "https://prod.example.test/",
+            "environment": "production",
+            "location": "external",
+        },
+    ]
+    board = boards.start_direct_goal(
+        thread_id="worker-inspection-contract",
+        goal="Implement the responsive dashboard",
+        project_context={
+            "project_inspection_candidates": candidates,
+            "visual_qa_requirement": {
+                "level": "surface",
+                "target": "responsive dashboard",
+                "assertions": ["dashboard has no horizontal overflow"],
+            },
+        },
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Implement visual change",
+            assignee=ROLE_DEV,
+            tenant=board.slug,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        prompt = worker._build_prompt(conn, task_id, ROLE_DEV)
+    finally:
+        conn.close()
+
+    assert prompt.index(candidates[0]["url"]) < prompt.index(candidates[1]["url"])
+    assert prompt.index(candidates[1]["url"]) < prompt.index(candidates[2]["url"])
+    assert "only when connection, DNS, or navigation is unavailable" in prompt
+    assert "Do not switch to production" in prompt
+    assert "Structured board visual-QA requirement: required" in prompt
 
 
 def test_worker_prompt_includes_dashboard_qa_auth_without_secret(monkeypatch, tmp_path):

@@ -35,6 +35,7 @@ from hermes_cli.discord_worker_boards import (
     format_role_round_title,
     is_cancelled,
     mark_dispatch_dirty,
+    project_inspection_prompt_for_context,
     record_codex_worker_event,
     record_codex_worker_result,
 )
@@ -601,6 +602,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     pr_policy = _pr_policy_prompt_note(role)
     autoreview = _dev_autoreview_prompt(role)
     visual_qa_handoff = _visual_qa_handoff_prompt(role)
+    project_contracts = _board_project_context_prompt(conn, task_id)
     forced_skills = _forced_worker_skill_prompt(conn, task_id, role)
     return (
         f"You are the Discord Kanban {role} worker.\n"
@@ -614,6 +616,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         f"{dashboard_qa_auth}"
         f"{autoreview}"
         f"{visual_qa_handoff}"
+        f"{project_contracts}"
         f"{forced_skills}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
@@ -628,6 +631,63 @@ def _dashboard_qa_auth_prompt() -> str:
         "- Read the password from `HERMES_DASHBOARD_PASSWORD` in the worker environment; do not ask for it if that env var is absent.\n"
         "- Never print, log, copy into prompts, or include the password value in final output, test output, screenshots, URLs, or handoff metadata.\n\n"
     )
+
+
+def _board_project_context(conn: Any, task_id: str) -> dict[str, Any]:
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    except Exception:
+        return {}
+    board = str(getattr(task, "tenant", "") or "").strip() if task else ""
+    if not board:
+        return {}
+    try:
+        metadata = kanban_db.read_board_metadata(board)
+    except Exception:
+        return {}
+    worker = metadata.get(DISCORD_WORKER_META_KEY)
+    if not isinstance(worker, dict):
+        return {}
+    context = worker.get("project_context")
+    return dict(context) if isinstance(context, dict) else {}
+
+
+def _normalized_visual_requirement(value: Any) -> dict[str, Any]:
+    try:
+        from agent.visual_qa import normalize_visual_requirement
+
+        return normalize_visual_requirement(value)
+    except Exception:
+        return {"level": "none", "target": "", "assertions": []}
+
+
+def _board_project_context_prompt(conn: Any, task_id: str) -> str:
+    context = _board_project_context(conn, task_id)
+    blocks: list[str] = []
+    inspection = project_inspection_prompt_for_context(context)
+    if inspection:
+        blocks.append(inspection)
+    if "visual_qa_requirement" in context:
+        requirement = _normalized_visual_requirement(
+            context.get("visual_qa_requirement")
+        )
+        if requirement["level"] == "none":
+            blocks.append(
+                "Structured board visual-QA requirement: not required. Keep the "
+                "ticket handoff explicit with a Visual QA: N/A reason."
+            )
+        else:
+            blocks.append(
+                "Structured board visual-QA requirement: required. Preserve this "
+                "opaque bounded contract in the dev/reviewer handoff:\n"
+                + json.dumps(
+                    requirement,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+    return ("\n\n".join(blocks).rstrip() + "\n\n") if blocks else ""
 
 
 def _forced_worker_skill_prompt(conn: Any, task_id: str, role: str) -> str:
@@ -3238,6 +3298,91 @@ def _kanban_shared_closeout_enabled(config: dict[str, Any]) -> bool:
     return surfaces.get("kanban") is True and str(config.get("mode") or "off").lower() != "off"
 
 
+def _worker_visual_requirement(worker: dict[str, Any]) -> dict[str, Any]:
+    """Read only the normalized structured board requirement, never task prose."""
+    context = worker.get("project_context")
+    sources = [context, worker] if isinstance(context, dict) else [worker]
+    for source in sources:
+        if isinstance(source, dict) and "visual_qa_requirement" in source:
+            return _normalized_visual_requirement(source.get("visual_qa_requirement"))
+    return _normalized_visual_requirement(None)
+
+
+def _trusted_visual_receipts(worker: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect only host-shaped receipts carried in structured metadata."""
+    receipts: list[dict[str, Any]] = []
+    context = worker.get("project_context")
+    for source in (context, worker):
+        if not isinstance(source, dict):
+            continue
+        values = source.get("visual_qa_receipts")
+        if isinstance(values, list):
+            receipts.extend(item for item in values if isinstance(item, dict))
+        runtime = source.get("runtime_breakdown")
+        if isinstance(runtime, dict) and isinstance(runtime.get("visual_qa_receipts"), list):
+            receipts.extend(
+                item
+                for item in runtime["visual_qa_receipts"]
+                if isinstance(item, dict)
+            )
+    return receipts
+
+
+def _trusted_visual_receipt_status(
+    worker: dict[str, Any],
+    requirement: dict[str, Any],
+    head_sha: str,
+) -> str:
+    try:
+        from agent.visual_qa import visual_receipt_completion
+
+        min_order = 0
+        context = worker.get("project_context")
+        for source in (context, worker):
+            if not isinstance(source, dict):
+                continue
+            try:
+                min_order = max(
+                    min_order,
+                    int(source.get("visual_qa_min_receipt_order") or 0),
+                )
+            except (TypeError, ValueError):
+                continue
+        completion = visual_receipt_completion(
+            requirement,
+            _trusted_visual_receipts(worker),
+            min_order=min_order,
+        )
+    except Exception:
+        return ""
+    if completion.get("receipt") is None:
+        return ""
+    status = str(completion.get("status") or "").strip().lower()
+    if status not in {"passed", "failed", "blocked", "uncertain"}:
+        return ""
+    receipt = completion["receipt"]
+    receipt_key = ":".join(
+        (
+            str(receipt.get("requirement_id") or ""),
+            str(receipt.get("contract_id") or ""),
+            str(receipt.get("order") or 0),
+        )
+    )
+    binding = worker.get("trusted_visual_qa_receipt_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    if str(binding.get("receipt_key") or "") == receipt_key:
+        return (
+            status
+            if str(binding.get("head_sha") or "").strip().lower() == head_sha
+            else ""
+        )
+    worker["trusted_visual_qa_receipt_binding"] = {
+        "receipt_key": receipt_key,
+        "head_sha": head_sha,
+    }
+    return status
+
+
 def _legacy_worker_closeout_state(
     worker: dict[str, Any],
     *,
@@ -3270,6 +3415,8 @@ def _legacy_worker_closeout_state(
             "base_branch": base,
         }
     )
+    visual_requirement = _worker_visual_requirement(worker)
+    require_visual_qa = visual_requirement["level"] != "none"
     requirements = config.get("post_merge_requirements")
     state["policy"].update(
         {
@@ -3278,7 +3425,7 @@ def _legacy_worker_closeout_state(
             "early_draft_pr": config.get("early_draft_pr") is True,
             "require_local_verification": True,
             "require_review": True,
-            "require_visual_qa": False,
+            "require_visual_qa": require_visual_qa,
             "post_merge_requirements": {
                 key: requirements.get(key) is True if isinstance(requirements, dict) else False
                 for key in ("canonical_sync", "ci", "deployment", "production_qa", "restart")
@@ -3302,6 +3449,30 @@ def _legacy_worker_closeout_state(
         }
     )
     head_sha = str(pr.get("head_sha") or "")
+    if not require_visual_qa:
+        state["visual_qa"] = {"status": "not_required"}
+    elif head_sha:
+        trusted_visual_status = _trusted_visual_receipt_status(
+            worker,
+            visual_requirement,
+            head_sha,
+        )
+        existing_visual = state.get("visual_qa")
+        existing_visual = existing_visual if isinstance(existing_visual, dict) else {}
+        existing_visual_head = str(existing_visual.get("head_sha") or "").strip().lower()
+        if trusted_visual_status:
+            state["visual_qa"] = {
+                "status": trusted_visual_status,
+                "head_sha": head_sha,
+            }
+        elif existing_visual_head == head_sha and str(
+            existing_visual.get("status") or ""
+        ).strip().lower() in {"pending", "passed", "failed", "blocked", "uncertain"}:
+            state["visual_qa"] = dict(existing_visual)
+        else:
+            state["visual_qa"] = {"status": "pending", "head_sha": head_sha}
+    else:
+        state["visual_qa"] = {"status": "pending"}
     if not existing:
         state["telemetry"].update(
             {

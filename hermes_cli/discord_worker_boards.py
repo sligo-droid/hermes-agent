@@ -1194,6 +1194,105 @@ class DiscordBoard:
         return str(self.worker.get("public_url") or "")
 
 
+def _bounded_project_inspection_candidates(value: Any) -> list[dict[str, str]]:
+    """Revalidate the structured candidate list at the board boundary."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(value, (list, tuple)):
+        value = [
+            item
+            if isinstance(item, dict)
+            else {
+                "url": getattr(item, "url", ""),
+                "environment": getattr(item, "environment", ""),
+                "location": getattr(item, "location", ""),
+            }
+            for item in value
+        ]
+    try:
+        from hermes_cli.project_inspection import (
+            normalize_project_inspection_candidates,
+            project_inspection_candidates_to_dicts,
+        )
+
+        return project_inspection_candidates_to_dicts(
+            normalize_project_inspection_candidates(value)
+        )
+    except Exception:
+        pass
+    if not isinstance(value, (list, tuple)):
+        return []
+    candidates: list[dict[str, str]] = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        environment = str(item.get("environment") or "").strip().lower()
+        location = str(item.get("location") or "").strip().lower()
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        if (
+            len(url) > 2048
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(ord(char) < 32 or ord(char) == 127 for char in url)
+            or environment not in {"development", "production"}
+            or location not in {"local", "external"}
+        ):
+            continue
+        candidates.append(
+            {
+                "url": url,
+                "environment": environment,
+                "location": location,
+            }
+        )
+    return candidates
+
+
+def project_inspection_prompt_for_context(context: Any) -> str:
+    """Render the shared ordered, navigation-only fallback contract."""
+    raw = context if isinstance(context, dict) else {}
+    candidates = _bounded_project_inspection_candidates(
+        raw.get("project_inspection_candidates")
+    )
+    if not candidates:
+        return ""
+    lines = ["Project inspection contract (ordered, development first):"]
+    for index, candidate in enumerate(candidates, start=1):
+        lines.append(
+            f"{index}. {candidate['url']} "
+            f"({candidate['location']} {candidate['environment']})"
+        )
+    lines.extend(
+        [
+            "- Try the first development candidate, then use the next candidate only "
+            "when connection, DNS, or navigation is unavailable.",
+            "- Once navigation succeeds, inspect that origin. Do not switch to production "
+            "because of login, application content, an error state, or a failed assertion.",
+            "- If no configured candidate is reachable, start a repository-local preview "
+            "server and report the exact preview URL used.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _normalized_visual_requirement(value: Any) -> dict[str, Any]:
+    try:
+        from agent.visual_qa import normalize_visual_requirement
+
+        return normalize_visual_requirement(value)
+    except Exception:
+        return {"level": "none", "target": "", "assertions": []}
+
+
 def ensure_discord_thread_board(
     *,
     thread_id: str,
@@ -1228,9 +1327,17 @@ def ensure_discord_thread_board(
     existing_context = worker.get("project_context")
     merged_project_context = dict(existing_context) if isinstance(existing_context, dict) else {}
     incoming_project_context = dict(project_context or {})
-    merged_project_context.update(
-        {k: v for k, v in incoming_project_context.items() if v is not None}
-    )
+    for key, value in incoming_project_context.items():
+        if value is None:
+            continue
+        if key == "project_inspection_candidates":
+            normalized_candidates = _bounded_project_inspection_candidates(value)
+            if normalized_candidates:
+                merged_project_context[key] = normalized_candidates
+            elif key not in merged_project_context:
+                merged_project_context[key] = []
+            continue
+        merged_project_context[key] = value
     incoming_project_path = str(incoming_project_context.get("project_path") or "").strip() or None
     existing_project_path = str(worker.get("project_path") or "").strip() or None
     project_path = incoming_project_path or existing_project_path
@@ -7535,15 +7642,59 @@ def board_for_gateway_event(event: Any, *, create: bool = False) -> Optional[Dis
             return None
         return DiscordBoard(slug=slug, metadata=metadata)
     if create:
+        source_context = getattr(source, "project_context", None)
+        project_context = {}
+        if isinstance(source_context, dict):
+            for key in (
+                "project_name",
+                "project_path",
+                "project_github_url",
+                "project_channel_id",
+                "project_mapping_source",
+                "project_mapping_resolved",
+                "project_key",
+                "project_inspection_candidates",
+                "visual_qa_requirement",
+            ):
+                if key in source_context:
+                    project_context[key] = source_context[key]
+
+        def source_value(key: str) -> Any:
+            value = getattr(source, key, None)
+            return project_context.get(key) if value is None else value
+
+        source_candidates = getattr(source, "project_inspection_candidates", None)
+        if not source_candidates:
+            source_candidates = project_context.get("project_inspection_candidates")
+        visual_requirement = getattr(event, "visual_qa_requirement", None)
+        if visual_requirement is None:
+            visual_requirement = project_context.get("visual_qa_requirement")
         project_context = {
-            "project_name": getattr(source, "project_name", None),
-            "project_path": getattr(source, "project_path", None),
-            "project_github_url": getattr(source, "project_github_url", None),
-            "project_channel_id": getattr(source, "project_channel_id", None),
-            "project_mapping_source": getattr(source, "project_mapping_source", None),
-            "project_mapping_resolved": getattr(source, "project_mapping_resolved", None),
+            **project_context,
+            "project_name": source_value("project_name"),
+            "project_path": source_value("project_path"),
+            "project_github_url": source_value("project_github_url"),
+            "project_channel_id": source_value("project_channel_id"),
+            "project_mapping_source": source_value("project_mapping_source"),
+            "project_mapping_resolved": source_value("project_mapping_resolved"),
+            "project_key": source_value("project_key"),
+            "project_inspection_candidates": source_candidates,
+            "visual_qa_requirement": visual_requirement,
         }
         project_context = {k: v for k, v in project_context.items() if v is not None}
+        if "project_inspection_candidates" in project_context:
+            project_context["project_inspection_candidates"] = (
+                _bounded_project_inspection_candidates(
+                    project_context["project_inspection_candidates"]
+                )
+            )
+        visual_requirement = _normalized_visual_requirement(
+            project_context.get("visual_qa_requirement")
+        )
+        if visual_requirement["level"] == "none":
+            project_context.pop("visual_qa_requirement", None)
+        else:
+            project_context["visual_qa_requirement"] = visual_requirement
         return ensure_discord_thread_board(
             thread_id=thread_id,
             chat_id=str(getattr(source, "chat_id", "") or ""),
