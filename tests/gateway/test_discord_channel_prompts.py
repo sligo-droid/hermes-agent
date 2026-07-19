@@ -171,11 +171,19 @@ class TestResolveChannelPrompts:
         thread.parent_id = parent.id
         project_context = {
             "project_channel_id": str(parent.id),
+            "project_key": "hermes",
             "project_name": "Hermes",
             "project_path": "/home/droid/hermes",
             "project_github_url": "https://github.com/sligo-droid/hermes-agent",
             "project_mapping_source": "configured_channel_cwd",
             "project_mapping_resolved": True,
+            "project_inspection_candidates": [
+                {
+                    "url": "http://localhost:3000",
+                    "environment": "development",
+                    "location": "local",
+                }
+            ],
         }
         monkeypatch.setattr(
             discord_platform,
@@ -191,10 +199,12 @@ class TestResolveChannelPrompts:
 
         event = adapter._build_slash_event(interaction, "/goal minimize response time")
 
+        assert event.source.project_key == "hermes"
         assert event.source.project_path == "/home/droid/hermes"
         assert event.source.project_channel_id == "1504252294495998043"
         assert event.source.project_mapping_source == "configured_channel_cwd"
         assert event.source.project_mapping_resolved is True
+        assert event.source.project_inspection_candidates[0].url == "http://localhost:3000/"
 
     @pytest.mark.asyncio
     async def test_dispatch_thread_session_inherits_parent_channel_prompt(self):

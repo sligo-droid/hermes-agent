@@ -4868,12 +4868,14 @@ class BasePlatformAdapter(ABC):
         guild_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
+        project_key: Optional[str] = None,
         project_name: Optional[str] = None,
         project_path: Optional[str] = None,
         project_github_url: Optional[str] = None,
         project_channel_id: Optional[str] = None,
         project_mapping_source: Optional[str] = None,
         project_mapping_resolved: Optional[bool] = None,
+        project_inspection_candidates: Any = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -4894,12 +4896,14 @@ class BasePlatformAdapter(ABC):
             guild_id=str(guild_id) if guild_id else None,
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
+            project_key=project_key,
             project_name=project_name,
             project_path=project_path,
             project_github_url=project_github_url,
             project_channel_id=str(project_channel_id) if project_channel_id else None,
             project_mapping_source=project_mapping_source,
             project_mapping_resolved=project_mapping_resolved,
+            project_inspection_candidates=project_inspection_candidates,
         )
     
     @abstractmethod

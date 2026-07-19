@@ -73,10 +73,14 @@ _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 _CRON_EXECUTION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+_PROJECT_KEY: ContextVar = ContextVar("HERMES_PROJECT_KEY", default=_UNSET)
 _PROJECT_PATH: ContextVar = ContextVar("HERMES_PROJECT_PATH", default=_UNSET)
 _PROJECT_NAME: ContextVar = ContextVar("HERMES_PROJECT_NAME", default=_UNSET)
 _PROJECT_GITHUB_URL: ContextVar = ContextVar("HERMES_PROJECT_GITHUB_URL", default=_UNSET)
 _PROJECT_CHANNEL_ID: ContextVar = ContextVar("HERMES_PROJECT_CHANNEL_ID", default=_UNSET)
+_PROJECT_INSPECTION_CANDIDATES: ContextVar = ContextVar(
+    "HERMES_PROJECT_INSPECTION_CANDIDATES", default=_UNSET
+)
 _SESSION_GUILD_ID: ContextVar = ContextVar("HERMES_SESSION_GUILD_ID", default=_UNSET)
 _SESSION_PARENT_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_PARENT_CHAT_ID", default=_UNSET)
 _KANBAN_DEFAULT_INTAKE: ContextVar = ContextVar("HERMES_KANBAN_DEFAULT_INTAKE", default=_UNSET)
@@ -105,10 +109,12 @@ _VAR_MAP = {
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_CWD": _SESSION_CWD,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_PROJECT_KEY": _PROJECT_KEY,
     "HERMES_PROJECT_PATH": _PROJECT_PATH,
     "HERMES_PROJECT_NAME": _PROJECT_NAME,
     "HERMES_PROJECT_GITHUB_URL": _PROJECT_GITHUB_URL,
     "HERMES_PROJECT_CHANNEL_ID": _PROJECT_CHANNEL_ID,
+    "HERMES_PROJECT_INSPECTION_CANDIDATES": _PROJECT_INSPECTION_CANDIDATES,
     "HERMES_SESSION_GUILD_ID": _SESSION_GUILD_ID,
     "HERMES_SESSION_PARENT_CHAT_ID": _SESSION_PARENT_CHAT_ID,
     "HERMES_KANBAN_DEFAULT_INTAKE": _KANBAN_DEFAULT_INTAKE,
@@ -157,6 +163,20 @@ def set_current_session_id(session_id: str) -> None:
     _SESSION_ID.set(session_id)
 
 
+def bind_project_inspection_candidates(candidates: Any) -> Token:
+    """Bind a safe serialized candidate list to the current task."""
+    from hermes_cli.project_inspection import serialize_project_inspection_candidates
+
+    return _PROJECT_INSPECTION_CANDIDATES.set(
+        serialize_project_inspection_candidates(candidates)
+    )
+
+
+def reset_project_inspection_candidates(token: Token) -> None:
+    """Restore the candidate binding that preceded a task-local bind."""
+    _PROJECT_INSPECTION_CANDIDATES.reset(token)
+
+
 def set_session_vars(
     platform: str = "",
     source: str = "",
@@ -171,10 +191,12 @@ def set_session_vars(
     cwd: str = "",
     profile: str = "",
     async_delivery: bool = True,
+    project_key: str = "",
     project_path: str = "",
     project_name: str = "",
     project_github_url: str = "",
     project_channel_id: str = "",
+    project_inspection_candidates: Any = None,
     guild_id: str = "",
     parent_chat_id: str = "",
     kanban_default_intake: str = "",
@@ -207,10 +229,12 @@ def set_session_vars(
         _SESSION_CWD.set(effective_cwd),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _PROJECT_KEY.set(project_key),
         _PROJECT_PATH.set(project_path),
         _PROJECT_NAME.set(project_name),
         _PROJECT_GITHUB_URL.set(project_github_url),
         _PROJECT_CHANNEL_ID.set(project_channel_id),
+        bind_project_inspection_candidates(project_inspection_candidates),
         _SESSION_GUILD_ID.set(guild_id),
         _SESSION_PARENT_CHAT_ID.set(parent_chat_id),
         _KANBAN_DEFAULT_INTAKE.set(kanban_default_intake),
@@ -250,10 +274,12 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_CWD,
         _SESSION_PROFILE,
+        _PROJECT_KEY,
         _PROJECT_PATH,
         _PROJECT_NAME,
         _PROJECT_GITHUB_URL,
         _PROJECT_CHANNEL_ID,
+        _PROJECT_INSPECTION_CANDIDATES,
         _SESSION_GUILD_ID,
         _SESSION_PARENT_CHAT_ID,
         _KANBAN_DEFAULT_INTAKE,

@@ -1174,12 +1174,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return {}
         resolved = project_context.get("project_mapping_resolved")
         return {
+            "project_key": str(project_context.get("project_key") or "") or None,
             "project_name": str(project_context.get("project_name") or "") or None,
             "project_path": str(project_context.get("project_path") or "") or None,
             "project_github_url": str(project_context.get("project_github_url") or "") or None,
             "project_channel_id": str(project_context.get("project_channel_id") or "") or None,
             "project_mapping_source": str(project_context.get("project_mapping_source") or "") or None,
             "project_mapping_resolved": bool(resolved) if resolved is not None else None,
+            "project_inspection_candidates": project_context.get("project_inspection_candidates"),
         }
 
     @staticmethod
@@ -11044,12 +11046,16 @@ class DiscordAdapter(BasePlatformAdapter):
             guild_id=str(guild.id) if guild else None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
+            project_key=str(project_context.get("project_key") or "") if project_context else None,
             project_name=str(project_context.get("project_name") or "") if project_context else None,
             project_path=str(project_context.get("project_path") or "") if project_context and project_context.get("project_path") else None,
             project_github_url=str(project_context.get("project_github_url") or "") if project_context and project_context.get("project_github_url") else None,
             project_channel_id=str(project_context.get("project_channel_id") or "") if project_context and project_context.get("project_channel_id") else None,
             project_mapping_source=str(project_context.get("project_mapping_source") or "") if project_context else None,
             project_mapping_resolved=bool(project_context.get("project_mapping_resolved")) if project_context else None,
+            project_inspection_candidates=(
+                project_context.get("project_inspection_candidates") if project_context else None
+            ),
         )
 
         # Build media URLs -- download image attachments to local cache so the

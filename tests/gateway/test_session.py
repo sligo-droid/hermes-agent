@@ -69,21 +69,39 @@ class TestSessionSourceRoundtrip:
             chat_id="thread-123",
             chat_name="Sligo Labs / #pid / feature",
             chat_type="thread",
+            project_key="pid",
             project_name="PID",
             project_path="/home/droid/.hermes/workspace/PID",
             project_github_url="https://github.com/sligo-labs/pid",
             project_channel_id="chan-123",
             project_mapping_source="manual",
             project_mapping_resolved=True,
+            project_inspection_candidates=[
+                {
+                    "url": "https://dev.example.test",
+                    "environment": "development",
+                    "location": "external",
+                },
+                {
+                    "url": "https://example.test",
+                    "environment": "production",
+                    "location": "external",
+                },
+            ],
         )
         restored = SessionSource.from_dict(source.to_dict())
 
+        assert restored.project_key == "pid"
         assert restored.project_name == "PID"
         assert restored.project_path == "/home/droid/.hermes/workspace/PID"
         assert restored.project_github_url == "https://github.com/sligo-labs/pid"
         assert restored.project_channel_id == "chan-123"
         assert restored.project_mapping_source == "manual"
         assert restored.project_mapping_resolved is True
+        assert [candidate.url for candidate in restored.project_inspection_candidates] == [
+            "https://dev.example.test/",
+            "https://example.test/",
+        ]
 
     def test_minimal_roundtrip(self):
         source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
@@ -363,20 +381,66 @@ class TestBuildSessionContextPrompt:
             chat_type="thread",
             parent_chat_id="chan-123",
             thread_id="thread-123",
+            project_key="pid",
             project_name="PID",
             project_path="/home/droid/.hermes/workspace/PID",
             project_github_url="https://github.com/sligo-labs/pid",
             project_channel_id="chan-123",
             project_mapping_source="manual",
             project_mapping_resolved=True,
+            project_inspection_candidates=[
+                {
+                    "url": "http://localhost:3000",
+                    "environment": "development",
+                    "location": "local",
+                },
+                {
+                    "url": "https://dev.pid.example",
+                    "environment": "development",
+                    "location": "external",
+                },
+                {
+                    "url": "https://pid.example",
+                    "environment": "production",
+                    "location": "external",
+                },
+            ],
         )
         ctx = build_session_context(source, config)
         prompt = build_session_context_prompt(ctx)
 
         assert "**Mapped Project:**" in prompt
+        assert "Key: `pid`" in prompt
         assert "`/home/droid/.hermes/workspace/PID`" in prompt
         assert "not the Hermes Agent codebase" in prompt
         assert "use this project path explicitly" in prompt
+        assert prompt.index("http://localhost:3000/") < prompt.index("https://dev.pid.example/")
+        assert prompt.index("https://dev.pid.example/") < prompt.index("https://pid.example/")
+        assert "production target only when navigation" in prompt
+        assert "is not navigation unavailability" in prompt
+        assert "start a repository-local preview server" in prompt
+        assert "report the command and local URL" in prompt
+
+    def test_discord_prompt_requires_local_preview_when_no_targets_are_configured(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(enabled=True, token="fake-discord-token"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-123",
+            chat_type="group",
+            project_key="example",
+            project_path="/workspace/example",
+            project_mapping_resolved=True,
+        )
+
+        prompt = build_session_context_prompt(build_session_context(source, config))
+
+        assert "Inspection targets: none configured" in prompt
+        assert "start a repository-local preview server" in prompt
+        assert "report the command and local URL" in prompt
 
     def test_discord_prompt_marks_unresolved_project_channel(self):
         config = GatewayConfig(

@@ -20837,10 +20837,12 @@ class GatewayRunner:
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             session_cwd=session_cwd,
+            project_key=str(context.source.project_key) if context.source.project_key else "",
             project_path=str(context.source.project_path) if context.source.project_path else "",
             project_name=str(context.source.project_name) if context.source.project_name else "",
             project_github_url=str(context.source.project_github_url) if context.source.project_github_url else "",
             project_channel_id=str(context.source.project_channel_id) if context.source.project_channel_id else "",
+            project_inspection_candidates=context.source.project_inspection_candidates,
             guild_id=str(context.source.guild_id) if context.source.guild_id else "",
             parent_chat_id=str(context.source.parent_chat_id) if context.source.parent_chat_id else "",
             kanban_default_intake=(
