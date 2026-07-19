@@ -11,13 +11,13 @@ import copy
 import datetime as dt
 import inspect
 import json
+import multiprocessing
 import os
 import re
 import signal
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -94,13 +94,11 @@ def _discover_registered_adapters() -> None:
 
             discover_plugins()
         except Exception:
-            # Required adapters still fail closed as missing. Plugin discovery
-            # errors are intentionally not copied into durable receipts. The
-            # completion marker is set only after this bounded attempt finishes,
-            # so concurrent initial callers observe the same completed registry.
-            pass
-        finally:
-            _ADAPTER_DISCOVERY_ATTEMPTED = True
+            # Required adapters still fail closed as missing. Discovery failures
+            # are transient: leave the completion marker clear so a later caller
+            # can retry while the lock keeps concurrent callers serialized.
+            return
+        _ADAPTER_DISCOVERY_ATTEMPTED = True
 
 
 def _register(registry: dict[str, PostMergeAdapter], name: str, adapter: PostMergeAdapter) -> None:
@@ -174,6 +172,7 @@ def gateway_restart_adapter(
     get_process_start_time: Callable[[int], int | None] | None = None,
     now_utc: Callable[[], dt.datetime] | None = None,
     runtime_max_age_s: float = 900.0,
+    prior_receipt: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Two-phase self-restart adapter bound to trusted live runtime identity."""
 
@@ -242,6 +241,8 @@ def gateway_restart_adapter(
         value: Mapping[str, Any] | None,
         *,
         expected_commit: str,
+        previous_pid: int | None = None,
+        previous_start_time: int | None = None,
         allow_restart_requested: bool = False,
     ) -> tuple[bool, str, int, int]:
         if not isinstance(value, Mapping):
@@ -278,8 +279,8 @@ def gateway_restart_adapter(
         proven, proof_code = _gateway_replacement_proof(
             proof_state,
             manager_pid=manager_pid,
-            previous_pid=None,
-            previous_start_time=None,
+            previous_pid=previous_pid,
+            previous_start_time=previous_start_time,
             actual_start_time=actual_start,
             expected_source_commit=expected_commit,
         )
@@ -294,11 +295,46 @@ def gateway_restart_adapter(
             return False, aliases.get(proof_code, f"restart_{proof_code}"), runtime_pid, runtime_start
         return True, "passed", runtime_pid, runtime_start
 
+    prior = prior_receipt if isinstance(prior_receipt, Mapping) else {}
+    try:
+        baseline_pid = int(prior.get("baseline_pid"))
+        baseline_start = int(prior.get("baseline_start_time"))
+        if baseline_pid <= 0 or baseline_start < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        baseline_pid = None
+        baseline_start = None
+
     runtime = read_status() or {}
     observed = _safe_sha(runtime.get("source_commit")) if isinstance(runtime, Mapping) else ""
     if not observed:
         return {"status": "blocked", "diagnostic_code": "restart_source_identity_invalid"}
     restart_requested = runtime.get("restart_requested") is True if isinstance(runtime, Mapping) else False
+
+    if baseline_pid is not None and baseline_start is not None:
+        proven, proof_code, _pid, _start = prove_runtime(
+            runtime,
+            expected_commit=target,
+            previous_pid=baseline_pid,
+            previous_start_time=baseline_start,
+        )
+        if proven:
+            return {
+                "status": "passed",
+                "observed_sha": target,
+                "baseline_pid": baseline_pid,
+                "baseline_start_time": baseline_start,
+            }
+        # Once a signal has been issued, unchanged identity, startup readiness,
+        # and source propagation are retryable observations. Never signal an
+        # unproven or replacement process a second time.
+        return {
+            "status": "pending",
+            "diagnostic_code": "gateway_restart_replacement_not_observed",
+            "baseline_pid": baseline_pid,
+            "baseline_start_time": baseline_start,
+        }
+
     proven, proof_code, pid, start_time = prove_runtime(
         runtime,
         expected_commit=observed,
@@ -308,11 +344,6 @@ def gateway_restart_adapter(
         return {"status": "blocked", "diagnostic_code": proof_code}
     if restart_requested:
         return {"status": "pending", "diagnostic_code": "gateway_restart_in_progress"}
-    if observed == target:
-        proven, proof_code, _pid, _start = prove_runtime(runtime, expected_commit=target)
-        if proven:
-            return {"status": "passed", "observed_sha": target}
-        return {"status": "blocked", "diagnostic_code": proof_code}
 
     # Re-read and re-prove the exact live (pid, start_time) immediately before
     # signalling so a stale status file or PID reuse can never redirect SIGUSR1.
@@ -332,8 +363,6 @@ def gateway_restart_adapter(
         return {"status": "blocked", "diagnostic_code": latest_code}
     if (latest_pid, latest_start) != (pid, start_time):
         return {"status": "blocked", "diagnostic_code": "restart_runtime_identity_changed"}
-    if latest_observed == target:
-        return {"status": "passed", "observed_sha": target}
     if not operation_control.mutation_allowed():
         return {"status": "blocked", "diagnostic_code": "collector_cancelled"}
     sigusr1 = getattr(signal, "SIGUSR1", None)
@@ -344,7 +373,12 @@ def gateway_restart_adapter(
         send_signal(latest_pid, sigusr1)
     except Exception:
         return {"status": "blocked", "diagnostic_code": "gateway_restart_request_failed"}
-    return {"status": "pending", "diagnostic_code": "gateway_restart_requested"}
+    return {
+        "status": "pending",
+        "diagnostic_code": "gateway_restart_requested",
+        "baseline_pid": latest_pid,
+        "baseline_start_time": latest_start,
+    }
 
 
 def _safe_sha(value: Any) -> str:
@@ -366,12 +400,18 @@ def _receipt(
     now: float,
     target_sha: str = "",
     diagnostic_code: str = "",
+    baseline_pid: int | None = None,
+    baseline_start_time: int | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"status": status, "checked_at": now}
     if target_sha:
         result["observed_sha"] = target_sha
     if diagnostic_code:
         result["diagnostic_code"] = _safe_code(diagnostic_code, status)
+    if baseline_pid is not None and baseline_pid > 0:
+        result["baseline_pid"] = baseline_pid
+    if baseline_start_time is not None and baseline_start_time >= 0:
+        result["baseline_start_time"] = baseline_start_time
     return result
 
 
@@ -418,9 +458,12 @@ def _collect_ci(
     repository: str,
     workspace_path: str,
     run: CommandRunner,
+    control: PostMergeControl,
     now: float,
 ) -> dict[str, Any]:
     root = Path(workspace_path).expanduser().resolve(strict=False)
+    if control.expired():
+        return _receipt("blocked", now=now, diagnostic_code="collector_timeout")
     result = run(
         [
             "gh",
@@ -440,7 +483,7 @@ def _collect_ci(
             "databaseId,headSha,event,status,conclusion,workflowName,createdAt,updatedAt",
         ],
         cwd=root,
-        timeout=60,
+        timeout=max(0.1, min(60.0, control.remaining())),
         github=True,
     )
     if result.returncode != 0:
@@ -473,10 +516,12 @@ def _collect_ci(
     run_id = str(latest.get("databaseId") or "").strip()
     if not run_id.isdigit():
         return _receipt("blocked", now=now, diagnostic_code="post_merge_ci_run_id_missing")
+    if control.expired():
+        return _receipt("blocked", now=now, diagnostic_code="collector_timeout")
     jobs_result = run(
         ["gh", "run", "view", run_id, "--repo", repository, "--json", "jobs"],
         cwd=root,
-        timeout=60,
+        timeout=max(0.1, min(60.0, control.remaining())),
         github=True,
     )
     if jobs_result.returncode != 0:
@@ -538,9 +583,19 @@ def _collect_canonical(
     except Exception:
         return _receipt("failed", now=now, diagnostic_code="canonical_sync_failed")
     sync_state = str(data.get("state") or "").strip().lower()
-    if sync_state.startswith("synced") or sync_state == "not_applicable":
-        return _receipt("passed", now=now, target_sha=target_sha)
-    return _receipt("failed", now=now, diagnostic_code="canonical_sync_failed")
+    if sync_state == "not_applicable":
+        return _receipt("not_configured", now=now, diagnostic_code="canonical_not_applicable")
+    if not sync_state.startswith("synced"):
+        return _receipt("failed", now=now, diagnostic_code="canonical_sync_failed")
+    observed_head = _safe_sha(data.get("head"))
+    if not observed_head:
+        return _receipt("failed", now=now, diagnostic_code="canonical_head_missing")
+    if observed_head != target_sha:
+        return _receipt("failed", now=now, diagnostic_code="canonical_head_mismatch")
+    observed_merge = _safe_sha(data.get("merge_commit"))
+    if observed_merge != target_sha:
+        return _receipt("failed", now=now, diagnostic_code="canonical_merge_target_mismatch")
+    return _receipt("passed", now=now, target_sha=observed_head)
 
 
 def _adapter_receipt(
@@ -556,6 +611,7 @@ def _adapter_receipt(
     timeout_s: float,
     control: PostMergeControl,
     now: float,
+    prior_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     adapter = registry.get(adapter_name.lower()) if adapter_name else None
     if adapter is None:
@@ -565,14 +621,21 @@ def _adapter_receipt(
     if not control.mutation_allowed():
         return _receipt("blocked", now=now, diagnostic_code="collector_cancelled")
     try:
-        raw = adapter(
-            target_sha=target_sha,
-            repository=repository,
-            workspace_path=workspace_path,
-            canonical_path=canonical_path,
-            timeout_s=min(timeout_s, max(0.1, control.remaining())),
-            control=control,
-        )
+        adapter_kwargs: dict[str, Any] = {
+            "target_sha": target_sha,
+            "repository": repository,
+            "workspace_path": workspace_path,
+            "canonical_path": canonical_path,
+            "timeout_s": min(timeout_s, max(0.1, control.remaining())),
+            "control": control,
+        }
+        parameters = inspect.signature(adapter).parameters
+        if "prior_receipt" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            adapter_kwargs["prior_receipt"] = dict(prior_receipt or {})
+        raw = adapter(**adapter_kwargs)
     except Exception:
         return _receipt("failed", now=now, diagnostic_code="adapter_failed")
     data = raw if isinstance(raw, Mapping) else {}
@@ -583,13 +646,77 @@ def _adapter_receipt(
     code = _safe_code(data.get("diagnostic_code"), "adapter_result") if data.get("diagnostic_code") else ""
     if status == "passed" and observed != target_sha:
         return _receipt("failed", now=now, diagnostic_code="observed_sha_mismatch")
-    return _receipt(status, now=now, target_sha=observed, diagnostic_code=code)
+    try:
+        baseline_pid = int(data.get("baseline_pid"))
+        baseline_start = int(data.get("baseline_start_time"))
+        if baseline_pid <= 0 or baseline_start < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        baseline_pid = None
+        baseline_start = None
+    return _receipt(
+        status,
+        now=now,
+        target_sha=observed,
+        diagnostic_code=code,
+        baseline_pid=baseline_pid,
+        baseline_start_time=baseline_start,
+    )
 
 
 def _repository_config(config: Mapping[str, Any], repository: str) -> Mapping[str, Any]:
     repositories = config.get("repositories") if isinstance(config.get("repositories"), Mapping) else {}
     entry = repositories.get(repository) if isinstance(repositories, Mapping) else None
     return entry if isinstance(entry, Mapping) else {}
+
+
+def _isolated_collector_entry(
+    collector: Callable[[PostMergeControl], dict[str, Any]],
+    control: PostMergeControl,
+    connection: Any,
+) -> None:
+    """Run one collector in a process group the parent can terminate atomically."""
+
+    try:
+        if hasattr(os, "setsid"):
+            os.setsid()
+        connection.send(("result", collector(control)))
+    except BaseException:
+        try:
+            connection.send(("error", None))
+        except BaseException:
+            pass
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def _terminate_isolated_collector(process: Any, *, deadline: float) -> None:
+    """Kill and reap a timed-out collector and descendants before returning."""
+
+    if not process.is_alive():
+        process.join(timeout=0)
+        return
+    try:
+        if hasattr(os, "killpg") and process.pid:
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except Exception:
+            pass
+    process.join(timeout=max(0.0, deadline - time.monotonic()))
+    if process.is_alive():
+        # Do not let a timeout receipt escape while mutation-capable code lives.
+        try:
+            process.kill()
+        except Exception:
+            pass
+        process.join()
 
 
 def collect_post_merge_receipts(
@@ -642,14 +769,24 @@ def collect_post_merge_receipts(
     gathered = copy.deepcopy(dict(post_merge))
     gathered["target_sha"] = target_sha
     jobs: dict[str, Callable[[PostMergeControl], dict[str, Any]]] = {}
+    isolated_jobs: set[str] = set()
+
+    def exact_pass(name: str) -> bool:
+        prior = post_merge.get(name) if isinstance(post_merge.get(name), Mapping) else {}
+        return (
+            str(prior.get("status") or "").strip().lower() == "passed"
+            and _safe_sha(prior.get("observed_sha")) == target_sha
+        )
+
     canonical_configured = requirements.get("canonical_sync") is True or bool(canonical_path)
+    canonical_already_proven = canonical_configured and exact_pass("canonical_sync")
     if canonical_configured and read_only:
         gathered["canonical_sync"] = _receipt(
             "not_configured",
             now=collected_at,
             diagnostic_code="shadow_not_executed",
         )
-    elif canonical_configured:
+    elif canonical_configured and not canonical_already_proven:
         jobs["canonical_sync"] = lambda control: _collect_canonical(
             target_sha=target_sha,
             canonical_path=canonical_path,
@@ -660,12 +797,13 @@ def collect_post_merge_receipts(
             control=control,
             now=collected_at,
         )
-    if requirements.get("ci") is True:
-        jobs["ci"] = lambda _control: _collect_ci(
+    if requirements.get("ci") is True and not exact_pass("ci"):
+        jobs["ci"] = lambda control: _collect_ci(
             target_sha=target_sha,
             repository=repository,
             workspace_path=workspace_path,
             run=runner,
+            control=control,
             now=collected_at,
         )
     adapter_specs = (
@@ -685,7 +823,15 @@ def collect_post_merge_receipts(
                 diagnostic_code="shadow_not_executed",
             )
             continue
-        jobs[receipt_name] = lambda control, registry=registry, adapter_name=adapter_name, required=required: _adapter_receipt(
+        if exact_pass(receipt_name):
+            continue
+        prior_receipt = (
+            dict(post_merge.get(receipt_name))
+            if isinstance(post_merge.get(receipt_name), Mapping)
+            else {}
+        )
+        isolated_jobs.add(receipt_name)
+        jobs[receipt_name] = lambda control, registry=registry, adapter_name=adapter_name, required=required, prior_receipt=prior_receipt: _adapter_receipt(
             registry=registry,
             adapter_name=adapter_name,
             required=required,
@@ -697,17 +843,18 @@ def collect_post_merge_receipts(
             timeout_s=adapter_timeout_s,
             control=control,
             now=collected_at,
+            prior_receipt=prior_receipt,
         )
 
     if jobs:
-        workers = max(1, min(_MAX_WORKERS, int(max_workers), len(jobs)))
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="post-merge")
-        collector_deadline = time.monotonic() + collector_timeout_s
-        controls = {
-            name: PostMergeControl(deadline=collector_deadline)
-            for name in jobs
-        }
-        span_lock = threading.Lock()
+        try:
+            workers = max(1, min(_MAX_WORKERS, int(max_workers), len(jobs)))
+        except (TypeError, ValueError):
+            workers = min(_MAX_WORKERS, len(jobs))
+        hard_deadline = time.monotonic() + collector_timeout_s
+        cleanup_budget = min(0.1, max(0.02, collector_timeout_s * 0.2))
+        execution_deadline = hard_deadline - cleanup_budget
+        controls = {name: PostMergeControl(deadline=execution_deadline) for name in jobs}
         span_handles: dict[str, Any] = {}
         span_finished: set[str] = set()
         phase_by_name = {
@@ -717,36 +864,27 @@ def collect_post_merge_receipts(
             "production_qa": "production_qa",
             "restart": "restart",
         }
-        if span_recorder is not None:
-            for name in jobs:
-                span_handles[name] = span_recorder.start(
-                    f"post_merge_{name}",
-                    phase=phase_by_name.get(name, "closeout"),
-                    parent_id=span_parent_id,
-                    attempt_id=span_attempt_id,
-                    concurrency_id=f"post-merge-{target_sha[:12]}",
-                    metadata={"collector": name, "repository": repository},
-                )
+
+        def start_span(name: str) -> None:
+            if span_recorder is None or name in span_handles:
+                return
+            span_handles[name] = span_recorder.start(
+                f"post_merge_{name}",
+                phase=phase_by_name.get(name, "closeout"),
+                parent_id=span_parent_id,
+                attempt_id=span_attempt_id,
+                concurrency_id=f"post-merge-{target_sha[:12]}",
+                metadata={"collector": name, "repository": repository},
+            )
 
         def finish_span_once(name: str, status: str) -> None:
-            if span_recorder is None or name not in span_handles:
+            if span_recorder is None or name not in span_handles or name in span_finished:
                 return
-            with span_lock:
-                if name in span_finished:
-                    return
-                span_finished.add(name)
+            span_finished.add(name)
             span_recorder.finish(span_handles[name], status=status)
 
-        def collect_one(
-            name: str,
-            collector: Callable[[PostMergeControl], dict[str, Any]],
-            control: PostMergeControl,
-        ) -> dict[str, Any]:
-            try:
-                receipt = collector(control)
-            except Exception:
-                finish_span_once(name, "error")
-                raise
+        def finish_receipt(name: str, receipt: Mapping[str, Any]) -> None:
+            gathered[name] = dict(receipt)
             receipt_status = str(receipt.get("status") or "blocked").strip().lower()
             span_status = {
                 "passed": "ok",
@@ -756,41 +894,144 @@ def collect_post_merge_receipts(
                 "blocked": "blocked",
             }.get(receipt_status, "uncertain")
             finish_span_once(name, span_status)
-            return receipt
 
-        futures = {
-            pool.submit(collect_one, name, collector, controls[name]): name
-            for name, collector in jobs.items()
-        }
         try:
-            completed, overdue = wait(futures, timeout=collector_timeout_s)
-            for future in completed:
-                name = futures[future]
-                try:
-                    gathered[name] = future.result()
-                except Exception:
-                    gathered[name] = _receipt("blocked", now=collected_at, diagnostic_code="collector_failed")
-            for future in overdue:
-                name = futures[future]
-                controls[name].cancel()
-                future.cancel()
-                finish_span_once(name, "timeout")
-            if overdue:
-                # Cooperative workers must observe cancellation and stop before a
-                # timeout receipt can escape to caller-owned persistence.
-                wait(overdue)
-                for future in overdue:
-                    name = futures[future]
-                    gathered[name] = _receipt(
-                        "blocked",
-                        now=collected_at,
-                        diagnostic_code="collector_timeout",
+            process_context = multiprocessing.get_context("fork")
+        except ValueError:
+            process_context = None
+
+        pending = [name for name in jobs if name != "restart"]
+        restart_waiting = "restart" in jobs
+        if restart_waiting and (not canonical_configured or canonical_already_proven):
+            pending.append("restart")
+            restart_waiting = False
+        running: dict[str, tuple[str, Any, Any]] = {}
+
+        def start_one(name: str) -> None:
+            start_span(name)
+            if name not in isolated_jobs:
+                slot: dict[str, Any] = {}
+
+                def run_native() -> None:
+                    try:
+                        slot["payload"] = ("result", jobs[name](controls[name]))
+                    except BaseException:
+                        slot["payload"] = ("error", None)
+
+                thread = threading.Thread(
+                    target=run_native,
+                    name=f"post-merge-{name}",
+                    daemon=True,
+                )
+                thread.start()
+                running[name] = ("thread", thread, slot)
+                return
+            if process_context is None:
+                finish_receipt(
+                    name,
+                    _receipt("blocked", now=collected_at, diagnostic_code="collector_isolation_unavailable"),
+                )
+                return
+            receive, send = process_context.Pipe(duplex=False)
+            process = process_context.Process(
+                target=_isolated_collector_entry,
+                args=(jobs[name], controls[name], send),
+                name=f"post-merge-{name}",
+            )
+            process.start()
+            send.close()
+            running[name] = ("process", process, receive)
+
+        while (pending or running or restart_waiting) and time.monotonic() < execution_deadline:
+            while pending and len(running) < workers:
+                start_one(pending.pop(0))
+            completed_names: list[str] = []
+            for name, (kind, worker, channel) in list(running.items()):
+                payload: tuple[str, Any] | None = None
+                if kind == "thread":
+                    if worker.is_alive():
+                        continue
+                    payload = channel.get("payload", ("error", None))
+                    worker.join(timeout=0)
+                else:
+                    if channel.poll(0):
+                        try:
+                            payload = channel.recv()
+                        except (EOFError, OSError):
+                            payload = ("error", None)
+                    elif not worker.is_alive():
+                        payload = ("error", None)
+                    if payload is None:
+                        continue
+                    worker.join(timeout=max(0.0, hard_deadline - time.monotonic()))
+                    if worker.is_alive():
+                        _terminate_isolated_collector(worker, deadline=hard_deadline)
+                    channel.close()
+                completed_names.append(name)
+                if payload[0] == "result" and isinstance(payload[1], Mapping):
+                    finish_receipt(name, payload[1])
+                else:
+                    finish_receipt(
+                        name,
+                        _receipt("blocked", now=collected_at, diagnostic_code="collector_failed"),
                     )
-        finally:
-            for future, name in futures.items():
-                if not future.done():
-                    controls[name].cancel()
-            pool.shutdown(wait=True, cancel_futures=True)
+            for name in completed_names:
+                running.pop(name, None)
+                if name == "canonical_sync" and restart_waiting:
+                    canonical_receipt = gathered.get("canonical_sync")
+                    canonical_status = (
+                        str(canonical_receipt.get("status") or "").strip().lower()
+                        if isinstance(canonical_receipt, Mapping)
+                        else ""
+                    )
+                    canonical_ready = (
+                        canonical_status == "passed"
+                        and _safe_sha(canonical_receipt.get("observed_sha")) == target_sha
+                    ) or (
+                        canonical_status == "not_configured"
+                        and canonical_receipt.get("diagnostic_code") == "canonical_not_applicable"
+                    )
+                    if canonical_ready:
+                        pending.append("restart")
+                    else:
+                        start_span("restart")
+                        finish_receipt(
+                            "restart",
+                            _receipt(
+                                "pending",
+                                now=collected_at,
+                                diagnostic_code="canonical_sync_not_ready",
+                            ),
+                        )
+                    restart_waiting = False
+            if not completed_names:
+                time.sleep(min(0.005, max(0.0, execution_deadline - time.monotonic())))
+
+        for name, (kind, worker, channel) in list(running.items()):
+            controls[name].cancel()
+            if kind == "process":
+                _terminate_isolated_collector(worker, deadline=hard_deadline)
+                channel.close()
+            finish_span_once(name, "timeout")
+            gathered[name] = _receipt(
+                "blocked",
+                now=collected_at,
+                diagnostic_code="collector_timeout",
+            )
+        for name in pending:
+            start_span(name)
+            finish_span_once(name, "timeout")
+            gathered[name] = _receipt(
+                "blocked",
+                now=collected_at,
+                diagnostic_code="collector_timeout",
+            )
+        if restart_waiting:
+            start_span("restart")
+            finish_receipt(
+                "restart",
+                _receipt("pending", now=collected_at, diagnostic_code="canonical_sync_not_ready"),
+            )
     for name in _RECEIPT_NAMES:
         if name not in gathered:
             gathered[name] = {"status": "not_configured"}

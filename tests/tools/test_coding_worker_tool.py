@@ -1512,6 +1512,7 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
         task="land the requested change",
         worker_summary="Changed src/app.py and ran pytest.",
         closeout_mode="shadow",
+        verification_runtime_breakdown=None,
     )
 
 

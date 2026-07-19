@@ -144,7 +144,7 @@ def test_finalize_commits_pushes_draft_pr_and_returns_durable_closeout_without_w
     assert state["workspace"]["canonical_path"] == str(canonical)
     assert state["pr"]["head_sha"] == result.commit
     assert state["pr"]["is_draft"] is True
-    assert state["local_verification"] == {"status": "passed", "head_sha": result.commit}
+    assert state["local_verification"] == {"status": "pending"}
     spans = state["telemetry"]["phase_spans"]
     root_span = next(span for span in spans if span["name"] == "fable_finalization")
     assert root_span["attempt_id"].startswith("att_")
@@ -154,6 +154,36 @@ def test_finalize_commits_pushes_draft_pr_and_returns_durable_closeout_without_w
     assert all(span.get("attempt_id") == root_span["attempt_id"] for span in command_spans)
     assert not any(args[:3] == ["gh", "pr", "checks"] for args in calls)
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_trusted_local_verification_requires_exact_root_head_and_mutation_boundary(tmp_path):
+    _canonical, _remote, worktree = _linked_repo(tmp_path)
+    head = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    evidence = {
+        "mutation_generation": 2,
+        "mutation_boundary": 5,
+        "verification_evidence": [
+            {
+                "status": "success",
+                "surface": "verification",
+                "repository_root": str(worktree),
+                "canonical_command": "scripts/run_tests.sh tests/focused",
+                "scope": "tests",
+                "verified_head_sha": head,
+                "mutation_generation": 2,
+                "mutation_boundary": 5,
+            }
+        ],
+    }
+
+    assert finalizer._trusted_local_verification_receipt(worktree, head, evidence) == {
+        "status": "passed",
+        "head_sha": head,
+    }
+    stale = {**evidence, "mutation_boundary": 6}
+    assert finalizer._trusted_local_verification_receipt(worktree, head, stale) == {
+        "status": "pending"
+    }
 
 
 def test_shadow_merge_preserves_legacy_finalizer_with_exact_head_guard(monkeypatch, tmp_path):

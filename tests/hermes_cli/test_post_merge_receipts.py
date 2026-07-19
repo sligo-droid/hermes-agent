@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import multiprocessing
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -227,7 +229,7 @@ def test_missing_required_adapter_blocks_only_enforce_mode(tmp_path):
 
 
 def test_independent_collectors_run_concurrently_and_return_one_update(tmp_path):
-    barrier = threading.Barrier(2)
+    barrier = multiprocessing.get_context("fork").Barrier(2)
 
     def adapter(**_kwargs):
         barrier.wait(timeout=2)
@@ -260,10 +262,12 @@ def test_independent_collectors_run_concurrently_and_return_one_update(tmp_path)
 
 
 def test_adapter_receives_exact_target_and_bounded_timeout(tmp_path):
-    observed = {}
+    observed = multiprocessing.get_context("fork").Queue()
 
     def adapter(**kwargs):
-        observed.update(kwargs)
+        control = kwargs.pop("control")
+        prior_receipt = kwargs.pop("prior_receipt")
+        observed.put((kwargs, isinstance(control, receipts.PostMergeControl), control.cancelled(), prior_receipt))
         return {"status": "passed", "observed_sha": kwargs["target_sha"]}
 
     receipts.register_restart_adapter("test-restart-target", adapter)
@@ -275,15 +279,20 @@ def test_adapter_receives_exact_target_and_bounded_timeout(tmp_path):
             "adapter_timeout_s": 1.25,
             "repositories": {"owner/repo": {"restart_adapter": "test-restart-target"}},
         },
-        sync_canonical=lambda *_args: {"state": "synced"},
+        sync_canonical=lambda *_args: {
+            "state": "synced",
+            "head": TARGET,
+            "merge_commit": TARGET,
+        },
         now=100,
     )
 
     assert gathered["restart"] == {"status": "passed", "checked_at": 100, "observed_sha": TARGET}
-    control = observed.pop("control")
-    assert isinstance(control, receipts.PostMergeControl)
-    assert control.cancelled() is False
-    assert observed == {
+    adapter_kwargs, is_control, cancelled, prior_receipt = observed.get(timeout=1)
+    assert is_control is True
+    assert cancelled is False
+    assert prior_receipt == {"status": "pending"}
+    assert adapter_kwargs == {
         "target_sha": TARGET,
         "repository": "owner/repo",
         "workspace_path": str(tmp_path / "workspace"),
@@ -548,11 +557,14 @@ def test_gateway_restart_adapter_requests_restart_then_observes_exact_target(tmp
     assert first == {
         "status": "pending",
         "diagnostic_code": "gateway_restart_requested",
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
     }
     assert signals and signals[0][0] == 1234
 
+    # The original process reporting the target is not replacement proof.
     runtime.update(source_commit=TARGET)
-    second = receipts.gateway_restart_adapter(
+    unchanged = receipts.gateway_restart_adapter(
         target_sha=TARGET,
         repository="owner/repo",
         workspace_path="",
@@ -564,8 +576,36 @@ def test_gateway_restart_adapter_requests_restart_then_observes_exact_target(tmp
         get_running_pid=lambda: 1234,
         get_process_start_time=lambda _pid: 777,
         now_utc=lambda: now,
+        prior_receipt=first,
     )
-    assert second == {"status": "passed", "observed_sha": TARGET}
+    assert unchanged == {
+        "status": "pending",
+        "diagnostic_code": "gateway_restart_replacement_not_observed",
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
+    }
+
+    runtime.update(pid=5678, start_time=888)
+    second = receipts.gateway_restart_adapter(
+        target_sha=TARGET,
+        repository="owner/repo",
+        workspace_path="",
+        canonical_path=str(root),
+        timeout_s=2,
+        run=run,
+        read_status=lambda: runtime,
+        signal_process=lambda pid, sig: signals.append((pid, sig)),
+        get_running_pid=lambda: 5678,
+        get_process_start_time=lambda _pid: 888,
+        now_utc=lambda: now,
+        prior_receipt=first,
+    )
+    assert second == {
+        "status": "passed",
+        "observed_sha": TARGET,
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
+    }
     assert len(signals) == 1
 
 
@@ -689,18 +729,18 @@ def test_gateway_restart_adapter_fails_closed_on_wrong_or_dirty_source(tmp_path)
 
 
 def test_overdue_adapter_stops_before_timeout_receipt_can_be_persisted(tmp_path):
-    started = threading.Event()
-    stopped = threading.Event()
-    late_side_effect = threading.Event()
+    started = tmp_path / "adapter-started"
+    heartbeat = tmp_path / "adapter-heartbeat"
+    child_pid = tmp_path / "adapter-pid"
 
-    def adapter(*, control, **_kwargs):
-        started.set()
-        while not control.cancelled():
+    def adapter(**_kwargs):
+        child_pid.write_text(str(os.getpid()), encoding="utf-8")
+        started.write_text("started", encoding="utf-8")
+        counter = 0
+        while True:
+            counter += 1
+            heartbeat.write_text(str(counter), encoding="utf-8")
             time.sleep(0.005)
-        if control.mutation_allowed():
-            late_side_effect.set()
-        stopped.set()
-        return {"status": "blocked", "diagnostic_code": "collector_cancelled"}
 
     receipts.register_deployment_adapter("test-timeout-deploy", adapter)
     state = _state(tmp_path, requirements={"deployment": True})
@@ -717,15 +757,134 @@ def test_overdue_adapter_stops_before_timeout_receipt_can_be_persisted(tmp_path)
         max_workers=2,
     )
 
-    assert started.is_set()
-    assert stopped.is_set()
-    assert late_side_effect.is_set() is False
+    assert started.exists()
+    assert child_pid.exists()
+    heartbeat_after_return = heartbeat.read_text(encoding="utf-8")
+    time.sleep(0.05)
+    assert heartbeat.read_text(encoding="utf-8") == heartbeat_after_return
+    try:
+        os.kill(int(child_pid.read_text(encoding="utf-8")), 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError("timed-out adapter process remained alive")
     assert time.monotonic() - began < 1
     assert gathered["deployment"] == {
         "status": "blocked",
         "checked_at": 100,
         "diagnostic_code": "collector_timeout",
     }
+
+
+def test_plugin_discovery_failure_is_retryable(monkeypatch, tmp_path):
+    from hermes_cli import plugins
+
+    monkeypatch.setattr(receipts, "_ADAPTER_DISCOVERY_ATTEMPTED", False)
+    calls = []
+
+    def discover_plugins():
+        calls.append("discover")
+        if len(calls) == 1:
+            raise RuntimeError("transient discovery failure")
+        receipts.register_deployment_adapter(
+            "plugin-retry-deploy",
+            lambda **kwargs: {"status": "passed", "observed_sha": kwargs["target_sha"]},
+        )
+
+    monkeypatch.setattr(plugins, "discover_plugins", discover_plugins)
+    state = _state(tmp_path, requirements={"deployment": True})
+    state["workspace"]["canonical_path"] = ""
+    config = {
+        "repositories": {
+            "owner/repo": {"deployment_adapter": "plugin-retry-deploy"}
+        }
+    }
+
+    first = receipts.collect_post_merge_receipts(state, config=config, now=100)
+    second = receipts.collect_post_merge_receipts(state, config=config, now=101)
+
+    assert first["deployment"]["diagnostic_code"] == "required_adapter_missing"
+    assert second["deployment"] == {
+        "status": "passed",
+        "checked_at": 101,
+        "observed_sha": TARGET,
+    }
+    assert calls == ["discover", "discover"]
+
+
+def test_canonical_receipt_requires_exact_observed_head_and_merge_target(tmp_path):
+    state = _state(tmp_path, requirements={"canonical_sync": True})
+
+    missing = receipts.collect_post_merge_receipts(
+        state,
+        sync_canonical=lambda *_args, **_kwargs: {
+            "state": "synced",
+            "merge_commit": TARGET,
+        },
+        now=100,
+    )
+    mismatched = receipts.collect_post_merge_receipts(
+        state,
+        sync_canonical=lambda *_args, **_kwargs: {
+            "state": "synced",
+            "head": OTHER,
+            "merge_commit": TARGET,
+        },
+        now=101,
+    )
+    inconsistent = receipts.collect_post_merge_receipts(
+        state,
+        sync_canonical=lambda *_args, **_kwargs: {
+            "state": "synced",
+            "head": TARGET,
+            "merge_commit": OTHER,
+        },
+        now=102,
+    )
+
+    assert missing["canonical_sync"] == {
+        "status": "failed",
+        "checked_at": 100,
+        "diagnostic_code": "canonical_head_missing",
+    }
+    assert mismatched["canonical_sync"]["diagnostic_code"] == "canonical_head_mismatch"
+    assert "observed_sha" not in mismatched["canonical_sync"]
+    assert inconsistent["canonical_sync"]["diagnostic_code"] == "canonical_merge_target_mismatch"
+
+
+def test_restart_waits_for_canonical_exact_target(tmp_path):
+    canonical_observation = tmp_path / "canonical-head"
+    canonical_observation.write_text(OTHER, encoding="utf-8")
+
+    def sync_canonical(*_args, **_kwargs):
+        time.sleep(0.05)
+        canonical_observation.write_text(TARGET, encoding="utf-8")
+        return {"state": "synced", "head": TARGET, "merge_commit": TARGET}
+
+    def restart_adapter(**_kwargs):
+        observed = canonical_observation.read_text(encoding="utf-8")
+        return {"status": "passed", "observed_sha": observed}
+
+    receipts.register_restart_adapter("test-canonical-ordered-restart", restart_adapter)
+    state = _state(
+        tmp_path,
+        requirements={"canonical_sync": True, "restart": True},
+    )
+    gathered = receipts.collect_post_merge_receipts(
+        state,
+        config={
+            "repositories": {
+                "owner/repo": {"restart_adapter": "test-canonical-ordered-restart"}
+            }
+        },
+        sync_canonical=sync_canonical,
+        now=100,
+        max_workers=2,
+    )
+
+    assert gathered["canonical_sync"]["status"] == "passed"
+    assert gathered["restart"]["status"] == "passed"
+    assert gathered["restart"]["observed_sha"] == TARGET
 
 
 def test_post_merge_target_requires_exact_full_sha(tmp_path):

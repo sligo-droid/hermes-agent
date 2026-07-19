@@ -7179,11 +7179,16 @@ def reconcile_board(board: str) -> Optional[str]:
             _update_worker_meta(board, worker)
             persist_board_run_summary(board)
             return "blocked_review_loop_limit"
+        early_draft_checkpoint = _early_draft_checkpoint_before_review(board, worker)
+        if early_draft_checkpoint and early_draft_checkpoint.get("status") == "blocked":
+            # Opening/refreshing the draft is a retryable dispatcher checkpoint.
+            # Do not consume a review loop or create reviewer work against an
+            # unproven PR head; the next reconciliation retries this checkpoint.
+            return "early_draft_checkpoint_pending"
         loops += 1
         worker["review_loop_count"] = loops
         worker["phase"] = "reviewing"
         _update_worker_meta(board, worker)
-        early_draft_checkpoint = _early_draft_checkpoint_before_review(board, worker)
         reviewer_payload = {
             "role": ROLE_REVIEWER,
             "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",

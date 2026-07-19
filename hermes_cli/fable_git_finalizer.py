@@ -17,7 +17,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from agent.runtime_phase_classification import classify_runtime_phase
 from agent.runtime_spans import RuntimeSpanRecorder, sanitize_runtime_spans
@@ -849,6 +849,52 @@ def _pr_state(root: Path, *, repo: str, pr_url: str) -> tuple[dict[str, Any] | N
     return payload, ""
 
 
+def _trusted_local_verification_receipt(
+    root: Path,
+    expected_head: str,
+    runtime_breakdown: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Bind only host-produced exact-head evidence from the final mutation boundary."""
+
+    if not isinstance(runtime_breakdown, Mapping) or not _SHA_RE.fullmatch(expected_head):
+        return {"status": "pending"}
+    try:
+        expected_root = str(root.resolve(strict=True))
+        final_generation = int(runtime_breakdown.get("mutation_generation"))
+        final_boundary = int(runtime_breakdown.get("mutation_boundary"))
+    except (OSError, TypeError, ValueError):
+        return {"status": "pending"}
+    evidence = runtime_breakdown.get("verification_evidence")
+    if not isinstance(evidence, list):
+        return {"status": "pending"}
+    for item in reversed(evidence):
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("status") or "").strip().lower() != "success":
+            continue
+        if str(item.get("surface") or "").strip().lower() not in {"verification", "ci"}:
+            continue
+        repository_root = str(item.get("repository_root") or "").strip()
+        canonical_command = str(item.get("canonical_command") or "").strip()
+        scope = str(item.get("scope") or "").strip()
+        if not repository_root or not canonical_command or not scope:
+            continue
+        try:
+            evidence_root = str(Path(repository_root).resolve(strict=True))
+            generation = int(item.get("mutation_generation"))
+            boundary = int(item.get("mutation_boundary"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if (
+            evidence_root == expected_root
+            and str(item.get("verified_head_sha") or "").strip().lower() == expected_head
+            and generation == final_generation
+            and boundary == final_boundary
+        ):
+            return {"status": "passed", "head_sha": expected_head}
+    return {"status": "pending"}
+
+
 def _canonical_checkout(root: Path) -> Path | None:
     result = _run(["git", "rev-parse", "--git-common-dir"], cwd=root, timeout=10)
     raw = (result.stdout or "").strip()
@@ -895,6 +941,7 @@ def _finalize_fable_git_lifecycle_impl(
     task: str,
     worker_summary: str,
     closeout_mode: str,
+    verification_runtime_breakdown: Mapping[str, Any] | None = None,
 ) -> FableGitFinalization:
     """Finalize through legacy authority or enforced structured closeout."""
     normalized_mode = str(mode or "").strip().lower()
@@ -1040,7 +1087,11 @@ def _finalize_fable_git_lifecycle_impl(
                     "require_visual_qa": False,
                     "post_merge_requirements": {},
                 },
-                "local_verification": {"status": "passed", "head_sha": remote_head},
+                "local_verification": _trusted_local_verification_receipt(
+                    root,
+                    remote_head,
+                    verification_runtime_breakdown,
+                ),
                 "review": {"status": "not_required"},
                 "visual_qa": {"status": "not_required"},
                 "pr": {
@@ -1199,6 +1250,7 @@ def finalize_fable_git_lifecycle(
     task: str,
     worker_summary: str,
     closeout_mode: str = "shadow",
+    verification_runtime_breakdown: Mapping[str, Any] | None = None,
 ) -> FableGitFinalization:
     """Run trusted Fable finalization with bounded Git/GitHub spans."""
 
@@ -1226,6 +1278,7 @@ def finalize_fable_git_lifecycle(
             task=task,
             worker_summary=worker_summary,
             closeout_mode=closeout_mode,
+            verification_runtime_breakdown=verification_runtime_breakdown,
         )
     except Exception:
         recorder.finish(root_span, status="error")

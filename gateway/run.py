@@ -2830,6 +2830,18 @@ def _load_gateway_runtime_config() -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
+def _closeout_mapping(value: Any) -> dict[str, Any]:
+    """Normalize untrusted raw closeout YAML sections to an owned mapping."""
+
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _closeout_repository_config(closeout_config: Any, repository: str) -> dict[str, Any]:
+    closeout = _closeout_mapping(closeout_config)
+    repositories = _closeout_mapping(closeout.get("repositories"))
+    return _closeout_mapping(repositories.get(repository))
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -4862,17 +4874,9 @@ class GatewayRunner:
                 branch = str(branch_result.stdout or "").strip()[:240]
         except Exception:
             branch = ""
-        closeout_config = config.get("closeout") if isinstance(config.get("closeout"), dict) else {}
-        repo_config = (
-            closeout_config.get("repositories", {}).get(repository, {})
-            if isinstance(closeout_config.get("repositories"), dict)
-            else {}
-        )
-        base_branch = (
-            str(repo_config.get("base_branch") or "main").strip()
-            if isinstance(repo_config, dict)
-            else "main"
-        ) or "main"
+        closeout_config = _closeout_mapping(config.get("closeout"))
+        repo_config = _closeout_repository_config(closeout_config, repository)
+        base_branch = str(repo_config.get("base_branch") or "main").strip() or "main"
         ledger = self._ledger()
         existing_item = ledger.get(work_id) or {}
         existing_state = existing_item.get("closeout") if isinstance(existing_item.get("closeout"), dict) else {}
@@ -12977,7 +12981,9 @@ class GatewayRunner:
                     isinstance(visual_requirement, dict)
                     and visual_requirement.get("level") in {"surface", "artifact"}
                 ),
-                "post_merge_requirements": dict(closeout_cfg.get("post_merge_requirements") or {}),
+                "post_merge_requirements": _closeout_mapping(
+                    closeout_cfg.get("post_merge_requirements")
+                ),
             }
             self._persist_action_closeout_workspace(
                 event,
@@ -19451,7 +19457,7 @@ class GatewayRunner:
                     "require_local_verification": True,
                     "require_review": False,
                     "require_visual_qa": False,
-                    "post_merge_requirements": dict(requirements) if isinstance(requirements, dict) else {},
+                    "post_merge_requirements": _closeout_mapping(requirements),
                 }
                 self._persist_action_closeout_workspace(
                     event,

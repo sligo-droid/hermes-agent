@@ -142,6 +142,15 @@ def _receipt(value: Any, *, default: str = "pending") -> dict[str, Any]:
     code = _bounded_text(raw.get("diagnostic_code"), limit=80)
     if code:
         result["diagnostic_code"] = re.sub(r"[^A-Za-z0-9_.\-]", "_", code)
+    try:
+        baseline_pid = int(raw.get("baseline_pid"))
+        baseline_start_time = int(raw.get("baseline_start_time"))
+    except (TypeError, ValueError):
+        baseline_pid = 0
+        baseline_start_time = -1
+    if baseline_pid > 0 and baseline_start_time >= 0:
+        result["baseline_pid"] = baseline_pid
+        result["baseline_start_time"] = baseline_start_time
     return result
 
 
@@ -1224,6 +1233,40 @@ def _reconcile_trusted_closeout_impl(
             now=current_time,
             retry=True,
             poll_seconds=poll,
+        )
+
+    # Another actor may merge after the initial OPEN snapshot but before this
+    # authoritative pre-mutation refresh. Treat an exact merge commit as a
+    # successful externally completed merge and enter normal post-merge pickup.
+    if pr["state"] == "MERGED":
+        merge_sha = str(pr.get("merge_sha") or "").strip().lower()
+        if not _SHA_RE.fullmatch(merge_sha):
+            return _blocked(
+                original,
+                state,
+                code="merge_sha_missing",
+                message="Pre-merge refresh reported MERGED without an exact merge SHA",
+                now=current_time,
+                retry=True,
+                poll_seconds=poll,
+            )
+        from hermes_cli.post_merge_receipts import initialize_post_merge_receipts
+
+        state["post_merge"] = initialize_post_merge_receipts(state, target_sha=merge_sha)
+        state["canonical_sync"] = dict(state["post_merge"]["canonical_sync"])
+        _update_green_unmerged_telemetry(
+            state,
+            eligible=False,
+            now=current_time,
+            overdue_seconds=green_unmerged_overdue_seconds,
+        )
+        return _transition(
+            original,
+            state,
+            outcome="post_merge_pending",
+            next_due_at=current_time,
+            terminal=False,
+            wake_immediately=True,
         )
 
     # Re-evaluate every gate from the just-applied snapshot. This is required

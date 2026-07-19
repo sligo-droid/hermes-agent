@@ -449,6 +449,35 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
     assert sync_calls == [(str(tmp_path / "canonical"), "main", MERGE_SHA)]
 
 
+def test_premerge_refresh_accepts_concurrent_external_merge(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    views = iter(
+        [
+            _pr_payload(),
+            _pr_payload(state="MERGED", merge_sha=MERGE_SHA),
+        ]
+    )
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "post_merge_pending"
+    assert transition.terminal is False
+    assert transition.wake_immediately is True
+    assert transition.state["pr"]["state"] == "MERGED"
+    assert transition.state["pr"]["merge_sha"] == MERGE_SHA
+    assert transition.state["post_merge"]["target_sha"] == MERGE_SHA
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
 def test_premerge_head_change_invalidates_gates_and_prevents_merge(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
     calls = []

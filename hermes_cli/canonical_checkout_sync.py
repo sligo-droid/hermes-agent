@@ -40,6 +40,16 @@ def _control_cancelled(control: Any | None) -> bool:
         return True
 
 
+def _remaining_timeout(control: Any | None, requested: int | float) -> int | float:
+    remaining = getattr(control, "remaining", None)
+    if not callable(remaining):
+        return requested
+    try:
+        return max(0.001, min(float(requested), float(remaining())))
+    except Exception:
+        return 0.001
+
+
 @dataclass(frozen=True)
 class CanonicalCheckoutSyncResult:
     """Outcome of one canonical checkout synchronization attempt."""
@@ -122,6 +132,7 @@ def resolve_protected_canonical_checkout(
     branch: str,
     *,
     run_git: GitRunner | None = None,
+    control: Any | None = None,
 ) -> tuple[Path | None, str | None]:
     """Resolve a protected canonical root on its repository default branch.
 
@@ -153,7 +164,7 @@ def resolve_protected_canonical_checkout(
         timeout: int,
     ) -> subprocess.CompletedProcess[str] | None:
         try:
-            return runner(args, cwd=requested, timeout=timeout)
+            return runner(args, cwd=requested, timeout=_remaining_timeout(control, timeout))
         except Exception:
             return None
 
@@ -230,6 +241,7 @@ def sync_protected_canonical_checkout(
         project_path,
         branch,
         run_git=run_git,
+        control=control,
     )
     if validation_error:
         return _blocked_result(project_path, branch, expected_merge_commit, validation_error)
@@ -312,7 +324,7 @@ def sync_canonical_checkout(
         cwd: Path,
         timeout: int,
     ) -> subprocess.CompletedProcess[str]:
-        return runner(args, cwd=cwd, timeout=timeout)
+        return runner(args, cwd=cwd, timeout=_remaining_timeout(control, timeout))
 
     def require_clean(sync_path: Path, *, label: str) -> CanonicalCheckoutSyncResult | None:
         try:

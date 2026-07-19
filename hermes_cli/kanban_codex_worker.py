@@ -3529,7 +3529,6 @@ def _ensure_early_draft_pr(board: Optional[str], workspace: str) -> dict[str, An
             "early_draft_status": "existing" if already_pushed == head_sha else "opened",
             "early_draft_diagnostic_code": "",
             "early_draft_pushed_head_sha": head_sha,
-            "trusted_local_verification_head": head_sha,
         }
     )
     state = _legacy_worker_closeout_state(
@@ -3541,7 +3540,8 @@ def _ensure_early_draft_pr(board: Optional[str], workspace: str) -> dict[str, An
         base=base,
         config=config,
     )
-    state["local_verification"] = {"status": "passed", "head_sha": head_sha}
+    if str(worker.get("trusted_local_verification_head") or "").strip().lower() != head_sha:
+        state["local_verification"] = {"status": "pending"}
     if str(worker.get("review_approved_head") or "").strip().lower() == head_sha:
         state["review"] = {"status": "approved", "head_sha": head_sha}
     else:

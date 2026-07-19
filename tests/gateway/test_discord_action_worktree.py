@@ -80,6 +80,18 @@ def _config(default_cwd: Path, **discord: object) -> dict:
     return config
 
 
+def test_closeout_raw_config_normalizes_non_mapping_sections():
+    assert gateway_run._closeout_mapping(["ci", "restart"]) == {}
+    assert gateway_run._closeout_repository_config(
+        {"repositories": {"owner/repo": "gateway-self"}},
+        "owner/repo",
+    ) == {}
+    assert gateway_run._closeout_repository_config(
+        {"repositories": ["owner/repo"]},
+        "owner/repo",
+    ) == {}
+
+
 def test_action_worktree_warmup_config_defaults():
     discord = DEFAULT_CONFIG["discord"]
 

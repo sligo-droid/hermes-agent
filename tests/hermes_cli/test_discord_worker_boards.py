@@ -4127,6 +4127,69 @@ def test_reconcile_board_opens_early_draft_before_reviewer_without_waiting_for_c
     }
 
 
+def test_reconcile_board_retries_blocked_early_draft_before_creating_reviewer(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="early-draft-retry", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        dev_id = kanban_db.create_task(
+            conn,
+            title="R1: Implement task",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, dev_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            dev_id,
+            summary="done",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    head = "a" * 40
+    attempts = iter(
+        [
+            {"status": "blocked", "head_sha": head, "diagnostic_code": "early_draft_open_failed"},
+            {"status": "opened", "head_sha": head},
+        ]
+    )
+    monkeypatch.setattr(
+        kanban_codex_worker,
+        "_ensure_early_draft_pr",
+        lambda _board, _workspace: next(attempts),
+    )
+
+    assert dwb.reconcile_board(board.slug) == "early_draft_checkpoint_pending"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        assert not [
+            task for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.assignee == dwb.ROLE_REVIEWER
+        ]
+    finally:
+        conn.close()
+    assert int(dwb._read_worker_meta(board.slug).get("review_loop_count") or 0) == 0
+
+    assert dwb.reconcile_board(board.slug) == "reviewer_created"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewers = [
+            task for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.assignee == dwb.ROLE_REVIEWER
+        ]
+    finally:
+        conn.close()
+    assert len(reviewers) == 1
+    assert int(dwb._read_worker_meta(board.slug).get("review_loop_count") or 0) == 1
+
+
 def test_reconcile_board_reviewer_body_includes_pre_review_readiness(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

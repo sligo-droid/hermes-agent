@@ -2296,6 +2296,7 @@ def _delegate_coding_task_impl(
                 task=task_text,
                 worker_summary=turn.final_text,
                 closeout_mode=configured_closeout_mode,
+                verification_runtime_breakdown=getattr(turn, "runtime_breakdown", None),
             )
             fable_git_result = finalized.as_dict()
             closeout_state = getattr(finalized, "closeout_state", None)

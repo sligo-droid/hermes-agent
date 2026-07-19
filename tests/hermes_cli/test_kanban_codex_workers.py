@@ -452,10 +452,8 @@ def test_early_draft_checkpoint_pushes_exact_head_before_review(monkeypatch, tmp
     assert opened[0]["draft"] is True
     assert opened[0]["allow_draft"] is True
     assert stored["early_draft_pushed_head_sha"] == head
-    assert stored["closeout"]["local_verification"] == {
-        "status": "passed",
-        "head_sha": head,
-    }
+    assert "trusted_local_verification_head" not in stored
+    assert stored["closeout"]["local_verification"] == {"status": "pending"}
     assert stored["closeout"]["review"] == {
         "status": "pending",
         "head_sha": head,
@@ -528,7 +526,8 @@ def test_early_draft_followup_head_keeps_prior_review_stale(monkeypatch, tmp_pat
     result = worker._ensure_early_draft_pr("board-1", str(root))
 
     assert result == {"status": "opened", "head_sha": new_head}
-    assert stored["closeout"]["local_verification"]["head_sha"] == new_head
+    assert stored["trusted_local_verification_head"] == old_head
+    assert stored["closeout"]["local_verification"] == {"status": "pending"}
     assert stored["closeout"]["review"] == {
         "status": "pending",
         "head_sha": new_head,
