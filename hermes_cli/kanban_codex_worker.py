@@ -2942,6 +2942,7 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
         root=root,
         run=run_identity_query,
     )
+    identity_error = str(data.pop("_required_check_identity_error", "") or "").strip()
     if data.get("url"):
         worker["pr_url"] = str(data.get("url") or "")
     if data.get("number") is not None:
@@ -2969,8 +2970,10 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     worker["pr_checks_status"] = checks_status
     worker["pr_checks_total"] = checks_total
     worker["pr_checks_failed"] = failed
-    worker["pr_status_error"] = ""
-    if checks_status == "pending":
+    worker["pr_status_error"] = identity_error
+    if identity_error:
+        _clear_pr_ci_wait(worker)
+    elif checks_status == "pending":
         worker["pr_ci_wait_state"] = wait_state or "queued"
     if _pr_is_merged(worker):
         _clear_pr_ci_wait(worker)

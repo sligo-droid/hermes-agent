@@ -146,6 +146,11 @@ def _completed(args, returncode=0, *, stdout="", stderr=""):
 def _patch_repo_boundary(monkeypatch):
     monkeypatch.setattr(closeout, "github_remote_preflight_error", lambda *_a, **_k: None)
     monkeypatch.setattr(closeout, "github_origin_repo", lambda *_a, **_k: "acme/example")
+    monkeypatch.setattr(
+        closeout,
+        "enrich_required_check_identities",
+        lambda payload, **_kwargs: dict(payload),
+    )
 
 
 def test_normalize_closeout_state_is_bounded_and_additive(tmp_path):
@@ -257,8 +262,13 @@ def test_required_checks_enrich_actual_gh_rollup_with_trusted_rest_identity(tmp_
     check_runs = {
         "check_runs": [
             {
+                "id": item["databaseId"],
                 "name": item["name"],
                 "head_sha": HEAD_SHA,
+                "status": item["status"],
+                "conclusion": item["conclusion"],
+                "started_at": item.get("startedAt"),
+                "completed_at": item.get("completedAt"),
                 "details_url": item["detailsUrl"],
                 "app": {"slug": "github-actions"},
             }
@@ -293,6 +303,162 @@ def test_required_checks_enrich_actual_gh_rollup_with_trusted_rest_identity(tmp_
     assert summary["status"] == "failed"
     assert summary["total"] == 2
     assert summary["failed"] == ["Basic Tests / basic"]
+
+
+def test_required_check_enrichment_rejects_prepopulated_identity_without_rest(tmp_path):
+    payload = _pr_payload()
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        return _completed(args, stdout=json.dumps({"check_runs": []}))
+
+    enriched = closeout.enrich_required_check_identities(
+        payload,
+        repo="acme/example",
+        root=tmp_path,
+        run=run,
+    )
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+
+    assert len(calls) == 1
+    assert summary["status"] == "pending"
+    assert summary["total"] == 0
+
+
+@pytest.mark.parametrize("ordering", ["original", "reversed", "rotated"])
+def test_required_check_enrichment_is_order_independent_under_bounded_budget(
+    tmp_path,
+    ordering,
+):
+    repo = "acme/example"
+
+    def details(run_id, job_id):
+        return f"https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}"
+
+    check_runs = []
+    raw_checks = []
+    for offset in range(10):
+        run_id = str(100 + offset)
+        url = details(run_id, f"{run_id}1")
+        raw_checks.append(
+            {
+                "workflowName": "Basic Tests",
+                "name": "basic",
+                "detailsUrl": url,
+                "app": {"slug": "github-actions"},
+                "workflow": {"path": ".github/workflows/tests.yml"},
+                "headSha": HEAD_SHA,
+            }
+        )
+        check_runs.append(
+            {
+                "id": 100 + offset,
+                "name": "basic",
+                "head_sha": HEAD_SHA,
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "completed_at": f"2026-07-18T00:00:{offset:02d}Z",
+                "details_url": url,
+                "app": {"slug": "github-actions"},
+            }
+        )
+    for check_id, conclusion, completed_at in (
+        (9001, "SUCCESS", "2026-07-18T00:05:00Z"),
+        (9002, "FAILURE", "2026-07-18T00:10:00Z"),
+    ):
+        url = details("900", str(check_id))
+        raw_checks.append(
+            {
+                "workflowName": "Basic Tests",
+                "name": "basic",
+                "detailsUrl": url,
+            }
+        )
+        check_runs.append(
+            {
+                "id": check_id,
+                "name": "basic",
+                "head_sha": HEAD_SHA,
+                "status": "COMPLETED",
+                "conclusion": conclusion,
+                "completed_at": completed_at,
+                "details_url": url,
+                "app": {"slug": "github-actions"},
+            }
+        )
+    pr_body_url = details("901", "9011")
+    raw_checks.append(
+        {
+            "workflowName": "PR Body Format",
+            "name": "pr body",
+            "detailsUrl": pr_body_url,
+        }
+    )
+    check_runs.append(
+        {
+            "id": 9011,
+            "name": "pr body",
+            "head_sha": HEAD_SHA,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "completed_at": "2026-07-18T00:09:00Z",
+            "details_url": pr_body_url,
+            "app": {"slug": "github-actions"},
+        }
+    )
+    raw_checks.insert(
+        0,
+        {
+            "workflowName": "Unrelated",
+            "name": "unrelated",
+            "detailsUrl": details("999", "9991"),
+        },
+    )
+    if ordering == "reversed":
+        raw_checks.reverse()
+        check_runs.reverse()
+    elif ordering == "rotated":
+        raw_checks[:] = raw_checks[5:] + raw_checks[:5]
+        check_runs[:] = check_runs[7:] + check_runs[:7]
+
+    queried_runs = []
+
+    def run(args, **_kwargs):
+        endpoint = args[2]
+        if "/check-runs?" in endpoint:
+            return _completed(args, stdout=json.dumps({"check_runs": check_runs}))
+        run_id = endpoint.rsplit("/", 1)[-1]
+        queried_runs.append(run_id)
+        path = {
+            "900": ".github/workflows/tests.yml",
+            "901": ".github/workflows/pr-body-format.yml",
+        }.get(run_id, f".github/workflows/spoof-{run_id}.yml")
+        return _completed(
+            args,
+            stdout=json.dumps({"path": path, "head_sha": HEAD_SHA}),
+        )
+
+    payload = _pr_payload(checks=raw_checks)
+    enriched = closeout.enrich_required_check_identities(
+        payload,
+        repo=repo,
+        root=tmp_path,
+        run=run,
+    )
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+
+    assert summary["status"] == "failed"
+    assert summary["total"] == 2
+    assert summary["failed"] == ["Basic Tests / basic"]
+    assert queried_runs == ["900", "901"]
+    assert "_required_check_identity_error" not in enriched
 
 
 def test_required_checks_classify_all_terminal_failure_conclusions():

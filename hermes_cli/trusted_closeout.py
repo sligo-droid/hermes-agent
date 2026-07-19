@@ -471,103 +471,242 @@ def enrich_required_check_identities(
     root: Path,
     run: CommandRunner,
 ) -> dict[str, Any]:
-    """Resolve app/workflow identity omitted by ``gh pr view``."""
+    """Rebuild required-check identity from bounded exact-head REST evidence."""
 
     enriched = dict(payload)
     raw_items = payload.get("statusCheckRollup")
+    untrusted_items: list[Any] = []
+    raw_urls: set[str] = set()
+    if isinstance(raw_items, list):
+        for raw in raw_items[:200]:
+            if not isinstance(raw, Mapping):
+                untrusted_items.append(raw)
+                continue
+            item = dict(raw)
+            details_url = str(item.get("detailsUrl") or item.get("url") or "").strip()
+            if details_url:
+                raw_urls.add(details_url)
+            for key in ("app", "workflow", "workflowPath", "headSha", "headRefOid"):
+                item.pop(key, None)
+            untrusted_items.append(item)
+    enriched["statusCheckRollup"] = untrusted_items
+
     head_sha = str(payload.get("headRefOid") or "").strip().lower()
     if not isinstance(raw_items, list) or not _SHA_RE.fullmatch(head_sha):
         return enriched
-    if all(
-        not isinstance(raw, Mapping)
-        or (str(raw.get("workflowName") or ""), _check_name(raw)) not in REQUIRED_PR_CHECKS
-        or _is_trusted_required_check(raw)
-        for raw in raw_items[:200]
-    ):
-        return enriched
+
+    errors: list[str] = []
+
+    def record_error(label: str, detail: Any) -> None:
+        safe = sanitize_closeout_error(detail) or "request failed without diagnostic output"
+        errors.append(f"{label}: {safe}")
 
     try:
         check_runs_result = run(
-            ["gh", "api", f"repos/{repo}/commits/{head_sha}/check-runs?filter=all&per_page=100"],
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/commits/{head_sha}/check-runs?filter=all&per_page=100",
+            ],
             cwd=root,
             timeout=30,
             github=True,
         )
-        check_runs_payload = (
-            json.loads(check_runs_result.stdout or "{}")
-            if check_runs_result.returncode == 0
-            else {}
-        )
-    except Exception:
-        check_runs_payload = {}
+    except Exception as exc:
+        record_error("Required check identity lookup failed", exc)
+        check_runs_result = None
+    if check_runs_result is None or check_runs_result.returncode != 0:
+        if check_runs_result is not None:
+            record_error(
+                f"Required check identity lookup failed (exit {check_runs_result.returncode})",
+                check_runs_result.stderr or check_runs_result.stdout,
+            )
+        enriched["_required_check_identity_error"] = sanitize_closeout_error("; ".join(errors))
+        return enriched
+    try:
+        check_runs_payload = json.loads(check_runs_result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        record_error("Required check identity lookup returned invalid JSON", exc)
+        enriched["_required_check_identity_error"] = sanitize_closeout_error("; ".join(errors))
+        return enriched
     raw_check_runs = (
         check_runs_payload.get("check_runs")
         if isinstance(check_runs_payload, Mapping)
         else None
     )
-    trusted_by_url: dict[str, Mapping[str, Any]] = {}
-    if isinstance(raw_check_runs, list):
-        for raw_check_run in raw_check_runs[:100]:
-            if not isinstance(raw_check_run, Mapping):
-                continue
-            app = raw_check_run.get("app")
-            app_slug = (
-                str(app.get("slug") or "").strip().casefold()
-                if isinstance(app, Mapping)
-                else ""
-            )
-            run_head = str(raw_check_run.get("head_sha") or "").strip().lower()
-            details_url = str(raw_check_run.get("details_url") or "").strip()
-            if app_slug == "github-actions" and run_head == head_sha and details_url:
-                trusted_by_url[details_url] = raw_check_run
+    if not isinstance(raw_check_runs, list):
+        record_error("Required check identity lookup returned no check-runs list", "invalid response")
+        enriched["_required_check_identity_error"] = sanitize_closeout_error("; ".join(errors))
+        return enriched
 
-    resolved_runs: dict[str, Mapping[str, Any] | None] = {}
-    items: list[Any] = []
-    for raw in raw_items[:200]:
-        if not isinstance(raw, Mapping):
-            items.append(raw)
+    required_by_name = {check: (workflow, check) for workflow, check in REQUIRED_PR_CHECKS}
+    grouped: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = {
+        identity: {} for identity in REQUIRED_PR_CHECKS
+    }
+    for raw_check_run in raw_check_runs[:100]:
+        if not isinstance(raw_check_run, Mapping):
             continue
-        item = dict(raw)
-        visible_identity = (str(item.get("workflowName") or ""), _check_name(item))
-        details_url = str(item.get("detailsUrl") or item.get("url") or "").strip()
-        trusted_check_run = trusted_by_url.get(details_url)
-        if visible_identity not in REQUIRED_PR_CHECKS or trusted_check_run is None:
-            items.append(item)
-            continue
-        if str(trusted_check_run.get("name") or "") != visible_identity[1]:
-            items.append(item)
-            continue
+        app = raw_check_run.get("app")
+        app_slug = (
+            str(app.get("slug") or "").strip().casefold()
+            if isinstance(app, Mapping)
+            else ""
+        )
+        run_head = str(raw_check_run.get("head_sha") or "").strip().lower()
+        details_url = str(raw_check_run.get("details_url") or "").strip()
+        check_name = str(raw_check_run.get("name") or "").strip()
+        identity = required_by_name.get(check_name)
         match = re.fullmatch(
             r"https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+)(?:/job/\d+)?/?",
             details_url,
             flags=re.IGNORECASE,
         )
-        if not match or match.group(1).casefold() != repo.casefold():
-            items.append(item)
+        if (
+            identity is None
+            or app_slug != "github-actions"
+            or run_head != head_sha
+            or details_url not in raw_urls
+            or not match
+            or match.group(1).casefold() != repo.casefold()
+        ):
             continue
         run_id = match.group(2)
-        if run_id not in resolved_runs and len(resolved_runs) < 8:
-            try:
-                result = run(
-                    ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
-                    cwd=root,
-                    timeout=30,
-                    github=True,
+        grouped[identity].setdefault(run_id, []).append(dict(raw_check_run))
+
+    def check_run_sort_key(item: Mapping[str, Any]) -> tuple[str, int, str]:
+        timestamp = str(
+            item.get("completed_at")
+            or item.get("started_at")
+            or item.get("updated_at")
+            or item.get("created_at")
+            or ""
+        )
+        try:
+            numeric_id = int(item.get("id") or 0)
+        except (TypeError, ValueError):
+            numeric_id = 0
+        return (timestamp, numeric_id, str(item.get("details_url") or ""))
+
+    queues: dict[tuple[str, str], list[tuple[str, list[dict[str, Any]]]]] = {}
+    for identity in REQUIRED_PR_CHECKS:
+        run_groups = list(grouped[identity].items())
+        for _run_id, check_runs in run_groups:
+            check_runs.sort(key=check_run_sort_key, reverse=True)
+        run_groups.sort(
+            key=lambda entry: (check_run_sort_key(entry[1][0]), entry[0]),
+            reverse=True,
+        )
+        queues[identity] = run_groups
+
+    trusted_items: list[dict[str, Any]] = []
+    resolved_identities: set[tuple[str, str]] = set()
+    uncertain_identities: set[tuple[str, str]] = set()
+    resolved_runs: dict[str, Mapping[str, Any]] = {}
+    failed_runs: dict[str, str] = {}
+    query_count = 0
+    positions = {identity: 0 for identity in REQUIRED_PR_CHECKS}
+
+    while query_count < 8:
+        progressed = False
+        for identity in REQUIRED_PR_CHECKS:
+            if identity in resolved_identities or identity in uncertain_identities:
+                continue
+            position = positions[identity]
+            if position >= len(queues[identity]):
+                continue
+            progressed = True
+            run_id, check_runs = queues[identity][position]
+            positions[identity] = position + 1
+            if (
+                run_id not in resolved_runs
+                and run_id not in failed_runs
+                and query_count >= 8
+            ):
+                positions[identity] = position
+                continue
+            if run_id not in resolved_runs and run_id not in failed_runs:
+                query_count += 1
+                try:
+                    result = run(
+                        ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
+                        cwd=root,
+                        timeout=30,
+                        github=True,
+                    )
+                except Exception as exc:
+                    failed_runs[run_id] = sanitize_closeout_error(exc)
+                else:
+                    if result.returncode != 0:
+                        failed_runs[run_id] = sanitize_closeout_error(
+                            result.stderr or result.stdout or f"exit {result.returncode}"
+                        )
+                    else:
+                        try:
+                            candidate = json.loads(result.stdout or "{}")
+                        except json.JSONDecodeError as exc:
+                            failed_runs[run_id] = sanitize_closeout_error(exc)
+                        else:
+                            if isinstance(candidate, Mapping):
+                                resolved_runs[run_id] = candidate
+                            else:
+                                failed_runs[run_id] = "workflow-run response was not an object"
+            if run_id in failed_runs:
+                record_error(
+                    f"Required workflow identity lookup failed for {identity[0]} / {identity[1]}",
+                    failed_runs[run_id],
                 )
-                candidate = json.loads(result.stdout or "{}") if result.returncode == 0 else None
-                resolved_runs[run_id] = candidate if isinstance(candidate, Mapping) else None
-            except Exception:
-                resolved_runs[run_id] = None
-        workflow_run = resolved_runs.get(run_id)
-        if isinstance(workflow_run, Mapping):
+                uncertain_identities.add(identity)
+                continue
+            workflow_run = resolved_runs.get(run_id)
+            if not isinstance(workflow_run, Mapping):
+                continue
             workflow_path = str(workflow_run.get("path") or "").strip()
-            run_head = str(workflow_run.get("head_sha") or "").strip().lower()
-            if workflow_path and run_head == head_sha:
-                item["app"] = {"name": "GitHub Actions", "slug": "github-actions"}
-                item["workflow"] = {"path": workflow_path}
-                item["headSha"] = run_head
-        items.append(item)
-    enriched["statusCheckRollup"] = items
+            workflow_head = str(workflow_run.get("head_sha") or "").strip().lower()
+            if workflow_head != head_sha:
+                record_error(
+                    f"Required workflow identity head mismatch for {identity[0]} / {identity[1]}",
+                    "workflow run did not match the current PR head",
+                )
+                uncertain_identities.add(identity)
+                continue
+            if workflow_path != _REQUIRED_PR_CHECK_WORKFLOWS[identity]:
+                continue
+            workflow, check = identity
+            for check_run in check_runs:
+                trusted_items.append(
+                    {
+                        "workflowName": workflow,
+                        "name": check,
+                        "status": str(check_run.get("status") or ""),
+                        "conclusion": str(check_run.get("conclusion") or ""),
+                        "headSha": head_sha,
+                        "databaseId": check_run.get("id") or 0,
+                        "startedAt": str(check_run.get("started_at") or ""),
+                        "completedAt": str(check_run.get("completed_at") or ""),
+                        "detailsUrl": str(check_run.get("details_url") or ""),
+                        "app": {"name": "GitHub Actions", "slug": "github-actions"},
+                        "workflow": {"path": workflow_path},
+                    }
+                )
+            resolved_identities.add(identity)
+        if not progressed:
+            break
+
+    budget_exhausted = any(
+        identity not in resolved_identities
+        and identity not in uncertain_identities
+        and positions[identity] < len(queues[identity])
+        for identity in REQUIRED_PR_CHECKS
+    )
+    if budget_exhausted:
+        record_error(
+            "Required workflow identity lookup budget exhausted",
+            "more candidate workflow runs remained after 8 bounded queries",
+        )
+
+    enriched["statusCheckRollup"] = untrusted_items + trusted_items
+    if errors:
+        enriched["_required_check_identity_error"] = sanitize_closeout_error("; ".join(errors))
     return enriched
 
 

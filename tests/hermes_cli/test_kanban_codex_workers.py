@@ -72,6 +72,7 @@ def _mock_required_check_identity_api(monkeypatch):
 
     original_run_gh = worker._run_gh
     heads_by_repo: dict[str, str] = {}
+    rollups_by_repo_head: dict[tuple[str, str], list[dict]] = {}
 
     def wrapped(args, *, root, timeout):
         endpoint = args[1] if len(args) > 1 and args[0] == "api" else ""
@@ -83,15 +84,27 @@ def _mock_required_check_identity_api(monkeypatch):
         if check_runs_match:
             repo, head_sha = check_runs_match.groups()
             heads_by_repo[repo.casefold()] = head_sha
-            check_runs = [
-                {
-                    "name": check,
-                    "head_sha": head_sha,
-                    "details_url": _required_check_details_url(repo, workflow, check),
-                    "app": {"slug": "github-actions"},
-                }
-                for workflow, check in _REQUIRED_CHECK_RUNS
-            ]
+            raw_rollup = rollups_by_repo_head.get((repo.casefold(), head_sha), [])
+            check_runs = []
+            for index, raw in enumerate(raw_rollup, start=1):
+                identity = (
+                    str(raw.get("workflowName") or ""),
+                    str(raw.get("name") or ""),
+                )
+                if identity not in _REQUIRED_CHECK_RUNS:
+                    continue
+                check_runs.append(
+                    {
+                        "id": raw.get("databaseId") or index,
+                        "name": identity[1],
+                        "head_sha": head_sha,
+                        "status": str(raw.get("status") or ""),
+                        "conclusion": str(raw.get("conclusion") or ""),
+                        "completed_at": f"2026-07-18T00:00:{index:02d}Z",
+                        "details_url": str(raw.get("detailsUrl") or ""),
+                        "app": {"slug": "github-actions"},
+                    }
+                )
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps({"check_runs": check_runs}),
@@ -119,7 +132,24 @@ def _mock_required_check_identity_api(monkeypatch):
                         stderr="",
                     )
             return SimpleNamespace(returncode=1, stdout="", stderr="unknown run")
-        return original_run_gh(args, root=root, timeout=timeout)
+        result = original_run_gh(args, root=root, timeout=timeout)
+        if args[:2] == ["pr", "view"] and result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            if isinstance(payload, dict):
+                try:
+                    repo = str(args[args.index("--repo") + 1])
+                except (ValueError, IndexError):
+                    repo = ""
+                head_sha = str(payload.get("headRefOid") or "")
+                rollup = payload.get("statusCheckRollup")
+                if repo and head_sha and isinstance(rollup, list):
+                    rollups_by_repo_head[(repo.casefold(), head_sha)] = [
+                        dict(item) for item in rollup if isinstance(item, dict)
+                    ]
+        return result
 
     monkeypatch.setattr(worker, "_run_gh", wrapped)
 
@@ -375,12 +405,16 @@ def test_refresh_pr_status_enriches_raw_checks_and_rejects_spoof_before_canonica
                     {
                         "check_runs": [
                             {
+                                "id": index,
                                 "name": item["name"],
                                 "head_sha": _TRUSTED_PR_HEAD,
+                                "status": item["status"],
+                                "conclusion": item["conclusion"],
+                                "completed_at": item["startedAt"],
                                 "details_url": item["detailsUrl"],
                                 "app": {"slug": "github-actions"},
                             }
-                            for item in checks
+                            for index, item in enumerate(checks, start=1)
                         ]
                     }
                 ),
@@ -410,6 +444,175 @@ def test_refresh_pr_status_enriches_raw_checks_and_rejects_spoof_before_canonica
     assert state["pr_checks_status"] == "failed"
     assert state["pr_checks_total"] == 2
     assert state["pr_checks_failed"] == ["Basic Tests / basic"]
+
+
+def test_ensure_pr_merge_blocks_newest_failed_rerun_after_many_spoofs(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import kanban_codex_worker as worker
+
+    repo = "sligo-labs/PID"
+
+    def details(run_id, job_id):
+        return f"https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}"
+
+    raw_checks = []
+    check_runs = []
+    for offset in range(10):
+        run_id = str(100 + offset)
+        url = details(run_id, f"{run_id}1")
+        raw_checks.append(
+            {"workflowName": "Basic Tests", "name": "basic", "detailsUrl": url}
+        )
+        check_runs.append(
+            {
+                "id": 100 + offset,
+                "name": "basic",
+                "head_sha": _TRUSTED_PR_HEAD,
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "completed_at": f"2026-07-18T00:00:{offset:02d}Z",
+                "details_url": url,
+                "app": {"slug": "github-actions"},
+            }
+        )
+    for check_id, conclusion, completed_at in (
+        (9001, "SUCCESS", "2026-07-18T00:05:00Z"),
+        (9002, "FAILURE", "2026-07-18T00:10:00Z"),
+    ):
+        url = details("900", str(check_id))
+        raw_checks.append(
+            {"workflowName": "Basic Tests", "name": "basic", "detailsUrl": url}
+        )
+        check_runs.append(
+            {
+                "id": check_id,
+                "name": "basic",
+                "head_sha": _TRUSTED_PR_HEAD,
+                "status": "COMPLETED",
+                "conclusion": conclusion,
+                "completed_at": completed_at,
+                "details_url": url,
+                "app": {"slug": "github-actions"},
+            }
+        )
+    pr_body_url = details("901", "9011")
+    raw_checks.append(
+        {
+            "workflowName": "PR Body Format",
+            "name": "pr body",
+            "detailsUrl": pr_body_url,
+        }
+    )
+    check_runs.append(
+        {
+            "id": 9011,
+            "name": "pr body",
+            "head_sha": _TRUSTED_PR_HEAD,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "completed_at": "2026-07-18T00:09:00Z",
+            "details_url": pr_body_url,
+            "app": {"slug": "github-actions"},
+        }
+    )
+    calls = []
+    queried_runs = []
+
+    def fake_gh(args, **_kwargs):
+        calls.append(args)
+        if args[:2] == ["pr", "view"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=457,
+                    state="OPEN",
+                    checks=raw_checks,
+                ),
+                stderr="",
+            )
+        if args[:1] == ["api"] and "/check-runs?" in args[1]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"check_runs": check_runs}),
+                stderr="",
+            )
+        if args[:1] == ["api"] and "/actions/runs/" in args[1]:
+            run_id = args[1].rsplit("/", 1)[-1]
+            queried_runs.append(run_id)
+            path = {
+                "900": ".github/workflows/tests.yml",
+                "901": ".github/workflows/pr-body-format.yml",
+            }.get(run_id, f".github/workflows/spoof-{run_id}.yml")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"path": path, "head_sha": _TRUSTED_PR_HEAD}),
+                stderr="",
+            )
+        if args[:2] == ["pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_run_gh", fake_gh)
+    state = {
+        "pr_url": f"https://github.com/{repo}/pull/457",
+        "review_approved_head": _TRUSTED_PR_HEAD,
+    }
+
+    outcome = worker._ensure_pr_merged(state, root=tmp_path, repo=repo)
+
+    assert outcome == worker.PRFinalizationOutcome.FAILED
+    assert state["pr_checks_status"] == "failed"
+    assert state["pr_checks_failed"] == ["Basic Tests / basic"]
+    assert queried_runs == ["900", "901"]
+    assert not any(args[:2] == ["pr", "merge"] for args in calls)
+
+
+def test_required_check_identity_api_failure_is_bounded_blocker(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    repo = "sligo-labs/PID"
+    calls = []
+
+    def fake_gh(args, **_kwargs):
+        calls.append(args)
+        if args[:2] == ["pr", "view"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(number=458, state="OPEN"),
+                stderr="",
+            )
+        if args[:1] == ["api"] and "/check-runs?" in args[1]:
+            return SimpleNamespace(
+                returncode=403,
+                stdout="",
+                stderr=(
+                    "token=supersecret rate limited at "
+                    "https://api.github.com/protected "
+                    + ("x" * 1000)
+                ),
+            )
+        if args[:2] == ["pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_run_gh", fake_gh)
+    state = {
+        "pr_url": f"https://github.com/{repo}/pull/458",
+        "review_approved_head": _TRUSTED_PR_HEAD,
+    }
+
+    outcome = worker._ensure_pr_merged(state, root=tmp_path, repo=repo)
+
+    assert outcome == worker.PRFinalizationOutcome.FAILED
+    assert state["pr_status_error"].startswith("Required check identity lookup failed")
+    assert state["pr_blocker"] == state["pr_status_error"]
+    assert len(state["pr_status_error"]) <= 600
+    assert "supersecret" not in state["pr_status_error"]
+    assert "api.github.com" not in state["pr_status_error"]
+    assert not state.get("pr_ci_wait_state")
+    assert not any(args[:2] == ["pr", "merge"] for args in calls)
 
 
 def test_legacy_kanban_fields_normalize_and_dual_write_shared_closeout(tmp_path):
@@ -5998,8 +6201,12 @@ def test_legacy_merge_rejects_reviewer_approval_for_stale_pr_head(monkeypatch, t
                     {
                         "check_runs": [
                             {
+                                "id": index,
                                 "name": check,
                                 "head_sha": current_head,
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                                "completed_at": f"2026-07-18T00:00:0{index}Z",
                                 "details_url": _required_check_details_url(
                                     "sligo-labs/PID",
                                     workflow,
@@ -6007,7 +6214,10 @@ def test_legacy_merge_rejects_reviewer_approval_for_stale_pr_head(monkeypatch, t
                                 ),
                                 "app": {"slug": "github-actions"},
                             }
-                            for workflow, check in _REQUIRED_CHECK_RUNS
+                            for index, (workflow, check) in enumerate(
+                                _REQUIRED_CHECK_RUNS,
+                                start=1,
+                            )
                         ]
                     }
                 ),
