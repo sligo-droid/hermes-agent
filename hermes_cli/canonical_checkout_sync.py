@@ -11,10 +11,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+import inspect
 import re
 import subprocess
 from typing import Any, Callable
 
+from hermes_cli.closeout_execution import (
+    classify_closeout_command,
+    run_closeout_command,
+)
 from hermes_cli.pr_workflow_preflight import find_worktree_for_branch
 
 
@@ -91,16 +96,49 @@ def _default_run_git(
     args: list[str],
     *,
     cwd: Path,
-    timeout: int,
+    timeout: int | float,
+    control: Any | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a direct, bounded Git command without shell or GitHub CLI helpers."""
-    return subprocess.run(
+    """Run one classified Git command with contained mutation processes."""
+
+    if control is None:
+        # Non-closeout callers retain the established bounded runner contract.
+        # Trusted closeout always supplies a renewable collector/lease control.
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    return run_closeout_command(
         ["git", *args],
         cwd=cwd,
-        capture_output=True,
-        text=True,
         timeout=timeout,
+        control=control,
     )
+
+
+def _run_git_command(
+    runner: GitRunner,
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int | float,
+    control: Any | None,
+) -> subprocess.CompletedProcess[str]:
+    classify_closeout_command(["git", *args])
+    kwargs: dict[str, Any] = {"cwd": cwd, "timeout": timeout}
+    try:
+        parameters = inspect.signature(runner).parameters
+    except Exception:
+        parameters = {}
+    if "control" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        kwargs["control"] = control
+    return runner(args, **kwargs)
 
 
 def _command_detail(result: subprocess.CompletedProcess[str] | None) -> str:
@@ -164,7 +202,13 @@ def resolve_protected_canonical_checkout(
         timeout: int,
     ) -> subprocess.CompletedProcess[str] | None:
         try:
-            return runner(args, cwd=requested, timeout=_remaining_timeout(control, timeout))
+            return _run_git_command(
+                runner,
+                args,
+                cwd=requested,
+                timeout=_remaining_timeout(control, timeout),
+                control=control,
+            )
         except Exception:
             return None
 
@@ -324,7 +368,13 @@ def sync_canonical_checkout(
         cwd: Path,
         timeout: int,
     ) -> subprocess.CompletedProcess[str]:
-        return runner(args, cwd=cwd, timeout=_remaining_timeout(control, timeout))
+        return _run_git_command(
+            runner,
+            args,
+            cwd=cwd,
+            timeout=_remaining_timeout(control, timeout),
+            control=control,
+        )
 
     def require_clean(sync_path: Path, *, label: str) -> CanonicalCheckoutSyncResult | None:
         try:
@@ -441,7 +491,7 @@ def sync_canonical_checkout(
         state = "synced"
         label = "Canonical checkout"
     else:
-        existing = find_worktree_for_branch(wanted_branch, cwd=canonical_path, run_git=runner)
+        existing = find_worktree_for_branch(wanted_branch, cwd=canonical_path, run_git=run)
         if existing is None:
             return fail("Canonical checkout branch checkout failed", checkout)
         blocked = require_clean(existing, label="Existing branch worktree")

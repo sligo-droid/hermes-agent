@@ -2334,6 +2334,7 @@ def test_closeout_workspace_attachment_revision_leases_and_pending_scan(tmp_path
     )
     assert leased is not None
     assert leased["closeout"]["revision"] == 3
+    assert leased["closeout"]["lease_generation"] == 1
     assert leased["closeout"]["lease"] == {"owner": "watcher-1", "until": 130.0}
     assert ledger.pending_closeouts(due_at=now) == []
     now = 110.0
@@ -2342,18 +2343,28 @@ def test_closeout_workspace_attachment_revision_leases_and_pending_scan(tmp_path
         owner="watcher-2",
         lease_seconds=30,
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
     ) is False
     assert ledger.renew_closeout_lease(
         item["id"],
         owner="watcher-1",
         lease_seconds=30,
         expected_revision=leased["closeout"]["revision"] - 1,
+        expected_generation=leased["closeout"]["lease_generation"],
     ) is False
     assert ledger.renew_closeout_lease(
         item["id"],
         owner="watcher-1",
         lease_seconds=30,
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"] + 1,
+    ) is False
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
     ) is True
     renewed = ledger.get(item["id"])["closeout"]
     assert renewed["revision"] == leased["closeout"]["revision"]
@@ -2367,6 +2378,7 @@ def test_closeout_workspace_attachment_revision_leases_and_pending_scan(tmp_path
         item["id"],
         owner="watcher-1",
         expected_revision=3,
+        expected_generation=leased["closeout"]["lease_generation"],
         closeout_state=updated,
     )
     assert released is not None
@@ -2374,6 +2386,55 @@ def test_closeout_workspace_attachment_revision_leases_and_pending_scan(tmp_path
     assert released["lease"] == {"owner": "", "until": None}
     assert ledger.pending_closeouts(due_at=150) == []
     assert ledger.pending_closeouts(due_at=160)[0]["closeout"]["status"] == "waiting_for_ci"
+
+
+def test_expired_closeout_lease_cannot_persist_stale_authoritative_result(tmp_path):
+    now = 100.0
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
+    event = _discord_event(message_id="expired-closeout-lease")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-expired",
+        lease_seconds=1,
+        expected_revision=activated["revision"],
+    )
+    stale = dict(leased["closeout"])
+    stale["status"] = "completed"
+    before = ledger.get(item["id"])
+    now = 102.0
+
+    assert ledger.release_closeout(
+        item["id"],
+        owner="watcher-expired",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=stale,
+    ) is None
+    assert ledger.finalize_blocked_closeout(
+        item["id"],
+        owner="watcher-expired",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state={**stale, "status": "repair_required"},
+        final_response="stale result",
+        reason="stale",
+    ) is None
+    assert ledger.get(item["id"]) == before
 
 
 def test_fable_shadow_activation_is_observational_not_authoritative(tmp_path):
@@ -2443,6 +2504,7 @@ def test_pending_closeouts_prioritizes_least_recently_claimed_items(tmp_path):
         work_ids[0],
         owner="watcher-1",
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
         closeout_state=leased["closeout"],
     ) is not None
 
@@ -2575,6 +2637,7 @@ def test_blocked_closeout_finalization_is_one_atomic_cas(tmp_path):
         item["id"],
         owner="watcher-1",
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
         closeout_state=blocked_state,
         final_response="Trusted closeout blocked.",
         reason="trusted_closeout_repair_required",
@@ -2583,6 +2646,7 @@ def test_blocked_closeout_finalization_is_one_atomic_cas(tmp_path):
         item["id"],
         owner="watcher-1",
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
         closeout_state=blocked_state,
         final_response="duplicate",
         reason="duplicate",
@@ -2649,6 +2713,7 @@ def test_blocked_closeout_run_state_cas_preserves_new_live_run_and_closeout(tmp_
         item["id"],
         owner="watcher-1",
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
         closeout_state=blocked_state,
         final_response="stale blocked response",
         reason="stale_reason",

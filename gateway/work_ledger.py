@@ -1153,6 +1153,7 @@ class GatewayWorkLedger:
             state = normalize_closeout_state(closeout_state)
             state["revision"] = int(expected_revision) + 1
             item["closeout"] = state
+            item.pop("closeout_mutation_uncertainty", None)
             if state["mode"] != "enforce":
                 item["closeout_authoritative"] = False
             elif item.get("closeout_activated_at") is not None:
@@ -1183,6 +1184,13 @@ class GatewayWorkLedger:
                 return None
             now = self._now()
             state = normalize_closeout_state(item["closeout"])
+            pending_uncertainty = item.get("closeout_mutation_uncertainty")
+            if isinstance(pending_uncertainty, dict):
+                normalized_uncertainty = normalize_closeout_state(
+                    {"mutation_uncertainty": pending_uncertainty}
+                )["mutation_uncertainty"]
+                if normalized_uncertainty.get("status") == "uncertain":
+                    state["mutation_uncertainty"] = normalized_uncertainty
             revision = int(state.get("revision") or 0)
             if expected_revision is not None and revision != int(expected_revision):
                 return None
@@ -1194,12 +1202,17 @@ class GatewayWorkLedger:
             next_due = float(state.get("next_due_at") or 0)
             if next_due > now:
                 return None
+            state["lease_generation"] = min(
+                2_147_483_647,
+                int(state.get("lease_generation") or 0) + 1,
+            )
             state["lease"] = {
                 "owner": owner_text[:160],
                 "until": now + max(1.0, min(3600.0, float(lease_seconds))),
             }
             state["revision"] = revision + 1
             item["closeout"] = state
+            item.pop("closeout_mutation_uncertainty", None)
             item["closeout_last_claimed_at"] = now
             item["updated_at"] = now
             self._write(data)
@@ -1214,6 +1227,7 @@ class GatewayWorkLedger:
         owner: str,
         lease_seconds: float,
         expected_revision: int,
+        expected_generation: int,
     ) -> bool:
         """Extend an unexpired owned lease without changing logical revision."""
 
@@ -1229,7 +1243,11 @@ class GatewayWorkLedger:
                 return False
             now = self._now()
             state = normalize_closeout_state(item["closeout"])
-            if int(state.get("revision") or 0) != int(expected_revision):
+            if (
+                int(state.get("revision") or 0) != int(expected_revision)
+                or int(state.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
                 return False
             lease = state.get("lease") if isinstance(state.get("lease"), dict) else {}
             if (
@@ -1246,12 +1264,50 @@ class GatewayWorkLedger:
             self._write(data)
             return True
 
+    def record_closeout_mutation_uncertainty(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        uncertainty: dict[str, Any],
+    ) -> bool:
+        """Persist a conservative non-authoritative marker after lease loss."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        marker = normalize_closeout_state(
+            {"mutation_uncertainty": uncertainty}
+        )["mutation_uncertainty"]
+        if marker.get("status") != "uncertain":
+            return False
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return False
+            current = normalize_closeout_state(item["closeout"])
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+                or str(lease.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            item["closeout_mutation_uncertainty"] = marker
+            item["updated_at"] = self._now()
+            self._write(data)
+            return True
+
     def release_closeout(
         self,
         work_id: str,
         *,
         owner: str,
         expected_revision: int,
+        expected_generation: int,
         closeout_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Release an owned lease and optionally persist the reconciliation result."""
@@ -1263,18 +1319,28 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
                 return None
+            now = self._now()
             current = normalize_closeout_state(item["closeout"])
-            if int(current.get("revision") or 0) != int(expected_revision):
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
                 return None
             lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
-            if str(lease.get("owner") or "") != str(owner or ""):
+            if (
+                str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
                 return None
             state = normalize_closeout_state(closeout_state if closeout_state is not None else current)
+            state["lease_generation"] = int(expected_generation)
             state["lease"] = {"owner": "", "until": None}
             state["revision"] = int(expected_revision) + 1
             item["closeout"] = state
+            item.pop("closeout_mutation_uncertainty", None)
             item["closeout_authoritative"] = state["mode"] == "enforce"
-            item["updated_at"] = self._now()
+            item["updated_at"] = now
             self._write(data)
             return dict(state)
 
@@ -1284,6 +1350,7 @@ class GatewayWorkLedger:
         *,
         owner: str,
         expected_revision: int,
+        expected_generation: int,
         closeout_state: dict[str, Any],
         final_response: str,
         reason: str,
@@ -1300,17 +1367,26 @@ class GatewayWorkLedger:
                 return None
             if not _run_state_matches(item, expected_run_state):
                 return None
+            now = self._now()
             current = normalize_closeout_state(item["closeout"])
-            if int(current.get("revision") or 0) != int(expected_revision):
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
                 return None
             lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
-            if str(lease.get("owner") or "") != str(owner or ""):
+            if (
+                str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
                 return None
             state = normalize_closeout_state(closeout_state)
+            state["lease_generation"] = int(expected_generation)
             state["lease"] = {"owner": "", "until": None}
             state["revision"] = int(expected_revision) + 1
-            now = self._now()
             response = str(final_response or "")
+            item.pop("closeout_mutation_uncertainty", None)
             item.update(
                 {
                     "closeout": state,

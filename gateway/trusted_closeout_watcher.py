@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import os
-import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from agent.execution_guard import RenewableExecutionGuard
 from gateway.work_ledger import GatewayWorkLedger
 from hermes_cli.trusted_closeout import (
     closeout_terminal_eligible,
@@ -149,8 +150,9 @@ class TrustedCloseoutWatcher:
         self,
         work_id: str,
         revision: int,
+        generation: int,
         stop: asyncio.Event,
-        ownership_lost: threading.Event,
+        guard: RenewableExecutionGuard,
     ) -> None:
         """Heartbeat one logical reconciliation lease without advancing its CAS."""
 
@@ -168,12 +170,13 @@ class TrustedCloseoutWatcher:
                     owner=self.owner,
                     lease_seconds=self.lease_seconds,
                     expected_revision=revision,
+                    expected_generation=generation,
                 )
             except Exception:
-                ownership_lost.set()
+                guard.cancel("closeout lease renewal failed")
                 return
-            if not renewed:
-                ownership_lost.set()
+            if not renewed or not guard.renew(self.lease_seconds):
+                guard.cancel("closeout lease ownership lost")
                 return
 
     async def _reconcile_item(self, item: dict[str, Any], semaphore: asyncio.Semaphore) -> bool:
@@ -192,14 +195,16 @@ class TrustedCloseoutWatcher:
                 return False
             leased_state = leased.get("closeout") if isinstance(leased.get("closeout"), dict) else {}
             leased_revision = int(leased_state.get("revision") or 0)
-            ownership_lost = threading.Event()
+            lease_generation = int(leased_state.get("lease_generation") or 0)
+            guard = RenewableExecutionGuard(self.lease_seconds)
             heartbeat_stop = asyncio.Event()
             heartbeat = asyncio.create_task(
                 self._renew_closeout_lease(
                     work_id,
                     leased_revision,
+                    lease_generation,
                     heartbeat_stop,
-                    ownership_lost,
+                    guard,
                 )
             )
             heartbeat_stopped = False
@@ -212,6 +217,75 @@ class TrustedCloseoutWatcher:
                 heartbeat_stop.set()
                 await heartbeat
 
+            async def persist_mutation_uncertainty(value: Any) -> None:
+                state_value = getattr(value, "state", value)
+                if not isinstance(state_value, dict):
+                    return
+                uncertainty = state_value.get("mutation_uncertainty")
+                if not isinstance(uncertainty, dict) or uncertainty.get("status") != "uncertain":
+                    return
+                persistence = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.ledger.record_closeout_mutation_uncertainty,
+                        work_id,
+                        owner=self.owner,
+                        expected_revision=leased_revision,
+                        expected_generation=lease_generation,
+                        uncertainty=uncertainty,
+                    )
+                )
+                while not persistence.done():
+                    try:
+                        await asyncio.shield(persistence)
+                    except asyncio.CancelledError:
+                        guard.cancel("closeout watcher cancelled")
+                try:
+                    persistence.result()
+                except BaseException:
+                    pass
+
+            try:
+                reconcile_parameters = inspect.signature(self.reconcile).parameters
+            except Exception:
+                reconcile_parameters = {}
+            reconcile_accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in reconcile_parameters.values()
+            )
+
+            async def reconcile_with_guard() -> Any:
+                kwargs: dict[str, Any] = {
+                    "poll_seconds": self.poll_seconds,
+                    "post_merge_config": self.post_merge_config,
+                    "green_unmerged_overdue_seconds": self.green_unmerged_overdue_seconds,
+                    "mutation_allowed": guard.mutation_allowed,
+                    "control": guard,
+                }
+                if not reconcile_accepts_kwargs:
+                    kwargs = {
+                        key: value
+                        for key, value in kwargs.items()
+                        if key in reconcile_parameters
+                    }
+                worker = asyncio.create_task(
+                    asyncio.to_thread(self.reconcile, leased_state, **kwargs)
+                )
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    guard.cancel("closeout watcher cancelled")
+                    while not worker.done():
+                        try:
+                            await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            guard.cancel("closeout watcher cancelled")
+                    try:
+                        cancelled_result = worker.result()
+                    except BaseException:
+                        cancelled_result = None
+                    await persist_mutation_uncertainty(cancelled_result)
+                    raise
+
             wake_immediately = False
             try:
                 try:
@@ -222,14 +296,7 @@ class TrustedCloseoutWatcher:
                     }:
                         next_state = dict(leased_state)
                     else:
-                        transition = await asyncio.to_thread(
-                            self.reconcile,
-                            leased_state,
-                            poll_seconds=self.poll_seconds,
-                            post_merge_config=self.post_merge_config,
-                            green_unmerged_overdue_seconds=self.green_unmerged_overdue_seconds,
-                            mutation_allowed=lambda: not ownership_lost.is_set(),
-                        )
+                        transition = await reconcile_with_guard()
                         next_state = transition.state
                         wake_immediately = bool(getattr(transition, "wake_immediately", False))
                 except Exception:
@@ -238,7 +305,8 @@ class TrustedCloseoutWatcher:
                     next_state = dict(leased_state)
                     next_state["next_due_at"] = time.time() + self.poll_seconds
 
-                if ownership_lost.is_set():
+                if guard.cancelled():
+                    await persist_mutation_uncertainty(next_state)
                     return False
                 next_enforced = str(next_state.get("mode") or "").lower() == "enforce"
                 next_blocked = next_enforced and str(next_state.get("status") or "") in {
@@ -253,24 +321,28 @@ class TrustedCloseoutWatcher:
                         and self.is_agent_active(stored)
                     ):
                         await stop_heartbeat()
-                        if ownership_lost.is_set():
+                        if guard.cancelled():
+                            await persist_mutation_uncertainty(next_state)
                             return False
                         released = await asyncio.to_thread(
                             self.ledger.release_closeout,
                             work_id,
                             owner=self.owner,
                             expected_revision=leased_revision,
+                            expected_generation=lease_generation,
                             closeout_state=next_state,
                         )
                         return released is not None
                     await stop_heartbeat()
-                    if ownership_lost.is_set():
+                    if guard.cancelled():
+                        await persist_mutation_uncertainty(next_state)
                         return False
                     blocked = await asyncio.to_thread(
                         self.ledger.finalize_blocked_closeout,
                         work_id,
                         owner=self.owner,
                         expected_revision=leased_revision,
+                        expected_generation=lease_generation,
                         closeout_state=next_state,
                         final_response=(
                             "Trusted closeout blocked: a deterministic lifecycle gate requires repair."
@@ -288,13 +360,15 @@ class TrustedCloseoutWatcher:
                     return True
 
                 await stop_heartbeat()
-                if ownership_lost.is_set():
+                if guard.cancelled():
+                    await persist_mutation_uncertainty(next_state)
                     return False
                 released = await asyncio.to_thread(
                     self.ledger.release_closeout,
                     work_id,
                     owner=self.owner,
                     expected_revision=leased_revision,
+                    expected_generation=lease_generation,
                     closeout_state=next_state,
                 )
                 if released is None:
@@ -344,8 +418,7 @@ class TrustedCloseoutWatcher:
                             await callback_result
                 return True
             finally:
-                if not heartbeat_stopped:
-                    ownership_lost.set()
+                guard.cancel("closeout reconciliation finished")
                 await stop_heartbeat()
 
     async def run_once(self) -> int:

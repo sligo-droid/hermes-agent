@@ -8,6 +8,7 @@ state and schedule another pass at ``next_due_at`` when needed.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import re
 import subprocess
@@ -19,8 +20,12 @@ from typing import Any, Callable, Mapping
 
 from agent.runtime_phase_classification import classify_runtime_phase
 from agent.runtime_spans import RuntimeSpanRecorder, sanitize_runtime_spans
+from hermes_cli.closeout_execution import (
+    RemoteMutationUncertain,
+    classify_closeout_command,
+    run_closeout_command,
+)
 from hermes_cli.github_remote import (
-    github_cli_env,
     github_origin_repo,
     github_remote_preflight_error,
 )
@@ -182,6 +187,23 @@ def _normalize_errors(value: Any) -> list[dict[str, Any]]:
     return errors
 
 
+def _normalize_mutation_uncertainty(value: Any) -> dict[str, Any]:
+    raw = _record(value)
+    if str(raw.get("status") or "").strip().lower() != "uncertain":
+        return {"status": "none"}
+    result: dict[str, Any] = {
+        "status": "uncertain",
+        "operation": _safe_status(raw.get("operation"), default="remote_mutation")[:80],
+    }
+    at = _safe_float(raw.get("at"))
+    if at is not None:
+        result["at"] = at
+    head_sha = str(raw.get("head_sha") or "").strip().lower()
+    if _SHA_RE.fullmatch(head_sha):
+        result["head_sha"] = head_sha
+    return result
+
+
 def _normalize_post_merge(value: Any) -> dict[str, Any]:
     raw = _record(value)
     target_sha = str(raw.get("target_sha") or "").strip().lower()
@@ -286,6 +308,9 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
         },
         "canonical_sync": _receipt(raw.get("canonical_sync"), default="not_started"),
         "post_merge": _normalize_post_merge(raw.get("post_merge")),
+        "mutation_uncertainty": _normalize_mutation_uncertainty(
+            raw.get("mutation_uncertainty")
+        ),
         "telemetry": {
             "green_unmerged_since": _safe_float(telemetry.get("green_unmerged_since")),
             "green_unmerged_overdue": telemetry.get("green_unmerged_overdue") is True,
@@ -296,6 +321,10 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
             ),
         },
         "revision": _safe_int(raw.get("revision"), maximum=2_147_483_647),
+        "lease_generation": _safe_int(
+            raw.get("lease_generation"),
+            maximum=2_147_483_647,
+        ),
         "lease": {
             "owner": _bounded_text(lease.get("owner"), limit=160),
             "until": _safe_float(lease.get("until")),
@@ -847,24 +876,32 @@ def _default_run(
     cwd: Path,
     timeout: int | float = 60,
     github: bool = False,
+    control: Any | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return run_closeout_command(
         args,
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         timeout=timeout,
-        check=False,
-        env=github_cli_env() if github else None,
+        github=github,
+        control=control,
     )
 
 
-def _default_sync(canonical_path: str, branch: str, merge_sha: str) -> Any:
+def _default_sync(
+    canonical_path: str,
+    branch: str,
+    merge_sha: str,
+    *,
+    control: Any | None = None,
+) -> Any:
     from hermes_cli.canonical_checkout_sync import sync_protected_canonical_checkout
 
-    return sync_protected_canonical_checkout(canonical_path, branch, merge_sha)
+    return sync_protected_canonical_checkout(
+        canonical_path,
+        branch,
+        merge_sha,
+        control=control,
+    )
 
 
 def _detail(result: subprocess.CompletedProcess[str], fallback: str) -> str:
@@ -1092,6 +1129,7 @@ def _reconcile_trusted_closeout_impl(
     green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
+    control: Any | None = None,
     _span_recorder: RuntimeSpanRecorder | None = None,
     _span_parent_id: str = "",
     _span_attempt_id: str = "",
@@ -1105,7 +1143,30 @@ def _reconcile_trusted_closeout_impl(
     runner = run or _default_run
     command_count = 0
     command_count_lock = threading.Lock()
-    ownership_allows_mutation = mutation_allowed or (lambda: True)
+
+    def ownership_allows_mutation() -> bool:
+        if mutation_allowed is not None:
+            try:
+                if not mutation_allowed():
+                    return False
+            except Exception:
+                return False
+        checker = getattr(control, "mutation_allowed", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return True
+
+    try:
+        runner_parameters = inspect.signature(runner).parameters
+    except Exception:
+        runner_parameters = {}
+    runner_accepts_control = "control" in runner_parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in runner_parameters.values()
+    )
 
     def execute(
         args: list[str],
@@ -1122,7 +1183,49 @@ def _reconcile_trusted_closeout_impl(
             over_budget = command_count > max(1, min(_MAX_COMMANDS, int(max_commands)))
         if over_budget:
             raise RuntimeError("closeout command budget exceeded")
-        return runner(args, cwd=cwd, timeout=timeout, github=github)
+        classify_closeout_command(args)
+        kwargs: dict[str, Any] = {
+            "cwd": cwd,
+            "timeout": timeout,
+            "github": github,
+        }
+        if runner_accepts_control:
+            kwargs["control"] = control
+        return runner(args, **kwargs)
+
+    def uncertain_operation() -> str:
+        uncertainty = state.get("mutation_uncertainty")
+        if not isinstance(uncertainty, Mapping):
+            return ""
+        if str(uncertainty.get("status") or "") != "uncertain":
+            return ""
+        return str(uncertainty.get("operation") or "")
+
+    def clear_uncertainty(*operations: str) -> None:
+        if uncertain_operation() in operations:
+            state["mutation_uncertainty"] = {"status": "none"}
+
+    def remote_mutation_uncertain(
+        exc: RemoteMutationUncertain,
+    ) -> CloseoutTransition:
+        state["mutation_uncertainty"] = {
+            "status": "uncertain",
+            "operation": exc.operation,
+            "at": current_time,
+            "head_sha": str(state.get("pr", {}).get("head_sha") or ""),
+        }
+        return _blocked(
+            original,
+            state,
+            code="remote_mutation_uncertain",
+            message=(
+                "Remote mutation outcome is uncertain; authoritative "
+                "re-observation is required before retry"
+            ),
+            now=current_time,
+            retry=True,
+            poll_seconds=poll,
+        )
 
     if state["mode"] == "off":
         return _transition(original, state, outcome="not_required", next_due_at=None, terminal=True)
@@ -1189,6 +1292,9 @@ def _reconcile_trusted_closeout_impl(
 
     pr_ref = _pr_ref(state)
     if not pr_ref:
+        pr_list_state = (
+            "all" if uncertain_operation() == "github_pr_create" else "open"
+        )
         try:
             listed = execute(
                 [
@@ -1202,7 +1308,7 @@ def _reconcile_trusted_closeout_impl(
                     "--base",
                     base_branch,
                     "--state",
-                    "open",
+                    pr_list_state,
                     "--json",
                     "number,url",
                     "--jq",
@@ -1232,6 +1338,9 @@ def _reconcile_trusted_closeout_impl(
             state["pr"]["url"] = str(listed_payload.get("url") or "")[:1200]
             state["pr"]["number"] = _bounded_text(listed_payload.get("number"), limit=32)
             pr_ref = _pr_ref(state)
+        clear_uncertainty("github_pr_create")
+        if pr_ref:
+            clear_uncertainty("git_push")
 
     if not pr_ref:
         if state["mode"] == "shadow":
@@ -1244,17 +1353,104 @@ def _reconcile_trusted_closeout_impl(
                 next_due_at=current_time + poll,
                 terminal=False,
             )
-        try:
-            pushed = execute(
-                ["git", "push", "-u", "origin", branch],
-                cwd=root,
-                timeout=300,
-                github=True,
+        push_required = True
+        if uncertain_operation() == "git_push":
+            try:
+                local_head_result = execute(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=root,
+                    timeout=20,
+                )
+                remote_head_result = execute(
+                    [
+                        "git",
+                        "ls-remote",
+                        "--heads",
+                        "origin",
+                        f"refs/heads/{branch}",
+                    ],
+                    cwd=root,
+                    timeout=60,
+                    github=True,
+                )
+            except Exception as exc:
+                return _blocked(
+                    original,
+                    state,
+                    code="push_reobservation_error",
+                    message=exc,
+                    now=current_time,
+                    retry=True,
+                    poll_seconds=poll,
+                )
+            if local_head_result.returncode != 0 or remote_head_result.returncode != 0:
+                detail = (
+                    _detail(local_head_result, "local head query failed")
+                    if local_head_result.returncode != 0
+                    else _detail(remote_head_result, "remote branch query failed")
+                )
+                return _blocked(
+                    original,
+                    state,
+                    code="push_reobservation_failed",
+                    message=detail,
+                    now=current_time,
+                    retry=True,
+                    poll_seconds=poll,
+                )
+            local_head = str(local_head_result.stdout or "").strip().lower()
+            remote_line = next(
+                (
+                    line.strip()
+                    for line in str(remote_head_result.stdout or "").splitlines()
+                    if line.strip()
+                ),
+                "",
             )
-        except Exception as exc:
-            return _blocked(original, state, code="push_error", message=exc, now=current_time)
-        if pushed.returncode != 0:
-            return _blocked(original, state, code="push_failed", message=_detail(pushed, "git push failed"), now=current_time)
+            remote_head = remote_line.split()[0].lower() if remote_line else ""
+            if not _SHA_RE.fullmatch(local_head):
+                return _blocked(
+                    original,
+                    state,
+                    code="push_reobservation_invalid_local_head",
+                    message="Local branch head is not an exact Git SHA",
+                    now=current_time,
+                )
+            if remote_head and not _SHA_RE.fullmatch(remote_head):
+                return _blocked(
+                    original,
+                    state,
+                    code="push_reobservation_invalid_remote_head",
+                    message="Remote branch head is not an exact Git SHA",
+                    now=current_time,
+                    retry=True,
+                    poll_seconds=poll,
+                )
+            if remote_head and remote_head != local_head:
+                return _blocked(
+                    original,
+                    state,
+                    code="push_reobservation_head_changed",
+                    message="Remote branch changed after an uncertain push",
+                    now=current_time,
+                )
+            clear_uncertainty("git_push")
+            push_required = remote_head != local_head
+
+        if push_required:
+            try:
+                pushed = execute(
+                    ["git", "push", "-u", "origin", branch],
+                    cwd=root,
+                    timeout=300,
+                    github=True,
+                )
+            except RemoteMutationUncertain as exc:
+                return remote_mutation_uncertain(exc)
+            except Exception as exc:
+                return _blocked(original, state, code="push_error", message=exc, now=current_time)
+            if pushed.returncode != 0:
+                return _blocked(original, state, code="push_failed", message=_detail(pushed, "git push failed"), now=current_time)
         create_args = [
             "gh",
             "pr",
@@ -1274,6 +1470,8 @@ def _reconcile_trusted_closeout_impl(
             create_args.append("--draft")
         try:
             created = execute(create_args, cwd=root, timeout=120, github=True)
+        except RemoteMutationUncertain as exc:
+            return remote_mutation_uncertain(exc)
         except Exception as exc:
             return _blocked(original, state, code="pr_create_error", message=exc, now=current_time)
         if created.returncode != 0:
@@ -1358,6 +1556,10 @@ def _reconcile_trusted_closeout_impl(
             retry=True,
             poll_seconds=poll,
         )
+
+    # This authoritative PR snapshot resolves whether a prior ready or merge
+    # request took effect. Only after this observation may either mutation recur.
+    clear_uncertainty("github_pr_ready", "github_pr_merge")
 
     if pr["state"] == "MERGED":
         _update_green_unmerged_telemetry(
@@ -1553,6 +1755,8 @@ def _reconcile_trusted_closeout_impl(
                 timeout=60,
                 github=True,
             )
+        except RemoteMutationUncertain as exc:
+            return remote_mutation_uncertain(exc)
         except Exception as exc:
             return _blocked(original, state, code="pr_ready_error", message=exc, now=current_time, retry=True, poll_seconds=poll)
         if readied.returncode != 0:
@@ -1841,6 +2045,8 @@ def _reconcile_trusted_closeout_impl(
             timeout=300,
             github=True,
         )
+    except RemoteMutationUncertain as exc:
+        return remote_mutation_uncertain(exc)
     except Exception as exc:
         return _blocked(original, state, code="pr_merge_error", message=exc, now=current_time, retry=True, poll_seconds=poll)
     if merged.returncode != 0:
@@ -1874,6 +2080,7 @@ def reconcile_trusted_closeout(
     green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = _DEFAULT_MAX_COMMANDS,
     mutation_allowed: Callable[[], bool] | None = None,
+    control: Any | None = None,
 ) -> CloseoutTransition:
     """Perform one bounded pass and attach trusted closeout/runtime spans."""
 
@@ -1898,6 +2105,14 @@ def reconcile_trusted_closeout(
         },
     )
     base_runner = run or _default_run
+    try:
+        base_runner_parameters = inspect.signature(base_runner).parameters
+    except Exception:
+        base_runner_parameters = {}
+    base_runner_accepts_control = "control" in base_runner_parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in base_runner_parameters.values()
+    )
 
     def instrumented_run(
         args: list[str],
@@ -1905,6 +2120,7 @@ def reconcile_trusted_closeout(
         cwd: Path,
         timeout: int | float = 60,
         github: bool = False,
+        control: Any | None = None,
     ) -> subprocess.CompletedProcess[str]:
         operation, phase = _command_span_operation(args)
         handle = recorder.start(
@@ -1916,12 +2132,14 @@ def reconcile_trusted_closeout(
             metadata={"operation": operation, "repository": repository},
         )
         try:
-            result = base_runner(
-                args,
-                cwd=cwd,
-                timeout=timeout,
-                github=github,
-            )
+            runner_kwargs: dict[str, Any] = {
+                "cwd": cwd,
+                "timeout": timeout,
+                "github": github,
+            }
+            if base_runner_accepts_control:
+                runner_kwargs["control"] = control
+            result = base_runner(args, **runner_kwargs)
         except subprocess.TimeoutExpired:
             recorder.finish(handle, status="timeout")
             raise
@@ -1945,6 +2163,7 @@ def reconcile_trusted_closeout(
             green_unmerged_overdue_seconds=green_unmerged_overdue_seconds,
             max_commands=max_commands,
             mutation_allowed=mutation_allowed,
+            control=control,
             _span_recorder=recorder,
             _span_parent_id=pass_span.id,
             _span_attempt_id=attempt_id,

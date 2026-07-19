@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from agent.runtime_spans import RuntimeSpanRecorder
-from hermes_cli.github_remote import github_cli_env
+from hermes_cli.closeout_execution import run_closeout_command
 
 
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -137,17 +137,14 @@ def _default_run(
     cwd: Path,
     timeout: int | float = 60,
     github: bool = False,
+    control: Any | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return run_closeout_command(
         args,
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         timeout=timeout,
-        check=False,
-        env=github_cli_env() if github else None,
+        github=github,
+        control=control,
     )
 
 
@@ -1240,7 +1237,14 @@ def collect_post_merge_receipts(
 
         for name, (kind, worker, channel) in list(running.items()):
             controls[name].cancel()
-            if kind != "thread":
+            if kind == "thread":
+                if name == "canonical_sync":
+                    # Cooperative canonical synchronization must finish active
+                    # process-group cleanup before collection returns.
+                    worker.join()
+                else:
+                    worker.join(timeout=max(0.0, hard_deadline - time.monotonic()))
+            else:
                 _terminate_isolated_collector(worker, deadline=hard_deadline)
                 channel.close()
             finish_span_once(name, "timeout")

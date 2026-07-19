@@ -1167,6 +1167,69 @@ def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path)
     assert sync_calls == [(str(tmp_path / "canonical"), "main", MERGE_SHA)]
 
 
+def test_uncertain_merge_is_reobserved_before_any_duplicate_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    merge_attempts = 0
+
+    def uncertain_run(args, **_kwargs):
+        nonlocal merge_attempts
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        if args[:3] == ["gh", "pr", "merge"]:
+            merge_attempts += 1
+            raise closeout.RemoteMutationUncertain(
+                "github_pr_merge",
+                "command timeout",
+            )
+        raise AssertionError(args)
+
+    first = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=uncertain_run,
+    )
+
+    assert first.outcome == "pending"
+    assert first.state["mutation_uncertainty"] == {
+        "status": "uncertain",
+        "operation": "github_pr_merge",
+        "at": 100,
+        "head_sha": HEAD_SHA,
+    }
+    assert merge_attempts == 1
+
+    def observed_run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
+                ),
+            )
+        if args[:3] == ["gh", "pr", "merge"]:
+            raise AssertionError("merge must not be replayed before re-observation")
+        raise AssertionError(args)
+
+    second = closeout.reconcile_trusted_closeout(
+        first.state,
+        now=101,
+        run=observed_run,
+    )
+
+    assert second.outcome == "post_merge_pending"
+    assert second.state["mutation_uncertainty"] == {"status": "none"}
+    assert second.state["post_merge"]["target_sha"] == MERGE_SHA
+    assert merge_attempts == 1
+
+
 def test_premerge_refresh_accepts_concurrent_external_merge(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
     _patch_identity_passthrough(monkeypatch)

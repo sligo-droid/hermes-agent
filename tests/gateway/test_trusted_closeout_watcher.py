@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from gateway.trusted_closeout_watcher import (
     mark_closeout_dirty,
 )
 from gateway.work_ledger import GatewayWorkLedger
+from hermes_cli.closeout_execution import run_closeout_command
 
 
 def _event(message_id="m1"):
@@ -37,6 +40,61 @@ def _event(message_id="m1"):
         source=source,
         message_id=message_id,
     )
+
+
+def _install_blocking_git(monkeypatch, tmp_path: Path) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pid_path = tmp_path / "watcher-git-tree.pids"
+    script = bin_dir / "git"
+    script.write_text(
+        """#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+def terminate(_signum, _frame):
+    try:
+        child.wait(timeout=1)
+    except Exception:
+        pass
+    raise SystemExit(143)
+signal.signal(signal.SIGTERM, terminate)
+with open(os.environ["HERMES_TEST_WATCHER_PID_FILE"], "w", encoding="utf-8") as handle:
+    handle.write(f"{os.getpid()} {child.pid}\\n")
+    handle.flush()
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("HERMES_TEST_WATCHER_PID_FILE", str(pid_path))
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return pid_path
+
+
+async def _wait_for_pids(pid_path: Path) -> tuple[int, int]:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            values = [int(value) for value in pid_path.read_text().split()]
+        except (FileNotFoundError, ValueError):
+            values = []
+        if len(values) == 2:
+            return values[0], values[1]
+        await asyncio.sleep(0.01)
+    raise AssertionError("fake Git process tree did not start")
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def _pending_item(
@@ -91,6 +149,7 @@ def _blocked_item(
         item["id"],
         owner="watcher-1",
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
         closeout_state=blocked_state,
         final_response="Trusted closeout blocked: repair required.",
         reason="trusted_closeout_repair_required",
@@ -210,6 +269,148 @@ async def test_lost_closeout_renewal_stops_later_cooperative_mutation(monkeypatc
     stored = ledger.get(item["id"])
     assert stored["closeout"]["revision"] == state["revision"] + 1
     assert stored["closeout"]["status"] == state["status"]
+
+
+@pytest.mark.asyncio
+async def test_renewal_failure_kills_active_mutation_tree_before_watcher_returns(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    pid_path = _install_blocking_git(monkeypatch, tmp_path)
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    item, state = _pending_item(ledger)
+
+    def reconcile(value, *, control, **_kwargs):
+        try:
+            run_closeout_command(
+                ["git", "fetch", "origin", "main"],
+                cwd=tmp_path,
+                timeout=10,
+                control=control,
+            )
+        except Exception:
+            pass
+        updated = dict(value)
+        updated["status"] = "completed"
+        return SimpleNamespace(state=updated)
+
+    monkeypatch.setattr(ledger, "renew_closeout_lease", lambda *_args, **_kwargs: False)
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        config={"lease_seconds": 1, "poll_seconds": 30},
+        reconcile=reconcile,
+        owner="watcher-renewal-failed",
+    )
+
+    run_task = asyncio.create_task(watcher.run_once())
+    parent_pid, child_pid = await _wait_for_pids(pid_path)
+    assert await run_task == 0
+
+    assert not _pid_exists(parent_pid)
+    assert not _pid_exists(child_pid)
+    stored = ledger.get(item["id"])
+    assert stored["closeout"]["revision"] == state["revision"] + 1
+    assert stored["closeout"]["status"] == state["status"]
+
+
+@pytest.mark.asyncio
+async def test_watcher_cancellation_kills_mutation_tree_before_completion(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    pid_path = _install_blocking_git(monkeypatch, tmp_path)
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    item, state = _pending_item(ledger)
+
+    def reconcile(value, *, control, **_kwargs):
+        run_closeout_command(
+            ["git", "fetch", "origin", "main"],
+            cwd=tmp_path,
+            timeout=10,
+            control=control,
+        )
+        return SimpleNamespace(state=value)
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        config={"lease_seconds": 10, "poll_seconds": 30},
+        reconcile=reconcile,
+        owner="watcher-cancelled",
+    )
+    run_task = asyncio.create_task(watcher.run_once())
+    parent_pid, child_pid = await _wait_for_pids(pid_path)
+    run_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert not _pid_exists(parent_pid)
+    assert not _pid_exists(child_pid)
+    stored = ledger.get(item["id"])
+    assert stored["closeout"]["revision"] == state["revision"] + 1
+    assert stored["closeout"]["status"] == state["status"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remote_mutation_uncertainty_survives_for_next_lease(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    now = 100.0
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: now)
+    item, state = _pending_item(ledger)
+    started = threading.Event()
+
+    def reconcile(value, *, control, **_kwargs):
+        started.set()
+        while control.mutation_allowed():
+            time.sleep(0.01)
+        updated = dict(value)
+        updated["mutation_uncertainty"] = {
+            "status": "uncertain",
+            "operation": "github_pr_merge",
+            "at": now,
+            "head_sha": "a" * 40,
+        }
+        return SimpleNamespace(state=updated)
+
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        config={"lease_seconds": 1, "poll_seconds": 30},
+        reconcile=reconcile,
+        owner="watcher-remote-cancelled",
+    )
+    run_task = asyncio.create_task(watcher.run_once())
+    assert await asyncio.to_thread(started.wait, 1)
+    run_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    stored = ledger.get(item["id"])
+    assert stored["closeout"]["revision"] == state["revision"] + 1
+    assert stored["closeout"]["status"] == state["status"]
+    assert stored["closeout_mutation_uncertainty"] == {
+        "status": "uncertain",
+        "operation": "github_pr_merge",
+        "at": 100.0,
+        "head_sha": "a" * 40,
+    }
+
+    now = 102.0
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-next",
+        lease_seconds=30,
+        expected_revision=state["revision"] + 1,
+    )
+    assert leased["closeout"]["mutation_uncertainty"] == stored[
+        "closeout_mutation_uncertainty"
+    ]
+    assert "closeout_mutation_uncertainty" not in ledger.get(item["id"])
 
 
 @pytest.mark.asyncio
@@ -782,6 +983,7 @@ async def test_blocked_terminal_callback_delivers_exactly_once(monkeypatch, tmp_
         item["id"],
         owner="watcher-1",
         expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
         closeout_state=blocked_state,
         final_response="Trusted closeout blocked: repair required.",
         reason="trusted_closeout_repair_required",
