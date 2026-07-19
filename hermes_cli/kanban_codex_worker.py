@@ -55,6 +55,7 @@ from hermes_cli.worker_autoreview import materialize_autoreview_helper
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _CODEX_AUTH_RETRY_LIMIT = 2
+_FULL_SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _PR_GUARDED_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _GH_PR_MUTATING_SUBCOMMANDS = {
     "close",
@@ -123,6 +124,7 @@ class PRFinalizationOutcome(str, Enum):
 
     MERGED = "merged"
     WAITING_FOR_CI = "waiting_for_ci"
+    POST_MERGE_PENDING = "post_merge_pending"
     FAILED = "failed"
 
 
@@ -1203,6 +1205,7 @@ def _resolve_task_ui_work_route(
     *,
     workspace: str,
     backend: str,
+    worker_tier: str = "",
 ) -> UIWorkRouteDecision | None:
     if role != ROLE_DEV:
         return None
@@ -1223,6 +1226,9 @@ def _resolve_task_ui_work_route(
         cwd=workspace,
         backend=backend,
         route_decision=route_decision,
+        # Skill breadth follows trusted scheduler setup, never planner-authored
+        # task prose or route-decision metadata.
+        worker_tier=worker_tier,
     )
     if not decision.matched and decision.selected_route == "default_coding_worker":
         return None
@@ -1300,6 +1306,17 @@ def _attach_ui_work_route(
         pass
 
 
+def _trusted_scheduled_worker_tier() -> str:
+    """Return the scheduler-resolved UI skill tier, if one was supplied."""
+
+    source = str(
+        os.environ.get("HERMES_CODEX_WORKER_TIER_SOURCE") or "none"
+    ).strip().lower()
+    if source != "role":
+        return ""
+    return str(os.environ.get("HERMES_CODEX_WORKER_TIER") or "").strip().lower()
+
+
 def _run_role_backend(
     prompt: str,
     workspace: str,
@@ -1318,6 +1335,7 @@ def _run_role_backend(
         role,
         workspace=workspace,
         backend="opencode" if uses_opencode else "codex",
+        worker_tier=_trusted_scheduled_worker_tier(),
     )
     route_prompt = _ui_work_route_prompt(ui_work_route)
     if route_prompt:
@@ -1786,6 +1804,42 @@ def _request_dispatch_reconciliation(board: Optional[str]) -> None:
         pass
 
 
+def _record_reviewer_approval_head(board: Optional[str], workspace: str) -> None:
+    """Bind reviewer approval only to the exact clean checkpoint inspected."""
+
+    if not board:
+        return
+    root = Path(workspace).expanduser().resolve(strict=False)
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return
+    head_sha = str(head.stdout or "").strip().lower() if head.returncode == 0 else ""
+    if status.returncode != 0 or bool(str(status.stdout or "").strip()):
+        return
+    if not _FULL_SHA_RE.fullmatch(head_sha):
+        return
+    try:
+        from hermes_cli.discord_worker_boards import _update_worker_meta
+
+        _update_worker_meta(board, {"review_approved_head": head_sha})
+    except Exception:
+        return
+
+
 def _apply_role_output(
     conn: Any,
     task_id: str,
@@ -1856,6 +1910,7 @@ def _apply_role_output(
             )
             if not completed:
                 return
+            _record_reviewer_approval_head(board, workspace)
             _request_dispatch_reconciliation(board)
             return
         if status == "blocked":
@@ -1886,6 +1941,7 @@ def _apply_role_output(
             )
             if not completed:
                 return
+            _record_reviewer_approval_head(board, workspace)
             _request_dispatch_reconciliation(board)
             return
         dev_round = active_dev_round_for_board(board)
@@ -2591,56 +2647,20 @@ def _required_check_rollup_summary(
     *,
     head_sha: str = "",
 ) -> tuple[str, int, list[str], str]:
-    """Summarize only the two stable merge-gate checks for the current head.
+    """Compatibility wrapper around the shared current-head check contract."""
 
-    GitHub can retain cancelled attempts beside newer successful reruns.  The
-    generic rollup helper already collapses those attempts; this helper then
-    selects the explicit finalizer contract instead of making unrelated checks
-    accidental merge gates.
-    """
-    latest = _latest_check_rollup_items(items) if isinstance(items, list) else []
-    selected: dict[tuple[str, str], dict[str, Any]] = {}
-    for item in latest:
-        identity = (str(item.get("workflowName") or ""), _check_rollup_item_name(item))
-        if identity not in _REQUIRED_PR_CI_CHECKS:
-            continue
-        item_head = str(item.get("headSha") or item.get("headRefOid") or "").strip()
-        if head_sha and item_head and item_head != head_sha:
-            continue
-        prior = selected.get(identity)
-        is_newer = prior is None or (
-            _check_rollup_item_sort_key(item, 0) >= _check_rollup_item_sort_key(prior, 0)
-        )
-        if is_newer:
-            selected[identity] = item
+    from hermes_cli.trusted_closeout import summarize_required_checks
 
-    failed: list[str] = []
-    pending = False
-    running = False
-    for workflow_name, check_name in _REQUIRED_PR_CI_CHECKS:
-        item = selected.get((workflow_name, check_name))
-        if item is None:
-            pending = True
-            continue
-        status = str(item.get("status") or item.get("state") or "").strip().upper()
-        conclusion = str(item.get("conclusion") or item.get("conclusionState") or "").strip().upper()
-        display = f"{workflow_name} / {check_name}"
-        if conclusion in {"FAILURE", "FAILED", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"} or status in {
-            "FAILURE",
-            "FAILED",
-        }:
-            failed.append(display)
-        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
-            continue
-        else:
-            pending = True
-            if status in {"IN_PROGRESS", "QUEUED", "REQUESTED", "PENDING", "WAITING"}:
-                running = True
-    if failed:
-        return "failed", len(selected), failed, ""
-    if pending:
-        return "pending", len(selected), [], "running" if running else "queued"
-    return "passed", len(selected), [], ""
+    summary = summarize_required_checks(items, head_sha=head_sha)
+    wait_state = str(summary.get("wait_state") or "")
+    if wait_state == "complete":
+        wait_state = ""
+    return (
+        str(summary.get("status") or "pending"),
+        int(summary.get("total") or 0),
+        list(summary.get("failed") or []),
+        wait_state,
+    )
 
 
 def _pr_ci_poll_seconds() -> float:
@@ -2789,9 +2809,9 @@ def _verify_pr_amend_head_advanced(worker: dict[str, Any], *, root: Path) -> boo
     upstream_repo = str(amend.get("upstream_repo") or "").strip()
     upstream_pr_number = str(amend.get("upstream_pr_number") or "").strip()
     trigger_sha = str(amend.get("head_sha") or "").strip()
-    if not upstream_repo or not upstream_pr_number or not trigger_sha:
+    if not upstream_repo or not upstream_pr_number or not _FULL_SHA_RE.fullmatch(trigger_sha):
         worker["pr_amend_head_advanced"] = False
-        worker["pr_blocker"] = "PR-amend completion blocked: missing upstream PR head SHA verification context."
+        worker["pr_blocker"] = "PR-amend completion blocked: missing exact upstream PR head SHA verification context."
         return False
 
     viewed = _run_gh(
@@ -2817,7 +2837,11 @@ def _verify_pr_amend_head_advanced(worker: dict[str, Any], *, root: Path) -> boo
     current_sha = (viewed.stdout or "").strip().strip('"')
     worker["pr_amend_upstream_head_sha"] = current_sha
     worker["pr_amend_trigger_head_sha"] = trigger_sha
-    advanced = bool(current_sha and current_sha != trigger_sha)
+    if not _FULL_SHA_RE.fullmatch(current_sha):
+        worker["pr_amend_head_advanced"] = False
+        worker["pr_blocker"] = "PR-amend completion blocked: upstream PR returned an invalid head SHA."
+        return False
+    advanced = current_sha != trigger_sha
     worker["pr_amend_head_advanced"] = advanced
     if not advanced:
         worker["pr_blocker"] = "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit."
@@ -2898,6 +2922,27 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
         worker.setdefault("pr_merge_state", "unknown")
         worker["pr_blocker"] = _pr_blocker(worker)
         return
+
+    from hermes_cli.trusted_closeout import enrich_required_check_identities
+
+    def run_identity_query(
+        args: list[str],
+        *,
+        cwd: Path,
+        timeout: int | float = 60,
+        github: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        if not args or args[0] != "gh":
+            return subprocess.CompletedProcess(args, 2, "", "GitHub command required")
+        return _run_gh(args[1:], root=cwd, timeout=timeout)
+
+    data = enrich_required_check_identities(
+        data,
+        repo=repo,
+        root=root,
+        run=run_identity_query,
+    )
+    identity_error = str(data.pop("_required_check_identity_error", "") or "").strip()
     if data.get("url"):
         worker["pr_url"] = str(data.get("url") or "")
     if data.get("number") is not None:
@@ -2925,12 +2970,15 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     worker["pr_checks_status"] = checks_status
     worker["pr_checks_total"] = checks_total
     worker["pr_checks_failed"] = failed
-    worker["pr_status_error"] = ""
-    if checks_status == "pending":
+    worker["pr_status_error"] = identity_error
+    if identity_error:
+        _clear_pr_ci_wait(worker)
+    elif checks_status == "pending":
         worker["pr_ci_wait_state"] = wait_state or "queued"
     if _pr_is_merged(worker):
         _clear_pr_ci_wait(worker)
     worker["pr_blocker"] = _pr_blocker(worker)
+    worker["_pr_status_just_refreshed"] = True
 
 
 def _ensure_pr_open(
@@ -2941,6 +2989,8 @@ def _ensure_pr_open(
     branch: str,
     base: str,
     board: Optional[str],
+    draft: bool = False,
+    allow_draft: bool = False,
 ) -> bool:
     remote_error = github_remote_preflight_error(root, operation="create/finalize PR")
     if remote_error:
@@ -3008,21 +3058,24 @@ def _ensure_pr_open(
     else:
         title, _body_without_project_state_hygiene = _build_worker_pr_copy(worker, board=str(board or ""))
         body = _worker_pr_body(worker, board=board, changed_files=changed_files)
+        create_args = [
+            "pr",
+            "create",
+            "--repo",
+            repo,
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        ]
+        if draft:
+            create_args.append("--draft")
         created = _run_gh(
-            [
-                "pr",
-                "create",
-                "--repo",
-                repo,
-                "--base",
-                base,
-                "--head",
-                branch,
-                "--title",
-                title,
-                "--body",
-                body,
-            ],
+            create_args,
             root=root,
             timeout=60,
         )
@@ -3036,8 +3089,11 @@ def _ensure_pr_open(
             return False
 
     _refresh_pr_status(worker, root=root, repo=repo)
-    worker["pr_blocker"] = _pr_open_blocker(worker)
-    return not bool(worker.get("pr_blocker")) and _pr_is_open_or_merged(worker)
+    blocker = _pr_open_blocker(worker)
+    if allow_draft and blocker == "PR is draft":
+        blocker = ""
+    worker["pr_blocker"] = blocker
+    return not bool(blocker) and _pr_is_open_or_merged(worker)
 
 
 def _ensure_pr_merged(
@@ -3046,7 +3102,7 @@ def _ensure_pr_merged(
     root: Path,
     repo: str,
 ) -> PRFinalizationOutcome:
-    """Merge once the two stable CI gates pass, without blocking the dispatcher."""
+    """Merge once exact current-head reviewer evidence and CI gates pass."""
     pr_ref = _pr_ref(worker)
     if not pr_ref:
         worker.setdefault("pr_checks_status", "not checked")
@@ -3054,7 +3110,10 @@ def _ensure_pr_merged(
         worker["pr_blocker"] = _pr_blocker(worker)
         return PRFinalizationOutcome.FAILED
 
-    if not worker.get("pr_state"):
+    # Never merge from a caller's cached snapshot. A refresh performed by the
+    # immediately preceding open/reconcile step is consumed once; direct or
+    # later calls refresh here before evaluating exact-head evidence.
+    if worker.pop("_pr_status_just_refreshed", False) is not True:
         _refresh_pr_status(worker, root=root, repo=repo)
     if _pr_is_merged(worker):
         _clear_pr_ci_wait(worker)
@@ -3091,6 +3150,16 @@ def _ensure_pr_merged(
         _clear_pr_ci_wait(worker)
         return PRFinalizationOutcome.FAILED
 
+    current_head = str(worker.get("pr_ci_head_sha") or "").strip().lower()
+    approved_head = str(worker.get("review_approved_head") or "").strip().lower()
+    if not current_head or approved_head != current_head:
+        worker["pr_blocker"] = (
+            "Reviewer approval is missing or stale for the current PR head; "
+            "a reviewer must approve the refreshed head before merge."
+        )
+        _clear_pr_ci_wait(worker)
+        return PRFinalizationOutcome.FAILED
+
     blocker = _pr_blocker(worker)
     if blocker:
         worker["pr_blocker"] = blocker
@@ -3107,7 +3176,17 @@ def _ensure_pr_merged(
         return PRFinalizationOutcome.FAILED
 
     merged = _run_gh(
-        ["pr", "merge", pr_ref, "--repo", repo, "--merge", "--delete-branch"],
+        [
+            "pr",
+            "merge",
+            pr_ref,
+            "--repo",
+            repo,
+            "--merge",
+            "--delete-branch",
+            "--match-head-commit",
+            current_head,
+        ],
         root=root,
         timeout=300,
     )
@@ -3141,6 +3220,358 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
     )
     worker.update(result.as_worker_metadata())
     return result.state.startswith("synced")
+
+
+def _kanban_closeout_config() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        return {}
+    closeout = config.get("closeout") if isinstance(config, dict) else None
+    return dict(closeout) if isinstance(closeout, dict) else {}
+
+
+def _kanban_shared_closeout_enabled(config: dict[str, Any]) -> bool:
+    surfaces = config.get("surfaces") if isinstance(config.get("surfaces"), dict) else {}
+    return surfaces.get("kanban") is True and str(config.get("mode") or "off").lower() != "off"
+
+
+def _legacy_worker_closeout_state(
+    worker: dict[str, Any],
+    *,
+    board: str,
+    workspace: str,
+    repo: str,
+    branch: str,
+    base: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize flattened board metadata into the shared closeout schema."""
+
+    from hermes_cli.trusted_closeout import normalize_closeout_state
+
+    existing = worker.get("closeout") if isinstance(worker.get("closeout"), dict) else {}
+    state = normalize_closeout_state(existing)
+    state.update(
+        {
+            "id": str(existing.get("id") or f"kanban:{board}"),
+            "source": "kanban",
+            "mode": str(config.get("mode") or "shadow").lower(),
+        }
+    )
+    state["workspace"].update(
+        {
+            "path": workspace,
+            "canonical_path": str(worker.get("project_path") or ""),
+            "repository": repo,
+            "branch": branch,
+            "base_branch": base,
+        }
+    )
+    requirements = config.get("post_merge_requirements")
+    state["policy"].update(
+        {
+            "merge": _merge_policy(worker),
+            "pr_open": _pr_open_policy(worker),
+            "early_draft_pr": config.get("early_draft_pr") is True,
+            "require_local_verification": True,
+            "require_review": True,
+            "require_visual_qa": False,
+            "post_merge_requirements": {
+                key: requirements.get(key) is True if isinstance(requirements, dict) else False
+                for key in ("canonical_sync", "ci", "deployment", "production_qa", "restart")
+            },
+        }
+    )
+    pr = state["pr"]
+    pr.update(
+        {
+            "url": str(worker.get("pr_url") or pr.get("url") or ""),
+            "number": str(worker.get("pr_number") or pr.get("number") or ""),
+            "title": str(worker.get("pr_title") or pr.get("title") or _pr_title_source(worker)),
+            "body": str(worker.get("pr_body") or pr.get("body") or _worker_pr_body(worker, board=board, changed_files=[])),
+            "state": str(worker.get("pr_state") or pr.get("state") or ""),
+            "is_draft": worker.get("pr_is_draft") is True,
+            "head_sha": str(worker.get("pr_ci_head_sha") or pr.get("head_sha") or ""),
+            "merge_sha": str(worker.get("pr_merge_commit") or pr.get("merge_sha") or ""),
+            "merge_state": str(worker.get("pr_merge_state") or pr.get("merge_state") or "unknown"),
+            "mergeable": worker.get("pr_mergeable", pr.get("mergeable", "unknown")),
+            "review_decision": str(worker.get("pr_review_decision") or pr.get("review_decision") or "unknown"),
+        }
+    )
+    head_sha = str(pr.get("head_sha") or "")
+    if not existing:
+        state["telemetry"].update(
+            {
+                "green_unmerged_since": worker.get("green_unmerged_since"),
+                "green_unmerged_overdue": worker.get("green_unmerged_overdue") is True,
+            }
+        )
+    trusted_local_head = str(worker.get("trusted_local_verification_head") or "").strip().lower()
+    review_approved_head = str(worker.get("review_approved_head") or "").strip().lower()
+    if head_sha and trusted_local_head == head_sha:
+        state["local_verification"] = {"status": "passed", "head_sha": head_sha}
+    if head_sha and review_approved_head == head_sha:
+        state["review"] = {"status": "approved", "head_sha": head_sha}
+    state["ci"].update(
+        {
+            "head_sha": head_sha,
+            "status": str(worker.get("pr_checks_status") or state["ci"].get("status") or "not_checked").replace(" ", "_"),
+            "total": int(worker.get("pr_checks_total") or 0),
+            "failed": list(worker.get("pr_checks_failed") or []),
+            "wait_state": str(worker.get("pr_ci_wait_state") or state["ci"].get("wait_state") or "queued"),
+        }
+    )
+    return normalize_closeout_state(state)
+
+
+def _dual_write_closeout_to_worker(worker: dict[str, Any], state: dict[str, Any]) -> None:
+    """Preserve flattened Kanban compatibility fields beside nested state."""
+
+    pr = state["pr"]
+    ci = state["ci"]
+    canonical = state["canonical_sync"]
+    telemetry = state["telemetry"]
+    worker.update(
+        {
+            "closeout": state,
+            "pr_url": pr.get("url") or "",
+            "pr_number": pr.get("number") or "",
+            "pr_state": pr.get("state") or "unknown",
+            "pr_is_draft": pr.get("is_draft") is True,
+            "pr_ci_head_sha": pr.get("head_sha") or ci.get("head_sha") or "",
+            "pr_merge_commit": pr.get("merge_sha") or "",
+            "pr_merge_state": pr.get("merge_state") or "unknown",
+            "pr_mergeable": pr.get("mergeable", "unknown"),
+            "pr_review_decision": pr.get("review_decision") or "unknown",
+            "pr_checks_status": ci.get("status") or "not checked",
+            "pr_checks_total": int(ci.get("total") or 0),
+            "pr_checks_failed": list(ci.get("failed") or []),
+            "pr_ci_wait_state": ci.get("wait_state") or "",
+            "pr_ci_next_poll_at": state.get("next_due_at") or 0,
+            "green_unmerged_since": telemetry.get("green_unmerged_since") or 0,
+            "green_unmerged_overdue": telemetry.get("green_unmerged_overdue") is True,
+            "canonical_sync_state": canonical.get("status") or "not_started",
+            "canonical_sync_head": canonical.get("observed_sha") or "",
+        }
+    )
+    errors = state.get("errors") or []
+    if state.get("status") in {"blocked", "repair_required"} and errors:
+        worker["pr_error"] = str(errors[-1].get("message") or "trusted closeout blocked")
+        worker["pr_blocker"] = worker["pr_error"]
+    elif state.get("status") in {"post_merge_complete", "pr_open", "completed"}:
+        worker["pr_error"] = None
+        worker["pr_blocker"] = ""
+
+
+def _reconcile_kanban_closeout(
+    worker: dict[str, Any],
+    *,
+    board: str,
+    workspace: str,
+    repo: str,
+    branch: str,
+    base: str,
+    config: dict[str, Any],
+) -> PRFinalizationOutcome:
+    from hermes_cli.canonical_checkout_sync import sync_protected_canonical_checkout
+    from hermes_cli.trusted_closeout import reconcile_trusted_closeout
+
+    state = _legacy_worker_closeout_state(
+        worker,
+        board=board,
+        workspace=workspace,
+        repo=repo,
+        branch=branch,
+        base=base,
+        config=config,
+    )
+
+    def run(args: list[str], *, cwd: Path, timeout: int | float = 60, github: bool = False):
+        if args and args[0] == "gh":
+            return _run_gh(args[1:], root=cwd, timeout=int(timeout))
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=_github_cli_env() if github else None,
+        )
+
+    transition = reconcile_trusted_closeout(
+        state,
+        poll_seconds=float(config.get("poll_seconds") or 30),
+        run=run,
+        sync_canonical=sync_protected_canonical_checkout,
+        post_merge_config=config,
+        green_unmerged_overdue_seconds=float(
+            config.get("green_unmerged_overdue_seconds") or 0
+        ),
+    )
+    _dual_write_closeout_to_worker(worker, transition.state)
+    if transition.state.get("mode") != "enforce":
+        # Shadow contributes diagnostics only; the legacy Kanban finalizer keeps
+        # ownership of success/failure and all repository mutations.
+        return PRFinalizationOutcome.WAITING_FOR_CI
+    if transition.outcome == "post_merge_pending":
+        return PRFinalizationOutcome.POST_MERGE_PENDING
+    if transition.outcome in {"post_merge_complete", "pr_open", "completed", "not_required"}:
+        return PRFinalizationOutcome.MERGED
+    if transition.outcome in {"blocked", "repair_required"}:
+        return PRFinalizationOutcome.FAILED
+    return PRFinalizationOutcome.WAITING_FOR_CI
+
+
+def _ensure_early_draft_pr(board: Optional[str], workspace: str) -> dict[str, Any]:
+    """Push one settled Kanban checkpoint and open/refresh its draft PR.
+
+    This dispatcher-only path runs before reviewer creation. It never waits for
+    CI or marks review complete; later dev checkpoints push a new exact head and
+    leave the prior review evidence stale until the next reviewer approves.
+    """
+
+    result: dict[str, Any] = {"status": "disabled", "head_sha": ""}
+    if not board:
+        return result
+    config = _kanban_closeout_config()
+    if (
+        not _kanban_shared_closeout_enabled(config)
+        or str(config.get("mode") or "off").strip().lower() != "enforce"
+        or config.get("early_draft_pr") is not True
+    ):
+        return result
+    if str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return {"status": "blocked", "head_sha": "", "diagnostic_code": "role_worker_context"}
+
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+    from hermes_cli.discord_worker_boards import effective_pr_policy_for_worker
+    from hermes_cli.discord_worker_boards import _update_worker_meta
+
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    worker.update(effective_pr_policy_for_worker(worker))
+    if _pr_open_policy(worker) == PR_OPEN_POLICY_NEVER:
+        worker["early_draft_status"] = "not_required"
+        _update_worker_meta(board, worker)
+        return {"status": "not_required", "head_sha": ""}
+
+    root = Path(workspace).expanduser().resolve(strict=False)
+    branch = str(worker.get("worker_branch") or "").strip()
+    base = str(worker.get("base_branch") or "main").strip() or "main"
+    repo = _resolve_github_repo(worker, root) if root.is_dir() else None
+    diagnostic = ""
+    head_sha = ""
+    if not root.is_dir():
+        diagnostic = "workspace_unavailable"
+    elif not branch:
+        diagnostic = "branch_missing"
+    elif not repo:
+        diagnostic = "repository_missing"
+    else:
+        try:
+            diff_check = subprocess.run(
+                ["git", "diff", "--check"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            status = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            diagnostic = "checkpoint_probe_failed"
+        else:
+            head_sha = str(head.stdout or "").strip().lower() if head.returncode == 0 else ""
+            if diff_check.returncode != 0:
+                diagnostic = "checkpoint_diff_invalid"
+            elif status.returncode != 0 or bool(str(status.stdout or "").strip()):
+                diagnostic = "checkpoint_not_clean"
+            elif not _FULL_SHA_RE.fullmatch(head_sha):
+                diagnostic = "checkpoint_head_invalid"
+
+    if diagnostic:
+        worker.update(
+            {
+                "early_draft_status": "blocked",
+                "early_draft_diagnostic_code": diagnostic,
+            }
+        )
+        _update_worker_meta(board, worker)
+        return {"status": "blocked", "head_sha": "", "diagnostic_code": diagnostic}
+
+    assert repo is not None
+    already_pushed = str(worker.get("early_draft_pushed_head_sha") or "").strip().lower()
+    if already_pushed == head_sha and _pr_ref(worker):
+        _refresh_pr_status(worker, root=root, repo=repo)
+        observed = str(worker.get("pr_ci_head_sha") or "").strip().lower()
+        opened = observed == head_sha and _pr_is_open_or_merged(worker)
+    else:
+        opened = _ensure_pr_open(
+            worker,
+            root=root,
+            repo=repo,
+            branch=branch,
+            base=base,
+            board=board,
+            draft=True,
+            allow_draft=True,
+        )
+        observed = str(worker.get("pr_ci_head_sha") or "").strip().lower()
+
+    if not opened or observed != head_sha or not _FULL_SHA_RE.fullmatch(observed):
+        diagnostic = "early_draft_head_mismatch" if opened else "early_draft_open_failed"
+        worker.update(
+            {
+                "early_draft_status": "blocked",
+                "early_draft_diagnostic_code": diagnostic,
+            }
+        )
+        _update_worker_meta(board, worker)
+        return {"status": "blocked", "head_sha": head_sha, "diagnostic_code": diagnostic}
+
+    worker.update(
+        {
+            "early_draft_status": "existing" if already_pushed == head_sha else "opened",
+            "early_draft_diagnostic_code": "",
+            "early_draft_pushed_head_sha": head_sha,
+        }
+    )
+    state = _legacy_worker_closeout_state(
+        worker,
+        board=board,
+        workspace=str(root),
+        repo=repo,
+        branch=branch,
+        base=base,
+        config=config,
+    )
+    if str(worker.get("trusted_local_verification_head") or "").strip().lower() != head_sha:
+        state["local_verification"] = {"status": "pending"}
+    if str(worker.get("review_approved_head") or "").strip().lower() == head_sha:
+        state["review"] = {"status": "approved", "head_sha": head_sha}
+    else:
+        state["review"] = {"status": "pending", "head_sha": head_sha}
+    _dual_write_closeout_to_worker(worker, state)
+    _update_worker_meta(board, worker)
+    return {"status": worker["early_draft_status"], "head_sha": head_sha}
 
 
 def _ensure_pr(board: Optional[str], workspace: str) -> PRFinalizationOutcome:
@@ -3181,9 +3612,42 @@ def _ensure_pr(board: Optional[str], workspace: str) -> PRFinalizationOutcome:
     open_policy = _pr_open_policy(worker)
     worker["pr_open_policy"] = open_policy
     worker["merge_policy"] = policy
+
+    # PR-amend target and advancement are preconditions, not post-merge
+    # diagnostics. No merge command or enforce-mode shared-closeout handoff may
+    # run until the exact upstream PR head is proven to have advanced.
+    amend_preflight_blocked = False
+    if repo:
+        target_error = _validate_pr_amend_target(worker, repo=repo, base=base)
+        if target_error:
+            worker["pr_error"] = target_error
+            worker["pr_checks_status"] = "not checked"
+            worker["pr_merge_state"] = "unknown"
+            worker["pr_blocker"] = target_error
+            amend_preflight_blocked = True
+    if not amend_preflight_blocked and _pr_amend_requires_head_sha_advance(worker):
+        if not _verify_pr_amend_head_advanced(worker, root=root):
+            worker.setdefault("pr_checks_status", "not checked")
+            worker.setdefault("pr_merge_state", "unknown")
+            amend_preflight_blocked = True
+
+    closeout_config = _kanban_closeout_config()
+    if not amend_preflight_blocked and _kanban_shared_closeout_enabled(closeout_config):
+        outcome = _reconcile_kanban_closeout(
+            worker,
+            board=board,
+            workspace=str(root),
+            repo=str(repo or ""),
+            branch=branch,
+            base=base,
+            config=closeout_config,
+        )
+        _update_worker_meta(board, worker)
+        if str(closeout_config.get("mode") or "shadow").lower() == "enforce":
+            return outcome
     outcome = PRFinalizationOutcome.FAILED
     try:
-        skip_pr_lifecycle = False
+        skip_pr_lifecycle = amend_preflight_blocked
         if open_policy == PR_OPEN_POLICY_NEVER:
             _reset_pr_status_fields(worker)
             worker["pr_skipped_no_changes"] = True
@@ -3213,14 +3677,6 @@ def _ensure_pr(board: Optional[str], workspace: str) -> PRFinalizationOutcome:
                 skip_pr_lifecycle = True
             if not skip_pr_lifecycle:
                 assert repo is not None
-                target_error = _validate_pr_amend_target(worker, repo=repo, base=base)
-                if target_error:
-                    worker["pr_error"] = target_error
-                    worker["pr_checks_status"] = "not checked"
-                    worker["pr_merge_state"] = "unknown"
-                    worker["pr_blocker"] = target_error
-                    outcome = PRFinalizationOutcome.FAILED
-                    skip_pr_lifecycle = True
             if not skip_pr_lifecycle and policy == MERGE_POLICY_AUTO and _pr_ref(worker):
                 now = int(time.time())
                 if not _pr_ci_wait_is_due(worker, now=now):
@@ -3302,10 +3758,6 @@ def _ensure_pr(board: Optional[str], workspace: str) -> PRFinalizationOutcome:
                         worker.setdefault("pr_merge_state", "unknown")
                         worker["pr_blocker"] = _pr_open_blocker(worker)
                         outcome = PRFinalizationOutcome.FAILED
-        if outcome == PRFinalizationOutcome.MERGED and not worker.get("pr_blocker") and not _verify_pr_amend_head_advanced(worker, root=root):
-            worker.setdefault("pr_checks_status", "not checked")
-            worker.setdefault("pr_merge_state", "unknown")
-            outcome = PRFinalizationOutcome.FAILED
     except Exception as exc:
         worker.setdefault("pr_error", str(exc))
         worker.setdefault("pr_checks_status", "not checked")

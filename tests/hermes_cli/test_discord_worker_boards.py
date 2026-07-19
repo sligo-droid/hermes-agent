@@ -4074,6 +4074,122 @@ def test_reconcile_board_creates_round_prefixed_reviewer_ticket(monkeypatch, tmp
     assert reviewer_tasks[0].title == "R1: Review Discord implementation"
 
 
+def test_reconcile_board_opens_early_draft_before_reviewer_without_waiting_for_ci(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="early-draft-review", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        dev_id = kanban_db.create_task(
+            conn,
+            title="R1: Implement task",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, dev_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            dev_id,
+            summary="done",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    calls = []
+    head = "a" * 40
+    monkeypatch.setattr(
+        kanban_codex_worker,
+        "_ensure_early_draft_pr",
+        lambda board_name, workspace: calls.append((board_name, workspace))
+        or {"status": "opened", "head_sha": head},
+    )
+
+    assert dwb.reconcile_board(board.slug) == "reviewer_created"
+    assert calls == [(board.slug, str(board.worker.get("worktree_path") or ""))]
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer = [
+            task
+            for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.assignee == dwb.ROLE_REVIEWER
+        ][0]
+    finally:
+        conn.close()
+    payload = json.loads(reviewer.body or "{}")
+    assert payload["early_draft_checkpoint"] == {
+        "status": "opened",
+        "head_sha": head,
+    }
+
+
+def test_reconcile_board_retries_blocked_early_draft_before_creating_reviewer(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="early-draft-retry", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        dev_id = kanban_db.create_task(
+            conn,
+            title="R1: Implement task",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, dev_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            dev_id,
+            summary="done",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    head = "a" * 40
+    attempts = iter(
+        [
+            {"status": "blocked", "head_sha": head, "diagnostic_code": "early_draft_open_failed"},
+            {"status": "opened", "head_sha": head},
+        ]
+    )
+    monkeypatch.setattr(
+        kanban_codex_worker,
+        "_ensure_early_draft_pr",
+        lambda _board, _workspace: next(attempts),
+    )
+
+    assert dwb.reconcile_board(board.slug) == "early_draft_checkpoint_pending"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        assert not [
+            task for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.assignee == dwb.ROLE_REVIEWER
+        ]
+    finally:
+        conn.close()
+    assert int(dwb._read_worker_meta(board.slug).get("review_loop_count") or 0) == 0
+
+    assert dwb.reconcile_board(board.slug) == "reviewer_created"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewers = [
+            task for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.assignee == dwb.ROLE_REVIEWER
+        ]
+    finally:
+        conn.close()
+    assert len(reviewers) == 1
+    assert int(dwb._read_worker_meta(board.slug).get("review_loop_count") or 0) == 1
+
+
 def test_reconcile_board_reviewer_body_includes_pre_review_readiness(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -4141,6 +4257,19 @@ def test_reconcile_board_reviewer_body_includes_pre_review_readiness(monkeypatch
     assert "verbose output" not in readiness_json
 
 
+_APPROVED_CURRENT_HEAD = "a" * 40
+
+
+def _bind_approved_current_head(dwb, board: str) -> None:
+    dwb._update_worker_meta(
+        board,
+        {
+            "review_approved_head": _APPROVED_CURRENT_HEAD,
+            "pr_ci_head_sha": _APPROVED_CURRENT_HEAD,
+        },
+    )
+
+
 def test_reconcile_board_recovers_approved_reviewer_finalizer_success(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -4158,6 +4287,7 @@ def test_reconcile_board_recovers_approved_reviewer_finalizer_success(monkeypatc
             "review_loop_count": 1,
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -4231,6 +4361,7 @@ def test_reconcile_board_blocks_when_approved_reviewer_finalizer_fails(monkeypat
             "review_loop_count": 1,
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -4324,6 +4455,7 @@ def test_reconcile_board_retries_retryable_pr_amend_head_advance_blocker(monkeyp
             "pr_amend_trigger_head_sha": "oldsha",
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -4407,6 +4539,7 @@ def test_reconcile_board_keeps_operator_blocked_canonical_sync_from_completing(m
             "canonical_sync_error": blocker,
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -4536,6 +4669,7 @@ def test_reconcile_board_blocks_pr_body_check_finalizer_without_recovery_round(m
             "pr_open_policy": "after_review_approval",
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -4661,6 +4795,7 @@ def test_reconcile_board_creates_dev_recovery_for_real_failed_pr_checks(monkeypa
             ],
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -4745,6 +4880,7 @@ def test_reconcile_blocked_approved_board_with_generic_pr_blocker_stays_finalize
             "pr_merge_state": "unknown",
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         planner_id = kanban_db.create_task(conn, title="R1: Plan", assignee=dwb.ROLE_PLANNER, tenant=board.slug)
@@ -4826,6 +4962,7 @@ def test_reconcile_blocked_approved_board_finalizes_after_generic_pr_blocker_cle
             "pr_blocker": "HTTP 401: Requires authentication",
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         dev_id = kanban_db.create_task(conn, title="R2: Build", assignee=dwb.ROLE_DEV, tenant=board.slug)
@@ -4914,6 +5051,7 @@ def test_reconcile_board_creates_dev_recovery_for_pr_merge_conflict_finalizer(mo
             ],
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -5115,6 +5253,7 @@ def test_reconcile_board_recovers_already_blocked_pr_merge_conflict_finalizer(mo
             "pr_error": "approved reviewer PR finalization failed",
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
 
     def fake_ensure_pr(board_arg, workspace_arg):
         return False
@@ -5202,6 +5341,7 @@ def test_reconcile_board_finalizes_already_blocked_pending_checks_after_refresh(
             "pr_error": "approved reviewer PR finalization failed",
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
 
     def fake_ensure_pr(board_arg, workspace_arg):
         assert board_arg == board.slug
@@ -5257,6 +5397,7 @@ def test_reconcile_board_keeps_queued_ci_active_without_recovery_task(monkeypatc
     finally:
         conn.close()
 
+    approved_head = "a" * 40
     dwb._update_worker_meta(
         board.slug,
         {
@@ -5267,6 +5408,8 @@ def test_reconcile_board_keeps_queued_ci_active_without_recovery_task(monkeypatc
             "execution_mode": "kanban_pipeline",
             "merge_policy": "auto",
             "pr_open_policy": "after_review_approval",
+            "review_approved_head": approved_head,
+            "pr_ci_head_sha": approved_head,
         },
     )
 
@@ -5285,6 +5428,7 @@ def test_reconcile_board_keeps_queued_ci_active_without_recovery_task(monkeypatc
                 "pr_ci_wait_started_at": 100,
                 "pr_ci_next_poll_at": 110,
                 "pr_ci_wait_seconds": 0,
+                "pr_ci_head_sha": approved_head,
                 "pr_blocker": "",
                 "pr_error": None,
             },
@@ -5307,6 +5451,97 @@ def test_reconcile_board_keeps_queued_ci_active_without_recovery_task(monkeypatc
     finally:
         conn.close()
     assert [task for task in tasks if task.created_by == "discord-pr-finalizer-recovery"] == []
+
+
+def test_failed_ci_repair_head_requires_new_reviewer_before_ci_wait(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    old_head = "a" * 40
+    repaired_head = "b" * 40
+    board = dwb.start_direct_goal(thread_id="review-repaired-head", goal="Ship repaired CI change")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            claimed = kanban_db.claim_task(conn, task.id)
+            assert claimed is not None
+            kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R1: Review original head",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            reviewer_id,
+            summary="Approved original head.",
+            metadata={"raw": {"status": "approved"}},
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "phase": "reviewing",
+            "goal_status": "active",
+            "worktree_path": str(tmp_path / "repo"),
+            "review_loop_count": 1,
+            "execution_mode": "kanban_pipeline",
+            "merge_policy": "auto",
+            "pr_open_policy": "after_review_approval",
+            "review_approved_head": old_head,
+            "trusted_local_verification_head": old_head,
+            "pr_ci_head_sha": old_head,
+            "pr_finalizer_recovery_state": "dev_checks_recovery",
+        },
+    )
+
+    def fake_ensure_pr(board_arg, workspace_arg):
+        assert (board_arg, workspace_arg) == (board.slug, str(tmp_path / "repo"))
+        dwb._update_worker_meta(
+            board_arg,
+            {
+                "pr_url": "https://github.com/sligo-labs/PID/pull/308",
+                "pr_number": 308,
+                "pr_state": "OPEN",
+                "pr_ci_head_sha": repaired_head,
+                "pr_merge_state": "UNSTABLE",
+                "pr_checks_status": "pending",
+                "pr_ci_wait_state": "running",
+                "pr_blocker": "",
+                "pr_error": None,
+            },
+        )
+        return kanban_codex_worker.PRFinalizationOutcome.WAITING_FOR_CI
+
+    monkeypatch.setattr(kanban_codex_worker, "_ensure_pr", fake_ensure_pr)
+
+    assert dwb.reconcile_board(board.slug) == "reviewer_created"
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["pr_ci_head_sha"] == repaired_head
+    assert worker["review_approved_head"] == old_head
+    assert worker["pr_finalizer_recovery_state"] == "review_required"
+    assert worker["phase"] == "reviewing"
+    assert worker["goal_status"] == "active"
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_tasks = [
+            task
+            for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.assignee == dwb.ROLE_REVIEWER
+        ]
+    finally:
+        conn.close()
+    assert len(reviewer_tasks) == 2
+    assert any(task.status in {"triage", "todo", "ready"} for task in reviewer_tasks)
 
 
 def test_reconcile_board_finalizes_blocked_stale_unstable_after_refresh(monkeypatch, tmp_path):
@@ -5362,6 +5597,7 @@ def test_reconcile_board_finalizes_blocked_stale_unstable_after_refresh(monkeypa
             "pr_error": "approved reviewer PR finalization failed",
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
 
     def fake_ensure_pr(board_arg, workspace_arg):
         assert (board_arg, workspace_arg) == (board.slug, str(worktree))
@@ -5460,6 +5696,7 @@ def test_reconcile_board_recovers_already_blocked_pr_merge_conflict_finalizer_wi
             "pr_error": None,
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
 
     def fake_ensure_pr(board_arg, workspace_arg):
         return False
@@ -5552,6 +5789,7 @@ def test_reconcile_board_finalizes_already_blocked_pr_after_recovery_clears_conf
             "pr_error": None,
         },
     )
+    _bind_approved_current_head(dwb, board.slug)
     calls = []
 
     def fake_ensure_pr(board_arg, workspace_arg):
@@ -5635,6 +5873,8 @@ def test_reconcile_board_keeps_other_blocked_finalizer_states_inert(monkeypatch,
             "blocked_reason": "approved reviewer PR finalization failed",
             "worktree_path": str(tmp_path / "repo"),
             "review_loop_count": 1,
+            "review_approved_head": _APPROVED_CURRENT_HEAD,
+            "pr_ci_head_sha": _APPROVED_CURRENT_HEAD,
         }
         worker.update(worker_updates)
         dwb._update_worker_meta(board.slug, worker)

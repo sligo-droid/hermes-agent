@@ -642,76 +642,20 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
 # ---------------------------------------------------------------------------
 
 
-def _supports_media_in_tool_results(provider: str, model: str) -> bool:
-    """Whether the given provider+model combination accepts image content
-    inside a tool-result message.
+def _supports_media_in_tool_results(
+    provider: str,
+    model: str,
+    api_mode: str = "",
+) -> bool:
+    """Compatibility wrapper for centralized transport capability policy."""
 
-    Providers covered today (per spec docs verified Apr-2026):
+    from agent.vision_capabilities import transport_supports_image_tool_results
 
-      * Anthropic Messages API (``anthropic`` provider, plus aggregators that
-        proxy Claude — ``openrouter``, ``nous``, ``vertex``, ``bedrock``):
-        ``tool_result`` blocks accept ``image`` content blocks.
-      * OpenAI Chat Completions: tool messages accept array content with
-        ``image_url`` parts.
-      * OpenAI Responses (``openai-codex``): ``function_call_output.output``
-        accepts an array of ``input_text``/``input_image`` items.
-      * Gemini 3 (and proxied via aggregators): supports multimodal tool
-        results. Older Gemini does NOT.
-
-    For unknown / legacy providers we conservatively return False — the
-    caller falls back to the legacy aux-LLM text path.  The check is relaxed
-    when the provider's ``ProviderProfile`` declares ``supports_vision=True``.
-    """
-    if not isinstance(provider, str):
-        return False
-    p = provider.strip().lower()
-    if not p:
-        return False
-
-    # Aggregators that route to multiple vendors — assume support since
-    # users on these aggregators are typically using vision-capable
-    # frontier models. Falling back to text would be a regression for
-    # them.
-    _AGGREGATORS = {
-        "openrouter", "nous", "vertex", "bedrock", "anthropic-vertex",
-        "google-vertex",
-    }
-    if p in _AGGREGATORS:
-        return True
-
-    # Native Anthropic
-    if p in {"anthropic", "claude", "anthropic-direct"}:
-        return True
-
-    # OpenAI Chat Completions and Responses
-    if p in {"openai", "openai-chat", "openai-codex", "azure-openai"}:
-        return True
-
-    # Gemini — gate on model name; older Gemini variants did not support
-    # multimodal functionResponse. Gemini 3.x does.
-    if p in {"google", "gemini", "google-gemini", "google-vertex-gemini"}:
-        if not isinstance(model, str):
-            return False
-        m = model.strip().lower()
-        if "gemini-3" in m or "gemini-pro-3" in m or "gemini-flash-3" in m:
-            return True
-        return False
-
-    # Check the provider's registered profile for the supports_vision flag.
-    # This covers vision-capable providers like xiaomi, minimax, etc. that
-    # aren't in the hardcoded list above.
-    try:
-        from providers import get_provider_profile
-        profile = get_provider_profile(p)
-        if profile is not None and profile.supports_vision:
-            return True
-    except Exception:
-        pass
-
-    # Other vision-capable provider stacks. Conservative default: False.
-    # Add explicit entries here as we verify each provider's tool-result
-    # multimodal support empirically.
-    return False
+    return transport_supports_image_tool_results(
+        provider,
+        model,
+        api_mode=api_mode,
+    )
 
 
 def _should_use_native_vision_fast_path() -> bool:
@@ -726,21 +670,38 @@ def _should_use_native_vision_fast_path() -> bool:
     the caller falls back to the legacy aux-LLM path.
     """
     try:
-        from agent.auxiliary_client import _read_main_provider, _read_main_model
-        from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
+        from agent.auxiliary_client import (
+            _read_main_api_mode,
+            _read_main_model,
+            _read_main_provider,
+        )
+        from agent.image_routing import decide_image_input_mode
+        from agent.vision_capabilities import resolve_vision_capabilities
         from hermes_cli.config import load_config
 
         provider = _read_main_provider()
         model = _read_main_model()
+        api_mode = _read_main_api_mode()
         cfg = load_config()
         if decide_image_input_mode(provider, model, cfg) != "native":
             return False
-        return (
-            _supports_media_in_tool_results(provider, model)
-            or _lookup_supports_vision(provider, model, cfg) is True
+        resolution = resolve_vision_capabilities(
+            provider,
+            model,
+            cfg,
+            api_mode=api_mode,
         )
+        if not resolution.native_tool_result_supported:
+            logger.debug(
+                "Native vision fast path unavailable: %s",
+                resolution.diagnostic_code,
+            )
+        return resolution.native_tool_result_supported
     except Exception as exc:
-        logger.debug("Native vision fast-path check failed: %s", exc)
+        logger.warning(
+            "Native vision capability resolution failed (%s)",
+            type(exc).__name__,
+        )
         return False
 
 

@@ -700,32 +700,43 @@ def _should_route_through_aux_vision() -> bool:
     """Return True when ``_capture_response`` should hand the PNG to aux vision.
 
     Reads the active main provider/model and the loaded config and asks the
-    routing helper. Any failure (config import, runtime override missing,
-    etc.) returns False so the existing multimodal envelope continues to be
-    returned — fail open on the routing decision so a broken config can
-    never silently drop the screenshot for vision-capable main models.
+    routing helper. Any capability-resolution failure returns True so the
+    screenshot is converted through the text pipeline instead of risking an
+    invalid multimodal tool result at the provider boundary.
     """
     try:
-        from agent.auxiliary_client import _read_main_model, _read_main_provider
+        from agent.auxiliary_client import (
+            _read_main_api_mode,
+            _read_main_model,
+            _read_main_provider,
+        )
         from hermes_cli.config import load_config
         from tools.computer_use.vision_routing import (
             should_route_capture_to_aux_vision,
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("computer_use: aux-vision routing import failed: %s", exc)
-        return False
+        return True
     try:
         provider = _read_main_provider()
         model = _read_main_model()
+        api_mode = _read_main_api_mode()
         cfg = load_config()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("computer_use: aux-vision routing config read failed: %s", exc)
-        return False
+        return True
     try:
-        return bool(should_route_capture_to_aux_vision(provider, model, cfg))
+        return bool(
+            should_route_capture_to_aux_vision(
+                provider,
+                model,
+                cfg,
+                api_mode=api_mode,
+            )
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("computer_use: aux-vision routing decision failed: %s", exc)
-        return False
+        return True
 
 
 def _route_capture_through_aux_vision(

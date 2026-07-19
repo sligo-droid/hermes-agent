@@ -157,19 +157,9 @@ _FALSE_TOKENS = frozenset({"false", "no", "off", "0"})
 
 def _coerce_capability_bool(raw: Any) -> Optional[bool]:
     """Return True/False for recognised boolean values, None otherwise."""
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, int):
-        if raw in (0, 1):
-            return bool(raw)
-        return None
-    if isinstance(raw, str):
-        s = raw.strip().lower()
-        if s in _TRUE_TOKENS:
-            return True
-        if s in _FALSE_TOKENS:
-            return False
-    return None
+    from agent.vision_capabilities import coerce_capability_bool
+
+    return coerce_capability_bool(raw)
 
 
 def _supports_vision_override(
@@ -190,64 +180,10 @@ def _supports_vision_override(
     models.dev. Returns False explicitly only when the user wrote a
     recognised boolean false token.
     """
-    if not isinstance(cfg, dict):
-        return None
+    from agent.vision_capabilities import configured_model_vision_support
 
-    # 1. Top-level shortcut
-    model_cfg_raw = cfg.get("model")
-    model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
-    top = _coerce_capability_bool(model_cfg.get("supports_vision"))
-    if top is not None:
-        return top
-
-    # 2. Per-provider, per-model. Named custom providers (e.g. "my-vllm")
-    # get rewritten to provider="custom" at runtime
-    # (hermes_cli/runtime_provider.py:_resolve_named_custom_runtime), so the
-    # config still holds the user-declared name under model.provider. Try
-    # both as candidate provider keys.
-    config_provider = str(model_cfg.get("provider") or "").strip()
-    providers_raw = cfg.get("providers")
-    providers_cfg: Dict[str, Any] = providers_raw if isinstance(providers_raw, dict) else {}
-    for p in dict.fromkeys(filter(None, (provider, config_provider))):
-        entry_raw = providers_cfg.get(p)
-        entry: Dict[str, Any] = entry_raw if isinstance(entry_raw, dict) else {}
-        models_raw = entry.get("models")
-        models_cfg: Dict[str, Any] = models_raw if isinstance(models_raw, dict) else {}
-        per_model_raw = models_cfg.get(model)
-        per_model: Dict[str, Any] = per_model_raw if isinstance(per_model_raw, dict) else {}
-        coerced = _coerce_capability_bool(per_model.get("supports_vision"))
-        if coerced is not None:
-            return coerced
-
-    # 2b. Legacy list-style custom_providers. Entries are dicts with a
-    # "name" key and a nested "models" dict. Match by provider name (which
-    # may appear as the raw name or "custom:<name>" at runtime).
-    custom_providers = cfg.get("custom_providers")
-    if isinstance(custom_providers, list):
-        # Build candidate names: the provider value and the config provider
-        # value, both raw and with "custom:" prefix stripped/added.
-        candidate_names: set = set()
-        for p in filter(None, (provider, config_provider)):
-            candidate_names.add(p)
-            if p.startswith("custom:"):
-                candidate_names.add(p[len("custom:"):])
-            else:
-                candidate_names.add(f"custom:{p}")
-        for entry_raw in custom_providers:
-            if not isinstance(entry_raw, dict):
-                continue
-            entry_name = str(entry_raw.get("name") or "").strip()
-            if entry_name not in candidate_names:
-                continue
-            models_raw = entry_raw.get("models")
-            models_cfg = models_raw if isinstance(models_raw, dict) else {}
-            per_model_raw = models_cfg.get(model)
-            per_model = per_model_raw if isinstance(per_model_raw, dict) else {}
-            coerced = _coerce_capability_bool(per_model.get("supports_vision"))
-            if coerced is not None:
-                return coerced
-
-    return None
+    support, _source = configured_model_vision_support(cfg, provider, model)
+    return support
 
 
 def _coerce_mode(raw: Any) -> str:
@@ -285,19 +221,15 @@ def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
     return True
 
 
-def _lookup_supports_vision(provider: str, model: str) -> Optional[bool]:
-    """Return True/False if we can resolve caps, None if unknown."""
-    if not provider or not model:
-        return None
-    try:
-        from agent.models_dev import get_model_capabilities
-        caps = get_model_capabilities(provider, model)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, model, exc)
-        return None
-    if caps is None:
-        return None
-    return bool(caps.supports_vision)
+def _lookup_supports_vision(
+    provider: str,
+    model: str,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[bool]:
+    """Return config/models.dev image-input support, or ``None`` if unknown."""
+    from agent.vision_capabilities import resolve_vision_capabilities
+
+    return resolve_vision_capabilities(provider, model, cfg).model_supports_image_input
 
 
 def decide_image_input_mode(
@@ -327,7 +259,7 @@ def decide_image_input_mode(
     if _explicit_aux_vision_override(cfg):
         return "text"
 
-    supports = _lookup_supports_vision(provider, model)
+    supports = _lookup_supports_vision(provider, model, cfg)
     if supports is True:
         return "native"
     return "text"

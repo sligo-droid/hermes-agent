@@ -173,6 +173,104 @@ def test_worker_errored_detector_uses_latest_failed_run_only():
     assert issues[0].evidence["run_error"] == "cannot spawn worker"
 
 
+def _green_unmerged_closeout():
+    head_sha = "a" * 40
+    return {
+        "mode": "shadow",
+        "status": "waiting_for_mergeability",
+        "source": "kanban",
+        "policy": {
+            "merge": "auto",
+            "require_local_verification": True,
+            "require_review": True,
+            "require_visual_qa": True,
+        },
+        "local_verification": {"status": "passed", "head_sha": head_sha},
+        "review": {"status": "passed", "head_sha": head_sha},
+        "visual_qa": {"status": "passed", "head_sha": head_sha},
+        "pr": {
+            "number": "123",
+            "state": "OPEN",
+            "is_draft": False,
+            "head_sha": head_sha,
+        },
+        "ci": {"status": "passed", "head_sha": head_sha},
+        "telemetry": {
+            "green_unmerged_since": 100,
+            "green_unmerged_overdue": True,
+        },
+    }
+
+
+def test_green_unmerged_overdue_detector_emits_safe_deduplicable_issue():
+    from hermes_cli.discord_worker_foreman import (
+        BoardSnapshot,
+        detect_green_unmerged_overdue,
+    )
+
+    snapshot = BoardSnapshot(
+        board="discord-green",
+        thread_id="123",
+        chat_id="123",
+        session_url="https://example.test/workers/123",
+        thread_state="running",
+        run_summary={},
+        tasks=(),
+        closeout=_green_unmerged_closeout(),
+    )
+
+    issues = detect_green_unmerged_overdue(snapshot)
+
+    assert [issue.kind for issue in issues] == ["green_unmerged_overdue"]
+    assert issues[0].task_id == "closeout"
+    assert issues[0].severity == "warning"
+    assert issues[0].evidence == {
+        "closeout_source": "kanban",
+        "closeout_status": "waiting_for_mergeability",
+        "green_unmerged_since": 100.0,
+        "pr_number": "123",
+        "session_url": "https://example.test/workers/123",
+        "thread_state": "running",
+    }
+
+
+def test_green_unmerged_overdue_detector_suppresses_ineligible_states():
+    from hermes_cli.discord_worker_foreman import (
+        BoardSnapshot,
+        detect_green_unmerged_overdue,
+    )
+
+    variants = []
+    draft = _green_unmerged_closeout()
+    draft["pr"]["is_draft"] = True
+    variants.append(draft)
+    manual = _green_unmerged_closeout()
+    manual["policy"]["merge"] = "manual"
+    variants.append(manual)
+    stale = _green_unmerged_closeout()
+    stale["ci"]["head_sha"] = "b" * 40
+    variants.append(stale)
+    incomplete = _green_unmerged_closeout()
+    incomplete["review"]["status"] = "pending"
+    variants.append(incomplete)
+    not_overdue = _green_unmerged_closeout()
+    not_overdue["telemetry"]["green_unmerged_overdue"] = False
+    variants.append(not_overdue)
+
+    for closeout in variants:
+        snapshot = BoardSnapshot(
+            board="discord-green",
+            thread_id="123",
+            chat_id="123",
+            session_url="https://example.test/workers/123",
+            thread_state="running",
+            run_summary={},
+            tasks=(),
+            closeout=closeout,
+        )
+        assert detect_green_unmerged_overdue(snapshot) == []
+
+
 def test_stale_running_detector_flags_missing_and_old_heartbeat():
     from hermes_cli import discord_worker_foreman as foreman
     from hermes_cli.discord_worker_foreman import RunSnapshot, TaskSnapshot, detect_stale_running

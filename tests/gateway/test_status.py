@@ -10,6 +10,99 @@ from gateway import status
 
 
 class TestGatewayPidState:
+    def test_source_identity_prefers_validated_immutable_build_metadata(self, tmp_path):
+        source = tmp_path / "repo" / "gateway" / "status.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("# source\n", encoding="utf-8")
+
+        identity = status.compute_gateway_source_identity(
+            source_file=source,
+            build_sha="a" * 40,
+            run=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("git must not run")),
+        )
+
+        assert identity.source_commit == "a" * 40
+        assert identity.source_identity_kind == "build_env"
+        assert identity.source_root == str(tmp_path / "repo")
+        assert identity.source_dirty is False
+
+    def test_source_identity_accepts_only_exact_build_sha_lengths(self, tmp_path):
+        root = tmp_path / "repo"
+        source = root / "gateway" / "status.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("# source\n", encoding="utf-8")
+
+        def run(args, **_kwargs):
+            if args == ["git", "rev-parse", "--show-toplevel"]:
+                return SimpleNamespace(returncode=0, stdout=str(root) + "\n", stderr="")
+            if args == ["git", "rev-parse", "HEAD"]:
+                return SimpleNamespace(returncode=0, stdout="b" * 64 + "\n", stderr="")
+            if args == ["git", "status", "--porcelain", "--untracked-files=normal"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(args)
+
+        for invalid in ("a" * 7, "a" * 41, "a" * 63):
+            identity = status.compute_gateway_source_identity(
+                source_file=source,
+                build_sha=invalid,
+                run=run,
+            )
+            assert identity.source_identity_kind == "git"
+            assert identity.source_commit == "b" * 64
+
+        exact = status.compute_gateway_source_identity(
+            source_file=source,
+            build_sha="c" * 64,
+            run=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("git must not run")),
+        )
+        assert exact.source_identity_kind == "build_env"
+        assert exact.source_commit == "c" * 64
+
+    def test_source_identity_uses_actual_loaded_git_tree_and_cleanliness(self, tmp_path):
+        root = tmp_path / "repo"
+        source = root / "gateway" / "status.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("# source\n", encoding="utf-8")
+        calls = []
+
+        def run(args, **_kwargs):
+            calls.append(args)
+            if args == ["git", "rev-parse", "--show-toplevel"]:
+                return SimpleNamespace(returncode=0, stdout=str(root) + "\n", stderr="")
+            if args == ["git", "rev-parse", "HEAD"]:
+                return SimpleNamespace(returncode=0, stdout="b" * 40 + "\n", stderr="")
+            if args == ["git", "status", "--porcelain", "--untracked-files=normal"]:
+                return SimpleNamespace(returncode=0, stdout=" M gateway/status.py\n", stderr="")
+            raise AssertionError(args)
+
+        identity = status.compute_gateway_source_identity(
+            source_file=source,
+            build_sha="invalid",
+            run=run,
+        )
+
+        assert identity.source_commit == "b" * 40
+        assert identity.source_identity_kind == "git"
+        assert identity.source_root == str(root)
+        assert identity.source_dirty is True
+        assert calls[-1] == ["git", "status", "--porcelain", "--untracked-files=normal"]
+
+    def test_runtime_status_persists_startup_source_identity(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            status,
+            "_GATEWAY_SOURCE_IDENTITY",
+            status.GatewaySourceIdentity("c" * 40, "git", "/trusted/source", False),
+        )
+
+        status.write_runtime_status(gateway_state="running")
+
+        payload = json.loads((tmp_path / "gateway_state.json").read_text(encoding="utf-8"))
+        assert payload["source_commit"] == "c" * 40
+        assert payload["source_identity_kind"] == "git"
+        assert payload["source_root"] == "/trusted/source"
+        assert payload["source_dirty"] is False
+
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

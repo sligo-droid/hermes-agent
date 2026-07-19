@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
+import hashlib
 import os
 import json
 import math
 import re
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
 from gateway.session import Platform, SessionSource
@@ -19,6 +23,7 @@ from agent.verification_evidence import (
     downgrade_verified_metadata,
     evidence_from_runtime_breakdown,
 )
+from agent.request_text import merge_request_fragments
 from agent.visual_qa import (
     classify_visual_requirement,
     normalize_visual_qa_config,
@@ -40,7 +45,60 @@ INCOMPLETE_STATUSES = frozenset(
 )
 TERMINAL_STATUSES = frozenset({"completed", "failed", "blocked", "cancelled", "expired"})
 LEASE_SECONDS = 3600.0
+_CLOSEOUT_LOCK_TIMEOUT_SECONDS = 5.0
+_CLOSEOUT_LOCK_POLL_SECONDS = 0.05
+_PROCESS_LEDGER_LOCK = threading.RLock()
 _DROP = object()
+_RUN_STATE_UNSET = object()
+_RUN_OWNED_STATUSES = frozenset({"claimed", "agent_running"})
+_RUN_STATE_TEXT_LIMIT = 240
+_RUN_STATE_EPOCH_LIMIT = 160
+_RUN_STATE_INT_LIMIT = (1 << 63) - 1
+_RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
+_MAX_CONFIRMED_MESSAGE_IDS = 128
+_MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
+
+
+def _bounded_delivery_message_ids(
+    values: Any = None,
+    *,
+    primary: Any = None,
+) -> tuple[str, ...]:
+    """Sanitize and bound durable platform message IDs in confirmation order."""
+
+    if values is None:
+        values = ()
+    elif isinstance(values, (str, bytes)):
+        values = (values,)
+    try:
+        candidates = iter(values)
+    except TypeError:
+        candidates = iter((values,))
+
+    def _sanitize(value: Any) -> str:
+        text = str(value or "").strip()
+        return "".join(
+            char for char in text if char.isalnum() or char in {"-", "_", ".", ":"}
+        )[:_MAX_DELIVERY_MESSAGE_ID_LENGTH]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        text = _sanitize(value)
+        if not text or text in seen:
+            continue
+        normalized.append(text)
+        seen.add(text)
+        if len(normalized) >= _MAX_CONFIRMED_MESSAGE_IDS:
+            break
+    primary_text = _sanitize(primary)
+    if (
+        primary_text
+        and primary_text not in seen
+        and len(normalized) < _MAX_CONFIRMED_MESSAGE_IDS
+    ):
+        normalized.append(primary_text)
+    return tuple(normalized)
 
 
 _PROJECT_SOURCE_KEYS = frozenset(
@@ -228,11 +286,11 @@ def _visual_qa_worker_route_for_event(event: Any) -> Any:
 def _visual_qa_requirement_for_event(event: Any) -> dict[str, Any]:
     """Classify only the accepted request text into a bounded public shape."""
 
-    request_parts = [str(getattr(event, "text", "") or "")]
     feature_summary = getattr(event, "feature_summary", None)
-    if isinstance(feature_summary, dict):
-        request_parts.append(str(feature_summary.get("initial_request") or ""))
-    request_text = "\n".join(part for part in request_parts if part.strip())
+    request_text = merge_request_fragments(
+        getattr(event, "text", ""),
+        feature_summary.get("initial_request") if isinstance(feature_summary, dict) else "",
+    )
     return classify_visual_requirement(
         request_text,
         worker_route=_visual_qa_worker_route_for_event(event),
@@ -257,9 +315,8 @@ def _visual_qa_receipts(
         receipt = sanitize_visual_receipt(raw, requirement=requirement)
         if receipt is not None:
             safe.append(receipt)
-        if len(safe) >= max_receipts:
-            break
-    return safe
+    safe.sort(key=lambda item: int(item.get("order") or 0))
+    return safe[-max_receipts:]
 
 
 def _visual_qa_state_for_item(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -294,6 +351,75 @@ def _positive_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _bounded_run_state_text(value: Any, *, limit: int = _RUN_STATE_TEXT_LIMIT) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    prefix_limit = max(0, limit - len(digest) - 1)
+    return f"{text[:prefix_limit]}:{digest}"
+
+
+def _bounded_run_state_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(_RUN_STATE_INT_LIMIT, max(0, number))
+
+
+def _bounded_run_state_lease(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        lease = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(lease):
+        return None
+    return max(-_RUN_STATE_LEASE_LIMIT, min(_RUN_STATE_LEASE_LIMIT, lease))
+
+
+def _normalize_run_state_snapshot(item: Any) -> dict[str, Any]:
+    """Return the bounded ownership fields used by finalization CAS checks."""
+
+    source = item if isinstance(item, dict) else {}
+    raw_active = source.get("active_run")
+    active_run = None
+    if isinstance(raw_active, dict):
+        active_run = {
+            "session_key": _bounded_run_state_text(raw_active.get("session_key")),
+            "generation": _bounded_run_state_int(raw_active.get("generation")),
+            "owner_pid": _bounded_run_state_int(raw_active.get("owner_pid")),
+            "process_epoch": _bounded_run_state_text(
+                raw_active.get("process_epoch"),
+                limit=_RUN_STATE_EPOCH_LIMIT,
+            ),
+            "lease_until": _bounded_run_state_lease(raw_active.get("lease_until")),
+        }
+    return {
+        "status": _bounded_run_state_text(source.get("status")),
+        "active_run": active_run,
+    }
+
+
+def _run_state_matches(item: dict[str, Any], expected_run_state: Any) -> bool:
+    current = _normalize_run_state_snapshot(item)
+    if expected_run_state is _RUN_STATE_UNSET:
+        # Legacy callers remain safe only when no run can own the item. A
+        # claimed/running legacy item may lack active_run metadata, so status is
+        # part of the fail-closed omission check.
+        return (
+            current["active_run"] is None
+            and current["status"] not in _RUN_OWNED_STATUSES
+        )
+    if not isinstance(expected_run_state, dict):
+        return False
+    return current == _normalize_run_state_snapshot(expected_run_state)
 
 
 def _apply_visual_qa_completion(item: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
@@ -679,6 +805,62 @@ def _source_from_dict(data: dict[str, Any]) -> SessionSource:
     return SessionSource.from_dict(data)
 
 
+@contextlib.contextmanager
+def _ledger_file_lock(path: Path, *, timeout_seconds: float = _CLOSEOUT_LOCK_TIMEOUT_SECONDS):
+    """Serialize closeout read-modify-write operations across processes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with _PROCESS_LEDGER_LOCK:
+        handle = lock_path.open("a+b")
+        acquired = False
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        try:
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"work ledger lock unavailable: {lock_path}") from exc
+                    time.sleep(_CLOSEOUT_LOCK_POLL_SECONDS)
+            yield
+        finally:
+            try:
+                if acquired:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def _locked_ledger_mutation(method):
+    """Apply the same cross-process lock to every ledger read-modify-write."""
+
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with _ledger_file_lock(self.path):
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class GatewayWorkLedger:
     """JSON-backed ledger of accepted gateway work.
 
@@ -737,6 +919,7 @@ class GatewayWorkLedger:
             target=session_key,
         )
 
+    @_locked_ledger_mutation
     def accept_event(
         self,
         event: Any,
@@ -789,14 +972,14 @@ class GatewayWorkLedger:
             "goal_thread_context": getattr(event, "goal_thread_context", None),
             "feature_summary": _durable_metadata(getattr(event, "feature_summary", None)),
             "project_summary": _durable_metadata(getattr(event, "project_summary", None)),
-            # These are deliberately normalized before persistence.  The
-            # request requirement contains only bounded plain text, config
-            # retains no unknown keys, and receipts are sanitized separately
-            # when a turn ends.
+            # These are deliberately normalized before persistence. The
+            # request requirement contains only opaque target/assertion IDs,
+            # config retains no unknown keys, and receipts are sanitized
+            # separately when a turn ends.
             "visual_qa_config": normalized_visual_config,
             "visual_qa_requirement": visual_requirement,
             "visual_qa_receipts": [],
-            "claim_pid": None,
+            "active_run": None,
             "lease_until": None,
             "result_message_id": None,
         }
@@ -810,7 +993,899 @@ class GatewayWorkLedger:
         item = self._read().get("items", {}).get(work_id)
         return dict(item) if isinstance(item, dict) else None
 
-    def claim(self, work_id: str) -> dict[str, Any] | None:
+    @staticmethod
+    def run_state_snapshot(item: Any) -> dict[str, Any]:
+        """Normalize one observed item into the bounded finalization CAS state."""
+
+        return _normalize_run_state_snapshot(item)
+
+    def capture_run_state(
+        self,
+        work_id: str,
+        *,
+        session_key: str,
+        run_generation: int,
+        owner_pid: int,
+        process_epoch: str,
+    ) -> dict[str, Any] | None:
+        """Capture the exact active run only when the requested owner still holds it."""
+
+        with _ledger_file_lock(self.path):
+            item = self._read().get("items", {}).get(work_id)
+            if not isinstance(item, dict):
+                return None
+            snapshot = _normalize_run_state_snapshot(item)
+            active_run = snapshot.get("active_run")
+            if not isinstance(active_run, dict):
+                return None
+            if (
+                active_run["session_key"] != _bounded_run_state_text(session_key)
+                or active_run["generation"] != _bounded_run_state_int(run_generation)
+                or active_run["owner_pid"] != _bounded_run_state_int(owner_pid)
+                or active_run["process_epoch"]
+                != _bounded_run_state_text(process_epoch, limit=_RUN_STATE_EPOCH_LIMIT)
+            ):
+                return None
+            return snapshot
+
+    def attach_closeout_workspace(
+        self,
+        work_id: str,
+        *,
+        workspace_path: str,
+        canonical_path: str = "",
+        repository: str = "",
+        branch: str = "",
+        base_branch: str = "main",
+        closeout_id: str = "",
+        source: str = "direct",
+        mode: str = "shadow",
+        policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically attach mutable/canonical workspace identity to one item."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict):
+                return None
+            existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+            state = normalize_closeout_state(
+                {
+                    **existing,
+                    "id": str(existing.get("id") or closeout_id or f"{work_id}:closeout"),
+                    "source": str(source or existing.get("source") or "direct"),
+                    "mode": str(mode or existing.get("mode") or "off"),
+                    "workspace": {
+                        "path": str(workspace_path or ""),
+                        "canonical_path": str(canonical_path or ""),
+                        "repository": str(repository or ""),
+                        "branch": str(branch or ""),
+                        "base_branch": str(base_branch or "main"),
+                    },
+                    "policy": policy if policy is not None else existing.get("policy"),
+                }
+            )
+            state["revision"] = int(existing.get("revision") or 0) + 1
+            item["closeout"] = state
+            if state["mode"] != "enforce":
+                item["closeout_authoritative"] = False
+            else:
+                item.setdefault("closeout_authoritative", False)
+            item["updated_at"] = self._now()
+            self._write(data)
+            return dict(state)
+
+    def activate_closeout(
+        self,
+        work_id: str,
+        closeout_state: dict[str, Any],
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically activate closeout; only enforce mode becomes authoritative."""
+
+        from agent.runtime_spans import RuntimeSpanRecorder, sanitize_runtime_spans
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict):
+                return None
+            existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+            revision = int(existing.get("revision") or 0)
+            if expected_revision is not None and revision != int(expected_revision):
+                return None
+            state = normalize_closeout_state(closeout_state)
+            if state["mode"] == "off":
+                return None
+            recorder = RuntimeSpanRecorder(work_id=work_id, max_spans=4)
+            handoff_span = recorder.start(
+                "closeout_handoff",
+                phase="gateway_handoff",
+                attempt_id=f"revision-{revision + 1}",
+                metadata={"operation": "closeout_handoff", "surface": "gateway"},
+            )
+            recorder.finish(
+                handoff_span,
+                status="ok",
+                metadata={
+                    "source": state.get("source") or "direct",
+                    "mode": state.get("mode") or "off",
+                },
+            )
+            telemetry = state.get("telemetry") if isinstance(state.get("telemetry"), dict) else {}
+            telemetry["phase_spans"] = sanitize_runtime_spans(
+                [*(telemetry.get("phase_spans") or []), *recorder.export()],
+                max_spans=120,
+            )
+            state["telemetry"] = telemetry
+            state["revision"] = revision + 1
+            item["closeout"] = state
+            item["closeout_authoritative"] = state["mode"] == "enforce"
+            item["closeout_activated_at"] = self._now()
+            item["updated_at"] = item["closeout_activated_at"]
+            self._write(data)
+            return dict(state)
+
+    def update_closeout(
+        self,
+        work_id: str,
+        closeout_state: dict[str, Any],
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any] | None:
+        """Compare-and-swap one normalized closeout state."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict):
+                return None
+            existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else None
+            if existing is None or int(existing.get("revision") or 0) != int(expected_revision):
+                return None
+            state = normalize_closeout_state(closeout_state)
+            state["revision"] = int(expected_revision) + 1
+            item["closeout"] = state
+            item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
+            if state["mode"] != "enforce":
+                item["closeout_authoritative"] = False
+            elif item.get("closeout_activated_at") is not None:
+                item["closeout_authoritative"] = True
+            item["updated_at"] = self._now()
+            self._write(data)
+            return dict(state)
+
+    def lease_closeout(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        lease_seconds: float,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Claim a due closeout lease without replaying model work."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        owner_text = str(owner or "").strip()
+        if not owner_text:
+            return None
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            now = self._now()
+            state = normalize_closeout_state(item["closeout"])
+            pending_uncertainty = item.get("closeout_mutation_uncertainty")
+            mutation_fence = item.get("closeout_mutation_fence")
+            for candidate in (pending_uncertainty, mutation_fence):
+                if not isinstance(candidate, dict):
+                    continue
+                normalized_uncertainty = normalize_closeout_state(
+                    {"mutation_uncertainty": candidate}
+                )["mutation_uncertainty"]
+                if normalized_uncertainty.get("status") == "uncertain":
+                    state["mutation_uncertainty"] = normalized_uncertainty
+            revision = int(state.get("revision") or 0)
+            if expected_revision is not None and revision != int(expected_revision):
+                return None
+            lease = state.get("lease") if isinstance(state.get("lease"), dict) else {}
+            lease_until = float(lease.get("until") or 0)
+            lease_owner = str(lease.get("owner") or "")
+            if lease_until > now and lease_owner and lease_owner != owner_text:
+                return None
+            next_due = float(state.get("next_due_at") or 0)
+            if next_due > now:
+                return None
+            state["lease_generation"] = min(
+                2_147_483_647,
+                int(state.get("lease_generation") or 0) + 1,
+            )
+            state["lease"] = {
+                "owner": owner_text[:160],
+                "until": now + max(1.0, min(3600.0, float(lease_seconds))),
+            }
+            state["revision"] = revision + 1
+            item["closeout"] = state
+            item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
+            item["closeout_last_claimed_at"] = now
+            item["updated_at"] = now
+            self._write(data)
+            result = dict(item)
+            result["closeout"] = state
+            return result
+
+    def renew_closeout_lease(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        lease_seconds: float,
+        expected_revision: int,
+        expected_generation: int,
+    ) -> bool:
+        """Extend an unexpired owned lease without changing logical revision."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        owner_text = str(owner or "").strip()
+        if not owner_text:
+            return False
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return False
+            now = self._now()
+            state = normalize_closeout_state(item["closeout"])
+            if (
+                int(state.get("revision") or 0) != int(expected_revision)
+                or int(state.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
+                return False
+            lease = state.get("lease") if isinstance(state.get("lease"), dict) else {}
+            if (
+                str(lease.get("owner") or "") != owner_text
+                or float(lease.get("until") or 0) <= now
+            ):
+                return False
+            state["lease"] = {
+                "owner": owner_text[:160],
+                "until": now + max(1.0, min(3600.0, float(lease_seconds))),
+            }
+            item["closeout"] = state
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
+    def record_closeout_mutation_start(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        operation: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Durably fence a remote mutation before its subprocess can start."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        raw_context = dict(context) if isinstance(context, Mapping) else {}
+        marker = normalize_closeout_state(
+            {
+                "mutation_uncertainty": {
+                    "status": "uncertain",
+                    "operation": operation,
+                    **raw_context,
+                }
+            }
+        )["mutation_uncertainty"]
+        if marker.get("status") != "uncertain":
+            return False
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return False
+            now = self._now()
+            current = normalize_closeout_state(item["closeout"])
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+                or str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
+                return False
+            marker["at"] = float(marker.get("at") or now)
+            item["closeout_mutation_fence"] = marker
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
+    def record_closeout_mutation_uncertainty(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        uncertainty: dict[str, Any],
+    ) -> bool:
+        """Persist a conservative non-authoritative marker after lease loss."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        marker = normalize_closeout_state(
+            {"mutation_uncertainty": uncertainty}
+        )["mutation_uncertainty"]
+        if marker.get("status") != "uncertain":
+            return False
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return False
+            current = normalize_closeout_state(item["closeout"])
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+                or str(lease.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            item["closeout_mutation_uncertainty"] = marker
+            item["updated_at"] = self._now()
+            self._write(data)
+            return True
+
+    def release_closeout(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        closeout_state: dict[str, Any] | None = None,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> dict[str, Any] | None:
+        """Release an owned lease and optionally persist the reconciliation result."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if not _run_state_matches(item, expected_run_state):
+                return None
+            now = self._now()
+            current = normalize_closeout_state(item["closeout"])
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
+                return None
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
+                return None
+            state = normalize_closeout_state(closeout_state if closeout_state is not None else current)
+            state["lease_generation"] = int(expected_generation)
+            state["lease"] = {"owner": "", "until": None}
+            state["revision"] = int(expected_revision) + 1
+            item["closeout"] = state
+            item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
+            item["closeout_authoritative"] = state["mode"] == "enforce"
+            item["updated_at"] = now
+            self._write(data)
+            return dict(state)
+
+    def finalize_blocked_closeout(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        closeout_state: dict[str, Any],
+        final_response: str,
+        reason: str,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> dict[str, Any] | None:
+        """CAS the leased closeout and blocked delivery record in one write."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if not _run_state_matches(item, expected_run_state):
+                return None
+            now = self._now()
+            current = normalize_closeout_state(item["closeout"])
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
+                return None
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
+                return None
+            state = normalize_closeout_state(closeout_state)
+            state["lease_generation"] = int(expected_generation)
+            state["lease"] = {"owner": "", "until": None}
+            state["revision"] = int(expected_revision) + 1
+            response = str(final_response or "")
+            item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
+            item.update(
+                {
+                    "closeout": state,
+                    "closeout_authoritative": state["mode"] == "enforce",
+                    "status": "blocked",
+                    "updated_at": now,
+                    "agent_done_at": now,
+                    "blocked_at": now,
+                    "blocked_reason": str(reason or "trusted_closeout_repair_required"),
+                    "final_response": response,
+                    "summary_status": "Blocked",
+                    "active_run": None,
+                    "lease_until": None,
+                    "completion_gate": {
+                        "allowed_to_complete": False,
+                        "summary_status": "Blocked",
+                        "terminal_status": "blocked",
+                        "reason": str(reason or "trusted_closeout_repair_required"),
+                    },
+                    "terminal_delivery": {
+                        "source": "trusted_closeout",
+                        "status": "pending",
+                        "revision": 1,
+                        "owner": "",
+                        "lease_until": None,
+                        "attempt_count": 0,
+                        "retry_count": 0,
+                        "send_started_at": None,
+                        "send_confirmed_at": None,
+                        "result_message_id": None,
+                        "confirmed_message_ids": [],
+                        "summary_updated_at": None,
+                    },
+                }
+            )
+            item.pop("claim_pid", None)
+            _record_discord_board_final_response(item)
+            _record_provider_progress(item, "ledger_status_blocked", status="blocked")
+            self._write(data)
+            return dict(item)
+
+    def finalize_successful_closeout(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        expected_generation: int,
+        closeout_state: dict[str, Any],
+        final_response: str,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> dict[str, Any] | None:
+        """Atomically release terminal closeout authority and advance work state."""
+
+        from hermes_cli.trusted_closeout import (
+            closeout_terminal_eligible,
+            normalize_closeout_state,
+        )
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if not _run_state_matches(item, expected_run_state):
+                return None
+            now = self._now()
+            current = normalize_closeout_state(item["closeout"])
+            if (
+                int(current.get("revision") or 0) != int(expected_revision)
+                or int(current.get("lease_generation") or 0)
+                != int(expected_generation)
+            ):
+                return None
+            lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
+            if (
+                str(lease.get("owner") or "") != str(owner or "")
+                or float(lease.get("until") or 0) <= now
+            ):
+                return None
+            state = normalize_closeout_state(closeout_state)
+            state["lease_generation"] = int(expected_generation)
+            state["lease"] = {"owner": "", "until": None}
+            state["revision"] = int(expected_revision) + 1
+            if not closeout_terminal_eligible(state):
+                return None
+
+            item["closeout"] = state
+            item["closeout_authoritative"] = state["mode"] == "enforce"
+            item.pop("closeout_mutation_uncertainty", None)
+            item.pop("closeout_mutation_fence", None)
+            status = str(item.get("status") or "")
+            if status in {"accepted", "claimed", "agent_running"}:
+                item.update(
+                    {
+                        "status": "agent_done",
+                        "updated_at": now,
+                        "agent_done_at": now,
+                        "final_response": str(final_response or ""),
+                        "summary_status": "Complete",
+                        "active_run": None,
+                        "lease_until": None,
+                    }
+                )
+                item.pop("claim_pid", None)
+                gate = classify_delivery_completion(item)
+                item["completion_gate"] = gate
+                item["summary_status"] = str(
+                    gate.get("summary_status") or "Complete"
+                )
+                _record_discord_board_final_response(item)
+                _record_provider_progress(
+                    item,
+                    "ledger_status_agent_done",
+                    status="agent_done",
+                )
+            elif status == "summary_updated":
+                item["status"] = "completed"
+                item["updated_at"] = now
+                _record_provider_progress(
+                    item,
+                    "ledger_status_completed",
+                    status="completed",
+                )
+            else:
+                item["updated_at"] = now
+            self._write(data)
+            return dict(item)
+
+    def claim_terminal_delivery(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        lease_seconds: float = 120.0,
+    ) -> dict[str, Any] | None:
+        """Claim terminal response or summary work without replaying an uncertain send."""
+
+        owner_text = str(owner or "").strip()
+        if not owner_text:
+            return None
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            if not isinstance(item, dict) or not isinstance(delivery, dict):
+                return None
+            now = self._now()
+            status = str(delivery.get("status") or "")
+            if status == "completed" or (
+                status == "uncertain" and delivery.get("summary_updated_at") is not None
+            ):
+                return None
+            if (
+                status in {"delivering", "sending", "uncertain"}
+                and float(delivery.get("lease_until") or 0) > now
+            ):
+                return None
+            next_delivery = dict(delivery)
+            send_was_confirmed = bool(
+                delivery.get("send_confirmed_at")
+                or str(delivery.get("result_message_id") or "").strip()
+                or _bounded_delivery_message_ids(delivery.get("confirmed_message_ids"))
+            )
+            if status == "sending" and not send_was_confirmed:
+                next_delivery.update(
+                    {
+                        "status": "uncertain",
+                        "uncertain_at": now,
+                        "uncertain_reason": "send_attempt_outcome_unknown",
+                        "operator_repair_required": True,
+                    }
+                )
+                item["delivery_outcome"] = "uncertain"
+            elif status != "uncertain":
+                next_delivery["status"] = "delivering"
+            next_delivery.update(
+                {
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "owner": owner_text[:160],
+                    "lease_until": now + max(1.0, min(3600.0, float(lease_seconds))),
+                }
+            )
+            item["terminal_delivery"] = next_delivery
+            item["updated_at"] = now
+            self._write(data)
+            return dict(item)
+
+    def begin_terminal_send_attempt(self, work_id: str, *, owner: str) -> bool:
+        """Persist the ambiguous send window before invoking the platform side effect."""
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            now = self._now()
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "delivering"
+                or str(delivery.get("owner") or "") != str(owner or "")
+                or float(delivery.get("lease_until") or 0) <= now
+                or delivery.get("send_confirmed_at") is not None
+                or bool(str(delivery.get("result_message_id") or "").strip())
+                or bool(_bounded_delivery_message_ids(delivery.get("confirmed_message_ids")))
+            ):
+                return False
+            attempt_count = _positive_int(delivery.get("attempt_count")) + 1
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "sending",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "attempt_count": attempt_count,
+                    "attempt_id": f"send-{attempt_count}",
+                    "send_started_at": now,
+                    "send_confirmed_at": None,
+                }
+            )
+            item["terminal_delivery"] = next_delivery
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
+    def mark_terminal_response_delivered(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+    ) -> bool:
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "sending"
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            now = self._now()
+            next_delivery = dict(delivery)
+            confirmed_ids = _bounded_delivery_message_ids(
+                confirmed_message_ids,
+                primary=result_message_id,
+            )
+            primary_ids = _bounded_delivery_message_ids((result_message_id,))
+            message_id = primary_ids[0] if primary_ids else confirmed_ids[0] if confirmed_ids else ""
+            next_delivery["confirmed_message_ids"] = list(confirmed_ids)
+            item["confirmed_message_ids"] = list(confirmed_ids)
+            if message_id:
+                next_delivery["result_message_id"] = message_id
+                item["result_message_id"] = message_id
+            next_delivery.update(
+                {
+                    "status": "delivering",
+                    "send_confirmed_at": now,
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                }
+            )
+            item["delivery_outcome"] = "delivered"
+            item["terminal_delivery"] = next_delivery
+            item["updated_at"] = now
+            _record_discord_board_final_response(item, result_message_id=message_id or None)
+            self._write(data)
+            return True
+
+    def mark_terminal_delivery_uncertain(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        reason: str = "send_attempt_outcome_unknown",
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+    ) -> bool:
+        """Fail closed after an attempted send whose durable receipt is unavailable."""
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "sending"
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            now = self._now()
+            next_delivery = dict(delivery)
+            confirmed_ids = _bounded_delivery_message_ids(
+                confirmed_message_ids,
+                primary=result_message_id,
+            )
+            if confirmed_ids:
+                next_delivery["confirmed_message_ids"] = list(confirmed_ids)
+                item["confirmed_message_ids"] = list(confirmed_ids)
+                primary_ids = _bounded_delivery_message_ids((result_message_id,))
+                message_id = primary_ids[0] if primary_ids else confirmed_ids[0]
+                next_delivery["result_message_id"] = message_id
+                item["result_message_id"] = message_id
+            next_delivery.update(
+                {
+                    "status": "uncertain",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "uncertain_at": now,
+                    "uncertain_reason": str(reason or "send_attempt_outcome_unknown")[:120],
+                    "operator_repair_required": True,
+                }
+            )
+            item["terminal_delivery"] = next_delivery
+            item["delivery_outcome"] = "uncertain"
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
+    def release_terminal_delivery(self, work_id: str, *, owner: str) -> bool:
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            status = str(delivery.get("status") or "") if isinstance(delivery, dict) else ""
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or status not in {"delivering", "sending", "uncertain"}
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "uncertain" if status == "uncertain" else "pending",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "owner": "",
+                    "lease_until": None,
+                    "retry_count": _positive_int(delivery.get("retry_count")) + 1,
+                }
+            )
+            if status == "sending":
+                next_delivery["send_confirmed_at"] = None
+            item["terminal_delivery"] = next_delivery
+            item["updated_at"] = self._now()
+            self._write(data)
+            return True
+
+    def complete_terminal_delivery(self, work_id: str, *, owner: str) -> bool:
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            status = str(delivery.get("status") or "") if isinstance(delivery, dict) else ""
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or status not in {"delivering", "uncertain"}
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            now = self._now()
+            final_status = "uncertain" if status == "uncertain" else "completed"
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": final_status,
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "owner": "",
+                    "lease_until": None,
+                    "summary_updated_at": now,
+                }
+            )
+            item["terminal_delivery"] = next_delivery
+            item["delivery_outcome"] = final_status
+            item["summary_updated_at"] = now
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
+    def pending_closeouts(
+        self,
+        *,
+        due_at: float | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded due scan, including already-delivered model work."""
+
+        from hermes_cli.trusted_closeout import (
+            SUCCESS_CLOSEOUT_STATUSES,
+            TERMINAL_CLOSEOUT_STATUSES,
+            normalize_closeout_state,
+        )
+
+        now = self._now() if due_at is None else float(due_at)
+        pending: list[dict[str, Any]] = []
+        for item in self._read().get("items", {}).values():
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                continue
+            state = normalize_closeout_state(item["closeout"])
+            active = item.get("closeout_authoritative") is True or (
+                state["mode"] == "shadow" and item.get("closeout_activated_at") is not None
+            )
+            if not active:
+                continue
+            if state["mode"] == "off" or state["status"] in SUCCESS_CLOSEOUT_STATUSES:
+                continue
+            if (
+                state["status"] in TERMINAL_CLOSEOUT_STATUSES
+                and str(item.get("status") or "") in TERMINAL_STATUSES
+            ):
+                continue
+            next_due = float(state.get("next_due_at") or 0)
+            lease = state.get("lease") if isinstance(state.get("lease"), dict) else {}
+            if next_due > now or float(lease.get("until") or 0) > now:
+                continue
+            copy_item = dict(item)
+            copy_item["closeout"] = state
+            pending.append(copy_item)
+        pending.sort(
+            key=lambda item: (
+                float(item.get("closeout_last_claimed_at") or 0),
+                float(item.get("closeout", {}).get("next_due_at") or 0),
+                float(item.get("created_at") or 0),
+                str(item.get("id") or ""),
+            )
+        )
+        return pending[: max(1, min(200, int(limit)))]
+
+    @_locked_ledger_mutation
+    def claim(
+        self,
+        work_id: str,
+        *,
+        session_key: str | None = None,
+        run_generation: int | None = None,
+        owner_pid: int | None = None,
+        process_epoch: str | None = None,
+    ) -> dict[str, Any] | None:
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
@@ -818,27 +1893,72 @@ class GatewayWorkLedger:
         now = self._now()
         item["status"] = "claimed"
         item["updated_at"] = now
-        item["claim_pid"] = os.getpid()
+        generation = _positive_int(run_generation)
+        active_session = str(session_key or item.get("session_key") or "").strip()
+        epoch = str(process_epoch or "").strip()[:160]
+        if generation and active_session:
+            item["active_run"] = {
+                "session_key": active_session,
+                "generation": generation,
+                "owner_pid": _positive_int(owner_pid or os.getpid()),
+                "process_epoch": epoch,
+                "lease_until": now + LEASE_SECONDS,
+            }
+        else:
+            item["active_run"] = None
+        item.pop("claim_pid", None)
         item["lease_until"] = now + LEASE_SECONDS
         _record_provider_progress(item, "ledger_status_claimed", status="claimed")
         self._write(data)
         return dict(item)
 
-    def mark_agent_running(self, work_id: str, *, session_id: str | None = None) -> bool:
+    @_locked_ledger_mutation
+    def mark_agent_running(
+        self,
+        work_id: str,
+        *,
+        session_id: str | None = None,
+        session_key: str | None = None,
+        run_generation: int | None = None,
+        owner_pid: int | None = None,
+        process_epoch: str | None = None,
+    ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
             return False
+        now = self._now()
         item["status"] = "agent_running"
-        item["updated_at"] = self._now()
+        item["updated_at"] = now
+        generation = _positive_int(run_generation)
+        active_session = str(session_key or item.get("session_key") or "").strip()
+        epoch = str(process_epoch or "").strip()[:160]
+        if generation and active_session:
+            item["active_run"] = {
+                "session_key": active_session,
+                "generation": generation,
+                "owner_pid": _positive_int(owner_pid or os.getpid()),
+                "process_epoch": epoch,
+                "lease_until": now + LEASE_SECONDS,
+            }
+        else:
+            item["active_run"] = None
+        item.pop("claim_pid", None)
+        item["lease_until"] = now + LEASE_SECONDS
         for key in (
             "agent_done_at",
+            "blocked_at",
+            "blocked_reason",
             "completion_gate",
+            "confirmed_message_ids",
+            "delivery_outcome",
+            "delivery_uncertain_at",
             "final_response",
             "provider_no_progress",
             "result_message_id",
             "summary_status",
             "summary_updated_at",
+            "terminal_delivery",
             "visual_qa_code_mutation_observed",
             "visual_qa_min_receipt_order",
         ):
@@ -859,6 +1979,7 @@ class GatewayWorkLedger:
         self._write(data)
         return True
 
+    @_locked_ledger_mutation
     def mark_agent_done(
         self,
         work_id: str,
@@ -875,14 +1996,18 @@ class GatewayWorkLedger:
         visual_qa_code_mutation_observed: bool | None = None,
         visual_qa_min_receipt_order: int | None = None,
         already_delivered: bool = False,
+        expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         now = self._now()
         item["status"] = "response_delivered" if already_delivered else "agent_done"
         item["updated_at"] = now
+        item["active_run"] = None
+        item.pop("claim_pid", None)
+        item["lease_until"] = None
         item["agent_done_at"] = now
         item["final_response"] = str(final_response or "")
         if session_id:
@@ -939,27 +2064,175 @@ class GatewayWorkLedger:
         self._write(data)
         return True
 
-    def mark_response_delivered(self, work_id: str, *, result_message_id: str | None = None) -> bool:
+    @_locked_ledger_mutation
+    def mark_response_delivery_started(
+        self,
+        work_id: str,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
+        """Fence one non-idempotent logical send before platform I/O begins."""
+
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
+            return False
+        prior = (
+            item.get("delivery_attempt")
+            if isinstance(item.get("delivery_attempt"), dict)
+            else {}
+        )
+        if (
+            str(prior.get("status") or "") in {"sending", "uncertain"}
+            or str(item.get("delivery_outcome") or "")
+            in {"sending", "delivered", "uncertain"}
+            or str(item.get("status") or "") == "response_delivered"
+        ):
+            return False
+        now = self._now()
+        attempt_count = min(1000, int(prior.get("attempt_count") or 0) + 1)
+        item["delivery_attempt"] = {
+            "status": "sending",
+            "started_at": now,
+            "attempt_count": attempt_count,
+        }
+        item["delivery_outcome"] = "sending"
+        item["updated_at"] = now
+        self._write(data)
+        return True
+
+    @_locked_ledger_mutation
+    def release_response_delivery_attempt(
+        self,
+        work_id: str,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
+        """Clear a definitively side-effect-free send attempt for safe retry."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        attempt = item.get("delivery_attempt") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or not _run_state_matches(item, expected_run_state)
+            or not isinstance(attempt, dict)
+            or str(attempt.get("status") or "") != "sending"
+        ):
+            return False
+        item.pop("delivery_attempt", None)
+        item.pop("delivery_outcome", None)
+        item["updated_at"] = self._now()
+        self._write(data)
+        return True
+
+    @_locked_ledger_mutation
+    def mark_response_delivered(
+        self,
+        work_id: str,
+        *,
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         item["status"] = "response_delivered"
         item["updated_at"] = self._now()
-        if result_message_id:
-            item["result_message_id"] = str(result_message_id)
+        item["delivery_outcome"] = "delivered"
+        item.pop("delivery_attempt", None)
+        item.pop("delivery_uncertain_at", None)
+        confirmed_ids = _bounded_delivery_message_ids(
+            confirmed_message_ids,
+            primary=result_message_id,
+        )
+        if confirmed_ids:
+            item["confirmed_message_ids"] = list(confirmed_ids)
+        primary_ids = _bounded_delivery_message_ids((result_message_id,))
+        message_id = primary_ids[0] if primary_ids else confirmed_ids[0] if confirmed_ids else ""
+        if message_id:
+            item["result_message_id"] = message_id
         _record_discord_board_final_response(
             item,
-            result_message_id=str(result_message_id) if result_message_id else None,
+            result_message_id=message_id or None,
         )
         _record_provider_progress(item, "ledger_status_response_delivered", status="response_delivered")
         self._write(data)
         return True
 
-    def mark_summary_updated(self, work_id: str) -> bool:
+    @_locked_ledger_mutation
+    def mark_response_delivery_uncertain(
+        self,
+        work_id: str,
+        *,
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+        reason: str = "send_attempt_outcome_unknown",
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
+        """Persist an unsafe logical send without allowing automatic replay."""
+
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
+            return False
+        now = self._now()
+        confirmed_ids = _bounded_delivery_message_ids(
+            confirmed_message_ids,
+            primary=result_message_id,
+        )
+        primary_ids = _bounded_delivery_message_ids((result_message_id,))
+        message_id = primary_ids[0] if primary_ids else confirmed_ids[0] if confirmed_ids else ""
+        item.update(
+            {
+                "status": "response_delivered",
+                "updated_at": now,
+                "delivery_outcome": "uncertain",
+                "delivery_uncertain_at": now,
+                "delivery_attempt": {
+                    "status": "uncertain",
+                    "started_at": (
+                        item.get("delivery_attempt", {}).get("started_at")
+                        if isinstance(item.get("delivery_attempt"), dict)
+                        else now
+                    ),
+                    "attempt_count": min(
+                        1000,
+                        int(item.get("delivery_attempt", {}).get("attempt_count") or 1)
+                        if isinstance(item.get("delivery_attempt"), dict)
+                        else 1,
+                    ),
+                },
+                "confirmed_message_ids": list(confirmed_ids),
+                "summary_status": "Blocked",
+                "blocked_reason": str(reason or "send_attempt_outcome_unknown")[:120],
+                "completion_gate": {
+                    "allowed_to_complete": False,
+                    "summary_status": "Blocked",
+                    "terminal_status": "blocked",
+                    "reason": str(reason or "send_attempt_outcome_unknown")[:120],
+                },
+            }
+        )
+        if message_id:
+            item["result_message_id"] = message_id
+        _record_discord_board_final_response(item, result_message_id=message_id or None)
+        _record_provider_progress(item, "ledger_delivery_uncertain", status="response_delivered")
+        self._write(data)
+        return True
+
+    @_locked_ledger_mutation
+    def mark_summary_updated(
+        self,
+        work_id: str,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         item["status"] = "summary_updated"
         item["updated_at"] = self._now()
@@ -968,30 +2241,53 @@ class GatewayWorkLedger:
         self._write(data)
         return True
 
-    def mark_completed(self, work_id: str, *, result_message_id: str | None = None) -> bool:
+    @_locked_ledger_mutation
+    def mark_completed(
+        self,
+        work_id: str,
+        *,
+        result_message_id: str | None = None,
+        confirmed_message_ids: Any = None,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
+        confirmed_ids = _bounded_delivery_message_ids(
+            confirmed_message_ids,
+            primary=result_message_id,
+        )
+        if confirmed_ids:
+            item["confirmed_message_ids"] = list(confirmed_ids)
+            primary_ids = _bounded_delivery_message_ids((result_message_id,))
+            item["result_message_id"] = primary_ids[0] if primary_ids else confirmed_ids[0]
+        if item.get("closeout_authoritative") is True and isinstance(item.get("closeout"), dict):
+            from hermes_cli.trusted_closeout import closeout_terminal_eligible, normalize_closeout_state
+
+            normalized_closeout = normalize_closeout_state(item["closeout"])
+            if normalized_closeout["mode"] == "enforce" and not closeout_terminal_eligible(normalized_closeout):
+                # Enforced structured closeout is authoritative. Preserve the
+                # delivery phase so the watcher can resume without model replay.
+                item["updated_at"] = self._now()
+                self._write(data)
+                return False
         gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else None
         if gate and not gate.get("allowed_to_complete"):
             item["status"] = str(gate.get("terminal_status") or "blocked")
             item["summary_status"] = str(gate.get("summary_status") or "Blocked")
             item["updated_at"] = self._now()
             item["blocked_at"] = item["updated_at"]
-            if result_message_id:
-                item["result_message_id"] = str(result_message_id)
             _record_provider_progress(item, "ledger_status_blocked", status=str(item["status"]))
             self._write(data)
             return True
         item["status"] = "completed"
         item["updated_at"] = self._now()
-        if result_message_id:
-            item["result_message_id"] = str(result_message_id)
         _record_provider_progress(item, "ledger_status_completed", status="completed")
         self._write(data)
         return True
 
+    @_locked_ledger_mutation
     def mark_blocked(self, work_id: str, *, reason: str | None = None) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
@@ -1011,11 +2307,22 @@ class GatewayWorkLedger:
         self._write(data)
         return True
 
+    @_locked_ledger_mutation
     def mark_expired(self, work_id: str) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
             return False
+        terminal_delivery = (
+            item.get("terminal_delivery")
+            if isinstance(item.get("terminal_delivery"), dict)
+            else {}
+        )
+        if item.get("status") == "blocked" and terminal_delivery:
+            delivery_status = str(terminal_delivery.get("status") or "")
+            summary_pending = terminal_delivery.get("summary_updated_at") is None
+            if delivery_status not in {"completed", "uncertain"} or summary_pending:
+                return False
         item["status"] = "expired"
         item["updated_at"] = self._now()
         self._write(data)
@@ -1027,7 +2334,27 @@ class GatewayWorkLedger:
         for item in self._read().get("items", {}).values():
             if not isinstance(item, dict):
                 continue
-            if item.get("status") not in INCOMPLETE_STATUSES:
+            terminal_delivery = (
+                item.get("terminal_delivery")
+                if isinstance(item.get("terminal_delivery"), dict)
+                else {}
+            )
+            delivery_status = str(terminal_delivery.get("status") or "")
+            blocked_delivery_pending = (
+                item.get("status") == "blocked"
+                and bool(terminal_delivery)
+                and (
+                    delivery_status not in {"completed", "uncertain"}
+                    or terminal_delivery.get("summary_updated_at") is None
+                )
+            )
+            if item.get("status") not in INCOMPLETE_STATUSES and not blocked_delivery_pending:
+                continue
+            if blocked_delivery_pending:
+                # A deterministic blocked response and its summary outlive the
+                # original intake/source-message freshness window. They leave
+                # recovery only after a durable completed or uncertain outcome.
+                items.append(dict(item))
                 continue
             if item.get("platform") == "discord" and discord_message_exceeds_age_limit(
                 _discord_source_message_id_for_item(item),
@@ -1042,17 +2369,36 @@ class GatewayWorkLedger:
         return items
 
     @staticmethod
-    def claim_pid_alive(item: dict[str, Any]) -> bool:
-        pid = item.get("claim_pid")
-        try:
-            pid_int = int(pid)
-        except (TypeError, ValueError):
+    def agent_run_active(
+        item: dict[str, Any],
+        *,
+        session_key: str,
+        run_generation: int,
+        process_epoch: str,
+        registry_active: bool,
+    ) -> bool:
+        """Validate one exact live turn against the gateway run registry."""
+
+        if not registry_active:
             return False
-        if pid_int <= 0:
+        active_run = item.get("active_run") if isinstance(item.get("active_run"), dict) else {}
+        persisted_epoch = str(active_run.get("process_epoch") or "").strip()
+        current_epoch = str(process_epoch or "").strip()
+        if (
+            str(active_run.get("session_key") or "") != str(session_key or "")
+            or _positive_int(active_run.get("generation")) != _positive_int(run_generation)
+            or not persisted_epoch
+            or not current_epoch
+            or persisted_epoch != current_epoch
+        ):
+            return False
+        owner_pid = _positive_int(active_run.get("owner_pid"))
+        if owner_pid <= 0:
             return False
         try:
-            os.kill(pid_int, 0)
-            return True
+            from gateway.status import _pid_exists
+
+            return _pid_exists(owner_pid)
         except Exception:
             return False
 

@@ -39,6 +39,7 @@ import signal
 import tempfile
 import threading
 import time
+import uuid
 import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
@@ -76,6 +77,9 @@ _DISCORD_FOREMAN_DEFAULT_MENTION = "<@&1503914570077442058>"
 _DISCORD_WORKER_TASK_THREAD_STATE_KEY = "worker_task_thread"
 _DISCORD_LEGACY_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
 _DISCORD_WORKER_DIRTY_MARKER_POLL_SECS = 0.2
+_TERMINAL_DELIVERY_RETRY_MAX_ATTEMPTS = 3
+_TERMINAL_DELIVERY_RETRY_BASE_SECONDS = 1.0
+_GATEWAY_PROCESS_EPOCH = f"{time.time_ns()}-{uuid.uuid4().hex}"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
@@ -97,13 +101,14 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "focused syntax/unit check plus one rendered visual/browser check of the "
     "changed path. If a staging/verification command fails, immediately inspect "
     "the real repo state and either fix/retry the exact step or report the blocker; "
-    "do not finish with contradictory done/not-verified wording. Include a compact "
-    "phase timing line for action requests (classify, locate, edit, check, visual, "
-    "git/PR/deploy as applicable) when reporting completion or blockers. If code "
+    "do not finish with contradictory done/not-verified wording. If code "
     "work in a git worktree is complete and checks pass, do not treat 'ready for "
     "PR' or 'next step: commit/push/open PR' as a terminal handoff; continue "
     "through the repository's normal PR lifecycle when permitted by the active "
-    "instructions, including loading/using github-pr-workflow if needed. For "
+    "instructions, persisting durable trusted closeout so CI, merge, canonical "
+    "sync, and configured post-merge receipts reconcile outside the agent turn. "
+    "Do not load github-pr-workflow for routine closeout; reserve it for diagnosis "
+    "or recovery when trusted closeout reports a concrete blocker. For "
     "runtime/DAG/Airflow/deploy rollout work, full lifecycle means code merged, "
     "canonical/runtime checkout synced, and live pickup verified; do not hold the "
     "final Discord response open just to wait for a newly scheduled production DAG "
@@ -254,8 +259,7 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
 
     if requirement.get("level") == "none" or config.get("mode") == "off":
         return ""
-    assertions = "; ".join(str(item) for item in requirement.get("assertions") or [])
-    if not assertions:
+    if not requirement.get("assertions"):
         return ""
     mode = str(config.get("mode") or "shadow")
     enforcement = (
@@ -263,12 +267,18 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         if mode == "enforce_explicit"
         else "This is shadow-only reporting and does not block completion."
     )
+    required = ", ".join(
+        f"{item.get('id')}={item.get('kind')}"
+        for item in requirement.get("assertions") or []
+        if isinstance(item, dict) and item.get("id") and item.get("kind")
+    )
     return (
         "[Visual QA: "
-        f"mode={mode}; target={requirement.get('target')}; assertions={assertions}. "
-        "After the relevant code edit, attach one explicit "
-        "visual_qa_receipt: {level, target, assertions, check, status, evidence_ref} "
-        "to a terminal/browser/vision tool call. Generic navigation, screenshots, "
+        f"mode={mode}; the accepted request has an opaque {requirement.get('level')} requirement. "
+        "After the relevant code edit, call the dedicated `visual_qa` tool with "
+        f"one executable assertion for each required ID/kind ({required}). "
+        "Reuse each opaque ID and exact kind; add the transient locator or expectation needed to execute it. "
+        "Do not attach receipt arguments to terminal/browser/vision calls. Generic navigation, screenshots, "
         f"or console success do not count. {enforcement}]"
     )
 
@@ -290,8 +300,8 @@ def _visual_qa_turn_result(
             receipt = sanitize_visual_receipt(raw, requirement=normalized_requirement)
             if receipt is not None:
                 receipts.append(receipt)
-            if len(receipts) >= config["max_receipts_per_turn"]:
-                break
+        receipts.sort(key=lambda item: int(item.get("order") or 0))
+        receipts = receipts[-config["max_receipts_per_turn"] :]
     except Exception:
         pass
 
@@ -1780,6 +1790,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
+    get_confirmed_message_ids,
+    is_logical_send_retry_safe,
     merge_pending_message_event,
 )
 from gateway.restart import (
@@ -2824,6 +2836,18 @@ def _load_gateway_runtime_config() -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
+def _closeout_mapping(value: Any) -> dict[str, Any]:
+    """Normalize untrusted raw closeout YAML sections to an owned mapping."""
+
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _closeout_repository_config(closeout_config: Any, repository: str) -> dict[str, Any]:
+    closeout = _closeout_mapping(closeout_config)
+    repositories = _closeout_mapping(closeout.get("repositories"))
+    return _closeout_mapping(repositories.get(repository))
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -3166,8 +3190,18 @@ class GatewayRunner:
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
         from gateway.work_ledger import GatewayWorkLedger
+        from gateway.trusted_closeout_watcher import TrustedCloseoutWatcher
+
         self.work_ledger = GatewayWorkLedger()
+        closeout_config = _load_gateway_config().get("closeout")
+        self.trusted_closeout_watcher = TrustedCloseoutWatcher(
+            self.work_ledger,
+            config=closeout_config if isinstance(closeout_config, dict) else {},
+            is_agent_active=self._work_item_agent_run_active,
+            on_terminal=self._on_trusted_closeout_terminal,
+        )
         self.delivery_router = DeliveryRouter(self.config)
+        self._process_epoch = _GATEWAY_PROCESS_EPOCH
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -3372,6 +3406,7 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._terminal_delivery_retry_tasks: Dict[str, asyncio.Task] = {}
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -4785,6 +4820,269 @@ class GatewayRunner:
             self.work_ledger = ledger
         return ledger
 
+    def _work_item_agent_run_active(self, item: Dict[str, Any]) -> bool:
+        """Return whether the exact persisted turn still owns a live registry slot."""
+
+        session_key = str(item.get("session_key") or "")
+        active_run = item.get("active_run") if isinstance(item.get("active_run"), dict) else {}
+        try:
+            generation = int(active_run.get("generation") or 0)
+        except (TypeError, ValueError):
+            return False
+        registry_active = bool(session_key and session_key in getattr(self, "_running_agents", {}))
+        if not registry_active or not self._is_session_run_current(session_key, generation):
+            return False
+        return self._ledger().agent_run_active(
+            item,
+            session_key=session_key,
+            run_generation=generation,
+            process_epoch=str(getattr(self, "_process_epoch", "") or ""),
+            registry_active=True,
+        )
+
+    def _persist_action_closeout_workspace(
+        self,
+        event: MessageEvent,
+        *,
+        mutable_path: str,
+        canonical_path: str,
+        config: dict[str, Any],
+        source: str = "direct",
+        mode: str = "off",
+        policy: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Persist resolved mutable/canonical identity before model work starts."""
+
+        work_id = str(getattr(event, "work_item_id", "") or "").strip()
+        root_text = str(mutable_path or "").strip()
+        if not work_id or not root_text:
+            return None
+        root = Path(root_text).expanduser().resolve(strict=False)
+        repository = ""
+        branch = ""
+        try:
+            from hermes_cli.github_remote import github_origin_repo
+
+            repository = str(github_origin_repo(root) or "")
+        except Exception:
+            repository = ""
+        try:
+            import subprocess
+
+            branch_result = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            if branch_result.returncode == 0:
+                branch = str(branch_result.stdout or "").strip()[:240]
+        except Exception:
+            branch = ""
+        closeout_config = _closeout_mapping(config.get("closeout"))
+        repo_config = _closeout_repository_config(closeout_config, repository)
+        base_branch = str(repo_config.get("base_branch") or "main").strip() or "main"
+        ledger = self._ledger()
+        existing_item = ledger.get(work_id) or {}
+        existing_state = existing_item.get("closeout") if isinstance(existing_item.get("closeout"), dict) else {}
+        effective_mode = str(mode or "off").strip().lower()
+        if str(existing_state.get("mode") or "off") != "off" and effective_mode == "off":
+            effective_mode = str(existing_state.get("mode"))
+        state = ledger.attach_closeout_workspace(
+            work_id,
+            workspace_path=str(root),
+            canonical_path=str(canonical_path or ""),
+            repository=repository,
+            branch=branch,
+            base_branch=base_branch,
+            source=source,
+            mode=effective_mode,
+            policy=policy,
+        )
+        # Workspace attachment is not a lifecycle handoff. The watcher is
+        # notified only after a trusted checkpoint atomically activates the
+        # complete closeout state (for example Fable after commit/push/draft PR).
+        return state
+
+    def _activate_direct_closeout_after_checkpoint(
+        self,
+        work_item_id: str,
+        agent_result: Dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Activate configured direct closeout only after a settled verified head."""
+
+        if not work_item_id or not isinstance(agent_result, dict) or agent_result.get("failed"):
+            return None
+        ledger = self._ledger()
+        item = ledger.get(work_item_id)
+        if (
+            not isinstance(item, dict)
+            or item.get("closeout_authoritative") is True
+            or not isinstance(item.get("closeout"), dict)
+        ):
+            return None
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        state = normalize_closeout_state(item["closeout"])
+        if state["mode"] == "off" or state["source"] != "direct":
+            return None
+        runtime_breakdown = (
+            agent_result.get("runtime_breakdown")
+            if isinstance(agent_result.get("runtime_breakdown"), dict)
+            else {}
+        )
+        trusted_evidence: dict[str, Any] | None = None
+        try:
+            from agent.verification_evidence import (
+                evidence_from_runtime_breakdown,
+                latest_evidence_by_surface,
+            )
+
+            latest = latest_evidence_by_surface(
+                evidence_from_runtime_breakdown(runtime_breakdown)
+            )
+            final_mutation_generation = int(runtime_breakdown.get("mutation_generation") or 0)
+            final_mutation_boundary = int(runtime_breakdown.get("mutation_boundary") or 0)
+            for surface in ("verification", "ci"):
+                candidate = latest.get(surface)
+                if not isinstance(candidate, dict) or str(candidate.get("status") or "") != "success":
+                    continue
+                canonical_command = str(candidate.get("canonical_command") or "").strip()
+                scope = str(candidate.get("scope") or "").strip()
+                repository_root = str(candidate.get("repository_root") or "").strip()
+                verified_head_sha = str(candidate.get("verified_head_sha") or "").strip().lower()
+                if (
+                    canonical_command
+                    and scope in {"full", "targeted"}
+                    and repository_root
+                    and "mutation_generation" in runtime_breakdown
+                    and "mutation_boundary" in runtime_breakdown
+                    and "mutation_generation" in candidate
+                    and "mutation_boundary" in candidate
+                    and int(candidate.get("mutation_generation") or 0) == final_mutation_generation
+                    and int(candidate.get("mutation_boundary") or 0) == final_mutation_boundary
+                    and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", verified_head_sha)
+                ):
+                    trusted_evidence = candidate
+                    break
+        except Exception:
+            trusted_evidence = None
+        if trusted_evidence is None:
+            return None
+
+        root_text = str(state["workspace"].get("path") or "").strip()
+        root = Path(root_text).expanduser().resolve(strict=False) if root_text else Path()
+        if not root_text or not root.is_dir():
+            return None
+        evidence_root = Path(
+            str(trusted_evidence.get("repository_root") or "")
+        ).expanduser().resolve(strict=False)
+        try:
+            root.relative_to(evidence_root)
+        except ValueError:
+            return None
+        verified_head_sha = str(trusted_evidence.get("verified_head_sha") or "").lower()
+        try:
+            import subprocess
+
+            toplevel_result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            checked = subprocess.run(
+                ["git", "diff", "--check"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            head_result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            return None
+        current_head_sha = str(head_result.stdout or "").strip().lower()
+        git_toplevel = (
+            Path(str(toplevel_result.stdout or "").strip())
+            .expanduser()
+            .resolve(strict=False)
+        )
+        if (
+            toplevel_result.returncode != 0
+            or evidence_root != git_toplevel
+            or checked.returncode != 0
+            or status.returncode != 0
+            or bool(str(status.stdout or "").strip())
+            or head_result.returncode != 0
+            or current_head_sha != verified_head_sha
+        ):
+            return None
+
+        state["status"] = "pending"
+        state["local_verification"] = {"status": "passed", "head_sha": verified_head_sha}
+        state["pr"]["head_sha"] = verified_head_sha
+        state["ci"]["head_sha"] = verified_head_sha
+        if state["policy"]["require_visual_qa"]:
+            try:
+                from agent.visual_qa import visual_receipt_completion
+
+                completion = visual_receipt_completion(
+                    item.get("visual_qa_requirement"),
+                    agent_result.get("visual_qa", {}).get("receipts")
+                    if isinstance(agent_result.get("visual_qa"), dict)
+                    else [],
+                    min_order=int(
+                        agent_result.get("visual_qa", {}).get("min_receipt_order") or 0
+                    )
+                    if isinstance(agent_result.get("visual_qa"), dict)
+                    else 0,
+                )
+            except Exception:
+                completion = {"status": "missing"}
+            state["visual_qa"] = {
+                "status": "passed" if completion.get("status") == "passed" else "blocked",
+                "head_sha": verified_head_sha,
+            }
+        activated = ledger.activate_closeout(
+            work_item_id,
+            state,
+            expected_revision=int(state.get("revision") or 0),
+        )
+        if activated is None:
+            return None
+        try:
+            from gateway.trusted_closeout_watcher import mark_closeout_dirty
+
+            mark_closeout_dirty(work_item_id)
+        except Exception:
+            pass
+        watcher = getattr(self, "trusted_closeout_watcher", None)
+        if watcher is not None:
+            watcher.notify(work_item_id)
+        return activated
+
     def _accept_discord_work_item(
         self,
         event: MessageEvent,
@@ -5498,6 +5796,27 @@ class GatewayRunner:
             return None
         return entry if self._resume_pending_entry_is_fresh(entry) else None
 
+    def _authoritative_closeout_item_for_session(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Return the durable lifecycle handoff that owns recovery, if any."""
+
+        if not session_key:
+            return None
+        try:
+            from hermes_cli.trusted_closeout import normalize_closeout_state
+
+            for item in self._ledger().incomplete_items():
+                if (
+                    str(item.get("session_key") or "") != session_key
+                    or item.get("closeout_authoritative") is not True
+                    or not isinstance(item.get("closeout"), dict)
+                ):
+                    continue
+                if normalize_closeout_state(item["closeout"])["mode"] == "enforce":
+                    return item
+        except Exception:
+            return None
+        return None
+
     def _discord_resume_work_item_for_session(self, session_key: str) -> Optional[Dict[str, Any]]:
         if not session_key:
             return None
@@ -5705,6 +6024,18 @@ class GatewayRunner:
         for entry in candidates:
             if not self._resume_pending_entry_is_fresh(entry, now=now):
                 continue
+            if self._authoritative_closeout_item_for_session(entry.session_key) is not None:
+                # A completed model/worker turn already handed lifecycle ownership
+                # to trusted closeout. Never replay that turn after restart.
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception:
+                    logger.debug(
+                        "Failed to clear resume marker owned by closeout for %s",
+                        entry.session_key,
+                        exc_info=True,
+                    )
+                continue
 
             source = entry.origin
             adapter = self._adapter_for_source(source)
@@ -5760,11 +6091,67 @@ class GatewayRunner:
             if not work_id:
                 continue
             status = str(item.get("status") or "")
+            terminal_delivery = (
+                item.get("terminal_delivery")
+                if isinstance(item.get("terminal_delivery"), dict)
+                else {}
+            )
+            if status == "blocked" and str(terminal_delivery.get("status") or "") != "completed":
+                task = asyncio.create_task(self._resume_finished_discord_work_item(item))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                scheduled += 1
+                continue
+            closeout_state = item.get("closeout") if isinstance(item.get("closeout"), dict) else None
+            normalized_closeout = None
+            if closeout_state is not None:
+                from hermes_cli.trusted_closeout import TERMINAL_CLOSEOUT_STATUSES, normalize_closeout_state
+
+                normalized_closeout = normalize_closeout_state(closeout_state)
+            closeout_authoritative = (
+                item.get("closeout_authoritative") is True
+                and normalized_closeout is not None
+                and normalized_closeout["mode"] == "enforce"
+            )
+            if (
+                closeout_authoritative
+                and normalized_closeout is not None
+                and status not in {"agent_done", "response_delivered", "summary_updated"}
+            ):
+                if normalized_closeout["status"] in TERMINAL_CLOSEOUT_STATUSES:
+                    if status in {"claimed", "agent_running"} and self._work_item_agent_run_active(item):
+                        # A live turn still owns its own completion/delivery path.
+                        continue
+                    failed_closeout = normalized_closeout["status"] in {"blocked", "repair_required"}
+                    summary = (
+                        "Trusted closeout blocked: a deterministic lifecycle gate requires repair."
+                        if failed_closeout
+                        else (
+                            "Trusted closeout completed: the PR is open and intentionally unmerged under the configured policy."
+                            if normalized_closeout["status"] == "pr_open"
+                            else "Trusted closeout completed: the PR merge and all configured closeout gates passed."
+                        )
+                    )
+                    ledger.mark_agent_done(
+                        work_id,
+                        final_response=summary,
+                        summary_status="Blocked" if failed_closeout else "Complete",
+                        expected_run_state=ledger.run_state_snapshot(item),
+                    )
+                    item = ledger.get(work_id) or item
+                    status = str(item.get("status") or "")
+                else:
+                    watcher = getattr(self, "trusted_closeout_watcher", None)
+                    if watcher is not None:
+                        watcher.notify(work_id)
+                    # Model work already reached a durable lifecycle handoff.
+                    # The closeout watcher, not session replay, owns recovery.
+                    continue
             lease_until = float(item.get("lease_until") or 0)
             if (
                 status in {"claimed", "agent_running"}
                 and lease_until > time.time()
-                and ledger.claim_pid_alive(item)
+                and self._work_item_agent_run_active(item)
             ):
                 continue
             if self._resume_pending_entry_for_session(str(item.get("session_key") or "")):
@@ -5797,12 +6184,79 @@ class GatewayRunner:
             logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
         return scheduled
 
-    async def _resume_finished_discord_work_item(self, item: Dict[str, Any]) -> None:
+    def _schedule_terminal_delivery_retry(self, work_id: str, *, attempt: int) -> bool:
+        """Schedule one bounded, deduplicated retry without invoking a model."""
+
+        if not work_id or attempt > _TERMINAL_DELIVERY_RETRY_MAX_ATTEMPTS:
+            return False
+        if self.__dict__.get("_running") is False:
+            return False
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is not None and shutdown_event.is_set():
+            return False
+        tasks = self.__dict__.setdefault("_terminal_delivery_retry_tasks", {})
+        existing = tasks.get(work_id)
+        current_task = asyncio.current_task()
+        if existing is not None and not existing.done() and existing is not current_task:
+            return False
+
+        async def retry() -> None:
+            delay = min(
+                30.0,
+                _TERMINAL_DELIVERY_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1)),
+            )
+            try:
+                if shutdown_event is None:
+                    await asyncio.sleep(delay)
+                else:
+                    try:
+                        await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+                        return
+                    except TimeoutError:
+                        pass
+                if self.__dict__.get("_running") is False:
+                    return
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return
+                fresh = self._ledger().get(work_id)
+                if not isinstance(fresh, dict):
+                    return
+                delivery = (
+                    fresh.get("terminal_delivery")
+                    if isinstance(fresh.get("terminal_delivery"), dict)
+                    else {}
+                )
+                if (
+                    fresh.get("status") == "blocked"
+                    and str(delivery.get("status") or "") not in {"completed"}
+                ):
+                    await self._resume_finished_discord_work_item(
+                        fresh,
+                        _delivery_retry_attempt=attempt,
+                    )
+            finally:
+                if tasks.get(work_id) is asyncio.current_task():
+                    tasks.pop(work_id, None)
+
+        task = asyncio.create_task(retry())
+        tasks[work_id] = task
+        background_tasks = self.__dict__.setdefault("_background_tasks", set())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return True
+
+    async def _resume_finished_discord_work_item(
+        self,
+        item: Dict[str, Any],
+        *,
+        _delivery_retry_attempt: int = 0,
+    ) -> None:
         """Finish Discord work after the agent result was durably recorded."""
         ledger = self._ledger()
         work_id = str(item.get("id") or "")
         if not work_id:
             return
+        expected_run_state = ledger.run_state_snapshot(item)
         try:
             event = ledger.event_from_item(item)
         except Exception as exc:
@@ -5815,6 +6269,188 @@ class GatewayRunner:
             return
 
         status = str(item.get("status") or "")
+        delivery_attempt = (
+            item.get("delivery_attempt")
+            if isinstance(item.get("delivery_attempt"), dict)
+            else {}
+        )
+        if status == "agent_done" and str(delivery_attempt.get("status") or "") == "sending":
+            persisted = await asyncio.to_thread(
+                ledger.mark_response_delivery_uncertain,
+                work_id,
+                reason="send_attempt_outcome_unknown",
+                expected_run_state=expected_run_state,
+            )
+            if not persisted:
+                return
+            item = ledger.get(work_id) or item
+            status = str(item.get("status") or "")
+            expected_run_state = {
+                **expected_run_state,
+                "status": "response_delivered",
+            }
+        if status == "blocked" and isinstance(item.get("terminal_delivery"), dict):
+            delivery_owner = f"gateway-delivery:{os.getpid()}:{time.time_ns()}"
+            claimed = await asyncio.to_thread(
+                ledger.claim_terminal_delivery,
+                work_id,
+                owner=delivery_owner,
+            )
+            if claimed is None:
+                return
+            item = claimed
+            delivery = item.get("terminal_delivery") if isinstance(item.get("terminal_delivery"), dict) else {}
+            delivery_status = str(delivery.get("status") or "")
+            final_response = str(item.get("final_response") or "")
+            send_confirmed = bool(
+                delivery.get("send_confirmed_at")
+                or str(delivery.get("result_message_id") or "").strip()
+                or delivery.get("confirmed_message_ids")
+            )
+            if final_response and delivery_status != "uncertain" and not send_confirmed:
+                began = await asyncio.to_thread(
+                    ledger.begin_terminal_send_attempt,
+                    work_id,
+                    owner=delivery_owner,
+                )
+                if not began:
+                    return
+                metadata = {"notify": True}
+                try:
+                    from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
+
+                    metadata = _thread_metadata_for_source(
+                        event.source,
+                        _reply_anchor_for_event(event),
+                    ) or {}
+                    metadata = dict(metadata)
+                    metadata["notify"] = True
+                    reply_to = _reply_anchor_for_event(event)
+                except Exception:
+                    reply_to = item.get("reply_to_message_id") or item.get("message_id")
+                try:
+                    result = await adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=final_response,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                except Exception:
+                    # Once the side effect was attempted, an exception is
+                    # ambiguous. Surface uncertainty rather than risking an
+                    # automatic duplicate blocked response.
+                    uncertain = await asyncio.to_thread(
+                        ledger.mark_terminal_delivery_uncertain,
+                        work_id,
+                        owner=delivery_owner,
+                    )
+                    if not uncertain:
+                        return
+                    item = ledger.get(work_id) or item
+                    delivery_status = "uncertain"
+                else:
+                    if not getattr(result, "success", False):
+                        error_text = str(getattr(result, "error", "") or "")
+                        timeout_check = getattr(adapter, "_is_timeout_error", None)
+                        timed_out = bool(
+                            callable(timeout_check) and timeout_check(error_text)
+                        )
+                        confirmed_ids = get_confirmed_message_ids(result)
+                        unsafe_failure = bool(
+                            confirmed_ids
+                            or not is_logical_send_retry_safe(result)
+                            or timed_out
+                        )
+                        if unsafe_failure:
+                            reason = (
+                                "partial_send_confirmed"
+                                if confirmed_ids
+                                else "send_timeout_outcome_unknown"
+                                if timed_out
+                                else "send_attempt_outcome_unknown"
+                            )
+                            uncertain = await asyncio.to_thread(
+                                ledger.mark_terminal_delivery_uncertain,
+                                work_id,
+                                owner=delivery_owner,
+                                reason=reason,
+                                result_message_id=(
+                                    str(getattr(result, "message_id", "") or "") or None
+                                ),
+                                confirmed_message_ids=confirmed_ids,
+                            )
+                            if not uncertain:
+                                return
+                            item = ledger.get(work_id) or item
+                            delivery_status = "uncertain"
+                        else:
+                            await asyncio.to_thread(
+                                ledger.release_terminal_delivery,
+                                work_id,
+                                owner=delivery_owner,
+                            )
+                            self._schedule_terminal_delivery_retry(
+                                work_id,
+                                attempt=_delivery_retry_attempt + 1,
+                            )
+                            return
+                    else:
+                        try:
+                            persisted = await asyncio.to_thread(
+                                ledger.mark_terminal_response_delivered,
+                                work_id,
+                                owner=delivery_owner,
+                                result_message_id=(
+                                    str(getattr(result, "message_id", "") or "") or None
+                                ),
+                                confirmed_message_ids=get_confirmed_message_ids(result),
+                            )
+                        except Exception:
+                            # Crash-window injection and real persistence failures
+                            # intentionally leave the durable `sending` attempt for
+                            # expiry recovery to convert to `uncertain`.
+                            logger.warning(
+                                "Terminal response sent but receipt persistence failed for %s",
+                                work_id,
+                            )
+                            return
+                        if not persisted:
+                            return
+            try:
+                summary_ok = await self._update_discord_summaries(
+                    source=event.source,
+                    feature_summary=item.get("feature_summary"),
+                    project_summary=item.get("project_summary"),
+                    final_response=final_response,
+                    status=str(item.get("summary_status") or "Blocked"),
+                    session_id=item.get("session_id"),
+                    title=item.get("title"),
+                    runtime_breakdown=(
+                        item.get("runtime_breakdown")
+                        if isinstance(item.get("runtime_breakdown"), dict)
+                        else None
+                    ),
+                )
+            except Exception:
+                summary_ok = False
+            if summary_ok:
+                await asyncio.to_thread(
+                    ledger.complete_terminal_delivery,
+                    work_id,
+                    owner=delivery_owner,
+                )
+            else:
+                await asyncio.to_thread(
+                    ledger.release_terminal_delivery,
+                    work_id,
+                    owner=delivery_owner,
+                )
+                self._schedule_terminal_delivery_retry(
+                    work_id,
+                    attempt=_delivery_retry_attempt + 1,
+                )
+            return
+
         if status == "agent_done":
             final_response = str(item.get("final_response") or "")
             if not final_response:
@@ -5836,13 +6472,34 @@ class GatewayRunner:
                         reply_to = _reply_anchor_for_event(event)
                     except Exception:
                         reply_to = item.get("reply_to_message_id") or item.get("message_id")
+                    began = await asyncio.to_thread(
+                        ledger.mark_response_delivery_started,
+                        work_id,
+                        expected_run_state=expected_run_state,
+                    )
+                    if not began:
+                        return
                     result = await adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=final_response,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                except asyncio.CancelledError:
+                    await asyncio.to_thread(
+                        ledger.mark_response_delivery_uncertain,
+                        work_id,
+                        reason="send_attempt_outcome_unknown",
+                        expected_run_state=expected_run_state,
+                    )
+                    raise
                 except Exception as exc:
+                    await asyncio.to_thread(
+                        ledger.mark_response_delivery_uncertain,
+                        work_id,
+                        reason="send_attempt_outcome_unknown",
+                        expected_run_state=expected_run_state,
+                    )
                     logger.warning("Failed to deliver finished Discord work item %s: %s", work_id, exc)
                     return
                 if not getattr(result, "success", False):
@@ -5851,11 +6508,55 @@ class GatewayRunner:
                         work_id,
                         getattr(result, "error", None),
                     )
-                    return
-                ledger.mark_response_delivered(
+                    error_text = str(getattr(result, "error", "") or "")
+                    timeout_check = getattr(adapter, "_is_timeout_error", None)
+                    timed_out = bool(callable(timeout_check) and timeout_check(error_text))
+                    confirmed_ids = get_confirmed_message_ids(result)
+                    if not (
+                        confirmed_ids
+                        or not is_logical_send_retry_safe(result)
+                        or timed_out
+                    ):
+                        await asyncio.to_thread(
+                            ledger.release_response_delivery_attempt,
+                            work_id,
+                            expected_run_state=expected_run_state,
+                        )
+                        return
+                    reason = (
+                        "partial_send_confirmed"
+                        if confirmed_ids
+                        else "send_timeout_outcome_unknown"
+                        if timed_out
+                        else "send_attempt_outcome_unknown"
+                    )
+                    if not ledger.mark_response_delivery_uncertain(
+                        work_id,
+                        result_message_id=(
+                            str(getattr(result, "message_id", "") or "") or None
+                        ),
+                        confirmed_message_ids=confirmed_ids,
+                        reason=reason,
+                        expected_run_state=expected_run_state,
+                    ):
+                        return
+                    item = ledger.get(work_id) or item
+                    expected_run_state = {
+                        **expected_run_state,
+                        "status": "response_delivered",
+                    }
+                elif ledger.mark_response_delivered(
                     work_id,
                     result_message_id=str(getattr(result, "message_id", "") or "") or None,
-                )
+                    confirmed_message_ids=get_confirmed_message_ids(result),
+                    expected_run_state=expected_run_state,
+                ):
+                    expected_run_state = {
+                        **expected_run_state,
+                        "status": "response_delivered",
+                    }
+                else:
+                    return
 
         summary_ok = await self._update_discord_summaries(
             source=event.source,
@@ -5869,12 +6570,23 @@ class GatewayRunner:
         )
         if summary_ok:
             if item.get("feature_summary") or item.get("project_summary"):
-                ledger.mark_summary_updated(work_id)
+                if not ledger.mark_summary_updated(
+                    work_id,
+                    expected_run_state=expected_run_state,
+                ):
+                    return
+                expected_run_state = {
+                    **expected_run_state,
+                    "status": "summary_updated",
+                }
             gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
             if gate and not gate.get("allowed_to_complete"):
                 ledger.mark_blocked(work_id, reason=str(gate.get("reason") or "completion_gate"))
             else:
-                ledger.mark_completed(work_id)
+                ledger.mark_completed(
+                    work_id,
+                    expected_run_state=expected_run_state,
+                )
 
     async def start(self) -> bool:
         """
@@ -6384,12 +7096,19 @@ class GatewayRunner:
                 skip_targets=skip_home_targets,
             )
 
-        # Automatically continue fresh sessions that were interrupted by the
-        # previous gateway restart/shutdown.  The resume_pending flag is cleared
-        # by the normal successful-turn path, so a failed auto-resume remains
-        # visible for manual recovery on the next user message.
-        self._schedule_resume_pending_sessions()
+        # Establish durable closeout ownership before considering model replay.
+        # This prevents a restart marker from replaying a turn that already
+        # completed its trusted lifecycle handoff.
+        closeout_watcher = getattr(self, "trusted_closeout_watcher", None)
+        if closeout_watcher is not None:
+            if self._ledger().pending_closeouts():
+                closeout_watcher.notify()
+            asyncio.create_task(self._trusted_closeout_watcher())
         self._schedule_incomplete_discord_work_items()
+
+        # Automatically continue only genuinely interrupted model work. The
+        # helper excludes sessions now owned by authoritative closeout.
+        self._schedule_resume_pending_sessions()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -6444,8 +7163,32 @@ class GatewayRunner:
         asyncio.create_task(self._async_delegation_watcher())
 
         logger.info("Press Ctrl+C to stop")
-        
+
         return True
+
+    async def _on_trusted_closeout_terminal(self, item: Dict[str, Any]) -> None:
+        """Deliver deterministic terminal closeout state through existing paths."""
+
+        if str(item.get("status") or "") in {
+            "agent_done",
+            "response_delivered",
+            "summary_updated",
+            "blocked",
+        }:
+            await self._resume_finished_discord_work_item(item)
+
+    async def _trusted_closeout_watcher(self) -> None:
+        """Resume persisted lifecycle closeout without replaying model work."""
+
+        watcher = getattr(self, "trusted_closeout_watcher", None)
+        if watcher is None:
+            return
+        try:
+            await watcher.run_forever(self._shutdown_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Trusted closeout watcher failed")
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
@@ -9927,6 +10670,9 @@ class GatewayRunner:
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+            retry_tasks = getattr(self, "_terminal_delivery_retry_tasks", None)
+            if isinstance(retry_tasks, dict):
+                retry_tasks.clear()
 
             self.adapters.clear()
             if hasattr(self, '_profile_adapters'):
@@ -11901,6 +12647,17 @@ class GatewayRunner:
         self._running_agents_ts[_quick_key] = time.time()
         self._refresh_active_agent_runtime_status()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _work_item_id = str(getattr(event, "work_item_id", "") or "")
+        if _work_item_id and getattr(source, "platform", None) == Platform.DISCORD:
+            try:
+                self._ledger().claim(
+                    _work_item_id,
+                    session_key=_quick_key,
+                    run_generation=_run_generation,
+                    process_epoch=self._process_epoch,
+                )
+            except Exception:
+                logger.debug("Discord work ledger run-generation claim failed", exc_info=True)
 
         try:
             _flow_dispatch_start_ts = time.time()
@@ -12475,6 +13232,50 @@ class GatewayRunner:
                 "was not used as the agent working directory."
             )
         if action_worktree_cwd:
+            closeout_cfg = _pcfg.get("closeout") if isinstance(_pcfg.get("closeout"), dict) else {}
+            closeout_surfaces = (
+                closeout_cfg.get("surfaces")
+                if isinstance(closeout_cfg.get("surfaces"), dict)
+                else {}
+            )
+            direct_mode = (
+                str(closeout_cfg.get("mode") or "shadow").strip().lower()
+                if not _fable_implementation_turn and closeout_surfaces.get("direct") is not False
+                else "off"
+            )
+            visual_requirement = getattr(event, "visual_qa_requirement", None)
+            feature_summary = getattr(event, "feature_summary", None)
+            direct_request = (
+                str(feature_summary.get("initial_request") or "").strip()
+                if isinstance(feature_summary, dict)
+                else ""
+            ) or str(getattr(event, "text", "") or "").strip()
+            from hermes_cli.discord_worker_boards import pr_policy_for_request
+
+            pr_lifecycle_policy = pr_policy_for_request(direct_request)
+            direct_policy = {
+                "merge": pr_lifecycle_policy["merge_policy"],
+                "pr_open": pr_lifecycle_policy["pr_open_policy"],
+                "early_draft_pr": closeout_cfg.get("early_draft_pr") is True,
+                "require_local_verification": True,
+                "require_review": False,
+                "require_visual_qa": bool(
+                    isinstance(visual_requirement, dict)
+                    and visual_requirement.get("level") in {"surface", "artifact"}
+                ),
+                "post_merge_requirements": _closeout_mapping(
+                    closeout_cfg.get("post_merge_requirements")
+                ),
+            }
+            self._persist_action_closeout_workspace(
+                event,
+                mutable_path=action_worktree_cwd,
+                canonical_path=str(source.project_path or ""),
+                config=_pcfg,
+                source="fable" if _fable_implementation_turn else "direct",
+                mode=direct_mode,
+                policy=direct_policy,
+            )
             # The Discord mapping remains canonical in its DB/adapter state,
             # but this turn's injected project context must name the worktree.
             # Otherwise the system prompt explicitly tells lower-tier models to
@@ -13028,11 +13829,22 @@ class GatewayRunner:
 
             # Run the agent
             work_item_id = self._discord_work_item_id_for_event(event, session_key)
+            work_item_expected_run_state = None
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     self._ledger().mark_agent_running(
                         str(work_item_id),
                         session_id=session_entry.session_id,
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        process_epoch=self._process_epoch,
+                    )
+                    work_item_expected_run_state = self._ledger().capture_run_state(
+                        str(work_item_id),
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        owner_pid=os.getpid(),
+                        process_epoch=self._process_epoch,
                     )
                     try:
                         from agent.provider_progress import record_provider_progress_signal
@@ -13073,6 +13885,7 @@ class GatewayRunner:
                 visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
                 visual_qa_config=getattr(event, "visual_qa_config", None),
                 completed_worker_run=getattr(event, "completed_worker_run", None),
+                origin_work_item_id=str(work_item_id or ""),
             )
 
             _pending_background_workers = self._session_has_pending_background_workers(
@@ -13264,13 +14077,18 @@ class GatewayRunner:
                 and not _pending_background_workers
             ):
                 try:
+                    await asyncio.to_thread(
+                        self._activate_direct_closeout_after_checkpoint,
+                        str(work_item_id),
+                        agent_result,
+                    )
                     title = None
                     if session_entry.session_id and self._session_db and not getattr(event, "feature_summary", None):
                         try:
                             title = self._session_db.get_session_title(session_entry.session_id)
                         except Exception:
                             title = None
-                    self._ledger().mark_agent_done(
+                    agent_done = self._ledger().mark_agent_done(
                         str(work_item_id),
                         final_response=response,
                         session_id=session_entry.session_id,
@@ -13297,19 +14115,39 @@ class GatewayRunner:
                         ),
                         already_delivered=bool(agent_result.get("already_sent"))
                         and not agent_result.get("failed"),
+                        expected_run_state=work_item_expected_run_state,
                     )
-                    try:
-                        from agent.provider_progress import record_provider_progress_signal
-
-                        record_provider_progress_signal(
-                            session_key,
-                            "gateway_ledger_agent_done",
-                            phase="work_ledger",
-                            source="gateway",
-                            metadata={"work_id": str(work_item_id)},
+                    if agent_done:
+                        event.work_item_run_state = self._ledger().run_state_snapshot(
+                            {
+                                "status": (
+                                    "response_delivered"
+                                    if bool(agent_result.get("already_sent"))
+                                    and not agent_result.get("failed")
+                                    else "agent_done"
+                                ),
+                                "active_run": None,
+                            }
                         )
-                    except Exception:
-                        pass
+                    else:
+                        logger.info(
+                            "Suppressing stale Discord response after agent_done CAS failed for %s",
+                            work_item_id,
+                        )
+                        response = None
+                    if agent_done:
+                        try:
+                            from agent.provider_progress import record_provider_progress_signal
+
+                            record_provider_progress_signal(
+                                session_key,
+                                "gateway_ledger_agent_done",
+                                phase="work_ledger",
+                                source="gateway",
+                                metadata={"work_id": str(work_item_id)},
+                            )
+                        except Exception:
+                            pass
                 except Exception as exc:
                     logger.debug("Discord work ledger agent_done update failed: %s", exc)
 
@@ -13559,9 +14397,24 @@ class GatewayRunner:
                     and not _pending_background_workers
                 ):
                     try:
+                        expected_run_state = getattr(event, "work_item_run_state", None)
                         if turn_feature_summary or getattr(event, "project_summary", None):
-                            self._ledger().mark_summary_updated(str(work_item_id))
-                        self._ledger().mark_completed(str(work_item_id))
+                            if self._ledger().mark_summary_updated(str(work_item_id)) and isinstance(
+                                expected_run_state,
+                                dict,
+                            ):
+                                expected_run_state = {
+                                    **expected_run_state,
+                                    "status": "summary_updated",
+                                }
+                                event.work_item_run_state = expected_run_state
+                        completion_kwargs = {}
+                        if isinstance(expected_run_state, dict):
+                            completion_kwargs["expected_run_state"] = expected_run_state
+                        self._ledger().mark_completed(
+                            str(work_item_id),
+                            **completion_kwargs,
+                        )
                     except Exception as exc:
                         logger.debug("Discord work ledger summary completion update failed: %s", exc)
             else:
@@ -16238,9 +17091,24 @@ class GatewayRunner:
             )
             if summary_ok and work_item_id and not pending_background:
                 try:
+                    expected_run_state = getattr(event, "work_item_run_state", None)
                     if feature_summary or project_summary:
-                        self._ledger().mark_summary_updated(str(work_item_id))
-                    self._ledger().mark_completed(str(work_item_id))
+                        if self._ledger().mark_summary_updated(str(work_item_id)) and isinstance(
+                            expected_run_state,
+                            dict,
+                        ):
+                            expected_run_state = {
+                                **expected_run_state,
+                                "status": "summary_updated",
+                            }
+                            event.work_item_run_state = expected_run_state
+                    completion_kwargs = {}
+                    if isinstance(expected_run_state, dict):
+                        completion_kwargs["expected_run_state"] = expected_run_state
+                    self._ledger().mark_completed(
+                        str(work_item_id),
+                        **completion_kwargs,
+                    )
                 except Exception as exc:
                     logger.debug("Discord work ledger summary completion update failed: %s", exc)
             return summary_ok
@@ -18917,6 +19785,30 @@ class GatewayRunner:
                     f"in a mutable Git worktree. {session_cwd_error}"
                 )
             if action_worktree_cwd:
+                closeout_config = cfg.get("closeout") if isinstance(cfg.get("closeout"), dict) else {}
+                lifecycle = fable_git_lifecycle_mode(cfg)
+                # Persist identity now, but activation remains the coding
+                # worker's responsibility after trusted commit/push/PR handoff.
+                closeout_mode = "off"
+                requirements = closeout_config.get("post_merge_requirements")
+                closeout_policy = {
+                    "merge": "auto" if lifecycle == "merge" else "never",
+                    "pr_open": "after_review_approval",
+                    "early_draft_pr": True,
+                    "require_local_verification": True,
+                    "require_review": False,
+                    "require_visual_qa": False,
+                    "post_merge_requirements": _closeout_mapping(requirements),
+                }
+                self._persist_action_closeout_workspace(
+                    event,
+                    mutable_path=action_worktree_cwd,
+                    canonical_path=str(event.source.project_path or ""),
+                    config=cfg,
+                    source="fable",
+                    mode=closeout_mode,
+                    policy=closeout_policy,
+                )
                 source = dataclasses.replace(event.source, project_path=action_worktree_cwd)
                 try:
                     event.source = source
@@ -20381,6 +21273,8 @@ class GatewayRunner:
         synth_event.background_completion_id = str(
             evt.get("delegation_id") or ""
         )
+        origin_work_item_id = str(evt.get("origin_work_item_id") or "").strip()
+        synth_event.work_item_id = origin_work_item_id or None
         synth_event.completed_worker_run = (
             dict(evt.get("worker_run") or {})
             if evt.get("kind") == "coding_worker"
@@ -20390,7 +21284,7 @@ class GatewayRunner:
             self._hydrate_discord_continuation_event_from_work_item(
                 synth_event,
                 str(evt.get("session_key") or ""),
-                allow_session_fallback=True,
+                allow_session_fallback=not bool(origin_work_item_id),
             )
         await adapter.handle_message(synth_event)
         return True
@@ -20418,10 +21312,12 @@ class GatewayRunner:
             internal=True,
         )
         event.background_completion_id = delegation_id
+        origin_work_item_id = str(evt.get("origin_work_item_id") or "").strip()
+        event.work_item_id = origin_work_item_id or None
         self._hydrate_discord_continuation_event_from_work_item(
             event,
             str(evt.get("session_key") or ""),
-            allow_session_fallback=True,
+            allow_session_fallback=not bool(origin_work_item_id),
         )
         try:
             from gateway.platforms.base import ProcessingOutcome
@@ -20470,8 +21366,31 @@ class GatewayRunner:
             )
             if summary_ok and work_item_id and not pending_background:
                 try:
-                    self._ledger().mark_summary_updated(str(work_item_id))
-                    self._ledger().mark_completed(str(work_item_id))
+                    ledger = self._ledger()
+                    snapshot_fn = getattr(ledger, "run_state_snapshot", None)
+                    get_fn = getattr(ledger, "get", None)
+                    if callable(snapshot_fn) and callable(get_fn):
+                        stored = get_fn(str(work_item_id)) or {}
+                        expected_run_state = snapshot_fn(stored)
+                        if (
+                            expected_run_state["active_run"] is not None
+                            or expected_run_state["status"] in {"claimed", "agent_running"}
+                        ):
+                            return
+                        if ledger.mark_summary_updated(str(work_item_id)):
+                            expected_run_state = {
+                                **expected_run_state,
+                                "status": "summary_updated",
+                            }
+                        ledger.mark_completed(
+                            str(work_item_id),
+                            expected_run_state=expected_run_state,
+                        )
+                    else:
+                        # Preserve lightweight legacy/test ledger adapters that
+                        # do not implement the durable run-state CAS surface.
+                        ledger.mark_summary_updated(str(work_item_id))
+                        ledger.mark_completed(str(work_item_id))
                 except Exception:
                     logger.debug(
                         "Suppressed async ledger finalization failed",
@@ -21640,6 +22559,7 @@ class GatewayRunner:
         visual_qa_requirement: Optional[Dict[str, Any]] = None,
         visual_qa_config: Optional[Dict[str, Any]] = None,
         completed_worker_run: Optional[Dict[str, Any]] = None,
+        origin_work_item_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -22689,6 +23609,11 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.session_cwd = session_cwd
             agent.terminal_cwd = session_cwd
+            # Durable closeout identifiers are per-turn state. Coding workers
+            # must persist lifecycle handoff before reporting completion.
+            agent._origin_work_item_id = str(origin_work_item_id or "")
+            closeout_watcher = getattr(self, "trusted_closeout_watcher", None)
+            agent._closeout_notify = closeout_watcher.notify if closeout_watcher is not None else None
             if isinstance(completed_worker_run, dict) and completed_worker_run:
                 agent.turn_worker_runs = [dict(completed_worker_run)]
             # Per-turn rather than constructor state: cached agents must not
@@ -24035,6 +24960,7 @@ class GatewayRunner:
                 next_channel_prompt = channel_prompt
                 next_feature_summary = feature_summary
                 next_project_summary = project_summary
+                next_origin_work_item_id = str(origin_work_item_id or "")
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     self._hydrate_discord_continuation_event_from_work_item(
@@ -24059,6 +24985,9 @@ class GatewayRunner:
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_feature_summary = getattr(pending_event, "feature_summary", None)
                     next_project_summary = getattr(pending_event, "project_summary", None)
+                    next_origin_work_item_id = str(
+                        self._discord_work_item_id_for_event(pending_event, session_key) or ""
+                    )
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -24088,6 +25017,7 @@ class GatewayRunner:
                     project_summary=next_project_summary,
                     fable_reasoning_config=fable_reasoning_config,
                     session_cwd_override=session_cwd,
+                    origin_work_item_id=next_origin_work_item_id,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

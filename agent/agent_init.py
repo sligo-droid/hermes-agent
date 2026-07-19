@@ -1033,6 +1033,8 @@ def init_agent(
     agent._session_db = session_db
     agent._parent_session_id = parent_session_id
     agent._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
+    agent._last_flushed_db_snapshot_token = None  # (session_id, transcript_revision)
+    agent._session_db_append_conflict_session_id = None
     agent._session_db_created = False  # DB row deferred to run_conversation()
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,

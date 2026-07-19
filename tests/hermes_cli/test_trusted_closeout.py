@@ -1,0 +1,1944 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import trusted_closeout as closeout
+
+
+OLD_SHA = "1" * 40
+HEAD_SHA = "2" * 40
+MERGE_SHA = "3" * 40
+
+
+def _state(tmp_path: Path, **updates):
+    value = {
+        "id": "closeout-1",
+        "source": "fable",
+        "mode": "enforce",
+        "workspace": {
+            "path": str(tmp_path),
+            "canonical_path": str(tmp_path / "canonical"),
+            "repository": "acme/example",
+            "branch": "feature/test",
+            "base_branch": "main",
+        },
+        "policy": {
+            "merge": "auto",
+            "pr_open": "after_review_approval",
+            "require_local_verification": True,
+            "require_review": True,
+            "require_visual_qa": True,
+            "post_merge_requirements": {},
+        },
+        "local_verification": {"status": "passed", "head_sha": HEAD_SHA},
+        "review": {"status": "passed", "head_sha": HEAD_SHA},
+        "visual_qa": {"status": "passed", "head_sha": HEAD_SHA},
+        "pr": {
+            "url": "https://github.com/acme/example/pull/7",
+            "head_sha": HEAD_SHA,
+        },
+    }
+    for key, item in updates.items():
+        value[key] = item
+    return value
+
+
+def test_closeout_normalization_accepts_only_exact_sha_lengths(tmp_path):
+    for invalid in ("a" * 7, "a" * 41, "a" * 63):
+        state = _state(tmp_path)
+        state["pr"].update(
+            head_sha=invalid,
+            merge_sha=invalid,
+            merge_attempted_head_sha=invalid,
+        )
+        state["ci"] = {"head_sha": invalid}
+        state["post_merge"] = {"target_sha": invalid}
+        normalized = closeout.normalize_closeout_state(state)
+        assert normalized["pr"]["head_sha"] == ""
+        assert normalized["pr"]["merge_sha"] == ""
+        assert normalized["pr"]["merge_attempted_head_sha"] == ""
+        assert normalized["ci"]["head_sha"] == ""
+        assert normalized["post_merge"]["target_sha"] == ""
+
+    exact = _state(tmp_path)
+    exact["pr"].update(
+        head_sha="a" * 64,
+        merge_sha="b" * 64,
+        merge_attempted_head_sha="c" * 64,
+    )
+    exact["ci"] = {"head_sha": "d" * 64}
+    exact["post_merge"] = {"target_sha": "e" * 64}
+    normalized = closeout.normalize_closeout_state(exact)
+    assert normalized["pr"]["head_sha"] == "a" * 64
+    assert normalized["pr"]["merge_sha"] == "b" * 64
+    assert normalized["pr"]["merge_attempted_head_sha"] == "c" * 64
+    assert normalized["ci"]["head_sha"] == "d" * 64
+    assert normalized["post_merge"]["target_sha"] == "e" * 64
+
+
+def _check(
+    workflow,
+    name,
+    *,
+    conclusion="SUCCESS",
+    head_sha=HEAD_SHA,
+    run=1,
+    app="GitHub Actions",
+    workflow_path=None,
+):
+    if workflow_path is None:
+        workflow_path = {
+            "Basic Tests": ".github/workflows/tests.yml",
+            "PR Body Format": ".github/workflows/pr-body-format.yml",
+        }.get(workflow, f".github/workflows/{workflow.lower().replace(' ', '-')}.yml")
+    return {
+        "workflowName": workflow,
+        "name": name,
+        "status": "COMPLETED",
+        "conclusion": conclusion,
+        "headSha": head_sha,
+        "databaseId": run,
+        "completedAt": f"2026-07-17T00:00:{run:02d}Z",
+        "app": {"name": app},
+        "workflow": {"path": workflow_path},
+    }
+
+
+def _pr_payload(
+    *,
+    head_sha=HEAD_SHA,
+    draft=False,
+    state="OPEN",
+    merge_sha="",
+    checks=None,
+    merge_state="CLEAN",
+    mergeable="MERGEABLE",
+    review_decision="APPROVED",
+):
+    return {
+        "number": 7,
+        "url": "https://github.com/acme/example/pull/7",
+        "state": state,
+        "headRefOid": head_sha,
+        "mergedAt": "2026-07-17T00:01:00Z" if state == "MERGED" else None,
+        "mergeCommit": {"oid": merge_sha} if merge_sha else None,
+        "mergeStateStatus": merge_state,
+        "mergeable": mergeable,
+        "isDraft": draft,
+        "reviewDecision": review_decision,
+        "statusCheckRollup": checks
+        if checks is not None
+        else [
+            _check("Basic Tests", "basic"),
+            _check("PR Body Format", "pr body"),
+        ],
+    }
+
+
+def _completed(args, returncode=0, *, stdout="", stderr=""):
+    return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
+
+
+def _raw_required_check(
+    workflow,
+    name,
+    run_id,
+    *,
+    check_id=None,
+    conclusion="SUCCESS",
+    created_at="2026-07-18T00:00:00Z",
+    completed_at="2026-07-18T00:01:00Z",
+):
+    details_url = (
+        f"https://github.com/acme/example/actions/runs/{run_id}/job/"
+        f"{check_id or run_id}1"
+    )
+    return (
+        {
+            "workflowName": workflow,
+            "name": name,
+            "detailsUrl": details_url,
+        },
+        {
+            "id": check_id or int(run_id),
+            "name": name,
+            "head_sha": HEAD_SHA,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "created_at": created_at,
+            "started_at": created_at,
+            "completed_at": completed_at,
+            "details_url": details_url,
+            "app": {"slug": "github-actions"},
+        },
+    )
+
+
+def _unrelated_check_runs(count=100, *, start=1):
+    return [
+        {
+            "id": check_id,
+            "name": f"unrelated-{check_id}",
+            "head_sha": HEAD_SHA,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "created_at": f"2026-07-17T00:{(check_id // 60) % 60:02d}:{check_id % 60:02d}Z",
+            "completed_at": f"2026-07-17T01:{(check_id // 60) % 60:02d}:{check_id % 60:02d}Z",
+            "details_url": (
+                f"https://github.com/acme/example/actions/runs/{check_id}/"
+                f"job/{check_id}1"
+            ),
+            "app": {"slug": "github-actions"},
+        }
+        for check_id in range(start, start + count)
+    ]
+
+
+def _patch_repo_boundary(monkeypatch):
+    monkeypatch.setattr(closeout, "github_remote_preflight_error", lambda *_a, **_k: None)
+    monkeypatch.setattr(closeout, "github_origin_repo", lambda *_a, **_k: "acme/example")
+
+
+def _patch_identity_passthrough(monkeypatch):
+    monkeypatch.setattr(
+        closeout,
+        "enrich_required_check_identities",
+        lambda payload, **_kwargs: dict(payload),
+    )
+
+
+def test_normalize_closeout_state_is_bounded_and_additive(tmp_path):
+    state = closeout.normalize_closeout_state(
+        {
+            "mode": "bogus",
+            "workspace": {"path": str(tmp_path)},
+            "policy": {"merge": "bogus", "post_merge_requirements": {"deployment": True}},
+            "errors": [
+                {
+                    "code": "bad",
+                    "message": "token=secret https://protected.invalid/page " + ("x" * 1000),
+                }
+            ]
+            * 20,
+            "unknown": "discarded",
+        }
+    )
+
+    assert state["schema_version"] == 1
+    assert state["mode"] == "off"
+    assert state["policy"]["merge"] == "auto"
+    assert state["policy"]["post_merge_requirements"]["deployment"] is True
+    assert len(state["errors"]) == 8
+    assert "secret" not in state["errors"][0]["message"]
+    assert "protected.invalid" not in state["errors"][0]["message"]
+    assert "unknown" not in state
+
+
+def test_required_checks_use_current_head_and_newest_logical_rerun():
+    checks = [
+        _check("Basic Tests", "basic", conclusion="FAILURE", run=1),
+        _check("Basic Tests", "basic", conclusion="SUCCESS", run=2),
+        _check("PR Body Format", "pr body", conclusion="SUCCESS", head_sha=OLD_SHA, run=5),
+        _check("PR Body Format", "pr body", conclusion="SUCCESS", head_sha=HEAD_SHA, run=4),
+        _check("Unrelated", "lint", conclusion="FAILURE", run=99),
+    ]
+
+    summary = closeout.summarize_required_checks(checks, head_sha=HEAD_SHA)
+
+    assert summary == {
+        "head_sha": HEAD_SHA,
+        "status": "passed",
+        "total": 2,
+        "failed": [],
+        "wait_state": "complete",
+        "required": [
+            {"workflow": "Basic Tests", "check": "basic"},
+            {"workflow": "PR Body Format", "check": "pr body"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("spoof_first", [False, True])
+@pytest.mark.parametrize(
+    ("workflow", "check", "spoof_kwargs"),
+    [
+        ("Basic Tests", "basic", {"app": "Other CI"}),
+        ("Basic Tests", "basic", {"workflow_path": ".github/workflows/spoof-tests.yml"}),
+        ("PR Body Format", "pr body", {"app": "Other CI"}),
+        (
+            "PR Body Format",
+            "pr body",
+            {"workflow_path": ".github/workflows/spoof-pr-body.yml"},
+        ),
+    ],
+)
+def test_required_checks_do_not_replace_canonical_github_actions_identity(
+    workflow,
+    check,
+    spoof_kwargs,
+    spoof_first,
+):
+    checks = [
+        _check("Basic Tests", "basic", run=1),
+        _check("PR Body Format", "pr body", run=1),
+    ]
+    for item in checks:
+        if item["workflowName"] == workflow:
+            item["conclusion"] = "FAILURE"
+    spoof = _check(workflow, check, conclusion="SUCCESS", run=9, **spoof_kwargs)
+    if spoof_first:
+        checks.insert(0, spoof)
+    else:
+        checks.append(spoof)
+
+    summary = closeout.summarize_required_checks(checks, head_sha=HEAD_SHA)
+
+    assert summary["status"] == "failed"
+    assert summary["total"] == 2
+    assert summary["failed"] == [f"{workflow} / {check}"]
+
+
+def test_required_checks_enrich_actual_gh_rollup_with_trusted_rest_identity(tmp_path):
+    repo = "acme/example"
+
+    def raw_check(workflow, name, run_id, *, conclusion="SUCCESS"):
+        item = _check(workflow, name, conclusion=conclusion)
+        item.pop("app")
+        item.pop("workflow")
+        item["databaseId"] = int(run_id)
+        item["detailsUrl"] = f"https://github.com/{repo}/actions/runs/{run_id}/job/{run_id}1"
+        return item
+
+    checks = [
+        raw_check("Basic Tests", "basic", "333"),
+        raw_check("Basic Tests", "basic", "111", conclusion="FAILURE"),
+        raw_check("PR Body Format", "pr body", "222"),
+    ]
+    check_runs = {
+        "check_runs": [
+            {
+                "id": item["databaseId"],
+                "name": item["name"],
+                "head_sha": HEAD_SHA,
+                "status": item["status"],
+                "conclusion": item["conclusion"],
+                "started_at": item.get("startedAt"),
+                "completed_at": item.get("completedAt"),
+                "details_url": item["detailsUrl"],
+                "app": {"slug": "github-actions"},
+            }
+            for item in checks
+        ]
+    }
+    workflow_runs = {
+        "111": {"path": ".github/workflows/tests.yml", "head_sha": HEAD_SHA},
+        "222": {"path": ".github/workflows/pr-body-format.yml", "head_sha": HEAD_SHA},
+        "333": {"path": ".github/workflows/spoof-tests.yml", "head_sha": HEAD_SHA},
+    }
+
+    def run(args, **_kwargs):
+        endpoint = args[2]
+        if "/check-runs?" in endpoint:
+            return _completed(args, stdout=json.dumps(check_runs))
+        run_id = endpoint.rsplit("/", 1)[-1]
+        return _completed(args, stdout=json.dumps(workflow_runs[run_id]))
+
+    payload = _pr_payload(checks=checks)
+    enriched = closeout.enrich_required_check_identities(
+        payload,
+        repo=repo,
+        root=tmp_path,
+        run=run,
+    )
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+
+    assert summary["status"] == "failed"
+    assert summary["total"] == 2
+    assert summary["failed"] == ["Basic Tests / basic"]
+
+
+def test_required_check_enrichment_rejects_prepopulated_identity_without_rest(tmp_path):
+    payload = _pr_payload()
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        return _completed(args, stdout=json.dumps({"check_runs": []}))
+
+    enriched = closeout.enrich_required_check_identities(
+        payload,
+        repo="acme/example",
+        root=tmp_path,
+        run=run,
+    )
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+
+    assert len(calls) == 1
+    assert summary["status"] == "pending"
+    assert summary["total"] == 0
+
+
+@pytest.mark.parametrize("ordering", ["original", "reversed", "rotated"])
+def test_required_check_enrichment_is_order_independent_under_bounded_budget(
+    tmp_path,
+    ordering,
+):
+    repo = "acme/example"
+
+    def details(run_id, job_id):
+        return f"https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}"
+
+    check_runs = []
+    raw_checks = []
+    for offset in range(9):
+        run_id = str(100 + offset)
+        url = details(run_id, f"{run_id}1")
+        raw_checks.append(
+            {
+                "workflowName": "Basic Tests",
+                "name": "basic",
+                "detailsUrl": url,
+                "app": {"slug": "github-actions"},
+                "workflow": {"path": ".github/workflows/tests.yml"},
+                "headSha": HEAD_SHA,
+            }
+        )
+        check_runs.append(
+            {
+                "id": 100 + offset,
+                "name": "basic",
+                "head_sha": HEAD_SHA,
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "created_at": f"2026-07-17T00:00:{offset:02d}Z",
+                "started_at": f"2026-07-17T00:01:{offset:02d}Z",
+                "completed_at": f"2026-07-19T00:00:{offset:02d}Z",
+                "details_url": url,
+                "app": {"slug": "github-actions"},
+            }
+        )
+    for check_id, conclusion, created_at, completed_at in (
+        (9001, "SUCCESS", "2026-07-18T00:04:00Z", "2026-07-18T00:05:00Z"),
+        (9002, "FAILURE", "2026-07-18T00:09:00Z", "2026-07-18T00:10:00Z"),
+    ):
+        url = details("900", str(check_id))
+        raw_checks.append(
+            {
+                "workflowName": "Basic Tests",
+                "name": "basic",
+                "detailsUrl": url,
+            }
+        )
+        check_runs.append(
+            {
+                "id": check_id,
+                "name": "basic",
+                "head_sha": HEAD_SHA,
+                "status": "COMPLETED",
+                "conclusion": conclusion,
+                "created_at": created_at,
+                "started_at": created_at,
+                "completed_at": completed_at,
+                "details_url": url,
+                "app": {"slug": "github-actions"},
+            }
+        )
+    pr_body_url = details("901", "9011")
+    raw_checks.append(
+        {
+            "workflowName": "PR Body Format",
+            "name": "pr body",
+            "detailsUrl": pr_body_url,
+        }
+    )
+    check_runs.append(
+        {
+            "id": 9011,
+            "name": "pr body",
+            "head_sha": HEAD_SHA,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "created_at": "2026-07-18T00:08:00Z",
+            "started_at": "2026-07-18T00:08:00Z",
+            "completed_at": "2026-07-18T00:09:00Z",
+            "details_url": pr_body_url,
+            "app": {"slug": "github-actions"},
+        }
+    )
+    raw_checks.insert(
+        0,
+        {
+            "workflowName": "Unrelated",
+            "name": "unrelated",
+            "detailsUrl": details("999", "9991"),
+        },
+    )
+    if ordering == "reversed":
+        raw_checks.reverse()
+        check_runs.reverse()
+    elif ordering == "rotated":
+        raw_checks[:] = raw_checks[5:] + raw_checks[:5]
+        check_runs[:] = check_runs[7:] + check_runs[:7]
+
+    queried_runs = []
+
+    def run(args, **_kwargs):
+        endpoint = args[2]
+        if "/check-runs?" in endpoint:
+            return _completed(args, stdout=json.dumps({"check_runs": check_runs}))
+        run_id = endpoint.rsplit("/", 1)[-1]
+        queried_runs.append(run_id)
+        path = {
+            "900": ".github/workflows/tests.yml",
+            "901": ".github/workflows/pr-body-format.yml",
+        }.get(run_id, f".github/workflows/spoof-{run_id}.yml")
+        return _completed(
+            args,
+            stdout=json.dumps({"path": path, "head_sha": HEAD_SHA}),
+        )
+
+    payload = _pr_payload(checks=raw_checks)
+    enriched = closeout.enrich_required_check_identities(
+        payload,
+        repo=repo,
+        root=tmp_path,
+        run=run,
+    )
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+
+    assert summary["status"] == "failed"
+    assert summary["total"] == 2
+    assert summary["failed"] == ["Basic Tests / basic"]
+    assert queried_runs == ["900", "901"]
+    assert "_required_check_identity_error" not in enriched
+
+
+def test_shared_reconciliation_finds_failed_required_checks_on_second_page(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic_old, basic_run_old = _raw_required_check(
+        "Basic Tests",
+        "basic",
+        "900",
+        check_id=9000,
+        created_at="2026-07-18T00:00:00Z",
+        completed_at="2026-07-18T00:01:00Z",
+    )
+    raw_basic, basic_run = _raw_required_check(
+        "Basic Tests",
+        "basic",
+        "900",
+        check_id=9001,
+        conclusion="FAILURE",
+        created_at="2026-07-18T00:02:00Z",
+        completed_at="2026-07-18T00:03:00Z",
+    )
+    raw_body, body_run = _raw_required_check(
+        "PR Body Format",
+        "pr body",
+        "901",
+        check_id=9011,
+    )
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    _pr_payload(checks=[raw_basic_old, raw_basic, raw_body])
+                ),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            page = (
+                [basic_run_old, basic_run, body_run]
+                if "&page=2" in args[2]
+                else _unrelated_check_runs()
+            )
+            return _completed(
+                args,
+                stdout=json.dumps({"total_count": 103, "check_runs": page}),
+            )
+        if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
+            run_id = args[2].rsplit("/", 1)[-1]
+            path = {
+                "900": ".github/workflows/tests.yml",
+                "901": ".github/workflows/pr-body-format.yml",
+            }[run_id]
+            return _completed(
+                args,
+                stdout=json.dumps({"path": path, "head_sha": HEAD_SHA}),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "repair_required"
+    assert transition.state["ci"]["failed"] == ["Basic Tests / basic"]
+    assert transition.state["errors"][-1]["code"] == "required_checks_failed"
+    check_pages = [args[2] for args in calls if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]]
+    assert len(check_pages) == 2
+    assert "&page=2" not in check_pages[0]
+    assert check_pages[1].endswith("&page=2")
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_check_run_page_bound_exhaustion_is_retryable_error(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "900")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "901")
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            page = (
+                _unrelated_check_runs(start=101)
+                if "&page=2" in args[2]
+                else _unrelated_check_runs()
+            )
+            return _completed(
+                args,
+                stdout=json.dumps({"total_count": 201, "check_runs": page}),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.outcome != "waiting_for_ci"
+    error = transition.state["errors"][-1]
+    assert error["code"] == "required_check_identity_failed"
+    assert "pagination budget exhausted" in error["message"]
+    assert len(error["message"]) <= 600
+    assert transition.state["ci"]["status"] == "not_checked"
+    check_pages = [args for args in calls if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]]
+    assert len(check_pages) == 2
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_malformed_check_run_pagination_fails_closed(tmp_path):
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "900")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "901")
+
+    def run(args, **_kwargs):
+        return _completed(
+            args,
+            stdout=json.dumps(
+                {"total_count": 101, "check_runs": _unrelated_check_runs(count=99)}
+            ),
+        )
+
+    enriched = closeout.enrich_required_check_identities(
+        _pr_payload(checks=[raw_basic, raw_body]),
+        repo="acme/example",
+        root=tmp_path,
+        run=run,
+    )
+
+    assert "pagination was inconsistent" in enriched[
+        "_required_check_identity_error"
+    ]
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+    assert summary["status"] == "pending"
+    assert summary["total"] == 0
+
+
+def test_initial_identity_api_failure_is_retryable_with_durable_error(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "101")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "202")
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            return _completed(
+                args,
+                returncode=403,
+                stderr=(
+                    "token=should-not-persist denied at "
+                    "https://api.github.com/protected"
+                ),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.next_due_at == 130
+    assert transition.terminal is False
+    error = transition.state["errors"][-1]
+    assert error["code"] == "required_check_identity_failed"
+    assert "should-not-persist" not in error["message"]
+    assert "api.github.com" not in error["message"]
+    assert len(error["message"]) <= 600
+    assert transition.state["ci"]["status"] == "not_checked"
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_premerge_identity_api_failure_is_retryable_with_durable_error(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, basic_run = _raw_required_check("Basic Tests", "basic", "101")
+    raw_body, body_run = _raw_required_check("PR Body Format", "pr body", "202")
+    check_runs_calls = 0
+    calls = []
+
+    def run(args, **_kwargs):
+        nonlocal check_runs_calls
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            check_runs_calls += 1
+            if check_runs_calls == 2:
+                return _completed(
+                    args,
+                    returncode=403,
+                    stderr="password=should-not-persist identity endpoint denied",
+                )
+            return _completed(
+                args,
+                stdout=json.dumps({"check_runs": [basic_run, body_run]}),
+            )
+        if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
+            run_id = args[2].rsplit("/", 1)[-1]
+            path = {
+                "101": ".github/workflows/tests.yml",
+                "202": ".github/workflows/pr-body-format.yml",
+            }[run_id]
+            return _completed(
+                args,
+                stdout=json.dumps({"path": path, "head_sha": HEAD_SHA}),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.next_due_at == 130
+    error = transition.state["errors"][-1]
+    assert error["code"] == "premerge_required_check_identity_failed"
+    assert "should-not-persist" not in error["message"]
+    assert len(error["message"]) <= 600
+    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_default_command_budget_reaches_merge_after_maximum_identity_lookups(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    raw_checks = []
+    check_runs = []
+    workflow_paths = {}
+    for workflow, name, run_ids, expected_path in (
+        (
+            "Basic Tests",
+            "basic",
+            (1200, 1100, 1000, 900),
+            ".github/workflows/tests.yml",
+        ),
+        (
+            "PR Body Format",
+            "pr body",
+            (2200, 2100, 2000, 1900),
+            ".github/workflows/pr-body-format.yml",
+        ),
+    ):
+        for run_id in run_ids:
+            raw, check_run = _raw_required_check(workflow, name, str(run_id))
+            raw_checks.append(raw)
+            check_runs.append(check_run)
+            workflow_paths[str(run_id)] = (
+                expected_path
+                if run_id == run_ids[-1]
+                else f".github/workflows/spoof-{run_id}.yml"
+            )
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=raw_checks)),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            page = check_runs if "&page=2" in args[2] else _unrelated_check_runs()
+            return _completed(
+                args,
+                stdout=json.dumps({"total_count": 108, "check_runs": page}),
+            )
+        if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
+            run_id = args[2].rsplit("/", 1)[-1]
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    {"path": workflow_paths[run_id], "head_sha": HEAD_SHA}
+                ),
+            )
+        if args[:3] == ["gh", "pr", "merge"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.wake_immediately is True
+    assert transition.state["errors"] == []
+    assert len(calls) == 24
+    merge_calls = [args for args in calls if args[:3] == ["gh", "pr", "merge"]]
+    assert len(merge_calls) == 1
+    assert merge_calls[0][-2:] == ["--match-head-commit", HEAD_SHA]
+
+
+def test_command_budget_exhaustion_is_retryable_error_not_ci_wait(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "101")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "202")
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+        max_commands=2,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.outcome != "waiting_for_ci"
+    assert transition.next_due_at == 130
+    error = transition.state["errors"][-1]
+    assert error["code"] == "required_check_identity_failed"
+    assert "command budget exceeded" in error["message"]
+    assert transition.state["ci"]["status"] == "not_checked"
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_required_checks_classify_all_terminal_failure_conclusions():
+    for conclusion in ("STALE", "STARTUP_FAILURE", "ERROR"):
+        summary = closeout.summarize_required_checks(
+            [
+                _check("Basic Tests", "basic", conclusion=conclusion),
+                _check("PR Body Format", "pr body"),
+            ],
+            head_sha=HEAD_SHA,
+        )
+        assert summary["status"] == "failed"
+        assert summary["wait_state"] == "rerun_required"
+        assert summary["failed"] == ["Basic Tests / basic"]
+
+
+def test_head_change_atomically_invalidates_head_bound_receipts(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["pr"]["head_sha"] = OLD_SHA
+    state["local_verification"] = {"status": "passed", "head_sha": OLD_SHA}
+    state["review"] = {"status": "passed", "head_sha": OLD_SHA}
+    state["visual_qa"] = {"status": "passed", "head_sha": OLD_SHA}
+    state["ci"] = {"status": "passed", "head_sha": OLD_SHA}
+    state["pr"]["ready_at"] = 10
+    state["pr"]["merge_attempted_head_sha"] = OLD_SHA
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "waiting_for_gates"
+    assert transition.next_due_at == 130
+    assert transition.state["pr"]["head_sha"] == HEAD_SHA
+    assert transition.state["ci"]["head_sha"] == HEAD_SHA
+    for key in ("local_verification", "review", "visual_qa"):
+        assert transition.state[key] == {"status": "stale"}
+    assert transition.state["pr"]["ready_at"] is None
+    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
+
+
+def test_failed_current_head_ci_requires_repair_without_polling(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    failed_checks = [
+        _check("Basic Tests", "basic", conclusion="FAILURE"),
+        _check("PR Body Format", "pr body", conclusion="SUCCESS"),
+    ]
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=failed_checks)),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "repair_required"
+    assert transition.terminal is True
+    assert transition.next_due_at is None
+    assert transition.state["status"] == "repair_required"
+    assert transition.state["errors"][-1]["code"] == "required_checks_failed"
+    assert closeout.closeout_terminal_eligible(transition.state) is False
+
+
+def test_shadow_ci_failure_is_diagnostic_only(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    failed_checks = [
+        _check("Basic Tests", "basic", conclusion="FAILURE"),
+        _check("PR Body Format", "pr body"),
+    ]
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(checks=failed_checks)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path, mode="shadow"),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "waiting_for_ci"
+    assert transition.terminal is False
+    assert transition.next_due_at == 130
+    assert transition.state["errors"][-1]["code"] == "required_checks_failed"
+    assert closeout.closeout_terminal_eligible(transition.state) is False
+
+
+def test_shadow_is_read_only_and_pending_is_not_terminal(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path, mode="shadow")
+    state["pr"] = {}
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(args, stdout="null")
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_pending"
+    assert transition.terminal is False
+    assert closeout.closeout_terminal_eligible(transition.state) is False
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+    assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
+
+
+def test_shadow_never_readies_or_merges(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
+        raise AssertionError(args)
+
+    draft = closeout.reconcile_trusted_closeout(
+        _state(tmp_path, mode="shadow"),
+        now=100,
+        run=run,
+    )
+
+    assert draft.outcome == "ready_pending"
+    assert closeout.closeout_terminal_eligible(draft.state) is False
+    assert not any(args[:3] == ["gh", "pr", "ready"] for args in calls)
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+    calls.clear()
+
+    def run_ready(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        raise AssertionError(args)
+
+    merge = closeout.reconcile_trusted_closeout(
+        _state(tmp_path, mode="shadow"),
+        now=101,
+        run=run_ready,
+    )
+
+    assert merge.outcome == "pending"
+    assert closeout.closeout_terminal_eligible(merge.state) is False
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_draft_becomes_ready_only_after_current_head_gates(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
+        if args[:3] == ["gh", "pr", "ready"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "ready_pending"
+    assert transition.next_due_at == 100
+    assert transition.wake_immediately is True
+    assert transition.state["pr"]["is_draft"] is False
+    assert transition.state["pr"]["ready_at"] == 100
+    assert sum(args[:3] == ["gh", "pr", "ready"] for args in calls) == 1
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_merge_is_one_pass_then_exact_sha_sync_on_refresh(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+
+    def run_open(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        if args[:3] == ["gh", "pr", "merge"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    first = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run_open)
+
+    assert first.outcome == "pending"
+    assert first.next_due_at == 100
+    assert first.state["pr"]["merge_attempted_head_sha"] == HEAD_SHA
+    assert first.state["telemetry"]["green_unmerged_since"] == 100
+    merge_calls = [args for args in calls if args[:3] == ["gh", "pr", "merge"]]
+    assert len(merge_calls) == 1
+    assert merge_calls[0][-2:] == ["--match-head-commit", HEAD_SHA]
+    assert sum(args[:3] == ["gh", "pr", "view"] for args in calls) == 2
+
+    sync_record = tmp_path / "canonical-sync-record.json"
+
+    def run_merged(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(state="MERGED", merge_sha=MERGE_SHA)),
+            )
+        raise AssertionError(args)
+
+    def sync(path, branch, sha, *, control):
+        assert control.mutation_allowed()
+        sync_record.write_text(
+            json.dumps([path, branch, sha, os.getpid()]),
+            encoding="utf-8",
+        )
+        return {"state": "synced", "head": sha, "merge_commit": sha}
+
+    second = closeout.reconcile_trusted_closeout(
+        first.state,
+        now=101,
+        run=run_merged,
+        sync_canonical=sync,
+    )
+
+    assert second.outcome == "post_merge_pending"
+    assert second.state["post_merge"]["target_sha"] == MERGE_SHA
+    assert second.state["canonical_sync"] == {"status": "pending"}
+    assert second.state["telemetry"]["green_unmerged_since"] is None
+    assert second.state["telemetry"]["green_unmerged_overdue"] is False
+    assert not sync_record.exists()
+
+    third = closeout.reconcile_trusted_closeout(
+        second.state,
+        now=102,
+        run=run_merged,
+        sync_canonical=sync,
+    )
+
+    assert third.outcome == "post_merge_complete"
+    assert third.terminal is True
+    assert third.state["canonical_sync"] == {
+        "status": "passed",
+        "observed_sha": MERGE_SHA,
+        "checked_at": 102,
+    }
+    path, branch, sha, child_pid = json.loads(
+        sync_record.read_text(encoding="utf-8")
+    )
+    assert (path, branch, sha) == (str(tmp_path / "canonical"), "main", MERGE_SHA)
+    assert child_pid != os.getpid()
+
+
+def test_uncertain_pr_create_rejects_historical_branch_match(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_create",
+        "at": 200.0,
+        "head_sha": HEAD_SHA,
+        "branch": "feature/test",
+        "base_branch": "main",
+        "repository": "acme/example",
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "number": 3,
+                            "url": "https://github.com/acme/example/pull/3",
+                            "state": "OPEN",
+                            "headRefOid": HEAD_SHA,
+                            "headRefName": "feature/test",
+                            "baseRefName": "main",
+                            "headRepository": {
+                                "name": "example",
+                                "nameWithOwner": "acme/example",
+                            },
+                            "headRepositoryOwner": {"login": "acme"},
+                            "createdAt": "1970-01-01T00:01:00Z",
+                        }
+                    ]
+                ),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=300, run=run)
+
+    assert transition.outcome == "pending"
+    assert transition.state["mutation_uncertainty"]["operation"] == "github_pr_create"
+    assert transition.state["errors"][-1]["code"] == (
+        "pr_create_reobservation_identity_mismatch"
+    )
+    assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+    assert not any(args[:2] == ["git", "rev-parse"] for args in calls)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        ("[]", "pr_create_reobservation_empty"),
+        ("{malformed", "pr_create_reobservation_invalid_json"),
+    ],
+)
+def test_uncertain_pr_create_keeps_fence_on_inconclusive_discovery(
+    monkeypatch,
+    tmp_path,
+    payload,
+    expected_code,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_create",
+        "at": 200.0,
+        "head_sha": HEAD_SHA,
+        "branch": "feature/test",
+        "base_branch": "main",
+        "repository": "acme/example",
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(args, stdout=payload)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=300, run=run)
+
+    assert transition.outcome == "pending"
+    assert transition.state["mutation_uncertainty"]["operation"] == (
+        "github_pr_create"
+    )
+    assert transition.state["errors"][-1]["code"] == expected_code
+    assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+
+
+def test_uncertain_pr_create_adopts_fenced_sha_after_local_branch_advances(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["policy"]["merge"] = "manual"
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "github_pr_create",
+        "at": 200.0,
+        "head_sha": HEAD_SHA,
+        "branch": "feature/test",
+        "base_branch": "main",
+        "repository": "acme/example",
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "number": 9,
+                            "url": "https://github.com/acme/example/pull/9",
+                            "state": "OPEN",
+                            "headRefOid": HEAD_SHA,
+                            "headRefName": "feature/test",
+                            "baseRefName": "main",
+                            "headRepository": {
+                                "name": "example",
+                                "nameWithOwner": "acme/example",
+                            },
+                            "headRepositoryOwner": {"login": "acme"},
+                            "createdAt": "1970-01-01T00:03:21Z",
+                        }
+                    ]
+                ),
+            )
+        if args[:3] == ["gh", "pr", "view"]:
+            payload = _pr_payload()
+            payload.update(
+                {
+                    "number": 9,
+                    "url": "https://github.com/acme/example/pull/9",
+                }
+            )
+            return _completed(args, stdout=json.dumps(payload))
+        if args[:2] == ["git", "rev-parse"]:
+            raise AssertionError("fenced create recovery must not read advanced branch")
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=300, run=run)
+
+    assert transition.state["pr"]["number"] == "9"
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
+    assert not any(args[:3] == ["gh", "pr", "create"] for args in calls)
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+
+
+def test_uncertain_push_reobserves_configured_branch_not_checkout_head(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    calls = []
+    state = _state(tmp_path)
+    state["pr"] = {"title": "Test PR"}
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "git_push",
+        "at": 100.0,
+        "head_sha": HEAD_SHA,
+    }
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return _completed(args, stdout="[]")
+        if args[:2] == ["git", "rev-parse"]:
+            assert args == ["git", "rev-parse", "refs/heads/feature/test"]
+            return _completed(args, stdout=HEAD_SHA + "\n")
+        if args[:2] == ["git", "ls-remote"]:
+            return _completed(
+                args,
+                stdout=f"{HEAD_SHA}\trefs/heads/feature/test\n",
+            )
+        if args[:3] == ["gh", "pr", "create"]:
+            return _completed(
+                args,
+                stdout="https://github.com/acme/example/pull/8\n",
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=101, run=run)
+
+    assert transition.outcome == "pr_pending"
+    assert ["git", "rev-parse", "refs/heads/feature/test"] in calls
+    assert ["git", "rev-parse", "HEAD"] not in calls
+    assert not any(args[:2] == ["git", "push"] for args in calls)
+
+
+def test_uncertain_merge_is_reobserved_before_any_duplicate_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    merge_attempts = 0
+
+    def uncertain_run(args, **_kwargs):
+        nonlocal merge_attempts
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        if args[:3] == ["gh", "pr", "merge"]:
+            merge_attempts += 1
+            raise closeout.RemoteMutationUncertain(
+                "github_pr_merge",
+                "command timeout",
+            )
+        raise AssertionError(args)
+
+    first = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=uncertain_run,
+    )
+
+    assert first.outcome == "pending"
+    assert first.state["mutation_uncertainty"] == {
+        "status": "uncertain",
+        "operation": "github_pr_merge",
+        "at": 100,
+        "head_sha": HEAD_SHA,
+    }
+    assert merge_attempts == 1
+
+    def observed_run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
+                ),
+            )
+        if args[:3] == ["gh", "pr", "merge"]:
+            raise AssertionError("merge must not be replayed before re-observation")
+        raise AssertionError(args)
+
+    second = closeout.reconcile_trusted_closeout(
+        first.state,
+        now=101,
+        run=observed_run,
+    )
+
+    assert second.outcome == "post_merge_pending"
+    assert second.state["mutation_uncertainty"] == {"status": "none"}
+    assert second.state["post_merge"]["target_sha"] == MERGE_SHA
+    assert merge_attempts == 1
+
+
+def test_premerge_refresh_accepts_concurrent_external_merge(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    views = iter(
+        [
+            _pr_payload(),
+            _pr_payload(state="MERGED", merge_sha=MERGE_SHA),
+        ]
+    )
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "post_merge_pending"
+    assert transition.terminal is False
+    assert transition.wake_immediately is True
+    assert transition.state["pr"]["state"] == "MERGED"
+    assert transition.state["pr"]["merge_sha"] == MERGE_SHA
+    assert transition.state["post_merge"]["target_sha"] == MERGE_SHA
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_premerge_head_change_invalidates_gates_and_prevents_merge(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    new_sha = "4" * 40
+    views = iter(
+        [
+            _pr_payload(),
+            _pr_payload(head_sha=new_sha),
+        ]
+    )
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "waiting_for_gates"
+    assert transition.state["pr"]["head_sha"] == new_sha
+    for key in ("local_verification", "review", "visual_qa"):
+        assert transition.state[key] == {"status": "stale"}
+    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_outcome"),
+    [
+        ("closed", "blocked"),
+        ("draft", "ready_pending"),
+        ("mergeability", "blocked"),
+        ("review", "blocked"),
+        ("stale_check", "repair_required"),
+        ("startup_failure", "repair_required"),
+    ],
+)
+def test_same_head_premerge_refresh_reapplies_every_gate_and_prevents_merge(
+    monkeypatch,
+    tmp_path,
+    change,
+    expected_outcome,
+):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    second = _pr_payload()
+    if change == "closed":
+        second = _pr_payload(state="CLOSED")
+    elif change == "draft":
+        second = _pr_payload(draft=True)
+    elif change == "mergeability":
+        second = _pr_payload(mergeable="CONFLICTING")
+    elif change == "review":
+        second = _pr_payload(review_decision="CHANGES_REQUESTED")
+    elif change == "stale_check":
+        second = _pr_payload(
+            checks=[
+                _check("Basic Tests", "basic", conclusion="STALE", run=8),
+                _check("PR Body Format", "pr body", run=8),
+            ]
+        )
+    elif change == "startup_failure":
+        second = _pr_payload(
+            checks=[
+                _check("Basic Tests", "basic", conclusion="STARTUP_FAILURE", run=9),
+                _check("PR Body Format", "pr body", run=9),
+            ]
+        )
+    views = iter([_pr_payload(), second])
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(next(views)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == expected_outcome
+    assert transition.state["pr"]["head_sha"] == HEAD_SHA
+    assert transition.state["pr"]["merge_attempted_head_sha"] == ""
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+    premerge_view = [args for args in calls if args[:3] == ["gh", "pr", "view"]][-1]
+    requested = premerge_view[premerge_view.index("--json") + 1]
+    assert "mergeable" in requested
+    assert "reviewDecision" in requested
+    assert "statusCheckRollup" in requested
+
+
+def test_reobserved_adapter_fence_uncertainty_clears_after_exact_proof(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import post_merge_receipts
+
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    observed = tmp_path / "deployment-reobserved"
+
+    def adapter(*, target_sha, reobserve_only, **_kwargs):
+        observed.write_text(str(reobserve_only), encoding="utf-8")
+        return {"status": "passed", "observed_sha": target_sha}
+
+    post_merge_receipts.register_deployment_adapter(
+        "trusted-fenced-reobserve",
+        adapter,
+    )
+    state = _state(tmp_path)
+    state["workspace"]["canonical_path"] = ""
+    state["policy"]["post_merge_requirements"] = {"deployment": True}
+    state["post_merge"] = post_merge_receipts.initialize_post_merge_receipts(
+        state,
+        target_sha=MERGE_SHA,
+    )
+    state["mutation_uncertainty"] = {
+        "status": "uncertain",
+        "operation": "post_merge_deployment",
+        "at": 100,
+        "head_sha": MERGE_SHA,
+    }
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
+                ),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        state,
+        now=101,
+        run=run,
+        post_merge_config={
+            "repositories": {
+                "acme/example": {
+                    "deployment_adapter": "trusted-fenced-reobserve"
+                }
+            }
+        },
+        mutation_started=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("re-observation must not start a new mutation")
+        ),
+    )
+
+    assert observed.exists(), transition
+    assert observed.read_text(encoding="utf-8") == "True"
+    assert transition.state["mutation_uncertainty"] == {"status": "none"}
+    assert transition.state["post_merge"]["deployment"] == {
+        "status": "passed",
+        "checked_at": 101,
+        "observed_sha": MERGE_SHA,
+    }
+
+
+def test_required_post_merge_receipts_return_distinct_pending_outcome(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["policy"]["post_merge_requirements"] = {"ci": True, "deployment": True}
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(state="MERGED", merge_sha=MERGE_SHA)),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        state,
+        now=100,
+        run=run,
+        sync_canonical=lambda *_a: {"state": "synced"},
+    )
+
+    assert transition.outcome == "post_merge_pending"
+    assert transition.next_due_at == 100
+    assert transition.wake_immediately is True
+    assert closeout.closeout_terminal_eligible(transition.state) is False
+
+
+@pytest.mark.parametrize(
+    ("receipt_status", "expected_outcome", "error_code"),
+    [
+        ("failed", "repair_required", "post_merge_receipt_failed"),
+        ("blocked", "blocked", "post_merge_receipt_blocked"),
+    ],
+)
+def test_terminal_required_post_merge_receipt_does_not_poll_forever(
+    monkeypatch,
+    tmp_path,
+    receipt_status,
+    expected_outcome,
+    error_code,
+):
+    from hermes_cli import post_merge_receipts
+
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["policy"]["post_merge_requirements"] = {"deployment": True}
+    state["post_merge"] = post_merge_receipts.initialize_post_merge_receipts(
+        state,
+        target_sha=MERGE_SHA,
+    )
+
+    gathered = dict(state["post_merge"])
+    gathered["deployment"] = {
+        "status": receipt_status,
+        "checked_at": 100,
+        "diagnostic_code": f"deployment_{receipt_status}",
+    }
+    monkeypatch.setattr(
+        post_merge_receipts,
+        "collect_post_merge_receipts",
+        lambda *_args, **_kwargs: gathered,
+    )
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(state="MERGED", merge_sha=MERGE_SHA)),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == expected_outcome
+    assert transition.next_due_at is None
+    assert transition.terminal is True
+    assert transition.state["errors"][-1]["code"] == error_code
+
+
+def test_manual_merge_policy_allows_terminal_open_pr(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["policy"]["merge"] = "manual"
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    assert transition.outcome == "pr_open"
+    assert transition.terminal is True
+    assert transition.state["telemetry"]["green_unmerged_since"] is None
+    assert transition.state["telemetry"]["green_unmerged_overdue"] is False
+    assert closeout.closeout_terminal_eligible(transition.state) is True
+
+
+def test_green_unmerged_telemetry_starts_immediately_and_becomes_overdue(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(merge_state="UNKNOWN")),
+            )
+        raise AssertionError(args)
+
+    first = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+        green_unmerged_overdue_seconds=60,
+    )
+
+    assert first.outcome == "waiting_for_mergeability"
+    assert first.wake_immediately is True
+    assert first.next_due_at == 100
+    assert first.state["telemetry"]["green_unmerged_since"] == 100
+    assert first.state["telemetry"]["green_unmerged_overdue"] is False
+
+    second = closeout.reconcile_trusted_closeout(
+        first.state,
+        now=161,
+        run=run,
+        green_unmerged_overdue_seconds=60,
+    )
+
+    assert second.outcome == "waiting_for_mergeability"
+    assert second.wake_immediately is False
+    assert second.next_due_at == 191
+    assert second.state["telemetry"]["green_unmerged_since"] == 100
+    assert second.state["telemetry"]["green_unmerged_overdue"] is True
+
+
+def test_draft_and_incomplete_gates_suppress_green_unmerged_telemetry(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["telemetry"] = {
+        "green_unmerged_since": 50,
+        "green_unmerged_overdue": True,
+    }
+    state["review"] = {"status": "pending", "head_sha": HEAD_SHA}
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=True)))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        state,
+        now=100,
+        run=run,
+        green_unmerged_overdue_seconds=60,
+    )
+
+    assert transition.outcome == "waiting_for_gates"
+    assert transition.state["telemetry"]["green_unmerged_since"] is None
+    assert transition.state["telemetry"]["green_unmerged_overdue"] is False
+
+
+def test_one_pass_never_sleeps_and_sanitizes_command_errors(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(
+                args,
+                returncode=1,
+                stderr="Authorization: bearer ghp_secret https://github.com/private/page",
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "pending"
+    assert transition.next_due_at == 130
+    error = transition.state["errors"][-1]
+    assert error["code"] == "github_auth_unavailable"
+    assert "ghp_secret" not in error["message"]
+    assert "private/page" not in error["message"]
+
+
+def test_closeout_records_sanitized_git_github_and_transition_spans(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    state = _state(tmp_path)
+    state["policy"]["merge"] = "manual"
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload()))
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+
+    spans = transition.state["telemetry"]["phase_spans"]
+    assert {span["phase"] for span in spans} >= {"closeout", "github"}
+    assert all(str(span.get("work_id") or "").startswith("wrk_") for span in spans)
+    rendered = json.dumps(spans)
+    assert "closeout-1" not in rendered
+    assert "https://" not in rendered
+    assert "--json" not in rendered
+    assert "statusCheckRollup" not in rendered
+    assert transition.state["telemetry"]["last_transition"] == "pr_open"
+
+
+def test_shadow_post_merge_finishes_without_mutating_collectors(monkeypatch, tmp_path):
+    from hermes_cli import post_merge_receipts
+
+    _patch_repo_boundary(monkeypatch)
+    _patch_identity_passthrough(monkeypatch)
+    calls = []
+    post_merge_receipts.register_deployment_adapter(
+        "shadow-forbidden",
+        lambda **_kwargs: calls.append("adapter")
+        or {"status": "passed", "observed_sha": MERGE_SHA},
+    )
+    state = _state(tmp_path, mode="shadow")
+    state["policy"]["post_merge_requirements"] = {
+        "canonical_sync": True,
+        "deployment": True,
+    }
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    _pr_payload(state="MERGED", merge_sha=MERGE_SHA)
+                ),
+            )
+        raise AssertionError(args)
+
+    first = closeout.reconcile_trusted_closeout(state, now=100, run=run)
+    assert first.outcome == "post_merge_pending"
+    second = closeout.reconcile_trusted_closeout(
+        first.state,
+        now=101,
+        run=run,
+        sync_canonical=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("shadow canonical sync")
+        ),
+        post_merge_config={
+            "repositories": {
+                "acme/example": {"deployment_adapter": "shadow-forbidden"}
+            }
+        },
+    )
+
+    assert calls == []
+    assert second.outcome == "post_merge_complete"
+    assert second.state["post_merge"]["canonical_sync"]["status"] == "not_configured"
+    assert second.state["post_merge"]["deployment"]["status"] == "not_configured"
+    assert closeout.closeout_terminal_eligible(second.state) is False
+
+
+def test_existing_post_merge_receipts_must_match_exact_target_sha():
+    state = closeout.normalize_closeout_state(
+        {
+            "mode": "enforce",
+            "status": "post_merge_complete",
+            "policy": {"post_merge_requirements": {"ci": True}},
+            "post_merge": {
+                "target_sha": MERGE_SHA,
+                "ci": {"status": "passed", "observed_sha": HEAD_SHA},
+            },
+        }
+    )
+
+    assert closeout.closeout_terminal_eligible(state) is False
+    state["post_merge"]["ci"]["observed_sha"] = MERGE_SHA
+    assert closeout.closeout_terminal_eligible(state) is True

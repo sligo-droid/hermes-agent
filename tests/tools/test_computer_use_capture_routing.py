@@ -399,14 +399,12 @@ class TestRoutingDecisionWiring:
                    return_value=True):
             assert cu_tool._should_route_through_aux_vision() is False
 
-    def test_config_load_failure_disables_routing_safely(self):
+    def test_config_load_failure_routes_to_safe_text_fallback(self):
         from tools.computer_use import tool as cu_tool
 
         with patch("hermes_cli.config.load_config",
                    side_effect=RuntimeError("config.yaml unreadable")):
-            # No exception should bubble up — fail open by returning False
-            # so the legacy multimodal envelope continues to work.
-            assert cu_tool._should_route_through_aux_vision() is False
+            assert cu_tool._should_route_through_aux_vision() is True
 
     def test_helper_decision_exception_is_swallowed(self):
         from tools.computer_use import tool as cu_tool
@@ -419,7 +417,7 @@ class TestRoutingDecisionWiring:
              patch("hermes_cli.config.load_config", return_value={}), \
              patch.object(vr_mod, "should_route_capture_to_aux_vision",
                           side_effect=ValueError("policy bug")):
-            assert cu_tool._should_route_through_aux_vision() is False
+            assert cu_tool._should_route_through_aux_vision() is True
 
 
 # ---------------------------------------------------------------------------

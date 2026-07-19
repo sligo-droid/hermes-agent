@@ -512,9 +512,12 @@ def assess_worker_routing(
                 "worktree cwd under /home/droid/workspaces/ to "
                 "delegate_coding_task; do not launch the worker from canonical "
                 "main. At the PR boundary, if the worker returned code "
-                "changes or a committed repo fix, load/use github-pr-workflow and "
-                "complete PR->CI->merge->pull unless explicitly review-only or "
-                "blocked. Do not use direct mutation tools before the coding worker "
+                "changes or a committed repo fix, persist durable trusted closeout "
+                "for bounded CI, merge, canonical-sync, and post-merge reconciliation "
+                "unless explicitly review-only or blocked. Do not load "
+                "github-pr-workflow for routine closeout; reserve it for diagnosis "
+                "or recovery after a concrete closeout blocker. Do not use direct "
+                "mutation tools before the coding worker "
                 "has run.]\n\n"
             ),
             required=True,

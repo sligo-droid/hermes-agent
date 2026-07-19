@@ -11,17 +11,48 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+import inspect
 import re
 import subprocess
-from typing import Callable
+from typing import Any, Callable
 
+from hermes_cli.closeout_execution import (
+    classify_closeout_command,
+    run_closeout_command,
+)
 from hermes_cli.pr_workflow_preflight import find_worktree_for_branch
 
 
 GitRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
-_MERGE_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_MERGE_COMMIT_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+
+
+def _control_cancelled(control: Any | None) -> bool:
+    mutation_allowed = getattr(control, "mutation_allowed", None)
+    if callable(mutation_allowed):
+        try:
+            return not bool(mutation_allowed())
+        except Exception:
+            return True
+    checker = getattr(control, "cancelled", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return True
+
+
+def _remaining_timeout(control: Any | None, requested: int | float) -> int | float:
+    remaining = getattr(control, "remaining", None)
+    if not callable(remaining):
+        return requested
+    try:
+        return max(0.001, min(float(requested), float(remaining())))
+    except Exception:
+        return 0.001
 
 
 @dataclass(frozen=True)
@@ -65,16 +96,49 @@ def _default_run_git(
     args: list[str],
     *,
     cwd: Path,
-    timeout: int,
+    timeout: int | float,
+    control: Any | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a direct, bounded Git command without shell or GitHub CLI helpers."""
-    return subprocess.run(
+    """Run one classified Git command with contained mutation processes."""
+
+    if control is None:
+        # Non-closeout callers retain the established bounded runner contract.
+        # Trusted closeout always supplies a renewable collector/lease control.
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    return run_closeout_command(
         ["git", *args],
         cwd=cwd,
-        capture_output=True,
-        text=True,
         timeout=timeout,
+        control=control,
     )
+
+
+def _run_git_command(
+    runner: GitRunner,
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int | float,
+    control: Any | None,
+) -> subprocess.CompletedProcess[str]:
+    classify_closeout_command(["git", *args])
+    kwargs: dict[str, Any] = {"cwd": cwd, "timeout": timeout}
+    try:
+        parameters = inspect.signature(runner).parameters
+    except Exception:
+        parameters = {}
+    if "control" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        kwargs["control"] = control
+    return runner(args, **kwargs)
 
 
 def _command_detail(result: subprocess.CompletedProcess[str] | None) -> str:
@@ -106,6 +170,7 @@ def resolve_protected_canonical_checkout(
     branch: str,
     *,
     run_git: GitRunner | None = None,
+    control: Any | None = None,
 ) -> tuple[Path | None, str | None]:
     """Resolve a protected canonical root on its repository default branch.
 
@@ -137,7 +202,13 @@ def resolve_protected_canonical_checkout(
         timeout: int,
     ) -> subprocess.CompletedProcess[str] | None:
         try:
-            return runner(args, cwd=requested, timeout=timeout)
+            return _run_git_command(
+                runner,
+                args,
+                cwd=requested,
+                timeout=_remaining_timeout(control, timeout),
+                control=control,
+            )
         except Exception:
             return None
 
@@ -192,25 +263,40 @@ def sync_protected_canonical_checkout(
     merge_commit: str,
     *,
     run_git: GitRunner | None = None,
+    control: Any | None = None,
 ) -> CanonicalCheckoutSyncResult:
     """Synchronize only an authority-checked protected canonical checkout."""
     expected_merge_commit = str(merge_commit or "").strip()
+    if _control_cancelled(control):
+        return _blocked_result(
+            project_path,
+            branch,
+            expected_merge_commit,
+            "Canonical checkout synchronization cancelled before mutation",
+        )
     if not _MERGE_COMMIT_RE.fullmatch(expected_merge_commit):
         return _blocked_result(
             project_path,
             branch,
             expected_merge_commit,
-            "merge_commit must be a 7-64 character hexadecimal Git SHA",
+            "merge_commit must be an exact 40- or 64-character hexadecimal Git SHA",
         )
     root, validation_error = resolve_protected_canonical_checkout(
         project_path,
         branch,
         run_git=run_git,
+        control=control,
     )
     if validation_error:
         return _blocked_result(project_path, branch, expected_merge_commit, validation_error)
     assert root is not None
-    return sync_canonical_checkout(root, branch, expected_merge_commit, run_git=run_git)
+    return sync_canonical_checkout(
+        root,
+        branch,
+        expected_merge_commit,
+        run_git=run_git,
+        control=control,
+    )
 
 
 def sync_canonical_checkout(
@@ -219,6 +305,7 @@ def sync_canonical_checkout(
     merge_commit: str,
     *,
     run_git: GitRunner | None = None,
+    control: Any | None = None,
 ) -> CanonicalCheckoutSyncResult:
     """Fetch and fast-forward a clean checkout, then prove it contains a merge.
 
@@ -263,6 +350,11 @@ def sync_canonical_checkout(
         detail = _command_detail(command)
         return result("blocked", f"{message}: {detail}" if detail else message, path=path)
 
+    def cancelled(*, path: Path | None = None) -> CanonicalCheckoutSyncResult | None:
+        if not _control_cancelled(control):
+            return None
+        return fail("Canonical checkout synchronization cancelled before mutation", path=path)
+
     if not raw_path or not canonical_path.is_dir():
         return fail(f"Canonical checkout missing or invalid: {raw_path or '(missing)'}")
     if not wanted_branch:
@@ -276,7 +368,13 @@ def sync_canonical_checkout(
         cwd: Path,
         timeout: int,
     ) -> subprocess.CompletedProcess[str]:
-        return runner(args, cwd=cwd, timeout=timeout)
+        return _run_git_command(
+            runner,
+            args,
+            cwd=cwd,
+            timeout=_remaining_timeout(control, timeout),
+            control=control,
+        )
 
     def require_clean(sync_path: Path, *, label: str) -> CanonicalCheckoutSyncResult | None:
         try:
@@ -309,56 +407,107 @@ def sync_canonical_checkout(
             return fail("Canonical checkout does not contain PR merge commit", ancestor, path=sync_path)
         return result(state, path=sync_path, head=head)
 
-    def fetch_and_pull(sync_path: Path, *, label: str, state: str) -> CanonicalCheckoutSyncResult:
-        for args, message, timeout in (
-            (["fetch", "origin", "--prune"], f"{label} fetch failed", 120),
-            (["pull", "--ff-only", "origin", wanted_branch], f"{label} fast-forward pull failed", 120),
-        ):
-            try:
-                command = run(args, cwd=sync_path, timeout=timeout)
-            except Exception as exc:
-                return fail(f"{message}: {exc}", path=sync_path)
-            if command.returncode != 0:
-                return fail(message, command, path=sync_path)
-        return verify(sync_path, state=state)
+    remote_ref = f"refs/remotes/origin/{wanted_branch}"
 
     blocked = require_clean(canonical_path, label="Canonical checkout")
     if blocked is not None:
         return blocked
 
+    # One normal fetch refreshes the exact remote-tracking ref used below. A
+    # bounded exact-object fallback is permitted only when the expected merge
+    # commit is still unavailable after that primary fetch.
+    fetch_refspec = f"+refs/heads/{wanted_branch}:{remote_ref}"
+    cancellation = cancelled(path=canonical_path)
+    if cancellation is not None:
+        return cancellation
     try:
-        fetched = run(["fetch", "origin", "--prune"], cwd=canonical_path, timeout=120)
+        fetched = run(
+            ["fetch", "origin", "--prune", fetch_refspec],
+            cwd=canonical_path,
+            timeout=120,
+        )
     except Exception as exc:
         return fail(f"Canonical checkout fetch failed: {exc}")
     if fetched.returncode != 0:
         return fail("Canonical checkout fetch failed", fetched)
 
     try:
-        checkout = run(["checkout", wanted_branch], cwd=canonical_path, timeout=60)
+        remote = run(["rev-parse", "--verify", remote_ref], cwd=canonical_path, timeout=20)
     except Exception as exc:
-        return fail(f"Canonical checkout branch checkout failed: {exc}")
-    if checkout.returncode == 0:
+        return fail(f"Canonical checkout remote ref verification failed: {exc}")
+    if remote.returncode != 0:
+        return fail("Canonical checkout remote ref verification failed", remote)
+
+    try:
+        commit_available = run(
+            ["cat-file", "-e", f"{expected_merge_commit}^{{commit}}"],
+            cwd=canonical_path,
+            timeout=20,
+        )
+    except Exception as exc:
+        return fail(f"Canonical checkout merge commit lookup failed: {exc}")
+    if commit_available.returncode != 0:
+        cancellation = cancelled(path=canonical_path)
+        if cancellation is not None:
+            return cancellation
         try:
-            pulled = run(
-                ["pull", "--ff-only", "origin", wanted_branch],
+            exact_fetch = run(
+                ["fetch", "origin", expected_merge_commit],
                 cwd=canonical_path,
                 timeout=120,
             )
         except Exception as exc:
-            return fail(f"Canonical checkout fast-forward pull failed: {exc}")
-        if pulled.returncode != 0:
-            return fail("Canonical checkout fast-forward pull failed", pulled)
-        return verify(canonical_path, state="synced")
+            return fail(f"Canonical checkout exact commit fetch failed: {exc}")
+        if exact_fetch.returncode != 0:
+            return fail("Canonical checkout exact commit fetch failed", exact_fetch)
+        commit_available = run(
+            ["cat-file", "-e", f"{expected_merge_commit}^{{commit}}"],
+            cwd=canonical_path,
+            timeout=20,
+        )
+        if commit_available.returncode != 0:
+            return fail("Canonical checkout merge commit remains unavailable", commit_available)
 
-    existing = find_worktree_for_branch(wanted_branch, cwd=canonical_path, run_git=runner)
-    if existing is None:
-        return fail("Canonical checkout branch checkout failed", checkout)
+    try:
+        remote_contains_merge = run(
+            ["merge-base", "--is-ancestor", expected_merge_commit, remote_ref],
+            cwd=canonical_path,
+            timeout=20,
+        )
+    except Exception as exc:
+        return fail(f"Canonical checkout remote ancestry verification failed: {exc}")
+    if remote_contains_merge.returncode != 0:
+        return fail("Canonical checkout remote ref does not contain PR merge commit", remote_contains_merge)
 
-    blocked = require_clean(existing, label="Existing branch worktree")
-    if blocked is not None:
-        return blocked
-    return fetch_and_pull(
-        existing,
-        label="Existing branch worktree",
-        state="synced_existing_worktree",
-    )
+    cancellation = cancelled(path=canonical_path)
+    if cancellation is not None:
+        return cancellation
+    try:
+        checkout = run(["checkout", wanted_branch], cwd=canonical_path, timeout=60)
+    except Exception as exc:
+        return fail(f"Canonical checkout branch checkout failed: {exc}")
+    if checkout.returncode == 0:
+        sync_path = canonical_path
+        state = "synced"
+        label = "Canonical checkout"
+    else:
+        existing = find_worktree_for_branch(wanted_branch, cwd=canonical_path, run_git=run)
+        if existing is None:
+            return fail("Canonical checkout branch checkout failed", checkout)
+        blocked = require_clean(existing, label="Existing branch worktree")
+        if blocked is not None:
+            return blocked
+        sync_path = existing
+        state = "synced_existing_worktree"
+        label = "Existing branch worktree"
+
+    cancellation = cancelled(path=sync_path)
+    if cancellation is not None:
+        return cancellation
+    try:
+        merged = run(["merge", "--ff-only", remote_ref], cwd=sync_path, timeout=120)
+    except Exception as exc:
+        return fail(f"{label} fast-forward merge failed: {exc}", path=sync_path)
+    if merged.returncode != 0:
+        return fail(f"{label} fast-forward merge failed", merged, path=sync_path)
+    return verify(sync_path, state=state)

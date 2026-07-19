@@ -128,3 +128,51 @@ def test_external_writer_reenables_guard_and_prevents_clobber(tmp_path):
     data = _read_log(agent.session_log_file)
     assert data["message_count"] == 6
     assert len(data["messages"]) == 6
+
+
+def test_visual_tool_arguments_are_redacted_before_json_log_persistence(tmp_path):
+    agent = _agent(tmp_path)
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "visual-1",
+                    "type": "function",
+                    "function": {
+                        "name": "visual_qa",
+                        "arguments": json.dumps(
+                            {
+                                "assertions": [
+                                    {
+                                        "id": "toolbar-check",
+                                        "kind": "screenshot_appearance",
+                                        "locator": {"by": "css", "value": "#private-toolbar"},
+                                        "expectation": "literal appearance prose",
+                                        "text": "private visible text",
+                                        "cursor": "dcur_9_0123456789abcdef01234567",
+                                    }
+                                ],
+                                "api_key": "runtime-credential-value",
+                            }
+                        ),
+                    },
+                }
+            ],
+        }
+    ]
+
+    agent._save_session_log(messages)
+
+    serialized = agent.session_log_file.read_text(encoding="utf-8")
+    assert "toolbar-check" in serialized
+    assert "screenshot_appearance" in serialized
+    for forbidden in (
+        "#private-toolbar",
+        "literal appearance prose",
+        "private visible text",
+        "dcur_9_0123456789abcdef01234567",
+        "runtime-credential-value",
+    ):
+        assert forbidden not in serialized

@@ -151,19 +151,6 @@ def build_turn_context(
     # null; rebuilding from scratch" warning and a needless first-turn prefix
     # cache miss. (Issue #45499.)
 
-    # Tell auxiliary_client what the live main provider/model are for this turn.
-    try:
-        from agent.auxiliary_client import set_runtime_main
-        set_runtime_main(
-            getattr(agent, "provider", "") or "",
-            getattr(agent, "model", "") or "",
-            base_url=getattr(agent, "base_url", "") or "",
-            api_key=getattr(agent, "api_key", "") or "",
-            api_mode=getattr(agent, "api_mode", "") or "",
-        )
-    except Exception:
-        pass
-
     # Tag log records on this thread with the session ID for ``hermes logs``.
     set_session_context(agent.session_id)
 
@@ -172,6 +159,15 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+
+    # Publish only after restoration so task-local auxiliary routes observe the
+    # fully active provider/model/endpoint/credential/API-mode tuple.
+    try:
+        from agent.auxiliary_client import publish_runtime_main
+
+        publish_runtime_main(agent)
+    except Exception:
+        pass
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
@@ -458,6 +454,8 @@ def build_turn_context(
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    agent._turn_mutation_generation = 0
+    agent._turn_mutation_boundary = 0
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
 

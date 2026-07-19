@@ -7,10 +7,13 @@ Verifies that:
 4. The gateway doesn't double-write messages the agent already persisted
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 
@@ -162,6 +165,58 @@ class TestFlushDeduplication:
             # Old session should still have its 2 messages
             old_rows = db.get_messages(old_session)
             assert len(old_rows) == 2
+
+    def test_visual_tool_arguments_are_redacted_before_sqlite_persistence(self):
+        """Durable tool calls retain only assertion identity and kind."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "visual-1",
+                            "type": "function",
+                            "function": {
+                                "name": "visual_qa",
+                                "arguments": json.dumps(
+                                    {
+                                        "assertions": [
+                                            {
+                                                "id": "toolbar-check",
+                                                "kind": "screenshot_appearance",
+                                                "locator": {"by": "css", "value": "#private-toolbar"},
+                                                "expectation": "literal appearance prose",
+                                                "text": "private visible text",
+                                                "cursor": "dcur_9_0123456789abcdef01234567",
+                                            }
+                                        ],
+                                        "api_key": "runtime-credential-value",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            ]
+
+            agent._flush_messages_to_session_db(messages, [])
+
+            serialized = json.dumps(db.get_messages(agent.session_id), sort_keys=True)
+            assert "toolbar-check" in serialized
+            assert "screenshot_appearance" in serialized
+            for forbidden in (
+                "#private-toolbar",
+                "literal appearance prose",
+                "private visible text",
+                "dcur_9_0123456789abcdef01234567",
+                "runtime-credential-value",
+            ):
+                assert forbidden not in serialized
 
 
 # ---------------------------------------------------------------------------

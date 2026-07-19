@@ -1,0 +1,67 @@
+from pathlib import Path
+
+from tools.registry import _module_registers_tools, registry
+
+
+def _schema_property_names(value):
+    if isinstance(value, dict):
+        names = set((value.get("properties") or {}).keys())
+        for item in value.values():
+            names.update(_schema_property_names(item))
+        return names
+    if isinstance(value, list):
+        names = set()
+        for item in value:
+            names.update(_schema_property_names(item))
+        return names
+    return set()
+
+
+def test_visual_qa_is_statically_discoverable_and_always_registered():
+    module_path = Path(__file__).resolve().parents[2] / "tools" / "visual_qa_tool.py"
+    assert _module_registers_tools(module_path) is True
+
+    import tools.visual_qa_tool  # noqa: F401
+
+    entry = registry.get_entry("visual_qa")
+    assert entry is not None
+    assert entry.toolset == "browser"
+    assert entry.is_async is True
+    assert entry.check_fn is None
+
+
+def test_visual_qa_is_in_stable_direct_action_toolsets():
+    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+
+    assert "visual_qa" in _HERMES_CORE_TOOLS
+    assert "visual_qa" in TOOLSETS["browser"]["tools"]
+
+
+def test_visual_qa_schema_has_no_arbitrary_execution_or_protected_inputs():
+    from tools.visual_qa_tool import VISUAL_QA_SCHEMA
+
+    assert VISUAL_QA_SCHEMA["parameters"]["additionalProperties"] is False
+    property_names = {name.lower() for name in _schema_property_names(VISUAL_QA_SCHEMA)}
+    assert VISUAL_QA_SCHEMA["parameters"]["required"] == ["assertions"]
+    assert "target" not in property_names
+    assert "receipt_assertions" not in property_names
+    assert property_names.isdisjoint(
+        {
+            "javascript",
+            "js",
+            "cdp",
+            "command",
+            "shell",
+            "url",
+            "screenshot",
+            "image",
+            "cookie",
+            "cookies",
+            "header",
+            "headers",
+            "credential",
+            "credentials",
+            "authorization",
+            "token",
+        }
+    )

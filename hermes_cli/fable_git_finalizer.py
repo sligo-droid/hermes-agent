@@ -2,12 +2,14 @@
 
 Codex coding workers are implementation inputs: they edit and verify files in
 an owned mutable worktree, but they do not receive Git metadata or GitHub PR
-authority.  This module runs in the parent Hermes process after the worker
-returns and owns commit, push, PR, CI, merge, and canonical-checkout sync.
+authority. This module runs in the parent Hermes process after the worker
+returns. Enforce mode hands exact-head state to trusted closeout; shadow/off
+mode preserves the authorized legacy CI, merge, and canonical-sync finalizer.
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
 import subprocess
@@ -15,8 +17,10 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from agent.runtime_phase_classification import classify_runtime_phase
+from agent.runtime_spans import RuntimeSpanRecorder, sanitize_runtime_spans
 from hermes_cli.github_remote import (
     github_cli_env,
     github_origin_repo,
@@ -35,6 +39,14 @@ _PROTECTED_BRANCHES = {"main", "master"}
 _CHECK_TIMEOUT_SECONDS = 900
 _CHECK_MATERIALIZATION_TIMEOUT_SECONDS = 60
 _CHECK_MATERIALIZATION_POLL_SECONDS = 2
+_SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+_FABLE_SPAN_RECORDER: contextvars.ContextVar[RuntimeSpanRecorder | None] = (
+    contextvars.ContextVar("fable_span_recorder", default=None)
+)
+_FABLE_SPAN_PARENT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "fable_span_parent",
+    default="",
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +87,8 @@ class FableGitFinalization:
     pr_created: bool = False
     merge_performed: bool = False
     merge_observed: bool = False
+    closeout_id: str = ""
+    closeout_state: dict[str, Any] = field(default_factory=dict)
     error: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -88,17 +102,59 @@ def _run(
     timeout: int | float = 60,
     github: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
-        env=github_cli_env() if github else None,
-    )
+    recorder = _FABLE_SPAN_RECORDER.get()
+    handle = None
+    if recorder is not None:
+        first = str(args[0] if args else "").strip().lower()
+        second = re.sub(
+            r"[^a-z0-9_-]",
+            "",
+            str(args[1] if len(args) > 1 else "command").strip().lower(),
+        )
+        third = re.sub(
+            r"[^a-z0-9_-]",
+            "",
+            str(args[2] if len(args) > 2 else "command").strip().lower(),
+        )
+        if first == "git":
+            operation = f"git_{second or 'command'}"
+        elif first == "gh" and second == "pr":
+            operation = f"github_pr_{third or 'command'}"
+        elif first == "gh":
+            operation = f"github_{second or 'command'}"
+        else:
+            operation = "fable_command"
+        handle = recorder.start(
+            operation,
+            phase=classify_runtime_phase(operation),
+            parent_id=_FABLE_SPAN_PARENT.get(),
+            attempt_id="finalization-1",
+            concurrency_id="fable-finalization",
+            metadata={"operation": operation},
+        )
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=github_cli_env() if github else None,
+        )
+    except subprocess.TimeoutExpired:
+        if recorder is not None and handle is not None:
+            recorder.finish(handle, status="timeout")
+        raise
+    except Exception:
+        if recorder is not None and handle is not None:
+            recorder.finish(handle, status="error")
+        raise
+    if recorder is not None and handle is not None:
+        recorder.finish(handle, status="ok" if result.returncode == 0 else "error")
+    return result
 
 
 def _detail(result: subprocess.CompletedProcess[str], fallback: str) -> str:
@@ -584,6 +640,7 @@ def _open_pr(
     base_branch: str,
     title: str,
     body: str,
+    draft: bool,
 ) -> tuple[str, bool, str]:
     existing = _existing_pr(
         root,
@@ -596,22 +653,25 @@ def _open_pr(
     with tempfile.TemporaryDirectory(prefix="hermes-fable-pr-") as temp_dir:
         body_path = Path(temp_dir) / "body.md"
         body_path.write_text(body, encoding="utf-8")
+        create_args = [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            repo,
+            "--base",
+            base_branch,
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body-file",
+            str(body_path),
+        ]
+        if draft:
+            create_args.append("--draft")
         created = _run(
-            [
-                "gh",
-                "pr",
-                "create",
-                "--repo",
-                repo,
-                "--base",
-                base_branch,
-                "--head",
-                branch,
-                "--title",
-                title,
-                "--body-file",
-                str(body_path),
-            ],
+            create_args,
             cwd=root,
             timeout=120,
             github=True,
@@ -632,16 +692,7 @@ def _reported_checks(
     pr_url: str,
 ) -> tuple[list[dict[str, Any]] | None, str]:
     viewed = _run(
-        [
-            "gh",
-            "pr",
-            "view",
-            pr_url,
-            "--repo",
-            repo,
-            "--json",
-            "statusCheckRollup",
-        ],
+        ["gh", "pr", "view", pr_url, "--repo", repo, "--json", "statusCheckRollup"],
         cwd=root,
         timeout=60,
         github=True,
@@ -659,10 +710,6 @@ def _reported_checks(
 
 
 def _wait_for_checks(root: Path, *, repo: str, pr_url: str) -> str:
-    # GitHub commonly returns an empty rollup for a few seconds immediately
-    # after PR creation. Treating that transient state as "this repo has no
-    # checks" lets merge race ahead of CI. Wait for bounded materialization;
-    # only a persistently empty rollup counts as a genuine no-check repository.
     deadline = time.monotonic() + _CHECK_MATERIALIZATION_TIMEOUT_SECONDS
     while True:
         reported, error = _reported_checks(root, repo=repo, pr_url=pr_url)
@@ -690,10 +737,89 @@ def _wait_for_checks(root: Path, *, repo: str, pr_url: str) -> str:
         timeout=_CHECK_TIMEOUT_SECONDS,
         github=True,
     )
-    if watched.returncode == 0:
-        return ""
-    detail = _detail(watched, "gh pr checks failed")
-    return detail
+    return "" if watched.returncode == 0 else _detail(watched, "gh pr checks failed")
+
+
+def _verified_remote_pr_head(
+    root: Path,
+    *,
+    repo: str,
+    pr_url: str,
+    intended_commit: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Fetch and prove the authoritative remote PR head equals the intended commit."""
+
+    intended = str(intended_commit or "").strip().lower()
+    if not _SHA_RE.fullmatch(intended):
+        return None, "Fable finalizer could not resolve an exact intended commit SHA."
+    viewed = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            pr_url,
+            "--repo",
+            repo,
+            "--json",
+            "state,isDraft,mergeStateStatus,mergedAt,mergeCommit,url,headRefOid,headRefName,headRepository",
+        ],
+        cwd=root,
+        timeout=60,
+        github=True,
+    )
+    if viewed.returncode != 0:
+        return None, _detail(viewed, "gh pr view head verification failed")
+    try:
+        payload = json.loads(viewed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return None, f"gh pr view head verification returned invalid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return None, "gh pr view head verification returned non-object JSON"
+
+    remote_head = str(payload.get("headRefOid") or "").strip().lower()
+    head_ref = str(payload.get("headRefName") or "").strip()
+    head_repository = payload.get("headRepository")
+    head_repo = (
+        str(head_repository.get("nameWithOwner") or "").strip()
+        if isinstance(head_repository, dict)
+        else ""
+    )
+    if not _SHA_RE.fullmatch(remote_head):
+        return None, "GitHub returned an invalid Fable PR head SHA."
+    if not head_ref:
+        return None, "GitHub did not report the Fable PR head branch."
+    if head_repo and head_repo.lower() != repo.lower():
+        return None, (
+            f"Fable PR head repository {head_repo} does not match trusted checkout origin {repo}."
+        )
+
+    checked_ref = _run(
+        ["git", "check-ref-format", f"refs/heads/{head_ref}"],
+        cwd=root,
+        timeout=10,
+    )
+    if checked_ref.returncode != 0:
+        return None, "GitHub returned an invalid Fable PR head branch."
+    fetched = _run(
+        ["git", "fetch", "origin", f"refs/heads/{head_ref}"],
+        cwd=root,
+        timeout=300,
+        github=True,
+    )
+    if fetched.returncode != 0:
+        return None, _detail(fetched, "could not fetch the authoritative Fable PR head")
+    fetched_head = _run(["git", "rev-parse", "FETCH_HEAD"], cwd=root, timeout=10)
+    fetched_sha = (fetched_head.stdout or "").strip().lower()
+    if fetched_head.returncode != 0 or not _SHA_RE.fullmatch(fetched_sha):
+        return None, _detail(fetched_head, "could not resolve the fetched Fable PR head")
+    if fetched_sha != remote_head:
+        return None, "Fetched Fable PR head does not match GitHub's authoritative head SHA."
+    if remote_head != intended:
+        return None, (
+            "Fable PR head does not match the intended verified commit; "
+            "refusing to bind local verification or closeout evidence."
+        )
+    return payload, ""
 
 
 def _pr_state(root: Path, *, repo: str, pr_url: str) -> tuple[dict[str, Any] | None, str]:
@@ -706,7 +832,7 @@ def _pr_state(root: Path, *, repo: str, pr_url: str) -> tuple[dict[str, Any] | N
             "--repo",
             repo,
             "--json",
-            "state,isDraft,mergeStateStatus,mergedAt,mergeCommit,url",
+            "state,isDraft,mergeStateStatus,mergedAt,mergeCommit,url,headRefOid",
         ],
         cwd=root,
         timeout=60,
@@ -721,6 +847,52 @@ def _pr_state(root: Path, *, repo: str, pr_url: str) -> tuple[dict[str, Any] | N
     if not isinstance(payload, dict):
         return None, "gh pr view returned non-object JSON"
     return payload, ""
+
+
+def _trusted_local_verification_receipt(
+    root: Path,
+    expected_head: str,
+    runtime_breakdown: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Bind only host-produced exact-head evidence from the final mutation boundary."""
+
+    if not isinstance(runtime_breakdown, Mapping) or not _SHA_RE.fullmatch(expected_head):
+        return {"status": "pending"}
+    try:
+        expected_root = str(root.resolve(strict=True))
+        final_generation = int(runtime_breakdown.get("mutation_generation"))
+        final_boundary = int(runtime_breakdown.get("mutation_boundary"))
+    except (OSError, TypeError, ValueError):
+        return {"status": "pending"}
+    evidence = runtime_breakdown.get("verification_evidence")
+    if not isinstance(evidence, list):
+        return {"status": "pending"}
+    for item in reversed(evidence):
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("status") or "").strip().lower() != "success":
+            continue
+        if str(item.get("surface") or "").strip().lower() not in {"verification", "ci"}:
+            continue
+        repository_root = str(item.get("repository_root") or "").strip()
+        canonical_command = str(item.get("canonical_command") or "").strip()
+        scope = str(item.get("scope") or "").strip()
+        if not repository_root or not canonical_command or not scope:
+            continue
+        try:
+            evidence_root = str(Path(repository_root).resolve(strict=True))
+            generation = int(item.get("mutation_generation"))
+            boundary = int(item.get("mutation_boundary"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if (
+            evidence_root == expected_root
+            and str(item.get("verified_head_sha") or "").strip().lower() == expected_head
+            and generation == final_generation
+            and boundary == final_boundary
+        ):
+            return {"status": "passed", "head_sha": expected_head}
+    return {"status": "pending"}
 
 
 def _canonical_checkout(root: Path) -> Path | None:
@@ -750,27 +922,32 @@ def _sync_after_merge(
     try:
         from hermes_cli.canonical_checkout_sync import sync_protected_canonical_checkout
 
-        result = sync_protected_canonical_checkout(
+        sync_result = sync_protected_canonical_checkout(
             str(canonical),
             base_branch,
             merge_commit,
         )
     except Exception as exc:
         return "failed", str(exc)
-    if result.state.startswith("synced"):
-        return result.state, ""
-    return result.state, result.error or "Canonical checkout sync failed"
+    if sync_result.state.startswith("synced"):
+        return sync_result.state, ""
+    return sync_result.state, sync_result.error or "Canonical checkout sync failed"
 
 
-def finalize_fable_git_lifecycle(
+def _finalize_fable_git_lifecycle_impl(
     preparation: FableGitPreparation,
     *,
     mode: str,
     task: str,
     worker_summary: str,
+    closeout_mode: str,
+    verification_runtime_breakdown: Mapping[str, Any] | None = None,
 ) -> FableGitFinalization:
-    """Commit and finalize the PR after a Codex worker returns."""
+    """Finalize through legacy authority or enforced structured closeout."""
     normalized_mode = str(mode or "").strip().lower()
+    normalized_closeout_mode = str(closeout_mode or "shadow").strip().lower()
+    if normalized_closeout_mode not in {"off", "shadow", "enforce"}:
+        normalized_closeout_mode = "shadow"
     root = Path(preparation.worktree).resolve(strict=False)
     result = FableGitFinalization(
         success=False,
@@ -859,18 +1036,99 @@ def finalize_fable_git_lifecycle(
             base_branch=preparation.base_branch,
             title=title,
             body=body,
+            draft=(
+                normalized_mode == FABLE_GIT_LIFECYCLE_PR
+                or normalized_closeout_mode == "enforce"
+            ),
         )
     result.pr_url = pr_url
     if error:
         result.status = "pushed"
         result.error = error
         return result
+    pr_payload, error = _verified_remote_pr_head(
+        root,
+        repo=preparation.repo,
+        pr_url=pr_url,
+        intended_commit=result.commit,
+    )
+    if error or pr_payload is None:
+        result.status = "pr_head_verification_blocked"
+        result.error = error
+        return result
+    remote_head = str(pr_payload.get("headRefOid") or "").strip().lower()
+
+    if normalized_closeout_mode != "off":
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        canonical = _canonical_checkout(root)
+        closeout_id = f"fable:{preparation.repo}:{preparation.branch}:{remote_head}"
+        closeout_status = "pr_open" if normalized_mode == FABLE_GIT_LIFECYCLE_PR else "pending"
+        result.closeout_id = closeout_id
+        result.closeout_state = normalize_closeout_state(
+            {
+                "id": closeout_id,
+                "source": "fable",
+                "mode": normalized_closeout_mode,
+                "status": closeout_status,
+                "workspace": {
+                    "path": str(root),
+                    "canonical_path": str(canonical or ""),
+                    "repository": preparation.repo,
+                    "branch": preparation.branch,
+                    "base_branch": preparation.base_branch,
+                },
+                "policy": {
+                    "merge": "never" if normalized_mode == FABLE_GIT_LIFECYCLE_PR else "auto",
+                    "pr_open": "after_review_approval",
+                    "early_draft_pr": True,
+                    "require_local_verification": True,
+                    "require_review": False,
+                    "require_visual_qa": False,
+                    "post_merge_requirements": {},
+                },
+                "local_verification": _trusted_local_verification_receipt(
+                    root,
+                    remote_head,
+                    verification_runtime_breakdown,
+                ),
+                "review": {"status": "not_required"},
+                "visual_qa": {"status": "not_required"},
+                "pr": {
+                    "url": pr_url,
+                    "title": title,
+                    "state": str(pr_payload.get("state") or "OPEN"),
+                    "is_draft": pr_payload.get("isDraft") is True,
+                    "head_sha": remote_head,
+                },
+                "ci": {
+                    "head_sha": remote_head,
+                    "status": "not_checked",
+                    "wait_state": "queued",
+                },
+                "next_due_at": 0,
+            }
+        )
+
     if normalized_mode == FABLE_GIT_LIFECYCLE_PR:
         result.success = True
         result.status = "pr_opened"
         result.checks_status = "not_waited"
+        result.next_action = "PR lifecycle complete; the draft PR remains intentionally unmerged."
         return result
 
+    if normalized_closeout_mode == "enforce":
+        result.success = True
+        result.status = "closeout_pending"
+        result.checks_status = "pending"
+        result.next_action = (
+            "Persist the closeout state and let the trusted closeout watcher reconcile current-head CI and merge."
+        )
+        return result
+
+    # Shadow is observational only. The previously-authorized legacy finalizer
+    # remains responsible for CI, merge, and canonical sync so an explicit merge
+    # request cannot become a permanent read-only handoff.
     checks_error = _wait_for_checks(root, repo=preparation.repo, pr_url=pr_url)
     if checks_error:
         result.status = "pr_opened"
@@ -879,10 +1137,11 @@ def finalize_fable_git_lifecycle(
         return result
     result.checks_status = "passed"
 
-    before_merge, error = _pr_state(
+    before_merge, error = _verified_remote_pr_head(
         root,
         repo=preparation.repo,
         pr_url=pr_url,
+        intended_commit=result.commit,
     )
     if error or before_merge is None:
         result.status = "pr_opened"
@@ -907,6 +1166,8 @@ def finalize_fable_git_lifecycle(
                 preparation.repo,
                 "--merge",
                 "--delete-branch",
+                "--match-head-commit",
+                remote_head,
             ],
             cwd=root,
             timeout=300,
@@ -940,6 +1201,10 @@ def finalize_fable_git_lifecycle(
         merge = after_merge.get("mergeCommit") or {}
         result.merge_commit = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
 
+    if result.closeout_state:
+        result.closeout_state["pr"]["state"] = "MERGED"
+        result.closeout_state["pr"]["merge_sha"] = result.merge_commit
+
     sync_state, sync_error = _sync_after_merge(
         root,
         base_branch=preparation.base_branch,
@@ -957,11 +1222,15 @@ def finalize_fable_git_lifecycle(
         timeout=300,
         github=True,
     )
-    aligned = _run(
-        ["git", "merge", "--ff-only", f"origin/{preparation.base_branch}"],
-        cwd=root,
-        timeout=120,
-    ) if fetched.returncode == 0 else fetched
+    aligned = (
+        _run(
+            ["git", "merge", "--ff-only", f"origin/{preparation.base_branch}"],
+            cwd=root,
+            timeout=120,
+        )
+        if fetched.returncode == 0
+        else fetched
+    )
     if aligned.returncode != 0:
         result.status = "merged_sync_blocked"
         result.error = _detail(aligned, "could not realign the owned Fable worktree")
@@ -970,4 +1239,67 @@ def finalize_fable_git_lifecycle(
 
     result.success = True
     result.status = "merged"
+    result.next_action = "Legacy trusted Fable finalization completed; shadow closeout remains observational."
+    return result
+
+
+def finalize_fable_git_lifecycle(
+    preparation: FableGitPreparation,
+    *,
+    mode: str,
+    task: str,
+    worker_summary: str,
+    closeout_mode: str = "shadow",
+    verification_runtime_breakdown: Mapping[str, Any] | None = None,
+) -> FableGitFinalization:
+    """Run trusted Fable finalization with bounded Git/GitHub spans."""
+
+    work_id = (
+        f"fable:{preparation.repo}:{preparation.branch}"
+        if preparation.repo or preparation.branch
+        else "fable-finalization"
+    )
+    recorder = RuntimeSpanRecorder(work_id=work_id, max_spans=80)
+    root_span = recorder.start(
+        "fable_finalization",
+        phase="closeout",
+        attempt_id="finalization-1",
+        metadata={
+            "operation": "fable_finalization",
+            "source": "fable",
+        },
+    )
+    recorder_token = _FABLE_SPAN_RECORDER.set(recorder)
+    parent_token = _FABLE_SPAN_PARENT.set(root_span.id)
+    try:
+        result = _finalize_fable_git_lifecycle_impl(
+            preparation,
+            mode=mode,
+            task=task,
+            worker_summary=worker_summary,
+            closeout_mode=closeout_mode,
+            verification_runtime_breakdown=verification_runtime_breakdown,
+        )
+    except Exception:
+        recorder.finish(root_span, status="error")
+        raise
+    finally:
+        _FABLE_SPAN_PARENT.reset(parent_token)
+        _FABLE_SPAN_RECORDER.reset(recorder_token)
+    recorder.finish(
+        root_span,
+        status="ok" if result.success else "blocked",
+        metadata={"outcome": result.status},
+    )
+    if result.closeout_state:
+        telemetry = (
+            result.closeout_state.get("telemetry")
+            if isinstance(result.closeout_state.get("telemetry"), dict)
+            else {}
+        )
+        telemetry["phase_spans"] = sanitize_runtime_spans(
+            [*(telemetry.get("phase_spans") or []), *recorder.export()],
+            max_spans=120,
+        )
+        result.closeout_state["telemetry"] = telemetry
     return result

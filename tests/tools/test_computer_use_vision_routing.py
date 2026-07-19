@@ -160,8 +160,8 @@ class TestRouteDecision:
                 "some-aggregator", "some-vision-model", {}
             ) is True
 
-    def test_user_declared_vision_support_keeps_custom_provider_native(self):
-        """Local/custom VLMs use config as their tool-result image escape hatch."""
+    def test_user_declared_vision_support_still_requires_transport_support(self):
+        """Model capability cannot override an incompatible tool-result transport."""
         from tools.computer_use import vision_routing
 
         cfg = {
@@ -176,7 +176,18 @@ class TestRouteDecision:
                           return_value=False):
             assert vision_routing.should_route_capture_to_aux_vision(
                 "custom", "Qwen3.6-35B-A3B-local-vlm", cfg
-            ) is False
+            ) is True
+
+    def test_custom_codex_responses_with_declared_vision_stays_native(self):
+        from tools.computer_use import vision_routing
+
+        cfg = {"model": {"supports_vision": True}}
+        assert vision_routing.should_route_capture_to_aux_vision(
+            "custom",
+            "gpt-5.6-sol",
+            cfg,
+            api_mode="codex_responses",
+        ) is False
 
     def test_user_declared_no_vision_routes_custom_provider_to_aux(self):
         """An explicit false override should not fall through to native routing."""

@@ -177,7 +177,6 @@ CI Failed
 ```bash
 git add <fixed_files> && git commit -m "fix: resolve CI failure" && git push
 
-# Then monitor
-gh pr checks --watch 2>/dev/null || \
-  echo "Poll with: curl -s -H 'Authorization: token ...' https://api.github.com/repos/.../commits/$(git rev-parse HEAD)/status"
+# Inspect the current PR head once; durable closeout owns continued reconciliation.
+gh pr checks --json name,state,bucket,workflow,link
 ```

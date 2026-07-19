@@ -79,6 +79,14 @@ def _worker_config() -> dict[str, Any]:
         model_tiers = cfg.get("model_tiers") if isinstance(cfg, dict) else None
         if isinstance(model_tiers, dict):
             worker_cfg["model_tiers"] = model_tiers
+        coding_worker = cfg.get("coding_worker") if isinstance(cfg, dict) else None
+        worker_tiers = (
+            coding_worker.get("worker_tiers")
+            if isinstance(coding_worker, dict)
+            else None
+        )
+        if isinstance(worker_tiers, dict):
+            worker_cfg["coding_worker"] = {"worker_tiers": worker_tiers}
         return worker_cfg
     except Exception:
         return {}
@@ -146,11 +154,13 @@ def _role_runtime_settings(
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
     try:
-        from hermes_cli.model_tiers import resolve_model_tier
+        from hermes_cli.model_tiers import resolve_model_tier, resolve_worker_tier
 
         model_tier = resolve_model_tier(cfg, role_cfg.get("model_tier"))
+        worker_tier = resolve_worker_tier(cfg, role_cfg.get("worker_tier"))
     except Exception:
         model_tier = None
+        worker_tier = None
 
     raw_reasoning = _config_value_with_auto_env(
         "HERMES_CODEX_WORKER_REASONING",
@@ -189,6 +199,8 @@ def _role_runtime_settings(
         "reasoning_source": reasoning_source,
         "model_tier": model_tier.name if model_tier is not None else "",
         "model_tier_source": "role" if model_tier is not None else "none",
+        "worker_tier": worker_tier.name if worker_tier is not None else "",
+        "worker_tier_source": "role" if worker_tier is not None else "none",
         "model": model_tier.model if model_tier is not None else "",
         "opencode_model": model_tier.opencode_model if model_tier is not None else "",
         "service_tier": tier,
@@ -524,6 +536,10 @@ def _spawn_host_worker(
             "HERMES_CODEX_WORKER_MODEL_TIER_SOURCE": settings.get(
                 "model_tier_source", "none"
             ),
+            "HERMES_CODEX_WORKER_TIER": settings.get("worker_tier", ""),
+            "HERMES_CODEX_WORKER_TIER_SOURCE": settings.get(
+                "worker_tier_source", "none"
+            ),
             "HERMES_CODEX_WORKER_MODEL": settings["model"],
             "HERMES_OPENCODE_WORKER_MODEL": settings["opencode_model"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
@@ -597,6 +613,10 @@ def _spawn_docker_worker(
             "HERMES_CODEX_WORKER_MODEL_TIER": settings["model_tier"],
             "HERMES_CODEX_WORKER_MODEL_TIER_SOURCE": settings.get(
                 "model_tier_source", "none"
+            ),
+            "HERMES_CODEX_WORKER_TIER": settings.get("worker_tier", ""),
+            "HERMES_CODEX_WORKER_TIER_SOURCE": settings.get(
+                "worker_tier_source", "none"
             ),
             "HERMES_CODEX_WORKER_MODEL": settings["model"],
             "HERMES_OPENCODE_WORKER_MODEL": settings["opencode_model"],

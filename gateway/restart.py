@@ -117,6 +117,9 @@ def is_restart_watcher_self_process(
     proc: RestartProcessInfo,
     *,
     self_pid: int | None = None,
+    watcher_pid: int | None = None,
+    watcher_pgid: int | None = None,
+    watcher_sid: int | None = None,
 ) -> bool:
     """Return True for the restart watcher wrapper/current process lineage.
 
@@ -126,11 +129,14 @@ def is_restart_watcher_self_process(
     children, while unrelated direct children of the old gateway still block.
     """
     current_pid, current_pgid, current_sid = _current_process_identity(self_pid)
-    if proc.pid == current_pid:
+    excluded_pid = watcher_pid if watcher_pid is not None else current_pid
+    excluded_pgid = watcher_pgid if watcher_pgid is not None else current_pgid
+    excluded_sid = watcher_sid if watcher_sid is not None else current_sid
+    if proc.pid == excluded_pid:
         return True
-    if current_pgid is not None and proc.pgid == current_pgid:
+    if excluded_pgid is not None and proc.pgid == excluded_pgid:
         return True
-    if current_sid is not None and proc.sid == current_sid:
+    if excluded_sid is not None and proc.sid == excluded_sid:
         return True
     return False
 
@@ -141,6 +147,9 @@ def restart_blocker_evidence(
     runtime_state: dict[str, Any] | None = None,
     direct_children: Iterable[RestartProcessInfo] | None = None,
     self_pid: int | None = None,
+    watcher_pid: int | None = None,
+    watcher_pgid: int | None = None,
+    watcher_sid: int | None = None,
 ) -> RestartBlockerEvidence:
     """Return active-agent and direct-child evidence that can defer restart.
 
@@ -158,6 +167,13 @@ def restart_blocker_evidence(
     blockers = tuple(
         child
         for child in children
-        if child.pid > 0 and not is_restart_watcher_self_process(child, self_pid=self_pid)
+        if child.pid > 0
+        and not is_restart_watcher_self_process(
+            child,
+            self_pid=self_pid,
+            watcher_pid=watcher_pid,
+            watcher_pgid=watcher_pgid,
+            watcher_sid=watcher_sid,
+        )
     )
     return RestartBlockerEvidence(active_agents=active_agents, blockers=blockers)

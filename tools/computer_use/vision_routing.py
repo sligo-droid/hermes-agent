@@ -140,7 +140,11 @@ def _lookup_supports_vision(
     return bool(getattr(caps, "supports_vision", False))
 
 
-def _provider_accepts_multimodal_tool_result(provider: str, model: str) -> Optional[bool]:
+def _provider_accepts_multimodal_tool_result(
+    provider: str,
+    model: str,
+    api_mode: str = "",
+) -> Optional[bool]:
     """Return whether *provider*+*model* carries images inside tool-result messages.
 
     Reuses ``tools.vision_tools._supports_media_in_tool_results`` so the
@@ -158,13 +162,15 @@ def _provider_accepts_multimodal_tool_result(provider: str, model: str) -> Optio
             exc,
         )
         return None
-    return bool(_supports_media_in_tool_results(provider, model))
+    return bool(_supports_media_in_tool_results(provider, model, api_mode))
 
 
 def should_route_capture_to_aux_vision(
     provider: str,
     model: str,
     cfg: Optional[Dict[str, Any]],
+    *,
+    api_mode: str = "",
 ) -> bool:
     """Return True iff the captured screenshot should be pre-analysed via aux vision.
 
@@ -184,19 +190,22 @@ def should_route_capture_to_aux_vision(
         return True
 
     user_declared = _lookup_user_declared_supports_vision(provider, model, cfg)
-    if user_declared is True:
-        return False
     if user_declared is False:
         return True
 
-    accepts_tool_image = _provider_accepts_multimodal_tool_result(provider, model)
+    accepts_tool_image = _provider_accepts_multimodal_tool_result(
+        provider,
+        model,
+        api_mode,
+    )
     if accepts_tool_image is None or accepts_tool_image is False:
         return True
 
-    supports_vision = _lookup_supports_vision(provider, model, cfg)
-    if supports_vision is True:
+    if user_declared is True:
         return False
-    return True
+
+    supports_vision = _lookup_supports_vision(provider, model, cfg)
+    return supports_vision is not True
 
 
 __all__ = [

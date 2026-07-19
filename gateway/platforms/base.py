@@ -1485,14 +1485,51 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+_MAX_CONFIRMED_MESSAGE_IDS = 128
+_MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
+
+
+def _normalize_delivery_message_ids(values: Any) -> tuple[str, ...]:
+    """Return bounded, de-duplicated platform IDs in confirmation order."""
+
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)):
+        values = (values,)
+    try:
+        candidates = iter(values)
+    except TypeError:
+        candidates = iter((values,))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        text = "".join(
+            char for char in text if char.isalnum() or char in {"-", "_", ".", ":"}
+        )[:_MAX_DELIVERY_MESSAGE_ID_LENGTH]
+        if not text or text in seen:
+            continue
+        normalized.append(text)
+        seen.add(text)
+        if len(normalized) >= _MAX_CONFIRMED_MESSAGE_IDS:
+            break
+    return tuple(normalized)
+
+
 @dataclass
 class SendResult:
-    """Result of sending a message."""
+    """Result of sending a logical message, including confirmed side effects."""
+
     success: bool
     message_id: Optional[str] = None
     error: Optional[str] = None
     raw_response: Any = None
-    retryable: bool = False  # True for transient connection errors — base will retry automatically
+    retryable: bool = False  # True for transient connection errors — base may retry when replay is safe
+    # Server-requested retry delay in seconds (for example Telegram FloodWait).
+    # The next retry honors this once instead of the default backoff.
+    retry_after: Optional[float] = None
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -1500,6 +1537,45 @@ class SendResult:
     # made up the full payload, in send order.  Empty tuple for the common
     # single-message case.
     continuation_message_ids: tuple = ()
+    # Every platform message whose creation is confirmed for this logical send,
+    # in send order. The tuple is bounded and immutable so partial-delivery
+    # evidence can safely cross adapter and persistence boundaries.
+    confirmed_message_ids: tuple[str, ...] = ()
+    # False means replaying the whole logical message is unsafe. None preserves
+    # compatibility with adapters that predate this field; confirmed IDs always
+    # override it and make replay unsafe.
+    retry_safe: bool | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.continuation_message_ids, tuple):
+            self.continuation_message_ids = tuple(self.continuation_message_ids or ())
+        confirmed = _normalize_delivery_message_ids(self.confirmed_message_ids)
+        if not confirmed and self.message_id:
+            confirmed = _normalize_delivery_message_ids((self.message_id,))
+        self.confirmed_message_ids = confirmed
+        if confirmed:
+            self.retry_safe = False
+
+
+def get_confirmed_message_ids(result: Any) -> tuple[str, ...]:
+    """Extract bounded confirmed side-effect IDs from old or new send results."""
+
+    if result is None:
+        return ()
+    confirmed = _normalize_delivery_message_ids(
+        getattr(result, "confirmed_message_ids", ())
+    )
+    if confirmed:
+        return confirmed
+    return _normalize_delivery_message_ids((getattr(result, "message_id", None),))
+
+
+def is_logical_send_retry_safe(result: Any) -> bool:
+    """Return whether replaying the full logical message is still safe."""
+
+    if get_confirmed_message_ids(result):
+        return False
+    return getattr(result, "retry_safe", None) is not False
 
 
 class EphemeralReply(str):
@@ -3176,15 +3252,31 @@ class BasePlatformAdapter(ABC):
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
+        # Never replay or fall back after any confirmed side effect, or when the
+        # adapter explicitly reports that whole-message replay is unsafe.
+        if not is_logical_send_retry_safe(result):
+            logger.warning(
+                "[%s] Send failed after a confirmed or ambiguous side effect; "
+                "whole-message replay is disabled",
+                self.name,
+            )
+            return result
+
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
             return result
 
         if is_network:
-            # Retry with exponential backoff for transient errors
+            # Retry with exponential backoff for transient errors. A provider
+            # retry_after is authoritative for the immediately following retry.
+            server_retry_after = result.retry_after
             for attempt in range(1, max_retries + 1):
-                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                if server_retry_after is not None:
+                    delay = server_retry_after + random.uniform(0, 1)
+                    server_retry_after = None
+                else:
+                    delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,
@@ -3200,6 +3292,15 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
+                if result.retry_after is not None:
+                    server_retry_after = result.retry_after
+                if not is_logical_send_retry_safe(result):
+                    logger.warning(
+                        "[%s] Retry produced a confirmed or ambiguous side effect; "
+                        "stopping without replay",
+                        self.name,
+                    )
+                    return result
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
@@ -3936,12 +4037,57 @@ class BasePlatformAdapter(ABC):
             from gateway.work_ledger import GatewayWorkLedger
 
             result_message_id = getattr(result, "message_id", None)
-            GatewayWorkLedger().mark_completed(
-                str(work_item_id),
-                result_message_id=str(result_message_id) if result_message_id else None,
-            )
+            kwargs: dict[str, Any] = {
+                "result_message_id": str(result_message_id) if result_message_id else None,
+                "confirmed_message_ids": get_confirmed_message_ids(result),
+            }
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            GatewayWorkLedger().mark_completed(str(work_item_id), **kwargs)
         except Exception as exc:
             logger.warning("[%s] Failed to mark work item completed: %s", self.name, exc)
+
+    def _mark_work_item_delivery_started(self, event: MessageEvent) -> bool:
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return True
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            return GatewayWorkLedger().mark_response_delivery_started(
+                str(work_item_id),
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to fence work item delivery: %s", self.name, exc)
+            return False
+
+    def _release_work_item_delivery_attempt(self, event: MessageEvent) -> None:
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            GatewayWorkLedger().release_response_delivery_attempt(
+                str(work_item_id),
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to release work item delivery attempt: %s",
+                self.name,
+                exc,
+            )
 
     def _mark_work_item_response_delivered(self, event: MessageEvent, result=None) -> None:
         work_item_id = getattr(event, "work_item_id", None)
@@ -3951,31 +4097,99 @@ class BasePlatformAdapter(ABC):
             from gateway.work_ledger import GatewayWorkLedger
 
             result_message_id = getattr(result, "message_id", None)
-            GatewayWorkLedger().mark_response_delivered(
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            delivered = GatewayWorkLedger().mark_response_delivered(
                 str(work_item_id),
                 result_message_id=str(result_message_id) if result_message_id else None,
+                confirmed_message_ids=get_confirmed_message_ids(result),
+                **kwargs,
             )
+            if delivered and isinstance(expected_run_state, dict):
+                event.work_item_run_state = {
+                    **expected_run_state,
+                    "status": "response_delivered",
+                }
         except Exception as exc:
             logger.warning("[%s] Failed to mark work item response delivered: %s", self.name, exc)
+
+    def _mark_work_item_delivery_uncertain(self, event: MessageEvent, result=None) -> None:
+        """Persist an unsafe or partially confirmed logical-send outcome."""
+
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            confirmed_ids = get_confirmed_message_ids(result)
+            error_text = str(getattr(result, "error", "") or "")
+            reason = (
+                "partial_send_confirmed"
+                if confirmed_ids
+                else "send_timeout_outcome_unknown"
+                if self._is_timeout_error(error_text)
+                else "send_attempt_outcome_unknown"
+            )
+            result_message_id = getattr(result, "message_id", None)
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            kwargs: dict[str, Any] = {}
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            persisted = GatewayWorkLedger().mark_response_delivery_uncertain(
+                str(work_item_id),
+                result_message_id=str(result_message_id) if result_message_id else None,
+                confirmed_message_ids=confirmed_ids,
+                reason=reason,
+                **kwargs,
+            )
+            if persisted and isinstance(expected_run_state, dict):
+                event.work_item_run_state = {
+                    **expected_run_state,
+                    "status": "response_delivered",
+                }
+        except Exception as exc:
+            logger.warning("[%s] Failed to mark work item delivery uncertain: %s", self.name, exc)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_uncertain = False
+        delivery_fenced = False
+        delivery_complete = False
         processing_outcome: Optional[ProcessingOutcome] = None
         completion_deferred = False
         handoff_spawned = False
         post_delivery_ok = True
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_uncertain
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
+                if delivery_uncertain:
+                    return
                 delivery_succeeded = True
                 self._mark_work_item_response_delivered(event, result)
+                return
+            error_text = str(getattr(result, "error", "") or "")
+            if (
+                delivery_succeeded
+                or get_confirmed_message_ids(result)
+                or getattr(result, "retry_safe", None) is False
+                or self._is_timeout_error(error_text)
+            ):
+                delivery_succeeded = False
+                delivery_uncertain = True
+                self._mark_work_item_delivery_uncertain(event, result)
+            # Definitively side-effect-free failures are released only after all
+            # components of this logical response have finished. Another media
+            # or attachment component may already have produced a side effect.
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -4108,6 +4322,32 @@ class BasePlatformAdapter(ABC):
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
+                has_response_delivery = bool(
+                    text_content
+                    or _tts_path
+                    or images
+                    or media_files
+                    or local_files
+                )
+                if has_response_delivery:
+                    delivery_fenced = self._mark_work_item_delivery_started(event)
+                    if not delivery_fenced:
+                        logger.info(
+                            "[%s] Suppressing stale response after work-item delivery CAS failed",
+                            self.name,
+                        )
+                        if _tts_path:
+                            try:
+                                os.remove(_tts_path)
+                            except OSError:
+                                pass
+                        _tts_path = None
+                        response = None
+                        text_content = ""
+                        images = []
+                        media_files = []
+                        local_files = []
+
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
                 if _tts_path and Path(_tts_path).exists():
@@ -4128,6 +4368,7 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        _record_delivery(tts_result)
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -4188,7 +4429,15 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(batch_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -4230,7 +4479,15 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(batch_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 for media_path, is_voice in _non_image_media:
@@ -4257,9 +4514,17 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(media_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -4269,19 +4534,32 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            local_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            local_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        _record_delivery(local_result)
                     except Exception as file_err:
+                        _record_delivery(
+                            SendResult(
+                                success=False,
+                                error=str(file_err),
+                                retry_safe=False,
+                            )
+                        )
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+                if delivery_fenced:
+                    if delivery_attempted and not delivery_succeeded and not delivery_uncertain:
+                        self._release_work_item_delivery_attempt(event)
+                    delivery_complete = True
 
             # Determine overall success for the processing hook.  The hook is
             # flushed after the pending-message checks so status reactions stay
@@ -4337,6 +4615,8 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            if delivery_fenced and not delivery_complete:
+                self._mark_work_item_delivery_uncertain(event)
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -4344,6 +4624,8 @@ class BasePlatformAdapter(ABC):
             processing_outcome = outcome
             raise
         except Exception as e:
+            if delivery_fenced and not delivery_complete:
+                self._mark_work_item_delivery_uncertain(event)
             processing_outcome = ProcessingOutcome.FAILURE
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence

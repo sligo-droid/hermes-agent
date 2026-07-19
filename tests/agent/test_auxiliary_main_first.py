@@ -472,6 +472,68 @@ class TestResolveVisionMainFirst:
         assert mock_resolve.call_args.args[1] == "anthropic/claude-sonnet-4.6"
         assert mock_resolve.call_args.kwargs.get("is_vision") is True
 
+    def test_unknown_main_vision_remains_permissive_by_default(self):
+        """Ordinary descriptive vision still attempts uncatalogued main models."""
+        main_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="experimental",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="new-multimodal",
+        ), patch(
+            "agent.image_routing._lookup_supports_vision", return_value=None,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(main_client, "new-multimodal"),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ):
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client()
+
+        assert (provider, client, model) == (
+            "experimental",
+            main_client,
+            "new-multimodal",
+        )
+        mock_resolve.assert_called_once()
+
+    def test_strict_capability_skips_unknown_main_for_known_backend(self):
+        """Trusted assertions spend no attempt on an uncatalogued main model."""
+        fallback_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="experimental",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="new-multimodal",
+        ), patch(
+            "agent.image_routing._lookup_supports_vision", return_value=None,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._resolve_strict_vision_backend",
+            side_effect=lambda provider, model=None: (
+                (fallback_client, "known-vision-model")
+                if provider == "openrouter"
+                else (None, None)
+            ),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ):
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client(
+                strict_capability=True
+            )
+
+        assert (provider, client, model) == (
+            "openrouter",
+            fallback_client,
+            "known-vision-model",
+        )
+        mock_resolve.assert_not_called()
+
     def test_nous_main_vision_uses_paid_nous_vision_backend(self):
         """Paid Nous main → aux vision uses the dedicated Nous vision backend."""
         with patch(
@@ -688,9 +750,17 @@ class TestResolveVisionCustomProvider:
         """custom main with recorded runtime endpoint → Step 1 builds a client."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://my.endpoint.example/v1")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "sk-runtime-key")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "anthropic_messages")
+        monkeypatch.setattr(
+            aux,
+            "get_runtime_main",
+            lambda: {
+                "provider": "custom",
+                "model": "claude-opus-4-8",
+                "base_url": "https://my.endpoint.example/v1",
+                "api_key": "sk-runtime-key",
+                "api_mode": "anthropic_messages",
+            },
+        )
 
         with patch(
             "agent.auxiliary_client._read_main_provider", return_value="custom",
@@ -723,9 +793,17 @@ class TestResolveVisionCustomProvider:
         """A ``custom:<name>`` provider id also forwards the runtime endpoint."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://named.example/v1")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "sk-named")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "")
+        monkeypatch.setattr(
+            aux,
+            "get_runtime_main",
+            lambda: {
+                "provider": "custom:copilot-gateway",
+                "model": "claude-opus-4-8",
+                "base_url": "https://named.example/v1",
+                "api_key": "sk-named",
+                "api_mode": "",
+            },
+        )
 
         with patch(
             "agent.auxiliary_client._read_main_provider",
@@ -756,9 +834,17 @@ class TestResolveVisionCustomProvider:
         """No recorded runtime endpoint → resolve the configured custom endpoint."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "")
-        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "")
+        monkeypatch.setattr(
+            aux,
+            "get_runtime_main",
+            lambda: {
+                "provider": "custom",
+                "model": "claude-opus-4-8",
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            },
+        )
 
         with patch(
             "agent.auxiliary_client._read_main_provider", return_value="custom",

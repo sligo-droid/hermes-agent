@@ -25,6 +25,36 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
 
+      - name: Fetch exact PR commits without checkout
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40,64}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40,64}$ ]]
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          [[ "$(git rev-parse HEAD^{commit})" == "$BASE_SHA" ]]
+          git fetch --no-tags --depth=256 origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
+          resolved_head="$(git rev-parse "refs/remotes/pull/${PR_NUMBER}/head^{commit}")"
+          [[ "$resolved_head" == "$HEAD_SHA" ]]
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
+      - name: Run trusted-base source-CI preflight
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/ci/source_ci_preflight.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --pr-number "$PR_NUMBER"
+
       - name: Collect changed file names
         env:
           GH_TOKEN: ${{ github.token }}

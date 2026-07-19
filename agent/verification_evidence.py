@@ -6,6 +6,7 @@ import json
 import re
 import shlex
 import sqlite3
+import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ _MAX_EVENTS_PER_SESSION_ROOT = 100
 _MAX_TOTAL_UNREFERENCED_EVENTS = 10_000
 _AD_HOC_SCRIPT_NAME_PREFIXES = ("hermes-verify-", "hermes-ad-hoc-")
 _VERIFY_SCHEMA_VERSION = 1
-_SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
+_SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,8 @@ _MERGE_RE = re.compile(r"\b(merge|merged|pull|pr)\b", re.IGNORECASE)
 _SUCCESS_RE = re.compile(r"\b(success|passed|pass|ok|complete|completed|visible|found|healthy)\b", re.IGNORECASE)
 _TIMEOUT_RE = re.compile(r"\b(timed?\s*out|timeout|deadline|expired)\b", re.IGNORECASE)
 _SHELL_SEGMENT_RE = re.compile(r"\s*(?:&&|\|\||[;\n])\s*")
+_UNSAFE_VERIFY_SHELL_RE = re.compile(r"\|\||(?<!&)&(?!&)|(?<!\|)\|(?!\|)|[<>`]|\$\(")
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _GIT_OPTION_ARGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
 _NON_VERIFY_GIT_PATHSPEC_COMMANDS = {"add", "rm", "mv", "restore", "checkout", "reset"}
 
@@ -243,20 +246,6 @@ def _is_non_verification_git_pathspec_segment(segment: str) -> bool:
     return parts[index] in _NON_VERIFY_GIT_PATHSPEC_COMMANDS
 
 
-def _split_segment_tokens(command: str) -> list[list[str]]:
-    segments: list[list[str]] = []
-    for segment in _SHELL_SPLIT_RE.split(command.strip()):
-        if not segment:
-            continue
-        try:
-            tokens = shlex.split(segment)
-        except ValueError:
-            continue
-        if tokens:
-            segments.append(tokens)
-    return segments
-
-
 def _clean_token(token: str) -> str:
     token = token.strip()
     while token.startswith("./"):
@@ -304,18 +293,77 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     return candidates
 
 
-def _find_canonical_match(command: str, canonical_commands: list[str]) -> tuple[str, list[str]] | None:
-    segments = _split_segment_tokens(command)
+def _canonical_match_for_tokens(
+    tokens: list[str],
+    canonical_commands: list[str],
+) -> tuple[str, list[str]] | None:
+    candidate_tokens = _strip_command_prefix(tokens)
     for canonical in canonical_commands:
         needle = _canonical_tokens(canonical)
         if not needle:
             continue
-        for tokens in segments:
-            candidate_tokens = _strip_command_prefix(tokens)
-            for candidate in _equivalent_needles(needle):
-                if candidate_tokens[:len(candidate)] == candidate:
-                    return canonical, candidate_tokens[len(candidate):]
+        for candidate in _equivalent_needles(needle):
+            if candidate_tokens[:len(candidate)] == candidate:
+                return canonical, candidate_tokens[len(candidate):]
     return None
+
+
+def _is_narrow_verification_setup(tokens: list[str]) -> bool:
+    """Allow only bounded environment setup before verification commands."""
+
+    if not tokens:
+        return False
+    if all(_ENV_ASSIGNMENT_RE.fullmatch(token) for token in tokens):
+        return True
+    if tokens[0] == "export" and len(tokens) > 1:
+        return all(_ENV_ASSIGNMENT_RE.fullmatch(token) for token in tokens[1:])
+    if tokens[0] in {"source", "."} and len(tokens) == 2:
+        return Path(tokens[1]).name == "activate"
+    if len(tokens) >= 2 and tokens[0] in {"conda", "pyenv"} and tokens[1] == "activate":
+        return len(tokens) == 3
+    return False
+
+
+def _verification_only_segments(command: str) -> list[list[str]] | None:
+    """Parse the small accepted shell subset, failing closed on other shapes."""
+
+    if _UNSAFE_VERIFY_SHELL_RE.search(command):
+        return None
+    raw_segments = _SHELL_SEGMENT_RE.split(command.strip())
+    if not raw_segments or any(not segment.strip() for segment in raw_segments):
+        return None
+    segments: list[list[str]] = []
+    for segment in raw_segments:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+        segments.append(tokens)
+    return segments
+
+
+def _find_canonical_match(command: str, canonical_commands: list[str]) -> tuple[str, list[str]] | None:
+    segments = _verification_only_segments(command)
+    if not segments:
+        return None
+    first_match: tuple[str, list[str]] | None = None
+    verification_started = False
+    for tokens in segments:
+        match = _canonical_match_for_tokens(tokens, canonical_commands)
+        if match is not None:
+            verification_started = True
+            if first_match is None:
+                first_match = match
+            continue
+        if not verification_started and _is_narrow_verification_setup(tokens):
+            continue
+        # Once the command contains a non-setup, non-verification segment, the
+        # whole composite is ineligible. This rejects trailing and parallel
+        # mutation rather than crediting an earlier successful test segment.
+        return None
+    return first_match
 
 
 def _kind_for_command(canonical: str) -> str:
@@ -405,11 +453,22 @@ def _ad_hoc_script_args(tokens: list[str], root: str | Path | None) -> list[str]
 
 
 def _find_ad_hoc_match(command: str, root: str | Path | None) -> list[str] | None:
-    for tokens in _split_segment_tokens(command):
+    segments = _verification_only_segments(command)
+    if not segments:
+        return None
+    first_args: list[str] | None = None
+    verification_started = False
+    for tokens in segments:
         trailing_args = _ad_hoc_script_args(tokens, root)
         if trailing_args is not None:
-            return trailing_args
-    return None
+            verification_started = True
+            if first_args is None:
+                first_args = trailing_args
+            continue
+        if not verification_started and _is_narrow_verification_setup(tokens):
+            continue
+        return None
+    return first_args
 
 
 def _summarize_output(output: str) -> str:
@@ -556,14 +615,11 @@ def classify_tool_verification_evidence(
     ]
 
 
-def _visual_receipt_tag(tool_args: dict[str, Any], result_data: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract an opt-in receipt tag without promoting raw tool output."""
-    for source in (tool_args, result_data):
-        for key in ("visual_qa_receipt", "visual_qa"):
-            value = source.get(key) if isinstance(source, dict) else None
-            if isinstance(value, dict):
-                return value
-    return None
+def _visual_receipt_tag(result_data: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract only the dedicated tool's host-produced receipt field."""
+
+    value = result_data.get("visual_qa_receipt") if isinstance(result_data, dict) else None
+    return value if isinstance(value, dict) else None
 
 
 def classify_tool_visual_receipt(
@@ -575,19 +631,43 @@ def classify_tool_visual_receipt(
     order: int | None = None,
     requirement: Any = None,
 ) -> dict[str, Any] | None:
-    """Return one explicitly tagged visual receipt, never inferred browser proof.
+    """Return one host-produced receipt from the dedicated ``visual_qa`` tool.
 
-    A check must opt in via a ``visual_qa_receipt`` (or legacy ``visual_qa``)
-    object in its arguments or structured result.  Generic browser navigation,
-    snapshots, screenshots, console output, and terminal success therefore
-    remain ordinary verification evidence.
+    Generic browser/terminal/vision arguments and results can never opt into
+    receipt status, so unsupported model-authored receipt tags are ignored.
     """
     name = str(tool_name or "")
-    if name != "terminal" and not name.startswith("browser") and name != "vision_analyze":
+    if name != "visual_qa" or not isinstance(tool_args, dict):
         return None
-    args = tool_args if isinstance(tool_args, dict) else {}
-    tag = _visual_receipt_tag(args, _json_object(result))
+    raw_assertions = tool_args.get("assertions")
+    if not isinstance(raw_assertions, list) or not raw_assertions:
+        return None
+    try:
+        from agent.visual_assertions import (
+            validate_visual_assertion_coverage,
+            visual_assertion_contract_id,
+        )
+
+        assertions = validate_visual_assertion_coverage(
+            requirement,
+            raw_assertions,
+        )
+    except Exception:
+        return None
+    # Validation normally omits malformed, duplicate, or over-limit entries.
+    # Receipt acceptance is a security boundary, so fail closed unless every
+    # supplied assertion survived validation in its original order.
+    if len(assertions) != len(raw_assertions):
+        return None
+    assertion_ids = [item["id"] for item in assertions]
+    contract_id = visual_assertion_contract_id(assertions)
+    if not contract_id:
+        return None
+
+    tag = _visual_receipt_tag(_json_object(result))
     if tag is None:
+        return None
+    if tag.get("contract_id") != contract_id or tag.get("assertion_ids") != assertion_ids:
         return None
     candidate = dict(tag)
     if order is not None:
@@ -642,6 +722,62 @@ def visual_receipts_from_runtime_breakdown(runtime_breakdown: Any) -> list[dict[
     if isinstance(receipts, list):
         return [item for item in receipts if isinstance(item, dict)]
     return []
+
+
+def _trusted_repository_snapshot(root: str | Path | None) -> dict[str, str]:
+    """Capture the exact repository root and HEAD at verification completion."""
+
+    if not root:
+        return {}
+    try:
+        root_path = Path(root).expanduser().resolve(strict=True)
+        top_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        head_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        repository_root = Path(str(top_result.stdout or "").strip()).resolve(strict=True)
+        root_path.relative_to(repository_root)
+        verified_head_sha = str(head_result.stdout or "").strip().lower()
+    except Exception:
+        return {}
+    if (
+        top_result.returncode != 0
+        or head_result.returncode != 0
+        or status_result.returncode != 0
+        or bool(str(status_result.stdout or "").strip())
+        or _SHA_RE.fullmatch(verified_head_sha) is None
+    ):
+        return {}
+    return {
+        "repository_root": str(repository_root),
+        "verified_head_sha": verified_head_sha,
+    }
 
 
 def record_terminal_result(
@@ -704,7 +840,10 @@ def record_terminal_result(
             _prune_old_events(conn, session_id=evidence.session_id, root=evidence.root)
             conn.commit()
 
-    return {"id": event_id, **evidence.__dict__, "created_at": created_at}
+    result = {"id": event_id, **evidence.__dict__, "created_at": created_at}
+    if evidence.status == "passed":
+        result.update(_trusted_repository_snapshot(evidence.root))
+    return result
 
 
 def mark_workspace_edited(

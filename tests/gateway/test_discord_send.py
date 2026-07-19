@@ -114,6 +114,8 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
 
     assert result.success is True
     assert result.message_id == "1001"
+    assert result.confirmed_message_ids == ("1001", "1002")
+    assert result.retry_safe is False
     assert channel.fetch_message.await_count == 1
     assert channel.send.await_count == 3
     ref_msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
@@ -158,6 +160,77 @@ async def test_send_does_not_retry_on_unrelated_errors():
     # Only the first attempt happens — no reference-retry replay.
     assert channel.send.await_count == 1
     assert send_calls[0]["reference"] is reference_obj
+
+
+@pytest.mark.asyncio
+async def test_send_preserves_confirmed_prefix_when_later_chunk_fails():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.MAX_MESSAGE_LENGTH = 20
+    channel = SimpleNamespace(
+        send=AsyncMock(
+            side_effect=[
+                SimpleNamespace(id=1001),
+                RuntimeError("httpx.ConnectError: connection dropped"),
+            ]
+        )
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "A" * 50)
+
+    assert result.success is False
+    assert result.message_id == "1001"
+    assert result.confirmed_message_ids == ("1001",)
+    assert result.raw_response == {"message_ids": ["1001"]}
+    assert result.retry_safe is False
+    assert channel.send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_preserves_confirmed_prefix_when_later_chunk_times_out():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.MAX_MESSAGE_LENGTH = 20
+    channel = SimpleNamespace(
+        send=AsyncMock(
+            side_effect=[
+                SimpleNamespace(id=1001),
+                RuntimeError("ReadTimeout: response outcome unknown"),
+            ]
+        )
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "A" * 50)
+
+    assert result.success is False
+    assert result.confirmed_message_ids == ("1001",)
+    assert result.retry_safe is False
+    assert channel.send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_zero_confirmed_transient_failure_is_ambiguous_and_not_retry_safe():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("httpx.ConnectError: refused"))
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "hello")
+
+    assert result.success is False
+    assert result.confirmed_message_ids == ()
+    assert result.retryable is True
+    assert result.retry_safe is False
 
 
 @pytest.mark.asyncio
@@ -288,10 +361,17 @@ async def test_send_to_forum_sends_remaining_chunks():
     adapter.MAX_MESSAGE_LENGTH = 20
 
     chunk_msg_1 = SimpleNamespace(id=500)
-    chunk_msg_2 = SimpleNamespace(id=501)
+    next_message_id = 501
+
+    async def send_follow_up(*, content):
+        nonlocal next_message_id
+        message = SimpleNamespace(id=next_message_id)
+        next_message_id += 1
+        return message
+
     thread_ch = SimpleNamespace(
         id=555,
-        send=AsyncMock(return_value=chunk_msg_2),
+        send=AsyncMock(side_effect=send_follow_up),
     )
     # thread object has no 'send' so _send_to_forum uses thread.thread
     thread = SimpleNamespace(
@@ -312,6 +392,8 @@ async def test_send_to_forum_sends_remaining_chunks():
 
     assert result.success is True
     assert result.message_id == "500"
+    assert result.confirmed_message_ids == tuple(result.raw_response["message_ids"])
+    assert len(result.confirmed_message_ids) > 1
     # Should have sent at least one follow-up chunk
     assert thread_ch.send.await_count >= 1
 
@@ -335,6 +417,28 @@ async def test_send_to_forum_create_thread_failure():
     assert "rate limited" in result.error
 
 
+@pytest.mark.asyncio
+async def test_send_to_forum_transient_create_failure_is_ambiguous() -> None:
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.name = "ideas"
+    forum_channel.create_thread = AsyncMock(
+        side_effect=RuntimeError("httpx.ConnectError: refused")
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("999", "Hello forum!")
+
+    assert result.success is False
+    assert result.confirmed_message_ids == ()
+    assert result.retryable is True
+    assert result.retry_safe is False
+
 
 # ---------------------------------------------------------------------------
 # Forum follow-up chunk failure reporting + media on forum paths
@@ -342,13 +446,11 @@ async def test_send_to_forum_create_thread_failure():
 
 
 @pytest.mark.asyncio
-async def test_send_to_forum_follow_up_chunk_failures_collected_as_warnings():
-    """Partial-send chunk failures surface in raw_response['warnings']."""
+async def test_send_to_forum_follow_up_chunk_failure_is_unsafe_partial_delivery():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     adapter.MAX_MESSAGE_LENGTH = 20
 
     chunk_msg_1 = SimpleNamespace(id=500)
-    # Every follow-up chunk fails — we should collect a warning per failure
     thread_ch = SimpleNamespace(
         id=555,
         send=AsyncMock(side_effect=Exception("rate limited")),
@@ -363,16 +465,14 @@ async def test_send_to_forum_follow_up_chunk_failures_collected_as_warnings():
         fetch_channel=AsyncMock(),
     )
 
-    # Long enough to produce multiple chunks
     result = await adapter.send("999", "A" * 60)
 
-    # Starter message (first chunk) was delivered via create_thread, so send is
-    # successful overall — but follow-up chunks all failed and are reported.
-    assert result.success is True
+    assert result.success is False
     assert result.message_id == "500"
-    warnings = (result.raw_response or {}).get("warnings") or []
-    assert len(warnings) >= 1
-    assert all("rate limited" in w for w in warnings)
+    assert result.confirmed_message_ids == ("500",)
+    assert result.retry_safe is False
+    assert result.raw_response["partial_delivery"] is True
+    assert thread_ch.send.await_count == 1
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent.provider_progress import clear_provider_progress_signal, latest_provider_progress_signal
+from agent.visual_qa import normalize_visual_requirement, visual_requirement_id
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
@@ -48,16 +50,25 @@ def _repo_discord_event(message_id="m1", text="do the work"):
     return event
 
 
-def _visual_receipt(requirement, *, order=3, status="passed", evidence_ref="local rendered check"):
-    return {
-        "level": requirement["level"],
-        "target": requirement["target"],
-        "assertions": list(requirement["assertions"]),
-        "check": "browser viewport inspection",
+def _visual_receipt(requirement, *, order=3, status="passed", evidence_ref=""):
+    normalized = normalize_visual_requirement(requirement)
+    assertion_ids = [
+        item["id"] for item in normalized["assertions"] if isinstance(item, dict)
+    ]
+    receipt = {
+        "requirement_id": visual_requirement_id(normalized),
+        "contract_id": "vac_" + ("a" * 24),
+        "assertion_ids": assertion_ids,
         "status": status,
-        "evidence_ref": evidence_ref,
+        "attempts": 1,
+        "vision_calls": 0,
+        "duration_ms": 25,
+        "diagnostic_codes": ["no_horizontal_overflow_satisfied"],
         "order": order,
     }
+    if evidence_ref:
+        receipt["evidence_ref"] = evidence_ref
+    return receipt
 
 
 def test_ledger_deduplicates_discord_message_ids(tmp_path):
@@ -164,11 +175,22 @@ def test_ledger_persists_normalized_visual_requirement_from_feature_summary(tmp_
         "mode": "enforce_explicit",
         "max_receipts_per_turn": 1,
         "max_followup_turns": 1,
+        "max_attempts": 2,
+        "max_assertions": 6,
+        "max_vision_calls": 1,
+        "attempt_timeout_s": 30.0,
+        "total_timeout_s": 60.0,
+        "max_output_chars": 6000,
     }
     requirement = stored["visual_qa_requirement"]
     assert requirement["level"] == "surface"
-    assert requirement["target"]
-    assert requirement["assertions"]
+    assert requirement["target"].startswith("vtarget_")
+    assert all(
+        item["id"].startswith("vassert_") and item["kind"] == "screenshot_appearance"
+        for item in requirement["assertions"]
+    )
+    assert "responsive dashboard" not in repr(requirement).lower()
+    assert "mobile sidebar" not in repr(requirement).lower()
     replay = ledger.event_from_item(stored)
     assert replay.visual_qa_requirement == requirement
     assert replay.visual_qa_config == stored["visual_qa_config"]
@@ -212,15 +234,18 @@ def test_shadow_visual_qa_reports_missing_fresh_receipt_without_blocking(tmp_pat
 def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     from gateway.run import _visual_qa_context_prompt, _visual_qa_turn_result
 
-    requirement = {
-        "level": "surface",
-        "target": "responsive dashboard",
-        "assertions": ["dashboard has no unintended overflow"],
-    }
+    requirement = normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": "responsive dashboard",
+            "assertions": ["dashboard has no unintended overflow"],
+        }
+    )
     config = {"mode": "enforce_explicit", "max_receipts_per_turn": 1, "max_followup_turns": 1}
     prompt = _visual_qa_context_prompt(requirement, config)
     assert "mode=enforce_explicit" in prompt
-    assert "visual_qa_receipt: {level, target, assertions, check, status, evidence_ref}" in prompt
+    assert "call the dedicated `visual_qa` tool" in prompt
+    assert "attach receipt arguments" in prompt
     assert "Generic navigation" in prompt
 
     agent = SimpleNamespace(
@@ -229,7 +254,12 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     )
     state = _visual_qa_turn_result(
         agent,
-        {"visual_qa_receipts": [_visual_receipt(requirement, order=3)]},
+        {
+            "visual_qa_receipts": [
+                _visual_receipt(requirement, order=1, status="failed"),
+                _visual_receipt(requirement, order=3),
+            ]
+        },
         requirement,
     )
     assert state == {
@@ -280,7 +310,10 @@ def test_enforced_visual_qa_requires_a_fresh_post_edit_receipt(tmp_path):
     assert ledger.mark_agent_done(
         fresh["id"],
         final_response="Implemented the dashboard.",
-        visual_qa_receipts=[_visual_receipt(fresh_requirement, order=3)],
+        visual_qa_receipts=[
+            _visual_receipt(fresh_requirement, order=2, status="failed"),
+            _visual_receipt(fresh_requirement, order=3),
+        ],
         visual_qa_code_mutation_observed=True,
         visual_qa_min_receipt_order=3,
     )
@@ -356,6 +389,344 @@ def test_mark_agent_running_clears_stale_terminal_fields(tmp_path):
         "summary_updated_at",
     ):
         assert key not in stored
+
+
+def test_agent_run_guard_requires_exact_active_generation(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="active-generation")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_id="session-1",
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+    stored = ledger.get(item["id"])
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 4242)
+
+    assert ledger.agent_run_active(
+        stored,
+        session_key=session_key,
+        run_generation=4,
+        process_epoch="boot-a",
+        registry_active=True,
+    ) is True
+    assert ledger.agent_run_active(
+        stored,
+        session_key=session_key,
+        run_generation=5,
+        process_epoch="boot-a",
+        registry_active=True,
+    ) is False
+    assert ledger.agent_run_active(
+        stored,
+        session_key=session_key,
+        run_generation=4,
+        process_epoch="boot-a",
+        registry_active=False,
+    ) is False
+
+
+def test_run_state_cas_finalizes_only_unchanged_active_run(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="run-state-success")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_id="session-1",
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+    expected = ledger.capture_run_state(
+        item["id"],
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+
+    assert expected == {
+        "status": "agent_running",
+        "active_run": {
+            "session_key": session_key,
+            "generation": 4,
+            "owner_pid": 4242,
+            "process_epoch": "boot-a",
+            "lease_until": 3700.0,
+        },
+    }
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="done",
+        expected_run_state=expected,
+    ) is True
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_done"
+    assert stored["active_run"] is None
+
+
+def test_run_state_snapshot_is_bounded_and_preserves_long_identity_changes():
+    prefix = "x" * 400
+    first = GatewayWorkLedger.run_state_snapshot(
+        {
+            "status": prefix + "-status-a",
+            "active_run": {
+                "session_key": prefix + "-session-a",
+                "generation": 1 << 80,
+                "owner_pid": float("inf"),
+                "process_epoch": prefix + "-epoch-a",
+                "lease_until": float("nan"),
+            },
+        }
+    )
+    second = GatewayWorkLedger.run_state_snapshot(
+        {
+            "status": prefix + "-status-b",
+            "active_run": {
+                "session_key": prefix + "-session-b",
+                "generation": 1 << 80,
+                "owner_pid": float("inf"),
+                "process_epoch": prefix + "-epoch-b",
+                "lease_until": float("nan"),
+            },
+        }
+    )
+
+    assert len(first["status"]) <= 240
+    assert len(first["active_run"]["session_key"]) <= 240
+    assert len(first["active_run"]["process_epoch"]) <= 160
+    assert first["active_run"]["generation"] == (1 << 63) - 1
+    assert first["active_run"]["owner_pid"] == 0
+    assert first["active_run"]["lease_until"] is None
+    assert first["status"] != second["status"]
+    assert first["active_run"]["session_key"] != second["active_run"]["session_key"]
+    assert first["active_run"]["process_epoch"] != second["active_run"]["process_epoch"]
+
+
+def test_run_state_cas_rejects_same_pid_new_generation_and_epoch_without_mutation(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="run-state-generation")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+    expected = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=5,
+        owner_pid=4242,
+        process_epoch="boot-b",
+    )
+    before = ledger.get(item["id"])
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="stale result",
+        summary_status="Complete",
+        expected_run_state=expected,
+    ) is False
+    assert ledger.get(item["id"]) == before
+
+
+def test_run_state_cas_rejects_lease_renewal_without_partial_mutation(tmp_path):
+    now = 100.0
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
+    event = _discord_event(message_id="run-state-lease")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+    expected = ledger.run_state_snapshot(ledger.get(item["id"]))
+    now = 101.0
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+    before = ledger.get(item["id"])
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="stale result",
+        runtime_breakdown={"total": 1},
+        expected_run_state=expected,
+    ) is False
+    assert ledger.get(item["id"]) == before
+
+
+def test_mark_completed_cas_rejects_run_started_after_observation(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="completed-run-race")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    assert ledger.mark_agent_done(item["id"], final_response="done")
+    assert ledger.mark_summary_updated(item["id"])
+    expected = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=2,
+        owner_pid=4242,
+        process_epoch="boot-b",
+    )
+    before = ledger.get(item["id"])
+
+    assert ledger.mark_completed(
+        item["id"],
+        result_message_id="stale-result",
+        expected_run_state=expected,
+    ) is False
+    assert ledger.get(item["id"]) == before
+
+
+def test_live_gateway_does_not_keep_abandoned_turn_active(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="abandoned-turn")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=2,
+        owner_pid=os.getpid(),
+    )
+    stored = ledger.get(item["id"])
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._session_run_generation = {session_key: 2}
+    runner._running_agents = {"another-session": object()}
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+
+    assert runner._work_item_agent_run_active(stored) is False
+
+
+def test_gateway_run_guard_accepts_exact_process_epoch(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="exact-process-epoch")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=1,
+        owner_pid=5151,
+        process_epoch="gateway-boot",
+    )
+    stored = ledger.get(item["id"])
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._session_run_generation = {session_key: 1}
+    runner._running_agents = {session_key: object()}
+    runner._process_epoch = "gateway-boot"
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 5151)
+
+    assert runner._work_item_agent_run_active(stored) is True
+
+
+def test_pid_reuse_cannot_revive_stale_turn(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="pid-reuse")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=1,
+        owner_pid=5151,
+        process_epoch="old-process",
+    )
+    stored = ledger.get(item["id"])
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+
+    assert ledger.agent_run_active(
+        stored,
+        session_key=session_key,
+        run_generation=1,
+        process_epoch="restarted-process",
+        registry_active=True,
+    ) is False
+
+
+def test_legacy_active_run_without_process_epoch_is_not_authoritatively_live(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="legacy-process-epoch")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=1,
+        owner_pid=5151,
+    )
+    stored = ledger.get(item["id"])
+    stored["active_run"].pop("process_epoch", None)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+
+    assert ledger.agent_run_active(
+        stored,
+        session_key=session_key,
+        run_generation=1,
+        process_epoch="current-process",
+        registry_active=True,
+    ) is False
+
+
+def test_agent_run_guard_uses_platform_safe_process_helper(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="platform-safe")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=3,
+        owner_pid=6161,
+        process_epoch="boot-safe",
+    )
+    stored = ledger.get(item["id"])
+    seen = []
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: seen.append(pid) or True)
+    monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("os.kill must not be used"))
+
+    assert ledger.agent_run_active(
+        stored,
+        session_key=session_key,
+        run_generation=3,
+        process_epoch="boot-safe",
+        registry_active=True,
+    ) is True
+    assert seen == [6161]
 
 
 def test_mark_agent_running_clears_prior_visual_receipt_but_keeps_contract(tmp_path):
@@ -445,11 +816,57 @@ def test_work_ledger_state_transitions_record_provider_progress(tmp_path):
     assert signal["reason"] == "ledger_status_agent_running"
     assert signal["metadata"] == {"work_id": item["id"], "status": "agent_running"}
 
-    assert ledger.mark_summary_updated(item["id"]) is True
+    expected_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_summary_updated(
+        item["id"],
+        expected_run_state=expected_run_state,
+    ) is True
     signal = latest_provider_progress_signal(session_key)
     assert signal is not None
     assert signal["reason"] == "ledger_status_summary_updated"
     assert signal["metadata"] == {"work_id": item["id"], "status": "summary_updated"}
+
+
+def test_all_ledger_read_modify_write_mutations_use_file_lock(monkeypatch, tmp_path):
+    import gateway.work_ledger as work_ledger
+
+    entries = []
+
+    @contextmanager
+    def tracked_lock(path):
+        entries.append(path)
+        yield
+
+    monkeypatch.setattr(work_ledger, "_ledger_file_lock", tracked_lock)
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+
+    item = ledger.accept_event(
+        _discord_event(message_id="locked-complete"),
+        session_key="locked-complete",
+        freshness_seconds=60,
+    )
+    ledger.claim(item["id"])
+    ledger.mark_agent_running(item["id"], session_id="session-1")
+    ledger.mark_agent_done(item["id"], final_response="done")
+    ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    ledger.mark_summary_updated(item["id"])
+    ledger.mark_completed(item["id"])
+
+    blocked = ledger.accept_event(
+        _discord_event(message_id="locked-block"),
+        session_key="locked-block",
+        freshness_seconds=60,
+    )
+    ledger.mark_blocked(blocked["id"], reason="test")
+    expired = ledger.accept_event(
+        _discord_event(message_id="locked-expire"),
+        session_key="locked-expire",
+        freshness_seconds=60,
+    )
+    ledger.mark_expired(expired["id"])
+
+    assert len(entries) == 11
+    assert set(entries) == {ledger.path}
 
 
 def test_ledger_skips_completed_and_expires_stale_items(tmp_path):
@@ -493,12 +910,14 @@ def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_pa
     assert item is not None
     ledger.claim(item["id"])
     ledger.mark_agent_running(item["id"], session_id="session-1")
+    expected_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
     ledger.mark_agent_done(
         item["id"],
         final_response="normal final answer",
         session_id="session-1",
         summary_status="Complete",
         feature_summary={"message_id": "summary-1", "_message_obj": object()},
+        expected_run_state=expected_run_state,
     )
     assert ledger.get(item["id"])["status"] == "agent_done"
     assert ledger.get(item["id"])["feature_summary"] == {"message_id": "summary-1"}
@@ -514,6 +933,126 @@ def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_pa
 
     ledger.mark_completed(item["id"])
     assert ledger.incomplete_items() == []
+
+
+def test_delivery_start_fence_allows_only_one_inflight_logical_send(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="delivery-fence"),
+        session_key="delivery-fence",
+        freshness_seconds=60,
+    )
+    expected_run_state = ledger.run_state_snapshot(item)
+
+    assert ledger.mark_response_delivery_started(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    assert not ledger.mark_response_delivery_started(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    assert ledger.release_response_delivery_attempt(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    assert ledger.mark_response_delivery_started(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+
+
+def test_summary_update_rejects_stale_run_state(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="summary-run-state-cas"),
+        session_key="summary-run-state-cas",
+        freshness_seconds=60,
+    )
+    assert ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    expected_run_state = ledger.run_state_snapshot(ledger.get(item["id"]))
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key="summary-run-state-cas",
+        run_generation=2,
+        owner_pid=2222,
+        process_epoch="replacement-process",
+    )
+
+    assert not ledger.mark_summary_updated(
+        item["id"],
+        expected_run_state=expected_run_state,
+    )
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 2
+
+
+def test_ledger_persists_all_bounded_confirmed_message_ids(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="multi-result"),
+        session_key="multi-result",
+        freshness_seconds=60,
+    )
+
+    assert ledger.mark_response_delivered(
+        item["id"],
+        result_message_id="chunk-1",
+        confirmed_message_ids=("chunk-1", "chunk-2", "chunk-2", "bad id!"),
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["result_message_id"] == "chunk-1"
+    assert stored["confirmed_message_ids"] == ["chunk-1", "chunk-2", "badid"]
+    assert stored["delivery_outcome"] == "delivered"
+
+
+def test_ledger_bounds_confirmed_message_id_arrays(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(
+        _discord_event(message_id="bounded-results"),
+        session_key="bounded-results",
+        freshness_seconds=60,
+    )
+
+    assert ledger.mark_response_delivered(
+        item["id"],
+        result_message_id="chunk-0",
+        confirmed_message_ids=(f"chunk-{index}" for index in range(200)),
+    )
+
+    stored = ledger.get(item["id"])
+    assert len(stored["confirmed_message_ids"]) == 128
+    assert stored["confirmed_message_ids"][0] == "chunk-0"
+    assert stored["confirmed_message_ids"][-1] == "chunk-127"
+
+
+def test_ledger_partial_delivery_is_durable_uncertain_and_cannot_complete(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    item = ledger.accept_event(
+        _discord_event(message_id="partial-result"),
+        session_key="partial-result",
+        freshness_seconds=60,
+    )
+
+    assert ledger.mark_response_delivery_uncertain(
+        item["id"],
+        result_message_id="chunk-1",
+        confirmed_message_ids=("chunk-1",),
+        reason="partial_send_confirmed",
+    )
+    uncertain = ledger.get(item["id"])
+    assert uncertain["status"] == "response_delivered"
+    assert uncertain["delivery_outcome"] == "uncertain"
+    assert uncertain["confirmed_message_ids"] == ["chunk-1"]
+    assert uncertain["completion_gate"]["allowed_to_complete"] is False
+
+    assert ledger.mark_completed(item["id"])
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    assert stored["delivery_outcome"] == "uncertain"
+    assert stored["confirmed_message_ids"] == ["chunk-1"]
 
 
 def test_ledger_records_discord_board_final_response_provenance(tmp_path, monkeypatch):
@@ -1304,12 +1843,23 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     session_key = build_session_key(event.source)
     item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
     assert item is not None
-    runner.work_ledger.claim(item["id"])
-    # Simulate a previous gateway process.  An alive current PID would not be
-    # replayed, because that would duplicate active work.
-    data = runner.work_ledger._read()
-    data["items"][item["id"]]["claim_pid"] = os.getpid() + 10_000_000
-    runner.work_ledger._write(data)
+    attached = runner.work_ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    assert attached is not None
+    assert runner.work_ledger.get(item["id"])["closeout_authoritative"] is False
+    runner.work_ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=1,
+        owner_pid=os.getpid(),
+    )
+    # A live gateway PID is insufficient: no exact active registry generation
+    # owns this abandoned turn after startup.
+    runner._session_run_generation = {session_key: 2}
+    runner._running_agents = {}
 
     scheduled = runner._schedule_incomplete_discord_work_items()
     await asyncio.sleep(0)
@@ -1371,6 +1921,50 @@ async def test_startup_auto_resume_reuses_original_discord_work_item(tmp_path):
     assert resumed.feature_summary == event.feature_summary
     assert resumed.goal_thread_context == event.goal_thread_context
     assert resumed.message_id == "m1"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_closeout_clears_resume_pending_without_model_replay(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner._background_tasks = set()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _discord_event(message_id="closeout-resume")
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert item is not None
+    attached = runner.work_ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    assert attached is not None
+    assert runner.work_ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    ) is not None
+    entry = SimpleNamespace(
+        session_key=session_key,
+        origin=event.source,
+        resume_pending=True,
+        suspended=False,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    runner.session_store = MagicMock()
+    runner.session_store._entries = {session_key: entry}
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    runner.session_store.clear_resume_pending.assert_called_once_with(session_key)
+    adapter.handle_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1731,3 +2325,653 @@ def test_discord_worker_reference_context_resolves_bare_message_ids(monkeypatch)
     assert refs[0]["id"] == "1507176047022575776"
     assert refs[0]["channel_id"] == "parent-1"
     assert refs[0]["content"] == "reported bug details"
+
+
+def test_closeout_workspace_attachment_revision_leases_and_pending_scan(tmp_path):
+    now = 100.0
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
+    event = _discord_event(message_id="closeout-item")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert item is not None
+
+    state = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        canonical_path="/protected/canonical",
+        repository="acme/example",
+        branch="feature/test",
+        base_branch="main",
+        closeout_id="closeout-1",
+        mode="enforce",
+        policy={"merge": "auto"},
+    )
+
+    assert state is not None
+    assert state["workspace"] == {
+        "path": "/mutable/worktree",
+        "canonical_path": "/protected/canonical",
+        "repository": "acme/example",
+        "branch": "feature/test",
+        "base_branch": "main",
+    }
+    assert state["revision"] == 1
+    assert ledger.get(item["id"])["closeout_authoritative"] is False
+    assert ledger.pending_closeouts(due_at=now) == []
+
+    activated = ledger.activate_closeout(
+        item["id"],
+        state,
+        expected_revision=state["revision"],
+    )
+    assert activated is not None
+    assert activated["revision"] == 2
+    handoff_spans = activated["telemetry"]["phase_spans"]
+    assert len(handoff_spans) == 1
+    assert handoff_spans[0]["phase"] == "gateway_handoff"
+    assert handoff_spans[0]["work_id"].startswith("wrk_")
+    assert handoff_spans[0]["attempt_id"].startswith("att_")
+    assert item["id"] not in repr(handoff_spans[0])
+    assert "revision-2" not in repr(handoff_spans[0])
+    assert handoff_spans[0]["metadata"]["operation"].startswith("meta_")
+    assert handoff_spans[0]["metadata"]["source"].startswith("meta_")
+    assert handoff_spans[0]["metadata"]["mode"] == "enforce"
+    assert handoff_spans[0]["metadata"]["surface"] == "gateway"
+    assert ledger.get(item["id"])["closeout_authoritative"] is True
+    assert ledger.pending_closeouts(due_at=now)[0]["id"] == item["id"]
+
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=activated["revision"],
+    )
+    assert leased is not None
+    assert leased["closeout"]["revision"] == 3
+    assert leased["closeout"]["lease_generation"] == 1
+    assert leased["closeout"]["lease"] == {"owner": "watcher-1", "until": 130.0}
+    assert ledger.pending_closeouts(due_at=now) == []
+    now = 110.0
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-2",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+    ) is False
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"] - 1,
+        expected_generation=leased["closeout"]["lease_generation"],
+    ) is False
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"] + 1,
+    ) is False
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+    ) is True
+    renewed = ledger.get(item["id"])["closeout"]
+    assert renewed["revision"] == leased["closeout"]["revision"]
+    assert renewed["lease"] == {"owner": "watcher-1", "until": 140.0}
+    assert ledger.lease_closeout(item["id"], owner="watcher-2", lease_seconds=30) is None
+
+    updated = dict(leased["closeout"])
+    updated["status"] = "waiting_for_ci"
+    updated["next_due_at"] = 160.0
+    released = ledger.release_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=3,
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=updated,
+    )
+    assert released is not None
+    assert released["revision"] == 4
+    assert released["lease"] == {"owner": "", "until": None}
+    assert ledger.pending_closeouts(due_at=150) == []
+    assert ledger.pending_closeouts(due_at=160)[0]["closeout"]["status"] == "waiting_for_ci"
+
+
+def test_expired_closeout_lease_cannot_persist_stale_authoritative_result(tmp_path):
+    now = 100.0
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
+    event = _discord_event(message_id="expired-closeout-lease")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-expired",
+        lease_seconds=1,
+        expected_revision=activated["revision"],
+    )
+    stale = dict(leased["closeout"])
+    stale["status"] = "completed"
+    before = ledger.get(item["id"])
+    now = 102.0
+
+    assert ledger.release_closeout(
+        item["id"],
+        owner="watcher-expired",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=stale,
+    ) is None
+    assert ledger.finalize_blocked_closeout(
+        item["id"],
+        owner="watcher-expired",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state={**stale, "status": "repair_required"},
+        final_response="stale result",
+        reason="stale",
+    ) is None
+    assert ledger.get(item["id"]) == before
+
+
+def test_remote_mutation_fence_survives_replacement_lease_generation(tmp_path):
+    now = {"value": 100.0}
+    ledger = GatewayWorkLedger(
+        tmp_path / "work_ledger.json",
+        now_fn=lambda: now["value"],
+    )
+    event = _discord_event(message_id="closeout-mutation-fence")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        repository="acme/example",
+        branch="feature/test",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    first = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-old",
+        lease_seconds=1,
+        expected_revision=activated["revision"],
+    )
+    assert ledger.record_closeout_mutation_start(
+        item["id"],
+        owner="watcher-old",
+        expected_revision=first["closeout"]["revision"],
+        expected_generation=first["closeout"]["lease_generation"],
+        operation="post_merge_restart",
+        context={
+            "at": 100.0,
+            "head_sha": "a" * 40,
+            "repository": "acme/example",
+            "baseline_pid": 1234,
+            "baseline_start_time": 777,
+        },
+    )
+
+    now["value"] = 102.0
+    replacement = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-new",
+        lease_seconds=30,
+        expected_revision=first["closeout"]["revision"],
+    )
+
+    assert replacement is not None
+    assert replacement["closeout"]["lease_generation"] == 2
+    assert replacement["closeout"]["mutation_uncertainty"] == {
+        "status": "uncertain",
+        "operation": "post_merge_restart",
+        "at": 100.0,
+        "head_sha": "a" * 40,
+        "repository": "acme/example",
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
+    }
+    assert "closeout_mutation_fence" not in ledger.get(item["id"])
+    assert ledger.record_closeout_mutation_uncertainty(
+        item["id"],
+        owner="watcher-old",
+        expected_revision=first["closeout"]["revision"],
+        expected_generation=first["closeout"]["lease_generation"],
+        uncertainty={"status": "uncertain", "operation": "post_merge_restart"},
+    ) is False
+
+
+def test_fable_shadow_activation_is_observational_not_authoritative(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="fable-shadow-closeout")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert item is not None
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        source="fable",
+        mode="shadow",
+    )
+    assert attached is not None
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    assert activated is not None
+
+    stored = ledger.get(item["id"])
+    assert stored["closeout_authoritative"] is False
+    assert ledger.pending_closeouts(due_at=100.0)[0]["id"] == item["id"]
+
+    ledger.mark_agent_done(item["id"], final_response="Legacy Fable finalizer completed.")
+    ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    ledger.mark_summary_updated(item["id"])
+    assert ledger.mark_completed(item["id"]) is True
+    assert ledger.get(item["id"])["status"] == "completed"
+
+
+def test_pending_closeouts_prioritizes_least_recently_claimed_items(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    work_ids = []
+    for index in range(3):
+        event = _discord_event(message_id=f"fair-{index}")
+        item = ledger.accept_event(
+            event,
+            session_key=build_session_key(event.source),
+            freshness_seconds=3600,
+        )
+        attached = ledger.attach_closeout_workspace(
+            item["id"],
+            workspace_path=f"/mutable/worktree-{index}",
+            mode="enforce",
+        )
+        activated = ledger.activate_closeout(
+            item["id"],
+            attached,
+            expected_revision=attached["revision"],
+        )
+        assert activated is not None
+        work_ids.append(item["id"])
+
+    leased = ledger.lease_closeout(
+        work_ids[0],
+        owner="watcher-1",
+        lease_seconds=30,
+    )
+    assert leased is not None
+    assert ledger.release_closeout(
+        work_ids[0],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=leased["closeout"],
+    ) is not None
+
+    pending = ledger.pending_closeouts(due_at=100.0, limit=2)
+    assert [item["id"] for item in pending] == work_ids[1:]
+
+
+def test_startup_does_not_replay_model_work_after_durable_closeout_handoff(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    notifications = []
+    runner.trusted_closeout_watcher = SimpleNamespace(
+        notify=lambda work_id="": notifications.append(work_id)
+    )
+    event = _discord_event(message_id="closeout-recovery")
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert item is not None
+    attached = runner.work_ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    assert attached is not None
+    assert runner.work_ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    ) is not None
+
+    assert runner._schedule_incomplete_discord_work_items() == 0
+    assert notifications == [item["id"]]
+    assert runner.work_ledger.get(item["id"])["status"] == "accepted"
+
+
+def test_startup_closeout_finalization_does_not_overwrite_new_live_run(
+    tmp_path,
+    monkeypatch,
+):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    runner._background_tasks = set()
+    runner.adapters = {}
+    runner._process_epoch = "gateway-new"
+    event = _discord_event(message_id="startup-closeout-run-race")
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=3600,
+    )
+    attached = runner.work_ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    activated = runner.work_ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    completed = dict(activated)
+    completed["status"] = "completed"
+    assert runner.work_ledger.update_closeout(
+        item["id"],
+        completed,
+        expected_revision=activated["revision"],
+    ) is not None
+    runner._session_run_generation = {session_key: 2}
+    runner._running_agents = {session_key: object()}
+    original_mark_agent_done = runner.work_ledger.mark_agent_done
+    raced = False
+
+    def race_then_finalize(work_id, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            assert runner.work_ledger.mark_agent_running(
+                work_id,
+                session_key=session_key,
+                run_generation=2,
+                owner_pid=os.getpid(),
+                process_epoch="gateway-new",
+            )
+        return original_mark_agent_done(work_id, **kwargs)
+
+    monkeypatch.setattr(runner.work_ledger, "mark_agent_done", race_then_finalize)
+
+    assert runner._schedule_incomplete_discord_work_items() == 0
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 2
+    assert stored["active_run"]["process_epoch"] == "gateway-new"
+    assert stored["closeout"]["status"] == "completed"
+    assert "final_response" not in stored
+    assert "summary_status" not in stored
+
+
+def test_blocked_closeout_finalization_is_one_atomic_cas(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="blocked-closeout-cas")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=activated["revision"],
+    )
+    blocked_state = dict(leased["closeout"])
+    blocked_state["status"] = "repair_required"
+
+    winner = ledger.finalize_blocked_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=blocked_state,
+        final_response="Trusted closeout blocked.",
+        reason="trusted_closeout_repair_required",
+    )
+    loser = ledger.finalize_blocked_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=blocked_state,
+        final_response="duplicate",
+        reason="duplicate",
+    )
+
+    assert winner is not None
+    assert loser is None
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    assert stored["final_response"] == "Trusted closeout blocked."
+    assert stored["summary_status"] == "Blocked"
+    assert stored["blocked_reason"] == "trusted_closeout_repair_required"
+    assert stored["closeout"]["status"] == "repair_required"
+    assert stored["terminal_delivery"] == {
+        "source": "trusted_closeout",
+        "status": "pending",
+        "revision": 1,
+        "owner": "",
+        "lease_until": None,
+        "attempt_count": 0,
+        "retry_count": 0,
+        "send_started_at": None,
+        "send_confirmed_at": None,
+        "result_message_id": None,
+        "confirmed_message_ids": [],
+        "summary_updated_at": None,
+    }
+
+
+def test_successful_closeout_finalization_is_one_atomic_cas(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="successful-closeout-cas")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=activated["revision"],
+    )
+    completed_state = dict(leased["closeout"])
+    completed_state["status"] = "completed"
+    expected = ledger.run_state_snapshot(leased)
+
+    winner = ledger.finalize_successful_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=completed_state,
+        final_response="Trusted closeout completed.",
+        expected_run_state=expected,
+    )
+    loser = ledger.finalize_successful_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=completed_state,
+        final_response="duplicate",
+        expected_run_state=expected,
+    )
+
+    assert winner is not None
+    assert loser is None
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_done"
+    assert stored["final_response"] == "Trusted closeout completed."
+    assert stored["closeout"]["status"] == "completed"
+    assert stored["closeout"]["lease"] == {"owner": "", "until": None}
+
+
+def test_blocked_closeout_run_state_cas_preserves_new_live_run_and_closeout(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="blocked-closeout-run-state")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=3600)
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=activated["revision"],
+    )
+    expected = ledger.run_state_snapshot(leased)
+    blocked_state = dict(leased["closeout"])
+    blocked_state["status"] = "repair_required"
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=2,
+        owner_pid=4242,
+        process_epoch="boot-b",
+    )
+    before = ledger.get(item["id"])
+
+    assert ledger.finalize_blocked_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=blocked_state,
+        final_response="stale blocked response",
+        reason="stale_reason",
+        expected_run_state=expected,
+    ) is None
+    assert ledger.get(item["id"]) == before
+    assert "terminal_delivery" not in before
+    assert "blocked_reason" not in before
+
+
+def test_closeout_compare_and_swap_rejects_stale_revision(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="closeout-cas")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert item is not None
+    state = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="shadow",
+    )
+    assert state is not None
+
+    candidate = dict(state)
+    candidate["status"] = "waiting_for_ci"
+    assert ledger.update_closeout(item["id"], candidate, expected_revision=0) is None
+    updated = ledger.update_closeout(item["id"], candidate, expected_revision=1)
+    assert updated is not None
+    assert updated["revision"] == 2
+    assert updated["status"] == "waiting_for_ci"
+
+
+def test_mark_completed_refuses_incomplete_enforced_closeout_without_replay(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="closeout-terminal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    assert item is not None
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+    )
+    assert attached is not None
+    state = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    assert state is not None
+    ledger.mark_agent_done(item["id"], final_response="Implementation model work is complete.")
+    ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    ledger.mark_summary_updated(item["id"])
+
+    assert ledger.mark_completed(item["id"]) is False
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "summary_updated"
+    assert stored["closeout"]["status"] == "pending"
+
+    completed = dict(stored["closeout"])
+    completed["status"] = "completed"
+    assert ledger.update_closeout(
+        item["id"],
+        completed,
+        expected_revision=stored["closeout"]["revision"],
+    ) is not None
+    assert ledger.mark_completed(item["id"]) is True
+    assert ledger.get(item["id"])["status"] == "completed"

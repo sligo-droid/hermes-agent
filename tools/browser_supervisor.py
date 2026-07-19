@@ -21,8 +21,12 @@ Design spec: ``website/docs/developer-guide/browser-supervisor.md``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +36,16 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
+
+
+def _guarded_timeout(execution_guard: Any, timeout: float) -> float:
+    """Check a cooperative guard and bound the next blocking operation."""
+
+    requested = max(0.01, float(timeout))
+    if execution_guard is None:
+        return requested
+    execution_guard.check()
+    return max(0.01, min(requested, execution_guard.remaining()))
 
 
 def _redact_cdp_error_text(exc: object) -> str:
@@ -250,6 +264,7 @@ class ConsoleEvent:
     level: str  # "log" | "error" | "warning" | "exception"
     text: str
     url: Optional[str] = None
+    seq: int = 0
 
 
 @dataclass(frozen=True)
@@ -341,8 +356,10 @@ class CDPSupervisor:
 
         # Dialog auto-dismiss watchdog handles (per dialog id).
         self._dialog_watchdogs: Dict[str, asyncio.TimerHandle] = {}
-        # Monotonic id generator for dialogs (human-readable in snapshots).
+        # Monotonic id generators for dialogs and page diagnostics.
         self._dialog_seq = 0
+        self._diagnostic_seq = 0
+        self._diagnostic_cursor_secret = secrets.token_bytes(32)
 
     # ── Public sync API ──────────────────────────────────────────────────────
 
@@ -507,6 +524,7 @@ class CDPSupervisor:
         return_by_value: bool = True,
         await_promise: bool = True,
         timeout: float = 10.0,
+        execution_guard: Any = None,
     ) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
 
@@ -522,6 +540,7 @@ class CDPSupervisor:
         primitive / plain-object expressions. For DOM nodes or non-serializable
         objects, the browser returns a description string in ``result_type``.
         """
+        timeout = _guarded_timeout(execution_guard, timeout)
         loop = self._loop
         if loop is None or not loop.is_running():
             return {"ok": False, "error": "supervisor loop is not running"}
@@ -535,6 +554,8 @@ class CDPSupervisor:
             return {"ok": False, "error": "supervisor has no attached page session"}
 
         async def _do_eval(by_value: bool) -> Dict[str, Any]:
+            if execution_guard is not None:
+                execution_guard.check()
             return await self._cdp(
                 "Runtime.evaluate",
                 {
@@ -547,11 +568,14 @@ class CDPSupervisor:
                 },
                 session_id=session_id,
                 timeout=timeout,
+                execution_guard=execution_guard,
             )
 
         from agent.async_utils import safe_schedule_threadsafe
 
         def _run_eval(by_value: bool) -> Dict[str, Any]:
+            if execution_guard is not None:
+                execution_guard.check()
             fut = safe_schedule_threadsafe(_do_eval(by_value), loop)
             if fut is None:
                 raise RuntimeError("Browser supervisor loop unavailable")
@@ -603,6 +627,290 @@ class CDPSupervisor:
             value = result_obj.get("description") or result_obj.get("unserializableValue")
 
         return {"ok": True, "result": value, "result_type": result_type}
+
+    def _diagnostic_cursor_token(self, sequence: int) -> str:
+        payload = str(max(0, int(sequence))).encode("ascii")
+        digest = hmac.new(
+            self._diagnostic_cursor_secret,
+            payload,
+            hashlib.sha256,
+        ).hexdigest()[:24]
+        return f"dcur_{payload.decode('ascii')}_{digest}"
+
+    def diagnostic_cursor(self) -> str:
+        """Return a host-issued opaque cursor for the latest diagnostic."""
+
+        with self._state_lock:
+            return self._diagnostic_cursor_token(self._diagnostic_seq)
+
+    def diagnostics_since(self, cursor: str, *, limit: int = 50) -> Dict[str, Any]:
+        """Return safe codes newer than a valid host-issued cursor token."""
+
+        token = str(cursor or "").strip().lower()
+        parts = token.split("_")
+        try:
+            normalized_cursor = int(parts[1])
+        except (IndexError, TypeError, ValueError):
+            normalized_cursor = -1
+        expected = (
+            self._diagnostic_cursor_token(normalized_cursor)
+            if normalized_cursor >= 0
+            else ""
+        )
+        max_items = max(1, min(int(limit or 50), 50))
+        with self._state_lock:
+            current = self._diagnostic_seq
+            valid = (
+                bool(expected)
+                and hmac.compare_digest(token, expected)
+                and normalized_cursor <= current
+            )
+            oldest_retained = self._console_events[0].seq if self._console_events else current + 1
+            history_evicted = valid and normalized_cursor < oldest_retained - 1
+            events = (
+                [event for event in self._console_events if event.seq > normalized_cursor]
+                if valid and not history_evicted
+                else []
+            )
+        current_token = self._diagnostic_cursor_token(current)
+        if not valid:
+            return {
+                "ok": False,
+                "cursor": current_token,
+                "codes": ["invalid_diagnostic_cursor"],
+                "count": 1,
+                "truncated": False,
+            }
+        if history_evicted:
+            return {
+                "ok": False,
+                "cursor": current_token,
+                "codes": ["diagnostic_history_evicted"],
+                "count": 1,
+                "truncated": True,
+            }
+        code_map = {
+            "exception": "runtime_exception",
+            "error": "console_error",
+            "warning": "console_warning",
+        }
+        codes = [code_map[event.level] for event in events if event.level in code_map]
+        return {
+            "ok": True,
+            "cursor": current_token,
+            "codes": codes[:max_items],
+            "count": min(len(codes), max_items),
+            "truncated": len(codes) > max_items,
+        }
+
+    def _trusted_locator_expression(self, locator: Dict[str, Any]) -> str:
+        """Build host-authored JS for one validated declarative locator."""
+
+        by = str(locator.get("by") or "").strip().lower()
+        value = str(locator.get("value") or "").strip()
+        name = str(locator.get("name") or "").strip()
+        if by not in {"test_id", "role", "css"} or not value or len(value) > 200:
+            raise ValueError("invalid trusted locator")
+        if any(ord(char) < 32 for char in value) or (by == "css" and any(char in value for char in "{};")):
+            raise ValueError("invalid trusted locator")
+        spec = json.dumps({"by": by, "value": value, "name": name}, ensure_ascii=True)
+        return f"""(() => {{
+            const spec = {spec};
+            let nodes = [];
+            if (spec.by === 'test_id') {{
+                nodes = Array.from(document.querySelectorAll('[data-testid="' + CSS.escape(spec.value) + '"]'));
+            }} else if (spec.by === 'role') {{
+                nodes = Array.from(document.querySelectorAll('[role="' + CSS.escape(spec.value) + '"]'));
+                if (spec.name) {{
+                    nodes = nodes.filter((node) => ((node.getAttribute('aria-label') || node.textContent || '').trim() === spec.name));
+                }}
+            }} else {{
+                nodes = Array.from(document.querySelectorAll(spec.value));
+            }}
+            const node = nodes[0] || null;
+            if (!node) return {{count: nodes.length, exists: false, visible: false, viewport_contained: false, no_horizontal_overflow: false, bounds: null}};
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            const visible = rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+            return {{
+                count: nodes.length,
+                exists: true,
+                visible,
+                viewport_contained: rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight,
+                no_horizontal_overflow: node.scrollWidth <= node.clientWidth + 1,
+                bounds: {{x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)}},
+            }};
+        }})()"""
+
+    def trusted_element_state(
+        self,
+        locator: Dict[str, Any],
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        """Return count/visibility/geometry facts without exposing DOM text."""
+
+        try:
+            expression = self._trusted_locator_expression(locator)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        result = self.evaluate_runtime(
+            expression,
+            timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+            execution_guard=execution_guard,
+        )
+        if not result.get("ok") or not isinstance(result.get("result"), dict):
+            return {"ok": False, "error": "trusted element lookup failed"}
+        value = result["result"]
+        bounds = value.get("bounds") if isinstance(value.get("bounds"), dict) else None
+        return {
+            "ok": True,
+            "count": max(0, min(int(value.get("count") or 0), 10_000)),
+            "exists": value.get("exists") is True,
+            "visible": value.get("visible") is True,
+            "viewport_contained": value.get("viewport_contained") is True,
+            "no_horizontal_overflow": value.get("no_horizontal_overflow") is True,
+            "bounds": bounds,
+        }
+
+    def trusted_text_present(
+        self,
+        text: str,
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        """Check one bounded literal without returning page content."""
+
+        literal = " ".join(str(text or "").split())
+        if not literal or len(literal) > 80:
+            return {"ok": False, "error": "invalid trusted text assertion"}
+        expression = f"""(() => {{
+            const needle = {json.dumps(literal, ensure_ascii=True)};
+            const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+            let node;
+            while ((node = walker.nextNode())) {{
+                if ((node.nodeValue || '').includes(needle)) return true;
+            }}
+            return false;
+        }})()"""
+        result = self.evaluate_runtime(
+            expression,
+            timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+            execution_guard=execution_guard,
+        )
+        return {"ok": bool(result.get("ok")), "present": result.get("result") is True}
+
+    def trusted_page_overflow(self, *, timeout: float = 10.0) -> Dict[str, Any]:
+        result = self.evaluate_runtime(
+            "(() => document.documentElement.scrollWidth <= window.innerWidth + 1)()",
+            timeout=max(1.0, min(timeout, 10.0)),
+        )
+        return {"ok": bool(result.get("ok")), "no_horizontal_overflow": result.get("result") is True}
+
+    def trusted_state_fingerprint(
+        self,
+        locators: Optional[List[Dict[str, Any]]] = None,
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> str:
+        """Hash bounded trusted state; never return URLs, selectors, or page text."""
+
+        states = []
+        for locator in (locators or [])[:6]:
+            if execution_guard is not None:
+                execution_guard.check()
+            state = self.trusted_element_state(
+                locator,
+                timeout=_guarded_timeout(execution_guard, timeout),
+                execution_guard=execution_guard,
+            )
+            states.append({key: state.get(key) for key in (
+                "ok", "count", "exists", "visible", "viewport_contained",
+                "no_horizontal_overflow", "bounds",
+            )})
+        if execution_guard is not None:
+            execution_guard.check()
+        payload = {
+            "states": states,
+            "diagnostic_cursor": self.diagnostic_cursor(),
+            "active": self.snapshot().active,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:24]
+
+    def _page_cdp_call(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        timeout = _guarded_timeout(execution_guard, timeout)
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "supervisor loop is not running"}
+        with self._state_lock:
+            if not self._active or not self._page_session_id:
+                return {"ok": False, "error": "supervisor has no active page session"}
+            session_id = self._page_session_id
+
+        async def _call() -> Dict[str, Any]:
+            if execution_guard is not None:
+                execution_guard.check()
+            return await self._cdp(
+                method,
+                params or {},
+                session_id=session_id,
+                timeout=timeout,
+                execution_guard=execution_guard,
+            )
+
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            if execution_guard is not None:
+                execution_guard.check()
+            future = safe_schedule_threadsafe(_call(), loop)
+            if future is None:
+                return {"ok": False, "error": "supervisor loop unavailable"}
+            response = future.result(timeout=timeout + 1.0)
+            return {"ok": True, "response": response}
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__}
+
+    def capture_screenshot_memory(
+        self,
+        *,
+        timeout: float = 10.0,
+        max_bytes: int = 8 * 1024 * 1024,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        """Capture PNG bytes in memory only; never write or persist them."""
+
+        response = self._page_cdp_call(
+            "Page.captureScreenshot",
+            {"format": "png", "fromSurface": True, "captureBeyondViewport": False},
+            timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+            execution_guard=execution_guard,
+        )
+        if not response.get("ok"):
+            return response
+        payload = response.get("response") or {}
+        data = (payload.get("result") or {}).get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, str):
+            return {"ok": False, "error": "screenshot data missing"}
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except Exception:
+            return {"ok": False, "error": "screenshot data invalid"}
+        cap = max(1, min(int(max_bytes), 8 * 1024 * 1024))
+        if len(raw) > cap:
+            return {"ok": False, "error": "screenshot exceeds memory budget"}
+        return {"ok": True, "image_bytes": raw, "mime_type": "image/png"}
 
     # ── Supervisor loop internals ────────────────────────────────────────────
 
@@ -827,8 +1135,10 @@ class CDPSupervisor:
         *,
         session_id: Optional[str] = None,
         timeout: float = 10.0,
+        execution_guard: Any = None,
     ) -> Dict[str, Any]:
         """Send a CDP command and await its response."""
+        timeout = _guarded_timeout(execution_guard, timeout)
         if self._ws is None:
             raise RuntimeError("supervisor WebSocket is not connected")
         call_id = self._next_call_id
@@ -838,6 +1148,8 @@ class CDPSupervisor:
             payload["params"] = params
         if session_id:
             payload["sessionId"] = session_id
+        if execution_guard is not None:
+            execution_guard.check()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_calls[call_id] = fut
         await self._ws.send(json.dumps(payload))
@@ -1364,6 +1676,8 @@ class CDPSupervisor:
                     parts.append(str(a.get("value") or a.get("description") or ""))
             event = ConsoleEvent(ts=time.time(), level=level, text=" ".join(parts))
         with self._state_lock:
+            self._diagnostic_seq += 1
+            event.seq = self._diagnostic_seq
             self._console_events.append(event)
             if len(self._console_events) > CONSOLE_HISTORY_MAX * 2:
                 # Keep last CONSOLE_HISTORY_MAX; allow 2x slack to reduce churn.
@@ -1441,12 +1755,14 @@ class _SupervisorRegistry:
         dialog_policy: str = DEFAULT_DIALOG_POLICY,
         dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
         start_timeout: float = 15.0,
+        execution_guard: Any = None,
     ) -> CDPSupervisor:
         """Idempotently ensure a supervisor is running for ``(task_id, cdp_url)``.
 
         If a supervisor exists for this task but was bound to a different
         ``cdp_url``, the old one is stopped and a fresh one is started.
         """
+        start_timeout = _guarded_timeout(execution_guard, start_timeout)
         with self._lock:
             existing = self._by_task.get(task_id)
             if existing is not None:
@@ -1459,8 +1775,12 @@ class _SupervisorRegistry:
                 # URL changed or unhealthy — tear down, fall through to re-create.
                 self._by_task.pop(task_id, None)
         if existing is not None:
+            if execution_guard is not None:
+                execution_guard.check()
             existing.stop()
 
+        if execution_guard is not None:
+            execution_guard.check()
         supervisor = CDPSupervisor(
             task_id=task_id,
             cdp_url=cdp_url,
@@ -1468,13 +1788,29 @@ class _SupervisorRegistry:
             dialog_timeout_s=dialog_timeout_s,
         )
         supervisor.start(timeout=start_timeout)
+        try:
+            if execution_guard is not None:
+                execution_guard.check()
+        except Exception:
+            supervisor.stop()
+            raise
+        cancelled_before_register = False
         with self._lock:
             # Guard against a concurrent get_or_start from another thread.
             already = self._by_task.get(task_id)
-            if already is not None and already.cdp_url == cdp_url:
-                supervisor.stop()
-                return already
-            self._by_task[task_id] = supervisor
+            cancelled_before_register = bool(
+                execution_guard is not None and execution_guard.cancelled
+            )
+            if not cancelled_before_register and not (
+                already is not None and already.cdp_url == cdp_url
+            ):
+                self._by_task[task_id] = supervisor
+        if cancelled_before_register:
+            supervisor.stop()
+            execution_guard.check()
+        if already is not None and already.cdp_url == cdp_url:
+            supervisor.stop()
+            return already
         return supervisor
 
     def stop(self, task_id: str) -> None:

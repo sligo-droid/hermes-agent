@@ -254,6 +254,53 @@ class TestProjectFacts:
         for cmd in facts["verifyCommands"]:
             assert cmd in verify_line
 
+    def test_empty_git_directory_is_not_treated_as_repository(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+
+        assert cc._git_root(tmp_path) is None
+        assert cc.project_facts_for(tmp_path) is None
+
+    def test_project_facts_for_prefers_nearer_manifest_inside_outer_git_root(self, tmp_path):
+        _git_init(tmp_path)
+        nested = tmp_path / "nested-app"
+        nested.mkdir()
+        (nested / "package.json").write_text(
+            json.dumps({"scripts": {"test": "vitest"}})
+        )
+        (nested / "pnpm-lock.yaml").write_text("")
+
+        facts = cc.project_facts_for(nested)
+
+        assert facts is not None
+        assert facts["root"] == str(nested)
+        assert facts["verifyCommands"] == ["pnpm run test"]
+
+    @pytest.mark.parametrize("context_file", ["AGENTS.md", "CLAUDE.md"])
+    def test_nested_instruction_file_keeps_git_project_facts(self, tmp_path, context_file):
+        _git_init(tmp_path)
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {"test": "vitest", "lint": "eslint ."}})
+        )
+        (tmp_path / "pnpm-lock.yaml").write_text("")
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (scripts / "run_tests.sh").write_text("#!/bin/sh\n")
+        nested = tmp_path / "packages" / "feature"
+        nested.mkdir(parents=True)
+        (nested / context_file).write_text("# nested instructions\n")
+
+        facts = cc.project_facts_for(nested)
+
+        assert facts is not None
+        assert facts["root"] == str(tmp_path)
+        assert facts["manifests"] == ["package.json"]
+        assert facts["packageManagers"] == ["pnpm"]
+        assert facts["verifyCommands"] == [
+            "scripts/run_tests.sh",
+            "pnpm run test",
+            "pnpm run lint",
+        ]
+
     def test_project_facts_for_none_outside_workspace(self, tmp_path):
         assert cc.project_facts_for(tmp_path) is None
 

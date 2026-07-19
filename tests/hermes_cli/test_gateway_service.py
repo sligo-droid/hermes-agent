@@ -175,12 +175,16 @@ class TestSystemdServiceRefresh:
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
 
         calls = []
+        target = "a" * 40
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-        monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
+        monkeypatch.setattr(gateway_cli, "_expected_gateway_source_commit", lambda: target)
+        monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None, expected_source_commit="": False)
         monkeypatch.setattr(
             gateway_cli,
             "_wait_for_systemd_service_restart",
-            lambda system=False, previous_pid=None: calls.append(("wait", system, previous_pid)) or True,
+            lambda system=False, previous_pid=None, previous_start_time=None, expected_source_commit="": calls.append(
+                ("wait", system, previous_pid, previous_start_time, expected_source_commit)
+            ) or True,
         )
 
         def fake_run(cmd, check=True, **kwargs):
@@ -197,7 +201,7 @@ class TestSystemdServiceRefresh:
             ["systemctl", "--user", "show", gateway_cli.get_service_name(), "--no-pager", "--property", "ActiveState,SubState,Result,ExecMainStatus,MainPID"],
             ["systemctl", "--user", "reset-failed", gateway_cli.get_service_name()],
             ["systemctl", "--user", "restart", gateway_cli.get_service_name()],
-            ("wait", False, None),
+            ("wait", False, None, None, target),
         ]
 
     def test_systemd_stop_marks_running_gateway_as_planned_stop(self, monkeypatch):
@@ -265,7 +269,7 @@ class TestSystemdServiceRefresh:
         monkeypatch.setattr(
             gateway_cli,
             "_recover_pending_systemd_restart",
-            lambda system=False, previous_pid=None: False,
+            lambda system=False, previous_pid=None, expected_source_commit="": False,
         )
         monkeypatch.setattr(
             gateway_cli,
@@ -1612,10 +1616,13 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        target = "a" * 40
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 654,
         )
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 12345)
+        monkeypatch.setattr(gateway_cli, "_expected_gateway_source_commit", lambda: target)
         monkeypatch.setattr(
             gateway_cli,
             "_graceful_restart_via_sigusr1",
@@ -1638,7 +1645,9 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(
             gateway_cli,
             "_wait_for_systemd_service_restart",
-            lambda system=False, previous_pid=None: calls.append(("wait", system, previous_pid)) or True,
+            lambda system=False, previous_pid=None, previous_start_time=None, expected_source_commit="": calls.append(
+                ("wait", system, previous_pid, previous_start_time, expected_source_commit)
+            ) or True,
         )
 
         gateway_cli.systemd_restart()
@@ -1646,7 +1655,7 @@ class TestGatewaySystemServiceRouting:
         assert ("graceful", 654, 17.0) in calls
         assert any(call[0] == "reset-failed" for call in calls)
         assert any(call[0] == "restart" for call in calls)
-        assert ("wait", False, 654) in calls
+        assert ("wait", False, 654, 12345, target) in calls
         out = capsys.readouterr().out.lower()
         assert "restarting gracefully" in out
 
@@ -1657,7 +1666,10 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
+        target = "b" * 40
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 67890)
+        monkeypatch.setattr(gateway_cli, "_expected_gateway_source_commit", lambda: target)
         monkeypatch.setattr(
             gateway_cli,
             "_read_systemd_unit_properties",
@@ -1678,13 +1690,15 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(
             gateway_cli,
             "_wait_for_systemd_service_restart",
-            lambda system=False, previous_pid=None: calls.append(("wait", system, previous_pid)) or True,
+            lambda system=False, previous_pid=None, previous_start_time=None, expected_source_commit="": calls.append(
+                ("wait", system, previous_pid, previous_start_time, expected_source_commit)
+            ) or True,
         )
 
         gateway_cli.systemd_restart()
 
         assert ("graceful", 777, 15.0) in calls
-        assert ("wait", False, 777) in calls
+        assert ("wait", False, 777, 67890, target) in calls
         assert "restarting gracefully (pid 777)" in capsys.readouterr().out.lower()
 
     def test_systemd_restart_stops_after_graceful_handoff_deferred_by_watcher(self, monkeypatch, capsys):
@@ -1708,8 +1722,21 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_run_systemctl)
 
-        def fake_wait(system=False, previous_pid=None):
-            calls.append(("wait", system, previous_pid))
+        def fake_wait(
+            system=False,
+            previous_pid=None,
+            previous_start_time=None,
+            expected_source_commit="",
+        ):
+            calls.append(
+                (
+                    "wait",
+                    system,
+                    previous_pid,
+                    previous_start_time,
+                    expected_source_commit,
+                )
+            )
             print("⏳ User service restart deferred: active_agents=1; blocking_direct_children=none")
             return False
 
@@ -1721,7 +1748,7 @@ class TestGatewaySystemServiceRouting:
             ("graceful", 654, 15.0),
             ("reset-failed", gateway_cli.get_service_name()),
             ("restart", gateway_cli.get_service_name()),
-            ("wait", False, 654),
+            ("wait", False, 654, None, ""),
         ]
         out = capsys.readouterr().out.lower()
         assert "restart deferred" in out
@@ -1740,18 +1767,106 @@ class TestGatewaySystemServiceRouting:
             },
         )
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 12345)
         monkeypatch.setattr(
             gateway_cli,
             "_gateway_runtime_status_for_pid",
             lambda pid: {
                 "pid": pid,
+                "start_time": 12345,
+                "kind": "hermes-gateway",
+                "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
                 "gateway_state": "running",
+                "restart_requested": False,
                 "platforms": {"discord": {"state": "connected"}},
             },
         )
 
         assert gateway_cli._wait_for_systemd_service_restart(previous_pid=777, timeout=0.1) is True
         assert "restarted (pid 999)" in capsys.readouterr().out.lower()
+
+    def test_gateway_replacement_proof_requires_process_source_and_platform_identity(self, monkeypatch):
+        target = "a" * 40
+        monkeypatch.setattr(gateway_cli, "_runtime_has_connected_configured_platform", lambda state: True)
+        state = {
+            "pid": 999,
+            "start_time": 12345,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+            "gateway_state": "running",
+            "restart_requested": False,
+            "source_commit": target,
+            "source_identity_kind": "git",
+            "source_root": "/trusted/source",
+            "source_dirty": False,
+            "platforms": {"discord": {"state": "connected"}},
+        }
+
+        assert gateway_cli._gateway_replacement_proof(
+            state,
+            manager_pid=999,
+            previous_pid=777,
+            previous_start_time=10000,
+            actual_start_time=12345,
+            expected_source_commit=target,
+        ) == (True, "passed")
+
+        dirty = dict(state, source_dirty=True)
+        assert gateway_cli._gateway_replacement_proof(
+            dirty,
+            manager_pid=999,
+            previous_pid=777,
+            previous_start_time=10000,
+            actual_start_time=12345,
+            expected_source_commit=target,
+        ) == (False, "source_checkout_dirty")
+
+        stale_process = dict(state, pid=777, start_time=10000)
+        assert gateway_cli._gateway_replacement_proof(
+            stale_process,
+            manager_pid=777,
+            previous_pid=777,
+            previous_start_time=10000,
+            actual_start_time=10000,
+            expected_source_commit=target,
+        ) == (False, "replacement_pid_not_changed")
+
+    def test_gateway_replacement_proof_rejects_wrong_source_and_unready_platform(self, monkeypatch):
+        target = "a" * 40
+        state = {
+            "pid": 999,
+            "start_time": 12345,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+            "gateway_state": "running",
+            "restart_requested": False,
+            "source_commit": "b" * 40,
+            "source_identity_kind": "git",
+            "source_root": "/trusted/source",
+            "source_dirty": False,
+            "platforms": {},
+        }
+        monkeypatch.setattr(gateway_cli, "_runtime_has_connected_configured_platform", lambda value: True)
+
+        assert gateway_cli._gateway_replacement_proof(
+            state,
+            manager_pid=999,
+            previous_pid=777,
+            previous_start_time=10000,
+            actual_start_time=12345,
+            expected_source_commit=target,
+        ) == (False, "source_commit_mismatch")
+
+        state["source_commit"] = target
+        monkeypatch.setattr(gateway_cli, "_runtime_has_connected_configured_platform", lambda value: False)
+        assert gateway_cli._gateway_replacement_proof(
+            state,
+            manager_pid=999,
+            previous_pid=777,
+            previous_start_time=10000,
+            actual_start_time=12345,
+            expected_source_commit=target,
+        ) == (False, "platform_not_ready")
 
     def test_wait_for_systemd_restart_defers_on_blocker_evidence(self, monkeypatch, capsys):
         monkeypatch.setattr(
@@ -1826,7 +1941,7 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-        monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
+        monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None, expected_source_commit="": False)
 
         def fake_run_systemctl(args, **kwargs):
             calls.append(args)
@@ -1852,9 +1967,11 @@ class TestGatewaySystemServiceRouting:
         assert "reset-failed" in out
 
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
+        target = "c" * 40
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(gateway_cli, "_expected_gateway_source_commit", lambda: target)
         monkeypatch.setattr(
             "gateway.status.read_runtime_status",
             lambda: {"restart_requested": True, "gateway_state": "stopped"},
@@ -1894,10 +2011,23 @@ class TestGatewaySystemServiceRouting:
             "gateway.status.get_running_pid",
             lambda: 999 if started["value"] else None,
         )
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 24680)
         monkeypatch.setattr(
             gateway_cli,
             "_gateway_runtime_status_for_pid",
-            lambda pid: {"pid": pid, "gateway_state": "running"},
+            lambda pid: {
+                "pid": pid,
+                "start_time": 24680,
+                "kind": "hermes-gateway",
+                "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+                "gateway_state": "running",
+                "restart_requested": False,
+                "source_commit": target,
+                "source_identity_kind": "git",
+                "source_root": "/trusted/source",
+                "source_dirty": False,
+                "platforms": {},
+            },
         )
 
         gateway_cli.systemd_restart()

@@ -174,11 +174,8 @@ curl -s -X POST \
 **使用 gh：**
 
 ```bash
-# One-shot check
-gh pr checks
-
-# Watch until all checks finish (polls every 10s)
-gh pr checks --watch
+# One-shot check of the current PR head. Durable closeout owns continued reconciliation.
+gh pr checks --json name,state,bucket,workflow,link
 ```
 
 **使用 git + curl：**
@@ -209,23 +206,19 @@ for cr in data.get('check_runs', []):
     print(f\"  {cr['name']}: {cr['status']} / {cr['conclusion'] or 'pending'}\")"
 ```
 
-### 轮询直至完成（git + curl）
+### 有界单次查询与持久收尾
+
+不要在前台运行固定次数的 `sleep` 轮询。需要诊断时，对当前精确提交执行一次有界查询：
 
 ```bash
-# Simple polling loop — check every 30 seconds, up to 10 minutes
 SHA=$(git rev-parse HEAD)
-for i in $(seq 1 20); do
-  STATUS=$(curl -s \
-    -H "Authorization: token $GITHUB_TOKEN" \
-    https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
-  echo "Check $i: $STATUS"
-  if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
-    break
-  fi
-  sleep 30
-done
+curl -s \
+  -H "Authorization: token $GITHUB_TOKEN" \
+  https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
+  | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['state'])"
 ```
+
+若结果仍为 pending，请结束当前前台步骤，并把后续检查交给持久收尾所有者（例如网关 watcher、CI 自动化或明确指定的人工负责人）。持久收尾必须保存目标 PR 与精确 head SHA，按计划执行后续单次查询，并在 head 变化时废弃旧结果；不要让一个交互式 agent 通过长时间轮询占住会话。
 
 ## 5. 自动修复 CI 失败
 

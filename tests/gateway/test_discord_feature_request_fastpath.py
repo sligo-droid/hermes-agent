@@ -175,7 +175,9 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "[Recent channel messages]" in init["ephemeral_system_prompt"]
     assert "context compaction summaries are background only" in init["ephemeral_system_prompt"]
     assert "do not treat 'ready for PR'" in init["ephemeral_system_prompt"]
-    assert "github-pr-workflow" in init["ephemeral_system_prompt"]
+    assert "durable trusted closeout" in init["ephemeral_system_prompt"]
+    assert "Do not load github-pr-workflow for routine closeout" in init["ephemeral_system_prompt"]
+    assert "diagnosis or recovery" in init["ephemeral_system_prompt"]
     assert "full lifecycle means code merged, canonical/runtime checkout synced" in init["ephemeral_system_prompt"]
     assert "do not hold the final Discord response open" in init["ephemeral_system_prompt"]
     assert "terminal(background=True, notify_on_complete=True)" in init["ephemeral_system_prompt"]
@@ -202,7 +204,7 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "state the assumption and continue" in init["ephemeral_system_prompt"]
     assert "Simple UI fast lane" in init["ephemeral_system_prompt"]
     assert "instead of spawning a coding worker" in init["ephemeral_system_prompt"]
-    assert "phase timing line" in init["ephemeral_system_prompt"]
+    assert "phase timing line" not in init["ephemeral_system_prompt"]
     assert "contradictory done/not-verified" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
 

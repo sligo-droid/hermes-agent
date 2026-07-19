@@ -1380,6 +1380,75 @@ def _prepare_pnpm_dependency_links(workdir: str) -> list[str]:
     return notes
 
 
+def _persist_fable_closeout(
+    parent_agent: Any,
+    closeout_state: dict[str, Any],
+    loaded_config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    """Persist lifecycle handoff before a coding-worker result can complete."""
+
+    work_item_id = str(
+        getattr(parent_agent, "_origin_work_item_id", "")
+        or getattr(parent_agent, "work_item_id", "")
+        or ""
+    ).strip()
+    if not work_item_id:
+        return None, (
+            "Fable Git lifecycle requires a durable closeout work item; "
+            "refusing to report completion without a persistence sink."
+        )
+    closeout_cfg = loaded_config.get("closeout") if isinstance(loaded_config.get("closeout"), dict) else {}
+    surfaces = closeout_cfg.get("surfaces") if isinstance(closeout_cfg.get("surfaces"), dict) else {}
+    if surfaces.get("fable") is False or str(closeout_cfg.get("mode") or "shadow").lower() == "off":
+        return None, (
+            "Fable Git lifecycle closeout is disabled for this surface; "
+            "refusing to fall back to synchronous CI polling."
+        )
+    try:
+        from gateway.work_ledger import GatewayWorkLedger
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        ledger = getattr(parent_agent, "_closeout_ledger", None) or GatewayWorkLedger()
+        state = normalize_closeout_state(closeout_state)
+        state["mode"] = str(closeout_cfg.get("mode") or state.get("mode") or "shadow").lower()
+        post_merge = closeout_cfg.get("post_merge_requirements")
+        if isinstance(post_merge, dict):
+            state["policy"]["post_merge_requirements"] = {
+                key: post_merge.get(key) is True
+                for key in ("canonical_sync", "ci", "deployment", "production_qa", "restart")
+            }
+        existing_item = ledger.get(work_item_id)
+        if not isinstance(existing_item, dict):
+            return None, "Fable Git lifecycle work item is unavailable in the durable closeout ledger."
+        existing_state = (
+            existing_item.get("closeout")
+            if isinstance(existing_item.get("closeout"), dict)
+            else {}
+        )
+        persisted = ledger.activate_closeout(
+            work_item_id,
+            state,
+            expected_revision=int(existing_state.get("revision") or 0),
+        )
+        if persisted is None:
+            return None, "Fable Git lifecycle closeout revision changed before atomic activation completed."
+        try:
+            from gateway.trusted_closeout_watcher import mark_closeout_dirty
+
+            mark_closeout_dirty(work_item_id)
+        except Exception:
+            pass
+        notify = getattr(parent_agent, "_closeout_notify", None)
+        if callable(notify):
+            try:
+                notify(work_item_id)
+            except Exception:
+                pass
+        return persisted, ""
+    except Exception as exc:
+        return None, f"Fable Git lifecycle closeout persistence failed: {exc}"
+
+
 def _delegate_coding_task_impl(
     task: Optional[str] = None,
     context: Optional[str] = None,
@@ -1617,6 +1686,11 @@ def _delegate_coding_task_impl(
                 cwd=workdir,
                 backend=backend,
                 route_decision=route_decision,
+                worker_tier=(
+                    selected_worker_tier.name
+                    if selected_worker_tier is not None
+                    else worker_tier
+                ),
             )
         except Exception:
             ui_route = None
@@ -2201,13 +2275,51 @@ def _delegate_coding_task_impl(
         try:
             from hermes_cli.fable_git_finalizer import finalize_fable_git_lifecycle
 
+            closeout_cfg = (
+                loaded_config.get("closeout")
+                if isinstance(loaded_config.get("closeout"), dict)
+                else {}
+            )
+            closeout_surfaces = (
+                closeout_cfg.get("surfaces")
+                if isinstance(closeout_cfg.get("surfaces"), dict)
+                else {}
+            )
+            configured_closeout_mode = (
+                "off"
+                if closeout_surfaces.get("fable") is False
+                else str(closeout_cfg.get("mode") or "shadow").strip().lower()
+            )
             finalized = finalize_fable_git_lifecycle(
                 fable_git_preparation,
                 mode=fable_git_lifecycle,
                 task=task_text,
                 worker_summary=turn.final_text,
+                closeout_mode=configured_closeout_mode,
+                verification_runtime_breakdown=getattr(turn, "runtime_breakdown", None),
             )
             fable_git_result = finalized.as_dict()
+            closeout_state = getattr(finalized, "closeout_state", None)
+            if finalized.success and isinstance(closeout_state, dict) and closeout_state:
+                persisted, persistence_error = _persist_fable_closeout(
+                    parent_agent,
+                    closeout_state,
+                    loaded_config,
+                )
+                if persisted is None:
+                    if configured_closeout_mode == "enforce":
+                        success = False
+                        lifecycle_error = persistence_error
+                        fable_git_result["success"] = False
+                        fable_git_result["error"] = persistence_error
+                        fable_git_result["status"] = "closeout_persistence_blocked"
+                    else:
+                        # Shadow state is diagnostic only and cannot displace or
+                        # fail the authorized legacy Fable finalizer.
+                        fable_git_result["closeout_persistence_error"] = persistence_error
+                else:
+                    fable_git_result["closeout_state"] = persisted
+                    fable_git_result["closeout_revision"] = persisted.get("revision")
             if not finalized.success:
                 success = False
                 lifecycle_error = finalized.error or (
@@ -2478,6 +2590,11 @@ def _dispatch_background_coding_task(
         runner=_runner,
         max_async_children=get_coding_worker_background_max_concurrent(loaded_config),
         kind="coding_worker",
+        origin_work_item_id=str(
+            getattr(parent_agent, "_origin_work_item_id", "")
+            or getattr(parent_agent, "work_item_id", "")
+            or ""
+        ),
     )
     if dispatch.get("status") != "dispatched":
         error = str(

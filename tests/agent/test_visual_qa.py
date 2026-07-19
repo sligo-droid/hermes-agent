@@ -2,9 +2,29 @@ from agent.visual_qa import (
     build_visual_qa_followup_nudge,
     classify_visual_requirement,
     normalize_visual_qa_config,
+    normalize_visual_requirement,
     sanitize_visual_receipt,
     visual_receipt_completion,
+    visual_requirement_id,
 )
+
+
+def _receipt(requirement, *, status="passed", order=4):
+    normalized = normalize_visual_requirement(requirement)
+    assertion_ids = [
+        item["id"] for item in normalized["assertions"] if isinstance(item, dict)
+    ]
+    return {
+        "requirement_id": visual_requirement_id(normalized),
+        "contract_id": "vac_" + ("a" * 24),
+        "assertion_ids": assertion_ids,
+        "status": status,
+        "attempts": 1,
+        "vision_calls": 0,
+        "duration_ms": 25,
+        "diagnostic_codes": ["viewport_contained_satisfied"],
+        "order": order,
+    }
 
 
 def test_classifier_recognizes_explicit_artifact_and_surface_work():
@@ -13,8 +33,10 @@ def test_classifier_recognizes_explicit_artifact_and_surface_work():
 
     assert artifact["level"] == "artifact"
     assert artifact["assertions"]
+    assert artifact["assertions"][0]["kind"] == "screenshot_appearance"
     assert surface["level"] == "surface"
     assert surface["assertions"]
+    assert surface["assertions"][0]["kind"] == "no_horizontal_overflow"
 
 
 def test_classifier_excludes_review_only_work():
@@ -43,30 +65,68 @@ def test_classifier_drops_credential_bearing_request_text_from_requirement():
     assert "super-secret" not in serialized
 
 
+def test_durable_visual_requirement_uses_only_opaque_content_ids():
+    protected = [
+        "internal.example.test/admin",
+        "/private/worktree/src/dashboard.tsx",
+        "[data-secret='account-panel']",
+        "api_key=not-a-real-key",
+        "Welcome Alice, balance 123.45",
+    ]
+    requirement = {
+        "level": "surface",
+        "target": protected[0],
+        "assertions": protected[1:],
+    }
+
+    normalized = normalize_visual_requirement(requirement)
+    serialized = repr(normalized)
+
+    assert normalized["target"].startswith("vtarget_")
+    assert all(
+        item["id"].startswith("vassert_")
+        and item["kind"] in {"no_horizontal_overflow", "viewport_contained", "screenshot_appearance"}
+        for item in normalized["assertions"]
+    )
+    for value in protected:
+        assert value not in serialized
+    assert normalize_visual_requirement(normalized) == normalized
+
+
 def test_receipt_requires_safe_assertion_driven_metadata():
     requirement = {
         "level": "artifact",
         "target": "national-map-export",
         "assertions": ["attribution remains inside image bounds"],
     }
-    receipt = sanitize_visual_receipt(
-        {
-            **requirement,
-            "check": "rendered-artifact-inspection",
-            "status": "passed",
-            "evidence_ref": "representative export inspected",
-            "order": 4,
-        },
-        requirement,
-    )
+    receipt = sanitize_visual_receipt(_receipt(requirement), requirement)
 
     assert receipt is not None
     assert receipt["status"] == "passed"
-    assert sanitize_visual_receipt({**receipt, "evidence_ref": "https://user:secret@example.test/export"}) is None
-    assert sanitize_visual_receipt({**receipt, "evidence_ref": "cookie=session-value"}) is None
-    assert sanitize_visual_receipt({**receipt, "evidence_ref": "x" * 241}) is None
-    assert sanitize_visual_receipt({**receipt, "target": "https://example.test/?token=secret"}) is None
-    assert sanitize_visual_receipt({**receipt, "check": "Bearer super-secret"}) is None
+    assert set(receipt) == {
+        "requirement_id",
+        "contract_id",
+        "assertion_ids",
+        "status",
+        "attempts",
+        "vision_calls",
+        "duration_ms",
+        "diagnostic_codes",
+        "order",
+    }
+    assert "secret" not in repr(receipt)
+    assert sanitize_visual_receipt(
+        {**receipt, "evidence_ref": "cookie=session-value"},
+        requirement,
+    ) is None
+    assert sanitize_visual_receipt(
+        {**receipt, "requirement_id": "vrq_" + ("b" * 24)},
+        requirement,
+    ) is None
+    assert sanitize_visual_receipt(
+        {**receipt, "diagnostic_codes": ["model_authored_success"]},
+        requirement,
+    ) is None
 
 
 def test_receipt_completion_uses_latest_fresh_matching_receipt():
@@ -75,14 +135,8 @@ def test_receipt_completion_uses_latest_fresh_matching_receipt():
         "target": "mobile-toolbar",
         "assertions": ["toolbar has no horizontal overflow"],
     }
-    failed = {
-        **requirement,
-        "check": "desktop-browser-inspection",
-        "status": "failed",
-        "evidence_ref": "desktop inspection recorded",
-        "order": 2,
-    }
-    passed = {**failed, "status": "passed", "order": 4, "evidence_ref": "mobile inspection recorded"}
+    failed = _receipt(requirement, status="failed", order=2)
+    passed = _receipt(requirement, status="passed", order=4)
 
     assert visual_receipt_completion(requirement, [failed, passed], min_order=3)["status"] == "passed"
     assert visual_receipt_completion(requirement, [failed, passed], min_order=5)["status"] == "missing"
@@ -103,9 +157,98 @@ def test_visual_followup_is_single_and_requires_code_change():
     assert build_visual_qa_followup_nudge(requirement, [], [], attempts=0) is None
 
 
+def test_classifier_preserves_newline_boundaries_before_assertion_extraction():
+    requirement = classify_visual_requirement(
+        "Implement the responsive toolbar.\n"
+        "Keep the toolbar inside the mobile viewport without horizontal overflow."
+    )
+
+    assert requirement["level"] == "surface"
+    assert len(requirement["assertions"]) == 2
+    assert all(item["id"].startswith("vassert_") for item in requirement["assertions"])
+    assert [item["kind"] for item in requirement["assertions"]] == [
+        "screenshot_appearance",
+        "no_horizontal_overflow",
+    ]
+    assert "responsive toolbar" not in repr(requirement).lower()
+    assert "mobile viewport" not in repr(requirement).lower()
+
+
+def test_uncertain_is_a_safe_non_passing_receipt_status():
+    requirement = {
+        "level": "surface",
+        "target": "mobile-toolbar",
+        "assertions": ["toolbar has no horizontal overflow"],
+    }
+    receipt = sanitize_visual_receipt(
+        _receipt(requirement, status="uncertain", order=2),
+        requirement,
+    )
+
+    assert receipt is not None
+    assert visual_receipt_completion(requirement, [receipt], min_order=2)["status"] == "uncertain"
+
+
+def test_visual_followup_directs_model_to_dedicated_tool():
+    requirement = {
+        "level": "surface",
+        "target": "mobile-toolbar",
+        "assertions": ["toolbar has no horizontal overflow"],
+    }
+
+    nudge = build_visual_qa_followup_nudge(requirement, ["src/toolbar.tsx"], [], attempts=0)
+
+    assert nudge is not None
+    assert "call the `visual_qa` tool" in nudge
+    assert "attach `visual_qa_receipt`" not in nudge
+
+
 def test_config_invalid_values_fall_back_to_bounded_shadow_mode():
-    assert normalize_visual_qa_config({"mode": "enforce_everything", "max_receipts_per_turn": 999}) == {
+    assert normalize_visual_qa_config(
+        {
+            "mode": "enforce_everything",
+            "max_receipts_per_turn": 999,
+            "max_attempts": 999,
+            "max_assertions": 999,
+            "max_vision_calls": 999,
+            "attempt_timeout_s": 999,
+            "total_timeout_s": 999,
+            "max_output_chars": 999_999,
+        }
+    ) == {
         "mode": "shadow",
         "max_receipts_per_turn": 1,
         "max_followup_turns": 1,
+        "max_attempts": 2,
+        "max_assertions": 6,
+        "max_vision_calls": 1,
+        "attempt_timeout_s": 30.0,
+        "total_timeout_s": 60.0,
+        "max_output_chars": 6000,
+    }
+
+
+def test_config_allows_lower_budgets_without_allowing_unbounded_work():
+    normalized = normalize_visual_qa_config(
+        {
+            "mode": "enforce_explicit",
+            "max_attempts": 1,
+            "max_assertions": 2,
+            "max_vision_calls": 0,
+            "attempt_timeout_s": 4,
+            "total_timeout_s": 8,
+            "max_output_chars": 900,
+        }
+    )
+
+    assert normalized == {
+        "mode": "enforce_explicit",
+        "max_receipts_per_turn": 1,
+        "max_followup_turns": 1,
+        "max_attempts": 1,
+        "max_assertions": 2,
+        "max_vision_calls": 0,
+        "attempt_timeout_s": 4.0,
+        "total_timeout_s": 8.0,
+        "max_output_chars": 900,
     }

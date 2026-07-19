@@ -89,6 +89,25 @@ def test_rejects_noncanonical_target_before_running_git(monkeypatch, tmp_path: P
     assert result["error"] == "not canonical"
 
 
+def test_rejects_non_exact_merge_sha_lengths_before_root_resolution(monkeypatch, tmp_path: Path):
+    from tools import canonical_checkout_sync_tool as sync_tool
+
+    root_calls = []
+    monkeypatch.setattr(sync_tool, "_canonical_root", lambda *_args: root_calls.append(_args))
+
+    for invalid in ("a" * 7, "a" * 41, "a" * 63):
+        result = json.loads(
+            sync_tool.sync_canonical_checkout_tool(
+                project_path=str(tmp_path),
+                branch="main",
+                merge_commit=invalid,
+                parent_agent=_parent(),
+            )
+        )
+        assert "exact 40- or 64-character" in result["error"]
+    assert root_calls == []
+
+
 def test_syncs_only_after_root_and_merge_sha_validation(monkeypatch, tmp_path: Path):
     from hermes_cli.canonical_checkout_sync import CanonicalCheckoutSyncResult
     from tools import canonical_checkout_sync_tool as sync_tool

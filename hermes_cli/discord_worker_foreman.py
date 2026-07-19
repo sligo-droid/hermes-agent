@@ -105,7 +105,10 @@ _DISALLOWED_EVIDENCE_KEYS = frozenset(
 )
 _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
     {
+        "closeout_source",
+        "closeout_status",
         "error_excerpt",
+        "green_unmerged_since",
         "heartbeat_age_seconds",
         "last_heartbeat_at",
         "latest_run_error",
@@ -124,6 +127,7 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "manual_intervention_reason",
         "manual_intervention_steps",
         "manual_intervention_type",
+        "pr_number",
         "ready_count",
         "run_error",
         "run_id",
@@ -294,6 +298,7 @@ class BoardSnapshot:
     blocked_reason: str = ""
     request_text: str = ""
     archived: bool = False
+    closeout: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -332,6 +337,7 @@ def collect_foreman_issues(
         issues.extend(detect_worker_errored(snapshot))
         issues.extend(detect_stale_running(snapshot, now=now))
         issues.extend(detect_missing_read_broker(snapshot))
+        issues.extend(detect_green_unmerged_overdue(snapshot))
         issues.extend(detect_stalled_blocked_board(snapshot, now=now, min_age_seconds=min_age))
     return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
 
@@ -1117,6 +1123,11 @@ def _build_board_snapshot(
             or ""
         ),
         archived=archived,
+        closeout=(
+            dict(worker.get("closeout"))
+            if isinstance(worker.get("closeout"), dict)
+            else {}
+        ),
     )
 
 
@@ -1152,6 +1163,65 @@ def detect_worker_errored(snapshot: BoardSnapshot) -> list[ForemanIssue]:
                 )
             )
     return issues
+
+
+def detect_green_unmerged_overdue(snapshot: BoardSnapshot) -> list[ForemanIssue]:
+    """Flag an active auto-merge PR that remains green beyond its threshold."""
+
+    if snapshot.archived or not isinstance(snapshot.closeout, dict) or not snapshot.closeout:
+        return []
+    from hermes_cli.trusted_closeout import normalize_closeout_state
+
+    state = normalize_closeout_state(snapshot.closeout)
+    policy = state["policy"]
+    pr = state["pr"]
+    ci = state["ci"]
+    telemetry = state["telemetry"]
+    head_sha = str(pr.get("head_sha") or "").strip().lower()
+    if (
+        state["mode"] == "off"
+        or policy["merge"] != "auto"
+        or pr["is_draft"]
+        or pr["state"] not in {"OPEN", "UNKNOWN", ""}
+        or not head_sha
+        or not telemetry.get("green_unmerged_overdue")
+        or ci.get("status") != "passed"
+        or str(ci.get("head_sha") or "").strip().lower() != head_sha
+    ):
+        return []
+
+    for key, required_key in (
+        ("local_verification", "require_local_verification"),
+        ("review", "require_review"),
+        ("visual_qa", "require_visual_qa"),
+    ):
+        if not policy[required_key]:
+            continue
+        receipt = state[key]
+        if (
+            str(receipt.get("status") or "").strip().lower()
+            not in {"passed", "approved", "success"}
+            or str(receipt.get("head_sha") or "").strip().lower() != head_sha
+        ):
+            return []
+
+    return [
+        ForemanIssue(
+            kind="green_unmerged_overdue",
+            board=snapshot.board,
+            task_id="closeout",
+            severity="warning",
+            title="PR remains green but unmerged",
+            evidence={
+                "closeout_source": state["source"],
+                "closeout_status": state["status"],
+                "green_unmerged_since": telemetry.get("green_unmerged_since"),
+                "pr_number": pr.get("number"),
+                "session_url": snapshot.session_url,
+                "thread_state": snapshot.thread_state,
+            },
+        )
+    ]
 
 
 def detect_stale_running(snapshot: BoardSnapshot, *, now: int) -> list[ForemanIssue]:

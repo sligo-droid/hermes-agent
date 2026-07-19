@@ -775,6 +775,9 @@ def try_recover_primary_transport(
                 shared=True,
             )
 
+        from agent.auxiliary_client import publish_runtime_main
+
+        publish_runtime_main(agent)
         wait_time = min(3 + retry_count, 8)
         agent._vprint(
             f"{agent.log_prefix}🔁 Transient {error_type} on {agent.provider} — "
@@ -954,6 +957,9 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_activated = False
         agent._fallback_index = 0
 
+        from agent.auxiliary_client import publish_runtime_main
+
+        publish_runtime_main(agent)
         logger.info(
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
@@ -1596,6 +1602,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
 
+    from agent.auxiliary_client import publish_runtime_main
+
+    publish_runtime_main(agent)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,

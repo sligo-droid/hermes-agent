@@ -367,7 +367,7 @@ def _get_dialog_policy_config() -> Tuple[str, float]:
         return DEFAULT_DIALOG_POLICY, DEFAULT_DIALOG_TIMEOUT_S
 
 
-def _ensure_cdp_supervisor(task_id: str) -> None:
+def _ensure_cdp_supervisor(task_id: str, *, execution_guard: Any = None) -> None:
     """Start a CDP supervisor for ``task_id`` if an endpoint is reachable.
 
     Idempotent — delegates to ``SupervisorRegistry.get_or_start`` which skips
@@ -386,6 +386,8 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
+    if execution_guard is not None:
+        execution_guard.check()
     cdp_url = _get_cdp_override()
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
@@ -401,12 +403,20 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
 
         policy, timeout_s = _get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(
-            task_id=task_id,
-            cdp_url=cdp_url,
-            dialog_policy=policy,
-            dialog_timeout_s=timeout_s,
-        )
+        if execution_guard is not None:
+            execution_guard.check()
+        start_kwargs = {
+            "task_id": task_id,
+            "cdp_url": cdp_url,
+            "dialog_policy": policy,
+            "dialog_timeout_s": timeout_s,
+        }
+        if execution_guard is not None:
+            start_kwargs.update(
+                start_timeout=min(15.0, execution_guard.remaining()),
+                execution_guard=execution_guard,
+            )
+        SUPERVISOR_REGISTRY.get_or_start(**start_kwargs)
     except Exception as exc:
         logger.debug(
             "CDP supervisor attach for task=%s failed (non-fatal): %s",
@@ -3441,10 +3451,20 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     for session_key in session_keys:
         _cleanup_single_browser_session(session_key)
 
-    # Drop the last-active pointer only when the bare task is being cleaned
+    # Drop task-scoped state only when the bare task is being cleaned
     # (i.e. not when we're only reaping a sidecar mid-task).
     if not _is_local_sidecar_key(task_id):
         _last_active_session_key.pop(bare_task_id, None)
+        try:
+            from tools.visual_assertion_runner import clear_trusted_visual_mutation
+
+            clear_trusted_visual_mutation(bare_task_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear trusted visual mutation state for task %s",
+                bare_task_id,
+                exc_info=True,
+            )
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:

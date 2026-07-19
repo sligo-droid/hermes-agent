@@ -150,7 +150,7 @@ def test_parent_guidance_keeps_post_worker_checks_minimal(monkeypatch, tmp_path)
     assert "comprehensive testing belongs to the worker" in guidance
 
 
-def test_parent_guidance_names_pr_boundary_workflow(monkeypatch, tmp_path):
+def test_parent_guidance_uses_durable_pr_closeout(monkeypatch, tmp_path):
     hermes_root = tmp_path / "hermes"
     hermes_root.mkdir()
     monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
@@ -164,10 +164,11 @@ def test_parent_guidance_names_pr_boundary_workflow(monkeypatch, tmp_path):
         cwd=str(hermes_root),
     )
 
-    assert "github-pr-workflow" in guidance
     assert "PR boundary" in guidance
     assert "worker returned code changes or a committed repo fix" in guidance
-    assert "complete PR->CI->merge->pull" in guidance
+    assert "persist durable trusted closeout" in guidance
+    assert "Do not load github-pr-workflow for routine closeout" in guidance
+    assert "diagnosis or recovery" in guidance
     assert "review-only or blocked" in guidance
 
 
