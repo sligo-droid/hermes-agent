@@ -178,6 +178,26 @@ def _raw_required_check(
     )
 
 
+def _unrelated_check_runs(count=100, *, start=1):
+    return [
+        {
+            "id": check_id,
+            "name": f"unrelated-{check_id}",
+            "head_sha": HEAD_SHA,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "created_at": f"2026-07-17T00:{(check_id // 60) % 60:02d}:{check_id % 60:02d}Z",
+            "completed_at": f"2026-07-17T01:{(check_id // 60) % 60:02d}:{check_id % 60:02d}Z",
+            "details_url": (
+                f"https://github.com/acme/example/actions/runs/{check_id}/"
+                f"job/{check_id}1"
+            ),
+            "app": {"slug": "github-actions"},
+        }
+        for check_id in range(start, start + count)
+    ]
+
+
 def _patch_repo_boundary(monkeypatch):
     monkeypatch.setattr(closeout, "github_remote_preflight_error", lambda *_a, **_k: None)
     monkeypatch.setattr(closeout, "github_origin_repo", lambda *_a, **_k: "acme/example")
@@ -289,6 +309,7 @@ def test_required_checks_enrich_actual_gh_rollup_with_trusted_rest_identity(tmp_
         item = _check(workflow, name, conclusion=conclusion)
         item.pop("app")
         item.pop("workflow")
+        item["databaseId"] = int(run_id)
         item["detailsUrl"] = f"https://github.com/{repo}/actions/runs/{run_id}/job/{run_id}1"
         return item
 
@@ -505,6 +526,160 @@ def test_required_check_enrichment_is_order_independent_under_bounded_budget(
     assert "_required_check_identity_error" not in enriched
 
 
+def test_shared_reconciliation_finds_failed_required_checks_on_second_page(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic_old, basic_run_old = _raw_required_check(
+        "Basic Tests",
+        "basic",
+        "900",
+        check_id=9000,
+        created_at="2026-07-18T00:00:00Z",
+        completed_at="2026-07-18T00:01:00Z",
+    )
+    raw_basic, basic_run = _raw_required_check(
+        "Basic Tests",
+        "basic",
+        "900",
+        check_id=9001,
+        conclusion="FAILURE",
+        created_at="2026-07-18T00:02:00Z",
+        completed_at="2026-07-18T00:03:00Z",
+    )
+    raw_body, body_run = _raw_required_check(
+        "PR Body Format",
+        "pr body",
+        "901",
+        check_id=9011,
+    )
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(
+                    _pr_payload(checks=[raw_basic_old, raw_basic, raw_body])
+                ),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            page = (
+                [basic_run_old, basic_run, body_run]
+                if "&page=2" in args[2]
+                else _unrelated_check_runs()
+            )
+            return _completed(
+                args,
+                stdout=json.dumps({"total_count": 103, "check_runs": page}),
+            )
+        if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
+            run_id = args[2].rsplit("/", 1)[-1]
+            path = {
+                "900": ".github/workflows/tests.yml",
+                "901": ".github/workflows/pr-body-format.yml",
+            }[run_id]
+            return _completed(
+                args,
+                stdout=json.dumps({"path": path, "head_sha": HEAD_SHA}),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "repair_required"
+    assert transition.state["ci"]["failed"] == ["Basic Tests / basic"]
+    assert transition.state["errors"][-1]["code"] == "required_checks_failed"
+    check_pages = [args[2] for args in calls if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]]
+    assert len(check_pages) == 2
+    assert "&page=2" not in check_pages[0]
+    assert check_pages[1].endswith("&page=2")
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_check_run_page_bound_exhaustion_is_retryable_error(monkeypatch, tmp_path):
+    _patch_repo_boundary(monkeypatch)
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "900")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "901")
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(
+                args,
+                stdout=json.dumps(_pr_payload(checks=[raw_basic, raw_body])),
+            )
+        if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            page = (
+                _unrelated_check_runs(start=101)
+                if "&page=2" in args[2]
+                else _unrelated_check_runs()
+            )
+            return _completed(
+                args,
+                stdout=json.dumps({"total_count": 201, "check_runs": page}),
+            )
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(
+        _state(tmp_path),
+        now=100,
+        run=run,
+    )
+
+    assert transition.outcome == "pending"
+    assert transition.outcome != "waiting_for_ci"
+    error = transition.state["errors"][-1]
+    assert error["code"] == "required_check_identity_failed"
+    assert "pagination budget exhausted" in error["message"]
+    assert len(error["message"]) <= 600
+    assert transition.state["ci"]["status"] == "not_checked"
+    check_pages = [args for args in calls if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]]
+    assert len(check_pages) == 2
+    assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
+
+
+def test_malformed_check_run_pagination_fails_closed(tmp_path):
+    raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "900")
+    raw_body, _body_run = _raw_required_check("PR Body Format", "pr body", "901")
+
+    def run(args, **_kwargs):
+        return _completed(
+            args,
+            stdout=json.dumps(
+                {"total_count": 101, "check_runs": _unrelated_check_runs(count=99)}
+            ),
+        )
+
+    enriched = closeout.enrich_required_check_identities(
+        _pr_payload(checks=[raw_basic, raw_body]),
+        repo="acme/example",
+        root=tmp_path,
+        run=run,
+    )
+
+    assert "pagination was inconsistent" in enriched[
+        "_required_check_identity_error"
+    ]
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+    assert summary["status"] == "pending"
+    assert summary["total"] == 0
+
+
 def test_initial_identity_api_failure_is_retryable_with_durable_error(monkeypatch, tmp_path):
     _patch_repo_boundary(monkeypatch)
     raw_basic, _basic_run = _raw_required_check("Basic Tests", "basic", "101")
@@ -652,9 +827,10 @@ def test_default_command_budget_reaches_merge_after_maximum_identity_lookups(
                 stdout=json.dumps(_pr_payload(checks=raw_checks)),
             )
         if args[:2] == ["gh", "api"] and "/check-runs?" in args[2]:
+            page = check_runs if "&page=2" in args[2] else _unrelated_check_runs()
             return _completed(
                 args,
-                stdout=json.dumps({"check_runs": check_runs}),
+                stdout=json.dumps({"total_count": 108, "check_runs": page}),
             )
         if args[:2] == ["gh", "api"] and "/actions/runs/" in args[2]:
             run_id = args[2].rsplit("/", 1)[-1]
@@ -677,7 +853,7 @@ def test_default_command_budget_reaches_merge_after_maximum_identity_lookups(
     assert transition.outcome == "pending"
     assert transition.wake_immediately is True
     assert transition.state["errors"] == []
-    assert len(calls) == 22
+    assert len(calls) == 24
     merge_calls = [args for args in calls if args[:3] == ["gh", "pr", "merge"]]
     assert len(merge_calls) == 1
     assert merge_calls[0][-2:] == ["--match-head-commit", HEAD_SHA]

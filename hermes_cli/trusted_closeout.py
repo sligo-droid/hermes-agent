@@ -63,8 +63,10 @@ _BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _MAX_ERRORS = 8
 _MAX_ERROR_CHARS = 600
 _MAX_CHECK_FAILURES = 8
-_DEFAULT_MAX_COMMANDS = 24
+_DEFAULT_MAX_COMMANDS = 26
 _MAX_COMMANDS = 32
+_CHECK_RUNS_PER_PAGE = 100
+_MAX_CHECK_RUN_PAGES = 2
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 CanonicalSync = Callable[[str, str, str], Any]
@@ -503,49 +505,173 @@ def enrich_required_check_identities(
         safe = sanitize_closeout_error(detail) or "request failed without diagnostic output"
         errors.append(f"{label}: {safe}")
 
-    try:
-        check_runs_result = run(
-            [
-                "gh",
-                "api",
-                f"repos/{repo}/commits/{head_sha}/check-runs?filter=all&per_page=100",
-            ],
-            cwd=root,
-            timeout=30,
-            github=True,
+    def fail_identity_lookup() -> dict[str, Any]:
+        enriched["_required_check_identity_error"] = sanitize_closeout_error(
+            "; ".join(errors)
         )
-    except Exception as exc:
-        record_error("Required check identity lookup failed", exc)
-        check_runs_result = None
-    if check_runs_result is None or check_runs_result.returncode != 0:
-        if check_runs_result is not None:
+        return enriched
+
+    collected_check_runs: list[dict[str, Any]] = []
+    expected_total: int | None = None
+    total_count_present: bool | None = None
+    collected_count = 0
+    for page in range(1, _MAX_CHECK_RUN_PAGES + 1):
+        endpoint = (
+            f"repos/{repo}/commits/{head_sha}/"
+            f"check-runs?filter=all&per_page={_CHECK_RUNS_PER_PAGE}"
+        )
+        if page > 1:
+            endpoint += f"&page={page}"
+        try:
+            check_runs_result = run(
+                ["gh", "api", endpoint],
+                cwd=root,
+                timeout=30,
+                github=True,
+            )
+        except Exception as exc:
+            record_error("Required check identity lookup failed", exc)
+            return fail_identity_lookup()
+        if check_runs_result.returncode != 0:
             record_error(
                 f"Required check identity lookup failed (exit {check_runs_result.returncode})",
                 check_runs_result.stderr or check_runs_result.stdout,
             )
-        enriched["_required_check_identity_error"] = sanitize_closeout_error("; ".join(errors))
-        return enriched
-    try:
-        check_runs_payload = json.loads(check_runs_result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        record_error("Required check identity lookup returned invalid JSON", exc)
-        enriched["_required_check_identity_error"] = sanitize_closeout_error("; ".join(errors))
-        return enriched
-    raw_check_runs = (
-        check_runs_payload.get("check_runs")
-        if isinstance(check_runs_payload, Mapping)
-        else None
-    )
-    if not isinstance(raw_check_runs, list):
-        record_error("Required check identity lookup returned no check-runs list", "invalid response")
-        enriched["_required_check_identity_error"] = sanitize_closeout_error("; ".join(errors))
-        return enriched
+            return fail_identity_lookup()
+        try:
+            check_runs_payload = json.loads(check_runs_result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            record_error("Required check identity lookup returned invalid JSON", exc)
+            return fail_identity_lookup()
+        if not isinstance(check_runs_payload, Mapping):
+            record_error(
+                "Required check identity lookup returned an invalid page",
+                "response was not an object",
+            )
+            return fail_identity_lookup()
+        page_check_runs = check_runs_payload.get("check_runs")
+        if not isinstance(page_check_runs, list):
+            record_error(
+                "Required check identity lookup returned no check-runs list",
+                "invalid response",
+            )
+            return fail_identity_lookup()
+        if len(page_check_runs) > _CHECK_RUNS_PER_PAGE:
+            record_error(
+                "Required check identity pagination was inconsistent",
+                "a page exceeded the requested page size",
+            )
+            return fail_identity_lookup()
+        if any(not isinstance(item, Mapping) for item in page_check_runs):
+            record_error(
+                "Required check identity lookup returned an invalid check-run",
+                "check-runs entries must be objects",
+            )
+            return fail_identity_lookup()
+
+        page_has_total = "total_count" in check_runs_payload
+        if total_count_present is None:
+            total_count_present = page_has_total
+        elif total_count_present != page_has_total:
+            record_error(
+                "Required check identity pagination was inconsistent",
+                "total_count presence changed between pages",
+            )
+            return fail_identity_lookup()
+        if page_has_total:
+            raw_total = check_runs_payload.get("total_count")
+            if (
+                isinstance(raw_total, bool)
+                or not isinstance(raw_total, int)
+                or raw_total < 0
+            ):
+                record_error(
+                    "Required check identity pagination returned invalid total_count",
+                    "total_count must be a non-negative integer",
+                )
+                return fail_identity_lookup()
+            total_count = raw_total
+            if expected_total is None:
+                expected_total = total_count
+            elif expected_total != total_count:
+                record_error(
+                    "Required check identity pagination was inconsistent",
+                    "total_count changed between pages",
+                )
+                return fail_identity_lookup()
+
+        collected_check_runs.extend(dict(item) for item in page_check_runs)
+        collected_count += len(page_check_runs)
+        if expected_total is not None:
+            if collected_count > expected_total:
+                record_error(
+                    "Required check identity pagination was inconsistent",
+                    "pages contained more entries than total_count",
+                )
+                return fail_identity_lookup()
+            remaining = expected_total - collected_count
+            if remaining == 0:
+                break
+            if len(page_check_runs) < _CHECK_RUNS_PER_PAGE:
+                record_error(
+                    "Required check identity pagination was inconsistent",
+                    "a non-final page was shorter than the requested page size",
+                )
+                return fail_identity_lookup()
+        elif len(page_check_runs) < _CHECK_RUNS_PER_PAGE:
+            break
+
+        if page == _MAX_CHECK_RUN_PAGES:
+            record_error(
+                "Required check identity pagination budget exhausted",
+                f"more than {_MAX_CHECK_RUN_PAGES} check-run pages were required",
+            )
+            return fail_identity_lookup()
+
+    deduplicated_check_runs: dict[int, dict[str, Any]] = {}
+    for raw_check_run in collected_check_runs:
+        raw_id = raw_check_run.get("id")
+        if isinstance(raw_id, bool):
+            check_run_id = 0
+        else:
+            try:
+                check_run_id = int(raw_id)
+            except (TypeError, ValueError):
+                check_run_id = 0
+        if check_run_id <= 0:
+            record_error(
+                "Required check identity lookup returned an invalid check-run ID",
+                "check-run IDs must be positive integers",
+            )
+            return fail_identity_lookup()
+        prior = deduplicated_check_runs.get(check_run_id)
+        current = dict(raw_check_run)
+        if prior is not None and prior != current:
+            record_error(
+                "Required check identity pagination was inconsistent",
+                "a duplicate check-run ID had conflicting data",
+            )
+            return fail_identity_lookup()
+        deduplicated_check_runs[check_run_id] = current
+    if (
+        expected_total is not None
+        and len(deduplicated_check_runs) != expected_total
+    ):
+        record_error(
+            "Required check identity pagination was inconsistent",
+            "deduplicated check-run count did not match total_count",
+        )
+        return fail_identity_lookup()
+    raw_check_runs = [
+        deduplicated_check_runs[check_run_id]
+        for check_run_id in sorted(deduplicated_check_runs)
+    ]
 
     required_by_name = {check: (workflow, check) for workflow, check in REQUIRED_PR_CHECKS}
     grouped: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = {
         identity: {} for identity in REQUIRED_PR_CHECKS
     }
-    for raw_check_run in raw_check_runs[:100]:
+    for raw_check_run in raw_check_runs:
         if not isinstance(raw_check_run, Mapping):
             continue
         app = raw_check_run.get("app")
