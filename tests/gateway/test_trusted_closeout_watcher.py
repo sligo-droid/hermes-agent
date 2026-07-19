@@ -335,6 +335,156 @@ async def test_terminal_closeout_never_overwrites_live_agent(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_terminal_closeout_run_state_cas_rejects_run_started_before_agent_done(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    session_key = str(item["session_key"])
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "completed"
+        updated["next_due_at"] = None
+        return SimpleNamespace(state=updated)
+
+    original_mark_agent_done = ledger.mark_agent_done
+    raced = False
+
+    def race_then_finalize(work_id, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            assert ledger.mark_agent_running(
+                work_id,
+                session_key=session_key,
+                run_generation=2,
+                owner_pid=4242,
+                process_epoch="replacement-process",
+            )
+        return original_mark_agent_done(work_id, **kwargs)
+
+    monkeypatch.setattr(ledger, "mark_agent_done", race_then_finalize)
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        is_agent_active=lambda _stored: False,
+    )
+
+    assert await watcher.run_once() == 1
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 2
+    assert stored["closeout"]["status"] == "completed"
+    assert "final_response" not in stored
+    assert "summary_status" not in stored
+
+
+@pytest.mark.asyncio
+async def test_terminal_closeout_run_state_cas_rejects_run_started_before_completed(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    assert ledger.mark_agent_done(item["id"], final_response="done")
+    assert ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    assert ledger.mark_summary_updated(item["id"])
+    session_key = str(item["session_key"])
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "completed"
+        updated["next_due_at"] = None
+        return SimpleNamespace(state=updated)
+
+    original_mark_completed = ledger.mark_completed
+    raced = False
+
+    def race_then_finalize(work_id, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            assert ledger.mark_agent_running(
+                work_id,
+                session_key=session_key,
+                run_generation=3,
+                owner_pid=4242,
+                process_epoch="replacement-process",
+            )
+        return original_mark_completed(work_id, **kwargs)
+
+    monkeypatch.setattr(ledger, "mark_completed", race_then_finalize)
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        is_agent_active=lambda _stored: False,
+    )
+
+    assert await watcher.run_once() == 1
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 3
+    assert stored["closeout"]["status"] == "completed"
+    assert "result_message_id" not in stored
+
+
+@pytest.mark.asyncio
+async def test_blocked_closeout_run_state_cas_rejects_run_started_before_finalization(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, _state = _pending_item(ledger)
+    session_key = str(item["session_key"])
+
+    def reconcile(value, **_kwargs):
+        updated = dict(value)
+        updated["status"] = "repair_required"
+        updated["next_due_at"] = None
+        return SimpleNamespace(state=updated)
+
+    original_finalize = ledger.finalize_blocked_closeout
+    raced = False
+
+    def race_then_finalize(work_id, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            assert ledger.mark_agent_running(
+                work_id,
+                session_key=session_key,
+                run_generation=4,
+                owner_pid=4242,
+                process_epoch="replacement-process",
+            )
+        return original_finalize(work_id, **kwargs)
+
+    monkeypatch.setattr(ledger, "finalize_blocked_closeout", race_then_finalize)
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        reconcile=reconcile,
+        owner="watcher-1",
+        is_agent_active=lambda _stored: False,
+    )
+
+    assert await watcher.run_once() == 0
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 4
+    assert stored["closeout"]["status"] == "pending"
+    assert "terminal_delivery" not in stored
+    assert "blocked_reason" not in stored
+    assert "final_response" not in stored
+
+
+@pytest.mark.asyncio
 async def test_repair_required_closeout_blocks_once_without_poll_loop(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)

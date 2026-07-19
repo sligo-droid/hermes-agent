@@ -6134,6 +6134,7 @@ class GatewayRunner:
                         work_id,
                         final_response=summary,
                         summary_status="Blocked" if failed_closeout else "Complete",
+                        expected_run_state=ledger.run_state_snapshot(item),
                     )
                     item = ledger.get(work_id) or item
                     status = str(item.get("status") or "")
@@ -6253,6 +6254,7 @@ class GatewayRunner:
         work_id = str(item.get("id") or "")
         if not work_id:
             return
+        expected_run_state = ledger.run_state_snapshot(item)
         try:
             event = ledger.event_from_item(item)
         except Exception as exc:
@@ -6445,10 +6447,14 @@ class GatewayRunner:
                         getattr(result, "error", None),
                     )
                     return
-                ledger.mark_response_delivered(
+                if ledger.mark_response_delivered(
                     work_id,
                     result_message_id=str(getattr(result, "message_id", "") or "") or None,
-                )
+                ):
+                    expected_run_state = {
+                        **expected_run_state,
+                        "status": "response_delivered",
+                    }
 
         summary_ok = await self._update_discord_summaries(
             source=event.source,
@@ -6462,12 +6468,19 @@ class GatewayRunner:
         )
         if summary_ok:
             if item.get("feature_summary") or item.get("project_summary"):
-                ledger.mark_summary_updated(work_id)
+                if ledger.mark_summary_updated(work_id):
+                    expected_run_state = {
+                        **expected_run_state,
+                        "status": "summary_updated",
+                    }
             gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
             if gate and not gate.get("allowed_to_complete"):
                 ledger.mark_blocked(work_id, reason=str(gate.get("reason") or "completion_gate"))
             else:
-                ledger.mark_completed(work_id)
+                ledger.mark_completed(
+                    work_id,
+                    expected_run_state=expected_run_state,
+                )
 
     async def start(self) -> bool:
         """
@@ -13710,6 +13723,7 @@ class GatewayRunner:
 
             # Run the agent
             work_item_id = self._discord_work_item_id_for_event(event, session_key)
+            work_item_expected_run_state = None
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     self._ledger().mark_agent_running(
@@ -13717,6 +13731,13 @@ class GatewayRunner:
                         session_id=session_entry.session_id,
                         session_key=session_key,
                         run_generation=run_generation,
+                        process_epoch=self._process_epoch,
+                    )
+                    work_item_expected_run_state = self._ledger().capture_run_state(
+                        str(work_item_id),
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        owner_pid=os.getpid(),
                         process_epoch=self._process_epoch,
                     )
                     try:
@@ -13961,7 +13982,7 @@ class GatewayRunner:
                             title = self._session_db.get_session_title(session_entry.session_id)
                         except Exception:
                             title = None
-                    self._ledger().mark_agent_done(
+                    agent_done = self._ledger().mark_agent_done(
                         str(work_item_id),
                         final_response=response,
                         session_id=session_entry.session_id,
@@ -13988,19 +14009,33 @@ class GatewayRunner:
                         ),
                         already_delivered=bool(agent_result.get("already_sent"))
                         and not agent_result.get("failed"),
+                        expected_run_state=work_item_expected_run_state,
                     )
-                    try:
-                        from agent.provider_progress import record_provider_progress_signal
-
-                        record_provider_progress_signal(
-                            session_key,
-                            "gateway_ledger_agent_done",
-                            phase="work_ledger",
-                            source="gateway",
-                            metadata={"work_id": str(work_item_id)},
+                    if agent_done:
+                        event.work_item_run_state = self._ledger().run_state_snapshot(
+                            {
+                                "status": (
+                                    "response_delivered"
+                                    if bool(agent_result.get("already_sent"))
+                                    and not agent_result.get("failed")
+                                    else "agent_done"
+                                ),
+                                "active_run": None,
+                            }
                         )
-                    except Exception:
-                        pass
+                    if agent_done:
+                        try:
+                            from agent.provider_progress import record_provider_progress_signal
+
+                            record_provider_progress_signal(
+                                session_key,
+                                "gateway_ledger_agent_done",
+                                phase="work_ledger",
+                                source="gateway",
+                                metadata={"work_id": str(work_item_id)},
+                            )
+                        except Exception:
+                            pass
                 except Exception as exc:
                     logger.debug("Discord work ledger agent_done update failed: %s", exc)
 
@@ -14250,9 +14285,24 @@ class GatewayRunner:
                     and not _pending_background_workers
                 ):
                     try:
+                        expected_run_state = getattr(event, "work_item_run_state", None)
                         if turn_feature_summary or getattr(event, "project_summary", None):
-                            self._ledger().mark_summary_updated(str(work_item_id))
-                        self._ledger().mark_completed(str(work_item_id))
+                            if self._ledger().mark_summary_updated(str(work_item_id)) and isinstance(
+                                expected_run_state,
+                                dict,
+                            ):
+                                expected_run_state = {
+                                    **expected_run_state,
+                                    "status": "summary_updated",
+                                }
+                                event.work_item_run_state = expected_run_state
+                        completion_kwargs = {}
+                        if isinstance(expected_run_state, dict):
+                            completion_kwargs["expected_run_state"] = expected_run_state
+                        self._ledger().mark_completed(
+                            str(work_item_id),
+                            **completion_kwargs,
+                        )
                     except Exception as exc:
                         logger.debug("Discord work ledger summary completion update failed: %s", exc)
             else:
@@ -16929,9 +16979,24 @@ class GatewayRunner:
             )
             if summary_ok and work_item_id and not pending_background:
                 try:
+                    expected_run_state = getattr(event, "work_item_run_state", None)
                     if feature_summary or project_summary:
-                        self._ledger().mark_summary_updated(str(work_item_id))
-                    self._ledger().mark_completed(str(work_item_id))
+                        if self._ledger().mark_summary_updated(str(work_item_id)) and isinstance(
+                            expected_run_state,
+                            dict,
+                        ):
+                            expected_run_state = {
+                                **expected_run_state,
+                                "status": "summary_updated",
+                            }
+                            event.work_item_run_state = expected_run_state
+                    completion_kwargs = {}
+                    if isinstance(expected_run_state, dict):
+                        completion_kwargs["expected_run_state"] = expected_run_state
+                    self._ledger().mark_completed(
+                        str(work_item_id),
+                        **completion_kwargs,
+                    )
                 except Exception as exc:
                     logger.debug("Discord work ledger summary completion update failed: %s", exc)
             return summary_ok
@@ -21189,8 +21254,31 @@ class GatewayRunner:
             )
             if summary_ok and work_item_id and not pending_background:
                 try:
-                    self._ledger().mark_summary_updated(str(work_item_id))
-                    self._ledger().mark_completed(str(work_item_id))
+                    ledger = self._ledger()
+                    snapshot_fn = getattr(ledger, "run_state_snapshot", None)
+                    get_fn = getattr(ledger, "get", None)
+                    if callable(snapshot_fn) and callable(get_fn):
+                        stored = get_fn(str(work_item_id)) or {}
+                        expected_run_state = snapshot_fn(stored)
+                        if (
+                            expected_run_state["active_run"] is not None
+                            or expected_run_state["status"] in {"claimed", "agent_running"}
+                        ):
+                            return
+                        if ledger.mark_summary_updated(str(work_item_id)):
+                            expected_run_state = {
+                                **expected_run_state,
+                                "status": "summary_updated",
+                            }
+                        ledger.mark_completed(
+                            str(work_item_id),
+                            expected_run_state=expected_run_state,
+                        )
+                    else:
+                        # Preserve lightweight legacy/test ledger adapters that
+                        # do not implement the durable run-state CAS surface.
+                        ledger.mark_summary_updated(str(work_item_id))
+                        ledger.mark_completed(str(work_item_id))
                 except Exception:
                     logger.debug(
                         "Suppressed async ledger finalization failed",

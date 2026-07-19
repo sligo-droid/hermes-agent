@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from agent.verification_evidence import record_terminal_result
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
+from gateway.work_ledger import GatewayWorkLedger
 from hermes_cli.config import DEFAULT_CONFIG
 from tools.canonical_repo_guard import canonical_main_terminal_violation
 
@@ -786,6 +788,68 @@ def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunn
         }
     )
     return runner
+
+
+@pytest.mark.asyncio
+async def test_direct_agent_result_cas_does_not_overwrite_replacement_run(tmp_path):
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    runner.work_ledger = GatewayWorkLedger(
+        tmp_path / "work_ledger.json",
+        now_fn=lambda: 100.0,
+    )
+    source = _source(tmp_path)
+    event = MessageEvent(
+        text="Do the work",
+        source=source,
+        message_id="direct-result-race",
+    )
+    session_key = "agent:main:discord:thread:thread-123"
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert item is not None
+    event.work_item_id = item["id"]
+    runner._discord_work_item_id_for_event = lambda *_args, **_kwargs: item["id"]
+    runner._activate_direct_closeout_after_checkpoint = lambda *_args, **_kwargs: None
+
+    async def replace_run_before_result(**_kwargs):
+        assert runner.work_ledger.mark_agent_running(
+            item["id"],
+            session_key=session_key,
+            run_generation=2,
+            owner_pid=os.getpid(),
+            process_epoch="replacement-process",
+        )
+        return {
+            "final_response": "stale direct result",
+            "messages": [
+                {"role": "user", "content": event.text},
+                {"role": "assistant", "content": "stale direct result"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+
+    runner._run_agent = AsyncMock(side_effect=replace_run_before_result)
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        1,
+    )
+
+    assert response.startswith("stale direct result")
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["active_run"]["generation"] == 2
+    assert stored["active_run"]["process_epoch"] == "replacement-process"
+    assert "final_response" not in stored
+    assert not hasattr(event, "work_item_run_state")
 
 
 @pytest.mark.asyncio

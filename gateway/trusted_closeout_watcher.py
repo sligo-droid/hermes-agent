@@ -247,6 +247,7 @@ class TrustedCloseoutWatcher:
                 }
                 if next_blocked:
                     stored = self.ledger.get(work_id) or leased
+                    expected_run_state = self.ledger.run_state_snapshot(stored)
                     if (
                         stored.get("status") in {"claimed", "agent_running"}
                         and self.is_agent_active(stored)
@@ -275,6 +276,7 @@ class TrustedCloseoutWatcher:
                             "Trusted closeout blocked: a deterministic lifecycle gate requires repair."
                         ),
                         reason="trusted_closeout_repair_required",
+                        expected_run_state=expected_run_state,
                     )
                     if blocked is None:
                         return False
@@ -301,6 +303,7 @@ class TrustedCloseoutWatcher:
                     self.wakeup.set()
                 if closeout_terminal_eligible(released):
                     stored = self.ledger.get(work_id) or {}
+                    expected_run_state = self.ledger.run_state_snapshot(stored)
                     if (
                         stored.get("status") in {"claimed", "agent_running"}
                         and self.is_agent_active(stored)
@@ -314,15 +317,25 @@ class TrustedCloseoutWatcher:
                             summary = "Trusted closeout completed: the PR is open and intentionally unmerged under the configured policy."
                         else:
                             summary = "Trusted closeout completed: the PR merge and all configured closeout gates passed."
-                        await asyncio.to_thread(
+                        finalized = await asyncio.to_thread(
                             self.ledger.mark_agent_done,
                             work_id,
                             final_response=summary,
                             summary_status="Complete",
+                            expected_run_state=expected_run_state,
                         )
+                        if not finalized:
+                            return True
                         stored = self.ledger.get(work_id) or stored
+                        expected_run_state = self.ledger.run_state_snapshot(stored)
                     if stored.get("status") == "summary_updated":
-                        await asyncio.to_thread(self.ledger.mark_completed, work_id)
+                        completed = await asyncio.to_thread(
+                            self.ledger.mark_completed,
+                            work_id,
+                            expected_run_state=expected_run_state,
+                        )
+                        if not completed:
+                            return True
                         stored = self.ledger.get(work_id) or stored
                     callback = self.on_terminal
                     if callback is not None:

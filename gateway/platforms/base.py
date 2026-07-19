@@ -3936,10 +3936,13 @@ class BasePlatformAdapter(ABC):
             from gateway.work_ledger import GatewayWorkLedger
 
             result_message_id = getattr(result, "message_id", None)
-            GatewayWorkLedger().mark_completed(
-                str(work_item_id),
-                result_message_id=str(result_message_id) if result_message_id else None,
-            )
+            kwargs: dict[str, Any] = {
+                "result_message_id": str(result_message_id) if result_message_id else None,
+            }
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            if isinstance(expected_run_state, dict):
+                kwargs["expected_run_state"] = expected_run_state
+            GatewayWorkLedger().mark_completed(str(work_item_id), **kwargs)
         except Exception as exc:
             logger.warning("[%s] Failed to mark work item completed: %s", self.name, exc)
 
@@ -3951,10 +3954,16 @@ class BasePlatformAdapter(ABC):
             from gateway.work_ledger import GatewayWorkLedger
 
             result_message_id = getattr(result, "message_id", None)
-            GatewayWorkLedger().mark_response_delivered(
+            delivered = GatewayWorkLedger().mark_response_delivered(
                 str(work_item_id),
                 result_message_id=str(result_message_id) if result_message_id else None,
             )
+            expected_run_state = getattr(event, "work_item_run_state", None)
+            if delivered and isinstance(expected_run_state, dict):
+                event.work_item_run_state = {
+                    **expected_run_state,
+                    "status": "response_delivered",
+                }
         except Exception as exc:
             logger.warning("[%s] Failed to mark work item response delivered: %s", self.name, exc)
 

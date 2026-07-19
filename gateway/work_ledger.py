@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import os
 import json
 import math
@@ -48,6 +49,12 @@ _CLOSEOUT_LOCK_TIMEOUT_SECONDS = 5.0
 _CLOSEOUT_LOCK_POLL_SECONDS = 0.05
 _PROCESS_LEDGER_LOCK = threading.RLock()
 _DROP = object()
+_RUN_STATE_UNSET = object()
+_RUN_OWNED_STATUSES = frozenset({"claimed", "agent_running"})
+_RUN_STATE_TEXT_LIMIT = 240
+_RUN_STATE_EPOCH_LIMIT = 160
+_RUN_STATE_INT_LIMIT = (1 << 63) - 1
+_RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 
 
 _PROJECT_SOURCE_KEYS = frozenset(
@@ -300,6 +307,75 @@ def _positive_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _bounded_run_state_text(value: Any, *, limit: int = _RUN_STATE_TEXT_LIMIT) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    prefix_limit = max(0, limit - len(digest) - 1)
+    return f"{text[:prefix_limit]}:{digest}"
+
+
+def _bounded_run_state_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(_RUN_STATE_INT_LIMIT, max(0, number))
+
+
+def _bounded_run_state_lease(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        lease = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(lease):
+        return None
+    return max(-_RUN_STATE_LEASE_LIMIT, min(_RUN_STATE_LEASE_LIMIT, lease))
+
+
+def _normalize_run_state_snapshot(item: Any) -> dict[str, Any]:
+    """Return the bounded ownership fields used by finalization CAS checks."""
+
+    source = item if isinstance(item, dict) else {}
+    raw_active = source.get("active_run")
+    active_run = None
+    if isinstance(raw_active, dict):
+        active_run = {
+            "session_key": _bounded_run_state_text(raw_active.get("session_key")),
+            "generation": _bounded_run_state_int(raw_active.get("generation")),
+            "owner_pid": _bounded_run_state_int(raw_active.get("owner_pid")),
+            "process_epoch": _bounded_run_state_text(
+                raw_active.get("process_epoch"),
+                limit=_RUN_STATE_EPOCH_LIMIT,
+            ),
+            "lease_until": _bounded_run_state_lease(raw_active.get("lease_until")),
+        }
+    return {
+        "status": _bounded_run_state_text(source.get("status")),
+        "active_run": active_run,
+    }
+
+
+def _run_state_matches(item: dict[str, Any], expected_run_state: Any) -> bool:
+    current = _normalize_run_state_snapshot(item)
+    if expected_run_state is _RUN_STATE_UNSET:
+        # Legacy callers remain safe only when no run can own the item. A
+        # claimed/running legacy item may lack active_run metadata, so status is
+        # part of the fail-closed omission check.
+        return (
+            current["active_run"] is None
+            and current["status"] not in _RUN_OWNED_STATUSES
+        )
+    if not isinstance(expected_run_state, dict):
+        return False
+    return current == _normalize_run_state_snapshot(expected_run_state)
 
 
 def _apply_visual_qa_completion(item: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
@@ -873,6 +949,41 @@ class GatewayWorkLedger:
         item = self._read().get("items", {}).get(work_id)
         return dict(item) if isinstance(item, dict) else None
 
+    @staticmethod
+    def run_state_snapshot(item: Any) -> dict[str, Any]:
+        """Normalize one observed item into the bounded finalization CAS state."""
+
+        return _normalize_run_state_snapshot(item)
+
+    def capture_run_state(
+        self,
+        work_id: str,
+        *,
+        session_key: str,
+        run_generation: int,
+        owner_pid: int,
+        process_epoch: str,
+    ) -> dict[str, Any] | None:
+        """Capture the exact active run only when the requested owner still holds it."""
+
+        with _ledger_file_lock(self.path):
+            item = self._read().get("items", {}).get(work_id)
+            if not isinstance(item, dict):
+                return None
+            snapshot = _normalize_run_state_snapshot(item)
+            active_run = snapshot.get("active_run")
+            if not isinstance(active_run, dict):
+                return None
+            if (
+                active_run["session_key"] != _bounded_run_state_text(session_key)
+                or active_run["generation"] != _bounded_run_state_int(run_generation)
+                or active_run["owner_pid"] != _bounded_run_state_int(owner_pid)
+                or active_run["process_epoch"]
+                != _bounded_run_state_text(process_epoch, limit=_RUN_STATE_EPOCH_LIMIT)
+            ):
+                return None
+            return snapshot
+
     def attach_closeout_workspace(
         self,
         work_id: str,
@@ -1132,6 +1243,7 @@ class GatewayWorkLedger:
         closeout_state: dict[str, Any],
         final_response: str,
         reason: str,
+        expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> dict[str, Any] | None:
         """CAS the leased closeout and blocked delivery record in one write."""
 
@@ -1141,6 +1253,8 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if not _run_state_matches(item, expected_run_state):
                 return None
             current = normalize_closeout_state(item["closeout"])
             if int(current.get("revision") or 0) != int(expected_revision):
@@ -1589,10 +1703,11 @@ class GatewayWorkLedger:
         visual_qa_code_mutation_observed: bool | None = None,
         visual_qa_min_receipt_order: int | None = None,
         already_delivered: bool = False,
+        expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         now = self._now()
         item["status"] = "response_delivered" if already_delivered else "agent_done"
@@ -1688,10 +1803,16 @@ class GatewayWorkLedger:
         return True
 
     @_locked_ledger_mutation
-    def mark_completed(self, work_id: str, *, result_message_id: str | None = None) -> bool:
+    def mark_completed(
+        self,
+        work_id: str,
+        *,
+        result_message_id: str | None = None,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
             return False
         if item.get("closeout_authoritative") is True and isinstance(item.get("closeout"), dict):
             from hermes_cli.trusted_closeout import closeout_terminal_eligible, normalize_closeout_state
