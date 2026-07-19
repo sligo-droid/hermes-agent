@@ -39,6 +39,7 @@ import signal
 import tempfile
 import threading
 import time
+import uuid
 import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
@@ -76,6 +77,9 @@ _DISCORD_FOREMAN_DEFAULT_MENTION = "<@&1503914570077442058>"
 _DISCORD_WORKER_TASK_THREAD_STATE_KEY = "worker_task_thread"
 _DISCORD_LEGACY_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
 _DISCORD_WORKER_DIRTY_MARKER_POLL_SECS = 0.2
+_TERMINAL_DELIVERY_RETRY_MAX_ATTEMPTS = 3
+_TERMINAL_DELIVERY_RETRY_BASE_SECONDS = 1.0
+_GATEWAY_PROCESS_EPOCH = f"{time.time_ns()}-{uuid.uuid4().hex}"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
@@ -3195,6 +3199,7 @@ class GatewayRunner:
             on_terminal=self._on_trusted_closeout_terminal,
         )
         self.delivery_router = DeliveryRouter(self.config)
+        self._process_epoch = _GATEWAY_PROCESS_EPOCH
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -3399,6 +3404,7 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._terminal_delivery_retry_tasks: Dict[str, asyncio.Task] = {}
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -4828,6 +4834,7 @@ class GatewayRunner:
             item,
             session_key=session_key,
             run_generation=generation,
+            process_epoch=str(getattr(self, "_process_epoch", "") or ""),
             registry_active=True,
         )
 
@@ -6157,7 +6164,73 @@ class GatewayRunner:
             logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
         return scheduled
 
-    async def _resume_finished_discord_work_item(self, item: Dict[str, Any]) -> None:
+    def _schedule_terminal_delivery_retry(self, work_id: str, *, attempt: int) -> bool:
+        """Schedule one bounded, deduplicated retry without invoking a model."""
+
+        if not work_id or attempt > _TERMINAL_DELIVERY_RETRY_MAX_ATTEMPTS:
+            return False
+        if self.__dict__.get("_running") is False:
+            return False
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is not None and shutdown_event.is_set():
+            return False
+        tasks = self.__dict__.setdefault("_terminal_delivery_retry_tasks", {})
+        existing = tasks.get(work_id)
+        current_task = asyncio.current_task()
+        if existing is not None and not existing.done() and existing is not current_task:
+            return False
+
+        async def retry() -> None:
+            delay = min(
+                30.0,
+                _TERMINAL_DELIVERY_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1)),
+            )
+            try:
+                if shutdown_event is None:
+                    await asyncio.sleep(delay)
+                else:
+                    try:
+                        await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+                        return
+                    except TimeoutError:
+                        pass
+                if self.__dict__.get("_running") is False:
+                    return
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return
+                fresh = self._ledger().get(work_id)
+                if not isinstance(fresh, dict):
+                    return
+                delivery = (
+                    fresh.get("terminal_delivery")
+                    if isinstance(fresh.get("terminal_delivery"), dict)
+                    else {}
+                )
+                if (
+                    fresh.get("status") == "blocked"
+                    and str(delivery.get("status") or "") not in {"completed"}
+                ):
+                    await self._resume_finished_discord_work_item(
+                        fresh,
+                        _delivery_retry_attempt=attempt,
+                    )
+            finally:
+                if tasks.get(work_id) is asyncio.current_task():
+                    tasks.pop(work_id, None)
+
+        task = asyncio.create_task(retry())
+        tasks[work_id] = task
+        background_tasks = self.__dict__.setdefault("_background_tasks", set())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return True
+
+    async def _resume_finished_discord_work_item(
+        self,
+        item: Dict[str, Any],
+        *,
+        _delivery_retry_attempt: int = 0,
+    ) -> None:
         """Finish Discord work after the agent result was durably recorded."""
         ledger = self._ledger()
         work_id = str(item.get("id") or "")
@@ -6186,43 +6259,104 @@ class GatewayRunner:
                 return
             item = claimed
             delivery = item.get("terminal_delivery") if isinstance(item.get("terminal_delivery"), dict) else {}
+            delivery_status = str(delivery.get("status") or "")
             final_response = str(item.get("final_response") or "")
-            try:
-                if final_response and not str(delivery.get("result_message_id") or ""):
-                    metadata = {"notify": True}
-                    try:
-                        from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
+            send_confirmed = bool(
+                delivery.get("send_confirmed_at")
+                or str(delivery.get("result_message_id") or "").strip()
+            )
+            if final_response and delivery_status != "uncertain" and not send_confirmed:
+                began = await asyncio.to_thread(
+                    ledger.begin_terminal_send_attempt,
+                    work_id,
+                    owner=delivery_owner,
+                )
+                if not began:
+                    return
+                metadata = {"notify": True}
+                try:
+                    from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
 
-                        metadata = _thread_metadata_for_source(
-                            event.source,
-                            _reply_anchor_for_event(event),
-                        ) or {}
-                        metadata = dict(metadata)
-                        metadata["notify"] = True
-                        reply_to = _reply_anchor_for_event(event)
-                    except Exception:
-                        reply_to = item.get("reply_to_message_id") or item.get("message_id")
+                    metadata = _thread_metadata_for_source(
+                        event.source,
+                        _reply_anchor_for_event(event),
+                    ) or {}
+                    metadata = dict(metadata)
+                    metadata["notify"] = True
+                    reply_to = _reply_anchor_for_event(event)
+                except Exception:
+                    reply_to = item.get("reply_to_message_id") or item.get("message_id")
+                try:
                     result = await adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=final_response,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
-                    if not getattr(result, "success", False):
-                        await asyncio.to_thread(
-                            ledger.release_terminal_delivery,
-                            work_id,
-                            owner=delivery_owner,
-                        )
-                        return
-                    await asyncio.to_thread(
-                        ledger.mark_terminal_response_delivered,
+                except Exception:
+                    # Once the side effect was attempted, an exception is
+                    # ambiguous. Surface uncertainty rather than risking an
+                    # automatic duplicate blocked response.
+                    uncertain = await asyncio.to_thread(
+                        ledger.mark_terminal_delivery_uncertain,
                         work_id,
                         owner=delivery_owner,
-                        result_message_id=(
-                            str(getattr(result, "message_id", "") or "") or None
-                        ),
                     )
+                    if not uncertain:
+                        return
+                    item = ledger.get(work_id) or item
+                    delivery_status = "uncertain"
+                else:
+                    if not getattr(result, "success", False):
+                        error_text = str(getattr(result, "error", "") or "")
+                        timeout_check = getattr(adapter, "_is_timeout_error", None)
+                        ambiguous_failure = bool(
+                            callable(timeout_check) and timeout_check(error_text)
+                        )
+                        if ambiguous_failure:
+                            uncertain = await asyncio.to_thread(
+                                ledger.mark_terminal_delivery_uncertain,
+                                work_id,
+                                owner=delivery_owner,
+                                reason="send_timeout_outcome_unknown",
+                            )
+                            if not uncertain:
+                                return
+                            item = ledger.get(work_id) or item
+                            delivery_status = "uncertain"
+                        else:
+                            await asyncio.to_thread(
+                                ledger.release_terminal_delivery,
+                                work_id,
+                                owner=delivery_owner,
+                            )
+                            self._schedule_terminal_delivery_retry(
+                                work_id,
+                                attempt=_delivery_retry_attempt + 1,
+                            )
+                            return
+                    else:
+                        try:
+                            persisted = await asyncio.to_thread(
+                                ledger.mark_terminal_response_delivered,
+                                work_id,
+                                owner=delivery_owner,
+                                result_message_id=(
+                                    str(getattr(result, "message_id", "") or "") or None
+                                ),
+                            )
+                        except Exception:
+                            # Crash-window injection and real persistence failures
+                            # intentionally leave the durable `sending` attempt for
+                            # expiry recovery to convert to `uncertain`.
+                            logger.warning(
+                                "Terminal response sent but receipt persistence failed for %s",
+                                work_id,
+                            )
+                            return
+                        if not persisted:
+                            return
+            try:
                 summary_ok = await self._update_discord_summaries(
                     source=event.source,
                     feature_summary=item.get("feature_summary"),
@@ -6237,25 +6371,24 @@ class GatewayRunner:
                         else None
                     ),
                 )
-                if summary_ok:
-                    await asyncio.to_thread(
-                        ledger.complete_terminal_delivery,
-                        work_id,
-                        owner=delivery_owner,
-                    )
-                else:
-                    await asyncio.to_thread(
-                        ledger.release_terminal_delivery,
-                        work_id,
-                        owner=delivery_owner,
-                    )
             except Exception:
+                summary_ok = False
+            if summary_ok:
+                await asyncio.to_thread(
+                    ledger.complete_terminal_delivery,
+                    work_id,
+                    owner=delivery_owner,
+                )
+            else:
                 await asyncio.to_thread(
                     ledger.release_terminal_delivery,
                     work_id,
                     owner=delivery_owner,
                 )
-                raise
+                self._schedule_terminal_delivery_retry(
+                    work_id,
+                    attempt=_delivery_retry_attempt + 1,
+                )
             return
 
         if status == "agent_done":
@@ -10401,6 +10534,9 @@ class GatewayRunner:
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+            retry_tasks = getattr(self, "_terminal_delivery_retry_tasks", None)
+            if isinstance(retry_tasks, dict):
+                retry_tasks.clear()
 
             self.adapters.clear()
             if hasattr(self, '_profile_adapters'):
@@ -12382,6 +12518,7 @@ class GatewayRunner:
                     _work_item_id,
                     session_key=_quick_key,
                     run_generation=_run_generation,
+                    process_epoch=self._process_epoch,
                 )
             except Exception:
                 logger.debug("Discord work ledger run-generation claim failed", exc_info=True)
@@ -13554,6 +13691,7 @@ class GatewayRunner:
                         session_id=session_entry.session_id,
                         session_key=session_key,
                         run_generation=run_generation,
+                        process_epoch=self._process_epoch,
                     )
                     try:
                         from agent.provider_progress import record_provider_progress_signal

@@ -678,6 +678,7 @@ def _reconcile_trusted_closeout_impl(
     post_merge_config: Mapping[str, Any] | None = None,
     green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = 12,
+    mutation_allowed: Callable[[], bool] | None = None,
     _span_recorder: RuntimeSpanRecorder | None = None,
     _span_parent_id: str = "",
     _span_attempt_id: str = "",
@@ -691,6 +692,7 @@ def _reconcile_trusted_closeout_impl(
     runner = run or _default_run
     command_count = 0
     command_count_lock = threading.Lock()
+    ownership_allows_mutation = mutation_allowed or (lambda: True)
 
     def execute(
         args: list[str],
@@ -700,6 +702,8 @@ def _reconcile_trusted_closeout_impl(
         github: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal command_count
+        if not ownership_allows_mutation():
+            raise RuntimeError("closeout lease ownership lost")
         with command_count_lock:
             command_count += 1
             over_budget = command_count > max(1, min(32, int(max_commands)))
@@ -970,6 +974,7 @@ def _reconcile_trusted_closeout_impl(
             sync_canonical=sync_canonical,
             now=current_time,
             read_only=state["mode"] != "enforce",
+            mutation_allowed=ownership_allows_mutation,
             span_recorder=_span_recorder,
             span_parent_id=_span_parent_id,
             span_attempt_id=_span_attempt_id,
@@ -1417,6 +1422,7 @@ def reconcile_trusted_closeout(
     post_merge_config: Mapping[str, Any] | None = None,
     green_unmerged_overdue_seconds: float = 0.0,
     max_commands: int = 12,
+    mutation_allowed: Callable[[], bool] | None = None,
 ) -> CloseoutTransition:
     """Perform one bounded pass and attach trusted closeout/runtime spans."""
 
@@ -1487,6 +1493,7 @@ def reconcile_trusted_closeout(
             post_merge_config=post_merge_config,
             green_unmerged_overdue_seconds=green_unmerged_overdue_seconds,
             max_commands=max_commands,
+            mutation_allowed=mutation_allowed,
             _span_recorder=recorder,
             _span_parent_id=pass_span.id,
             _span_attempt_id=attempt_id,

@@ -40,7 +40,7 @@ class PostMergeControl:
     """Cooperative collector deadline shared with mutation-capable workers."""
 
     deadline: float
-    _cancel_event: threading.Event = field(default_factory=threading.Event)
+    _cancel_event: Any = field(default_factory=threading.Event)
 
     def cancel(self) -> None:
         self._cancel_event.set()
@@ -728,6 +728,7 @@ def collect_post_merge_receipts(
     now: float | None = None,
     max_workers: int = _MAX_WORKERS,
     read_only: bool = False,
+    mutation_allowed: Callable[[], bool] | None = None,
     span_recorder: RuntimeSpanRecorder | None = None,
     span_parent_id: str = "",
     span_attempt_id: str = "",
@@ -765,6 +766,7 @@ def collect_post_merge_receipts(
         adapter_timeout_s = min(60.0, collector_timeout_s)
     runner = run or _default_run
     synchronizer = sync_canonical or _default_sync
+    ownership_allows_mutation = mutation_allowed or (lambda: True)
 
     gathered = copy.deepcopy(dict(post_merge))
     gathered["target_sha"] = target_sha
@@ -854,7 +856,18 @@ def collect_post_merge_receipts(
         hard_deadline = time.monotonic() + collector_timeout_s
         cleanup_budget = min(0.1, max(0.02, collector_timeout_s * 0.2))
         execution_deadline = hard_deadline - cleanup_budget
-        controls = {name: PostMergeControl(deadline=execution_deadline) for name in jobs}
+        try:
+            process_context = multiprocessing.get_context("fork")
+        except ValueError:
+            process_context = None
+        event_factory = process_context.Event if process_context is not None else threading.Event
+        controls = {
+            name: PostMergeControl(
+                deadline=execution_deadline,
+                _cancel_event=event_factory(),
+            )
+            for name in jobs
+        }
         span_handles: dict[str, Any] = {}
         span_finished: set[str] = set()
         phase_by_name = {
@@ -894,11 +907,6 @@ def collect_post_merge_receipts(
                 "blocked": "blocked",
             }.get(receipt_status, "uncertain")
             finish_span_once(name, span_status)
-
-        try:
-            process_context = multiprocessing.get_context("fork")
-        except ValueError:
-            process_context = None
 
         pending = [name for name in jobs if name != "restart"]
         restart_waiting = "restart" in jobs
@@ -943,7 +951,19 @@ def collect_post_merge_receipts(
             running[name] = ("process", process, receive)
 
         while (pending or running or restart_waiting) and time.monotonic() < execution_deadline:
+            if not ownership_allows_mutation():
+                for control in controls.values():
+                    control.cancel()
+                pending.clear()
+                restart_waiting = False
+                break
             while pending and len(running) < workers:
+                if not ownership_allows_mutation():
+                    for control in controls.values():
+                        control.cancel()
+                    pending.clear()
+                    restart_waiting = False
+                    break
                 start_one(pending.pop(0))
             completed_names: list[str] = []
             for name, (kind, worker, channel) in list(running.items()):

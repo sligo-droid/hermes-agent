@@ -402,6 +402,7 @@ def test_agent_run_guard_requires_exact_active_generation(monkeypatch, tmp_path)
         session_key=session_key,
         run_generation=4,
         owner_pid=4242,
+        process_epoch="boot-a",
     )
     assert ledger.mark_agent_running(
         item["id"],
@@ -409,6 +410,7 @@ def test_agent_run_guard_requires_exact_active_generation(monkeypatch, tmp_path)
         session_key=session_key,
         run_generation=4,
         owner_pid=4242,
+        process_epoch="boot-a",
     )
     stored = ledger.get(item["id"])
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 4242)
@@ -417,18 +419,21 @@ def test_agent_run_guard_requires_exact_active_generation(monkeypatch, tmp_path)
         stored,
         session_key=session_key,
         run_generation=4,
+        process_epoch="boot-a",
         registry_active=True,
     ) is True
     assert ledger.agent_run_active(
         stored,
         session_key=session_key,
         run_generation=5,
+        process_epoch="boot-a",
         registry_active=True,
     ) is False
     assert ledger.agent_run_active(
         stored,
         session_key=session_key,
         run_generation=4,
+        process_epoch="boot-a",
         registry_active=False,
     ) is False
 
@@ -454,6 +459,29 @@ def test_live_gateway_does_not_keep_abandoned_turn_active(monkeypatch, tmp_path)
     assert runner._work_item_agent_run_active(stored) is False
 
 
+def test_gateway_run_guard_accepts_exact_process_epoch(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="exact-process-epoch")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=1,
+        owner_pid=5151,
+        process_epoch="gateway-boot",
+    )
+    stored = ledger.get(item["id"])
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._session_run_generation = {session_key: 1}
+    runner._running_agents = {session_key: object()}
+    runner._process_epoch = "gateway-boot"
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 5151)
+
+    assert runner._work_item_agent_run_active(stored) is True
+
+
 def test_pid_reuse_cannot_revive_stale_turn(monkeypatch, tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="pid-reuse")
@@ -464,6 +492,7 @@ def test_pid_reuse_cannot_revive_stale_turn(monkeypatch, tmp_path):
         session_key=session_key,
         run_generation=1,
         owner_pid=5151,
+        process_epoch="old-process",
     )
     stored = ledger.get(item["id"])
     monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
@@ -471,7 +500,32 @@ def test_pid_reuse_cannot_revive_stale_turn(monkeypatch, tmp_path):
     assert ledger.agent_run_active(
         stored,
         session_key=session_key,
-        run_generation=2,
+        run_generation=1,
+        process_epoch="restarted-process",
+        registry_active=True,
+    ) is False
+
+
+def test_legacy_active_run_without_process_epoch_is_not_authoritatively_live(monkeypatch, tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="legacy-process-epoch")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    ledger.claim(
+        item["id"],
+        session_key=session_key,
+        run_generation=1,
+        owner_pid=5151,
+    )
+    stored = ledger.get(item["id"])
+    stored["active_run"].pop("process_epoch", None)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+
+    assert ledger.agent_run_active(
+        stored,
+        session_key=session_key,
+        run_generation=1,
+        process_epoch="current-process",
         registry_active=True,
     ) is False
 
@@ -486,6 +540,7 @@ def test_agent_run_guard_uses_platform_safe_process_helper(monkeypatch, tmp_path
         session_key=session_key,
         run_generation=3,
         owner_pid=6161,
+        process_epoch="boot-safe",
     )
     stored = ledger.get(item["id"])
     seen = []
@@ -496,6 +551,7 @@ def test_agent_run_guard_uses_platform_safe_process_helper(monkeypatch, tmp_path
         stored,
         session_key=session_key,
         run_generation=3,
+        process_epoch="boot-safe",
         registry_active=True,
     ) is True
     assert seen == [6161]
@@ -2039,6 +2095,28 @@ def test_closeout_workspace_attachment_revision_leases_and_pending_scan(tmp_path
     assert leased["closeout"]["revision"] == 3
     assert leased["closeout"]["lease"] == {"owner": "watcher-1", "until": 130.0}
     assert ledger.pending_closeouts(due_at=now) == []
+    now = 110.0
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-2",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"],
+    ) is False
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"] - 1,
+    ) is False
+    assert ledger.renew_closeout_lease(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=leased["closeout"]["revision"],
+    ) is True
+    renewed = ledger.get(item["id"])["closeout"]
+    assert renewed["revision"] == leased["closeout"]["revision"]
+    assert renewed["lease"] == {"owner": "watcher-1", "until": 140.0}
     assert ledger.lease_closeout(item["id"], owner="watcher-2", lease_seconds=30) is None
 
     updated = dict(leased["closeout"])
@@ -2220,6 +2298,10 @@ def test_blocked_closeout_finalization_is_one_atomic_cas(tmp_path):
         "revision": 1,
         "owner": "",
         "lease_until": None,
+        "attempt_count": 0,
+        "retry_count": 0,
+        "send_started_at": None,
+        "send_confirmed_at": None,
         "result_message_id": None,
         "summary_updated_at": None,
     }

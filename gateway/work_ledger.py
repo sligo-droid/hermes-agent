@@ -1052,6 +1052,45 @@ class GatewayWorkLedger:
             result["closeout"] = state
             return result
 
+    def renew_closeout_lease(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        lease_seconds: float,
+        expected_revision: int,
+    ) -> bool:
+        """Extend an unexpired owned lease without changing logical revision."""
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        owner_text = str(owner or "").strip()
+        if not owner_text:
+            return False
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return False
+            now = self._now()
+            state = normalize_closeout_state(item["closeout"])
+            if int(state.get("revision") or 0) != int(expected_revision):
+                return False
+            lease = state.get("lease") if isinstance(state.get("lease"), dict) else {}
+            if (
+                str(lease.get("owner") or "") != owner_text
+                or float(lease.get("until") or 0) <= now
+            ):
+                return False
+            state["lease"] = {
+                "owner": owner_text[:160],
+                "until": now + max(1.0, min(3600.0, float(lease_seconds))),
+            }
+            item["closeout"] = state
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
     def release_closeout(
         self,
         work_id: str,
@@ -1139,6 +1178,10 @@ class GatewayWorkLedger:
                         "revision": 1,
                         "owner": "",
                         "lease_until": None,
+                        "attempt_count": 0,
+                        "retry_count": 0,
+                        "send_started_at": None,
+                        "send_confirmed_at": None,
                         "result_message_id": None,
                         "summary_updated_at": None,
                     },
@@ -1157,7 +1200,7 @@ class GatewayWorkLedger:
         owner: str,
         lease_seconds: float = 120.0,
     ) -> dict[str, Any] | None:
-        """Claim one synthesized terminal delivery exactly once per live lease."""
+        """Claim terminal response or summary work without replaying an uncertain send."""
 
         owner_text = str(owner or "").strip()
         if not owner_text:
@@ -1170,14 +1213,34 @@ class GatewayWorkLedger:
                 return None
             now = self._now()
             status = str(delivery.get("status") or "")
-            if status == "completed":
+            if status == "completed" or (
+                status == "uncertain" and delivery.get("summary_updated_at") is not None
+            ):
                 return None
-            if status == "delivering" and float(delivery.get("lease_until") or 0) > now:
+            if (
+                status in {"delivering", "sending", "uncertain"}
+                and float(delivery.get("lease_until") or 0) > now
+            ):
                 return None
             next_delivery = dict(delivery)
+            send_was_confirmed = bool(
+                delivery.get("send_confirmed_at")
+                or str(delivery.get("result_message_id") or "").strip()
+            )
+            if status == "sending" and not send_was_confirmed:
+                next_delivery.update(
+                    {
+                        "status": "uncertain",
+                        "uncertain_at": now,
+                        "uncertain_reason": "send_attempt_outcome_unknown",
+                        "operator_repair_required": True,
+                    }
+                )
+                item["delivery_outcome"] = "uncertain"
+            elif status != "uncertain":
+                next_delivery["status"] = "delivering"
             next_delivery.update(
                 {
-                    "status": "delivering",
                     "revision": _positive_int(delivery.get("revision")) + 1,
                     "owner": owner_text[:160],
                     "lease_until": now + max(1.0, min(3600.0, float(lease_seconds))),
@@ -1187,6 +1250,41 @@ class GatewayWorkLedger:
             item["updated_at"] = now
             self._write(data)
             return dict(item)
+
+    def begin_terminal_send_attempt(self, work_id: str, *, owner: str) -> bool:
+        """Persist the ambiguous send window before invoking the platform side effect."""
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            now = self._now()
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "delivering"
+                or str(delivery.get("owner") or "") != str(owner or "")
+                or float(delivery.get("lease_until") or 0) <= now
+                or delivery.get("send_confirmed_at") is not None
+                or bool(str(delivery.get("result_message_id") or "").strip())
+            ):
+                return False
+            attempt_count = _positive_int(delivery.get("attempt_count")) + 1
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "sending",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "attempt_count": attempt_count,
+                    "attempt_id": f"send-{attempt_count}",
+                    "send_started_at": now,
+                    "send_confirmed_at": None,
+                }
+            )
+            item["terminal_delivery"] = next_delivery
+            item["updated_at"] = now
+            self._write(data)
+            return True
 
     def mark_terminal_response_delivered(
         self,
@@ -1202,19 +1300,64 @@ class GatewayWorkLedger:
             if (
                 not isinstance(item, dict)
                 or not isinstance(delivery, dict)
-                or str(delivery.get("status") or "") != "delivering"
+                or str(delivery.get("status") or "") != "sending"
                 or str(delivery.get("owner") or "") != str(owner or "")
             ):
                 return False
+            now = self._now()
             next_delivery = dict(delivery)
             message_id = str(result_message_id or "").strip()
             if message_id:
                 next_delivery["result_message_id"] = message_id
                 item["result_message_id"] = message_id
-            next_delivery["revision"] = _positive_int(delivery.get("revision")) + 1
+            next_delivery.update(
+                {
+                    "status": "delivering",
+                    "send_confirmed_at": now,
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                }
+            )
+            item["delivery_outcome"] = "delivered"
             item["terminal_delivery"] = next_delivery
-            item["updated_at"] = self._now()
+            item["updated_at"] = now
             _record_discord_board_final_response(item, result_message_id=message_id or None)
+            self._write(data)
+            return True
+
+    def mark_terminal_delivery_uncertain(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        reason: str = "send_attempt_outcome_unknown",
+    ) -> bool:
+        """Fail closed after an attempted send whose durable receipt is unavailable."""
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "sending"
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            now = self._now()
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "uncertain",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "uncertain_at": now,
+                    "uncertain_reason": str(reason or "send_attempt_outcome_unknown")[:120],
+                    "operator_repair_required": True,
+                }
+            )
+            item["terminal_delivery"] = next_delivery
+            item["delivery_outcome"] = "uncertain"
+            item["updated_at"] = now
             self._write(data)
             return True
 
@@ -1223,22 +1366,26 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            status = str(delivery.get("status") or "") if isinstance(delivery, dict) else ""
             if (
                 not isinstance(item, dict)
                 or not isinstance(delivery, dict)
-                or str(delivery.get("status") or "") != "delivering"
+                or status not in {"delivering", "sending", "uncertain"}
                 or str(delivery.get("owner") or "") != str(owner or "")
             ):
                 return False
             next_delivery = dict(delivery)
             next_delivery.update(
                 {
-                    "status": "pending",
+                    "status": "uncertain" if status == "uncertain" else "pending",
                     "revision": _positive_int(delivery.get("revision")) + 1,
                     "owner": "",
                     "lease_until": None,
+                    "retry_count": _positive_int(delivery.get("retry_count")) + 1,
                 }
             )
+            if status == "sending":
+                next_delivery["send_confirmed_at"] = None
             item["terminal_delivery"] = next_delivery
             item["updated_at"] = self._now()
             self._write(data)
@@ -1249,18 +1396,20 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            status = str(delivery.get("status") or "") if isinstance(delivery, dict) else ""
             if (
                 not isinstance(item, dict)
                 or not isinstance(delivery, dict)
-                or str(delivery.get("status") or "") != "delivering"
+                or status not in {"delivering", "uncertain"}
                 or str(delivery.get("owner") or "") != str(owner or "")
             ):
                 return False
             now = self._now()
+            final_status = "uncertain" if status == "uncertain" else "completed"
             next_delivery = dict(delivery)
             next_delivery.update(
                 {
-                    "status": "completed",
+                    "status": final_status,
                     "revision": _positive_int(delivery.get("revision")) + 1,
                     "owner": "",
                     "lease_until": None,
@@ -1268,6 +1417,7 @@ class GatewayWorkLedger:
                 }
             )
             item["terminal_delivery"] = next_delivery
+            item["delivery_outcome"] = final_status
             item["summary_updated_at"] = now
             item["updated_at"] = now
             self._write(data)
@@ -1330,6 +1480,7 @@ class GatewayWorkLedger:
         session_key: str | None = None,
         run_generation: int | None = None,
         owner_pid: int | None = None,
+        process_epoch: str | None = None,
     ) -> dict[str, Any] | None:
         data = self._read()
         item = data["items"].get(work_id)
@@ -1340,11 +1491,13 @@ class GatewayWorkLedger:
         item["updated_at"] = now
         generation = _positive_int(run_generation)
         active_session = str(session_key or item.get("session_key") or "").strip()
+        epoch = str(process_epoch or "").strip()[:160]
         if generation and active_session:
             item["active_run"] = {
                 "session_key": active_session,
                 "generation": generation,
                 "owner_pid": _positive_int(owner_pid or os.getpid()),
+                "process_epoch": epoch,
                 "lease_until": now + LEASE_SECONDS,
             }
         else:
@@ -1364,6 +1517,7 @@ class GatewayWorkLedger:
         session_key: str | None = None,
         run_generation: int | None = None,
         owner_pid: int | None = None,
+        process_epoch: str | None = None,
     ) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
@@ -1374,11 +1528,13 @@ class GatewayWorkLedger:
         item["updated_at"] = now
         generation = _positive_int(run_generation)
         active_session = str(session_key or item.get("session_key") or "").strip()
+        epoch = str(process_epoch or "").strip()[:160]
         if generation and active_session:
             item["active_run"] = {
                 "session_key": active_session,
                 "generation": generation,
                 "owner_pid": _positive_int(owner_pid or os.getpid()),
+                "process_epoch": epoch,
                 "lease_until": now + LEASE_SECONDS,
             }
         else:
@@ -1592,6 +1748,16 @@ class GatewayWorkLedger:
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
             return False
+        terminal_delivery = (
+            item.get("terminal_delivery")
+            if isinstance(item.get("terminal_delivery"), dict)
+            else {}
+        )
+        if item.get("status") == "blocked" and terminal_delivery:
+            delivery_status = str(terminal_delivery.get("status") or "")
+            summary_pending = terminal_delivery.get("summary_updated_at") is None
+            if delivery_status not in {"completed", "uncertain"} or summary_pending:
+                return False
         item["status"] = "expired"
         item["updated_at"] = self._now()
         self._write(data)
@@ -1608,12 +1774,22 @@ class GatewayWorkLedger:
                 if isinstance(item.get("terminal_delivery"), dict)
                 else {}
             )
+            delivery_status = str(terminal_delivery.get("status") or "")
             blocked_delivery_pending = (
                 item.get("status") == "blocked"
                 and bool(terminal_delivery)
-                and str(terminal_delivery.get("status") or "") != "completed"
+                and (
+                    delivery_status not in {"completed", "uncertain"}
+                    or terminal_delivery.get("summary_updated_at") is None
+                )
             )
             if item.get("status") not in INCOMPLETE_STATUSES and not blocked_delivery_pending:
+                continue
+            if blocked_delivery_pending:
+                # A deterministic blocked response and its summary outlive the
+                # original intake/source-message freshness window. They leave
+                # recovery only after a durable completed or uncertain outcome.
+                items.append(dict(item))
                 continue
             if item.get("platform") == "discord" and discord_message_exceeds_age_limit(
                 _discord_source_message_id_for_item(item),
@@ -1633,6 +1809,7 @@ class GatewayWorkLedger:
         *,
         session_key: str,
         run_generation: int,
+        process_epoch: str,
         registry_active: bool,
     ) -> bool:
         """Validate one exact live turn against the gateway run registry."""
@@ -1640,9 +1817,14 @@ class GatewayWorkLedger:
         if not registry_active:
             return False
         active_run = item.get("active_run") if isinstance(item.get("active_run"), dict) else {}
+        persisted_epoch = str(active_run.get("process_epoch") or "").strip()
+        current_epoch = str(process_epoch or "").strip()
         if (
             str(active_run.get("session_key") or "") != str(session_key or "")
             or _positive_int(active_run.get("generation")) != _positive_int(run_generation)
+            or not persisted_epoch
+            or not current_epoch
+            or persisted_epoch != current_epoch
         ):
             return False
         owner_pid = _positive_int(active_run.get("owner_pid"))

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -37,12 +39,18 @@ def _event(message_id="m1"):
     )
 
 
-def _pending_item(ledger: GatewayWorkLedger, *, mode="enforce"):
-    event = _event()
+def _pending_item(
+    ledger: GatewayWorkLedger,
+    *,
+    mode="enforce",
+    message_id="m1",
+    freshness_seconds=3600,
+):
+    event = _event(message_id=message_id)
     item = ledger.accept_event(
         event,
         session_key=build_session_key(event.source),
-        freshness_seconds=3600,
+        freshness_seconds=freshness_seconds,
     )
     attached = ledger.attach_closeout_workspace(
         item["id"],
@@ -57,6 +65,38 @@ def _pending_item(ledger: GatewayWorkLedger, *, mode="enforce"):
     )
     assert state is not None
     return item, state
+
+
+def _blocked_item(
+    ledger: GatewayWorkLedger,
+    *,
+    message_id="m1",
+    freshness_seconds=3600,
+):
+    item, state = _pending_item(
+        ledger,
+        message_id=message_id,
+        freshness_seconds=freshness_seconds,
+    )
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=state["revision"],
+    )
+    assert leased is not None
+    blocked_state = dict(leased["closeout"])
+    blocked_state["status"] = "repair_required"
+    blocked = ledger.finalize_blocked_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        closeout_state=blocked_state,
+        final_response="Trusted closeout blocked: repair required.",
+        reason="trusted_closeout_repair_required",
+    )
+    assert blocked is not None
+    return blocked
 
 
 def test_dirty_marker_is_bounded_identifier_only(monkeypatch, tmp_path):
@@ -101,6 +141,75 @@ async def test_watcher_leases_reconciles_and_releases_revision(monkeypatch, tmp_
     assert stored["closeout"]["next_due_at"] == 130.0
     assert stored["closeout"]["lease"] == {"owner": "", "until": None}
     assert stored["closeout"]["revision"] == state["revision"] + 2
+
+
+@pytest.mark.asyncio
+async def test_long_reconciliation_renews_single_owner_lease(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    _item, _state = _pending_item(ledger)
+    started = threading.Event()
+    reconciler_calls = []
+
+    def reconcile(value, **_kwargs):
+        reconciler_calls.append(threading.get_ident())
+        started.set()
+        time.sleep(1.5)
+        updated = dict(value)
+        updated["status"] = "waiting_for_ci"
+        updated["next_due_at"] = time.time() + 30
+        return SimpleNamespace(state=updated)
+
+    first = TrustedCloseoutWatcher(
+        ledger,
+        config={"lease_seconds": 1, "poll_seconds": 30},
+        reconcile=reconcile,
+        owner="watcher-1",
+    )
+    second = TrustedCloseoutWatcher(
+        ledger,
+        config={"lease_seconds": 1, "poll_seconds": 30},
+        reconcile=reconcile,
+        owner="watcher-2",
+    )
+
+    first_task = asyncio.create_task(first.run_once())
+    assert await asyncio.to_thread(started.wait, 1.0)
+    await asyncio.sleep(1.1)
+    assert await second.run_once() == 0
+    assert await first_task == 1
+    assert len(reconciler_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_lost_closeout_renewal_stops_later_cooperative_mutation(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    item, state = _pending_item(ledger)
+    mutations = []
+
+    def reconcile(value, *, mutation_allowed, **_kwargs):
+        time.sleep(0.45)
+        if mutation_allowed():
+            mutations.append("external-mutation")
+        updated = dict(value)
+        updated["status"] = "waiting_for_ci"
+        updated["next_due_at"] = time.time() + 30
+        return SimpleNamespace(state=updated)
+
+    monkeypatch.setattr(ledger, "renew_closeout_lease", lambda *_args, **_kwargs: False)
+    watcher = TrustedCloseoutWatcher(
+        ledger,
+        config={"lease_seconds": 1, "poll_seconds": 30},
+        reconcile=reconcile,
+        owner="watcher-lost",
+    )
+
+    assert await watcher.run_once() == 0
+    assert mutations == []
+    stored = ledger.get(item["id"])
+    assert stored["closeout"]["revision"] == state["revision"] + 1
+    assert stored["closeout"]["status"] == state["status"]
 
 
 @pytest.mark.asyncio
@@ -549,5 +658,178 @@ async def test_blocked_terminal_callback_delivers_exactly_once(monkeypatch, tmp_
     stored = ledger.get(item["id"])
     assert stored["status"] == "blocked"
     assert stored["result_message_id"] == "blocked-result"
+    assert stored["terminal_delivery"]["status"] == "completed"
+    assert ledger.incomplete_items() == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_terminal_delivery_retries_in_same_process(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("gateway.run._TERMINAL_DELIVERY_RETRY_BASE_SECONDS", 0.01)
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    blocked = _blocked_item(ledger)
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._background_tasks = set()
+    runner._terminal_delivery_retry_tasks = {}
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            side_effect=[
+                SimpleNamespace(success=False, error="transient"),
+                SimpleNamespace(success=True, message_id="blocked-result"),
+            ]
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(blocked)
+    for _ in range(100):
+        stored = ledger.get(blocked["id"])
+        if (
+            stored["terminal_delivery"]["status"] == "completed"
+            and not runner._terminal_delivery_retry_tasks
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert adapter._send_with_retry.await_count == 2
+    runner._update_discord_summaries.assert_awaited_once()
+    stored = ledger.get(blocked["id"])
+    assert stored["terminal_delivery"]["status"] == "completed"
+    assert stored["terminal_delivery"]["retry_count"] == 1
+    assert runner._terminal_delivery_retry_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_retry_is_deduplicated_and_stops_on_shutdown(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("gateway.run._TERMINAL_DELIVERY_RETRY_BASE_SECONDS", 60.0)
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    blocked = _blocked_item(ledger)
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._background_tasks = set()
+    runner._terminal_delivery_retry_tasks = {}
+
+    assert runner._schedule_terminal_delivery_retry(blocked["id"], attempt=1) is True
+    assert runner._schedule_terminal_delivery_retry(blocked["id"], attempt=1) is False
+    task = runner._terminal_delivery_retry_tasks[blocked["id"]]
+    runner._shutdown_event.set()
+    await task
+
+    assert runner._terminal_delivery_retry_tasks == {}
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_terminal_send_timeout_is_not_retried(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    blocked = _blocked_item(ledger)
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._background_tasks = set()
+    runner._terminal_delivery_retry_tasks = {}
+    adapter = SimpleNamespace(
+        _is_timeout_error=lambda _error: True,
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=False, error="ReadTimeout")
+        ),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(blocked)
+
+    stored = ledger.get(blocked["id"])
+    adapter._send_with_retry.assert_awaited_once()
+    assert runner._terminal_delivery_retry_tasks == {}
+    assert stored["terminal_delivery"]["status"] == "uncertain"
+    assert stored["terminal_delivery"]["uncertain_reason"] == "send_timeout_outcome_unknown"
+    assert stored["terminal_delivery"]["summary_updated_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_crash_after_send_recovers_as_uncertain_without_duplicate(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    now = {"value": 100.0}
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: now["value"])
+    blocked = _blocked_item(ledger)
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="sent-once")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+    persist_receipt = ledger.mark_terminal_response_delivered
+
+    def crash_before_receipt(*_args, **_kwargs):
+        raise RuntimeError("injected crash window")
+
+    monkeypatch.setattr(ledger, "mark_terminal_response_delivered", crash_before_receipt)
+    await runner._resume_finished_discord_work_item(blocked)
+    first = ledger.get(blocked["id"])
+    assert first["terminal_delivery"]["status"] == "sending"
+    assert adapter._send_with_retry.await_count == 1
+
+    now["value"] = 221.0
+    monkeypatch.setattr(ledger, "mark_terminal_response_delivered", persist_receipt)
+    await runner._resume_finished_discord_work_item(first)
+
+    stored = ledger.get(blocked["id"])
+    assert adapter._send_with_retry.await_count == 1
+    runner._update_discord_summaries.assert_awaited_once()
+    assert stored["terminal_delivery"]["status"] == "uncertain"
+    assert stored["terminal_delivery"]["uncertain_reason"] == "send_attempt_outcome_unknown"
+    assert stored["terminal_delivery"]["operator_repair_required"] is True
+    assert stored["terminal_delivery"]["summary_updated_at"] == 221.0
+    assert stored["delivery_outcome"] == "uncertain"
+    assert ledger.incomplete_items() == []
+
+
+@pytest.mark.asyncio
+async def test_expired_blocked_item_recovers_terminal_delivery(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    now = {"value": time.time()}
+    old_timestamp = now["value"] - (8 * 24 * 60 * 60)
+    old_snowflake = str(int((old_timestamp * 1000 - 1420070400000)) << 22)
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: now["value"])
+    blocked = _blocked_item(
+        ledger,
+        message_id=old_snowflake,
+        freshness_seconds=1,
+    )
+    now["value"] += 2
+
+    pending = ledger.incomplete_items()
+    assert [item["id"] for item in pending] == [blocked["id"]]
+    assert ledger.mark_expired(blocked["id"]) is False
+    assert ledger.get(blocked["id"])["status"] == "blocked"
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="late-result")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(pending[0])
+
+    stored = ledger.get(blocked["id"])
+    assert stored["status"] == "blocked"
+    assert stored["result_message_id"] == "late-result"
     assert stored["terminal_delivery"]["status"] == "completed"
     assert ledger.incomplete_items() == []
