@@ -279,7 +279,7 @@ def test_required_checks_enrich_actual_gh_rollup_with_trusted_rest_identity(tmp_
         return _completed(args, stdout=json.dumps(workflow_runs[run_id]))
 
     payload = _pr_payload(checks=checks)
-    enriched = closeout._enrich_required_check_identities(
+    enriched = closeout.enrich_required_check_identities(
         payload,
         repo=repo,
         root=tmp_path,

@@ -464,7 +464,7 @@ def summarize_required_checks(items: Any, *, head_sha: str) -> dict[str, Any]:
     }
 
 
-def _enrich_required_check_identities(
+def enrich_required_check_identities(
     payload: Mapping[str, Any],
     *,
     repo: str,
@@ -1055,7 +1055,7 @@ def _reconcile_trusted_closeout_impl(
         return _blocked(original, state, code="pr_refresh_invalid_json", message=exc, now=current_time, retry=True, poll_seconds=poll)
     if not isinstance(payload, Mapping):
         return _blocked(original, state, code="pr_refresh_invalid_payload", message="PR refresh returned non-object JSON", now=current_time, retry=True, poll_seconds=poll)
-    payload = _enrich_required_check_identities(
+    payload = enrich_required_check_identities(
         payload,
         repo=repo,
         root=root,
@@ -1376,7 +1376,7 @@ def _reconcile_trusted_closeout_impl(
         return _blocked(original, state, code="premerge_refresh_invalid_json", message=exc, now=current_time, retry=True, poll_seconds=poll)
     if not isinstance(premerge_payload, Mapping):
         return _blocked(original, state, code="premerge_refresh_invalid_payload", message="Pre-merge PR refresh returned non-object JSON", now=current_time, retry=True, poll_seconds=poll)
-    premerge_payload = _enrich_required_check_identities(
+    premerge_payload = enrich_required_check_identities(
         premerge_payload,
         repo=repo,
         root=root,
@@ -1698,6 +1698,7 @@ __all__ = [
     "REQUIRED_PR_CHECKS",
     "TERMINAL_CLOSEOUT_STATUSES",
     "closeout_terminal_eligible",
+    "enrich_required_check_identities",
     "latest_logical_checks",
     "normalize_closeout_state",
     "reconcile_trusted_closeout",

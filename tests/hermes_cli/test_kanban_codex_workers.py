@@ -15,6 +15,15 @@ import pytest
 
 
 _TRUSTED_PR_HEAD = "c" * 40
+_REQUIRED_CHECK_RUNS = {
+    ("Basic Tests", "basic"): ("101", ".github/workflows/tests.yml"),
+    ("PR Body Format", "pr body"): ("202", ".github/workflows/pr-body-format.yml"),
+}
+
+
+def _required_check_details_url(repo: str, workflow: str, check: str) -> str:
+    run_id, _path = _REQUIRED_CHECK_RUNS[(workflow, check)]
+    return f"https://github.com/{repo}/actions/runs/{run_id}/job/{run_id}1"
 
 
 def _home(monkeypatch, tmp_path: Path) -> Path:
@@ -55,9 +64,70 @@ def _resolve_canonical_sync_in_worker_integration_tests(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _mock_required_check_identity_api(monkeypatch):
+    """Serve exact-head REST identity for raw ``gh pr view`` test payloads."""
+
+    from hermes_cli import kanban_codex_worker as worker
+
+    original_run_gh = worker._run_gh
+    heads_by_repo: dict[str, str] = {}
+
+    def wrapped(args, *, root, timeout):
+        endpoint = args[1] if len(args) > 1 and args[0] == "api" else ""
+        check_runs_match = re.fullmatch(
+            r"repos/([^/]+/[^/]+)/commits/([0-9a-f]{40}|[0-9a-f]{64})/"
+            r"check-runs\?filter=all&per_page=100",
+            endpoint,
+        )
+        if check_runs_match:
+            repo, head_sha = check_runs_match.groups()
+            heads_by_repo[repo.casefold()] = head_sha
+            check_runs = [
+                {
+                    "name": check,
+                    "head_sha": head_sha,
+                    "details_url": _required_check_details_url(repo, workflow, check),
+                    "app": {"slug": "github-actions"},
+                }
+                for workflow, check in _REQUIRED_CHECK_RUNS
+            ]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"check_runs": check_runs}),
+                stderr="",
+            )
+        workflow_run_match = re.fullmatch(
+            r"repos/([^/]+/[^/]+)/actions/runs/(\d+)",
+            endpoint,
+        )
+        if workflow_run_match:
+            repo, run_id = workflow_run_match.groups()
+            for _identity, (expected_run_id, path) in _REQUIRED_CHECK_RUNS.items():
+                if run_id == expected_run_id:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps(
+                            {
+                                "path": path,
+                                "head_sha": heads_by_repo.get(
+                                    repo.casefold(),
+                                    _TRUSTED_PR_HEAD,
+                                ),
+                            }
+                        ),
+                        stderr="",
+                    )
+            return SimpleNamespace(returncode=1, stdout="", stderr="unknown run")
+        return original_run_gh(args, root=root, timeout=timeout)
+
+    monkeypatch.setattr(worker, "_run_gh", wrapped)
+
+
 def _pr_view_json(
     *,
     number: int = 123,
+    repo: str = "sligo-labs/PID",
     state: str = "MERGED",
     merge_state: str = "CLEAN",
     mergeable: str = "MERGEABLE",
@@ -79,10 +149,20 @@ def _pr_view_json(
                 "conclusion": "SUCCESS",
             },
         ]
+    raw_checks = []
+    for raw in checks:
+        item = dict(raw)
+        identity = (str(item.get("workflowName") or ""), str(item.get("name") or ""))
+        if identity in _REQUIRED_CHECK_RUNS:
+            item.setdefault(
+                "detailsUrl",
+                _required_check_details_url(repo, *identity),
+            )
+        raw_checks.append(item)
     return json.dumps(
         {
             "number": number,
-            "url": f"https://github.com/sligo-labs/PID/pull/{number}",
+            "url": f"https://github.com/{repo}/pull/{number}",
             "state": state,
             "headRefOid": head_sha,
             "mergedAt": "2026-05-26T15:30:17Z" if state == "MERGED" else None,
@@ -91,7 +171,7 @@ def _pr_view_json(
             "mergeable": mergeable,
             "isDraft": False,
             "reviewDecision": "",
-            "statusCheckRollup": checks,
+            "statusCheckRollup": raw_checks,
         }
     )
 
@@ -184,44 +264,152 @@ def test_check_rollup_summary_uses_latest_duplicate_check_run():
 def test_required_check_rollup_uses_current_head_skipped_and_latest_rerun():
     from hermes_cli import kanban_codex_worker as worker
 
+    def trusted(workflow, name, *, conclusion, started_at):
+        _run_id, path = _REQUIRED_CHECK_RUNS[(workflow, name)]
+        return {
+            "name": name,
+            "workflowName": workflow,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "headSha": _TRUSTED_PR_HEAD,
+            "startedAt": started_at,
+            "app": {"slug": "github-actions", "name": "GitHub Actions"},
+            "workflow": {"path": path},
+        }
+
     status, total, failed, wait_state = worker._required_check_rollup_summary(
         [
-            {
-                "name": "basic",
-                "workflowName": "Basic Tests",
-                "status": "COMPLETED",
-                "conclusion": "CANCELLED",
-                "headSha": "current-head",
-                "startedAt": "2026-06-09T15:00:00Z",
-            },
-            {
-                "name": "basic",
-                "workflowName": "Basic Tests",
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "headSha": "current-head",
-                "startedAt": "2026-06-09T15:02:00Z",
-            },
-            {
-                "name": "pr body",
-                "workflowName": "PR Body Format",
-                "status": "COMPLETED",
-                "conclusion": "SKIPPED",
-                "headSha": "current-head",
-                "startedAt": "2026-06-09T15:03:00Z",
-            },
+            trusted(
+                "Basic Tests",
+                "basic",
+                conclusion="CANCELLED",
+                started_at="2026-06-09T15:00:00Z",
+            ),
+            trusted(
+                "Basic Tests",
+                "basic",
+                conclusion="SUCCESS",
+                started_at="2026-06-09T15:02:00Z",
+            ),
+            trusted(
+                "PR Body Format",
+                "pr body",
+                conclusion="SKIPPED",
+                started_at="2026-06-09T15:03:00Z",
+            ),
             {
                 "name": "unrelated",
                 "workflowName": "Other Workflow",
                 "status": "COMPLETED",
                 "conclusion": "FAILURE",
-                "headSha": "current-head",
+                "headSha": _TRUSTED_PR_HEAD,
             },
         ],
-        head_sha="current-head",
+        head_sha=_TRUSTED_PR_HEAD,
     )
 
     assert (status, total, failed, wait_state) == ("passed", 2, [], "")
+
+
+def test_refresh_pr_status_enriches_raw_checks_and_rejects_spoof_before_canonical(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import kanban_codex_worker as worker
+
+    repo = "sligo-labs/PID"
+    spoof_url = f"https://github.com/{repo}/actions/runs/303/job/3031"
+    basic_url = _required_check_details_url(repo, "Basic Tests", "basic")
+    basic_rerun_url = basic_url.rsplit("/", 1)[0] + "/1012"
+    pr_body_url = _required_check_details_url(repo, "PR Body Format", "pr body")
+    checks = [
+        {
+            "name": "basic",
+            "workflowName": "Basic Tests",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "startedAt": "2026-06-09T15:05:00Z",
+            "detailsUrl": spoof_url,
+        },
+        {
+            "name": "basic",
+            "workflowName": "Basic Tests",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "startedAt": "2026-06-09T15:00:00Z",
+            "detailsUrl": basic_url,
+        },
+        {
+            "name": "basic",
+            "workflowName": "Basic Tests",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "startedAt": "2026-06-09T15:02:00Z",
+            "detailsUrl": basic_rerun_url,
+        },
+        {
+            "name": "pr body",
+            "workflowName": "PR Body Format",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "startedAt": "2026-06-09T15:03:00Z",
+            "detailsUrl": pr_body_url,
+        },
+    ]
+
+    def fake_gh(args, **_kwargs):
+        if args[:2] == ["pr", "view"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=456,
+                    state="OPEN",
+                    checks=checks,
+                ),
+                stderr="",
+            )
+        if args[:1] == ["api"] and "/check-runs?" in args[1]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "check_runs": [
+                            {
+                                "name": item["name"],
+                                "head_sha": _TRUSTED_PR_HEAD,
+                                "details_url": item["detailsUrl"],
+                                "app": {"slug": "github-actions"},
+                            }
+                            for item in checks
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        if args[:1] == ["api"] and "/actions/runs/" in args[1]:
+            run_id = args[1].rsplit("/", 1)[-1]
+            paths = {
+                "101": ".github/workflows/tests.yml",
+                "202": ".github/workflows/pr-body-format.yml",
+                "303": ".github/workflows/spoof-tests.yml",
+            }
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {"path": paths[run_id], "head_sha": _TRUSTED_PR_HEAD}
+                ),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_run_gh", fake_gh)
+    state = {"pr_url": f"https://github.com/{repo}/pull/456"}
+
+    worker._refresh_pr_status(state, root=tmp_path, repo=repo)
+
+    assert state["pr_checks_status"] == "failed"
+    assert state["pr_checks_total"] == 2
+    assert state["pr_checks_failed"] == ["Basic Tests / basic"]
 
 
 def test_legacy_kanban_fields_normalize_and_dual_write_shared_closeout(tmp_path):
@@ -5345,7 +5533,15 @@ def test_ensure_pr_open_allows_pr_amend_when_origin_is_head_repo(monkeypatch, tm
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7, state="OPEN"), stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=7,
+                    repo="sligo-droid/reserve-index-dtf",
+                    state="OPEN",
+                ),
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
@@ -5734,31 +5930,25 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
         if cmd[:3] == ["gh", "pr", "view"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    {
-                        "number": 125,
-                        "url": "https://github.com/sligo-labs/PID/pull/125",
-                        "state": "OPEN",
-                        "headRefOid": "current-head",
-                        "mergeStateStatus": "BLOCKED",
-                        "mergeable": "CONFLICTING",
-                        "isDraft": False,
-                        "reviewDecision": "REVIEW_REQUIRED",
-                        "statusCheckRollup": [
-                            {
-                                "name": "basic",
-                                "workflowName": "Basic Tests",
-                                "status": "COMPLETED",
-                                "conclusion": "FAILURE",
-                            },
-                            {
-                                "name": "pr body",
-                                "workflowName": "PR Body Format",
-                                "status": "COMPLETED",
-                                "conclusion": "SUCCESS",
-                            },
-                        ],
-                    }
+                stdout=_pr_view_json(
+                    number=125,
+                    state="OPEN",
+                    merge_state="BLOCKED",
+                    mergeable="CONFLICTING",
+                    checks=[
+                        {
+                            "name": "basic",
+                            "workflowName": "Basic Tests",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                        },
+                        {
+                            "name": "pr body",
+                            "workflowName": "PR Body Format",
+                            "status": "COMPLETED",
+                            "conclusion": "SUCCESS",
+                        },
+                    ],
                 ),
                 stderr="",
             )
@@ -5799,6 +5989,40 @@ def test_legacy_merge_rejects_reviewer_approval_for_stale_pr_head(monkeypatch, t
                     merge_state="CLEAN",
                     head_sha=current_head,
                 ),
+                stderr="",
+            )
+        if args[:1] == ["api"] and "/check-runs?" in args[1]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "check_runs": [
+                            {
+                                "name": check,
+                                "head_sha": current_head,
+                                "details_url": _required_check_details_url(
+                                    "sligo-labs/PID",
+                                    workflow,
+                                    check,
+                                ),
+                                "app": {"slug": "github-actions"},
+                            }
+                            for workflow, check in _REQUIRED_CHECK_RUNS
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        if args[:1] == ["api"] and "/actions/runs/" in args[1]:
+            run_id = args[1].rsplit("/", 1)[-1]
+            path = next(
+                path
+                for expected_run_id, path in _REQUIRED_CHECK_RUNS.values()
+                if run_id == expected_run_id
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"path": path, "head_sha": current_head}),
                 stderr="",
             )
         raise AssertionError(args)
@@ -6212,7 +6436,14 @@ def test_ensure_pr_explicit_target_repo_overrides_checkout_remote(monkeypatch, t
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7), stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=7,
+                    repo="sligo-droid/reserve-index-dtf",
+                ),
+                stderr="",
+            )
         sync_result = _canonical_sync_result(cmd)
         if sync_result is not None:
             return sync_result
@@ -6266,7 +6497,14 @@ def test_ensure_pr_amend_uses_head_repo_and_never_upstream_for_pr_commands(monke
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7), stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=7,
+                    repo="sligo-droid/reserve-index-dtf",
+                ),
+                stderr="",
+            )
         sync_result = _canonical_sync_result(cmd)
         if sync_result is not None:
             return sync_result
@@ -6453,7 +6691,15 @@ def test_ensure_pr_amend_succeeds_when_upstream_head_sha_advances(monkeypatch, t
         if cmd[:3] == ["gh", "pr", "view"] and "headRefOid" in cmd:
             return SimpleNamespace(returncode=0, stdout=("b" * 40) + "\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7, state=view_states.pop(0)), stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=7,
+                    repo="sligo-droid/reserve-index-dtf",
+                    state=view_states.pop(0),
+                ),
+                stderr="",
+            )
         if cmd[:3] == ["gh", "pr", "merge"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         sync_result = _canonical_sync_result(cmd)
@@ -6518,7 +6764,15 @@ def test_ensure_pr_amend_finalizer_ignores_dev_worker_no_pr_text(monkeypatch, tm
         if cmd[:3] == ["gh", "pr", "view"] and "headRefOid" in cmd:
             return SimpleNamespace(returncode=0, stdout=("b" * 40) + "\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
-            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7, state=view_states.pop(0)), stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=7,
+                    repo="sligo-droid/reserve-index-dtf",
+                    state=view_states.pop(0),
+                ),
+                stderr="",
+            )
         if cmd[:3] == ["gh", "pr", "merge"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         sync_result = _canonical_sync_result(cmd)

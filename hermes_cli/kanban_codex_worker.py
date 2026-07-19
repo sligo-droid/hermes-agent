@@ -2922,6 +2922,26 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
         worker.setdefault("pr_merge_state", "unknown")
         worker["pr_blocker"] = _pr_blocker(worker)
         return
+
+    from hermes_cli.trusted_closeout import enrich_required_check_identities
+
+    def run_identity_query(
+        args: list[str],
+        *,
+        cwd: Path,
+        timeout: int | float = 60,
+        github: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        if not args or args[0] != "gh":
+            return subprocess.CompletedProcess(args, 2, "", "GitHub command required")
+        return _run_gh(args[1:], root=cwd, timeout=timeout)
+
+    data = enrich_required_check_identities(
+        data,
+        repo=repo,
+        root=root,
+        run=run_identity_query,
+    )
     if data.get("url"):
         worker["pr_url"] = str(data.get("url") or "")
     if data.get("number") is not None:
