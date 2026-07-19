@@ -5148,6 +5148,17 @@ class GatewayRunner:
             return None
 
         if already_activated:
+            active_head_sha = str(state["pr"].get("head_sha") or "").strip().lower()
+            if active_head_sha != verified_head_sha:
+                advanced = ledger.publish_closeout_verified_head(
+                    work_item_id,
+                    expected_head_sha=active_head_sha,
+                    verified_head_sha=verified_head_sha,
+                )
+                if advanced is None:
+                    return None
+                state = advanced
+                notify_closeout()
             if not state["policy"]["require_visual_qa"] or visual_pending:
                 return state
             visual_result = (

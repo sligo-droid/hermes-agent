@@ -1180,6 +1180,112 @@ class GatewayWorkLedger:
             self._write(data)
             return dict(state)
 
+    def publish_closeout_verified_head(
+        self,
+        work_id: str,
+        *,
+        expected_head_sha: str,
+        verified_head_sha: str,
+    ) -> dict[str, Any] | None:
+        """Advance an active direct closeout from exact head H to verified H2.
+
+        The revision and lease generation fences invalidate any watcher result
+        still reconciling H. Head-bound review, visual, CI, readiness, merge,
+        and post-merge evidence is reset before H2 can be published.
+        """
+
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        expected_head = str(expected_head_sha or "").strip().lower()
+        verified_head = str(verified_head_sha or "").strip().lower()
+        if not (
+            _CLOSEOUT_SHA_RE.fullmatch(expected_head)
+            and _CLOSEOUT_SHA_RE.fullmatch(verified_head)
+        ):
+            return None
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("closeout"), dict)
+                or (
+                    item.get("closeout_authoritative") is not True
+                    and item.get("closeout_activated_at") is None
+                )
+            ):
+                return None
+            state = normalize_closeout_state(item["closeout"])
+            if state["mode"] == "off" or state["source"] != "direct":
+                return None
+            if str(state["pr"].get("head_sha") or "").strip().lower() != expected_head:
+                return None
+            if expected_head == verified_head:
+                return dict(state)
+
+            now = self._now()
+            state["status"] = "pending"
+            state["local_verification"] = {
+                "status": "passed",
+                "head_sha": verified_head,
+            }
+            state["review"] = (
+                {"status": "stale"}
+                if state["policy"]["require_review"]
+                else {"status": "not_required"}
+            )
+            state["visual_qa"] = (
+                {"status": "pending", "head_sha": verified_head}
+                if state["policy"]["require_visual_qa"]
+                else {"status": "not_required"}
+            )
+            state["ci"] = {
+                "head_sha": verified_head,
+                "status": "not_checked",
+                "total": 0,
+                "failed": [],
+                "wait_state": "queued",
+                "required": list(state["ci"].get("required") or []),
+            }
+            state["pr"].update(
+                {
+                    "head_sha": verified_head,
+                    "merge_sha": "",
+                    "merge_state": "UNKNOWN",
+                    "mergeable": "unknown",
+                    "review_decision": "UNKNOWN",
+                    "ready_at": None,
+                    "merge_attempted_head_sha": "",
+                }
+            )
+            state["canonical_sync"] = {"status": "not_started"}
+            state["post_merge"] = {
+                "target_sha": "",
+                "canonical_sync": {"status": "not_started"},
+                "ci": {"status": "not_started"},
+                "deployment": {"status": "not_configured"},
+                "production_qa": {"status": "not_configured"},
+                "restart": {"status": "not_configured"},
+            }
+            state["mutation_uncertainty"] = {}
+            state["telemetry"]["green_unmerged_since"] = None
+            state["telemetry"]["green_unmerged_overdue"] = False
+            state["lease_generation"] = min(
+                2_147_483_647,
+                int(state.get("lease_generation") or 0) + 1,
+            )
+            state["lease"] = {"owner": "", "until": None}
+            state["next_due_at"] = now
+            state["revision"] = min(
+                2_147_483_647,
+                int(state.get("revision") or 0) + 1,
+            )
+            item["closeout"] = state
+            item.pop("closeout_visual_completion", None)
+            item["updated_at"] = now
+            self._write(data)
+            return dict(state)
+
     def apply_closeout_visual_completion(
         self,
         work_id: str,
