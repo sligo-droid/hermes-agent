@@ -935,6 +935,74 @@ def test_mutation_adapter_is_fenced_before_process_start(tmp_path):
     assert gathered["deployment"]["status"] == "passed"
 
 
+def test_self_fencing_restart_records_only_baseline_rich_fence(tmp_path):
+    fence_log = tmp_path / "restart-fences.jsonl"
+
+    def mutation_started(operation, context):
+        with fence_log.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps([operation, dict(context)]) + "\n")
+        return True
+
+    def adapter(*, target_sha, repository, mutation_started, **_kwargs):
+        assert mutation_started(
+            "post_merge_restart",
+            {
+                "at": 101.0,
+                "head_sha": target_sha,
+                "repository": repository,
+                "baseline_pid": 1234,
+                "baseline_start_time": 777,
+            },
+        )
+        return {
+            "status": "pending",
+            "diagnostic_code": "gateway_restart_requested",
+            "baseline_pid": 1234,
+            "baseline_start_time": 777,
+        }
+
+    receipts.register_restart_adapter("test-self-fencing-restart", adapter)
+    state = _state(tmp_path, requirements={"restart": True})
+    state["workspace"]["canonical_path"] = ""
+
+    gathered = receipts.collect_post_merge_receipts(
+        state,
+        config={
+            "repositories": {
+                "owner/repo": {
+                    "restart_adapter": "test-self-fencing-restart"
+                }
+            }
+        },
+        mutation_started=mutation_started,
+        now=100,
+    )
+
+    fences = [
+        json.loads(line)
+        for line in fence_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert fences == [
+        [
+            "post_merge_restart",
+            {
+                "at": 101.0,
+                "head_sha": TARGET,
+                "repository": "owner/repo",
+                "baseline_pid": 1234,
+                "baseline_start_time": 777,
+            },
+        ]
+    ]
+    assert gathered["restart"] == {
+        "status": "pending",
+        "checked_at": 100,
+        "diagnostic_code": "gateway_restart_requested",
+        "baseline_pid": 1234,
+        "baseline_start_time": 777,
+    }
+
+
 def test_replacement_owner_fence_forces_adapter_reobservation_only(tmp_path):
     observation = tmp_path / "fenced-adapter-reobservation"
     starts = []

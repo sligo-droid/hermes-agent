@@ -970,7 +970,7 @@ def collect_post_merge_receipts(
     gathered["target_sha"] = target_sha
     jobs: dict[str, Callable[[PostMergeControl], dict[str, Any]]] = {}
     isolated_jobs: set[str] = set()
-    mutation_jobs: set[str] = set()
+    parent_fenced_mutation_jobs: set[str] = set()
     canonical_execution: _CanonicalSyncExecution | None = None
     mutation_uncertainty = (
         snapshot.get("mutation_uncertainty")
@@ -1070,7 +1070,19 @@ def collect_post_merge_receipts(
             if mutation_job_scheduled:
                 continue
             mutation_job_scheduled = True
-            mutation_jobs.add(receipt_name)
+            adapter = registry.get(adapter_name) if adapter_name else None
+            try:
+                self_fences_mutation = bool(
+                    adapter is not None
+                    and "mutation_started" in inspect.signature(adapter).parameters
+                )
+            except (TypeError, ValueError):
+                self_fences_mutation = False
+            # A self-fencing adapter records its authoritative mutation context
+            # immediately before the side effect. Pre-fencing it here would
+            # leave a less-specific uncertainty marker if the child exits first.
+            if not self_fences_mutation:
+                parent_fenced_mutation_jobs.add(receipt_name)
         isolated_jobs.add(receipt_name)
         jobs[receipt_name] = lambda control, registry=registry, adapter_name=adapter_name, required=required, prior_receipt=prior_receipt, mutation_capable=mutation_capable: _adapter_receipt(
             registry=registry,
@@ -1293,7 +1305,7 @@ def collect_post_merge_receipts(
                     _receipt("blocked", now=collected_at, diagnostic_code="collector_isolation_unavailable"),
                 )
                 return
-            if name in mutation_jobs and mutation_started is not None:
+            if name in parent_fenced_mutation_jobs and mutation_started is not None:
                 try:
                     fenced = mutation_started(
                         f"post_merge_{name}",
