@@ -80,7 +80,21 @@ def test_closeout_normalization_accepts_only_exact_sha_lengths(tmp_path):
     assert normalized["post_merge"]["target_sha"] == "e" * 64
 
 
-def _check(workflow, name, *, conclusion="SUCCESS", head_sha=HEAD_SHA, run=1):
+def _check(
+    workflow,
+    name,
+    *,
+    conclusion="SUCCESS",
+    head_sha=HEAD_SHA,
+    run=1,
+    app="GitHub Actions",
+    workflow_path=None,
+):
+    if workflow_path is None:
+        workflow_path = {
+            "Basic Tests": ".github/workflows/tests.yml",
+            "PR Body Format": ".github/workflows/pr-body-format.yml",
+        }.get(workflow, f".github/workflows/{workflow.lower().replace(' ', '-')}.yml")
     return {
         "workflowName": workflow,
         "name": name,
@@ -89,6 +103,8 @@ def _check(workflow, name, *, conclusion="SUCCESS", head_sha=HEAD_SHA, run=1):
         "headSha": head_sha,
         "databaseId": run,
         "completedAt": f"2026-07-17T00:00:{run:02d}Z",
+        "app": {"name": app},
+        "workflow": {"path": workflow_path},
     }
 
 
@@ -181,6 +197,102 @@ def test_required_checks_use_current_head_and_newest_logical_rerun():
             {"workflow": "PR Body Format", "check": "pr body"},
         ],
     }
+
+
+@pytest.mark.parametrize("spoof_first", [False, True])
+@pytest.mark.parametrize(
+    ("workflow", "check", "spoof_kwargs"),
+    [
+        ("Basic Tests", "basic", {"app": "Other CI"}),
+        ("Basic Tests", "basic", {"workflow_path": ".github/workflows/spoof-tests.yml"}),
+        ("PR Body Format", "pr body", {"app": "Other CI"}),
+        (
+            "PR Body Format",
+            "pr body",
+            {"workflow_path": ".github/workflows/spoof-pr-body.yml"},
+        ),
+    ],
+)
+def test_required_checks_do_not_replace_canonical_github_actions_identity(
+    workflow,
+    check,
+    spoof_kwargs,
+    spoof_first,
+):
+    checks = [
+        _check("Basic Tests", "basic", run=1),
+        _check("PR Body Format", "pr body", run=1),
+    ]
+    for item in checks:
+        if item["workflowName"] == workflow:
+            item["conclusion"] = "FAILURE"
+    spoof = _check(workflow, check, conclusion="SUCCESS", run=9, **spoof_kwargs)
+    if spoof_first:
+        checks.insert(0, spoof)
+    else:
+        checks.append(spoof)
+
+    summary = closeout.summarize_required_checks(checks, head_sha=HEAD_SHA)
+
+    assert summary["status"] == "failed"
+    assert summary["total"] == 2
+    assert summary["failed"] == [f"{workflow} / {check}"]
+
+
+def test_required_checks_enrich_actual_gh_rollup_with_trusted_rest_identity(tmp_path):
+    repo = "acme/example"
+
+    def raw_check(workflow, name, run_id, *, conclusion="SUCCESS"):
+        item = _check(workflow, name, conclusion=conclusion)
+        item.pop("app")
+        item.pop("workflow")
+        item["detailsUrl"] = f"https://github.com/{repo}/actions/runs/{run_id}/job/{run_id}1"
+        return item
+
+    checks = [
+        raw_check("Basic Tests", "basic", "333"),
+        raw_check("Basic Tests", "basic", "111", conclusion="FAILURE"),
+        raw_check("PR Body Format", "pr body", "222"),
+    ]
+    check_runs = {
+        "check_runs": [
+            {
+                "name": item["name"],
+                "head_sha": HEAD_SHA,
+                "details_url": item["detailsUrl"],
+                "app": {"slug": "github-actions"},
+            }
+            for item in checks
+        ]
+    }
+    workflow_runs = {
+        "111": {"path": ".github/workflows/tests.yml", "head_sha": HEAD_SHA},
+        "222": {"path": ".github/workflows/pr-body-format.yml", "head_sha": HEAD_SHA},
+        "333": {"path": ".github/workflows/spoof-tests.yml", "head_sha": HEAD_SHA},
+    }
+
+    def run(args, **_kwargs):
+        endpoint = args[2]
+        if "/check-runs?" in endpoint:
+            return _completed(args, stdout=json.dumps(check_runs))
+        run_id = endpoint.rsplit("/", 1)[-1]
+        return _completed(args, stdout=json.dumps(workflow_runs[run_id]))
+
+    payload = _pr_payload(checks=checks)
+    enriched = closeout._enrich_required_check_identities(
+        payload,
+        repo=repo,
+        root=tmp_path,
+        run=run,
+    )
+    summary = closeout.summarize_required_checks(
+        enriched["statusCheckRollup"],
+        head_sha=HEAD_SHA,
+    )
+
+    assert summary["status"] == "failed"
+    assert summary["total"] == 2
+    assert summary["failed"] == ["Basic Tests / basic"]
 
 
 def test_required_checks_classify_all_terminal_failure_conclusions():

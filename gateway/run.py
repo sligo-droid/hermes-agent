@@ -4979,12 +4979,22 @@ class GatewayRunner:
         evidence_root = Path(
             str(trusted_evidence.get("repository_root") or "")
         ).expanduser().resolve(strict=False)
-        if evidence_root != root:
+        try:
+            root.relative_to(evidence_root)
+        except ValueError:
             return None
         verified_head_sha = str(trusted_evidence.get("verified_head_sha") or "").lower()
         try:
             import subprocess
 
+            toplevel_result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
             checked = subprocess.run(
                 ["git", "diff", "--check"],
                 cwd=root,
@@ -5012,8 +5022,15 @@ class GatewayRunner:
         except Exception:
             return None
         current_head_sha = str(head_result.stdout or "").strip().lower()
+        git_toplevel = (
+            Path(str(toplevel_result.stdout or "").strip())
+            .expanduser()
+            .resolve(strict=False)
+        )
         if (
-            checked.returncode != 0
+            toplevel_result.returncode != 0
+            or evidence_root != git_toplevel
+            or checked.returncode != 0
             or status.returncode != 0
             or bool(str(status.stdout or "").strip())
             or head_result.returncode != 0
@@ -13108,9 +13125,18 @@ class GatewayRunner:
                 else "off"
             )
             visual_requirement = getattr(event, "visual_qa_requirement", None)
+            feature_summary = getattr(event, "feature_summary", None)
+            direct_request = (
+                str(feature_summary.get("initial_request") or "").strip()
+                if isinstance(feature_summary, dict)
+                else ""
+            ) or str(getattr(event, "text", "") or "").strip()
+            from hermes_cli.discord_worker_boards import pr_policy_for_request
+
+            pr_lifecycle_policy = pr_policy_for_request(direct_request)
             direct_policy = {
-                "merge": "auto",
-                "pr_open": "after_review_approval",
+                "merge": pr_lifecycle_policy["merge_policy"],
+                "pr_open": pr_lifecycle_policy["pr_open_policy"],
                 "early_draft_pr": closeout_cfg.get("early_draft_pr") is True,
                 "require_local_verification": True,
                 "require_review": False,

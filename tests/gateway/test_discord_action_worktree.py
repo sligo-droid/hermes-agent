@@ -664,6 +664,44 @@ def test_direct_closeout_activates_clean_verified_exact_head(
     assert notifications == ["work-1"]
 
 
+def test_direct_closeout_accepts_git_toplevel_for_nested_workspace(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(
+        canonical,
+        "worktree",
+        "add",
+        "-b",
+        "discord/action-test",
+        str(mutable),
+        "HEAD",
+    )
+    nested = mutable / "packages" / "app"
+    nested.mkdir(parents=True)
+    (nested / "app.txt").write_text("nested workspace\n", encoding="utf-8")
+    _run(mutable, "add", "packages/app/app.txt")
+    _run(mutable, "commit", "-m", "add nested workspace")
+    runner, captured, notifications = _direct_closeout_runner(nested, mode="enforce")
+    head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+
+    activated = runner._activate_direct_closeout_after_checkpoint(
+        "work-1",
+        _successful_verification_result(mutable),
+    )
+
+    assert activated is not None
+    assert captured["state"]["local_verification"] == {
+        "status": "passed",
+        "head_sha": head_sha,
+    }
+    assert notifications == ["work-1"]
+
+
 def test_direct_closeout_binds_required_visual_receipt_to_exact_head(
     tmp_path,
     monkeypatch,
@@ -910,3 +948,64 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
     )
     assert str(canonical) not in run_kwargs["context_prompt"]
     assert f"Path: `{worktree_cwd}`" in run_kwargs["context_prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_request", "expected_merge"),
+    [
+        ("Implement and ship this through the normal lifecycle.", "auto"),
+        ("Implement this and open a PR only; do not merge it.", "never"),
+    ],
+)
+async def test_direct_closeout_policy_preserves_pr_lifecycle_intent(
+    tmp_path,
+    monkeypatch,
+    initial_request,
+    expected_merge,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: _config(canonical),
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake"},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100_000,
+    )
+
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    runner._persist_action_closeout_workspace = lambda _event, **kwargs: captured.update(
+        closeout=kwargs
+    )
+    source = _source(canonical)
+    event = MessageEvent(
+        text="Proceed with the accepted request.",
+        source=source,
+        message_id="message-1",
+    )
+    event.feature_summary = {"initial_request": initial_request}
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:discord:thread:thread-123",
+        1,
+    )
+
+    assert response == "done"
+    assert captured["closeout"]["source"] == "direct"
+    assert captured["closeout"]["policy"]["merge"] == expected_merge
+    assert captured["closeout"]["policy"]["pr_open"] == "after_review_approval"

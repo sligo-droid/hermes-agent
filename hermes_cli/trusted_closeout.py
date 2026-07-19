@@ -30,6 +30,10 @@ REQUIRED_PR_CHECKS: tuple[tuple[str, str], ...] = (
     ("Basic Tests", "basic"),
     ("PR Body Format", "pr body"),
 )
+_REQUIRED_PR_CHECK_WORKFLOWS = {
+    ("Basic Tests", "basic"): ".github/workflows/tests.yml",
+    ("PR Body Format", "pr body"): ".github/workflows/pr-body-format.yml",
+}
 CLOSEOUT_MODES = frozenset({"off", "shadow", "enforce"})
 MERGE_POLICIES = frozenset({"auto", "manual", "never"})
 PR_OPEN_POLICIES = frozenset({"after_review_approval", "never"})
@@ -308,10 +312,41 @@ def _check_name(item: Mapping[str, Any]) -> str:
     )
 
 
-def _check_identity(item: Mapping[str, Any]) -> tuple[str, str, str]:
+def _check_app_identity(item: Mapping[str, Any]) -> str:
     app = item.get("app")
-    app_name = str(app.get("name") or "") if isinstance(app, Mapping) else ""
-    return (str(item.get("workflowName") or ""), _check_name(item), app_name)
+    if not isinstance(app, Mapping):
+        return ""
+    slug = str(app.get("slug") or "").strip().casefold()
+    name = str(app.get("name") or "").strip().casefold()
+    if (not slug or slug == "github-actions") and (not name or name == "github actions"):
+        return "github-actions"
+    return slug or name
+
+
+def _check_workflow_path(item: Mapping[str, Any]) -> str:
+    workflow = item.get("workflow")
+    if isinstance(workflow, Mapping):
+        value = str(workflow.get("path") or "").strip()
+        if value:
+            return value
+    return str(item.get("workflowPath") or "").strip()
+
+
+def _check_identity(item: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(item.get("workflowName") or ""),
+        _check_name(item),
+        _check_app_identity(item),
+        _check_workflow_path(item),
+    )
+
+
+def _is_trusted_required_check(item: Mapping[str, Any]) -> bool:
+    visible_identity = (str(item.get("workflowName") or ""), _check_name(item))
+    return (
+        _check_app_identity(item) == "github-actions"
+        and _check_workflow_path(item) == _REQUIRED_PR_CHECK_WORKFLOWS.get(visible_identity)
+    )
 
 
 def _check_sort_key(item: Mapping[str, Any], index: int) -> tuple[str, int, str, int]:
@@ -338,7 +373,10 @@ def _check_sort_key(item: Mapping[str, Any], index: int) -> tuple[str, int, str,
 def latest_logical_checks(items: Any) -> list[dict[str, Any]]:
     """Collapse historical attempts to the newest item per logical check."""
 
-    latest: dict[tuple[str, str, str], tuple[tuple[str, int, str, int], dict[str, Any]]] = {}
+    latest: dict[
+        tuple[str, str, str, str],
+        tuple[tuple[str, int, str, int], dict[str, Any]],
+    ] = {}
     if not isinstance(items, list):
         return []
     for index, raw in enumerate(items[:200]):
@@ -356,22 +394,20 @@ def summarize_required_checks(items: Any, *, head_sha: str) -> dict[str, Any]:
     """Summarize only exact required gates for the current trusted PR head."""
 
     selected: dict[tuple[str, str], dict[str, Any]] = {}
-    current_head_items = []
     if isinstance(items, list):
-        for raw in items:
+        for index, raw in enumerate(items[:200]):
             if not isinstance(raw, Mapping):
                 continue
             item_head = str(raw.get("headSha") or raw.get("headRefOid") or "").strip().lower()
-            if head_sha and item_head and item_head != head_sha.lower():
+            if head_sha and item_head != head_sha.lower():
                 continue
-            current_head_items.append(raw)
-    for item in latest_logical_checks(current_head_items):
-        identity = (str(item.get("workflowName") or ""), _check_name(item))
-        if identity not in REQUIRED_PR_CHECKS:
-            continue
-        prior = selected.get(identity)
-        if prior is None or _check_sort_key(item, 0) >= _check_sort_key(prior, 0):
-            selected[identity] = item
+            item = dict(raw)
+            visible_identity = (str(item.get("workflowName") or ""), _check_name(item))
+            if visible_identity not in REQUIRED_PR_CHECKS or not _is_trusted_required_check(item):
+                continue
+            prior = selected.get(visible_identity)
+            if prior is None or _check_sort_key(item, index) >= _check_sort_key(prior, 0):
+                selected[visible_identity] = item
 
     failed: list[str] = []
     pending = False
@@ -426,6 +462,113 @@ def summarize_required_checks(items: Any, *, head_sha: str) -> dict[str, Any]:
             for workflow, check in REQUIRED_PR_CHECKS
         ],
     }
+
+
+def _enrich_required_check_identities(
+    payload: Mapping[str, Any],
+    *,
+    repo: str,
+    root: Path,
+    run: CommandRunner,
+) -> dict[str, Any]:
+    """Resolve app/workflow identity omitted by ``gh pr view``."""
+
+    enriched = dict(payload)
+    raw_items = payload.get("statusCheckRollup")
+    head_sha = str(payload.get("headRefOid") or "").strip().lower()
+    if not isinstance(raw_items, list) or not _SHA_RE.fullmatch(head_sha):
+        return enriched
+    if all(
+        not isinstance(raw, Mapping)
+        or (str(raw.get("workflowName") or ""), _check_name(raw)) not in REQUIRED_PR_CHECKS
+        or _is_trusted_required_check(raw)
+        for raw in raw_items[:200]
+    ):
+        return enriched
+
+    try:
+        check_runs_result = run(
+            ["gh", "api", f"repos/{repo}/commits/{head_sha}/check-runs?filter=all&per_page=100"],
+            cwd=root,
+            timeout=30,
+            github=True,
+        )
+        check_runs_payload = (
+            json.loads(check_runs_result.stdout or "{}")
+            if check_runs_result.returncode == 0
+            else {}
+        )
+    except Exception:
+        check_runs_payload = {}
+    raw_check_runs = (
+        check_runs_payload.get("check_runs")
+        if isinstance(check_runs_payload, Mapping)
+        else None
+    )
+    trusted_by_url: dict[str, Mapping[str, Any]] = {}
+    if isinstance(raw_check_runs, list):
+        for raw_check_run in raw_check_runs[:100]:
+            if not isinstance(raw_check_run, Mapping):
+                continue
+            app = raw_check_run.get("app")
+            app_slug = (
+                str(app.get("slug") or "").strip().casefold()
+                if isinstance(app, Mapping)
+                else ""
+            )
+            run_head = str(raw_check_run.get("head_sha") or "").strip().lower()
+            details_url = str(raw_check_run.get("details_url") or "").strip()
+            if app_slug == "github-actions" and run_head == head_sha and details_url:
+                trusted_by_url[details_url] = raw_check_run
+
+    resolved_runs: dict[str, Mapping[str, Any] | None] = {}
+    items: list[Any] = []
+    for raw in raw_items[:200]:
+        if not isinstance(raw, Mapping):
+            items.append(raw)
+            continue
+        item = dict(raw)
+        visible_identity = (str(item.get("workflowName") or ""), _check_name(item))
+        details_url = str(item.get("detailsUrl") or item.get("url") or "").strip()
+        trusted_check_run = trusted_by_url.get(details_url)
+        if visible_identity not in REQUIRED_PR_CHECKS or trusted_check_run is None:
+            items.append(item)
+            continue
+        if str(trusted_check_run.get("name") or "") != visible_identity[1]:
+            items.append(item)
+            continue
+        match = re.fullmatch(
+            r"https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+)(?:/job/\d+)?/?",
+            details_url,
+            flags=re.IGNORECASE,
+        )
+        if not match or match.group(1).casefold() != repo.casefold():
+            items.append(item)
+            continue
+        run_id = match.group(2)
+        if run_id not in resolved_runs and len(resolved_runs) < 8:
+            try:
+                result = run(
+                    ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
+                    cwd=root,
+                    timeout=30,
+                    github=True,
+                )
+                candidate = json.loads(result.stdout or "{}") if result.returncode == 0 else None
+                resolved_runs[run_id] = candidate if isinstance(candidate, Mapping) else None
+            except Exception:
+                resolved_runs[run_id] = None
+        workflow_run = resolved_runs.get(run_id)
+        if isinstance(workflow_run, Mapping):
+            workflow_path = str(workflow_run.get("path") or "").strip()
+            run_head = str(workflow_run.get("head_sha") or "").strip().lower()
+            if workflow_path and run_head == head_sha:
+                item["app"] = {"name": "GitHub Actions", "slug": "github-actions"}
+                item["workflow"] = {"path": workflow_path}
+                item["headSha"] = run_head
+        items.append(item)
+    enriched["statusCheckRollup"] = items
+    return enriched
 
 
 def _default_run(
@@ -912,6 +1055,12 @@ def _reconcile_trusted_closeout_impl(
         return _blocked(original, state, code="pr_refresh_invalid_json", message=exc, now=current_time, retry=True, poll_seconds=poll)
     if not isinstance(payload, Mapping):
         return _blocked(original, state, code="pr_refresh_invalid_payload", message="PR refresh returned non-object JSON", now=current_time, retry=True, poll_seconds=poll)
+    payload = _enrich_required_check_identities(
+        payload,
+        repo=repo,
+        root=root,
+        run=execute,
+    )
 
     pr = state["pr"]
     try:
@@ -1227,6 +1376,12 @@ def _reconcile_trusted_closeout_impl(
         return _blocked(original, state, code="premerge_refresh_invalid_json", message=exc, now=current_time, retry=True, poll_seconds=poll)
     if not isinstance(premerge_payload, Mapping):
         return _blocked(original, state, code="premerge_refresh_invalid_payload", message="Pre-merge PR refresh returned non-object JSON", now=current_time, retry=True, poll_seconds=poll)
+    premerge_payload = _enrich_required_check_identities(
+        premerge_payload,
+        repo=repo,
+        root=root,
+        run=execute,
+    )
     try:
         refreshed_head = _apply_pr_payload(state, premerge_payload)
     except ValueError as exc:
