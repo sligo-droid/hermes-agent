@@ -156,12 +156,16 @@ def build_turn_runtime_breakdown(
     visual_receipts: list[dict[str, Any]] = []
     raw_receipts = stats.get("visual_qa_receipts")
     if isinstance(raw_receipts, list):
+        latest: dict[str, Any] | None = None
         for raw in raw_receipts:
             receipt = sanitize_visual_receipt(raw)
-            if receipt is not None:
-                visual_receipts.append(receipt)
-            if len(visual_receipts) >= 1:
-                break
+            if receipt is not None and (
+                latest is None
+                or _count(receipt.get("order")) >= _count(latest.get("order"))
+            ):
+                latest = receipt
+        if latest is not None:
+            visual_receipts.append(latest)
     visual_qa = _visual_qa_summary(stats, visual_receipts)
 
     return {

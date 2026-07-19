@@ -89,6 +89,18 @@ _SAFE_TEXT_RE = re.compile(r"[^A-Za-z0-9 .,:;()/_+-]+")
 _RECEIPT_ID_RE = re.compile(r"^(?:vrq|vac)_[0-9a-f]{24}$")
 _OPAQUE_REQUIREMENT_RE = re.compile(r"^(?:vtarget|vassert)_[0-9a-f]{24}$")
 _ASSERTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
+_HORIZONTAL_OVERFLOW_RE = re.compile(
+    r"\b(?:horizontal(?:ly)?\s+(?:overflow|scroll)|overflow(?:ing)?\s+(?:horizontally|on\s+the\s+x[- ]axis)|x[- ]axis\s+overflow)\b",
+    re.IGNORECASE,
+)
+_VIEWPORT_CONTAINMENT_RE = re.compile(
+    r"\b(?:inside|within|contained\s+(?:inside|within))\b.{0,40}\bviewport\b|"
+    r"\bviewport\b.{0,40}\b(?:inside|within|contained|bounds?)\b",
+    re.IGNORECASE,
+)
+_HOST_ASSERTION_KINDS = frozenset(
+    {"no_horizontal_overflow", "viewport_contained", "screenshot_appearance"}
+)
 _ACTIVE_VISUAL_REQUIREMENT: contextvars.ContextVar[dict[str, Any] | None] = (
     contextvars.ContextVar("hermes_active_visual_requirement", default=None)
 )
@@ -188,18 +200,57 @@ def _opaque_requirement_value(value: Any, prefix: str) -> str:
     return f"{prefix}_" + hashlib.sha256(encoded).hexdigest()[:24]
 
 
+def _required_assertion_kind(text: Any) -> str:
+    """Derive the host-owned executable kind before requirement prose is dropped."""
+
+    value = " ".join(str(text or "").split())
+    if _HORIZONTAL_OVERFLOW_RE.search(value):
+        return "no_horizontal_overflow"
+    if _VIEWPORT_CONTAINMENT_RE.search(value):
+        return "viewport_contained"
+    return "screenshot_appearance"
+
+
 def normalize_visual_requirement(value: Any) -> dict[str, Any]:
-    """Return an opaque durable requirement, or a ``none`` requirement."""
+    """Return an opaque durable requirement, or a ``none`` requirement.
+
+    Fresh host assertions retain only an opaque ID and a deterministic required
+    kind. Legacy opaque-string assertions remain recognizable but intentionally
+    non-covering because their required kind cannot be recovered safely.
+    """
     raw = value if isinstance(value, dict) else {}
     level = str(raw.get("level") or "none").strip().lower()
     if level not in VISUAL_QA_LEVELS:
         level = "none"
     target = _opaque_requirement_value(raw.get("target"), "vtarget")
-    assertions: list[str] = []
+    assertions: list[Any] = []
+    seen_ids: set[str] = set()
     for item in raw.get("assertions") or []:
-        assertion = _opaque_requirement_value(item, "vassert")
-        if assertion and assertion not in assertions:
-            assertions.append(assertion)
+        if isinstance(item, dict):
+            raw_id = item.get("id")
+            assertion_id = _opaque_requirement_value(raw_id, "vassert")
+            kind = str(item.get("kind") or "").strip().lower()
+            if (
+                assertion_id
+                and assertion_id not in seen_ids
+                and _OPAQUE_REQUIREMENT_RE.fullmatch(str(raw_id or "").strip())
+                and kind in _HOST_ASSERTION_KINDS
+            ):
+                assertions.append({"id": assertion_id, "kind": kind})
+                seen_ids.add(assertion_id)
+        else:
+            raw_text = " ".join(str(item or "").split())
+            assertion_id = _opaque_requirement_value(raw_text, "vassert")
+            if not assertion_id or assertion_id in seen_ids:
+                continue
+            if _OPAQUE_REQUIREMENT_RE.fullmatch(raw_text):
+                # Older durable contracts had IDs but no trustworthy kind.
+                assertions.append(assertion_id)
+            else:
+                assertions.append(
+                    {"id": assertion_id, "kind": _required_assertion_kind(raw_text)}
+                )
+            seen_ids.add(assertion_id)
         if len(assertions) >= _MAX_ASSERTIONS:
             break
     if level == "none":
@@ -368,6 +419,13 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
     expected_requirement_id = visual_requirement_id(requirement_value)
     if expected_requirement_id and requirement_id != expected_requirement_id:
         return None
+    if expected_requirement_id:
+        required_assertions = requirement_value.get("assertions") or []
+        if not all(isinstance(item, dict) for item in required_assertions):
+            return None
+        required_ids = [str(item.get("id") or "") for item in required_assertions]
+        if len(required_ids) != len(normalized_ids) or set(required_ids) != set(normalized_ids):
+            return None
 
     def _metric(name: str, maximum: int) -> int:
         try:

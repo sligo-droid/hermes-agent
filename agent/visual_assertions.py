@@ -7,7 +7,11 @@ import json
 import re
 from typing import Any
 
-from agent.visual_qa import ASSERTION_RESULT_CODES, VISUAL_QA_STATUSES
+from agent.visual_qa import (
+    ASSERTION_RESULT_CODES,
+    VISUAL_QA_STATUSES,
+    normalize_visual_requirement,
+)
 
 
 ASSERTION_KINDS = frozenset(
@@ -35,6 +39,7 @@ _ELEMENT_KINDS = frozenset(
     }
 )
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
+_HOST_ASSERTION_ID_RE = re.compile(r"^vassert_[0-9a-f]{24}$")
 _UNSAFE_RE = re.compile(
     r"(?:https?://|\b(?:authorization|bearer|cookie|password|secret|token)\b)",
     re.IGNORECASE,
@@ -127,6 +132,57 @@ def validate_visual_assertions(
     return normalized
 
 
+def validate_visual_assertion_coverage(
+    requirement: Any,
+    assertions: Any,
+    *,
+    max_assertions: int = 6,
+) -> list[dict[str, Any]]:
+    """Return assertions only for exact host-owned ID/kind coverage.
+
+    Syntax validation intentionally omits malformed entries for general callers.
+    Coverage validation is stricter: every supplied entry must survive, and the
+    executable contract must bind one-to-one to all host requirement assertions.
+    """
+
+    normalized_requirement = normalize_visual_requirement(requirement)
+    required = normalized_requirement.get("assertions") or []
+    if normalized_requirement.get("level") == "none" or not required:
+        return []
+    if not isinstance(assertions, list):
+        return []
+    normalized = validate_visual_assertions(
+        assertions,
+        max_assertions=max_assertions,
+    )
+    if len(normalized) != len(assertions) or len(required) != len(normalized):
+        return []
+
+    required_by_id: dict[str, str] = {}
+    for item in required:
+        if not isinstance(item, dict):
+            return []
+        assertion_id = str(item.get("id") or "")
+        kind = str(item.get("kind") or "")
+        if (
+            not _HOST_ASSERTION_ID_RE.fullmatch(assertion_id)
+            or kind not in ASSERTION_KINDS
+            or assertion_id in required_by_id
+        ):
+            return []
+        required_by_id[assertion_id] = kind
+
+    covered_ids: set[str] = set()
+    for item in normalized:
+        assertion_id = item["id"]
+        if required_by_id.get(assertion_id) != item["kind"] or assertion_id in covered_ids:
+            return []
+        covered_ids.add(assertion_id)
+    if covered_ids != set(required_by_id):
+        return []
+    return normalized
+
+
 def visual_assertion_contract_id(assertions: Any) -> str:
     """Hash the validated executable assertion contract into an opaque ID."""
 
@@ -188,6 +244,7 @@ __all__ = [
     "ASSERTION_RESULT_CODES",
     "aggregate_assertion_results",
     "sanitize_assertion_result",
+    "validate_visual_assertion_coverage",
     "validate_visual_assertions",
     "visual_assertion_contract_id",
 ]

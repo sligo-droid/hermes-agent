@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent.provider_progress import clear_provider_progress_signal, latest_provider_progress_signal
-from agent.visual_qa import visual_requirement_id
+from agent.visual_qa import normalize_visual_requirement, visual_requirement_id
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
@@ -51,10 +51,14 @@ def _repo_discord_event(message_id="m1", text="do the work"):
 
 
 def _visual_receipt(requirement, *, order=3, status="passed", evidence_ref=""):
+    normalized = normalize_visual_requirement(requirement)
+    assertion_ids = [
+        item["id"] for item in normalized["assertions"] if isinstance(item, dict)
+    ]
     receipt = {
-        "requirement_id": visual_requirement_id(requirement),
+        "requirement_id": visual_requirement_id(normalized),
         "contract_id": "vac_" + ("a" * 24),
-        "assertion_ids": ["layout-check"],
+        "assertion_ids": assertion_ids,
         "status": status,
         "attempts": 1,
         "vision_calls": 0,
@@ -181,7 +185,10 @@ def test_ledger_persists_normalized_visual_requirement_from_feature_summary(tmp_
     requirement = stored["visual_qa_requirement"]
     assert requirement["level"] == "surface"
     assert requirement["target"].startswith("vtarget_")
-    assert all(item.startswith("vassert_") for item in requirement["assertions"])
+    assert all(
+        item["id"].startswith("vassert_") and item["kind"] == "screenshot_appearance"
+        for item in requirement["assertions"]
+    )
     assert "responsive dashboard" not in repr(requirement).lower()
     assert "mobile sidebar" not in repr(requirement).lower()
     replay = ledger.event_from_item(stored)
@@ -227,11 +234,13 @@ def test_shadow_visual_qa_reports_missing_fresh_receipt_without_blocking(tmp_pat
 def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     from gateway.run import _visual_qa_context_prompt, _visual_qa_turn_result
 
-    requirement = {
-        "level": "surface",
-        "target": "responsive dashboard",
-        "assertions": ["dashboard has no unintended overflow"],
-    }
+    requirement = normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": "responsive dashboard",
+            "assertions": ["dashboard has no unintended overflow"],
+        }
+    )
     config = {"mode": "enforce_explicit", "max_receipts_per_turn": 1, "max_followup_turns": 1}
     prompt = _visual_qa_context_prompt(requirement, config)
     assert "mode=enforce_explicit" in prompt
@@ -245,7 +254,12 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     )
     state = _visual_qa_turn_result(
         agent,
-        {"visual_qa_receipts": [_visual_receipt(requirement, order=3)]},
+        {
+            "visual_qa_receipts": [
+                _visual_receipt(requirement, order=1, status="failed"),
+                _visual_receipt(requirement, order=3),
+            ]
+        },
         requirement,
     )
     assert state == {
@@ -296,7 +310,10 @@ def test_enforced_visual_qa_requires_a_fresh_post_edit_receipt(tmp_path):
     assert ledger.mark_agent_done(
         fresh["id"],
         final_response="Implemented the dashboard.",
-        visual_qa_receipts=[_visual_receipt(fresh_requirement, order=3)],
+        visual_qa_receipts=[
+            _visual_receipt(fresh_requirement, order=2, status="failed"),
+            _visual_receipt(fresh_requirement, order=3),
+        ],
         visual_qa_code_mutation_observed=True,
         visual_qa_min_receipt_order=3,
     )

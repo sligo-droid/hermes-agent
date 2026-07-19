@@ -2183,7 +2183,8 @@ class SessionDB:
         observed: bool = False,
         timestamp: Any = None,
         return_transcript_revision: bool = False,
-    ) -> int | Tuple[int, int]:
+        expected_transcript_revision: int | None = None,
+    ) -> int | Tuple[int, int] | None:
         """
         Append a message to a session. Returns the message row ID.
 
@@ -2191,6 +2192,8 @@ class SessionDB:
         if role is 'tool' or tool_calls is present). When
         ``return_transcript_revision`` is true, returns ``(message_id, revision)``
         with the durable revision committed by the same transaction.
+        ``expected_transcript_revision`` enables an ABA-safe append CAS and
+        returns ``None`` without inserting when the durable revision changed.
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -2225,6 +2228,14 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            if expected_transcript_revision is not None:
+                row = conn.execute(
+                    "SELECT transcript_revision FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                current_revision = int(row[0]) if row is not None else None
+                if current_revision != int(expected_transcript_revision):
+                    return None
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
@@ -2278,10 +2289,19 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def append_message_with_revision(self, *args, **kwargs) -> Tuple[int, int]:
-        """Append a message and return its row ID plus committed revision."""
+    def append_message_with_revision(
+        self,
+        *args,
+        **kwargs,
+    ) -> Tuple[int, int] | None:
+        """Append a message and return its row ID plus committed revision.
+
+        Returns ``None`` when an optional expected revision does not match.
+        """
         kwargs["return_transcript_revision"] = True
         result = self.append_message(*args, **kwargs)
+        if result is None:
+            return None
         message_id, revision = result
         return int(message_id), int(revision)
 

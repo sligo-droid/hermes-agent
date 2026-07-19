@@ -343,3 +343,48 @@ def test_final_rewrite_rejects_same_count_concurrent_sqlite_replacement(tmp_path
     rows = db.get_messages(agent.session_id)
     assert [row["content"] for row in rows] == ["concurrent rewrite"]
     assert agent._last_flushed_db_snapshot_token == stale_token
+
+
+def test_incremental_append_revision_cas_blocks_aba_final_rewrite(tmp_path):
+    """Concurrent replacement invalidates all remaining local write authority."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    agent = _make_agent()
+    agent._session_db = db
+    agent.session_id = "incremental-append-aba"
+    agent._session_db_created = False
+    agent._last_flushed_db_idx = 0
+    agent._ensure_db_session()
+
+    local_messages = [{"role": "user", "content": "local A"}]
+    agent._flush_messages_to_session_db(local_messages)
+    assert agent._last_flushed_db_snapshot_token == (agent.session_id, 1)
+
+    assert db.replace_messages(
+        agent.session_id,
+        [
+            {"role": "user", "content": "concurrent X"},
+            {"role": "assistant", "content": "concurrent Y"},
+        ],
+        expected_transcript_revision=1,
+    ) is True
+    assert db.get_session(agent.session_id)["transcript_revision"] == 2
+
+    local_messages.append({"role": "assistant", "content": "local B"})
+    agent._flush_messages_to_session_db(local_messages)
+
+    assert agent._session_db_append_conflict_session_id == agent.session_id
+    assert agent._last_flushed_db_snapshot_token is None
+    assert [row["content"] for row in db.get_messages(agent.session_id)] == [
+        "concurrent X",
+        "concurrent Y",
+    ]
+
+    # Same row count would satisfy the legacy count guard, but lost append CAS
+    # authority must also disable the stale local final rewrite.
+    agent._rewrite_messages_to_session_db(local_messages)
+    assert [row["content"] for row in db.get_messages(agent.session_id)] == [
+        "concurrent X",
+        "concurrent Y",
+    ]

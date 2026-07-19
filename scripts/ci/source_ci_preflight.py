@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run dependency-free source-CI security checks before project installs.
+"""Run dependency-free source-CI supply-chain checks.
 
-This intentionally uses only the Python standard library.  It is invoked by
-the untrusted source workflow before ``uv pip install`` or ``npm ci`` so a
-dangerous diff cannot first execute through a project dependency install.
+This intentionally uses only the Python standard library.  The mandatory
+security boundary invokes the trusted-base copy from ``pull_request_target``
+against exact PR commit metadata.  Source CI may also invoke its checkout's
+copy as defense in depth before project dependency installation.
 """
 
 from __future__ import annotations
@@ -82,15 +83,33 @@ def is_mcp_catalog_path(path: str) -> bool:
     return path.startswith(_MCP_CATALOG_PREFIX) or path == _MCP_CATALOG_FILE
 
 
-def _git_output(root: Path, args: list[str]) -> tuple[int, str, str]:
+def _git_output(
+    root: Path,
+    args: list[str],
+    *,
+    input_text: str | None = None,
+) -> tuple[int, str, str]:
     result = subprocess.run(
         ["git", *args],
         cwd=root,
         capture_output=True,
         text=True,
+        input=input_text,
         check=False,
     )
     return result.returncode, result.stdout, result.stderr
+
+
+def _empty_tree_oid(root: Path) -> tuple[str, bool]:
+    """Return this repository's object-format-specific empty tree ID."""
+
+    code, output, _error = _git_output(
+        root,
+        ["hash-object", "-t", "tree", "--stdin"],
+        input_text="",
+    )
+    oid = output.strip()
+    return oid, code == 0 and bool(oid)
 
 
 def _diff_reference(
@@ -109,17 +128,18 @@ def _diff_reference(
         if code == 0:
             return output, True
     if head:
-        # ``git diff --root <commit>`` compares the commit to the working tree
-        # and can return an empty scan for a clean checkout. ``diff-tree
-        # --root`` is the commit-to-tree operation: for a root commit it uses
-        # the empty tree, and for any other commit it scans the committed tree
-        # against its parent without consulting mutable workspace state.
-        code, output, _error = _git_output(
-            root,
-            ["diff-tree", "--root", "--no-commit-id", "-r", *options, head, *suffix],
-        )
-        if code == 0:
-            return output, True
+        # If the requested range cannot be proven, inspect the entire committed
+        # head tree.  Comparing against this repository's own empty-tree object
+        # works for SHA-1 and SHA-256 repositories, never reads the working tree,
+        # and cannot hide an unsafe earlier commit behind an innocuous tip.
+        empty_tree, empty_tree_available = _empty_tree_oid(root)
+        if empty_tree_available:
+            code, output, _error = _git_output(
+                root,
+                ["diff", *options, empty_tree, head, *suffix],
+            )
+            if code == 0:
+                return output, True
     return "", False
 
 

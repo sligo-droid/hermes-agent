@@ -28,10 +28,10 @@ def test_source_ci_has_parallel_lanes_and_always_created_basic_gate():
     assert "scripts/ci/resolve_changed_range.py" in source
     assert "--unshallow" not in source
     assert source.index("Resolve bounded changed range") < source.index("Classify changed surfaces")
-    assert source.index("Classify changed surfaces") < source.index("Run source-CI preflight")
-    assert source.index("Run source-CI preflight") < source.index("  python:\n")
-    assert source.index("Run source-CI preflight") < source.index("  frontend:\n")
-    assert source.index("Run source-CI preflight") < source.index("  site:\n")
+    assert source.index("Classify changed surfaces") < source.index("Run defense-in-depth source preflight")
+    assert source.index("Run defense-in-depth source preflight") < source.index("  python:\n")
+    assert source.index("Run defense-in-depth source preflight") < source.index("  frontend:\n")
+    assert source.index("Run defense-in-depth source preflight") < source.index("  site:\n")
     assert "Verify conditional lane results" in source
     assert '[[ "$CLASSIFY_RESULT" == "success" ]]' in source
     assert 'elif [[ "$required" == "false" ]]; then' in source
@@ -67,3 +67,23 @@ def test_pr_body_is_a_separate_trusted_base_gate():
     assert "group: pr-body-${{ github.event.pull_request.number }}" in source
     assert "cancel-in-progress: true" in source
     assert "merge-gate-" not in source
+    assert "ref: ${{ github.event.pull_request.base.sha }}" in source
+    assert "persist-credentials: false" in source
+    assert "Fetch exact PR commits without checkout" in source
+    assert "git fetch --no-tags --depth=256 origin" in source
+    assert "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head" in source
+    assert '[[ "$(git rev-parse HEAD^{commit})" == "$BASE_SHA" ]]' in source
+    assert '[[ "$resolved_head" == "$HEAD_SHA" ]]' in source
+    assert "Run trusted-base source-CI preflight" in source
+    assert "python scripts/ci/source_ci_preflight.py" in source
+    assert "uv pip install" not in source
+    assert "npm ci" not in source
+    assert source.index("Checkout trusted base code") < source.index(
+        "Fetch exact PR commits without checkout"
+    )
+    assert source.index("Fetch exact PR commits without checkout") < source.index(
+        "Run trusted-base source-CI preflight"
+    )
+    assert source.index("Run trusted-base source-CI preflight") < source.index(
+        "Check PR body Markdown and project-state hygiene"
+    )

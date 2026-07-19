@@ -854,6 +854,12 @@ def compress_context(
                 except (ValueError, Exception) as e:
                     logger.debug("Could not propagate title on compression: %s", e)
             agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+            session_row = agent._session_db.get_session(agent.session_id)
+            agent._last_flushed_db_snapshot_token = (
+                agent.session_id,
+                int((session_row or {}).get("transcript_revision") or 0),
+            )
+            agent._session_db_append_conflict_session_id = None
             # Reset flush cursor — new session starts with no messages written
             agent._last_flushed_db_idx = 0
         except Exception as e:

@@ -122,6 +122,7 @@ async def evaluate_screenshot_assertions(
         "max_tokens": 550,
         "timeout": max(1.0, min(float(timeout_s), 30.0)),
         "single_attempt": True,
+        "strict_vision_capability": True,
     }
     if resolution.native_tool_result_supported:
         if provider:

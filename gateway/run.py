@@ -263,12 +263,18 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         if mode == "enforce_explicit"
         else "This is shadow-only reporting and does not block completion."
     )
+    required = ", ".join(
+        f"{item.get('id')}={item.get('kind')}"
+        for item in requirement.get("assertions") or []
+        if isinstance(item, dict) and item.get("id") and item.get("kind")
+    )
     return (
         "[Visual QA: "
         f"mode={mode}; the accepted request has an opaque {requirement.get('level')} requirement. "
         "After the relevant code edit, call the dedicated `visual_qa` tool with "
-        "bounded declarative assertions. Do not attach receipt arguments to "
-        "terminal/browser/vision calls. Generic navigation, screenshots, "
+        f"one executable assertion for each required ID/kind ({required}). "
+        "Reuse each opaque ID and exact kind; add the transient locator or expectation needed to execute it. "
+        "Do not attach receipt arguments to terminal/browser/vision calls. Generic navigation, screenshots, "
         f"or console success do not count. {enforcement}]"
     )
 
@@ -290,8 +296,8 @@ def _visual_qa_turn_result(
             receipt = sanitize_visual_receipt(raw, requirement=normalized_requirement)
             if receipt is not None:
                 receipts.append(receipt)
-            if len(receipts) >= config["max_receipts_per_turn"]:
-                break
+        receipts.sort(key=lambda item: int(item.get("order") or 0))
+        receipts = receipts[-config["max_receipts_per_turn"] :]
     except Exception:
         pass
 

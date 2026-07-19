@@ -12,7 +12,7 @@ from typing import Any, Awaitable, Callable, Optional
 from agent.execution_guard import CooperativeExecutionGuard, ExecutionGuardExpired
 from agent.visual_assertions import (
     aggregate_assertion_results,
-    validate_visual_assertions,
+    validate_visual_assertion_coverage,
     visual_assertion_contract_id,
 )
 from agent.visual_qa import (
@@ -273,7 +273,8 @@ async def run_visual_assertions(
         return execution_guard.remaining()
 
     normalized_requirement = normalize_visual_requirement(requirement)
-    normalized_assertions = validate_visual_assertions(
+    normalized_assertions = validate_visual_assertion_coverage(
+        normalized_requirement,
         assertions,
         max_assertions=visual_config["max_assertions"],
     )

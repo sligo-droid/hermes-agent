@@ -6677,6 +6677,12 @@ class HermesCLI:
                         },
                     )
                     self.agent._session_db_created = True
+                    session_row = self._session_db.get_session(self.session_id)
+                    self.agent._last_flushed_db_snapshot_token = (
+                        self.session_id,
+                        int((session_row or {}).get("transcript_revision") or 0),
+                    )
+                    self.agent._session_db_append_conflict_session_id = None
                 except Exception:
                     pass
                 if title and self._session_db:

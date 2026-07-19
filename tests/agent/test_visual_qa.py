@@ -2,6 +2,7 @@ from agent.visual_qa import (
     build_visual_qa_followup_nudge,
     classify_visual_requirement,
     normalize_visual_qa_config,
+    normalize_visual_requirement,
     sanitize_visual_receipt,
     visual_receipt_completion,
     visual_requirement_id,
@@ -9,10 +10,14 @@ from agent.visual_qa import (
 
 
 def _receipt(requirement, *, status="passed", order=4):
+    normalized = normalize_visual_requirement(requirement)
+    assertion_ids = [
+        item["id"] for item in normalized["assertions"] if isinstance(item, dict)
+    ]
     return {
-        "requirement_id": visual_requirement_id(requirement),
+        "requirement_id": visual_requirement_id(normalized),
         "contract_id": "vac_" + ("a" * 24),
-        "assertion_ids": ["layout-check"],
+        "assertion_ids": assertion_ids,
         "status": status,
         "attempts": 1,
         "vision_calls": 0,
@@ -28,8 +33,10 @@ def test_classifier_recognizes_explicit_artifact_and_surface_work():
 
     assert artifact["level"] == "artifact"
     assert artifact["assertions"]
+    assert artifact["assertions"][0]["kind"] == "screenshot_appearance"
     assert surface["level"] == "surface"
     assert surface["assertions"]
+    assert surface["assertions"][0]["kind"] == "no_horizontal_overflow"
 
 
 def test_classifier_excludes_review_only_work():
@@ -72,13 +79,15 @@ def test_durable_visual_requirement_uses_only_opaque_content_ids():
         "assertions": protected[1:],
     }
 
-    from agent.visual_qa import normalize_visual_requirement
-
     normalized = normalize_visual_requirement(requirement)
     serialized = repr(normalized)
 
     assert normalized["target"].startswith("vtarget_")
-    assert all(item.startswith("vassert_") for item in normalized["assertions"])
+    assert all(
+        item["id"].startswith("vassert_")
+        and item["kind"] in {"no_horizontal_overflow", "viewport_contained", "screenshot_appearance"}
+        for item in normalized["assertions"]
+    )
     for value in protected:
         assert value not in serialized
     assert normalize_visual_requirement(normalized) == normalized
@@ -156,7 +165,11 @@ def test_classifier_preserves_newline_boundaries_before_assertion_extraction():
 
     assert requirement["level"] == "surface"
     assert len(requirement["assertions"]) == 2
-    assert all(item.startswith("vassert_") for item in requirement["assertions"])
+    assert all(item["id"].startswith("vassert_") for item in requirement["assertions"])
+    assert [item["kind"] for item in requirement["assertions"]] == [
+        "screenshot_appearance",
+        "no_horizontal_overflow",
+    ]
     assert "responsive toolbar" not in repr(requirement).lower()
     assert "mobile viewport" not in repr(requirement).lower()
 

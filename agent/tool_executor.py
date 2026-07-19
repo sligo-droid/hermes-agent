@@ -536,8 +536,10 @@ def _record_turn_verification_evidence(
             except Exception:
                 budget = 1
             receipts = stats.setdefault("visual_qa_receipts", [])
-            if len(receipts) < budget:
+            if isinstance(receipts, list) and budget > 0:
                 receipts.append(receipt)
+                receipts.sort(key=lambda item: int(item.get("order") or 0))
+                del receipts[:-budget]
                 try:
                     stats["visual_qa_check_duration_s"] = float(
                         stats.get("visual_qa_check_duration_s") or 0.0

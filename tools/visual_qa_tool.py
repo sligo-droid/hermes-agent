@@ -26,8 +26,10 @@ VISUAL_QA_SCHEMA = {
         "Run bounded declarative visual assertions against the existing task browser session. "
         "Use this after an explicit rendered UI or artifact change. This tool accepts only "
         "trusted assertion kinds; it does not accept JavaScript, CDP commands, shell commands, "
-        "URLs, screenshots, cookies, or headers. Only an explicit passed receipt satisfies an "
-        "enforced visual gate; failed, blocked, uncertain, malformed, and timed-out checks do not."
+        "URLs, screenshots, cookies, or headers. Reuse every host-provided opaque assertion ID "
+        "with its exact required kind; missing, duplicate, substituted, unrelated, or legacy "
+        "coverage is rejected. Only an explicit passed receipt satisfies an enforced visual gate; "
+        "failed, blocked, uncertain, malformed, and timed-out checks do not."
     ),
     "parameters": {
         "type": "object",

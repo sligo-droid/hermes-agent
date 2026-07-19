@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.visual_qa import normalize_visual_requirement
 from tools.visual_assertion_runner import (
     record_trusted_visual_mutation,
     run_visual_assertions,
@@ -11,18 +12,29 @@ from tools.visual_assertion_runner import (
 )
 
 
-_REQUIREMENT = {
-    "level": "surface",
-    "target": "mobile toolbar",
-    "assertions": ["toolbar remains inside the mobile viewport"],
-}
+_REQUIREMENT = normalize_visual_requirement(
+    {
+        "level": "surface",
+        "target": "mobile toolbar",
+        "assertions": ["toolbar remains inside the mobile viewport"],
+    }
+)
+_ASSERTION_ID = _REQUIREMENT["assertions"][0]["id"]
 _ASSERTIONS = [
     {
-        "id": "toolbar-contained",
+        "id": _ASSERTION_ID,
         "kind": "viewport_contained",
         "locator": {"by": "test_id", "value": "mobile-toolbar"},
     }
 ]
+_APPEARANCE_REQUIREMENT = normalize_visual_requirement(
+    {
+        "level": "surface",
+        "target": "mobile toolbar",
+        "assertions": ["toolbar has the requested balanced visual appearance"],
+    }
+)
+_APPEARANCE_ID = _APPEARANCE_REQUIREMENT["assertions"][0]["id"]
 
 
 class FakeSupervisor:
@@ -47,6 +59,90 @@ class FakeSupervisor:
             "viewport_contained": self.contained or self.state_calls > 1,
             "no_horizontal_overflow": True,
         }
+
+
+@pytest.mark.asyncio
+async def test_unrelated_exists_assertion_cannot_cover_overflow_requirement():
+    requirement = normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": "mobile toolbar",
+            "assertions": ["toolbar has no horizontal overflow"],
+        }
+    )
+    assertion_id = requirement["assertions"][0]["id"]
+
+    result = await run_visual_assertions(
+        task_id="coverage-mismatch",
+        requirement=requirement,
+        assertions=[
+            {
+                "id": assertion_id,
+                "kind": "exists",
+                "locator": {"by": "test_id", "value": "mobile-toolbar"},
+            }
+        ],
+        supervisor=FakeSupervisor(contained=True),
+    )
+
+    assert result == {
+        "status": "uncertain",
+        "code": "invalid_visual_contract",
+        "attempts": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_overflow_requirement_coverage_executes():
+    requirement = normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": "mobile toolbar",
+            "assertions": ["toolbar has no horizontal overflow"],
+        }
+    )
+    required = requirement["assertions"][0]
+
+    result = await run_visual_assertions(
+        task_id="coverage-match",
+        requirement=requirement,
+        assertions=[
+            {
+                "id": required["id"],
+                "kind": required["kind"],
+                "locator": {"by": "test_id", "value": "mobile-toolbar"},
+            }
+        ],
+        supervisor=FakeSupervisor(contained=True),
+    )
+
+    assert required["kind"] == "no_horizontal_overflow"
+    assert result["status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_opaque_requirement_is_non_covering():
+    legacy_requirement = {
+        "level": "surface",
+        "target": "vtarget_" + ("a" * 24),
+        "assertions": ["vassert_" + ("b" * 24)],
+    }
+
+    result = await run_visual_assertions(
+        task_id="legacy-coverage",
+        requirement=legacy_requirement,
+        assertions=[
+            {
+                "id": legacy_requirement["assertions"][0],
+                "kind": "exists",
+                "locator": {"by": "test_id", "value": "mobile-toolbar"},
+            }
+        ],
+        supervisor=FakeSupervisor(contained=True),
+    )
+
+    assert result["code"] == "invalid_visual_contract"
+    assert result["attempts"] == []
 
 
 @pytest.mark.asyncio
@@ -168,10 +264,10 @@ async def test_timed_out_vision_attempt_consumes_single_provider_budget():
 
     result = await run_visual_assertions(
         task_id="vision-budget-task",
-        requirement=_REQUIREMENT,
+        requirement=_APPEARANCE_REQUIREMENT,
         assertions=[
             {
-                "id": "appearance",
+                "id": _APPEARANCE_ID,
                 "kind": "screenshot_appearance",
                 "expectation": "balanced layout",
             }
@@ -207,9 +303,9 @@ async def test_screenshot_failure_does_not_consume_provider_budget():
 
     result = await run_visual_assertions(
         task_id="screenshot-failure",
-        requirement=_REQUIREMENT,
+        requirement=_APPEARANCE_REQUIREMENT,
         assertions=[
-            {"id": "appearance", "kind": "screenshot_appearance", "expectation": "balanced layout"}
+            {"id": _APPEARANCE_ID, "kind": "screenshot_appearance", "expectation": "balanced layout"}
         ],
         supervisor=ScreenshotFailureSupervisor(),
         vision_evaluator=evaluator,
@@ -229,15 +325,15 @@ async def test_capability_rejection_before_provider_start_does_not_consume_budge
         return {
             "status": "uncertain",
             "results": [
-                {"id": "appearance", "status": "uncertain", "code": "vision_capability_unavailable"}
+                {"id": _APPEARANCE_ID, "status": "uncertain", "code": "vision_capability_unavailable"}
             ],
         }
 
     result = await run_visual_assertions(
         task_id="capability-block",
-        requirement=_REQUIREMENT,
+        requirement=_APPEARANCE_REQUIREMENT,
         assertions=[
-            {"id": "appearance", "kind": "screenshot_appearance", "expectation": "balanced layout"}
+            {"id": _APPEARANCE_ID, "kind": "screenshot_appearance", "expectation": "balanced layout"}
         ],
         supervisor=ScreenshotSupervisor(),
         vision_evaluator=evaluator,
@@ -259,9 +355,9 @@ async def test_pre_provider_timeout_does_not_consume_budget():
 
     result = await run_visual_assertions(
         task_id="pre-provider-timeout",
-        requirement=_REQUIREMENT,
+        requirement=_APPEARANCE_REQUIREMENT,
         assertions=[
-            {"id": "appearance", "kind": "screenshot_appearance", "expectation": "balanced layout"}
+            {"id": _APPEARANCE_ID, "kind": "screenshot_appearance", "expectation": "balanced layout"}
         ],
         supervisor=ScreenshotSupervisor(),
         vision_evaluator=evaluator,
@@ -317,9 +413,9 @@ async def test_external_caller_timeout_prevents_late_provider_start():
         await asyncio.wait_for(
             run_visual_assertions(
                 task_id="external-timeout",
-                requirement=_REQUIREMENT,
+                requirement=_APPEARANCE_REQUIREMENT,
                 assertions=[
-                    {"id": "appearance", "kind": "screenshot_appearance", "expectation": "balanced layout"}
+                    {"id": _APPEARANCE_ID, "kind": "screenshot_appearance", "expectation": "balanced layout"}
                 ],
                 supervisor=ScreenshotSupervisor(),
                 vision_evaluator=evaluator,

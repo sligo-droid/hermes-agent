@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
+from agent.verification_evidence import record_terminal_result
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
@@ -483,6 +484,36 @@ def _successful_verification_result(mutable, *, mutation_generation=0, mutation_
             ],
         }
     }
+
+
+def test_direct_closeout_rejects_verification_followed_by_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canonical = tmp_path / "canonical"
+    mutable = tmp_path / "mutable"
+    _init_repo(canonical)
+    _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
+    (mutable / "scripts").mkdir()
+    (mutable / "scripts" / "run_tests.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    _run(mutable, "add", "scripts/run_tests.sh")
+    _run(mutable, "commit", "-m", "add test wrapper")
+    runner, captured, notifications = _direct_closeout_runner(mutable)
+
+    evidence = record_terminal_result(
+        command="scripts/run_tests.sh && mutate && git commit -am unsafe",
+        cwd=mutable,
+        session_id="direct-closeout-composite",
+        exit_code=0,
+        output="passed",
+    )
+    result = {"runtime_breakdown": {"verification_evidence": [evidence] if evidence else []}}
+
+    assert evidence is None
+    assert runner._activate_direct_closeout_after_checkpoint("work-1", result) is None
+    assert captured == {}
+    assert notifications == []
 
 
 def test_direct_closeout_does_not_activate_without_verification(tmp_path, monkeypatch):

@@ -549,6 +549,33 @@ class TestMessageStorage:
         db.clear_messages("s1")
         assert db.get_session("s1")["transcript_revision"] == 3
 
+    def test_append_message_revision_cas_preserves_concurrent_transcript(self, db):
+        db.create_session(session_id="s1", source="cli")
+        first = db.append_message_with_revision(
+            "s1",
+            role="user",
+            content="first",
+            expected_transcript_revision=0,
+        )
+        assert first is not None
+        _, revision = first
+        assert revision == 1
+
+        assert db.replace_messages(
+            "s1",
+            [{"role": "user", "content": "concurrent"}],
+            expected_transcript_revision=revision,
+        ) is True
+        assert db.append_message_with_revision(
+            "s1",
+            role="assistant",
+            content="stale local append",
+            expected_transcript_revision=revision,
+        ) is None
+
+        assert [row["content"] for row in db.get_messages("s1")] == ["concurrent"]
+        assert db.get_session("s1")["transcript_revision"] == 2
+
     def test_get_messages_as_conversation(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

@@ -55,19 +55,20 @@ def test_runtime_merge_accumulates_without_raw_details():
 
 
 def test_runtime_breakdown_carries_one_sanitized_visual_receipt():
-    receipt = dict(_VISUAL_RECEIPT)
+    receipt = {**_VISUAL_RECEIPT, "order": 1}
+    latest = {**receipt, "status": "failed", "order": 2}
 
     breakdown = build_turn_runtime_breakdown({
         "visual_qa_level": "artifact",
-        "visual_qa_receipts": [receipt, {**receipt, "status": "failed"}],
+        "visual_qa_receipts": [receipt, latest],
         "visual_qa_check_duration_s": 2.5,
         "visual_qa_followup_count": 1,
     })
 
-    assert breakdown["visual_qa_receipts"] == [receipt]
+    assert breakdown["visual_qa_receipts"] == [latest]
     assert breakdown["visual_qa"] == {
         "level": "artifact",
-        "receipt_status": "passed",
+        "receipt_status": "failed",
         "followup_count": 1,
         "check_duration_s": 2.5,
     }

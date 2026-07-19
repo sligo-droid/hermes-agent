@@ -532,6 +532,20 @@ class AIAgent:
                 parent_session_id=self._parent_session_id,
             )
             self._session_db_created = True
+            get_session = getattr(self._session_db, "get_session", None)
+            if callable(get_session):
+                session_row = get_session(self.session_id)
+                if isinstance(session_row, dict) and session_row.get("transcript_revision") is not None:
+                    self._last_flushed_db_snapshot_token = (
+                        self.session_id,
+                        int(session_row["transcript_revision"]),
+                    )
+                    if getattr(
+                        self,
+                        "_session_db_append_conflict_session_id",
+                        None,
+                    ) != self.session_id:
+                        self._session_db_append_conflict_session_id = None
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
@@ -1537,15 +1551,54 @@ class AIAgent:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
                 self._ensure_db_session()
+            conflict_session = getattr(
+                self,
+                "_session_db_append_conflict_session_id",
+                None,
+            )
+            if conflict_session == self.session_id:
+                # This local transcript lost append authority earlier in the
+                # turn. Never rebase stale local messages onto concurrent rows.
+                self._last_flushed_db_idx = len(messages)
+                return
+            if conflict_session is not None:
+                self._session_db_append_conflict_session_id = None
+
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
             append_with_revision = getattr(
                 type(self._session_db), "append_message_with_revision", None
             )
+            snapshot_token = getattr(
+                self,
+                "_last_flushed_db_snapshot_token",
+                None,
+            )
+            expected_revision = None
+            if (
+                isinstance(snapshot_token, tuple)
+                and len(snapshot_token) == 2
+                and snapshot_token[0] == self.session_id
+            ):
+                expected_revision = int(snapshot_token[1])
+            elif callable(append_with_revision):
+                get_session = getattr(type(self._session_db), "get_session", None)
+                if callable(get_session):
+                    session_row = get_session(self._session_db, self.session_id)
+                    if (
+                        isinstance(session_row, dict)
+                        and session_row.get("transcript_revision") is not None
+                    ):
+                        expected_revision = int(session_row["transcript_revision"])
+
             wrote_message = False
-            latest_revision = None
-            for msg in messages[flush_from:]:
+            latest_revision = expected_revision
+            for message_index, msg in enumerate(
+                messages[flush_from:],
+                start=flush_from,
+            ):
                 if _is_ephemeral_scaffolding(msg):
+                    self._last_flushed_db_idx = message_index + 1
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
@@ -1578,13 +1631,28 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items") if role == "assistant" else None,
                 }
                 if callable(append_with_revision):
-                    _, latest_revision = append_with_revision(
-                        self._session_db, **append_kwargs
+                    if expected_revision is not None:
+                        append_kwargs["expected_transcript_revision"] = expected_revision
+                    append_result = append_with_revision(
+                        self._session_db,
+                        **append_kwargs,
                     )
+                    if append_result is None:
+                        self._session_db_append_conflict_session_id = self.session_id
+                        self._last_flushed_db_snapshot_token = None
+                        self._last_flushed_db_idx = len(messages)
+                        logger.warning(
+                            "Session DB transcript changed during incremental append; "
+                            "preserving concurrent rows"
+                        )
+                        return
+                    _, latest_revision = append_result
+                    expected_revision = int(latest_revision)
                 else:
                     self._session_db.append_message(**append_kwargs)
                     latest_revision = None
                 wrote_message = True
+                self._last_flushed_db_idx = message_index + 1
             if wrote_message:
                 self._last_flushed_db_snapshot_token = (
                     (self.session_id, int(latest_revision))
@@ -1599,6 +1667,11 @@ class AIAgent:
         """Atomically persist the final post-budget/post-steer transcript."""
 
         if not self._session_db or not callable(getattr(self._session_db, "replace_messages", None)):
+            return
+        if getattr(self, "_session_db_append_conflict_session_id", None) == self.session_id:
+            logger.warning(
+                "Session DB incremental append authority was lost; preserving concurrent rows"
+            )
             return
         try:
             from agent.tool_executor import storage_safe_tool_calls

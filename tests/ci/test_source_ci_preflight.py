@@ -128,3 +128,17 @@ def test_unreliable_force_push_range_scans_committed_head_tree(tmp_path):
     assert "install-hook file added or modified: setup.py" in findings
     assert "PyPI dependency without an upper bound: unsafe>=1.0" in findings
     assert "could not obtain a complete Git diff for source-CI preflight" not in findings
+
+
+def test_unreliable_range_scans_unsafe_earlier_commit_not_only_tip(tmp_path):
+    root, _unsafe_head = _initial_commit_repo(tmp_path)
+    (root / "README.txt").write_text("innocuous tip\n", encoding="utf-8")
+    _git(root, "add", "README.txt")
+    _git(root, "commit", "-m", "innocuous last commit")
+    head = _git(root, "rev-parse", "HEAD").stdout.strip()
+
+    findings = _MOD.run_preflight(root, base="f" * 40, head=head)
+
+    assert "install-hook file added or modified: setup.py" in findings
+    assert "PyPI dependency without an upper bound: unsafe>=1.0" in findings
+    assert "could not obtain a complete Git diff for source-CI preflight" not in findings

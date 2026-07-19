@@ -11,9 +11,9 @@ permissions:
   pull-requests: read
 
 concurrency:
-  # Source CI and PR-body validation use separate groups: the latter runs
-  # trusted base code under pull_request_target, while this workflow runs PR
-  # source and must never cancel it.
+  # Source CI and trusted PR validation use separate groups. The mandatory
+  # security boundary runs trusted base code under pull_request_target; this
+  # workflow's PR-source copy is defense in depth and must not cancel it.
   group: merge-gate-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -52,7 +52,7 @@ jobs:
         id: changes
         run: python scripts/ci/classify_changes.py < /tmp/hermes-changed-paths.txt
 
-      - name: Run source-CI preflight
+      - name: Run defense-in-depth source preflight
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

@@ -4651,34 +4651,32 @@ _VISION_AUTO_PROVIDER_ORDER = (
 )
 
 
-def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
-    """Return True when ``provider``/``model`` is known to accept image input.
+def _main_model_supports_vision(
+    provider: str,
+    model: Optional[str],
+    *,
+    require_known: bool = False,
+) -> bool:
+    """Return whether the main route may be used for image input.
 
-    Used by the vision auto-detect chain to skip the user's main provider
-    when it's known to be text-only (e.g. DeepSeek, gpt-oss without vision).
-    Without this guard, ``resolve_vision_provider_client(provider="auto")``
-    would happily return the main-provider client and any subsequent image
-    payload would surface as a cryptic provider-side error
-    (``unknown variant `image_url`, expected `text```, #31179).
-
-    Returns True when capability lookup is unknown — preserves the historical
-    behaviour of attempting the call, so providers we haven't catalogued yet
-    don't silently regress to text-only.
+    Ordinary descriptive vision stays permissive when capability lookup is
+    unknown. Trusted visual assertions opt into ``require_known`` so their
+    single provider attempt skips both unknown and known text-only main models
+    in favor of a dedicated vision backend.
     """
     try:
         from agent.image_routing import _lookup_supports_vision
         from hermes_cli.config import load_config
     except ImportError:
-        return True
+        return not require_known
     try:
         supports = _lookup_supports_vision(provider, model, load_config())
     except Exception:  # pragma: no cover - defensive
-        return True
+        return not require_known
     if supports is None:
-        # No capability data — keep current behaviour and let the call attempt
-        # happen rather than silently skipping. This avoids false-positive
-        # skips for new/custom providers.
-        return True
+        # Descriptive vision preserves historical best-effort routing. Trusted
+        # assertions fail closed before spending their one provider attempt.
+        return not require_known
     return bool(supports)
 
 
@@ -4746,13 +4744,16 @@ def resolve_vision_provider_client(
     api_key: Optional[str] = None,
     api_mode: Optional[str] = None,
     async_mode: bool = False,
+    strict_capability: bool = False,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
 
     Direct endpoint overrides take precedence over provider selection. Explicit
     provider overrides still use the generic provider router for non-standard
     backends, so users can intentionally force experimental providers. Auto mode
-    stays conservative and only tries vision backends known to work today.
+    normally preserves permissive historical routing for unknown main models.
+    ``strict_capability`` requires explicit image-input support before selecting
+    the main route and otherwise falls through to a known vision backend.
     """
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
@@ -4800,6 +4801,7 @@ def resolve_vision_provider_client(
         #   4. Stop
         main_provider = _read_main_provider()
         main_model = _read_main_model()
+        main_route_attempted = False
         if main_provider and main_provider not in {"auto", ""}:
             runtime_base_url = ""
             runtime_api_key = ""
@@ -4813,6 +4815,7 @@ def resolve_vision_provider_client(
                     runtime_base_url, runtime_api_key, runtime_api_mode = _resolve_custom_runtime()
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
             if main_provider == "nous":
+                main_route_attempted = True
                 sync_client, default_model = _resolve_strict_vision_backend(
                     main_provider, vision_model
                 )
@@ -4835,7 +4838,11 @@ def resolve_vision_provider_client(
                     "vision support) — falling through to aggregator chain",
                     main_provider,
                 )
-            elif not _main_model_supports_vision(main_provider, vision_model):
+            elif not _main_model_supports_vision(
+                main_provider,
+                vision_model,
+                require_known=strict_capability,
+            ):
                 # The main model is known to be text-only (e.g. DeepSeek V4,
                 # gpt-oss-120b without vision). Building a client and sending
                 # an image would produce a cryptic provider-side error like
@@ -4853,6 +4860,7 @@ def resolve_vision_provider_client(
                     main_provider,
                 )
             else:
+                main_route_attempted = True
                 rpc_client, rpc_model = resolve_provider_client(
                     main_provider, vision_model,
                     explicit_base_url=runtime_base_url or None,
@@ -4870,7 +4878,7 @@ def resolve_vision_provider_client(
         # Fall back through aggregators (uses their dedicated vision model,
         # not the user's main model) when main provider has no client.
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
-            if candidate == main_provider:
+            if candidate == main_provider and main_route_attempted:
                 continue  # already tried above
             sync_client, default_model = _resolve_strict_vision_backend(candidate)
             if sync_client is not None:
@@ -6163,6 +6171,7 @@ async def async_call_llm(
     api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     single_attempt: bool = False,
+    strict_vision_capability: bool = False,
     messages: list,
     temperature: float = None,
     max_tokens: int = None,
@@ -6174,7 +6183,9 @@ async def async_call_llm(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     ``single_attempt`` disables all provider retries and fallbacks so a trusted
-    caller's attempt budget equals one outbound request.
+    caller's attempt budget equals one outbound request. Trusted screenshot
+    assertions also set ``strict_vision_capability`` to skip unknown or text-only
+    main models before that request is spent.
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
@@ -6191,6 +6202,7 @@ async def async_call_llm(
             api_key=resolved_api_key or api_key,
             api_mode=resolved_api_mode or api_mode,
             async_mode=True,
+            strict_capability=strict_vision_capability,
         )
         if (
             client is None
@@ -6206,6 +6218,7 @@ async def async_call_llm(
                 provider="auto",
                 model=resolved_model,
                 async_mode=True,
+                strict_capability=strict_vision_capability,
             )
         if client is None:
             raise RuntimeError(

@@ -264,9 +264,8 @@ def _visual_qa_receipts(
         receipt = sanitize_visual_receipt(raw, requirement=requirement)
         if receipt is not None:
             safe.append(receipt)
-        if len(safe) >= max_receipts:
-            break
-    return safe
+    safe.sort(key=lambda item: int(item.get("order") or 0))
+    return safe[-max_receipts:]
 
 
 def _visual_qa_state_for_item(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
