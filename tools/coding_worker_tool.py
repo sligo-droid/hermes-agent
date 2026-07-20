@@ -469,6 +469,7 @@ def _observer_safe_worker_messages(messages: Any) -> list[dict[str, Any]]:
 
     safe: list[dict[str, Any]] = []
     remaining = 2_000_000
+    tool_names_by_call: dict[str, str] = {}
     for raw in messages[:400]:
         if not isinstance(raw, dict) or remaining <= 0:
             continue
@@ -502,6 +503,22 @@ def _observer_safe_worker_messages(messages: Any) -> list[dict[str, Any]]:
                 remaining -= len(encoded)
             except (TypeError, ValueError):
                 pass
+        for tool_call in item.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            call_id = str(tool_call.get("id") or "")[:512]
+            function = tool_call.get("function")
+            function = function if isinstance(function, dict) else {}
+            tool_name = _observer_safe_text(function.get("name"), 512).strip()
+            if call_id and tool_name:
+                tool_names_by_call[call_id] = tool_name
+        if role == "tool":
+            explicit_name = raw.get("tool_name") or raw.get("name")
+            tool_name = _observer_safe_text(explicit_name, 512).strip()
+            if not tool_name and isinstance(tool_call_id, str):
+                tool_name = tool_names_by_call.get(tool_call_id[:512], "")
+            if tool_name:
+                item["tool_name"] = tool_name
         safe.append(item)
     return safe
 

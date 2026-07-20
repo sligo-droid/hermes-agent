@@ -4,10 +4,72 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from hermes_cli import plugins
 from tools import coding_worker_tool as coding
 from tools import delegate_tool as delegate
+
+
+def test_live_conversation_end_hook_carries_full_turn_lineage(monkeypatch):
+    from run_agent import AIAgent
+
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    captured = []
+    manager._hooks["on_session_end"] = [lambda **kwargs: captured.append(kwargs)]
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            provider="test-provider",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=[],
+        )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="done", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        model="test-model",
+        usage=None,
+    )
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.tool_delay = 0
+    agent._fallback_chain = []
+    agent.session_id = "child-session"
+    agent._parent_session_id = "parent-session"
+    agent._delegate_root_agent = SimpleNamespace(session_id="root-session")
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("finish", task_id="task-live")
+
+    assert result["final_response"] == "done"
+    assert len(captured) == 1
+    assert captured[0]["session_id"] == "child-session"
+    assert captured[0]["parent_session_id"] == "parent-session"
+    assert captured[0]["root_session_id"] == "root-session"
+    assert captured[0]["task_id"] == "task-live"
+    assert captured[0]["turn_id"] == agent._current_turn_id
+    assert captured[0]["turn_id"].startswith("child-session:task-live:")
 
 
 def test_subagent_start_carries_root_parent_and_child_ids(monkeypatch):
@@ -86,7 +148,22 @@ def test_coding_worker_hooks_share_one_stable_root_and_redact_messages(monkeypat
             {
                 "role": "assistant",
                 "content": f"Authorization: Bearer {secret}",
-            }
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": json.dumps({"cmd": f"echo {secret}"}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "tests passed",
+            },
         ],
         worker_events=[
             {"type": "log", "message": f"Authorization: Bearer {secret}"}
@@ -106,6 +183,7 @@ def test_coding_worker_hooks_share_one_stable_root_and_redact_messages(monkeypat
     assert secret not in stops[0]["summary"]
     assert secret not in stops[0]["error"]
     assert secret not in stops[0]["worker_messages"][0]["content"]
+    assert stops[0]["worker_messages"][1]["tool_name"] == "terminal"
     assert secret not in json.dumps(stops[0]["worker_events"])
     assert id(record) not in coding._WORKER_OBSERVER_CONTEXTS
     assert parent.turn_worker_runs == [

@@ -2844,6 +2844,34 @@ def test_opencode_exception_emits_failed_observer_closeout(monkeypatch, tmp_path
     assert id(parent.turn_worker_runs[0]) not in cwt._WORKER_OBSERVER_CONTEXTS
 
 
+def test_observer_tool_result_inherits_preceding_call_name():
+    messages = cwt._observer_safe_worker_messages(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"cmd":"pytest"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "passed",
+            },
+        ]
+    )
+
+    assert messages[1]["tool_name"] == "terminal"
+
+
 def test_codex_exception_emits_failed_observer_closeout(monkeypatch, tmp_path):
     manager = plugins.PluginManager()
     monkeypatch.setattr(plugins, "_plugin_manager", manager)

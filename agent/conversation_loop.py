@@ -887,6 +887,8 @@ def run_conversation(
     # state registry.  Set BEFORE any tool dispatch so snapshots taken at
     # child-launch time see the parent's real id, not None.
     agent._current_task_id = effective_task_id
+    turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    agent._current_turn_id = turn_id
     
     # Reset retry counters and iteration budget at the start of each turn
     # so subagent usage from a previous turn doesn't eat into the next one.
@@ -5792,6 +5794,17 @@ def run_conversation(
         _invoke_hook(
             "on_session_end",
             session_id=agent.session_id,
+            parent_session_id=getattr(agent, "_parent_session_id", None),
+            root_session_id=str(
+                getattr(
+                    getattr(agent, "_delegate_root_agent", agent),
+                    "session_id",
+                    agent.session_id,
+                )
+                or agent.session_id
+            ),
+            task_id=effective_task_id,
+            turn_id=turn_id,
             completed=completed,
             interrupted=interrupted,
             model=agent.model,
