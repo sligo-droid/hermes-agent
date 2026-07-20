@@ -79,6 +79,9 @@ _DISCORD_LEGACY_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
 _DISCORD_WORKER_DIRTY_MARKER_POLL_SECS = 0.2
 _TERMINAL_DELIVERY_RETRY_MAX_ATTEMPTS = 3
 _TERMINAL_DELIVERY_RETRY_BASE_SECONDS = 1.0
+_OWNED_RUNNER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+_REQUIRED_ASYNC_RECONCILE_INTERVAL_SECONDS = 2.0
+_REQUIRED_ASYNC_RESTART_BACKOFF_MAX_SECONDS = 5.0
 _GATEWAY_PROCESS_EPOCH = f"{time.time_ns()}-{uuid.uuid4().hex}"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
@@ -3524,6 +3527,12 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Long-lived gateway runners need both a strong reference and explicit
+        # shutdown ownership.  A bare create_task() can otherwise be collected
+        # while pending, which silently kills completion recovery.
+        self._owned_runner_tasks: Dict[str, asyncio.Task] = {}
+        self._required_async_item_tasks: Dict[str, asyncio.Task] = {}
+        self._required_async_reconcile_event = asyncio.Event()
         self._terminal_delivery_retry_tasks: Dict[str, asyncio.Task] = {}
 
 
@@ -4825,91 +4834,32 @@ class GatewayRunner:
         )
 
     def _async_completion_lifecycle_state(self, event: MessageEvent) -> str:
-        """Return advisory/stale/running/failed/succeeded for a completion turn."""
+        """Return the exact durable lifecycle state for Discord reactions."""
         kind = str(getattr(event, "background_completion_kind", "") or "")
-        if not kind:
-            return "ordinary"
-        if kind != "coding_worker" or not getattr(
-            event,
-            "participates_in_work_lifecycle",
-            True,
-        ):
+        if kind:
+            # Required coding results never become model turns.  Any completion
+            # event that reaches an adapter is advisory and cannot repaint the
+            # originating work-item reaction.
             return "advisory"
-
-        work_item_id = str(getattr(event, "work_item_id", "") or "").strip()
-        if not work_item_id:
-            return "stale"
-        completion_id = str(
-            getattr(event, "background_completion_id", "") or ""
-        ) or None
-        generation = getattr(event, "background_completion_generation", None)
         try:
-            from tools.async_delegation import completion_state
-
-            live = completion_state(
-                session_key=self._session_key_for_source(event.source),
-                origin_work_item_id=work_item_id,
-                origin_run_generation=generation,
-                origin_attempt_id=getattr(
-                    event,
-                    "background_completion_attempt_id",
-                    None,
-                ),
-                exclude_delegation_id=completion_id,
+            ledger = self._ledger()
+            session_key = self._session_key_for_source(event.source)
+            work_item_id = str(getattr(event, "work_item_id", "") or "")
+            if not work_item_id:
+                work_item_id = str(ledger.id_for_event(event, session_key) or "")
+            item = ledger.get(work_item_id) if work_item_id else None
+            required = (
+                ledger.required_async_completion_state(work_item_id)
+                if work_item_id
+                else None
             )
         except Exception:
-            live = {}
-        if int(live.get("required_pending") or 0) > 0:
-            return "running"
-
-        ledger_fn = getattr(self, "_ledger", None)
-        if not callable(ledger_fn):
-            return (
-                "failed"
-                if getattr(event, "background_completion_success", None) is False
-                else "running"
-            )
-        try:
-            ledger = ledger_fn()
-            item = ledger.get(work_item_id)
-        except Exception:
-            return (
-                "failed"
-                if getattr(event, "background_completion_success", None) is False
-                else "running"
-            )
+            return "ordinary"
         if not isinstance(item, dict):
-            return "stale"
-
-        required_state_fn = getattr(ledger, "required_async_completion_state", None)
-        required = required_state_fn(work_item_id) if callable(required_state_fn) else None
-        if isinstance(required, dict):
-            required_attempt_id = str(required.get("attempt_id") or "")
-            event_attempt_id = str(
-                getattr(event, "background_completion_attempt_id", "") or ""
-            )
-            if required_attempt_id and event_attempt_id != required_attempt_id:
-                return "stale"
-            try:
-                required_generation = int(required.get("generation") or 0)
-                event_generation = int(generation or 0)
-            except (TypeError, ValueError):
-                required_generation = event_generation = 0
-            if required_generation and event_generation < required_generation:
-                return "stale"
-        if isinstance(required, dict) and required.get("failed"):
-            return "failed"
-        if live.get("required_failed"):
-            return "failed"
-        if getattr(event, "background_completion_success", None) is False:
-            return "failed"
-
-        gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
+            return "ordinary"
         status = str(item.get("status") or "")
         summary_status = str(item.get("summary_status") or "").strip().lower()
-        if gate.get("reason") == "required_async_completion_failed":
-            return "failed"
-        if summary_status in {
+        if status in {"failed", "blocked", "cancelled", "expired"} or summary_status in {
             "failed",
             "failure",
             "error",
@@ -4918,39 +4868,11 @@ class GatewayRunner:
             "blocked",
         }:
             return "failed"
-        if item.get("closeout_authoritative") is True and isinstance(
-            item.get("closeout"),
-            dict,
-        ):
-            try:
-                from hermes_cli.trusted_closeout import (
-                    closeout_terminal_eligible,
-                    normalize_closeout_state,
-                )
-
-                closeout = normalize_closeout_state(item["closeout"])
-                if (
-                    status == "completed"
-                    and gate.get("allowed_to_complete", True)
-                    and closeout_terminal_eligible(closeout)
-                ):
-                    return "succeeded"
-                closeout_status = str(closeout.get("status") or "").lower()
-                if closeout_status in {"failed", "blocked", "error", "errored"}:
-                    return "failed"
-                return "running"
-            except Exception:
-                return "running"
-        if status in {"failed", "blocked", "cancelled", "expired"}:
-            return "failed"
-        if (
-            status == "completed"
-            and gate.get("allowed_to_complete", True)
-            and summary_status
-            in {"complete", "completed", "done", "success", "succeeded"}
-        ):
+        if status == "completed":
             return "succeeded"
-        return "running"
+        if isinstance(required, dict) and str(required.get("attempt_id") or ""):
+            return "running"
+        return "ordinary"
 
     def _install_background_worker_reaction_gate(self, adapter: Any) -> None:
         """Keep Discord action reactions pending while detached workers remain."""
@@ -5199,39 +5121,9 @@ class GatewayRunner:
         *,
         visual_pending: bool = False,
     ) -> dict[str, Any] | None:
-        """Activate or advance direct closeout at one clean verified exact head."""
+        """Extract genuine runtime evidence and activate its exact Git head."""
 
         if not work_item_id or not isinstance(agent_result, dict) or agent_result.get("failed"):
-            return None
-        ledger = self._ledger()
-        item = ledger.get(work_item_id)
-        if (
-            not isinstance(item, dict)
-            or not isinstance(item.get("closeout"), dict)
-        ):
-            return None
-        from hermes_cli.trusted_closeout import normalize_closeout_state
-
-        state = normalize_closeout_state(item["closeout"])
-        if state["mode"] == "off":
-            return None
-
-        def notify_closeout() -> None:
-            try:
-                from gateway.trusted_closeout_watcher import mark_closeout_dirty
-
-                mark_closeout_dirty(work_item_id)
-            except Exception:
-                pass
-            watcher = getattr(self, "trusted_closeout_watcher", None)
-            if watcher is not None:
-                watcher.notify(work_item_id)
-
-        already_activated = bool(
-            item.get("closeout_authoritative") is True
-            or item.get("closeout_activated_at") is not None
-        )
-        if state["source"] not in {"direct", "fable"}:
             return None
 
         runtime_breakdown = (
@@ -5277,19 +5169,77 @@ class GatewayRunner:
             trusted_evidence = None
         if trusted_evidence is None:
             return None
+        return self._activate_closeout_at_verified_head(
+            work_item_id,
+            repository_root=str(trusted_evidence.get("repository_root") or ""),
+            verified_head_sha=str(
+                trusted_evidence.get("verified_head_sha") or ""
+            ),
+            visual_result=(
+                agent_result.get("visual_qa")
+                if isinstance(agent_result.get("visual_qa"), dict)
+                else None
+            ),
+            visual_pending=visual_pending,
+        )
+
+    def _activate_closeout_at_verified_head(
+        self,
+        work_item_id: str,
+        *,
+        repository_root: str,
+        verified_head_sha: str,
+        visual_result: Optional[dict[str, Any]] = None,
+        visual_pending: bool = False,
+    ) -> dict[str, Any] | None:
+        """Activate or advance closeout at one clean exact host checkpoint."""
+
+        repository_root = str(repository_root or "").strip()
+        verified_head_sha = str(verified_head_sha or "").strip().lower()
+        if (
+            not work_item_id
+            or not repository_root
+            or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", verified_head_sha)
+        ):
+            return None
+        ledger = self._ledger()
+        item = ledger.get(work_item_id)
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("closeout"), dict)
+        ):
+            return None
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        state = normalize_closeout_state(item["closeout"])
+        if state["mode"] == "off" or state["source"] not in {"direct", "fable"}:
+            return None
+
+        def notify_closeout() -> None:
+            try:
+                from gateway.trusted_closeout_watcher import mark_closeout_dirty
+
+                mark_closeout_dirty(work_item_id)
+            except Exception:
+                pass
+            watcher = getattr(self, "trusted_closeout_watcher", None)
+            if watcher is not None:
+                watcher.notify(work_item_id)
+
+        already_activated = bool(
+            item.get("closeout_authoritative") is True
+            or item.get("closeout_activated_at") is not None
+        )
 
         root_text = str(state["workspace"].get("path") or "").strip()
         root = Path(root_text).expanduser().resolve(strict=False) if root_text else Path()
         if not root_text or not root.is_dir():
             return None
-        evidence_root = Path(
-            str(trusted_evidence.get("repository_root") or "")
-        ).expanduser().resolve(strict=False)
+        evidence_root = Path(repository_root).expanduser().resolve(strict=False)
         try:
             root.relative_to(evidence_root)
         except ValueError:
             return None
-        verified_head_sha = str(trusted_evidence.get("verified_head_sha") or "").lower()
         try:
             import subprocess
 
@@ -5358,11 +5308,7 @@ class GatewayRunner:
                 notify_closeout()
             if not state["policy"]["require_visual_qa"] or visual_pending:
                 return state
-            visual_result = (
-                agent_result.get("visual_qa")
-                if isinstance(agent_result.get("visual_qa"), dict)
-                else {}
-            )
+            visual_result = visual_result if isinstance(visual_result, dict) else {}
             applied = ledger.apply_closeout_visual_completion(
                 work_item_id,
                 expected_head_sha=verified_head_sha,
@@ -5384,9 +5330,7 @@ class GatewayRunner:
                     from agent.visual_qa import visual_receipt_completion
 
                     visual_result = (
-                        agent_result.get("visual_qa")
-                        if isinstance(agent_result.get("visual_qa"), dict)
-                        else {}
+                        visual_result if isinstance(visual_result, dict) else {}
                     )
                     completion = visual_receipt_completion(
                         item.get("visual_qa_requirement"),
@@ -5416,11 +5360,7 @@ class GatewayRunner:
                 return None
             if visual_pending or not latest_state["policy"]["require_visual_qa"]:
                 return latest_state
-            visual_result = (
-                agent_result.get("visual_qa")
-                if isinstance(agent_result.get("visual_qa"), dict)
-                else {}
-            )
+            visual_result = visual_result if isinstance(visual_result, dict) else {}
             activated = ledger.apply_closeout_visual_completion(
                 work_item_id,
                 expected_head_sha=verified_head_sha,
@@ -6108,6 +6048,128 @@ class GatewayRunner:
         task.add_done_callback(self._background_tasks.discard)
         return True
 
+    def _start_owned_runner(
+        self,
+        name: str,
+        runner_factory: Any,
+        *,
+        restart_on_exit: bool = False,
+    ) -> Optional[asyncio.Task]:
+        """Start one strongly-owned long-lived runner under a stable name.
+
+        Critical runners are supervised in-place: an unexpected return or
+        exception is logged and restarted with capped backoff while the gateway
+        still owns the process.  Shutdown flips ``_running`` before cancelling
+        these tasks, so a cancelled runner can never respawn behind teardown.
+        """
+
+        if not name or self.__dict__.get("_running") is False:
+            return None
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is not None and shutdown_event.is_set():
+            return None
+        owned = self.__dict__.setdefault("_owned_runner_tasks", {})
+        existing = owned.get(name)
+        if existing is not None and not existing.done():
+            return existing
+
+        async def _supervise() -> None:
+            backoff = 0.1
+            while self.__dict__.get("_running") is not False:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return
+                try:
+                    await runner_factory()
+                    failure: Optional[BaseException] = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failure = exc
+                    logger.exception("Gateway runner %s failed", name)
+                if not restart_on_exit:
+                    return
+                if self.__dict__.get("_running") is False:
+                    return
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return
+                if failure is None:
+                    logger.warning(
+                        "Critical gateway runner %s exited unexpectedly; restarting",
+                        name,
+                    )
+                try:
+                    if shutdown_event is None:
+                        await asyncio.sleep(backoff)
+                    else:
+                        await asyncio.wait_for(shutdown_event.wait(), timeout=backoff)
+                        return
+                except TimeoutError:
+                    pass
+                backoff = min(
+                    _REQUIRED_ASYNC_RESTART_BACKOFF_MAX_SECONDS,
+                    backoff * 2.0,
+                )
+
+        task = asyncio.create_task(
+            _supervise(),
+            name=f"gateway:{name}",
+        )
+        owned[name] = task
+        background_tasks = self.__dict__.setdefault("_background_tasks", set())
+        background_tasks.add(task)
+
+        def _finished(done: asyncio.Task) -> None:
+            background_tasks.discard(done)
+            if owned.get(name) is done:
+                owned.pop(name, None)
+            if done.cancelled():
+                return
+            try:
+                exc = done.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.error(
+                    "Owned gateway runner %s terminated outside supervision",
+                    name,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_finished)
+        return task
+
+    async def _cancel_owned_runners(self) -> None:
+        """Cancel and bounded-await all long-lived runner supervisors."""
+
+        owned = self.__dict__.setdefault("_owned_runner_tasks", {})
+        item_tasks = self.__dict__.setdefault("_required_async_item_tasks", {})
+        current = asyncio.current_task()
+        tasks = list(dict.fromkeys(
+            task
+            for task in [*owned.values(), *item_tasks.values()]
+            if task is not current and not task.done()
+        ))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=_OWNED_RUNNER_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                pending_names = [task.get_name() for task in tasks if not task.done()]
+                logger.warning(
+                    "Timed out awaiting owned gateway runners during shutdown: %s",
+                    ", ".join(pending_names) or "unknown",
+                )
+        for name, task in list(owned.items()):
+            if task.done() or task in tasks:
+                owned.pop(name, None)
+        for work_id, task in list(item_tasks.items()):
+            if task.done() or task in tasks:
+                item_tasks.pop(work_id, None)
+
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
@@ -6166,6 +6228,35 @@ class GatewayRunner:
                     return item
         except Exception:
             return None
+        return None
+
+    def _required_async_recovery_item_for_session(
+        self,
+        session_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the required coding attempt that owns restart recovery."""
+
+        if not session_key:
+            return None
+        try:
+            ledger = self._ledger()
+            for item in ledger.incomplete_items():
+                if (
+                    str(item.get("session_key") or "") != session_key
+                    or item.get("platform") != "discord"
+                ):
+                    continue
+                state = ledger.required_async_completion_state(
+                    str(item.get("id") or "")
+                )
+                if isinstance(state, dict) and state.get("owns_recovery") is True:
+                    return item
+        except Exception:
+            logger.debug(
+                "Required async recovery ownership lookup failed for %s",
+                session_key,
+                exc_info=True,
+            )
         return None
 
     def _discord_resume_work_item_for_session(self, session_key: str) -> Optional[Dict[str, Any]]:
@@ -6377,6 +6468,20 @@ class GatewayRunner:
         for entry in candidates:
             if not self._resume_pending_entry_is_fresh(entry, now=now):
                 continue
+            if self._required_async_recovery_item_for_session(entry.session_key) is not None:
+                # The transcript may still carry a restart marker from the
+                # parent turn, but its required coding attempt is durably owned
+                # by deterministic reconciliation.  Clear the replay marker so
+                # a later startup cannot resurrect the parent model turn.
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception:
+                    logger.debug(
+                        "Failed to clear resume marker owned by required async recovery for %s",
+                        entry.session_key,
+                        exc_info=True,
+                    )
+                continue
             if self._authoritative_closeout_item_for_session(entry.session_key) is not None:
                 # A completed model/worker turn already handed lifecycle ownership
                 # to trusted closeout. Never replay that turn after restart.
@@ -6444,6 +6549,14 @@ class GatewayRunner:
             if not work_id:
                 continue
             status = str(item.get("status") or "")
+            required_state = ledger.required_async_completion_state(work_id)
+            if (
+                isinstance(required_state, dict)
+                and required_state.get("owns_recovery") is True
+            ):
+                # The required-completion reconciler owns this exact attempt.
+                # Never replay its original Discord request after restart.
+                continue
             terminal_delivery = (
                 item.get("terminal_delivery")
                 if isinstance(item.get("terminal_delivery"), dict)
@@ -7482,14 +7595,39 @@ class GatewayRunner:
                 skip_targets=skip_home_targets,
             )
 
-        # Establish durable closeout ownership before considering model replay.
-        # This prevents a restart marker from replaying a turn that already
-        # completed its trusted lifecycle handoff.
+        # Establish durable async/closeout ownership before considering any
+        # original-intake or session replay.  Required coding work from a prior
+        # process is fenced as outcome-unknown and reconciled from the ledger;
+        # it must never be restarted as an arbitrary tool-capable model turn.
+        try:
+            recovered_required = await asyncio.to_thread(
+                self._ledger().mark_orphaned_required_async_dispatches_unknown,
+                current_process_epoch=self._process_epoch,
+                current_owner_pid=os.getpid(),
+            )
+        except Exception:
+            recovered_required = []
+            logger.exception("Required async startup recovery failed")
+        if recovered_required:
+            logger.warning(
+                "Recovered %d orphaned required coding dispatch(es) as outcome-unknown",
+                len(recovered_required),
+            )
+        self._start_owned_runner(
+            "required-async-reconciler",
+            self._required_async_reconciler,
+            restart_on_exit=True,
+        )
+
         closeout_watcher = getattr(self, "trusted_closeout_watcher", None)
         if closeout_watcher is not None:
             if self._ledger().pending_closeouts():
                 closeout_watcher.notify()
-            asyncio.create_task(self._trusted_closeout_watcher())
+            self._start_owned_runner(
+                "trusted-closeout-watcher",
+                self._trusted_closeout_watcher,
+                restart_on_exit=True,
+            )
         self._schedule_incomplete_discord_work_items()
 
         # Automatically continue only genuinely interrupted model work. The
@@ -7544,9 +7682,13 @@ class GatewayRunner:
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
 
-        # Detached subagents and coding workers complete through the shared
-        # process-registry queue and always re-enter as fresh serialized turns.
-        asyncio.create_task(self._async_delegation_watcher())
+        # Advisory detached subagents still re-enter as best-effort fresh turns.
+        # Required coding-worker queue events only wake deterministic ledger
+        # reconciliation; the ledger scan also repairs lost queue wakeups.
+        self._start_owned_runner(
+            "async-delegation-notifications",
+            self._async_delegation_watcher,
+        )
 
         logger.info("Press Ctrl+C to stop")
 
@@ -7575,6 +7717,411 @@ class GatewayRunner:
             raise
         except Exception:
             logger.exception("Trusted closeout watcher failed")
+
+    @staticmethod
+    def _required_async_dispatch_rows(state: Any) -> list[dict[str, Any]]:
+        if not isinstance(state, dict):
+            return []
+        raw = state.get("dispatches")
+        if isinstance(raw, dict):
+            rows = list(raw.values())
+        elif isinstance(raw, list):
+            rows = raw
+        else:
+            rows = []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    @staticmethod
+    def _required_async_identity(state: Any) -> dict[str, Any]:
+        state = state if isinstance(state, dict) else {}
+        return {
+            "generation": state.get("generation"),
+            "attempt_id": str(state.get("attempt_id") or ""),
+            "attempt_order": state.get("attempt_order"),
+        }
+
+    def _required_async_turn_identity(
+        self,
+        run_generation: Any,
+    ) -> dict[str, Any]:
+        """Return the durable attempt identity shared by parent and workers."""
+
+        try:
+            generation = int(run_generation or 0)
+        except (TypeError, ValueError, OverflowError):
+            generation = 0
+        process_epoch = str(self._process_epoch)
+        try:
+            attempt_order = int(process_epoch.split("-", 1)[0]) + max(0, generation)
+        except (TypeError, ValueError, OverflowError):
+            attempt_order = 0
+        return {
+            "generation": generation,
+            "attempt_id": f"{process_epoch}:{generation}",
+            "attempt_order": attempt_order,
+        }
+
+    def _seal_required_async_parent_attempt(
+        self,
+        work_item_id: str,
+        *,
+        run_generation: Any,
+    ) -> Optional[dict[str, Any]]:
+        """Close exact dispatch membership after a parent turn exits."""
+
+        if not work_item_id:
+            return None
+        identity = self._required_async_turn_identity(run_generation)
+        try:
+            ledger = self._ledger()
+            current = ledger.required_async_completion_state(work_item_id)
+            if (
+                not isinstance(current, dict)
+                or str(current.get("attempt_id") or "") != identity["attempt_id"]
+                or not current.get("dispatches")
+            ):
+                return None
+            sealed = ledger.seal_required_async_attempt(
+                work_item_id,
+                **identity,
+            )
+            if isinstance(sealed, dict):
+                self.__dict__.setdefault(
+                    "_required_async_reconcile_event",
+                    asyncio.Event(),
+                ).set()
+            return sealed
+        except Exception:
+            logger.exception(
+                "Could not seal required async attempt for %s",
+                work_item_id,
+            )
+            return None
+
+    @staticmethod
+    def _required_async_reconciliation_id(
+        work_id: str,
+        state: Any,
+    ) -> str:
+        identity = GatewayRunner._required_async_identity(state)
+        raw = ":".join(
+            (
+                str(work_id or ""),
+                str(identity.get("generation") or ""),
+                str(identity.get("attempt_id") or ""),
+                str(identity.get("attempt_order") or ""),
+            )
+        )
+        return "required-async:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _required_async_terminal_summary(
+        state: Any,
+        *,
+        success: bool,
+    ) -> str:
+        rows = GatewayRunner._required_async_dispatch_rows(state)
+        summaries: list[str] = []
+        errors: list[str] = []
+        for row in rows:
+            summary = str(row.get("summary") or "").strip()
+            error = str(row.get("error") or "").strip()
+            if summary and summary not in summaries:
+                summaries.append(summary[:800])
+            if error and error not in errors:
+                errors.append(error[:800])
+        if success:
+            body = "\n".join(f"- {summary}" for summary in summaries[:8])
+            return (
+                "Required coding workers completed successfully."
+                + (f"\n\n{body}" if body else "")
+            )
+        if isinstance(state, dict) and state.get("outcome_unknown"):
+            lead = (
+                "Required coding work could not be verified after gateway recovery. "
+                "At least one worker outcome is unknown, so Hermes did not retry or "
+                "replay the work automatically."
+            )
+        elif isinstance(state, dict) and state.get("cancelled"):
+            lead = "Required coding work was cancelled and will not be resumed automatically."
+        elif isinstance(state, dict) and state.get("malformed"):
+            lead = "Required coding work has incomplete durable evidence and was blocked safely."
+        else:
+            lead = "A required coding worker failed, so the request was blocked safely."
+        details = errors or summaries
+        body = "\n".join(f"- {detail}" for detail in details[:8])
+        return lead + (f"\n\n{body}" if body else "")
+
+    def _activate_required_async_closeout(
+        self,
+        work_id: str,
+        item: Dict[str, Any],
+        required_state: Dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Activate an existing closeout from bounded worker evidence.
+
+        No model or transcript replay is involved.  Successful worker evidence
+        is checked against the fresh, clean exact Git head before the existing
+        trusted closeout watcher receives ownership.
+        """
+
+        closeout_raw = item.get("closeout")
+        if not isinstance(closeout_raw, dict):
+            return False, "work_item"
+        from hermes_cli.trusted_closeout import normalize_closeout_state
+
+        closeout = normalize_closeout_state(closeout_raw)
+        if closeout["mode"] != "enforce":
+            return False, "work_item"
+        if item.get("closeout_authoritative") is True:
+            watcher = getattr(self, "trusted_closeout_watcher", None)
+            if watcher is not None:
+                watcher.notify(work_id)
+            return True, "closeout"
+        if closeout["source"] not in {"direct", "fable"}:
+            return False, "unsupported_closeout_source"
+
+        rows = sorted(
+            self._required_async_dispatch_rows(required_state),
+            key=lambda row: (
+                float(row.get("completed_at") or 0),
+                str(row.get("delegation_id") or ""),
+            ),
+        )
+        for row in rows:
+            evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+            scope_check = evidence.get("scope_check")
+            if isinstance(scope_check, dict) and (
+                scope_check.get("clean") is not True
+                or scope_check.get("out_of_scope_files")
+                or scope_check.get("inspection_error")
+            ):
+                return False, "worker_scope_check_failed"
+            merge = evidence.get("parallel_merge")
+            if isinstance(merge, dict) and (
+                merge.get("success") is False
+                or merge.get("recovery_required") is True
+                or merge.get("merge_pending") is True
+                or merge.get("error")
+            ):
+                return False, "parallel_merge_incomplete"
+        workspace = str(closeout["workspace"].get("path") or "").strip()
+        latest_evidence = (
+            rows[-1].get("evidence")
+            if rows and isinstance(rows[-1].get("evidence"), dict)
+            else {}
+        )
+        verified_head = str(latest_evidence.get("head_sha") or "").strip().lower()
+        if not rows or not workspace or not verified_head:
+            return False, "missing_dispatch_evidence"
+
+        visual_result: dict[str, Any] = {}
+        if closeout["policy"]["require_visual_qa"]:
+            try:
+                from agent.visual_qa import visual_receipt_completion
+
+                completion = visual_receipt_completion(
+                    item.get("visual_qa_requirement"),
+                    item.get("visual_qa_receipts"),
+                    min_order=int(item.get("visual_qa_min_receipt_order") or 0),
+                )
+            except Exception:
+                completion = {"status": "missing"}
+            if str(completion.get("status") or "") != "passed":
+                return False, "required_visual_qa_missing"
+            visual_result = {
+                "receipts": item.get("visual_qa_receipts") or [],
+                "min_receipt_order": int(item.get("visual_qa_min_receipt_order") or 0),
+            }
+
+        activated = self._activate_closeout_at_verified_head(
+            work_id,
+            repository_root=workspace,
+            verified_head_sha=verified_head,
+            visual_result=visual_result,
+        )
+        return (True, "closeout") if activated is not None else (
+            False,
+            "workspace_head_not_clean_or_verified",
+        )
+
+    async def _reconcile_required_async_item(
+        self,
+        work_id: str,
+        expected_state: Dict[str, Any],
+    ) -> None:
+        """Advance one sealed terminal attempt without invoking a model."""
+
+        ledger = self._ledger()
+        current = ledger.required_async_completion_state(work_id)
+        expected_identity = self._required_async_identity(expected_state)
+        if (
+            not isinstance(current, dict)
+            or self._required_async_identity(current) != expected_identity
+            or current.get("ready_to_reconcile") is not True
+            or current.get("owns_recovery") is not True
+        ):
+            return
+        item = ledger.get(work_id)
+        if not isinstance(item, dict):
+            return
+        reconciliation_id = self._required_async_reconciliation_id(work_id, current)
+        failure = bool(
+            current.get("failed")
+            or current.get("sticky_failure")
+            or current.get("cancelled")
+            or current.get("outcome_unknown")
+            or current.get("malformed")
+        )
+        identity = self._required_async_identity(current)
+        if failure:
+            reason = (
+                "required_async_outcome_unknown"
+                if current.get("outcome_unknown")
+                else "required_async_cancelled"
+                if current.get("cancelled")
+                else "required_async_malformed"
+                if current.get("malformed")
+                else "required_async_completion_failed"
+            )
+            finalized = await asyncio.to_thread(
+                ledger.finalize_required_async_failure,
+                work_id,
+                **identity,
+                final_response=self._required_async_terminal_summary(
+                    current,
+                    success=False,
+                ),
+                reason=reason,
+                reconciliation_id=reconciliation_id,
+            )
+            if isinstance(finalized, dict):
+                await self._resume_finished_discord_work_item(finalized)
+            return
+
+        activated, route = await asyncio.to_thread(
+            self._activate_required_async_closeout,
+            work_id,
+            item,
+            current,
+        )
+        if route not in {"closeout", "work_item"}:
+            finalized = await asyncio.to_thread(
+                ledger.finalize_required_async_failure,
+                work_id,
+                **identity,
+                final_response=(
+                    "Required coding workers completed, but Hermes could not "
+                    "safely reconcile their result into trusted closeout "
+                    f"({route}). The request was blocked without replaying or retrying work."
+                ),
+                reason="required_async_reconciliation_failed",
+                reconciliation_id=reconciliation_id,
+            )
+            if isinstance(finalized, dict):
+                await self._resume_finished_discord_work_item(finalized)
+            return
+
+        if route == "work_item":
+            expected_run_state = ledger.run_state_snapshot(item)
+            accepted = await asyncio.to_thread(
+                ledger.mark_agent_done,
+                work_id,
+                final_response=self._required_async_terminal_summary(
+                    current,
+                    success=True,
+                ),
+                session_id=item.get("session_id"),
+                summary_status="Complete",
+                feature_summary=item.get("feature_summary"),
+                project_summary=item.get("project_summary"),
+                expected_run_state=expected_run_state,
+            )
+            if not accepted:
+                return
+        reconciled = await asyncio.to_thread(
+            ledger.mark_required_async_reconciled,
+            work_id,
+            **identity,
+            reconciliation_id=reconciliation_id,
+        )
+        if not isinstance(reconciled, dict):
+            return
+        if route == "work_item":
+            fresh = ledger.get(work_id)
+            if isinstance(fresh, dict):
+                await self._resume_finished_discord_work_item(fresh)
+
+    def _schedule_required_async_reconciliation(
+        self,
+        work_id: str,
+        state: Dict[str, Any],
+    ) -> bool:
+        if not work_id or self.__dict__.get("_running") is False:
+            return False
+        tasks = self.__dict__.setdefault("_required_async_item_tasks", {})
+        existing = tasks.get(work_id)
+        if existing is not None and not existing.done():
+            return False
+
+        async def _run() -> None:
+            try:
+                await self._reconcile_required_async_item(work_id, dict(state))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Required async reconciliation failed for %s",
+                    work_id,
+                )
+            finally:
+                if tasks.get(work_id) is asyncio.current_task():
+                    tasks.pop(work_id, None)
+
+        task = asyncio.create_task(
+            _run(),
+            name=f"gateway:required-async-item:{work_id[:32]}",
+        )
+        tasks[work_id] = task
+        background = self.__dict__.setdefault("_background_tasks", set())
+        background.add(task)
+        task.add_done_callback(background.discard)
+        return True
+
+    def _scan_required_async_reconciliation(self) -> int:
+        ledger = self._ledger()
+        scheduled = 0
+        for item in ledger.incomplete_items():
+            work_id = str(item.get("id") or "")
+            if not work_id:
+                continue
+            state = ledger.required_async_completion_state(work_id)
+            if (
+                isinstance(state, dict)
+                and state.get("owns_recovery") is True
+                and state.get("ready_to_reconcile") is True
+                and self._schedule_required_async_reconciliation(work_id, state)
+            ):
+                scheduled += 1
+        return scheduled
+
+    async def _required_async_reconciler(
+        self,
+        interval: float = _REQUIRED_ASYNC_RECONCILE_INTERVAL_SECONDS,
+    ) -> None:
+        """Periodically repair lost required-completion queue wakeups."""
+
+        wake = self.__dict__.setdefault(
+            "_required_async_reconcile_event",
+            asyncio.Event(),
+        )
+        while self._running:
+            wake.clear()
+            self._scan_required_async_reconciliation()
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=max(0.05, interval))
+            except TimeoutError:
+                pass
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
@@ -10998,6 +11545,7 @@ class GatewayRunner:
                     )
                     self._cleanup_agent_resources(_agent)
 
+            await self._cancel_owned_runners()
             for platform, adapter in list(self.adapters.items()):
                 _adapter_started_at = time.monotonic()
                 try:
@@ -14269,6 +14817,7 @@ class GatewayRunner:
             )
             if isinstance(event_accounting, dict):
                 detached_accounting.append(event_accounting)
+            sealed_required_state = None
             try:
                 agent_result = await self._run_agent(
                     message=message_text,
@@ -14302,6 +14851,15 @@ class GatewayRunner:
                     ),
                 )
             finally:
+                if work_item_id and source.platform == Platform.DISCORD:
+                    # Returning or raising from _run_agent closes this parent
+                    # turn's dispatch-membership window. Seal in the unwind
+                    # path so an unexpected model/runtime error cannot strand
+                    # already released required workers in an open attempt.
+                    sealed_required_state = self._seal_required_async_parent_attempt(
+                        str(work_item_id),
+                        run_generation=run_generation,
+                    )
                 if work_item_heartbeat_task is not None:
                     work_item_heartbeat_task.cancel()
                     try:
@@ -14309,7 +14867,10 @@ class GatewayRunner:
                     except asyncio.CancelledError:
                         pass
 
-            _pending_background_workers = self._session_has_pending_background_workers(
+            _pending_background_workers = bool(
+                isinstance(sealed_required_state, dict)
+                and sealed_required_state.get("owns_recovery") is True
+            ) or self._session_has_pending_background_workers(
                 session_key,
                 work_item_id=str(work_item_id or "") or None,
                 origin_run_generation=getattr(
@@ -15693,13 +16254,15 @@ class GatewayRunner:
                 cleanup_background_processes=True,
             )
             return EphemeralReply(t("gateway.stop.stopped"))
+        stopped_required = self._stop_required_async_for_session(session_key)
         stopped_processes = self._stop_session_background_processes(session_key)
-        if stopped_boards or stopped_processes:
+        if stopped_boards or stopped_processes or stopped_required:
             logger.info(
-                "STOP for session %s — Discord worker boards stopped: %s, background_processes_stopped=%d",
+                "STOP for session %s — Discord worker boards stopped: %s, background_processes_stopped=%d, required_async_stopped=%d",
                 session_key,
                 ",".join(stopped_boards) if stopped_boards else "-",
                 stopped_processes,
+                stopped_required,
             )
             return EphemeralReply(t("gateway.stop.stopped"))
         return t("gateway.stop.no_active")
@@ -21716,6 +22279,14 @@ class GatewayRunner:
         suppress_user_output: bool = False,
     ) -> bool:
         """Forge a fresh internal turn for one detached completion event."""
+        if (
+            evt.get("kind") == "coding_worker"
+            and str(evt.get("origin_work_item_id") or "").strip()
+        ):
+            # Required coding completions are lifecycle evidence, not user
+            # prompts.  Never run them through an arbitrary tool-capable model
+            # turn, even if a legacy caller reaches this helper directly.
+            return self._record_required_async_queue_event(evt)
         source = self._build_process_event_source(evt)
         if not source:
             logger.warning(
@@ -21781,29 +22352,6 @@ class GatewayRunner:
                 str(evt.get("session_key") or ""),
                 allow_session_fallback=False,
             )
-        if synth_event.participates_in_work_lifecycle and synth_event.work_item_id:
-            try:
-                required_state = self._ledger().record_required_async_completion(
-                    str(synth_event.work_item_id),
-                    delegation_id=str(evt.get("delegation_id") or ""),
-                    success=bool(synth_event.background_completion_success),
-                    generation=evt.get("origin_run_generation"),
-                    attempt_id=evt.get("origin_attempt_id"),
-                    attempt_order=evt.get("origin_attempt_order"),
-                    status=str(evt.get("status") or ""),
-                    completed_at=evt.get("completed_at"),
-                    closeout_id=str(evt.get("closeout_id") or ""),
-                )
-                synth_event.background_completion_required_failed = bool(
-                    isinstance(required_state, dict)
-                    and required_state.get("failed")
-                )
-            except Exception:
-                logger.debug(
-                    "Could not persist required async completion %s",
-                    evt.get("delegation_id", "unknown"),
-                    exc_info=True,
-                )
         if isinstance(adapter, BasePlatformAdapter):
             synth_event.processing_completion_future = (
                 asyncio.get_running_loop().create_future()
@@ -21835,6 +22383,94 @@ class GatewayRunner:
                 suppress_user_output=True,
             )
 
+    def _record_required_async_queue_event(self, evt: dict) -> bool:
+        """Idempotently persist one required queue event and wake reconciliation.
+
+        The producer normally writes the terminal row before enqueueing.  The
+        duplicate write here is intentional compatibility for an event emitted
+        during an in-place upgrade; exact attempt fencing makes it harmless.
+        """
+
+        work_id = str(evt.get("origin_work_item_id") or "").strip()
+        delegation_id = str(evt.get("delegation_id") or "").strip()
+        if not work_id or not delegation_id:
+            return False
+        result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+        scope_check = (
+            result.get("scope_check")
+            if isinstance(result.get("scope_check"), dict)
+            else {}
+        )
+        parallel_merge = (
+            result.get("parallel_merge")
+            if isinstance(result.get("parallel_merge"), dict)
+            else {}
+        )
+        git_result = (
+            result.get("fable_git_result")
+            if isinstance(result.get("fable_git_result"), dict)
+            else {}
+        )
+        evidence: Dict[str, Any] = {
+            "scope_paths": list(
+                evt.get("scope_paths") or scope_check.get("scope_paths") or []
+            ),
+            "worker_cwd": str(evt.get("worker_cwd") or ""),
+            "scope_check": scope_check,
+            "parallel_merge": parallel_merge,
+            "worker_run": (
+                evt.get("worker_run")
+                if isinstance(evt.get("worker_run"), dict)
+                else {}
+            ),
+        }
+        for source, key in (
+            (result, "changed"),
+            (parallel_merge, "merged"),
+            (parallel_merge, "merge_ref"),
+            (result, "test_refs"),
+            (git_result, "commit_sha"),
+            (git_result, "head_sha"),
+        ):
+            if key in source:
+                evidence[key] = source[key]
+        try:
+            state = self._ledger().record_required_async_completion(
+                work_id,
+                delegation_id=delegation_id,
+                success=self._background_completion_success(evt),
+                generation=evt.get("origin_run_generation"),
+                attempt_id=evt.get("origin_attempt_id"),
+                attempt_order=evt.get("origin_attempt_order"),
+                status=str(evt.get("status") or ""),
+                completed_at=evt.get("completed_at"),
+                closeout_id=str(evt.get("closeout_id") or ""),
+                summary=result.get("summary") or evt.get("summary"),
+                error=result.get("error") or evt.get("error"),
+                evidence=evidence,
+            )
+        except Exception:
+            logger.exception(
+                "Could not persist required async queue event %s",
+                delegation_id,
+            )
+            return False
+        if state is None:
+            # Exact-fence rejection means this is stale or conflicting.  It is
+            # terminal for the volatile queue, but cannot wake/mutate current
+            # work or trigger any model invocation.
+            logger.info(
+                "Ignoring stale required async queue event %s for %s",
+                delegation_id,
+                work_id,
+            )
+            return True
+        self.__dict__.setdefault(
+            "_required_async_reconcile_event",
+            asyncio.Event(),
+        ).set()
+        return True
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain shared async completions and serialize them as fresh turns."""
         await asyncio.sleep(min(3.0, max(0.0, interval)))
@@ -21863,6 +22499,26 @@ class GatewayRunner:
                 for evt in async_events:
                     delegation_id = str(evt.get("delegation_id") or "")
                     if delegation_id and delegation_id in seen:
+                        continue
+                    required_coding = bool(
+                        evt.get("kind") == "coding_worker"
+                        and str(evt.get("origin_work_item_id") or "").strip()
+                    )
+                    if required_coding:
+                        accepted = self._record_required_async_queue_event(evt)
+                        if accepted:
+                            try:
+                                from tools.async_delegation import mark_completion_delivered
+
+                                mark_completion_delivered(delegation_id)
+                            except Exception:
+                                logger.debug(
+                                    "Could not acknowledge required async completion %s",
+                                    delegation_id,
+                                    exc_info=True,
+                                )
+                            if delegation_id:
+                                seen.add(delegation_id)
                         continue
                     self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
@@ -22431,6 +23087,8 @@ class GatewayRunner:
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        if interrupt_reason == _INTERRUPT_REASON_STOP:
+            self._stop_required_async_for_session(session_key)
         if cleanup_background_processes:
             self._stop_session_background_processes(session_key)
         if release_running_state:
@@ -22457,6 +23115,87 @@ class GatewayRunner:
                 "Failed stopping background processes for session %s: %s",
                 session_key,
                 exc,
+            )
+            return 0
+
+    def _stop_required_async_for_session(self, session_key: str) -> int:
+        """Seal and durably cancel required coding work for explicit /stop."""
+
+        if not session_key:
+            return 0
+        try:
+            from tools.async_delegation import interrupt_session
+
+            ledger = self._ledger()
+            stopped = 0
+            for item in ledger.incomplete_items():
+                if str(item.get("session_key") or "") != session_key:
+                    continue
+                work_id = str(item.get("id") or "")
+                state = ledger.required_async_completion_state(work_id)
+                if (
+                    not isinstance(state, dict)
+                    or not str(state.get("attempt_id") or "")
+                    or not state.get("dispatches")
+                    or state.get("reconciled_at") is not None
+                ):
+                    continue
+                identity = self._required_async_identity(state)
+                sealed = ledger.seal_required_async_attempt(
+                    work_id,
+                    **identity,
+                )
+                if not isinstance(sealed, dict):
+                    continue
+                result = interrupt_session(
+                    session_key,
+                    kind="coding_worker",
+                    origin_work_item_id=work_id,
+                    attempt_id=str(identity.get("attempt_id") or "") or None,
+                    reason="session_stop",
+                )
+                stopped += int(result.get("matched") or 0)
+                refreshed = ledger.required_async_completion_state(work_id)
+                if (
+                    isinstance(refreshed, dict)
+                    and refreshed.get("ready_to_reconcile") is True
+                    and not refreshed.get("failed")
+                ):
+                    reconciliation_id = self._required_async_reconciliation_id(
+                        work_id,
+                        refreshed,
+                    )
+                    finalized = ledger.finalize_required_async_failure(
+                        work_id,
+                        **self._required_async_identity(refreshed),
+                        final_response=(
+                            "Required coding work was explicitly stopped before "
+                            "its result was reconciled and will not be resumed automatically."
+                        ),
+                        reason="required_async_cancelled",
+                        reconciliation_id=reconciliation_id,
+                    )
+                    if isinstance(finalized, dict):
+                        stopped += 1
+                        task = asyncio.create_task(
+                            self._resume_finished_discord_work_item(finalized)
+                        )
+                        background = self.__dict__.setdefault(
+                            "_background_tasks",
+                            set(),
+                        )
+                        background.add(task)
+                        task.add_done_callback(background.discard)
+            if stopped:
+                self.__dict__.setdefault(
+                    "_required_async_reconcile_event",
+                    asyncio.Event(),
+                ).set()
+            return stopped
+        except Exception:
+            logger.exception(
+                "Failed to stop required coding work for session %s",
+                session_key,
             )
             return 0
 
@@ -24062,18 +24801,16 @@ class GatewayRunner:
             # Durable closeout identifiers are per-turn state. Coding workers
             # must persist lifecycle handoff before reporting completion.
             agent._origin_work_item_id = str(origin_work_item_id or "")
-            agent._origin_work_item_generation = run_generation
+            required_turn_identity = self._required_async_turn_identity(run_generation)
+            agent._origin_work_item_generation = required_turn_identity["generation"]
             agent._origin_work_item_attempt_id = (
-                f"{self._process_epoch}:{int(run_generation or 0)}"
+                required_turn_identity["attempt_id"]
                 if origin_work_item_id
                 else ""
             )
-            try:
-                agent._origin_work_item_attempt_order = int(
-                    str(self._process_epoch).split("-", 1)[0]
-                ) + max(0, int(run_generation or 0))
-            except (TypeError, ValueError):
-                agent._origin_work_item_attempt_order = 0
+            agent._origin_work_item_attempt_order = required_turn_identity[
+                "attempt_order"
+            ]
             closeout_watcher = getattr(self, "trusted_closeout_watcher", None)
             agent._closeout_notify = closeout_watcher.notify if closeout_watcher is not None else None
             if isinstance(completed_worker_run, dict) and completed_worker_run:

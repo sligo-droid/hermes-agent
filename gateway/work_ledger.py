@@ -58,6 +58,14 @@ _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 _MAX_CONFIRMED_MESSAGE_IDS = 128
 _MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
 _MAX_REQUIRED_ASYNC_COMPLETIONS = 64
+_REQUIRED_ASYNC_SCHEMA_VERSION = 2
+_REQUIRED_ASYNC_DISPATCH_STATES = frozenset(
+    {"registered", "running", "terminal", "cancelled", "outcome_unknown"}
+)
+_REQUIRED_ASYNC_PENDING_STATES = frozenset({"registered", "running"})
+_REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT = 1000
+_MAX_REQUIRED_ASYNC_SCOPE_PATHS = 32
+_MAX_REQUIRED_ASYNC_TEST_REFS = 16
 _CLOSEOUT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CLOSEOUT_VISUAL_STATUSES = frozenset(
     {"passed", "failed", "blocked", "uncertain", "missing"}
@@ -465,35 +473,405 @@ def _bounded_run_state_lease(value: Any) -> float | None:
     return max(-_RUN_STATE_LEASE_LIMIT, min(_RUN_STATE_LEASE_LIMIT, lease))
 
 
+def _bounded_required_async_text(value: Any) -> str:
+    return _bounded_run_state_text(value, limit=_REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT)
+
+
+def _bounded_required_async_strings(
+    values: Any,
+    *,
+    limit: int,
+) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        values = (values,)
+    try:
+        candidates = iter(values or ())
+    except TypeError:
+        candidates = iter((values,))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        text = _bounded_run_state_text(value)
+        if not text or text in seen:
+            continue
+        normalized.append(text)
+        seen.add(text)
+        if len(normalized) >= limit:
+            break
+    return normalized
+
+
+def _bounded_required_async_evidence(value: Any) -> dict[str, Any]:
+    """Keep only deterministic, bounded coding closeout references."""
+
+    raw = value if isinstance(value, Mapping) else {}
+    evidence: dict[str, Any] = {}
+    for key in ("changed", "merged"):
+        if isinstance(raw.get(key), bool):
+            evidence[key] = raw[key]
+    for key in ("scope_paths", "changed_paths"):
+        paths = _bounded_required_async_strings(
+            raw.get(key),
+            limit=_MAX_REQUIRED_ASYNC_SCOPE_PATHS,
+        )
+        if paths:
+            evidence[key] = paths
+    test_refs = _bounded_required_async_strings(
+        raw.get("test_refs"),
+        limit=_MAX_REQUIRED_ASYNC_TEST_REFS,
+    )
+    if test_refs:
+        evidence["test_refs"] = test_refs
+    for key in ("worker_cwd", "merge_ref", "result_ref", "closeout_id"):
+        text = _bounded_run_state_text(raw.get(key))
+        if text:
+            evidence[key] = text
+    for key in ("commit_sha", "head_sha", "base_sha"):
+        sha = str(raw.get(key) or "").strip().lower()
+        if _CLOSEOUT_SHA_RE.fullmatch(sha):
+            evidence[key] = sha
+    raw_scope_check = raw.get("scope_check")
+    if isinstance(raw_scope_check, Mapping):
+        scope_check: dict[str, Any] = {}
+        if isinstance(raw_scope_check.get("clean"), bool):
+            scope_check["clean"] = raw_scope_check["clean"]
+        for key in ("scope_paths", "out_of_scope_files"):
+            paths = _bounded_required_async_strings(
+                raw_scope_check.get(key),
+                limit=_MAX_REQUIRED_ASYNC_SCOPE_PATHS,
+            )
+            if paths:
+                scope_check[key] = paths
+        inspection_error = _bounded_required_async_text(
+            raw_scope_check.get("inspection_error")
+        )
+        if inspection_error:
+            scope_check["inspection_error"] = inspection_error
+        if scope_check:
+            evidence["scope_check"] = scope_check
+    raw_parallel_merge = raw.get("parallel_merge")
+    if isinstance(raw_parallel_merge, Mapping):
+        parallel_merge: dict[str, Any] = {}
+        for key in (
+            "success",
+            "recovery_required",
+            "merged",
+            "merge_pending",
+            "worktree_kept",
+        ):
+            if isinstance(raw_parallel_merge.get(key), bool):
+                parallel_merge[key] = raw_parallel_merge[key]
+        for key in ("group_id", "worker_cwd", "error", "next_action"):
+            text = _bounded_required_async_text(raw_parallel_merge.get(key))
+            if text:
+                parallel_merge[key] = text
+        conflicts = _bounded_required_async_strings(
+            raw_parallel_merge.get("merge_conflicts"),
+            limit=_MAX_REQUIRED_ASYNC_SCOPE_PATHS,
+        )
+        if conflicts:
+            parallel_merge["merge_conflicts"] = conflicts
+        if parallel_merge:
+            evidence["parallel_merge"] = parallel_merge
+    raw_worker_run = raw.get("worker_run")
+    if isinstance(raw_worker_run, Mapping):
+        worker_run: dict[str, Any] = {}
+        for key in ("backend", "model", "reasoning", "model_tier"):
+            text = _bounded_run_state_text(raw_worker_run.get(key))
+            if text:
+                worker_run[key] = text
+        for key in ("failed", "background"):
+            if isinstance(raw_worker_run.get(key), bool):
+                worker_run[key] = raw_worker_run[key]
+        if worker_run:
+            evidence["worker_run"] = worker_run
+    return evidence
+
+
+def _normalized_required_async_dispatch(
+    raw_dispatch: Any,
+    *,
+    legacy: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    malformed = not isinstance(raw_dispatch, dict)
+    raw = raw_dispatch if isinstance(raw_dispatch, dict) else {}
+    state = "terminal" if legacy else str(raw.get("state") or "").strip().lower()
+    if state not in _REQUIRED_ASYNC_DISPATCH_STATES:
+        state = "outcome_unknown"
+        malformed = True
+    success: bool | None = None
+    if state == "terminal":
+        success = raw.get("success") is True
+    elif state in {"cancelled", "outcome_unknown"}:
+        success = False
+    dispatch = {
+        "state": state,
+        "success": success,
+        "status": _bounded_run_state_text(raw.get("status")),
+        "registered_at": _bounded_run_state_lease(raw.get("registered_at")),
+        "started_at": _bounded_run_state_lease(raw.get("started_at")),
+        "completed_at": _bounded_run_state_lease(raw.get("completed_at")),
+        "owner_pid": _bounded_run_state_int(raw.get("owner_pid")),
+        "process_epoch": _bounded_run_state_text(
+            raw.get("process_epoch"),
+            limit=_RUN_STATE_EPOCH_LIMIT,
+        ),
+        "closeout_id": _bounded_run_state_text(raw.get("closeout_id")),
+        "summary": _bounded_required_async_text(raw.get("summary")),
+        "error": _bounded_required_async_text(raw.get("error")),
+        "evidence": _bounded_required_async_evidence(raw.get("evidence")),
+    }
+    if raw.get("registration_missing") is True:
+        dispatch["registration_missing"] = True
+    if raw.get("conflicting_replay") is True:
+        dispatch["conflicting_replay"] = True
+    return dispatch, malformed
+
+
 def _required_async_completion_state(item: Any) -> dict[str, Any]:
     source = item if isinstance(item, dict) else {}
-    raw = source.get("required_async_completions")
-    raw = raw if isinstance(raw, dict) else {}
+    present = "required_async_completions" in source
+    raw_value = source.get("required_async_completions")
+    raw = raw_value if isinstance(raw_value, dict) else {}
+    raw_version = raw.get("schema_version")
+    legacy = present and raw_version is None
+    malformed = present and not isinstance(raw_value, dict)
+    if raw_version is not None and _positive_int(raw_version) != _REQUIRED_ASYNC_SCHEMA_VERSION:
+        malformed = True
     generation = _positive_int(raw.get("generation"))
     attempt_id = _bounded_run_state_text(raw.get("attempt_id"))
     attempt_order = _positive_int(raw.get("attempt_order"))
-    outcomes: dict[str, dict[str, Any]] = {}
+    dispatches: dict[str, dict[str, Any]] = {}
+
+    raw_dispatches = raw.get("dispatches")
+    if raw_version is not None and not isinstance(raw_dispatches, dict):
+        malformed = True
+    if isinstance(raw_dispatches, dict):
+        if len(raw_dispatches) > _MAX_REQUIRED_ASYNC_COMPLETIONS:
+            malformed = True
+        for delegation_id, raw_dispatch in list(raw_dispatches.items())[
+            -_MAX_REQUIRED_ASYNC_COMPLETIONS:
+        ]:
+            normalized_id = _bounded_run_state_text(delegation_id)
+            if not normalized_id:
+                malformed = True
+                continue
+            dispatch, dispatch_malformed = _normalized_required_async_dispatch(raw_dispatch)
+            malformed = malformed or dispatch_malformed
+            dispatches[normalized_id] = dispatch
+
     raw_outcomes = raw.get("outcomes") if isinstance(raw.get("outcomes"), dict) else {}
-    for delegation_id, raw_outcome in list(raw_outcomes.items())[-_MAX_REQUIRED_ASYNC_COMPLETIONS:]:
-        if not isinstance(raw_outcome, dict):
+    if legacy or (raw_outcomes and not dispatches):
+        if len(raw_outcomes) > _MAX_REQUIRED_ASYNC_COMPLETIONS:
+            malformed = True
+        for delegation_id, raw_outcome in list(raw_outcomes.items())[
+            -_MAX_REQUIRED_ASYNC_COMPLETIONS:
+        ]:
+            normalized_id = _bounded_run_state_text(delegation_id)
+            if not normalized_id:
+                malformed = True
+                continue
+            dispatch, dispatch_malformed = _normalized_required_async_dispatch(
+                raw_outcome,
+                legacy=True,
+            )
+            malformed = malformed or dispatch_malformed
+            dispatches.setdefault(normalized_id, dispatch)
+
+    # A legacy attempt with no recorded outcome is exactly the crash window
+    # this state exists to close. Retain ownership and fail closed instead of
+    # treating the absent volatile queue as proof that no child existed.
+    if legacy and not dispatches:
+        malformed = True
+    if malformed:
+        for delegation_id, dispatch in list(dispatches.items()):
+            if dispatch["state"] not in _REQUIRED_ASYNC_PENDING_STATES:
+                continue
+            dispatches[delegation_id] = {
+                **dispatch,
+                "state": "outcome_unknown",
+                "success": False,
+                "status": "malformed_dispatch",
+                "error": "durable async dispatch state could not be normalized safely",
+            }
+    sealed = raw.get("sealed") is True if not legacy else bool(dispatches) or malformed
+    if malformed:
+        sealed = True
+    reconciled_at = _bounded_run_state_lease(raw.get("reconciled_at"))
+    outcomes: dict[str, dict[str, Any]] = {}
+    for delegation_id, dispatch in dispatches.items():
+        if dispatch["state"] not in {"terminal", "cancelled", "outcome_unknown"}:
             continue
-        normalized_id = _bounded_run_state_text(delegation_id)
-        if not normalized_id:
-            continue
-        outcomes[normalized_id] = {
-            "success": raw_outcome.get("success") is True,
-            "status": _bounded_run_state_text(raw_outcome.get("status")),
-            "completed_at": _bounded_run_state_lease(raw_outcome.get("completed_at")),
-            "closeout_id": _bounded_run_state_text(raw_outcome.get("closeout_id")),
+        outcomes[delegation_id] = {
+            "success": dispatch.get("success") is True,
+            "status": str(dispatch.get("status") or ""),
+            "completed_at": dispatch.get("completed_at"),
+            "closeout_id": str(dispatch.get("closeout_id") or ""),
         }
+    pending_count = sum(
+        dispatch["state"] in _REQUIRED_ASYNC_PENDING_STATES
+        for dispatch in dispatches.values()
+    )
+    cancelled = sum(dispatch["state"] == "cancelled" for dispatch in dispatches.values())
+    outcome_unknown = sum(
+        dispatch["state"] == "outcome_unknown" for dispatch in dispatches.values()
+    )
+    sticky_failure = bool(
+        malformed
+        or raw.get("sticky_failure") is True
+        or cancelled
+        or outcome_unknown
+        or any(
+            dispatch["state"] == "terminal" and dispatch.get("success") is not True
+            for dispatch in dispatches.values()
+        )
+    )
+    all_terminal = bool(dispatches) and pending_count == 0
+    if (malformed or (sealed and sticky_failure)) and not dispatches:
+        all_terminal = True
+    owns_recovery = bool(present and reconciled_at is None)
     return {
+        "schema_version": _REQUIRED_ASYNC_SCHEMA_VERSION,
         "generation": generation,
         "attempt_id": attempt_id,
         "attempt_order": attempt_order,
+        "sealed": sealed,
+        "sealed_at": _bounded_run_state_lease(raw.get("sealed_at")),
+        "reconciled_at": reconciled_at,
+        "reconciliation_id": _bounded_run_state_text(raw.get("reconciliation_id")),
+        "cancelled_at": _bounded_run_state_lease(raw.get("cancelled_at")),
+        "cancellation_reason": _bounded_required_async_text(
+            raw.get("cancellation_reason")
+        ),
+        "dispatches": dispatches,
         "outcomes": outcomes,
-        "failed": any(outcome["success"] is False for outcome in outcomes.values()),
+        "pending_count": pending_count,
+        "all_terminal": all_terminal,
+        "ready_to_reconcile": bool(
+            owns_recovery and sealed and all_terminal and reconciled_at is None
+        ),
+        "present": present,
+        "owns_recovery": owns_recovery,
+        "failed": sticky_failure,
+        "sticky_failure": sticky_failure,
+        "failure_reason": _bounded_run_state_text(raw.get("failure_reason")),
         "succeeded": sum(outcome["success"] is True for outcome in outcomes.values()),
+        "cancelled": cancelled,
+        "outcome_unknown": outcome_unknown,
+        "malformed": malformed,
     }
+
+
+def _required_async_payload(state: Mapping[str, Any]) -> dict[str, Any]:
+    dispatches = dict(state.get("dispatches") or {})
+    outcomes: dict[str, dict[str, Any]] = {}
+    for delegation_id, dispatch in dispatches.items():
+        if not isinstance(dispatch, dict) or dispatch.get("state") not in {
+            "terminal",
+            "cancelled",
+            "outcome_unknown",
+        }:
+            continue
+        outcomes[delegation_id] = {
+            "success": dispatch.get("success") is True,
+            "status": _bounded_run_state_text(dispatch.get("status")),
+            "completed_at": _bounded_run_state_lease(dispatch.get("completed_at")),
+            "closeout_id": _bounded_run_state_text(dispatch.get("closeout_id")),
+        }
+    payload: dict[str, Any] = {
+        "schema_version": _REQUIRED_ASYNC_SCHEMA_VERSION,
+        "generation": _positive_int(state.get("generation")),
+        "attempt_id": _bounded_run_state_text(state.get("attempt_id")),
+        "attempt_order": _positive_int(state.get("attempt_order")),
+        "sealed": state.get("sealed") is True,
+        "dispatches": dispatches,
+        # Retained for older callers and rollback compatibility. Dispatches are
+        # canonical and every mutation rewrites this derived projection.
+        "outcomes": outcomes,
+    }
+    for key in (
+        "sealed_at",
+        "reconciled_at",
+        "cancelled_at",
+    ):
+        value = _bounded_run_state_lease(state.get(key))
+        if value is not None:
+            payload[key] = value
+    for key in ("reconciliation_id", "failure_reason"):
+        value = _bounded_run_state_text(state.get(key))
+        if value:
+            payload[key] = value
+    cancellation_reason = _bounded_required_async_text(state.get("cancellation_reason"))
+    if cancellation_reason:
+        payload["cancellation_reason"] = cancellation_reason
+    if state.get("sticky_failure") is True:
+        payload["sticky_failure"] = True
+    return payload
+
+
+def _required_async_attempt_matches(
+    state: Mapping[str, Any],
+    *,
+    generation: Any,
+    attempt_id: Any,
+    attempt_order: Any,
+) -> bool:
+    return bool(
+        _positive_int(generation)
+        and _positive_int(generation) == _positive_int(state.get("generation"))
+        and _bounded_run_state_text(attempt_id)
+        == _bounded_run_state_text(state.get("attempt_id"))
+        and _positive_int(attempt_order)
+        and _positive_int(attempt_order) == _positive_int(state.get("attempt_order"))
+    )
+
+
+def _required_async_attempt_relation(
+    state: Mapping[str, Any],
+    *,
+    generation: Any,
+    attempt_id: Any,
+    attempt_order: Any,
+) -> str | None:
+    incoming_generation = _positive_int(generation)
+    incoming_id = _bounded_run_state_text(attempt_id)
+    incoming_order = _positive_int(attempt_order)
+    if not incoming_generation or not incoming_id or not incoming_order:
+        return None
+    if not state.get("present"):
+        return "new"
+    if _required_async_attempt_matches(
+        state,
+        generation=incoming_generation,
+        attempt_id=incoming_id,
+        attempt_order=incoming_order,
+    ):
+        return "same"
+    if (
+        incoming_order > _positive_int(state.get("attempt_order"))
+        and incoming_generation >= _positive_int(state.get("generation"))
+        and incoming_id != _bounded_run_state_text(state.get("attempt_id"))
+    ):
+        return "new"
+    return None
+
+
+def _refresh_required_async_failure_gate(item: dict[str, Any]) -> None:
+    required_state = _required_async_completion_state(item)
+    if required_state["failed"]:
+        gate = classify_delivery_completion(item)
+        item["completion_gate"] = gate
+        item["summary_status"] = str(gate.get("summary_status") or "Failed")
+        return
+    existing_gate = (
+        item.get("completion_gate")
+        if isinstance(item.get("completion_gate"), dict)
+        else {}
+    )
+    if existing_gate.get("reason") == "required_async_completion_failed":
+        item.pop("completion_gate", None)
+        if str(item.get("summary_status") or "").lower() == "failed":
+            item.pop("summary_status", None)
 
 
 def _normalize_run_state_snapshot(item: Any) -> dict[str, Any]:
@@ -1126,6 +1504,43 @@ class GatewayWorkLedger:
             return None
         return _required_async_completion_state(item)
 
+    @staticmethod
+    def _required_async_write_context(
+        data: dict[str, Any],
+        work_id: str,
+        *,
+        generation: Any,
+        attempt_id: Any,
+        attempt_order: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        item = data.get("items", {}).get(work_id)
+        if not isinstance(item, dict):
+            return None
+        state = _required_async_completion_state(item)
+        if not _required_async_attempt_matches(
+            state,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        ):
+            return None
+        return item, state
+
+    def _persist_required_async_state(
+        self,
+        data: dict[str, Any],
+        item: dict[str, Any],
+        state: Mapping[str, Any],
+        *,
+        refresh_gate: bool = False,
+    ) -> dict[str, Any]:
+        item["required_async_completions"] = _required_async_payload(state)
+        if refresh_gate:
+            _refresh_required_async_failure_gate(item)
+        item["updated_at"] = self._now()
+        self._write(data)
+        return _required_async_completion_state(item)
+
     @_locked_ledger_mutation
     def begin_required_async_attempt(
         self,
@@ -1135,7 +1550,7 @@ class GatewayWorkLedger:
         attempt_order: int | None,
         generation: int | None = None,
     ) -> dict[str, Any] | None:
-        """Start or resume one authoritative required-work dispatch attempt."""
+        """Compatibility API; producers should atomically register a dispatch."""
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
@@ -1144,37 +1559,310 @@ class GatewayWorkLedger:
         incoming_order = _positive_int(attempt_order)
         incoming_generation = _positive_int(generation)
         state = _required_async_completion_state(item)
-        current_order = int(state["attempt_order"] or 0)
-        current_id = str(state["attempt_id"] or "")
-        if current_order and incoming_order < current_order:
+        relation = _required_async_attempt_relation(
+            state,
+            generation=incoming_generation,
+            attempt_id=incoming_id,
+            attempt_order=incoming_order,
+        )
+        if relation == "same":
             return state
-        if (
-            current_order
-            and incoming_order == current_order
-            and current_id
-            and incoming_id != current_id
-        ):
-            return state
-        if incoming_id and incoming_id == current_id:
-            return state
-        item["required_async_completions"] = {
+        if relation != "new":
+            return None
+        item["required_async_completions"] = _required_async_payload({
             "attempt_id": incoming_id,
             "attempt_order": incoming_order,
             "generation": incoming_generation,
-            "outcomes": {},
-        }
-        existing_gate = (
-            item.get("completion_gate")
-            if isinstance(item.get("completion_gate"), dict)
-            else {}
-        )
-        if existing_gate.get("reason") == "required_async_completion_failed":
-            item.pop("completion_gate", None)
-            if str(item.get("summary_status") or "").lower() == "failed":
-                item.pop("summary_status", None)
+            "sealed": False,
+            "dispatches": {},
+        })
+        _refresh_required_async_failure_gate(item)
         item["updated_at"] = self._now()
         self._write(data)
         return _required_async_completion_state(item)
+
+    @_locked_ledger_mutation
+    def register_required_async_dispatch(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        owner_pid: int | None = None,
+        process_epoch: str | None = None,
+        registered_at: float | None = None,
+        closeout_id: str | None = None,
+        scope_paths: Any = None,
+    ) -> dict[str, Any] | None:
+        """Register one actual executor dispatch before submission begins."""
+
+        data = self._read()
+        item = data.get("items", {}).get(work_id)
+        if not isinstance(item, dict):
+            return None
+        state = _required_async_completion_state(item)
+        relation = _required_async_attempt_relation(
+            state,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if relation is None:
+            return None
+        if relation == "new":
+            state = {
+                "generation": _positive_int(generation),
+                "attempt_id": _bounded_run_state_text(attempt_id),
+                "attempt_order": _positive_int(attempt_order),
+                "sealed": False,
+                "dispatches": {},
+            }
+        elif state["sealed"]:
+            return None
+        completion_id = _bounded_run_state_text(delegation_id)
+        if not completion_id:
+            return None
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        epoch = _bounded_run_state_text(process_epoch, limit=_RUN_STATE_EPOCH_LIMIT)
+        pid = _bounded_run_state_int(owner_pid or os.getpid())
+        closeout = _bounded_run_state_text(closeout_id)
+        evidence = _bounded_required_async_evidence({"scope_paths": scope_paths})
+        if isinstance(existing, dict):
+            if (
+                existing.get("state") == "registered"
+                and int(existing.get("owner_pid") or 0) == pid
+                and str(existing.get("process_epoch") or "") == epoch
+                and str(existing.get("closeout_id") or "") == closeout
+                and existing.get("evidence", {}).get("scope_paths", [])
+                == evidence.get("scope_paths", [])
+            ):
+                return state
+            return None
+        if len(dispatches) >= _MAX_REQUIRED_ASYNC_COMPLETIONS:
+            return None
+        dispatches[completion_id] = {
+            "state": "registered",
+            "success": None,
+            "status": "registered",
+            "registered_at": _bounded_run_state_lease(
+                registered_at if registered_at is not None else self._now()
+            ),
+            "started_at": None,
+            "completed_at": None,
+            "owner_pid": pid,
+            "process_epoch": epoch,
+            "closeout_id": closeout,
+            "summary": "",
+            "error": "",
+            "evidence": evidence,
+        }
+        state["dispatches"] = dispatches
+        return self._persist_required_async_state(
+            data,
+            item,
+            state,
+            refresh_gate=relation == "new",
+        )
+
+    @_locked_ledger_mutation
+    def mark_required_async_dispatch_running(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        owner_pid: int | None = None,
+        process_epoch: str | None = None,
+        started_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        completion_id = _bounded_run_state_text(delegation_id)
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        if not isinstance(existing, dict):
+            return None
+        pid = _bounded_run_state_int(owner_pid or os.getpid())
+        epoch = _bounded_run_state_text(process_epoch, limit=_RUN_STATE_EPOCH_LIMIT)
+        if (
+            int(existing.get("owner_pid") or 0) != pid
+            or str(existing.get("process_epoch") or "") != epoch
+        ):
+            return None
+        if existing.get("state") == "running":
+            return state
+        if existing.get("state") != "registered":
+            return None
+        dispatch = dict(existing)
+        dispatch.update(
+            {
+                "state": "running",
+                "status": "running",
+                "started_at": _bounded_run_state_lease(
+                    started_at if started_at is not None else self._now()
+                ),
+            }
+        )
+        dispatches[completion_id] = dispatch
+        state["dispatches"] = dispatches
+        return self._persist_required_async_state(data, item, state)
+
+    def _record_required_async_terminal_locked(
+        self,
+        item: dict[str, Any],
+        *,
+        delegation_id: str,
+        success: bool,
+        generation: int | None,
+        attempt_id: str | None,
+        attempt_order: int | None,
+        status: str | None,
+        completed_at: float | None,
+        closeout_id: str | None,
+        summary: str | None,
+        error: str | None,
+        evidence: Mapping[str, Any] | None,
+        allow_missing_registration: bool,
+    ) -> dict[str, Any] | None:
+        state = _required_async_completion_state(item)
+        if not _required_async_attempt_matches(
+            state,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        ):
+            return None
+        completion_id = _bounded_run_state_text(delegation_id)
+        if not completion_id:
+            return None
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        if not isinstance(existing, dict):
+            if not allow_missing_registration or state["sealed"]:
+                return None
+            # Compatibility for callers from before durable dispatch
+            # registration. New producer code always registers first.
+            existing = {
+                "state": "registered",
+                "success": None,
+                "status": "registered",
+                "registered_at": _bounded_run_state_lease(completed_at),
+                "started_at": None,
+                "completed_at": None,
+                "owner_pid": 0,
+                "process_epoch": "",
+                "closeout_id": "",
+                "summary": "",
+                "error": "",
+                "evidence": {},
+                "registration_missing": True,
+            }
+        incoming_status = _bounded_run_state_text(status)
+        incoming_success = bool(success)
+        if existing.get("state") in {"cancelled", "outcome_unknown"}:
+            return state
+        if existing.get("state") == "terminal":
+            prior_success = existing.get("success") is True
+            prior_status = str(existing.get("status") or "")
+            conflict = prior_success != incoming_success or bool(
+                prior_status and incoming_status and prior_status != incoming_status
+            )
+            if not conflict:
+                return state
+            dispatch = dict(existing)
+            dispatch.update(
+                {
+                    "success": False,
+                    "status": "conflicting_replay",
+                    "error": "conflicting terminal replay for the same delegation id",
+                    "conflicting_replay": True,
+                }
+            )
+            dispatches[completion_id] = dispatch
+            state["sticky_failure"] = True
+            state["failure_reason"] = "required_async_conflicting_replay"
+        else:
+            dispatch = dict(existing)
+            combined_evidence = dict(dispatch.get("evidence") or {})
+            combined_evidence.update(_bounded_required_async_evidence(evidence))
+            closeout = _bounded_run_state_text(closeout_id) or str(
+                dispatch.get("closeout_id") or ""
+            )
+            dispatch.update(
+                {
+                    "state": "terminal",
+                    "success": incoming_success,
+                    "status": incoming_status,
+                    "completed_at": _bounded_run_state_lease(
+                        completed_at if completed_at is not None else self._now()
+                    ),
+                    "closeout_id": closeout,
+                    "summary": _bounded_required_async_text(summary),
+                    "error": _bounded_required_async_text(error),
+                    "evidence": combined_evidence,
+                }
+            )
+            dispatches[completion_id] = dispatch
+            if not incoming_success:
+                state["sticky_failure"] = True
+                state["failure_reason"] = "required_async_completion_failed"
+        state["dispatches"] = dispatches
+        item["required_async_completions"] = _required_async_payload(state)
+        _refresh_required_async_failure_gate(item)
+        return _required_async_completion_state(item)
+
+    @_locked_ledger_mutation
+    def record_required_async_submit_failure(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        error: str | None = None,
+        status: str | None = "submit_failed",
+        completed_at: float | None = None,
+        closeout_id: str | None = None,
+        evidence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return None
+        result = self._record_required_async_terminal_locked(
+            item,
+            delegation_id=delegation_id,
+            success=False,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+            status=status,
+            completed_at=completed_at,
+            closeout_id=closeout_id,
+            summary=None,
+            error=error,
+            evidence=evidence,
+            allow_missing_registration=False,
+        )
+        if result is not None:
+            item["updated_at"] = self._now()
+            self._write(data)
+        return result
 
     @_locked_ledger_mutation
     def record_required_async_completion(
@@ -1189,96 +1877,340 @@ class GatewayWorkLedger:
         status: str | None = None,
         completed_at: float | None = None,
         closeout_id: str | None = None,
+        summary: str | None = None,
+        error: str | None = None,
+        evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Latch one required coding outcome on its exact work generation.
-
-        Replays of the same delegation are idempotent. A lower or unversioned
-        stale event cannot mutate a newer persisted generation, while the first
-        event from a newer generation atomically replaces the older aggregate.
-        """
+        """Latch one registered coding outcome on its exact attempt."""
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
             return None
-        completion_id = _bounded_run_state_text(delegation_id)
-        if not completion_id:
+        result = self._record_required_async_terminal_locked(
+            item,
+            delegation_id=delegation_id,
+            success=success,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+            status=status,
+            completed_at=completed_at,
+            closeout_id=closeout_id,
+            summary=summary,
+            error=error,
+            evidence=evidence,
+            allow_missing_registration=True,
+        )
+        if result is not None:
+            item["updated_at"] = self._now()
+            self._write(data)
+        return result
+
+    @_locked_ledger_mutation
+    def cancel_required_async_dispatch(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        reason: str | None = None,
+        status: str | None = "cancelled",
+        cancelled_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
             return None
-        incoming_generation = _positive_int(generation)
-        incoming_attempt_id = _bounded_run_state_text(attempt_id)
-        incoming_attempt_order = _positive_int(attempt_order)
-        state = _required_async_completion_state(item)
-        current_attempt_id = str(state["attempt_id"] or "")
-        current_attempt_order = int(state["attempt_order"] or 0)
-        current_generation = int(state["generation"] or 0)
-        if current_attempt_order and incoming_attempt_order < current_attempt_order:
+        item, state = context
+        completion_id = _bounded_run_state_text(delegation_id)
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        if not isinstance(existing, dict):
+            return None
+        if existing.get("state") == "cancelled":
             return state
-        if (
-            current_attempt_order
-            and incoming_attempt_order == current_attempt_order
-            and current_attempt_id
-            and incoming_attempt_id != current_attempt_id
-        ):
-            return state
-        newer_attempt = incoming_attempt_order > current_attempt_order
-        if not newer_attempt and current_generation and (
-            not incoming_generation or incoming_generation < current_generation
-        ):
-            return state
-        if (
-            newer_attempt
-            or (
-                not current_attempt_order
-                and incoming_generation > current_generation
-            )
-        ):
-            state = {
-                "generation": incoming_generation,
-                "attempt_id": incoming_attempt_id,
-                "attempt_order": incoming_attempt_order,
-                "outcomes": {},
-                "failed": False,
-                "succeeded": 0,
+        if existing.get("state") not in _REQUIRED_ASYNC_PENDING_STATES:
+            return None
+        now = _bounded_run_state_lease(
+            cancelled_at if cancelled_at is not None else self._now()
+        )
+        dispatch = dict(existing)
+        dispatch.update(
+            {
+                "state": "cancelled",
+                "success": False,
+                "status": _bounded_run_state_text(status) or "cancelled",
+                "completed_at": now,
+                "error": _bounded_required_async_text(reason),
             }
-        outcomes = dict(state["outcomes"])
-        existing = outcomes.get(completion_id)
-        if isinstance(existing, dict):
-            # Conflicting replays fail closed; success can never repaint a
-            # previously recorded failure for the same completion id.
-            success = bool(success and existing.get("success") is True)
-        outcomes[completion_id] = {
-            "success": bool(success),
-            "status": _bounded_run_state_text(status),
-            "completed_at": _bounded_run_state_lease(
-                completed_at if completed_at is not None else self._now()
-            ),
-            "closeout_id": _bounded_run_state_text(closeout_id),
-        }
-        if len(outcomes) > _MAX_REQUIRED_ASYNC_COMPLETIONS:
-            outcomes = dict(list(outcomes.items())[-_MAX_REQUIRED_ASYNC_COMPLETIONS:])
-        item["required_async_completions"] = {
-            "generation": incoming_generation or current_generation,
-            "attempt_id": incoming_attempt_id or current_attempt_id,
-            "attempt_order": incoming_attempt_order or current_attempt_order,
-            "outcomes": outcomes,
-        }
-        required_state = _required_async_completion_state(item)
-        if required_state["failed"]:
-            gate = classify_delivery_completion(item)
-            item["completion_gate"] = gate
-            item["summary_status"] = str(gate.get("summary_status") or "Failed")
-        else:
-            existing_gate = (
-                item.get("completion_gate")
-                if isinstance(item.get("completion_gate"), dict)
-                else {}
+        )
+        dispatches[completion_id] = dispatch
+        state.update(
+            {
+                "dispatches": dispatches,
+                "sticky_failure": True,
+                "failure_reason": "required_async_dispatch_cancelled",
+                "cancelled_at": now,
+                "cancellation_reason": _bounded_required_async_text(reason),
+            }
+        )
+        return self._persist_required_async_state(
+            data,
+            item,
+            state,
+            refresh_gate=True,
+        )
+
+    @_locked_ledger_mutation
+    def seal_required_async_attempt(
+        self,
+        work_id: str,
+        *,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        sealed_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        if state["sealed"]:
+            return state
+        state["sealed"] = True
+        state["sealed_at"] = _bounded_run_state_lease(
+            sealed_at if sealed_at is not None else self._now()
+        )
+        if not state["dispatches"]:
+            state["sticky_failure"] = True
+            state["failure_reason"] = "required_async_attempt_empty"
+        return self._persist_required_async_state(
+            data,
+            item,
+            state,
+            refresh_gate=True,
+        )
+
+    @_locked_ledger_mutation
+    def mark_required_async_reconciled(
+        self,
+        work_id: str,
+        *,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        reconciliation_id: str | None = None,
+        reconciled_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        if not state["sealed"] or not state["all_terminal"]:
+            return None
+        incoming_id = _bounded_run_state_text(reconciliation_id)
+        if state["reconciled_at"] is not None:
+            if incoming_id and incoming_id != str(state.get("reconciliation_id") or ""):
+                return None
+            return state
+        state["reconciliation_id"] = incoming_id
+        state["reconciled_at"] = _bounded_run_state_lease(
+            reconciled_at if reconciled_at is not None else self._now()
+        )
+        return self._persist_required_async_state(data, item, state)
+
+    @_locked_ledger_mutation
+    def mark_orphaned_required_async_dispatches_unknown(
+        self,
+        *,
+        current_process_epoch: str,
+        current_owner_pid: int | None = None,
+        completed_at: float | None = None,
+    ) -> list[str]:
+        """Fail closed dispatches owned by a process other than this gateway."""
+
+        epoch = _bounded_run_state_text(
+            current_process_epoch,
+            limit=_RUN_STATE_EPOCH_LIMIT,
+        )
+        if not epoch:
+            return []
+        owner_pid = _bounded_run_state_int(current_owner_pid or os.getpid())
+        now = _bounded_run_state_lease(
+            completed_at if completed_at is not None else self._now()
+        )
+        data = self._read()
+        changed_work_ids: list[str] = []
+        for work_id, item in data.get("items", {}).items():
+            if not isinstance(item, dict):
+                continue
+            state = _required_async_completion_state(item)
+            if not state["owns_recovery"] or state["malformed"]:
+                continue
+            dispatches = dict(state["dispatches"])
+            changed = False
+            for delegation_id, existing in list(dispatches.items()):
+                if existing.get("state") not in _REQUIRED_ASYNC_PENDING_STATES:
+                    continue
+                dispatch_epoch = str(existing.get("process_epoch") or "")
+                dispatch_pid = int(existing.get("owner_pid") or 0)
+                if dispatch_epoch == epoch and dispatch_pid == owner_pid:
+                    continue
+                dispatch = dict(existing)
+                dispatch.update(
+                    {
+                        "state": "outcome_unknown",
+                        "success": False,
+                        "status": "producer_process_lost",
+                        "completed_at": now,
+                        "error": "producer process exited before a durable terminal outcome",
+                    }
+                )
+                dispatches[delegation_id] = dispatch
+                changed = True
+            if not changed:
+                continue
+            state.update(
+                {
+                    "dispatches": dispatches,
+                    "sticky_failure": True,
+                    "failure_reason": "required_async_outcome_unknown",
+                }
             )
-            if existing_gate.get("reason") == "required_async_completion_failed":
-                item.pop("completion_gate", None)
-                if str(item.get("summary_status") or "").lower() == "failed":
-                    item.pop("summary_status", None)
-        item["updated_at"] = self._now()
+            if not any(
+                dispatch.get("state") in _REQUIRED_ASYNC_PENDING_STATES
+                for dispatch in dispatches.values()
+            ):
+                state["sealed"] = True
+                state["sealed_at"] = state.get("sealed_at") or now
+            item["required_async_completions"] = _required_async_payload(state)
+            _refresh_required_async_failure_gate(item)
+            item["updated_at"] = self._now()
+            changed_work_ids.append(str(work_id))
+        if changed_work_ids:
+            self._write(data)
+        return changed_work_ids
+
+    @_locked_ledger_mutation
+    def finalize_required_async_failure(
+        self,
+        work_id: str,
+        *,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        final_response: str,
+        reason: str = "required_async_completion_failed",
+        reconciliation_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically fence a deterministic async block and terminal delivery."""
+
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        if not state["sealed"] or not state["all_terminal"]:
+            return None
+        terminal_delivery = (
+            item.get("terminal_delivery")
+            if isinstance(item.get("terminal_delivery"), dict)
+            else None
+        )
+        if terminal_delivery is not None:
+            if (
+                str(terminal_delivery.get("source") or "")
+                == "required_async_completion"
+                and str(terminal_delivery.get("async_attempt_id") or "")
+                == str(state["attempt_id"] or "")
+                and _positive_int(terminal_delivery.get("async_generation"))
+                == int(state["generation"] or 0)
+                and _positive_int(terminal_delivery.get("async_attempt_order"))
+                == int(state["attempt_order"] or 0)
+            ):
+                return dict(item)
+            return None
+        now = self._now()
+        block_reason = _bounded_run_state_text(reason) or "required_async_completion_failed"
+        state["reconciliation_id"] = _bounded_run_state_text(reconciliation_id)
+        state["reconciled_at"] = now
+        item["required_async_completions"] = _required_async_payload(state)
+        item.update(
+            {
+                "status": "blocked",
+                "updated_at": now,
+                "agent_done_at": now,
+                "blocked_at": now,
+                "blocked_reason": block_reason,
+                "final_response": str(final_response or ""),
+                "summary_status": "Blocked",
+                "active_run": None,
+                "lease_until": None,
+                "completion_gate": {
+                    "allowed_to_complete": False,
+                    "summary_status": "Blocked",
+                    "terminal_status": "blocked",
+                    "reason": block_reason,
+                    "required_async_completions": {
+                        "generation": state["generation"],
+                        "attempt_id": state["attempt_id"],
+                        "attempt_order": state["attempt_order"],
+                        "failed": state["failed"],
+                        "succeeded": state["succeeded"],
+                    },
+                },
+                "terminal_delivery": {
+                    "source": "required_async_completion",
+                    "async_generation": state["generation"],
+                    "async_attempt_id": state["attempt_id"],
+                    "async_attempt_order": state["attempt_order"],
+                    "status": "pending",
+                    "revision": 1,
+                    "owner": "",
+                    "lease_until": None,
+                    "attempt_count": 0,
+                    "retry_count": 0,
+                    "send_started_at": None,
+                    "send_confirmed_at": None,
+                    "result_message_id": None,
+                    "confirmed_message_ids": [],
+                    "summary_updated_at": None,
+                },
+            }
+        )
+        item.pop("claim_pid", None)
+        _record_discord_board_final_response(item)
+        _record_provider_progress(item, "ledger_status_blocked", status="blocked")
         self._write(data)
-        return required_state
+        return dict(item)
 
     @staticmethod
     def run_state_snapshot(item: Any) -> dict[str, Any]:
@@ -2945,6 +3877,13 @@ class GatewayWorkLedger:
                 )
             )
             if item.get("status") not in INCOMPLETE_STATUSES and not blocked_delivery_pending:
+                continue
+            if _required_async_completion_state(item)["owns_recovery"]:
+                # Required-worker ownership replaces the volatile intake TTL.
+                # Keep the item discoverable until reconciliation hands off to
+                # terminal delivery; silently expiring here would strand the
+                # durable dispatch or replay the original Discord request.
+                items.append(dict(item))
                 continue
             if blocked_delivery_pending:
                 # A deterministic blocked response and its summary outlive the
