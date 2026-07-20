@@ -841,6 +841,96 @@ def test_direct_closeout_activates_clean_verified_exact_head(
     assert notifications == ["work-1"]
 
 
+def _required_closeout_state(head_sha: str) -> dict:
+    return {
+        "dispatches": {
+            "deleg-required": {
+                "delegation_id": "deleg-required",
+                "completed_at": 1.0,
+                "evidence": {
+                    "head_sha": head_sha,
+                    "scope_check": {
+                        "clean": True,
+                        "out_of_scope_files": [],
+                    },
+                },
+            }
+        }
+    }
+
+
+def test_required_closeout_activates_clean_matching_host_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    runner, captured, notifications = _direct_closeout_runner(
+        repo,
+        mode="enforce",
+    )
+    head_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+
+    activated, route = runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        _required_closeout_state(head_sha),
+    )
+
+    assert (activated, route) == (True, "closeout")
+    assert captured["state"]["local_verification"] == {
+        "status": "passed",
+        "head_sha": head_sha,
+    }
+    assert notifications == ["work-1"]
+
+
+def test_required_closeout_rejects_mismatched_host_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    runner, captured, notifications = _direct_closeout_runner(
+        repo,
+        mode="enforce",
+    )
+
+    activated, route = runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        _required_closeout_state("a" * 40),
+    )
+
+    assert (activated, route) == (
+        False,
+        "workspace_head_not_clean_or_verified",
+    )
+    assert captured == {}
+    assert notifications == []
+
+
+def test_required_closeout_rejects_dirty_host_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    head_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    runner, captured, notifications = _direct_closeout_runner(
+        repo,
+        mode="enforce",
+    )
+
+    activated, route = runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        _required_closeout_state(head_sha),
+    )
+
+    assert (activated, route) == (
+        False,
+        "workspace_head_not_clean_or_verified",
+    )
+    assert captured == {}
+    assert notifications == []
+
+
 def test_direct_closeout_accepts_git_toplevel_for_nested_workspace(
     tmp_path,
     monkeypatch,
@@ -1100,6 +1190,85 @@ def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunn
         }
     )
     return runner
+
+
+@pytest.mark.asyncio
+async def test_parent_exception_seals_released_required_worker_attempt(tmp_path):
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    runner._process_epoch = "1000-test"
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner._resume_finished_discord_work_item = AsyncMock()
+    source = _source(tmp_path)
+    event = MessageEvent(
+        text="Dispatch the worker, then fail.",
+        source=source,
+        message_id="parent-error-after-dispatch",
+    )
+    session_key = "agent:main:discord:thread:thread-123"
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert item is not None
+    event.work_item_id = item["id"]
+    runner._discord_work_item_id_for_event = lambda *_args, **_kwargs: item["id"]
+    identity = runner._required_async_turn_identity(1)
+
+    async def dispatch_then_raise(**_kwargs):
+        assert runner.work_ledger.begin_required_async_attempt(
+            item["id"],
+            **identity,
+        )
+        assert runner.work_ledger.register_required_async_dispatch(
+            item["id"],
+            delegation_id="deleg-required",
+            owner_pid=os.getpid(),
+            process_epoch=runner._process_epoch,
+            scope_paths=["src"],
+            **identity,
+        )
+        assert runner.work_ledger.mark_required_async_dispatch_running(
+            item["id"],
+            delegation_id="deleg-required",
+            owner_pid=os.getpid(),
+            process_epoch=runner._process_epoch,
+            **identity,
+        )
+        raise RuntimeError("parent failed after releasing worker")
+
+    runner._run_agent = AsyncMock(side_effect=dispatch_then_raise)
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        1,
+    )
+
+    assert "parent failed after releasing worker" in response
+    state = runner.work_ledger.required_async_completion_state(item["id"])
+    assert state["sealed"] is True
+    assert state["all_terminal"] is False
+    assert state["owns_recovery"] is True
+
+    runner.work_ledger.record_required_async_completion(
+        item["id"],
+        delegation_id="deleg-required",
+        success=False,
+        status="error",
+        error="worker failed after parent exit",
+        **identity,
+    )
+    terminal = runner.work_ledger.required_async_completion_state(item["id"])
+    assert terminal["ready_to_reconcile"] is True
+
+    await runner._reconcile_required_async_item(item["id"], terminal)
+
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    runner._resume_finished_discord_work_item.assert_awaited_once()
 
 
 @pytest.mark.asyncio

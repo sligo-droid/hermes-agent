@@ -510,6 +510,131 @@ def test_coding_worker_schema_exposes_orchestrator_inputs():
     assert properties["background"]["default"] is False
 
 
+def test_required_background_worker_marks_running_before_model_start(
+    monkeypatch,
+    tmp_path,
+):
+    _reset_background_state()
+    calls = []
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+
+    class Ledger:
+        def register_required_async_dispatch(self, work_id, **kwargs):
+            calls.append(("register", work_id, kwargs))
+            return {"dispatches": {kwargs["delegation_id"]: {"state": "registered"}}}
+
+        def mark_required_async_dispatch_running(self, work_id, **kwargs):
+            calls.append(("running", work_id, kwargs))
+            return {"dispatches": {kwargs["delegation_id"]: {"state": "running"}}}
+
+        def record_required_async_completion(self, work_id, **kwargs):
+            calls.append(("complete", work_id, kwargs))
+            return {
+                "dispatches": {
+                    kwargs["delegation_id"]: {"state": "terminal", "success": True}
+                }
+            }
+
+    class ObservingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            assert any(call[0] == "running" for call in calls)
+            calls.append(("model_start",))
+            return super().run_turn(**kwargs)
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: Ledger())
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        ObservingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda workdir: None,
+    )
+    parent = _parent(repo)
+    parent._origin_work_item_id = "discord-work"
+    parent._origin_work_item_generation = 4
+    parent._origin_work_item_attempt_id = "gateway-epoch:4"
+    parent._origin_work_item_attempt_order = 11
+
+    handle = json.loads(
+        cwt.delegate_coding_task(
+            task="update the parser",
+            model_tier="trivial",
+            scope_paths=["src"],
+            background=True,
+            parent_agent=parent,
+        )
+    )
+    event = _drain_background_completion()
+
+    assert handle["success"] is True
+    names = [call[0] for call in calls]
+    assert names.index("register") < names.index("running") < names.index("model_start")
+    registration = next(call for call in calls if call[0] == "register")[2]
+    assert registration["delegation_id"] == handle["delegation_id"]
+    assert registration["owner_pid"] == os.getpid()
+    assert registration["process_epoch"] == "gateway-epoch"
+    assert registration["scope_paths"] == ["src"]
+    assert event["delegation_id"] == handle["delegation_id"]
+    completion = next(call for call in calls if call[0] == "complete")[2]
+    head_sha = completion["evidence"]["head_sha"]
+    assert len(head_sha) == 40
+    assert set(head_sha) <= set("0123456789abcdef")
+    assert event["result"]["head_sha"] == head_sha
+    _reset_background_state()
+
+
+def test_required_background_preflight_failure_is_durably_terminalized(
+    monkeypatch,
+    tmp_path,
+):
+    _reset_background_state()
+    calls = []
+
+    class Ledger:
+        def register_required_async_dispatch(self, work_id, **kwargs):
+            calls.append(("register", work_id, kwargs))
+            return {"dispatches": {kwargs["delegation_id"]: {"state": "registered"}}}
+
+        def record_required_async_completion(self, work_id, **kwargs):
+            calls.append(("complete", work_id, kwargs))
+            return {
+                "dispatches": {
+                    kwargs["delegation_id"]: {"state": "terminal", "success": False}
+                }
+            }
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: Ledger())
+    parent = _parent(tmp_path)
+    parent._origin_work_item_id = "discord-work"
+    parent._origin_work_item_generation = 4
+    parent._origin_work_item_attempt_id = "gateway-epoch:4"
+    parent._origin_work_item_attempt_order = 11
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="use missing cwd",
+            cwd=str(tmp_path / "missing" / "repo"),
+            background=True,
+            parent_agent=parent,
+        )
+    )
+
+    assert "cwd does not exist" in result["error"]
+    assert [call[0] for call in calls] == ["register", "complete"]
+    completion = calls[-1][2]
+    assert completion["success"] is False
+    assert completion["status"] == "preflight_failed"
+    assert process_registry.completion_queue.empty()
+    _reset_background_state()
+
+
 def test_background_dispatch_returns_handle_and_records_worker_run(monkeypatch, tmp_path):
     _reset_background_state()
     gate = threading.Event()

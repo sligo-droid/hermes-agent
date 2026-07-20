@@ -3451,3 +3451,507 @@ def test_mark_completed_refuses_incomplete_enforced_closeout_without_replay(tmp_
     ) is not None
     assert ledger.mark_completed(item["id"]) is True
     assert ledger.get(item["id"])["status"] == "completed"
+
+
+def _required_async_ledger(tmp_path, *, now=100.0):
+    ledger = GatewayWorkLedger(
+        tmp_path / "required_async_ledger.json",
+        now_fn=lambda: now,
+    )
+    event = _discord_event(message_id="required-async")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=3600,
+    )
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=7,
+        owner_pid=101,
+        process_epoch="boot-a",
+    )
+    assert ledger.begin_required_async_attempt(
+        item["id"],
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    ) is not None
+    return ledger, item["id"]
+
+
+def _unstarted_required_async_ledger(tmp_path, *, name="atomic-required"):
+    ledger = GatewayWorkLedger(tmp_path / f"{name}.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id=name)
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=3600,
+    )
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=7,
+        owner_pid=101,
+        process_epoch="boot-a",
+    )
+    assert "required_async_completions" not in ledger.get(item["id"])
+    return ledger, item["id"]
+
+
+def _register_required_dispatch(ledger, work_id, delegation_id, *, owner_pid=101, epoch="boot-a"):
+    return ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id=delegation_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        owner_pid=owner_pid,
+        process_epoch=epoch,
+        scope_paths=[f"src/{delegation_id}"],
+    )
+
+
+def _complete_required_dispatch(ledger, work_id, delegation_id, *, success=True, **kwargs):
+    return ledger.record_required_async_completion(
+        work_id,
+        delegation_id=delegation_id,
+        success=success,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        status="completed" if success else "error",
+        **kwargs,
+    )
+
+
+def test_required_async_first_registration_atomically_creates_attempt(tmp_path):
+    ledger, work_id = _unstarted_required_async_ledger(tmp_path)
+
+    state = ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id="worker-first",
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        owner_pid=101,
+        process_epoch="boot-a",
+    )
+
+    assert state is not None
+    assert state["attempt_id"] == "boot-a:7"
+    assert state["dispatches"]["worker-first"]["state"] == "registered"
+    stored = ledger.get(work_id)["required_async_completions"]
+    assert set(stored["dispatches"]) == {"worker-first"}
+
+
+def test_required_async_registration_atomically_replaces_newer_attempt(tmp_path):
+    ledger, work_id = _unstarted_required_async_ledger(tmp_path, name="atomic-newer")
+    assert ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id="worker-old",
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        owner_pid=101,
+        process_epoch="boot-a",
+    ) is not None
+
+    newer = ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id="worker-new",
+        generation=8,
+        attempt_id="boot-b:8",
+        attempt_order=11,
+        owner_pid=202,
+        process_epoch="boot-b",
+    )
+
+    assert newer is not None
+    assert newer["generation"] == 8
+    assert newer["attempt_id"] == "boot-b:8"
+    assert set(newer["dispatches"]) == {"worker-new"}
+    assert newer["dispatches"]["worker-new"]["state"] == "registered"
+
+
+def test_required_async_atomic_registration_rejects_stale_without_mutation(tmp_path):
+    ledger, work_id = _unstarted_required_async_ledger(tmp_path, name="atomic-stale")
+    assert ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id="worker-current",
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        owner_pid=101,
+        process_epoch="boot-a",
+    ) is not None
+    before = ledger.get(work_id)
+
+    assert ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id="worker-stale",
+        generation=6,
+        attempt_id="boot-old:6",
+        attempt_order=9,
+        owner_pid=99,
+        process_epoch="boot-old",
+    ) is None
+    assert ledger.get(work_id) == before
+
+
+def test_rejected_first_registration_does_not_create_empty_attempt(tmp_path):
+    ledger, work_id = _unstarted_required_async_ledger(tmp_path, name="atomic-rejected")
+
+    assert ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id="worker-invalid",
+        generation=None,
+        attempt_id="",
+        attempt_order=None,
+    ) is None
+    assert "required_async_completions" not in ledger.get(work_id)
+
+
+def test_required_async_registration_sealing_and_two_worker_readiness(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    first = _register_required_dispatch(ledger, work_id, "worker-a")
+    assert first is not None
+    assert first["pending_count"] == 1
+    assert first["owns_recovery"] is True
+    assert _register_required_dispatch(ledger, work_id, "worker-a") == first
+    assert _register_required_dispatch(ledger, work_id, "worker-b") is not None
+    assert ledger.mark_required_async_dispatch_running(
+        work_id,
+        delegation_id="worker-a",
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        owner_pid=101,
+        process_epoch="boot-a",
+    )["dispatches"]["worker-a"]["state"] == "running"
+
+    sealed = ledger.seal_required_async_attempt(
+        work_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    )
+    assert sealed["sealed"] is True
+    assert sealed["pending_count"] == 2
+    assert sealed["ready_to_reconcile"] is False
+    assert _register_required_dispatch(ledger, work_id, "worker-c") is None
+
+    first_done = _complete_required_dispatch(ledger, work_id, "worker-a")
+    assert first_done["pending_count"] == 1
+    assert first_done["all_terminal"] is False
+    assert first_done["ready_to_reconcile"] is False
+    second_done = _complete_required_dispatch(ledger, work_id, "worker-b")
+    assert second_done["pending_count"] == 0
+    assert second_done["all_terminal"] is True
+    assert second_done["ready_to_reconcile"] is True
+    assert second_done["succeeded"] == 2
+
+
+def test_required_async_submit_failure_and_conflicting_replay_stay_failed(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    assert _register_required_dispatch(ledger, work_id, "worker-a") is not None
+    failed = ledger.record_required_async_submit_failure(
+        work_id,
+        delegation_id="worker-a",
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        error="executor refused submission",
+    )
+    assert failed["failed"] is True
+    assert failed["dispatches"]["worker-a"]["status"] == "submit_failed"
+
+    replay = _complete_required_dispatch(ledger, work_id, "worker-a", success=True)
+    assert replay["failed"] is True
+    assert replay["dispatches"]["worker-a"]["success"] is False
+    assert replay["dispatches"]["worker-a"]["status"] == "conflicting_replay"
+    assert ledger.get(work_id)["completion_gate"]["reason"] == "required_async_completion_failed"
+
+
+def test_required_async_cancel_and_unknown_are_sticky(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    assert _register_required_dispatch(ledger, work_id, "worker-cancel") is not None
+    cancelled = ledger.cancel_required_async_dispatch(
+        work_id,
+        delegation_id="worker-cancel",
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        reason="user stopped worker",
+    )
+    assert cancelled["cancelled"] == 1
+    assert cancelled["failed"] is True
+    assert _complete_required_dispatch(
+        ledger,
+        work_id,
+        "worker-cancel",
+        success=True,
+    )["dispatches"]["worker-cancel"]["state"] == "cancelled"
+
+    assert _register_required_dispatch(
+        ledger,
+        work_id,
+        "worker-old",
+        owner_pid=202,
+        epoch="boot-old",
+    ) is not None
+    changed = ledger.mark_orphaned_required_async_dispatches_unknown(
+        current_process_epoch="boot-a",
+        current_owner_pid=101,
+    )
+    assert changed == [work_id]
+    state = ledger.required_async_completion_state(work_id)
+    assert state["outcome_unknown"] == 1
+    assert state["dispatches"]["worker-old"]["state"] == "outcome_unknown"
+    assert state["failed"] is True
+
+
+def test_required_async_attempt_fencing_rejects_stale_or_conflicting_writes(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    assert ledger.register_required_async_dispatch(
+        work_id,
+        delegation_id="stale",
+        generation=6,
+        attempt_id="boot-a:6",
+        attempt_order=9,
+    ) is None
+    assert ledger.begin_required_async_attempt(
+        work_id,
+        generation=8,
+        attempt_id="conflict",
+        attempt_order=10,
+    ) is None
+    newer = ledger.begin_required_async_attempt(
+        work_id,
+        generation=8,
+        attempt_id="boot-a:8",
+        attempt_order=11,
+    )
+    assert newer is not None
+    assert newer["generation"] == 8
+    assert newer["dispatches"] == {}
+    assert _complete_required_dispatch(ledger, work_id, "old-worker") is None
+
+
+def test_required_async_terminal_evidence_is_allowlisted_and_bounded(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    assert _register_required_dispatch(ledger, work_id, "worker-a") is not None
+    huge = "x" * 5000
+    state = _complete_required_dispatch(
+        ledger,
+        work_id,
+        "worker-a",
+        summary=huge,
+        error=huge,
+        closeout_id=huge,
+        evidence={
+            "worker_cwd": huge,
+            "changed": True,
+            "scope_paths": [f"src/{index}/{huge}" for index in range(100)],
+            "scope_check": {
+                "clean": False,
+                "out_of_scope_files": [huge] * 100,
+                "secret": huge,
+            },
+            "parallel_merge": {
+                "merged": False,
+                "recovery_required": True,
+                "error": huge,
+                "raw_result": {"secret": huge},
+            },
+            "worker_run": {
+                "backend": "codex",
+                "model": huge,
+                "failed": False,
+                "messages": [huge],
+            },
+            "test_refs": [f"test-{index}-{huge}" for index in range(100)],
+            "head_sha": "a" * 40,
+            "arbitrary_raw_payload": {"secret": huge},
+        },
+    )
+    dispatch = state["dispatches"]["worker-a"]
+    evidence = dispatch["evidence"]
+    assert len(dispatch["summary"]) <= 1000
+    assert len(dispatch["error"]) <= 1000
+    assert len(dispatch["closeout_id"]) <= 240
+    assert len(evidence["worker_cwd"]) <= 240
+    assert len(evidence["scope_paths"]) == 32
+    assert len(evidence["test_refs"]) == 16
+    assert evidence["head_sha"] == "a" * 40
+    assert "secret" not in evidence["scope_check"]
+    assert "raw_result" not in evidence["parallel_merge"]
+    assert "messages" not in evidence["worker_run"]
+    assert "arbitrary_raw_payload" not in evidence
+
+
+def test_required_async_legacy_outcomes_normalize_without_losing_compatibility(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    data = ledger._read()
+    data["items"][work_id]["required_async_completions"] = {
+        "generation": 7,
+        "attempt_id": "boot-a:7",
+        "attempt_order": 10,
+        "outcomes": {
+            "legacy-worker": {
+                "success": True,
+                "status": "completed",
+                "completed_at": 99.0,
+                "closeout_id": "closeout-1",
+            }
+        },
+    }
+    ledger._write(data)
+
+    state = ledger.required_async_completion_state(work_id)
+    assert state["sealed"] is True
+    assert state["ready_to_reconcile"] is True
+    assert state["failed"] is False
+    assert state["succeeded"] == 1
+    assert state["dispatches"]["legacy-worker"]["state"] == "terminal"
+    assert state["outcomes"]["legacy-worker"]["success"] is True
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [
+        "not-a-mapping",
+        {"schema_version": 999, "future_state": {"unknown": True}},
+        {
+            "schema_version": 999,
+            "generation": 7,
+            "attempt_id": "boot-a:7",
+            "attempt_order": 10,
+            "dispatches": {
+                "future-worker": {
+                    "state": "running",
+                    "owner_pid": 101,
+                    "process_epoch": "boot-a",
+                }
+            },
+        },
+        {"generation": 7, "attempt_id": "boot-a:7", "attempt_order": 10, "outcomes": {}},
+    ],
+)
+def test_required_async_malformed_or_unknown_state_fails_closed(tmp_path, raw_state):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    data = ledger._read()
+    data["items"][work_id]["required_async_completions"] = raw_state
+    ledger._write(data)
+
+    state = ledger.required_async_completion_state(work_id)
+    assert state["malformed"] is True
+    assert state["owns_recovery"] is True
+    assert state["sealed"] is True
+    assert state["all_terminal"] is True
+    assert state["ready_to_reconcile"] is True
+    assert state["failed"] is True
+
+
+def test_required_async_failure_finalization_uses_terminal_delivery_fence(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    assert _register_required_dispatch(ledger, work_id, "worker-a") is not None
+    assert ledger.seal_required_async_attempt(
+        work_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    ) is not None
+    assert _complete_required_dispatch(ledger, work_id, "worker-a") is not None
+
+    blocked = ledger.finalize_required_async_failure(
+        work_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        final_response="Worker evidence could not be reconciled safely.",
+        reason="required_async_reconciliation_failed",
+        reconciliation_id="reconcile-1",
+    )
+    assert blocked is not None
+    assert blocked["status"] == "blocked"
+    assert blocked["completion_gate"]["reason"] == "required_async_reconciliation_failed"
+    assert blocked["terminal_delivery"]["source"] == "required_async_completion"
+    assert blocked["terminal_delivery"]["status"] == "pending"
+    reconciled = ledger.required_async_completion_state(work_id)
+    assert reconciled["reconciled_at"] == 100.0
+    assert reconciled["owns_recovery"] is False
+    assert ledger.finalize_required_async_failure(
+        work_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        final_response="duplicate",
+        reason="different",
+        reconciliation_id="reconcile-1",
+    )["final_response"] == "Worker evidence could not be reconciled safely."
+    assert ledger.finalize_required_async_failure(
+        work_id,
+        generation=8,
+        attempt_id="boot-a:8",
+        attempt_order=11,
+        final_response="stale",
+    ) is None
+
+
+def test_required_async_ownership_outlives_intake_expiry_until_reconciled(tmp_path):
+    now = [time.time()]
+    ledger = GatewayWorkLedger(
+        tmp_path / "required_async_expiry.json",
+        now_fn=lambda: now[0],
+    )
+    old_message_id = _discord_snowflake_at(now[0] - (8 * 24 * 60 * 60))
+    event = _discord_event(message_id=old_message_id)
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=1,
+    )
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=7,
+        owner_pid=101,
+        process_epoch="boot-a",
+    )
+    assert ledger.begin_required_async_attempt(
+        item["id"],
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    ) is not None
+    assert _register_required_dispatch(ledger, item["id"], "worker-long") is not None
+
+    now[0] += 2 * 60 * 60
+    pending = ledger.incomplete_items()
+    assert [entry["id"] for entry in pending] == [item["id"]]
+    assert ledger.get(item["id"])["status"] == "agent_running"
+
+    assert _complete_required_dispatch(ledger, item["id"], "worker-long") is not None
+    assert ledger.seal_required_async_attempt(
+        item["id"],
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    ) is not None
+    assert ledger.mark_required_async_reconciled(
+        item["id"],
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        reconciliation_id="reconcile-long-worker",
+    ) is not None
+
+    assert ledger.incomplete_items() == []
+    assert ledger.get(item["id"])["status"] == "expired"

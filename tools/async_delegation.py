@@ -7,7 +7,10 @@ parent agent dispatches trusted work on a module-level daemon executor and
 returns a handle immediately, so the user and the model can keep working.
 
 When the child finishes, a completion event is pushed onto the SHARED
-``process_registry.completion_queue`` with ``type="async_delegation"``. The
+``process_registry.completion_queue`` with ``type="async_delegation"``. For
+required Discord coding workers, terminal state is first committed to the
+gateway work ledger; the queue is only a compatibility wakeup. Advisory
+``delegate_task`` results remain best-effort and in-memory. The
 CLI (``cli.py`` process_loop) and gateway (``_run_process_watcher`` /
 ``completion_queue`` drain) already poll that queue while the agent is idle
 and forge a fresh user/internal turn from each event. We deliberately reuse
@@ -38,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -106,6 +110,8 @@ _records: Dict[str, Dict[str, Any]] = {}
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
+_MAX_TERMINAL_EVIDENCE_TEXT = 2000
+_MAX_TERMINAL_EVIDENCE_ITEMS = 32
 
 
 def async_completion_succeeded(evt: Dict[str, Any]) -> bool:
@@ -294,6 +300,270 @@ def _capture_session_routing() -> Dict[str, str]:
     return captured
 
 
+def _is_required_coding_dispatch(record: Dict[str, Any]) -> bool:
+    """Whether the work ledger is the canonical owner for this dispatch."""
+    return bool(
+        record.get("kind") == "coding_worker"
+        and str(record.get("origin_work_item_id") or "").strip()
+    )
+
+
+def _required_async_ledger():
+    """Construct the profile-scoped durable owner lazily."""
+    from gateway.work_ledger import GatewayWorkLedger
+
+    return GatewayWorkLedger()
+
+
+def _required_dispatch_state(
+    state: Any,
+    delegation_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return one normalized durable dispatch from a ledger mutation result."""
+    if not isinstance(state, dict):
+        return None
+    dispatches = state.get("dispatches")
+    if not isinstance(dispatches, dict):
+        return None
+    dispatch = dispatches.get(str(delegation_id))
+    return dict(dispatch) if isinstance(dispatch, dict) else None
+
+
+def _register_required_async_dispatch(record: Dict[str, Any]) -> Optional[str]:
+    """Register one required coding dispatch before executor submission.
+
+    Returns an error string when registration was rejected or unavailable.
+    Advisory delegations intentionally never touch the durable work ledger.
+    """
+    if not _is_required_coding_dispatch(record):
+        return None
+    try:
+        ledger = _required_async_ledger()
+        registered = ledger.register_required_async_dispatch(
+            str(record["origin_work_item_id"]),
+            delegation_id=str(record["delegation_id"]),
+            generation=record.get("origin_run_generation"),
+            attempt_id=record.get("origin_attempt_id"),
+            attempt_order=record.get("origin_attempt_order"),
+            owner_pid=record.get("origin_owner_pid"),
+            process_epoch=record.get("origin_process_epoch"),
+            registered_at=record.get("dispatched_at"),
+            closeout_id=record.get("closeout_id"),
+            scope_paths=record.get("origin_scope_paths"),
+        )
+        registered_dispatch = _required_dispatch_state(
+            registered,
+            str(record["delegation_id"]),
+        )
+        if not registered_dispatch or registered_dispatch.get("state") != "registered":
+            return "required async dispatch is absent, stale, or conflicts"
+    except Exception as exc:  # noqa: BLE001 - dispatch must fail closed
+        logger.exception(
+            "Could not register required async dispatch %s",
+            record.get("delegation_id"),
+        )
+        return f"required async dispatch registration failed: {exc}"
+    record["required_async_registered"] = True
+    record["required_async_state"] = "registered"
+    return None
+
+
+def _coding_terminal_fields(
+    record: Dict[str, Any],
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return bounded deterministic terminal evidence for the work ledger."""
+    deterministic = result.get("result")
+    deterministic = deterministic if isinstance(deterministic, dict) else {}
+    coding_event = result.get("_async_coding_worker")
+    coding_event = coding_event if isinstance(coding_event, dict) else {}
+    scope_check = deterministic.get("scope_check")
+    scope_check = scope_check if isinstance(scope_check, dict) else {}
+    parallel_merge = deterministic.get("parallel_merge")
+    parallel_merge = parallel_merge if isinstance(parallel_merge, dict) else {}
+    git_result = deterministic.get("fable_git_result")
+    git_result = git_result if isinstance(git_result, dict) else {}
+
+    def bounded_text(value: Any) -> str:
+        return str(value or "")[:_MAX_TERMINAL_EVIDENCE_TEXT]
+
+    def bounded_strings(value: Any) -> List[str]:
+        if isinstance(value, (str, bytes)):
+            value = [value]
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        return [
+            bounded_text(item)
+            for item in list(value)[:_MAX_TERMINAL_EVIDENCE_ITEMS]
+            if bounded_text(item)
+        ]
+
+    evidence: Dict[str, Any] = {
+        "scope_paths": bounded_strings(
+            coding_event.get("scope_paths")
+            or scope_check.get("scope_paths")
+            or record.get("origin_scope_paths")
+            or []
+        ),
+        "worker_cwd": bounded_text(coding_event.get("worker_cwd")),
+    }
+    changed = deterministic.get("changed")
+    if isinstance(changed, bool):
+        evidence["changed"] = changed
+    else:
+        changed_paths = bounded_strings(changed)
+        if changed_paths:
+            evidence["changed_paths"] = changed_paths
+    if isinstance(scope_check, dict):
+        bounded_scope_check: Dict[str, Any] = {}
+        if isinstance(scope_check.get("clean"), bool):
+            bounded_scope_check["clean"] = scope_check["clean"]
+        for key in ("scope_paths", "out_of_scope_files"):
+            paths = bounded_strings(scope_check.get(key))
+            if paths:
+                bounded_scope_check[key] = paths
+        if scope_check.get("inspection_error"):
+            bounded_scope_check["inspection_error"] = bounded_text(
+                scope_check["inspection_error"]
+            )
+        if bounded_scope_check:
+            evidence["scope_check"] = bounded_scope_check
+    if parallel_merge:
+        bounded_parallel_merge: Dict[str, Any] = {}
+        for key in (
+            "success",
+            "recovery_required",
+            "merged",
+            "merge_pending",
+            "worktree_kept",
+        ):
+            if isinstance(parallel_merge.get(key), bool):
+                bounded_parallel_merge[key] = parallel_merge[key]
+        for key in ("group_id", "worker_cwd", "error", "next_action"):
+            if parallel_merge.get(key):
+                bounded_parallel_merge[key] = bounded_text(parallel_merge[key])
+        conflicts = bounded_strings(parallel_merge.get("merge_conflicts"))
+        if conflicts:
+            bounded_parallel_merge["merge_conflicts"] = conflicts
+        if bounded_parallel_merge:
+            evidence["parallel_merge"] = bounded_parallel_merge
+    worker_run = coding_event.get("worker_run")
+    if isinstance(worker_run, dict):
+        bounded_worker_run: Dict[str, Any] = {}
+        for key in ("backend", "model", "reasoning", "model_tier"):
+            if worker_run.get(key):
+                bounded_worker_run[key] = bounded_text(worker_run[key])
+        for key in ("failed", "background"):
+            if isinstance(worker_run.get(key), bool):
+                bounded_worker_run[key] = worker_run[key]
+        if bounded_worker_run:
+            evidence["worker_run"] = bounded_worker_run
+    test_refs = bounded_strings(deterministic.get("test_refs"))
+    if test_refs:
+        evidence["test_refs"] = test_refs
+    if isinstance(parallel_merge.get("merged"), bool):
+        evidence["merged"] = parallel_merge["merged"]
+    for source, key in (
+        (parallel_merge, "merge_ref"),
+        (deterministic, "commit_sha"),
+        (deterministic, "head_sha"),
+        (deterministic, "base_sha"),
+        (git_result, "commit_sha"),
+        (git_result, "head_sha"),
+        (git_result, "base_sha"),
+    ):
+        if source.get(key):
+            evidence[key] = bounded_text(source[key])
+    summary = deterministic.get("summary")
+    if summary is None:
+        summary = result.get("summary")
+    error = deterministic.get("error")
+    if error is None:
+        error = result.get("error")
+    closeout_id = (
+        git_result.get("closeout_id")
+        or deterministic.get("closeout_id")
+        or record.get("closeout_id")
+        or ""
+    )
+    if closeout_id:
+        evidence["closeout_id"] = bounded_text(closeout_id)
+    return {
+        "summary": summary,
+        "error": error,
+        "closeout_id": closeout_id,
+        "evidence": evidence,
+    }
+
+
+def _persist_required_async_terminal(
+    record: Dict[str, Any],
+    result: Dict[str, Any],
+    status: str,
+    *,
+    submit_failure: bool = False,
+) -> bool:
+    """Persist terminal required-work state before any volatile queue wakeup."""
+    if not _is_required_coding_dispatch(record):
+        return True
+    if not record.get("required_async_registered"):
+        logger.error(
+            "Required async dispatch %s reached terminal state without registration",
+            record.get("delegation_id"),
+        )
+        return False
+    terminal = _coding_terminal_fields(record, result)
+    common = {
+        "delegation_id": str(record.get("delegation_id") or ""),
+        "generation": record.get("origin_run_generation"),
+        "attempt_id": record.get("origin_attempt_id"),
+        "attempt_order": record.get("origin_attempt_order"),
+        "status": status,
+        "completed_at": record.get("completed_at"),
+        "closeout_id": terminal["closeout_id"],
+        "evidence": terminal["evidence"],
+    }
+    try:
+        ledger = _required_async_ledger()
+        if submit_failure:
+            persisted = ledger.record_required_async_submit_failure(
+                str(record["origin_work_item_id"]),
+                error=terminal["error"],
+                **common,
+            )
+        else:
+            persisted = ledger.record_required_async_completion(
+                str(record["origin_work_item_id"]),
+                success=bool(record.get("completion_success")),
+                summary=terminal["summary"],
+                error=terminal["error"],
+                **common,
+            )
+    except Exception:  # noqa: BLE001 - detached worker must not crash
+        logger.exception(
+            "Could not persist required async terminal state for %s",
+            record.get("delegation_id"),
+        )
+        return False
+    persisted_dispatch = _required_dispatch_state(
+        persisted,
+        str(record.get("delegation_id") or ""),
+    )
+    if (
+        not persisted_dispatch
+        or persisted_dispatch.get("state") != "terminal"
+        or persisted_dispatch.get("conflicting_replay") is True
+        or (persisted_dispatch.get("success") is True)
+        != bool(record.get("completion_success"))
+    ):
+        logger.warning(
+            "Required async terminal mutation for %s was rejected as stale or conflicting",
+            record.get("delegation_id"),
+        )
+        return False
+    return True
+
+
 def _completion_requires_delivery_ack(record: Dict[str, Any]) -> bool:
     """Whether gateway-visible state must stay pending until a forged turn runs."""
     platform = str(record.get("platform") or "").strip().lower()
@@ -339,6 +609,9 @@ def dispatch_async_delegation(
     origin_run_generation: Optional[int] = None,
     origin_attempt_id: str = "",
     origin_attempt_order: Optional[int] = None,
+    origin_owner_pid: Optional[int] = None,
+    origin_process_epoch: str = "",
+    origin_scope_paths: Optional[List[str]] = None,
     closeout_id: str = "",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
@@ -390,6 +663,9 @@ def dispatch_async_delegation(
         "origin_run_generation": _normalized_generation(origin_run_generation),
         "origin_attempt_id": str(origin_attempt_id or "")[:240],
         "origin_attempt_order": _normalized_generation(origin_attempt_order),
+        "origin_owner_pid": int(origin_owner_pid or os.getpid()),
+        "origin_process_epoch": str(origin_process_epoch or "")[:240],
+        "origin_scope_paths": list(origin_scope_paths or []),
         "closeout_id": str(closeout_id or "")[:240],
     }
     record.update(_capture_session_routing())
@@ -416,7 +692,24 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    executor = _get_executor(max_async_children)
+    try:
+        executor = _get_executor(max_async_children)
+    except Exception as exc:  # pragma: no cover - executor construction is rare
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {
+            "status": "rejected",
+            "error": f"Failed to initialize async delegation executor: {exc}",
+        }
+
+    registration_error = _register_required_async_dispatch(record)
+    if registration_error:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {
+            "status": "rejected",
+            "error": f"Failed to register required async dispatch: {registration_error}",
+        }
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -442,8 +735,28 @@ def dispatch_async_delegation(
         # get_hermes_home() under the right profile.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        with _records_lock:
-            _records.pop(delegation_id, None)
+        if _is_required_coding_dispatch(record):
+            failed_result = {
+                "status": "submit_failed",
+                "summary": "",
+                "error": f"Failed to schedule async delegation: {exc}",
+                "result": {
+                    "success": False,
+                    "status": "submit_failed",
+                    "summary": "",
+                    "error": f"Failed to schedule async delegation: {exc}",
+                },
+            }
+            _complete_record(
+                delegation_id,
+                failed_result,
+                "submit_failed",
+                enqueue=False,
+                submit_failure=True,
+            )
+        else:
+            with _records_lock:
+                _records.pop(delegation_id, None)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -458,14 +771,26 @@ def dispatch_async_delegation(
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     """Mark a record complete and push the completion event onto the queue."""
+    _complete_record(delegation_id, result, status, enqueue=True)
+
+
+def _complete_record(
+    delegation_id: str,
+    result: Dict[str, Any],
+    status: str,
+    *,
+    enqueue: bool,
+    submit_failure: bool = False,
+) -> bool:
+    """Terminalize one record exactly once, durably before queue delivery."""
     with _records_lock:
         record = _records.get(delegation_id)
-        if record is None:
-            return
+        if record is None or record.get("_terminalizing") or record.get("_terminalized"):
+            return False
+        record["_terminalizing"] = True
         record["status"] = status
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
-        record["delivery_pending"] = _completion_requires_delivery_ack(record)
         deterministic_result = result.get("result")
         if (
             record.get("kind") == "coding_worker"
@@ -477,11 +802,92 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
             )
         else:
             record["completion_success"] = status in {"completed", "success"}
-        # Snapshot fields needed for the event while holding the lock.
+        terminal_record = dict(record)
+
+    durable_accepted = _persist_required_async_terminal(
+        terminal_record,
+        result,
+        status,
+        submit_failure=submit_failure,
+    )
+
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None:
+            return durable_accepted
+        record.pop("_terminalizing", None)
+        record["_terminalized"] = True
+        record["required_async_terminal_accepted"] = durable_accepted
+        record["delivery_pending"] = bool(
+            enqueue
+            and durable_accepted
+            and _completion_requires_delivery_ack(record)
+        )
         event_record = dict(record)
         _prune_completed_locked()
 
-    _push_completion_event(event_record, result, status)
+    if enqueue and durable_accepted:
+        _push_completion_event(event_record, result, status)
+    return durable_accepted
+
+
+def mark_async_delegation_running(delegation_id: str) -> bool:
+    """Mark a registered required coding dispatch running before release."""
+    with _records_lock:
+        record = _records.get(str(delegation_id))
+        if record is None or record.get("_terminalized"):
+            return False
+        snapshot = dict(record)
+    if not _is_required_coding_dispatch(snapshot):
+        return True
+    try:
+        persisted = _required_async_ledger().mark_required_async_dispatch_running(
+            str(snapshot["origin_work_item_id"]),
+            delegation_id=str(snapshot["delegation_id"]),
+            generation=snapshot.get("origin_run_generation"),
+            attempt_id=snapshot.get("origin_attempt_id"),
+            attempt_order=snapshot.get("origin_attempt_order"),
+            owner_pid=snapshot.get("origin_owner_pid"),
+            process_epoch=snapshot.get("origin_process_epoch"),
+            started_at=time.time(),
+        )
+    except Exception:
+        logger.exception(
+            "Could not mark required async dispatch %s running",
+            snapshot.get("delegation_id"),
+        )
+        return False
+    persisted_dispatch = _required_dispatch_state(
+        persisted,
+        str(snapshot.get("delegation_id") or ""),
+    )
+    if not persisted_dispatch or persisted_dispatch.get("state") != "running":
+        logger.warning(
+            "Required async running mutation for %s was rejected",
+            snapshot.get("delegation_id"),
+        )
+        return False
+    with _records_lock:
+        current = _records.get(str(delegation_id))
+        if current is not None:
+            current["required_async_state"] = "running"
+    return True
+
+
+def terminalize_async_delegation(
+    delegation_id: str,
+    result: Dict[str, Any],
+    status: str = "error",
+    *,
+    enqueue: bool = False,
+) -> bool:
+    """Terminalize a dispatch rejected after submit but before worker release."""
+    return _complete_record(
+        str(delegation_id),
+        result,
+        str(status or "error"),
+        enqueue=enqueue,
+    )
 
 
 def _push_completion_event(
@@ -489,17 +895,27 @@ def _push_completion_event(
 ) -> None:
     """Push a type='async_delegation' event onto the shared completion queue.
 
-    Best-effort: a failure here must not crash the worker, but it WOULD mean a
-    silently-lost result, so we log loudly.
+    Best-effort: a failure here must not crash the worker. Required coding
+    results remain durable; advisory delegation results would be lost, so both
+    cases log loudly with the appropriate recovery semantics.
     """
     try:
         from tools.process_registry import process_registry
     except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
+        if _is_required_coding_dispatch(record):
+            logger.error(
+                "Async delegation %s finished but process_registry import failed; "
+                "durable result remains available for reconciliation: %s",
+                record.get("delegation_id"),
+                exc,
+            )
+        else:
+            logger.error(
+                "Async delegation %s finished but process_registry import failed; "
+                "result lost: %s",
+                record.get("delegation_id"),
+                exc,
+            )
         return
 
     coding_event = result.get("_async_coding_worker")
@@ -625,11 +1041,20 @@ def _push_completion_event(
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
+        if _is_required_coding_dispatch(record):
+            logger.error(
+                "Async delegation %s: failed to enqueue completion event; "
+                "durable result remains available for reconciliation: %s",
+                record.get("delegation_id"),
+                exc,
+            )
+        else:
+            logger.error(
+                "Async delegation %s: failed to enqueue completion event; "
+                "result lost: %s",
+                record.get("delegation_id"),
+                exc,
+            )
 
 
 def dispatch_async_delegation_batch(
@@ -898,6 +1323,108 @@ def interrupt_all(reason: str = "shutdown") -> int:
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
     return count
+
+
+def interrupt_session(
+    session_key: str,
+    *,
+    kind: str = "coding_worker",
+    origin_work_item_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    reason: str = "session_stop",
+) -> Dict[str, Any]:
+    """Fence and signal only matching background work for one session.
+
+    Required Discord coding dispatches are durably cancelled before their
+    interrupt callback is invoked, so a late successful worker result cannot
+    repaint the cancellation. The returned diagnostics are deliberately
+    bounded for gateway control-command responses.
+    """
+    normalized_session = str(session_key or "")
+    normalized_kind = str(kind or "coding_worker")
+    normalized_work_id = str(origin_work_item_id or "").strip()
+    normalized_attempt_id = str(attempt_id or "").strip()
+    with _records_lock:
+        targets = [
+            dict(record)
+            for record in _records.values()
+            if record.get("status") == "running"
+            and record.get("session_key", "") == normalized_session
+            and record.get("kind", "delegation") == normalized_kind
+            and (
+                not normalized_work_id
+                or str(record.get("origin_work_item_id") or "")
+                == normalized_work_id
+            )
+            and (
+                not normalized_attempt_id
+                or str(record.get("origin_attempt_id") or "")
+                == normalized_attempt_id
+            )
+        ]
+
+    durable_cancelled = 0
+    interrupted = 0
+    failed_ids: List[str] = []
+    for target in targets:
+        delegation_id = str(target.get("delegation_id") or "")
+        durable_ok = True
+        if _is_required_coding_dispatch(target):
+            try:
+                cancelled = _required_async_ledger().cancel_required_async_dispatch(
+                    str(target["origin_work_item_id"]),
+                    delegation_id=delegation_id,
+                    generation=target.get("origin_run_generation"),
+                    attempt_id=target.get("origin_attempt_id"),
+                    attempt_order=target.get("origin_attempt_order"),
+                    reason=str(reason or "session_stop")[:240],
+                    status="cancelled",
+                    cancelled_at=time.time(),
+                )
+                cancelled_dispatch = _required_dispatch_state(
+                    cancelled,
+                    delegation_id,
+                )
+                durable_ok = bool(
+                    cancelled_dispatch
+                    and cancelled_dispatch.get("state") == "cancelled"
+                )
+            except Exception:
+                durable_ok = False
+                logger.exception(
+                    "Could not durably cancel required async dispatch %s",
+                    delegation_id,
+                )
+            if durable_ok:
+                durable_cancelled += 1
+                with _records_lock:
+                    current = _records.get(delegation_id)
+                    if current is not None:
+                        current["required_async_state"] = "cancelled"
+                        current["cancel_requested"] = True
+            elif len(failed_ids) < 10:
+                failed_ids.append(delegation_id)
+
+        interrupt_fn = target.get("interrupt_fn")
+        if callable(interrupt_fn):
+            try:
+                interrupt_fn()
+                interrupted += 1
+            except Exception:
+                logger.debug(
+                    "interrupt_session: %s interrupt failed",
+                    delegation_id,
+                    exc_info=True,
+                )
+                if len(failed_ids) < 10 and delegation_id not in failed_ids:
+                    failed_ids.append(delegation_id)
+
+    return {
+        "matched": len(targets),
+        "durable_cancelled": durable_cancelled,
+        "interrupted": interrupted,
+        "failed_ids": failed_ids,
+    }
 
 
 def _reset_for_tests() -> None:

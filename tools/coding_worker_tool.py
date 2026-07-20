@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS, resolve_model_tier
@@ -276,6 +276,10 @@ class _BackgroundCodingStartup:
     scope_paths: list[str] = field(default_factory=list)
     backend: str = ""
     worker_run: Optional[dict[str, Any]] = None
+    cancel_reason: str = ""
+    interrupt_requested: threading.Event = field(default_factory=threading.Event)
+    _interrupt_lock: threading.Lock = field(default_factory=threading.Lock)
+    _interrupt_callback: Optional[Callable[[], None]] = None
 
     def mark_ready(
         self,
@@ -285,7 +289,7 @@ class _BackgroundCodingStartup:
         scope_paths: Optional[list[str]],
         backend: str,
         worker_run: Optional[dict[str, Any]],
-    ) -> None:
+    ) -> bool:
         """Publish deterministic dispatch metadata, then await parent release."""
         if not self.ready.is_set():
             self.worker_cwd = str(worker_cwd or "")
@@ -300,6 +304,26 @@ class _BackgroundCodingStartup:
                     _BACKGROUND_PARALLEL_WORKERS.add(registry_key)
             self.ready.set()
         self.release.wait()
+        return not bool(self.cancel_reason)
+
+    def request_interrupt(self) -> None:
+        """Signal the active worker session, including pre-session races."""
+        self.interrupt_requested.set()
+        with self._interrupt_lock:
+            callback = self._interrupt_callback
+        if callable(callback):
+            callback()
+
+    def set_interrupt_callback(self, callback: Callable[[], None]) -> None:
+        with self._interrupt_lock:
+            self._interrupt_callback = callback
+        if self.interrupt_requested.is_set():
+            callback()
+
+    def clear_interrupt_callback(self, callback: Callable[[], None]) -> None:
+        with self._interrupt_lock:
+            if self._interrupt_callback == callback:
+                self._interrupt_callback = None
 
 
 def _codex_reasoning_args(reasoning_level: str) -> list[str]:
@@ -2158,8 +2182,9 @@ def _delegate_coding_task_impl(
             ),
             background=_background_startup is not None,
         )
-        if _background_startup is not None:
-            _background_startup.mark_ready(
+        if (
+            _background_startup is not None
+            and not _background_startup.mark_ready(
                 worker_cwd=workdir,
                 model_tier=(
                     selected_model_tier.name
@@ -2169,6 +2194,12 @@ def _delegate_coding_task_impl(
                 scope_paths=normalized_scope_paths,
                 backend="opencode",
                 worker_run=opencode_run,
+            )
+        ):
+            _finish_worker_run(opencode_run, failed=True)
+            return tool_error(
+                _background_startup.cancel_reason
+                or "background coding worker was cancelled before startup"
             )
         result = _call_opencode_task(
             run_opencode_task,
@@ -2322,8 +2353,9 @@ def _delegate_coding_task_impl(
                 ),
                 background=_background_startup is not None,
             )
-            if _background_startup is not None:
-                _background_startup.mark_ready(
+            if (
+                _background_startup is not None
+                and not _background_startup.mark_ready(
                     worker_cwd=workdir,
                     model_tier=(
                         selected_model_tier.name
@@ -2333,6 +2365,12 @@ def _delegate_coding_task_impl(
                     scope_paths=normalized_scope_paths,
                     backend="codex",
                     worker_run=codex_run,
+                )
+            ):
+                _finish_worker_run(codex_run, failed=True)
+                return tool_error(
+                    _background_startup.cancel_reason
+                    or "background coding worker was cancelled before startup"
                 )
 
             if needs_plan:
@@ -2352,10 +2390,21 @@ def _delegate_coding_task_impl(
                     scope_kind="coding-worker",
                     scope_purpose="Codex coding worker plan pass",
                 ) as session:
-                    plan_turn = session.run_turn(
-                        user_input=_plan_prompt(worker_prompt),
-                        turn_timeout=timeout,
-                    )
+                    interrupt_callback = getattr(session, "request_interrupt", None)
+                    if _background_startup is not None and callable(interrupt_callback):
+                        _background_startup.set_interrupt_callback(interrupt_callback)
+                    try:
+                        plan_turn = session.run_turn(
+                            user_input=_plan_prompt(worker_prompt),
+                            turn_timeout=timeout,
+                        )
+                    finally:
+                        if _background_startup is not None and callable(
+                            interrupt_callback
+                        ):
+                            _background_startup.clear_interrupt_callback(
+                                interrupt_callback
+                            )
                 turns.append(plan_turn)
                 if plan_turn.error or plan_turn.interrupted:
                     duration = round(time.monotonic() - started, 2)
@@ -2418,10 +2467,21 @@ def _delegate_coding_task_impl(
                 scope_kind="coding-worker",
                 scope_purpose="Codex coding worker build pass",
             ) as session:
-                turn = session.run_turn(
-                    user_input=build_prompt,
-                    turn_timeout=timeout,
-                )
+                interrupt_callback = getattr(session, "request_interrupt", None)
+                if _background_startup is not None and callable(interrupt_callback):
+                    _background_startup.set_interrupt_callback(interrupt_callback)
+                try:
+                    turn = session.run_turn(
+                        user_input=build_prompt,
+                        turn_timeout=timeout,
+                    )
+                finally:
+                    if _background_startup is not None and callable(
+                        interrupt_callback
+                    ):
+                        _background_startup.clear_interrupt_callback(
+                            interrupt_callback
+                        )
             turns.append(turn)
             break
     finally:
@@ -2554,6 +2614,41 @@ def _background_result_status(payload: dict[str, Any]) -> str:
     return str(payload.get("status") or "partial")
 
 
+def _clean_git_head_sha(cwd: str) -> str:
+    """Return the current exact Git head only when the workspace is clean."""
+    if not cwd:
+        return ""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        if status.returncode != 0 or str(status.stdout or "").strip():
+            return ""
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return ""
+    sha = str(head.stdout or "").strip().lower()
+    return (
+        sha
+        if head.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha)
+        else ""
+    )
+
+
 def _complete_background_parallel_result(
     payload: dict[str, Any],
     startup: _BackgroundCodingStartup,
@@ -2677,6 +2772,18 @@ def _dispatch_background_coding_task(
                 "error": str(raw_result),
             }
         _complete_background_parallel_result(payload, startup)
+        if origin_work_item_id:
+            evidence_cwd = startup.worker_cwd
+            parallel_merge = payload.get("parallel_merge")
+            if (
+                startup.parallel_group
+                and isinstance(parallel_merge, dict)
+                and parallel_merge.get("merged") is True
+            ):
+                evidence_cwd = str(startup.parallel_group.get("base_cwd") or "")
+            head_sha = _clean_git_head_sha(evidence_cwd)
+            if head_sha:
+                payload["head_sha"] = head_sha
         worker_run = dict(startup.worker_run or {})
         return {
             "status": _background_result_status(payload),
@@ -2699,6 +2806,8 @@ def _dispatch_background_coding_task(
     from tools.async_delegation import (
         discard_async_delegation,
         dispatch_async_delegation,
+        mark_async_delegation_running,
+        terminalize_async_delegation,
     )
 
     origin_work_item_id = str(
@@ -2719,6 +2828,20 @@ def _dispatch_background_coding_task(
         "_origin_work_item_attempt_order",
         None,
     )
+    origin_owner_pid = getattr(
+        parent_agent,
+        "_origin_work_item_owner_pid",
+        None,
+    )
+    try:
+        origin_owner_pid = int(origin_owner_pid or os.getpid())
+    except (TypeError, ValueError, OverflowError):
+        origin_owner_pid = os.getpid()
+    origin_process_epoch = str(
+        getattr(parent_agent, "_origin_work_item_process_epoch", "") or ""
+    ).strip()
+    if not origin_process_epoch and ":" in origin_attempt_id:
+        origin_process_epoch = origin_attempt_id.rsplit(":", 1)[0]
     dispatch = dispatch_async_delegation(
         goal=task_text,
         context=context_text,
@@ -2727,12 +2850,20 @@ def _dispatch_background_coding_task(
         model=str(call_kwargs.get("model_tier") or ""),
         session_key=session_key,
         runner=_runner,
+        interrupt_fn=startup.request_interrupt,
         max_async_children=get_coding_worker_background_max_concurrent(loaded_config),
         kind="coding_worker",
         origin_work_item_id=origin_work_item_id,
         origin_run_generation=origin_run_generation,
         origin_attempt_id=origin_attempt_id,
         origin_attempt_order=origin_attempt_order,
+        origin_owner_pid=origin_owner_pid,
+        origin_process_epoch=origin_process_epoch,
+        origin_scope_paths=(
+            list(call_kwargs.get("scope_paths") or [])
+            if isinstance(call_kwargs.get("scope_paths"), list)
+            else []
+        ),
     )
     if dispatch.get("status") != "dispatched":
         error = str(
@@ -2754,24 +2885,66 @@ def _dispatch_background_coding_task(
     delegation_id = str(dispatch["delegation_id"])
     startup.ready.wait()
     if startup.preflight_result is not None:
-        discard_async_delegation(delegation_id)
+        if origin_work_item_id:
+            try:
+                preflight_payload = json.loads(startup.preflight_result)
+            except (TypeError, ValueError):
+                preflight_payload = {
+                    "success": False,
+                    "status": "preflight_failed",
+                    "summary": "",
+                    "error": str(startup.preflight_result),
+                }
+            terminalize_async_delegation(
+                delegation_id,
+                {
+                    "status": "preflight_failed",
+                    "summary": preflight_payload.get("summary"),
+                    "error": preflight_payload.get("error"),
+                    "result": preflight_payload,
+                    "_async_coding_worker": {
+                        "task": startup.task,
+                        "context_pack": {},
+                        "worker_cwd": startup.worker_cwd,
+                        "model_tier": startup.model_tier,
+                        "scope_paths": list(
+                            call_kwargs.get("scope_paths") or []
+                        ),
+                        "worker_run": {},
+                        "parallel_group": startup.parallel_group,
+                    },
+                },
+                "preflight_failed",
+                enqueue=False,
+            )
+        else:
+            discard_async_delegation(delegation_id)
         startup.release.set()
         return startup.preflight_result
-    if origin_work_item_id:
-        try:
-            from gateway.work_ledger import GatewayWorkLedger
-
-            GatewayWorkLedger().begin_required_async_attempt(
-                origin_work_item_id,
-                attempt_id=origin_attempt_id,
-                attempt_order=origin_attempt_order,
-                generation=origin_run_generation,
-            )
-        except Exception:
-            logger.debug(
-                "Could not initialize required async completion attempt",
-                exc_info=True,
-            )
+    if origin_work_item_id and not mark_async_delegation_running(delegation_id):
+        reason = (
+            "Required background coding-worker startup was rejected by the "
+            "durable work ledger; the worker was not released."
+        )
+        startup.cancel_reason = reason
+        terminalize_async_delegation(
+            delegation_id,
+            {
+                "status": "start_failed",
+                "summary": "",
+                "error": reason,
+                "result": {
+                    "success": False,
+                    "status": "start_failed",
+                    "summary": "",
+                    "error": reason,
+                },
+            },
+            "start_failed",
+            enqueue=False,
+        )
+        startup.release.set()
+        return tool_error(reason)
 
     handle: dict[str, Any] = {
         "success": True,

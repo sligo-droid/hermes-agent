@@ -35,6 +35,327 @@ def _drain_one(timeout=5.0):
     return None
 
 
+class _FakeRequiredLedger:
+    def __init__(self, calls, *, reject_register=False, reject_terminal=False):
+        self.calls = calls
+        self.reject_register = reject_register
+        self.reject_terminal = reject_terminal
+        self.cancelled = set()
+
+    def register_required_async_dispatch(self, work_id, **kwargs):
+        self.calls.append(("register", work_id, kwargs))
+        return None if self.reject_register else {
+            "dispatches": {kwargs["delegation_id"]: {"state": "registered"}}
+        }
+
+    def mark_required_async_dispatch_running(self, work_id, **kwargs):
+        self.calls.append(("running", work_id, kwargs))
+        return {"dispatches": {kwargs["delegation_id"]: {"state": "running"}}}
+
+    def record_required_async_submit_failure(self, work_id, **kwargs):
+        self.calls.append(("submit_failed", work_id, kwargs))
+        return {
+            "dispatches": {
+                kwargs["delegation_id"]: {"state": "terminal", "success": False}
+            }
+        }
+
+    def record_required_async_completion(self, work_id, **kwargs):
+        self.calls.append(("complete", work_id, kwargs))
+        if self.reject_terminal or kwargs["delegation_id"] in self.cancelled:
+            return None
+        return {
+            "dispatches": {
+                kwargs["delegation_id"]: {
+                    "state": "terminal",
+                    "success": kwargs["success"],
+                }
+            }
+        }
+
+    def cancel_required_async_dispatch(self, work_id, **kwargs):
+        self.calls.append(("cancel", work_id, kwargs))
+        self.cancelled.add(kwargs["delegation_id"])
+        return {"dispatches": {kwargs["delegation_id"]: {"state": "cancelled"}}}
+
+
+class _CapturingExecutor:
+    def __init__(self, calls, *, submit_error=None):
+        self.calls = calls
+        self.submit_error = submit_error
+        self.worker = None
+
+    def submit(self, worker):
+        self.calls.append(("submit",))
+        if self.submit_error is not None:
+            raise self.submit_error
+        self.worker = worker
+        return object()
+
+
+def _required_dispatch(ad_module, **overrides):
+    kwargs = {
+        "goal": "required code",
+        "context": None,
+        "toolsets": ["coding_worker"],
+        "role": "coding_worker",
+        "model": "trivial",
+        "session_key": "agent:main:discord:thread:1:2",
+        "runner": lambda: {
+            "status": "completed",
+            "summary": "done",
+            "result": {
+                "success": True,
+                "status": "completed",
+                "summary": "done",
+                "scope_check": {"clean": True, "scope_paths": ["src"]},
+            },
+            "_async_coding_worker": {
+                "task": "required code",
+                "context_pack": {},
+                "worker_cwd": "/tmp/repo",
+                "model_tier": "trivial",
+                "scope_paths": ["src"],
+                "worker_run": {"backend": "codex", "background": True},
+            },
+        },
+        "kind": "coding_worker",
+        "origin_work_item_id": "work-1",
+        "origin_run_generation": 7,
+        "origin_attempt_id": "epoch:7",
+        "origin_attempt_order": 9,
+        "origin_owner_pid": 123,
+        "origin_process_epoch": "epoch",
+        "origin_scope_paths": ["src"],
+    }
+    kwargs.update(overrides)
+    return ad_module.dispatch_async_delegation(**kwargs)
+
+
+def test_atomic_required_registration_precedes_submit_and_running_is_explicit(
+    monkeypatch,
+):
+    calls = []
+    ledger = _FakeRequiredLedger(calls)
+    executor = _CapturingExecutor(calls)
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    result = _required_dispatch(ad)
+
+    assert result["status"] == "dispatched"
+    assert [call[0] for call in calls] == ["register", "submit"]
+    register_kwargs = calls[0][2]
+    assert register_kwargs["delegation_id"] == result["delegation_id"]
+    assert register_kwargs["generation"] == 7
+    assert register_kwargs["attempt_id"] == "epoch:7"
+    assert register_kwargs["attempt_order"] == 9
+    assert register_kwargs["owner_pid"] == 123
+    assert register_kwargs["process_epoch"] == "epoch"
+    assert register_kwargs["scope_paths"] == ["src"]
+
+    assert ad.mark_async_delegation_running(result["delegation_id"]) is True
+    assert calls[-1][0] == "running"
+
+
+def test_required_registration_failure_prevents_submit(monkeypatch):
+    calls = []
+    ledger = _FakeRequiredLedger(calls, reject_register=True)
+    executor = _CapturingExecutor(calls)
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    result = _required_dispatch(ad)
+
+    assert result["status"] == "rejected"
+    assert "register required async dispatch" in result["error"]
+    assert [call[0] for call in calls] == ["register"]
+    assert ad.list_async_delegations() == []
+
+
+def test_required_submit_failure_is_durably_terminalized(monkeypatch):
+    calls = []
+    ledger = _FakeRequiredLedger(calls)
+    executor = _CapturingExecutor(calls, submit_error=RuntimeError("pool closed"))
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    result = _required_dispatch(ad)
+
+    assert result["status"] == "rejected"
+    assert [call[0] for call in calls] == [
+        "register",
+        "submit",
+        "submit_failed",
+    ]
+    failure = calls[-1][2]
+    assert failure["status"] == "submit_failed"
+    assert "pool closed" in failure["error"]
+    assert process_registry.completion_queue.empty()
+
+
+def test_required_terminal_persistence_precedes_volatile_enqueue(monkeypatch):
+    calls = []
+    ledger = _FakeRequiredLedger(calls)
+    executor = _CapturingExecutor(calls)
+
+    class RecordingQueue:
+        def put(self, event):
+            calls.append(("enqueue", event))
+
+        def empty(self):
+            return True
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+    monkeypatch.setattr(process_registry, "completion_queue", RecordingQueue())
+
+    result = _required_dispatch(ad)
+    executor.worker()
+
+    names = [call[0] for call in calls]
+    assert names.index("complete") < names.index("enqueue")
+    completion = next(call for call in calls if call[0] == "complete")[2]
+    assert completion["summary"] == "done"
+    assert completion["evidence"] == {
+        "scope_paths": ["src"],
+        "worker_cwd": "/tmp/repo",
+        "scope_check": {"clean": True, "scope_paths": ["src"]},
+        "worker_run": {"backend": "codex", "background": True},
+    }
+    assert result["delegation_id"] == calls[-1][1]["delegation_id"]
+
+
+def test_queue_failure_does_not_erase_durable_required_result(monkeypatch, caplog):
+    calls = []
+    ledger = _FakeRequiredLedger(calls)
+    executor = _CapturingExecutor(calls)
+
+    class FailingQueue:
+        def put(self, _event):
+            raise RuntimeError("queue unavailable")
+
+        def empty(self):
+            return True
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+    monkeypatch.setattr(process_registry, "completion_queue", FailingQueue())
+
+    result = _required_dispatch(ad)
+    executor.worker()
+
+    assert any(call[0] == "complete" for call in calls)
+    record = next(
+        item for item in ad.list_async_delegations()
+        if item["delegation_id"] == result["delegation_id"]
+    )
+    assert record["required_async_terminal_accepted"] is True
+    assert "failed to enqueue completion event" in caplog.text
+
+
+def test_stale_required_terminal_result_does_not_enqueue_or_repaint(monkeypatch):
+    calls = []
+    ledger = _FakeRequiredLedger(calls, reject_terminal=True)
+    executor = _CapturingExecutor(calls)
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    result = _required_dispatch(ad)
+    executor.worker()
+
+    assert any(call[0] == "complete" for call in calls)
+    assert process_registry.completion_queue.empty()
+    record = next(
+        item for item in ad.list_async_delegations()
+        if item["delegation_id"] == result["delegation_id"]
+    )
+    assert record["completion_success"] is True
+    assert record["required_async_terminal_accepted"] is False
+
+
+def test_advisory_delegation_remains_memory_only(monkeypatch):
+    executor = _CapturingExecutor([])
+    monkeypatch.setattr(
+        ad,
+        "_required_async_ledger",
+        lambda: (_ for _ in ()).throw(AssertionError("ledger must not be used")),
+    )
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    result = ad.dispatch_async_delegation(
+        goal="advice",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="agent:main:discord:thread:1:2",
+        runner=lambda: {"status": "completed", "summary": "done"},
+    )
+    executor.worker()
+
+    assert result["status"] == "dispatched"
+    assert _drain_one() is not None
+
+
+def test_interrupt_session_is_scoped_and_fences_late_success(monkeypatch):
+    calls = []
+    ledger = _FakeRequiredLedger(calls)
+    interrupts = []
+
+    class MultiExecutor:
+        def __init__(self):
+            self.workers = []
+
+        def submit(self, worker):
+            self.workers.append(worker)
+            return object()
+
+    executor = MultiExecutor()
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    first = _required_dispatch(
+        ad,
+        session_key="agent:main:discord:thread:1:first",
+        interrupt_fn=lambda: interrupts.append("first"),
+    )
+    second = _required_dispatch(
+        ad,
+        session_key="agent:main:discord:thread:1:second",
+        origin_work_item_id="work-2",
+        interrupt_fn=lambda: interrupts.append("second"),
+    )
+
+    outcome = ad.interrupt_session(
+        "agent:main:discord:thread:1:first",
+        origin_work_item_id="work-1",
+        attempt_id="epoch:7",
+    )
+
+    assert outcome == {
+        "matched": 1,
+        "durable_cancelled": 1,
+        "interrupted": 1,
+        "failed_ids": [],
+    }
+    assert interrupts == ["first"]
+    cancel = next(call for call in calls if call[0] == "cancel")
+    assert cancel[2]["delegation_id"] == first["delegation_id"]
+
+    executor.workers[0]()
+    assert process_registry.completion_queue.empty()
+    executor.workers[1]()
+    event = _drain_one()
+    assert event["delegation_id"] == second["delegation_id"]
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

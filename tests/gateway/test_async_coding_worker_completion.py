@@ -15,7 +15,13 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
 )
-from gateway.run import GatewayRunner, Platform, _format_gateway_process_notification
+from gateway.run import (
+    GatewayRunner,
+    Platform,
+    _INTERRUPT_REASON_RESET,
+    _INTERRUPT_REASON_STOP,
+    _format_gateway_process_notification,
+)
 from gateway.session import SessionSource, build_session_key
 from gateway.work_ledger import GatewayWorkLedger
 from tools import async_delegation as ad
@@ -187,6 +193,31 @@ def _reaction_work_item(tmp_path):
         generation=7,
     ) is not None
     return ledger, item["id"], session_key
+
+
+def _registered_required_attempt(tmp_path, *, dispatch_ids=("deleg_required",)):
+    ledger, work_item_id, session_key = _reaction_work_item(tmp_path)
+    for delegation_id in dispatch_ids:
+        assert ledger.register_required_async_dispatch(
+            work_item_id,
+            delegation_id=delegation_id,
+            generation=7,
+            attempt_id="boot-a:7",
+            attempt_order=10,
+            owner_pid=123,
+            process_epoch="boot-a",
+            scope_paths=["src"],
+        )
+        assert ledger.mark_required_async_dispatch_running(
+            work_item_id,
+            delegation_id=delegation_id,
+            generation=7,
+            attempt_id="boot-a:7",
+            attempt_order=10,
+            owner_pid=123,
+            process_epoch="boot-a",
+        )
+    return ledger, work_item_id, session_key
 
 
 class _OverlappingWorkLedger:
@@ -367,7 +398,7 @@ async def test_completion_turn_targets_original_discord_thread_and_carries_worke
 
 
 @pytest.mark.asyncio
-async def test_visible_completion_uses_exact_origin_with_overlapping_work_items():
+async def test_required_completion_never_invokes_a_model_turn():
     runner = object.__new__(GatewayRunner)
     adapter = SimpleNamespace(handle_message=AsyncMock())
     ledger = _OverlappingWorkLedger()
@@ -381,11 +412,9 @@ async def test_visible_completion_uses_exact_origin_with_overlapping_work_items(
         event,
     )
 
-    synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.work_item_id == "work-a"
-    assert synth_event.feature_summary == {"initial_request": "Original work A"}
-    assert synth_event.channel_prompt == "Original work instructions"
-    assert synth_event.feature_summary != ledger.items["work-b"]["feature_summary"]
+    adapter.handle_message.assert_not_awaited()
+    assert ledger.required_completion_records[0][0] == "work-a"
+    assert ledger.mutation_attempts == []
 
 
 @pytest.mark.asyncio
@@ -534,131 +563,138 @@ async def test_discord_reaction_gate_keeps_dispatch_pending_until_completion_tur
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "completion_order",
-    [
-        ("required_failure", "advisory_success"),
-        ("advisory_success", "required_failure"),
-    ],
-)
-async def test_required_worker_failure_cannot_be_overwritten_by_advisory_success(
-    completion_order,
-    tmp_path,
-):
-    """A successful review turn is not authoritative for required coding work."""
-    ledger, work_item_id, session_key = _reaction_work_item(tmp_path)
-    runner = object.__new__(GatewayRunner)
-    original_start = AsyncMock()
-    original_complete = AsyncMock()
-    adapter = SimpleNamespace(
-        platform=Platform.DISCORD,
-        handle_message=AsyncMock(),
-        on_processing_start=original_start,
-        on_processing_complete=original_complete,
+async def test_required_failure_reconciles_to_terminal_delivery_without_model(tmp_path):
+    ledger, work_item_id, _session_key = _registered_required_attempt(tmp_path)
+    ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="deleg_required",
+        success=False,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        status="error",
+        error="worker tests failed",
     )
-    runner._adapter_for_source = lambda source: adapter
+    state = ledger.seal_required_async_attempt(
+        work_item_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    )
+    assert state and state["ready_to_reconcile"]
+
+    runner = object.__new__(GatewayRunner)
     runner._ledger = lambda: ledger
-    runner._session_key_for_source = lambda source: session_key
-    runner._install_background_worker_reaction_gate(adapter)
+    runner._resume_finished_discord_work_item = AsyncMock()
+    runner._activate_required_async_closeout = MagicMock(
+        side_effect=AssertionError("failure must not activate closeout")
+    )
 
-    events = {
-        "required_failure": _coding_event(
-            delegation_id="deleg_required",
-            origin_work_item_id=work_item_id,
-            origin_run_generation=7,
-            status="error",
-            result={
-                "success": False,
-                "status": "error",
-                "error": "worker tests failed",
-            },
-        ),
-        "advisory_success": _advisory_event(
-            origin_work_item_id=work_item_id,
-            origin_run_generation=7,
-        ),
-    }
+    await runner._reconcile_required_async_item(work_item_id, state)
 
-    for name in completion_order:
-        event = await _injected_completion_event(runner, adapter, events[name])
-        # The synthetic agent can successfully explain a failed worker. The
-        # durable worker outcome must still control the work-item reaction.
-        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
-
-    outcomes = [call.args[1] for call in original_complete.await_args_list]
-    assert outcomes
-    assert ProcessingOutcome.SUCCESS not in outcomes
-    assert outcomes[-1] == ProcessingOutcome.FAILURE
-    original_start.assert_not_awaited()
     stored = ledger.get(work_item_id)
-    assert stored["completion_gate"]["reason"] == "required_async_completion_failed"
-    assert stored["completion_gate"]["allowed_to_complete"] is False
-    assert stored["summary_status"] == "Failed"
+    assert stored["status"] == "blocked"
+    assert stored["terminal_delivery"]["source"] == "required_async_completion"
+    assert stored["required_async_completions"]["reconciled_at"] is not None
+    runner._resume_finished_discord_work_item.assert_awaited_once()
+    runner._activate_required_async_closeout.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_reaction_becomes_success_only_after_required_worker_closeout(tmp_path):
-    ledger, work_item_id, session_key = _reaction_work_item(tmp_path)
-    runner = object.__new__(GatewayRunner)
-    original_start = AsyncMock()
-    original_complete = AsyncMock()
-    adapter = SimpleNamespace(
-        platform=Platform.DISCORD,
-        handle_message=AsyncMock(),
-        on_processing_start=original_start,
-        on_processing_complete=original_complete,
-    )
-    runner._adapter_for_source = lambda source: adapter
-    runner._ledger = lambda: ledger
-    runner._session_key_for_source = lambda source: session_key
-    runner._install_background_worker_reaction_gate(adapter)
-
-    advisory = await _injected_completion_event(
-        runner,
-        adapter,
-        _advisory_event(
-            origin_work_item_id=work_item_id,
-            origin_run_generation=7,
-        ),
-    )
-    await adapter.on_processing_complete(advisory, ProcessingOutcome.SUCCESS)
-    original_start.assert_not_awaited()
-    original_complete.assert_not_awaited()
-
-    required = await _injected_completion_event(
-        runner,
-        adapter,
-        _coding_event(
-            delegation_id="deleg_required",
-            origin_work_item_id=work_item_id,
-            origin_run_generation=7,
-        ),
-    )
-    await adapter.on_processing_complete(required, ProcessingOutcome.SUCCESS)
-    original_start.assert_awaited_once_with(required)
-    original_complete.assert_not_awaited()
-
-    # The successful worker result is necessary but not sufficient. Only the
-    # authoritative work-item closeout can move the reaction to success.
-    expected_run_state = ledger.run_state_snapshot(ledger.get(work_item_id))
-    assert ledger.mark_agent_done(
+async def test_stale_required_attempt_never_invokes_closeout_or_model(tmp_path):
+    ledger, work_item_id, _session_key = _registered_required_attempt(tmp_path)
+    old = ledger.required_async_completion_state(work_item_id)
+    assert ledger.begin_required_async_attempt(
         work_item_id,
-        final_response="Implemented and verified the parser fix.",
-        session_id="session-1",
-        summary_status="Complete",
-        expected_run_state=expected_run_state,
+        attempt_id="boot-b:8",
+        attempt_order=11,
+        generation=8,
     )
-    assert ledger.mark_summary_updated(work_item_id)
-    assert ledger.mark_completed(work_item_id)
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._activate_required_async_closeout = MagicMock()
+    runner._resume_finished_discord_work_item = AsyncMock()
+
+    await runner._reconcile_required_async_item(work_item_id, old)
+
+    runner._activate_required_async_closeout.assert_not_called()
+    runner._resume_finished_discord_work_item.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_required_attempt_advances_work_item_exactly_once(tmp_path):
+    ledger, work_item_id, _session_key = _registered_required_attempt(tmp_path)
+    ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="deleg_required",
+        success=True,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        status="completed",
+        summary="Implemented and verified the parser fix.",
+    )
+    state = ledger.seal_required_async_attempt(
+        work_item_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._activate_required_async_closeout = MagicMock(
+        return_value=(False, "work_item")
+    )
+    runner._resume_finished_discord_work_item = AsyncMock()
+
+    await runner._reconcile_required_async_item(work_item_id, state)
+    await runner._reconcile_required_async_item(work_item_id, state)
+
     stored = ledger.get(work_item_id)
-    assert stored["status"] == "completed"
-    assert stored["completion_gate"]["allowed_to_complete"] is True
+    required = ledger.required_async_completion_state(work_item_id)
+    assert stored["status"] == "agent_done"
+    assert "Implemented and verified" in stored["final_response"]
+    assert required["reconciled_at"] is not None
+    assert required["owns_recovery"] is False
+    runner._resume_finished_discord_work_item.assert_awaited_once()
 
-    await adapter.on_processing_complete(required, ProcessingOutcome.SUCCESS)
 
-    original_complete.assert_awaited_once_with(
-        required,
-        ProcessingOutcome.SUCCESS,
+def test_successful_required_evidence_hands_off_to_existing_closeout(tmp_path):
+    ledger, work_item_id, _session_key = _registered_required_attempt(tmp_path)
+    ledger.attach_closeout_workspace(
+        work_item_id,
+        workspace_path=str(tmp_path),
+        source="direct",
+        mode="enforce",
+        policy={"require_local_verification": True},
+    )
+    item = ledger.get(work_item_id)
+    state = ledger.required_async_completion_state(work_item_id)
+    dispatch = state["dispatches"]["deleg_required"]
+    dispatch["completed_at"] = 1
+    dispatch["evidence"] = {
+        "head_sha": "a" * 40,
+        "scope_check": {"clean": True},
+    }
+    state["dispatches"]["deleg_required"] = dispatch
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._activate_closeout_at_verified_head = MagicMock(
+        return_value={"status": "pending"}
+    )
+
+    activated, route = runner._activate_required_async_closeout(
+        work_item_id,
+        item,
+        state,
+    )
+
+    assert (activated, route) == (True, "closeout")
+    runner._activate_closeout_at_verified_head.assert_called_once_with(
+        work_item_id,
+        repository_root=str(tmp_path),
+        verified_head_sha="a" * 40,
+        visual_result={},
     )
 
 
@@ -678,7 +714,7 @@ async def test_completed_work_item_with_failed_summary_stays_failed(tmp_path):
     runner._install_background_worker_reaction_gate(adapter)
 
     required = MessageEvent(
-        text="completion",
+        text="original parent turn",
         source=SessionSource(
             platform=Platform.DISCORD,
             chat_id="111",
@@ -686,11 +722,6 @@ async def test_completed_work_item_with_failed_summary_stays_failed(tmp_path):
             thread_id="222",
         ),
         work_item_id=work_item_id,
-        background_completion_id="deleg_required",
-        background_completion_kind="coding_worker",
-        background_completion_success=True,
-        background_completion_generation=7,
-        background_completion_attempt_id="boot-a:7",
     )
     ledger.record_required_async_completion(
         work_item_id,
@@ -915,9 +946,9 @@ async def test_feature_summary_stays_running_while_background_worker_is_pending(
 
 
 @pytest.mark.asyncio
-async def test_suppressed_completion_missing_origin_cannot_mutate_later_work_item():
+async def test_suppressed_required_completion_is_ledger_only():
     runner = object.__new__(GatewayRunner)
-    ledger = _OverlappingWorkLedger(include_origin=False)
+    ledger = _OverlappingWorkLedger()
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner._adapter_for_source = lambda source: adapter
     runner._ledger = lambda: ledger
@@ -926,11 +957,8 @@ async def test_suppressed_completion_missing_origin_cannot_mutate_later_work_ite
 
     await runner._finalize_suppressed_async_completion(event)
 
-    completion_event = adapter.handle_message.await_args.args[0]
-    assert completion_event.suppress_user_output is True
-    assert completion_event.work_item_id == "work-a"
-    assert completion_event.feature_summary is None
-    assert completion_event.channel_prompt is None
+    adapter.handle_message.assert_not_awaited()
+    assert ledger.required_completion_records[0][0] == "work-a"
     assert ledger.items["work-b"]["status"] == "agent_running"
     assert ledger.mutation_attempts == []
 
@@ -960,75 +988,223 @@ async def test_missing_origin_completion_cannot_claim_ambiguous_later_work_item(
 
 
 @pytest.mark.asyncio
+async def test_two_required_workers_reconcile_only_after_seal_and_all_terminal(tmp_path):
+    ledger, work_item_id, _session_key = _registered_required_attempt(
+        tmp_path,
+        dispatch_ids=("worker-a", "worker-b"),
+    )
+    ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="worker-a",
+        success=True,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        status="completed",
+        summary="A done",
+    )
+    sealed = ledger.seal_required_async_attempt(
+        work_item_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    )
+    assert sealed["sealed"] is True
+    assert sealed["all_terminal"] is False
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._ledger = lambda: ledger
+    runner._background_tasks = set()
+    runner._required_async_item_tasks = {}
+    runner._reconcile_required_async_item = AsyncMock()
+    assert runner._scan_required_async_reconciliation() == 0
+
+    ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="worker-b",
+        success=True,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        status="completed",
+        summary="B done",
+    )
+    assert runner._scan_required_async_reconciliation() == 1
+    await asyncio.gather(*list(runner._background_tasks))
+    runner._reconcile_required_async_item.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_periodic_scan_repairs_lost_required_completion_wakeup(tmp_path):
+    ledger, work_item_id, _session_key = _registered_required_attempt(tmp_path)
+    ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="deleg_required",
+        success=False,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        status="error",
+        error="lost queue event",
+    )
+    ledger.seal_required_async_attempt(
+        work_item_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._ledger = lambda: ledger
+    runner._background_tasks = set()
+    runner._required_async_item_tasks = {}
+    runner._resume_finished_discord_work_item = AsyncMock()
+
+    assert runner._scan_required_async_reconciliation() == 1
+    await asyncio.gather(*list(runner._background_tasks))
+
+    stored = ledger.get(work_item_id)
+    assert stored["status"] == "blocked"
+    runner._resume_finished_discord_work_item.assert_awaited_once()
+
+
+def test_required_recovery_suppresses_original_discord_replay(tmp_path):
+    ledger, _work_item_id, _session_key = _registered_required_attempt(tmp_path)
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._background_tasks = set()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner._adapter_for_source = lambda source: adapter
+
+    assert runner._schedule_incomplete_discord_work_items() == 0
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_required_recovery_suppresses_resume_pending_session(tmp_path):
+    ledger, _work_item_id, session_key = _registered_required_attempt(tmp_path)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="111",
+        chat_type="thread",
+        thread_id="222",
+    )
+    entry = SimpleNamespace(
+        session_key=session_key,
+        resume_pending=True,
+        suspended=False,
+        origin=source,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=None,
+        updated_at=None,
+    )
+    store = SimpleNamespace(
+        _lock=threading.Lock(),
+        _entries={session_key: entry},
+        _ensure_loaded_locked=lambda: None,
+        clear_resume_pending=MagicMock(),
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner.session_store = store
+    runner._adapter_for_source = lambda source: SimpleNamespace(handle_message=AsyncMock())
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    store.clear_resume_pending.assert_called_once_with(session_key)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("mode", "expected_suppression"),
-    [("off", True), ("error", True), ("result", False), ("all", False)],
+    ("reason", "expected_calls"),
+    [
+        (_INTERRUPT_REASON_RESET, 0),
+        (_INTERRUPT_REASON_STOP, 1),
+    ],
 )
-async def test_notification_mode_changes_visibility_not_internal_closeout(
-    mode,
-    expected_suppression,
-):
+async def test_session_boundary_only_stop_cancels_required_work(reason, expected_calls):
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._invalidate_session_run_generation = MagicMock()
+    runner._adapter_for_source = lambda source: None
+    runner._release_running_agent_state = MagicMock()
+    runner._stop_required_async_for_session = MagicMock()
+    source = SessionSource(platform=Platform.DISCORD, chat_id="111", chat_type="dm")
+
+    await runner._interrupt_and_clear_session(
+        "session-key",
+        source,
+        interrupt_reason=reason,
+        invalidation_reason="test",
+    )
+
+    assert runner._stop_required_async_for_session.call_count == expected_calls
+
+
+def test_stop_seals_required_attempt_before_scoped_interrupt(tmp_path, monkeypatch):
+    ledger, work_item_id, session_key = _registered_required_attempt(tmp_path)
+    calls = []
+
+    def interrupt_session(session, **kwargs):
+        calls.append((session, kwargs))
+        return {"matched": 1, "durable_cancelled": 1, "interrupted": 1}
+
+    monkeypatch.setattr("tools.async_delegation.interrupt_session", interrupt_session)
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._background_tasks = set()
+
+    assert runner._stop_required_async_for_session(session_key) == 1
+
+    state = ledger.required_async_completion_state(work_item_id)
+    assert state["sealed"] is True
+    assert calls == [
+        (
+            session_key,
+            {
+                "kind": "coding_worker",
+                "origin_work_item_id": work_item_id,
+                "attempt_id": "boot-a:7",
+                "reason": "session_stop",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_notification_mode_off_still_wakes_required_reconciliation(tmp_path):
     _reset_async_state()
+    ledger, work_item_id, _session_key = _registered_required_attempt(tmp_path)
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner._async_completion_seen = set()
-    runner._load_background_notifications_mode = lambda: mode
-    runner._build_process_event_source = lambda event: SimpleNamespace(
-        platform=Platform.DISCORD,
-        chat_id="111",
-        thread_id="222",
-    )
-    ledger = SimpleNamespace(
-        record_required_async_completion=MagicMock(
-            return_value={
-                "generation": 7,
-                "outcomes": {"deleg_worker1": {"success": True}},
-                "failed": False,
-                "succeeded": 1,
-            }
-        ),
-    )
+    runner._required_async_reconcile_event = asyncio.Event()
+    runner._load_background_notifications_mode = lambda: "off"
     runner._ledger = lambda: ledger
-
-    async def stop_after_internal_injection(event):
-        runner._running = False
-
-    adapter = SimpleNamespace(
-        handle_message=AsyncMock(side_effect=stop_after_internal_injection),
-    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
     runner._adapter_for_source = lambda source: adapter
-    runner._hydrate_discord_continuation_event_from_work_item = (
-        lambda *args, **kwargs: None
-    )
     process_registry.completion_queue.put(
         _coding_event(
-            origin_work_item_id="work-1",
+            delegation_id="deleg_required",
+            origin_work_item_id=work_item_id,
             origin_run_generation=7,
         )
     )
 
+    async def stop_after_tick():
+        while not runner._required_async_reconcile_event.is_set():
+            await asyncio.sleep(0)
+        runner._running = False
+
+    stopper = asyncio.create_task(stop_after_tick())
+
     try:
         await runner._async_delegation_watcher(interval=0)
     finally:
+        await stopper
         _reset_async_state()
 
-    adapter.handle_message.assert_awaited_once()
-    completion_event = adapter.handle_message.await_args.args[0]
-    assert completion_event.internal is True
-    assert completion_event.suppress_user_output is expected_suppression
-    assert completion_event.participates_in_work_lifecycle is True
-    assert completion_event.background_completion_kind == "coding_worker"
-    assert completion_event.background_completion_success is True
-    assert completion_event.background_completion_generation == 7
-    assert completion_event.work_item_id == "work-1"
-    ledger.record_required_async_completion.assert_called_once()
-    record_args, record_kwargs = ledger.record_required_async_completion.call_args
-    assert record_args == ("work-1",)
-    assert record_kwargs["delegation_id"] == "deleg_worker1"
-    assert record_kwargs["success"] is True
-    assert record_kwargs["generation"] == 7
-    assert record_kwargs["attempt_id"] == "boot-a:7"
-    assert record_kwargs["attempt_order"] == 10
-    assert record_kwargs["status"] == "completed"
-    assert record_kwargs["completed_at"] is None
-    assert record_kwargs["closeout_id"] in {None, ""}
+    state = ledger.required_async_completion_state(work_item_id)
+    assert state["dispatches"]["deleg_required"]["state"] == "terminal"
+    assert runner._required_async_reconcile_event.is_set()
+    adapter.handle_message.assert_not_awaited()
