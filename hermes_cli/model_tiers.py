@@ -258,7 +258,7 @@ def restrict_reasoning_effort_for_task(
     effort = _normalized_name(reasoning_effort)
     resolved_purpose = _normalized_name(purpose) or classify_task_purpose(task, context)
     if resolved_purpose != "review" and effort in _REVIEW_ONLY_REASONING_EFFORTS:
-        return "medium"
+        return "high"
     return effort
 
 
@@ -271,7 +271,7 @@ def restrict_model_tier_for_task(
     worker: bool = False,
     purpose: str | None = None,
 ) -> ModelTier | None:
-    """Downgrade review-only tiers when a route can implement changes."""
+    """Preserve the selected tier while capping implementation reasoning."""
 
     if tier is None:
         return None
@@ -281,24 +281,16 @@ def restrict_model_tier_for_task(
         or tier.reasoning_effort not in _REVIEW_ONLY_REASONING_EFFORTS
     ):
         return tier
-    fallback_name = "thorough" if worker else "intermediate"
-    fallback = (
-        resolve_worker_tier(config, fallback_name)
-        if worker
-        else resolve_model_tier(config, fallback_name)
-    )
-    if fallback is None:
-        fallback = tier
     safe_effort = restrict_reasoning_effort_for_task(
-        fallback.reasoning_effort,
+        tier.reasoning_effort,
         task,
         context,
         purpose=resolved_purpose,
     )
     return ModelTier(
-        name=fallback.name,
-        model=fallback.model,
-        opencode_model=fallback.opencode_model,
+        name=tier.name,
+        model=tier.model,
+        opencode_model=tier.opencode_model,
         reasoning_effort=safe_effort,
     )
 

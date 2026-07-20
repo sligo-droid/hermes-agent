@@ -197,7 +197,7 @@ def _role_runtime_settings(
             reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
             reasoning_source = "default"
     if role != "reviewer" and reasoning in {"xhigh", "max"}:
-        reasoning = "medium"
+        reasoning = "high"
         reasoning_source = "review_only_cap"
 
     raw_tier = _config_value_with_auto_env(

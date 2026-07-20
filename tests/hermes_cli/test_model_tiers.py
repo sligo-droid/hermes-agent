@@ -128,14 +128,14 @@ def test_xhigh_and_max_reasoning_are_review_only():
     assert classify_task_purpose("Analyze the request") == "implementation"
 
     advanced = resolve_model_tier({}, "advanced")
-    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").name == "intermediate"
-    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").reasoning_effort == "medium"
+    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").name == "advanced"
+    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").reasoning_effort == "high"
     assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").name == "advanced"
-    assert restrict_reasoning_effort_for_task("max", "Apply the patch") == "medium"
+    assert restrict_reasoning_effort_for_task("max", "Apply the patch") == "high"
     assert restrict_reasoning_effort_for_task("xhigh", "Diagnose the incident") == "xhigh"
 
 
-def test_implementation_fallback_caps_custom_intermediate_xhigh_override():
+def test_implementation_cap_preserves_custom_advanced_model():
     config = {
         "model_tiers": {
             "advanced": {"model": "custom/advanced", "reasoning_effort": "xhigh"},
@@ -149,9 +149,9 @@ def test_implementation_fallback_caps_custom_intermediate_xhigh_override():
         "Build the feature",
     )
 
-    assert restricted.name == "intermediate"
-    assert restricted.model == "custom/intermediate"
-    assert restricted.reasoning_effort == "medium"
+    assert restricted.name == "advanced"
+    assert restricted.model == "custom/advanced"
+    assert restricted.reasoning_effort == "high"
 
 
 def test_default_worker_tiers_resolve_to_expected_model_and_effort():
@@ -239,6 +239,6 @@ def test_standalone_coding_worker_uses_its_named_tier():
     resolved = load_opencode_config(config)
 
     assert resolved["model"] == "custom/feature-worker"
-    assert resolved["simple_build_reasoning_level"] == "medium"
-    assert resolved["complex_plan_reasoning_level"] == "medium"
-    assert resolved["complex_build_reasoning_level"] == "medium"
+    assert resolved["simple_build_reasoning_level"] == "high"
+    assert resolved["complex_plan_reasoning_level"] == "high"
+    assert resolved["complex_build_reasoning_level"] == "high"

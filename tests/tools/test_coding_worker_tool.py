@@ -2642,7 +2642,7 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="medium"',
+        'model_reasoning_effort="high"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
@@ -2794,18 +2794,18 @@ def test_worker_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_pat
     assert result["success"] is True
     assert seen["worker_config"] == {
         "model_tier": "disabled",
-        "simple_build_reasoning_level": "medium",
-        "complex_plan_reasoning_level": "medium",
-        "complex_build_reasoning_level": "medium",
+        "simple_build_reasoning_level": "high",
+        "complex_plan_reasoning_level": "high",
+        "complex_build_reasoning_level": "high",
         "opencode": {"model": "hermes-codex/gpt-5.6-sol"},
     }
     resolved = ow.load_opencode_config(cfg, worker_config=seen["worker_config"])
     assert resolved["simple_build_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_plan_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_build_model"] == "hermes-codex/gpt-5.6-sol"
-    assert resolved["simple_build_reasoning_level"] == "medium"
-    assert resolved["complex_plan_reasoning_level"] == "medium"
-    assert resolved["complex_build_reasoning_level"] == "medium"
+    assert resolved["simple_build_reasoning_level"] == "high"
+    assert resolved["complex_plan_reasoning_level"] == "high"
+    assert resolved["complex_build_reasoning_level"] == "high"
 
 
 def test_review_task_keeps_deep_worker_reasoning(monkeypatch, tmp_path):
