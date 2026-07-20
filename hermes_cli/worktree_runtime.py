@@ -593,14 +593,24 @@ def maybe_cleanup_terminal_action_worktrees(
     cleanup = worktrees.get("cleanup") if isinstance(worktrees.get("cleanup"), dict) else {}
     if cleanup.get("enabled", True) is False:
         return {"skipped": "disabled"}
+    action_retention = cleanup.get("action_retention_minutes")
     try:
-        retention_days = max(1.0, float(cleanup.get("retention_days", 7)))
+        retention_days = (
+            max(1.0, float(action_retention)) / (24 * 60)
+            if action_retention is not None
+            else max(1.0, float(cleanup.get("retention_days", 7)))
+        )
     except (TypeError, ValueError):
-        retention_days = 7.0
+        retention_days = 15.0 / (24 * 60)
+    action_interval = cleanup.get("action_min_interval_minutes")
     try:
-        min_interval_hours = max(1.0, float(cleanup.get("min_interval_hours", 24)))
+        min_interval_seconds = (
+            max(1.0, float(action_interval)) * 60
+            if action_interval is not None
+            else max(1.0, float(cleanup.get("min_interval_hours", 24))) * 3600
+        )
     except (TypeError, ValueError):
-        min_interval_hours = 24.0
+        min_interval_seconds = 5 * 60
     try:
         max_per_run = max(1, int(cleanup.get("max_per_run", 25)))
     except (TypeError, ValueError):
@@ -612,7 +622,7 @@ def maybe_cleanup_terminal_action_worktrees(
     now = time.time()
     try:
         prior = json.loads(marker.read_text(encoding="utf-8"))
-        if now - float(prior.get("completed_at") or 0) < min_interval_hours * 3600:
+        if now - float(prior.get("completed_at") or 0) < min_interval_seconds:
             return {"skipped": "interval"}
     except Exception:
         pass
@@ -650,6 +660,26 @@ def maybe_cleanup_terminal_action_worktrees(
     except Exception:
         pass
     return result
+
+
+def terminal_action_cleanup_interval_seconds(
+    config: Optional[dict[str, Any]],
+) -> float:
+    """Return the bounded gateway janitor cadence for action worktrees."""
+
+    cfg = _config(config)
+    worktrees = cfg.get("worktrees") if isinstance(cfg.get("worktrees"), dict) else {}
+    cleanup = worktrees.get("cleanup") if isinstance(worktrees.get("cleanup"), dict) else {}
+    raw = cleanup.get("action_min_interval_minutes")
+    if raw is None:
+        try:
+            return max(60.0, float(cleanup.get("min_interval_hours", 24)) * 3600)
+        except (TypeError, ValueError):
+            return 24 * 3600.0
+    try:
+        return max(60.0, min(24 * 3600.0, float(raw) * 60))
+    except (TypeError, ValueError):
+        return 5 * 60.0
 
 
 def dedupe_python_venvs(

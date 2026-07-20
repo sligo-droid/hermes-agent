@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
+from agent.worker_runs import TURN_WORKER_RUNS_LOCK as _TURN_WORKER_RUNS_LOCK
 from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS, resolve_model_tier
 from hermes_constants import VALID_REASONING_EFFORTS, normalize_reasoning_effort
 from tools.parallel_worker_worktrees import (
@@ -40,7 +41,6 @@ _PARALLEL_MERGE_LOCKS_GUARD = threading.Lock()
 _BACKGROUND_PARALLEL_WORKERS: set[str] = set()
 _BACKGROUND_PARALLEL_RESULTS: dict[str, dict[str, Any]] = {}
 _BACKGROUND_PARALLEL_WORKERS_GUARD = threading.Lock()
-_TURN_WORKER_RUNS_LOCK = threading.Lock()
 _WORKER_OBSERVER_CONTEXTS: dict[int, dict[str, Any]] = {}
 _CODING_WORKER_FALLBACK_ENV_KEYS = frozenset({
     "ALL_PROXY",
@@ -428,6 +428,9 @@ def _start_worker_run(
         }
     try:
         with _TURN_WORKER_RUNS_LOCK:
+            # Inline the shared helper's tiny operation while holding the same
+            # exported lock so observer context and footer attribution remain
+            # one atomic registration.
             runs = getattr(parent_agent, "turn_worker_runs", None)
             if not isinstance(runs, list):
                 runs = []

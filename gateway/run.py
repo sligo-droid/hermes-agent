@@ -7732,6 +7732,11 @@ class GatewayRunner:
                 self._trusted_closeout_watcher,
                 restart_on_exit=True,
             )
+        self._start_owned_runner(
+            "action-worktree-cleanup",
+            self._action_worktree_cleanup_watcher,
+            restart_on_exit=True,
+        )
         self._schedule_incomplete_discord_work_items()
 
         # Automatically continue only genuinely interrupted model work. The
@@ -7797,6 +7802,45 @@ class GatewayRunner:
         logger.info("Press Ctrl+C to stop")
 
         return True
+
+    async def _action_worktree_cleanup_watcher(self) -> None:
+        """Periodically reclaim old terminal Discord action worktrees."""
+
+        from hermes_cli.worktree_runtime import (
+            maybe_cleanup_terminal_action_worktrees,
+            terminal_action_cleanup_interval_seconds,
+        )
+
+        while self._running:
+            config = _load_gateway_runtime_config()
+            interval = terminal_action_cleanup_interval_seconds(config)
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                pass
+            try:
+                result = await asyncio.to_thread(
+                    maybe_cleanup_terminal_action_worktrees,
+                    self.work_ledger,
+                    config,
+                    _DISCORD_ACTION_WORKTREE_ROOT,
+                )
+            except Exception:
+                logger.debug("Periodic action worktree cleanup failed", exc_info=True)
+                continue
+            removed = result.get("removed") if isinstance(result, dict) else None
+            errors = result.get("errors") if isinstance(result, dict) else None
+            if removed:
+                logger.info(
+                    "Periodic action worktree cleanup removed %d worktree(s)",
+                    len(removed),
+                )
+            if errors:
+                logger.warning(
+                    "Periodic action worktree cleanup encountered %d error(s)",
+                    len(errors),
+                )
 
     async def _on_trusted_closeout_terminal(self, item: Dict[str, Any]) -> None:
         """Deliver deterministic terminal closeout state through existing paths."""
@@ -16156,6 +16200,33 @@ class GatewayRunner:
                         str(work_item_id),
                         agent_result,
                     )
+                    current_item = self._ledger().get(str(work_item_id)) or {}
+                    if current_item.get("closeout_authoritative") is not True:
+                        try:
+                            from gateway.direct_closeout_observer import (
+                                observe_merged_direct_closeout,
+                            )
+
+                            observed_closeout = await asyncio.to_thread(
+                                observe_merged_direct_closeout,
+                                current_item,
+                                response,
+                            )
+                            if observed_closeout is not None:
+                                await asyncio.to_thread(
+                                    self._ledger().adopt_observed_direct_closeout,
+                                    str(work_item_id),
+                                    observed_closeout,
+                                    expected_run_state={
+                                        "status": current_item.get("status"),
+                                        "active_run": current_item.get("active_run"),
+                                    },
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Direct closeout observation failed",
+                                exc_info=True,
+                            )
                     title = None
                     if session_entry.session_id and self._session_db and not getattr(event, "feature_summary", None):
                         try:

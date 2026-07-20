@@ -151,6 +151,48 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_writable_default_is_explicit(self):
+        prompt = _build_child_system_prompt("Prepare the fixture")
+        self.assertIn("Workspace Mutation Capability", prompt)
+        self.assertIn("not read-only", prompt)
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={"max_spawn_depth": 1})
+    def test_child_gets_prepared_context_not_parent_session(self, mock_cfg, mock_creds):
+        mock_creds.return_value = {
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": None,
+        }
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+        parent.session_id = "parent-session"
+        parent.messages = [{"role": "user", "content": "private parent transcript"}]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                0,
+                "Inspect the fixture",
+                "Use /tmp/project and preserve setup.json",
+                ["terminal", "file"],
+                None,
+                5,
+                1,
+                parent,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        prompt = kwargs["ephemeral_system_prompt"]
+        self.assertIn("Inspect the fixture", prompt)
+        self.assertIn("Use /tmp/project and preserve setup.json", prompt)
+        self.assertNotIn("private parent transcript", prompt)
+        self.assertTrue(kwargs["skip_context_files"])
+        self.assertTrue(kwargs["skip_memory"])
+        self.assertEqual(kwargs["parent_session_id"], "parent-session")
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
@@ -1097,6 +1139,43 @@ class TestSubagentCostRollup(unittest.TestCase):
         # Rollup must strip the internal field before serialising to the model.
         self.assertNotIn("_child_cost_usd", result["results"][0])
         self.assertNotIn("_child_role", result["results"][0])
+
+    def test_single_child_records_model_and_reasoning_for_footer(self):
+        parent = self._make_parent_with_cost_counters()
+        parent.turn_worker_runs = []
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-terra"
+            mock_child.reasoning_config = {"effort": "xhigh"}
+            mock_child.session_prompt_tokens = 100
+            mock_child.session_completion_tokens = 20
+            mock_child.session_reasoning_tokens = 5
+            mock_child.session_estimated_cost_usd = 0.0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="inspect setup", parent_agent=parent))
+
+        self.assertEqual(
+            parent.turn_worker_runs,
+            [
+                {
+                    "backend": "delegate",
+                    "model": "gpt-5.6-terra",
+                    "reasoning": "xhigh",
+                    "model_tier": "intermediate",
+                    "failed": False,
+                }
+            ],
+        )
+        self.assertNotIn("_worker_run", result["results"][0])
 
     def test_batch_children_costs_sum_into_parent(self):
         parent = self._make_parent_with_cost_counters(starting_cost=0.00)

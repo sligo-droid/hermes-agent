@@ -215,6 +215,27 @@ def test_format_footer_renders_workers_and_collapses_consecutive_duplicates():
     )
 
 
+def test_format_footer_includes_general_delegate_model_and_reasoning():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        worker_runs=[
+            {"backend": "delegate", "model": "gpt-5.6-sol", "reasoning": "high"},
+            {"backend": "delegate", "model": "gpt-5.6-terra", "reasoning": "xhigh"},
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "medium"},
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "medium"},
+        ],
+        fields=("workers",),
+    )
+
+    assert out == (
+        "workers: delegate gpt-5.6-sol/high, delegate gpt-5.6-terra/xhigh, "
+        "codex gpt-5.6-luna/medium x2"
+    )
+
+
 def test_format_footer_worker_omits_unknown_reasoning():
     out = format_runtime_footer(
         model="",

@@ -2030,6 +2030,11 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "retention_days": 7,
             "min_interval_hours": 24,
+            # Completed Discord action worktrees are short-lived execution
+            # artifacts. Reclaim them promptly in the running gateway while
+            # preserving the broader seven-day manual cleanup policy.
+            "action_retention_minutes": 15,
+            "action_min_interval_minutes": 5,
             "max_per_run": 25,
         },
     },

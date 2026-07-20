@@ -41,6 +41,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from agent.worker_runs import append_turn_worker_run
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -949,6 +950,14 @@ def _build_child_system_prompt(
             "orchestrator owns the authorized cwd, work-item/session identity, "
             "worker accounting, visual/closeout state, isolation, merge-back, and "
             "the deterministic result. Coding workers are leaves."
+        )
+    else:
+        parts.append(
+            "\n## Workspace Mutation Capability\n"
+            "This delegation is not read-only. You may use the provided terminal "
+            "and file tools for bounded exploration, setup, and in-scope changes. "
+            "Preserve unrelated work, report every modified path, and return "
+            "verifiable evidence for external side effects."
         )
     if role == "orchestrator":
         child_note = (
@@ -2274,6 +2283,25 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        try:
+            from agent.runtime_audit import runtime_audit_fields
+
+            audit = runtime_audit_fields(child)
+            entry["_worker_run"] = {
+                "backend": "delegate",
+                "model": _model if isinstance(_model, str) else "",
+                "reasoning": str(audit.get("reasoning_effort") or "").strip(),
+                "model_tier": str(audit.get("model_tier") or "").strip() or None,
+                "failed": status != "completed",
+            }
+        except Exception:
+            entry["_worker_run"] = {
+                "backend": "delegate",
+                "model": _model if isinstance(_model, str) else "",
+                "reasoning": "",
+                "model_tier": None,
+                "failed": status != "completed",
+            }
         if status == "failed":
             entry["error"] = result.get("error") or summary or "Subagent did not produce a response."
 
@@ -2636,6 +2664,7 @@ def _finalize_detached_results(
                 "child_role": child_role,
                 "child_status": str(entry.get("status") or ""),
                 "duration_ms": int((entry.get("duration_seconds") or 0) * 1000),
+                "worker_run": dict(entry.pop("_worker_run", {}) or {}),
             }
         )
     return {
@@ -2707,6 +2736,9 @@ def apply_detached_delegation_accounting(
                 )
             except Exception:
                 logger.debug("detached subagent_stop hook failed", exc_info=True)
+        worker_run = child.get("worker_run")
+        if isinstance(worker_run, dict) and worker_run.get("model"):
+            append_turn_worker_run(parent_agent, dict(worker_run))
 
     try:
         cost_total = float(accounting.get("cost_total_usd") or 0.0)
@@ -3342,6 +3374,9 @@ def delegate_task(
     for entry in results:
         child_role = entry.pop("_child_role", None)
         observer_child = _observer_child_by_index.get(entry.get("task_index"))
+        worker_run = entry.pop("_worker_run", None)
+        if isinstance(worker_run, dict) and worker_run.get("model"):
+            append_turn_worker_run(parent_agent, dict(worker_run))
         child_cost = entry.pop("_child_cost_usd", 0.0)
         try:
             if child_cost:
@@ -3703,7 +3738,10 @@ def _build_top_level_description() -> str:
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
         "delegate_task, clarify, memory, send_message, execute_code.\n"
-        "- read_only=true is enforced at dispatch time and propagates to nested "
+        "- read_only=false is the default. Use it when a worker may need bounded "
+        "workspace exploration, setup, or in-scope mutation; terminal and file "
+        "tools remain available.\n"
+        "- read_only=true is opt-in, enforced at dispatch time, and propagates to nested "
         "delegate_task calls. It blocks file writes, all terminal execution, "
         "execute_code, and coding-worker mutation.\n"
         "- background=true requires read_only=true for every task. Detached "
@@ -3890,7 +3928,11 @@ DELEGATE_TASK_SCHEMA = {
             "read_only": {
                 "type": "boolean",
                 "default": False,
-                "description": "Runtime-enforced repository read-only mode; propagates to descendants.",
+                "description": (
+                    "Opt-in runtime-enforced repository read-only mode. Default false: "
+                    "workers may use terminal/file tools for bounded exploration, setup, "
+                    "and in-scope mutation. True propagates to descendants."
+                ),
             },
             "background": {
                 "type": "boolean",
