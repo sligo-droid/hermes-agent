@@ -1230,6 +1230,259 @@ def test_required_closeout_replays_exact_checkpoint_after_activation_crash(
     assert ledger.get(work_id)["closeout_authoritative"] is True
 
 
+def test_required_closeout_recovers_crash_after_ref_cas_before_index_replace(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    base_tree = _run(repo, "rev-parse", f"{base_sha}^{{tree}}").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runner, ledger, work_id = _durable_required_closeout_runner(
+        tmp_path,
+        repo,
+        base_sha=base_sha,
+        scope_paths=["src"],
+    )
+    real_replace = os.replace
+    crashed = False
+    index_path = (repo / ".git" / "index").resolve()
+
+    def crash_before_index_replace(source, destination):
+        nonlocal crashed
+        destination_path = Path(destination).resolve()
+        if not crashed and destination_path == index_path:
+            crashed = True
+            raise RuntimeError("crash after update-ref")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", crash_before_index_replace)
+    with pytest.raises(RuntimeError, match="crash after update-ref"):
+        runner._activate_required_async_closeout(
+            work_id,
+            ledger.get(work_id),
+            ledger.required_async_completion_state(work_id),
+        )
+
+    checkpoint_head = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    assert checkpoint_head != base_sha
+    assert _run(repo, "write-tree").stdout.strip() == base_tree
+    assert _run(repo, "status", "--porcelain").stdout
+    persisted = ledger.required_async_completion_state(work_id)
+    assert "committed_head_sha" not in persisted["checkpoint"]
+
+    restarted = object.__new__(gateway_run.GatewayRunner)
+    restarted.work_ledger = ledger
+    restarted.trusted_closeout_watcher = SimpleNamespace(notify=lambda _work_id: None)
+    replay_result = restarted._activate_required_async_closeout(
+        work_id,
+        ledger.get(work_id),
+        persisted,
+    )
+    assert replay_result == (True, "closeout"), replay_result
+    assert _run(repo, "status", "--porcelain").stdout == ""
+    recovered = ledger.required_async_completion_state(work_id)
+    assert recovered["checkpoint"]["committed_head_sha"] == checkpoint_head
+
+
+def test_required_closeout_ref_cas_loss_never_moves_competing_head(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    base_tree = _run(repo, "rev-parse", f"{base_sha}^{{tree}}").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runner, _captured, _notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+    original_run = subprocess.run
+    competing_head = ""
+    checkpoint_head = ""
+    injected = False
+
+    def racing_ref(*args, **kwargs):
+        nonlocal competing_head, checkpoint_head, injected
+        command = args[0] if args else kwargs.get("args")
+        if (
+            not injected
+            and isinstance(command, list)
+            and "update-ref" in command
+            and "HEAD" in command
+        ):
+            injected = True
+            checkpoint_head = command[-2]
+            competitor = original_run(
+                ["git", "commit-tree", base_tree, "-p", base_sha],
+                cwd=repo,
+                input="competing commit\n",
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            competing_head = competitor.stdout.strip()
+            original_run(
+                ["git", "update-ref", "HEAD", competing_head, base_sha],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", racing_ref)
+
+    assert runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    ) == (False, "checkpoint_ref_cas_lost")
+    assert _run(repo, "rev-parse", "HEAD").stdout.strip() == competing_head
+    assert _run(repo, "show", "-s", "--format=%P", checkpoint_head).stdout.strip() == base_sha
+    assert _run(repo, "show", "-s", "--format=%T", checkpoint_head).stdout.strip() != base_tree
+
+
+def test_required_closeout_private_index_excludes_concurrent_real_index_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runner, _captured, _notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+    original_run = subprocess.run
+    checkpoint_head = ""
+    injected = False
+
+    def mutate_real_index(*args, **kwargs):
+        nonlocal checkpoint_head, injected
+        result = original_run(*args, **kwargs)
+        command = args[0] if args else kwargs.get("args")
+        if (
+            not injected
+            and isinstance(command, list)
+            and "commit-tree" in command
+            and result.returncode == 0
+        ):
+            injected = True
+            checkpoint_head = str(result.stdout or "").strip()
+            (repo / "outside.txt").write_text("unrelated\n", encoding="utf-8")
+            alternate = repo / ".git" / "adversary-index"
+            env = {**os.environ, "GIT_INDEX_FILE": str(alternate)}
+            original_run(
+                ["git", "read-tree", base_sha],
+                cwd=repo,
+                env=env,
+                check=True,
+            )
+            original_run(
+                ["git", "add", "outside.txt"],
+                cwd=repo,
+                env=env,
+                check=True,
+            )
+            (repo / ".git" / "index").write_bytes(alternate.read_bytes())
+            alternate.unlink()
+        return result
+
+    monkeypatch.setattr(subprocess, "run", mutate_real_index)
+
+    assert runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    ) == (False, "checkpoint_real_index_changed")
+    assert _run(repo, "rev-parse", "HEAD").stdout.strip() == base_sha
+    assert _run(repo, "show", f"{checkpoint_head}:src/parser.py").stdout == "VALUE = 1\n"
+    missing = subprocess.run(
+        ["git", "show", f"{checkpoint_head}:outside.txt"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing.returncode != 0
+
+
+def test_required_closeout_cancellation_after_intent_prevents_commit_and_ref(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runner, ledger, work_id = _durable_required_closeout_runner(
+        tmp_path,
+        repo,
+        base_sha=base_sha,
+        scope_paths=["src"],
+    )
+    original_record = ledger.record_required_async_checkpoint
+    cancelled = False
+
+    def record_then_cancel(*args, **kwargs):
+        nonlocal cancelled
+        result = original_record(*args, **kwargs)
+        if not cancelled and not kwargs.get("committed_head_sha"):
+            cancelled = True
+            identity = runner._required_async_identity(result)
+            ledger.cancel_required_async_attempt(
+                work_id,
+                **identity,
+                reason="session_stop",
+            )
+        return result
+
+    monkeypatch.setattr(ledger, "record_required_async_checkpoint", record_then_cancel)
+
+    assert runner._activate_required_async_closeout(
+        work_id,
+        ledger.get(work_id),
+        ledger.required_async_completion_state(work_id),
+    ) == (False, "checkpoint_attempt_cancelled")
+    assert _run(repo, "rev-parse", "HEAD").stdout.strip() == base_sha
+    assert _run(repo, "rev-list", "--count", "--all").stdout.strip() == "1"
+    assert ledger.required_async_completion_state(work_id)["attempt_cancelled"] is True
+
+
 def test_required_closeout_rejects_worker_created_clean_commit(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     repo = tmp_path / "repo"
@@ -1341,7 +1594,8 @@ def test_required_closeout_fences_concurrent_out_of_scope_staging(
         if (
             not injected
             and isinstance(command, list)
-            and command[:3] == ["git", "add", "-A"]
+            and "add" in command
+            and "-A" in command
         ):
             injected = True
             (repo / "outside.txt").write_text("concurrent\n", encoding="utf-8")

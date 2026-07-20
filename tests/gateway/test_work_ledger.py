@@ -3715,6 +3715,34 @@ def test_required_async_cancel_and_unknown_are_sticky(tmp_path):
     assert state["failed"] is True
 
 
+def test_required_async_attempt_cancel_preserves_terminal_dispatch_evidence(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    assert _register_required_dispatch(ledger, work_id, "worker-terminal")
+    terminal = _complete_required_dispatch(
+        ledger,
+        work_id,
+        "worker-terminal",
+        summary="completed before stop",
+    )
+    assert terminal["dispatches"]["worker-terminal"]["state"] == "terminal"
+
+    cancelled = ledger.cancel_required_async_attempt(
+        work_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        reason="session_stop",
+    )
+
+    assert cancelled["attempt_cancelled"] is True
+    assert cancelled["failed"] is True
+    assert cancelled["failure_reason"] == "required_async_attempt_cancelled"
+    dispatch = cancelled["dispatches"]["worker-terminal"]
+    assert dispatch["state"] == "terminal"
+    assert dispatch["success"] is True
+    assert dispatch["summary"] == "completed before stop"
+
+
 def test_required_async_attempt_fencing_rejects_stale_or_conflicting_writes(tmp_path):
     ledger, work_id = _required_async_ledger(tmp_path)
     assert ledger.register_required_async_dispatch(
@@ -3848,10 +3876,10 @@ def test_required_async_v2_checkpoint_mutation_upgrades_schema(tmp_path):
     )
 
     assert state is not None
-    assert state["schema_version"] == 4
+    assert state["schema_version"] == 5
     assert state["checkpoint"]["tree_sha"] == "b" * 40
     stored = ledger.get(work_id)["required_async_completions"]
-    assert stored["schema_version"] == 4
+    assert stored["schema_version"] == 5
     assert stored["checkpoint"]["parent_sha"] == "a" * 40
 
 

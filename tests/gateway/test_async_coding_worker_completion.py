@@ -1397,7 +1397,7 @@ def test_stop_fences_delegate_only_attempt_after_restart_and_ignores_late_succes
     assert stopped["reconciled_at"] is not None
     item = ledger.get(work_item_id)
     assert item["status"] == "blocked"
-    assert item["blocked_reason"] == "advisory_async_cancelled"
+    assert item["blocked_reason"] == "required_async_attempt_cancelled"
 
     late = ledger.record_required_async_completion(
         work_item_id,
@@ -1408,6 +1408,91 @@ def test_stop_fences_delegate_only_attempt_after_restart_and_ignores_late_succes
     )
     assert late["dispatches"]["deleg-advisory-only"]["state"] == "cancelled"
     assert ledger.get(work_item_id)["status"] == "blocked"
+    ad._reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_stop_fences_all_terminal_unreconciled_attempt_before_late_reconcile(
+    tmp_path,
+):
+    ad._reset_for_tests()
+    ledger, work_item_id, session_key = _registered_required_attempt(tmp_path)
+    identity = {
+        "generation": 7,
+        "attempt_id": "boot-a:7",
+        "attempt_order": 10,
+    }
+    assert ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="deleg_required",
+        success=True,
+        status="completed",
+        evidence={
+            "base_sha": "a" * 40,
+            "scope_paths": ["src"],
+            "scope_check": {"clean": True, "scope_paths": ["src"]},
+        },
+        **identity,
+    )
+    terminal = ledger.seal_required_async_attempt(work_item_id, **identity)
+    assert terminal["ready_to_reconcile"] is True
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._background_tasks = set()
+    runner._resume_finished_discord_work_item = AsyncMock()
+    runner._activate_required_async_closeout = MagicMock(
+        side_effect=AssertionError("cancelled attempt must not activate closeout")
+    )
+
+    assert runner._stop_required_async_for_session(session_key) == 1
+    await runner._reconcile_required_async_item(work_item_id, terminal)
+    await asyncio.sleep(0)
+
+    stopped = ledger.required_async_completion_state(work_item_id)
+    assert stopped["attempt_cancelled"] is True
+    assert stopped["reconciled_at"] is not None
+    dispatch = stopped["dispatches"]["deleg_required"]
+    assert dispatch["state"] == "terminal"
+    assert dispatch["success"] is True
+    assert stopped["checkpoint"] is None
+    item = ledger.get(work_item_id)
+    assert item["status"] == "blocked"
+    assert item["summary_status"] == "Blocked"
+    assert item["terminal_delivery"]["source"] == "required_async_completion"
+    runner._activate_required_async_closeout.assert_not_called()
+    ad._reset_for_tests()
+
+
+def test_stop_does_not_retroactively_cancel_reconciled_attempt(tmp_path):
+    ad._reset_for_tests()
+    ledger, work_item_id, session_key = _registered_required_attempt(tmp_path)
+    identity = {
+        "generation": 7,
+        "attempt_id": "boot-a:7",
+        "attempt_order": 10,
+    }
+    assert ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="deleg_required",
+        success=True,
+        status="completed",
+        **identity,
+    )
+    assert ledger.seal_required_async_attempt(work_item_id, **identity)
+    assert ledger.mark_required_async_reconciled(
+        work_item_id,
+        reconciliation_id="already-reconciled",
+        **identity,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._background_tasks = set()
+
+    assert runner._stop_required_async_for_session(session_key) == 0
+    state = ledger.required_async_completion_state(work_item_id)
+    assert state["attempt_cancelled"] is False
+    assert state["reconciliation_id"] == "already-reconciled"
+    assert ledger.get(work_item_id)["status"] == "agent_running"
     ad._reset_for_tests()
 
 

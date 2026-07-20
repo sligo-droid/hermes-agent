@@ -58,8 +58,8 @@ _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 _MAX_CONFIRMED_MESSAGE_IDS = 128
 _MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
 _MAX_REQUIRED_ASYNC_COMPLETIONS = 64
-_REQUIRED_ASYNC_SCHEMA_VERSION = 4
-_SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS = frozenset({2, 3, 4})
+_REQUIRED_ASYNC_SCHEMA_VERSION = 5
+_SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 _REQUIRED_ASYNC_DISPATCH_STATES = frozenset(
     {"registered", "running", "terminal", "cancelled", "outcome_unknown"}
 )
@@ -829,6 +829,7 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
     sticky_failure = bool(
         malformed
         or raw.get("sticky_failure") is True
+        or raw.get("attempt_cancelled") is True
         or required_cancelled
         or required_outcome_unknown
         or any(
@@ -856,6 +857,13 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
         "cancelled_at": _bounded_run_state_lease(raw.get("cancelled_at")),
         "cancellation_reason": _bounded_required_async_text(
             raw.get("cancellation_reason")
+        ),
+        "attempt_cancelled": raw.get("attempt_cancelled") is True,
+        "attempt_cancelled_at": _bounded_run_state_lease(
+            raw.get("attempt_cancelled_at")
+        ),
+        "attempt_cancellation_reason": _bounded_required_async_text(
+            raw.get("attempt_cancellation_reason")
         ),
         "dispatches": dispatches,
         "checkpoint": checkpoint,
@@ -924,6 +932,7 @@ def _required_async_payload(state: Mapping[str, Any]) -> dict[str, Any]:
         "sealed_at",
         "reconciled_at",
         "cancelled_at",
+        "attempt_cancelled_at",
     ):
         value = _bounded_run_state_lease(state.get(key))
         if value is not None:
@@ -937,6 +946,13 @@ def _required_async_payload(state: Mapping[str, Any]) -> dict[str, Any]:
         payload["cancellation_reason"] = cancellation_reason
     if state.get("sticky_failure") is True:
         payload["sticky_failure"] = True
+    if state.get("attempt_cancelled") is True:
+        payload["attempt_cancelled"] = True
+    attempt_cancellation_reason = _bounded_required_async_text(
+        state.get("attempt_cancellation_reason")
+    )
+    if attempt_cancellation_reason:
+        payload["attempt_cancellation_reason"] = attempt_cancellation_reason
     checkpoint, checkpoint_malformed = _bounded_required_async_checkpoint(
         state.get("checkpoint")
     )
@@ -2064,6 +2080,51 @@ class GatewayWorkLedger:
         return result
 
     @_locked_ledger_mutation
+    def cancel_required_async_attempt(
+        self,
+        work_id: str,
+        *,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        reason: str | None = None,
+        cancelled_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        """CAS-fence one exact attempt without rewriting terminal dispatch evidence."""
+
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        if state.get("attempt_cancelled") is True:
+            return state
+        now = _bounded_run_state_lease(
+            cancelled_at if cancelled_at is not None else self._now()
+        )
+        state.update(
+            {
+                "attempt_cancelled": True,
+                "attempt_cancelled_at": now,
+                "attempt_cancellation_reason": _bounded_required_async_text(reason),
+                "sticky_failure": True,
+                "failure_reason": "required_async_attempt_cancelled",
+            }
+        )
+        return self._persist_required_async_state(
+            data,
+            item,
+            state,
+            refresh_gate=True,
+        )
+
+    @_locked_ledger_mutation
     def cancel_required_async_dispatch(
         self,
         work_id: str,
@@ -2192,7 +2253,11 @@ class GatewayWorkLedger:
         if context is None:
             return None
         item, state = context
-        if not state["sealed"] or not state["completion_terminal"]:
+        if (
+            not state["sealed"]
+            or not state["completion_terminal"]
+            or state.get("attempt_cancelled") is True
+        ):
             return None
         incoming, malformed = _bounded_required_async_checkpoint(
             {
@@ -2250,7 +2315,11 @@ class GatewayWorkLedger:
         if context is None:
             return None
         item, state = context
-        if not state["sealed"] or not state["completion_terminal"]:
+        if (
+            not state["sealed"]
+            or not state["completion_terminal"]
+            or state.get("attempt_cancelled") is True
+        ):
             return None
         incoming_id = _bounded_run_state_text(reconciliation_id)
         if state["reconciled_at"] is not None:
@@ -2493,6 +2562,8 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict):
                 return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                return None
             existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
             state = normalize_closeout_state(
                 {
@@ -2536,6 +2607,8 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             if not isinstance(item, dict):
+                return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 return None
             existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
             revision = int(existing.get("revision") or 0)
@@ -2608,6 +2681,8 @@ class GatewayWorkLedger:
                     and item.get("closeout_activated_at") is None
                 )
             ):
+                return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 return None
             state = normalize_closeout_state(item["closeout"])
             if state["mode"] == "off" or state["source"] not in {"direct", "fable"}:
@@ -2705,6 +2780,8 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
                 return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                return None
             state = normalize_closeout_state(item["closeout"])
             if not _closeout_expects_head(state, expected_head):
                 return None
@@ -2765,6 +2842,8 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict):
                 return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                return None
             existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else None
             if existing is None or int(existing.get("revision") or 0) != int(expected_revision):
                 return None
@@ -2800,6 +2879,8 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 return None
             now = self._now()
             state = normalize_closeout_state(item["closeout"])
@@ -2865,6 +2946,8 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
                 return False
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                return False
             now = self._now()
             state = normalize_closeout_state(item["closeout"])
             if (
@@ -2919,6 +3002,8 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
                 return False
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                return False
             now = self._now()
             current = normalize_closeout_state(item["closeout"])
             lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
@@ -2959,6 +3044,8 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
                 return False
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                return False
             current = normalize_closeout_state(item["closeout"])
             lease = current.get("lease") if isinstance(current.get("lease"), dict) else {}
             if (
@@ -2991,6 +3078,8 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 return None
             if not _run_state_matches(item, expected_run_state):
                 return None
@@ -3041,6 +3130,8 @@ class GatewayWorkLedger:
             data = self._read()
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
+                return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 return None
             if not _run_state_matches(item, expected_run_state):
                 return None
@@ -3130,6 +3221,8 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
                 return None
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                return None
             if not _run_state_matches(item, expected_run_state):
                 return None
             now = self._now()
@@ -3213,6 +3306,12 @@ class GatewayWorkLedger:
             item = data["items"].get(work_id)
             delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
             if not isinstance(item, dict) or not isinstance(delivery, dict):
+                return None
+            required_state = _required_async_completion_state(item)
+            if (
+                required_state.get("attempt_cancelled") is True
+                and str(delivery.get("source") or "") != "required_async_completion"
+            ):
                 return None
             now = self._now()
             status = str(delivery.get("status") or "")
@@ -3468,6 +3567,8 @@ class GatewayWorkLedger:
         for item in self._read().get("items", {}).values():
             if not isinstance(item, dict) or not isinstance(item.get("closeout"), dict):
                 continue
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                continue
             state = normalize_closeout_state(item["closeout"])
             active = item.get("closeout_authoritative") is True or (
                 state["mode"] == "shadow" and item.get("closeout_activated_at") is not None
@@ -3670,6 +3771,8 @@ class GatewayWorkLedger:
         data = self._read()
         item = data["items"].get(work_id)
         if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
+            return False
+        if _required_async_completion_state(item).get("attempt_cancelled") is True:
             return False
         now = self._now()
         item["status"] = "response_delivered" if already_delivered else "agent_done"

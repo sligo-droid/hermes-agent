@@ -5224,6 +5224,15 @@ class GatewayRunner:
             or not isinstance(item.get("closeout"), dict)
         ):
             return None
+        required_reader = getattr(ledger, "required_async_completion_state", None)
+        required_state = (
+            required_reader(work_item_id) if callable(required_reader) else None
+        )
+        if (
+            isinstance(required_state, dict)
+            and required_state.get("attempt_cancelled") is True
+        ):
+            return None
         from hermes_cli.trusted_closeout import normalize_closeout_state
 
         state = normalize_closeout_state(item["closeout"])
@@ -7933,6 +7942,24 @@ class GatewayRunner:
         trusted closeout watcher receives ownership.
         """
 
+        required_reader = getattr(
+            self._ledger(),
+            "required_async_completion_state",
+            None,
+        )
+        live_state = (
+            required_reader(work_id) if callable(required_reader) else required_state
+        )
+        if (
+            not isinstance(live_state, dict)
+            or self._required_async_identity(live_state)
+            != self._required_async_identity(required_state)
+        ):
+            return False, "required_async_attempt_changed"
+        if live_state.get("attempt_cancelled") is True:
+            return False, "required_async_attempt_cancelled"
+        required_state = live_state
+
         closeout_raw = item.get("closeout")
         if not isinstance(closeout_raw, dict):
             return False, "work_item"
@@ -8006,6 +8033,17 @@ class GatewayRunner:
         )
         if not verified_head:
             return False, checkpoint_reason
+        live_state = (
+            required_reader(work_id) if callable(required_reader) else required_state
+        )
+        if (
+            not isinstance(live_state, dict)
+            or self._required_async_identity(live_state)
+            != self._required_async_identity(required_state)
+        ):
+            return False, "required_async_attempt_changed"
+        if live_state.get("attempt_cancelled") is True:
+            return False, "required_async_attempt_cancelled"
 
         visual_result: dict[str, Any] = {}
         if closeout["policy"]["require_visual_qa"]:
@@ -8064,11 +8102,15 @@ class GatewayRunner:
             cwd: Path | None = None,
             timeout: float = 30.0,
             text: bool = True,
+            env: dict[str, str] | None = None,
+            input_text: str | None = None,
         ) -> subprocess.CompletedProcess:
             return subprocess.run(
                 ["git", *args],
                 cwd=cwd or repository_root,
                 text=text,
+                input=input_text,
+                env={**os.environ, **env} if env else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=timeout,
@@ -8157,6 +8199,23 @@ class GatewayRunner:
             return "", "checkpoint_base_head_conflict"
         base_sha = next(iter(base_shas))
         message = f"Hermes async checkpoint {str(work_id or '')}"
+        identity = self._required_async_identity(required_state)
+
+        def cancellation_fence() -> str:
+            ledger = self._ledger()
+            reader = getattr(ledger, "required_async_completion_state", None)
+            current = reader(work_id) if callable(reader) else required_state
+            if not isinstance(current, dict):
+                return "checkpoint_attempt_state_missing"
+            if self._required_async_identity(current) != identity:
+                return "checkpoint_attempt_changed"
+            if current.get("attempt_cancelled") is True:
+                return "checkpoint_attempt_cancelled"
+            return ""
+
+        cancellation_reason = cancellation_fence()
+        if cancellation_reason:
+            return "", cancellation_reason
         head = run_git(["rev-parse", "--verify", "HEAD"])
         current_head = str(head.stdout or "").strip().lower()
         if head.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", current_head):
@@ -8212,8 +8271,6 @@ class GatewayRunner:
             else None
         )
         if current_head != base_sha:
-            if changed_paths:
-                return "", "checkpoint_base_head_moved"
             if not isinstance(checkpoint, dict):
                 return "", "checkpoint_base_head_moved"
             if (
@@ -8241,7 +8298,179 @@ class GatewayRunner:
                 or identity_parts[2].rstrip("\n") != message
             ):
                 return "", "checkpoint_identity_mismatch"
-            return current_head, ""
+            if not changed_paths:
+                return current_head, ""
+
+            cancellation_reason = cancellation_fence()
+            if cancellation_reason:
+                return "", cancellation_reason
+            base_tree = run_git(["rev-parse", f"{base_sha}^{{tree}}"])
+            real_index_tree = run_git(["write-tree"])
+            if (
+                base_tree.returncode != 0
+                or real_index_tree.returncode != 0
+                or str(real_index_tree.stdout or "").strip().lower()
+                != str(base_tree.stdout or "").strip().lower()
+            ):
+                return "", "checkpoint_replay_index_base_mismatch"
+
+            import tempfile
+
+            git_dir_result = run_git(["rev-parse", "--git-dir"])
+            index_path_result = run_git(["rev-parse", "--git-path", "index"])
+            if git_dir_result.returncode != 0 or index_path_result.returncode != 0:
+                return "", "checkpoint_git_metadata_failed"
+            git_dir = Path(str(git_dir_result.stdout or "").strip())
+            if not git_dir.is_absolute():
+                git_dir = (repository_root / git_dir).resolve(strict=False)
+            index_path = Path(str(index_path_result.stdout or "").strip())
+            if not index_path.is_absolute():
+                index_path = (repository_root / index_path).resolve(strict=False)
+            try:
+                initial_index_bytes = index_path.read_bytes()
+            except FileNotFoundError:
+                initial_index_bytes = b""
+            except OSError:
+                return "", "checkpoint_index_read_failed"
+            private_fd, private_name = tempfile.mkstemp(
+                prefix="hermes-replay-index-",
+                dir=git_dir,
+            )
+            os.close(private_fd)
+            os.unlink(private_name)
+            private_index = Path(private_name)
+            index_lock = Path(f"{index_path}.lock")
+            lock_fd: int | None = None
+            try:
+                repaired = run_git(
+                    ["-c", "core.hooksPath=/dev/null", "read-tree", current_head],
+                    env={"GIT_INDEX_FILE": str(private_index)},
+                )
+                if repaired.returncode != 0:
+                    return "", "checkpoint_replay_index_failed"
+                replay_env = {"GIT_INDEX_FILE": str(private_index)}
+                replay_pathspecs = [f":(literal){path}" for path in changed_paths]
+                replay_stage = run_git(
+                    [
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "add",
+                        "-A",
+                        "--",
+                        *replay_pathspecs,
+                    ],
+                    env=replay_env,
+                )
+                replay_tree = run_git(["write-tree"], env=replay_env)
+                untracked = run_git(
+                    ["ls-files", "--others", "--exclude-standard", "-z"],
+                    text=False,
+                    env=replay_env,
+                )
+                if replay_stage.returncode != 0:
+                    return "", "checkpoint_replay_stage_failed"
+                if (
+                    replay_tree.returncode != 0
+                    or str(replay_tree.stdout or "").strip().lower()
+                    != str(checkpoint.get("tree_sha") or "")
+                ):
+                    logger.warning(
+                        "Checkpoint replay tree mismatch for %s: expected=%s actual=%s paths=%s",
+                        work_id,
+                        str(checkpoint.get("tree_sha") or ""),
+                        str(replay_tree.stdout or "").strip().lower(),
+                        changed_paths,
+                    )
+                    return "", "checkpoint_replay_tree_mismatch"
+                if untracked.returncode != 0 or bool(bytes(untracked.stdout or b"")):
+                    return "", "checkpoint_replay_untracked_files"
+                try:
+                    lock_fd = os.open(
+                        index_lock,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                except FileExistsError:
+                    return "", "checkpoint_index_lock_busy"
+                try:
+                    live_index_bytes = index_path.read_bytes()
+                except FileNotFoundError:
+                    live_index_bytes = b""
+                if live_index_bytes != initial_index_bytes:
+                    return "", "checkpoint_real_index_changed"
+                locked_seed = run_git(
+                    ["-c", "core.hooksPath=/dev/null", "read-tree", current_head],
+                    env=replay_env,
+                )
+                locked_stage = run_git(
+                    [
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "add",
+                        "-A",
+                        "--",
+                        *replay_pathspecs,
+                    ],
+                    env=replay_env,
+                )
+                locked_tree = run_git(["write-tree"], env=replay_env)
+                locked_untracked = run_git(
+                    ["ls-files", "--others", "--exclude-standard", "-z"],
+                    text=False,
+                    env=replay_env,
+                )
+                if (
+                    str(run_git(["rev-parse", "HEAD"]).stdout or "").strip().lower()
+                    != current_head
+                    or locked_seed.returncode != 0
+                    or locked_stage.returncode != 0
+                    or locked_tree.returncode != 0
+                    or str(locked_tree.stdout or "").strip().lower()
+                    != str(checkpoint.get("tree_sha") or "")
+                    or locked_untracked.returncode != 0
+                    or bool(bytes(locked_untracked.stdout or b""))
+                    or cancellation_fence()
+                ):
+                    return "", "checkpoint_replay_race"
+                with os.fdopen(lock_fd, "wb", closefd=True) as lock_handle:
+                    lock_fd = None
+                    lock_handle.write(private_index.read_bytes())
+                    lock_handle.flush()
+                    os.fsync(lock_handle.fileno())
+                os.replace(index_lock, index_path)
+                repaired_status = status_snapshot()
+                repaired_tree = run_git(["write-tree"])
+                if (
+                    repaired_status is None
+                    or bool(repaired_status[1])
+                    or str(repaired_tree.stdout or "").strip().lower()
+                    != str(checkpoint.get("tree_sha") or "")
+                ):
+                    return "", "checkpoint_replay_verification_failed"
+                completed = self._ledger().record_required_async_checkpoint(
+                    work_id,
+                    **identity,
+                    parent_sha=base_sha,
+                    tree_sha=str(checkpoint.get("tree_sha") or ""),
+                    message=message,
+                    repository_root=str(repository_root),
+                    workspace_path=str(workspace_root),
+                    committed_head_sha=current_head,
+                )
+                if not isinstance(completed, dict):
+                    return "", "checkpoint_replay_persistence_failed"
+                return current_head, ""
+            finally:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                try:
+                    index_lock.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    private_index.unlink()
+                except FileNotFoundError:
+                    pass
 
         if not changed_paths:
             if isinstance(checkpoint, dict) and str(checkpoint.get("tree_sha") or ""):
@@ -8267,163 +8496,405 @@ class GatewayRunner:
         head_before_stage = run_git(["rev-parse", "--verify", "HEAD"])
         if (
             before_stage is None
-            or sorted(
-                {
-                    path
-                    for _status_code, paths in before_stage[1]
-                    for path in paths
-                }
-            )
-            != changed_paths
+            or before_stage[0] != initial_status[0]
             or str(head_before_stage.stdout or "").strip().lower() != base_sha
         ):
             return "", "checkpoint_workspace_changed_before_stage"
 
-        literal_pathspecs = [f":(literal){path}" for path in changed_paths]
-        added = run_git(["add", "-A", "--", *literal_pathspecs])
-        if added.returncode != 0:
-            return "", "checkpoint_stage_failed"
+        import tempfile
 
-        def unstage_validated_paths() -> None:
-            run_git(["reset", "--mixed", base_sha, "--", *literal_pathspecs])
-
-        staged_status = status_snapshot()
-        staged_paths = (
-            sorted(
-                {
-                    path
-                    for _status_code, paths in staged_status[1]
-                    for path in paths
-                }
-            )
-            if staged_status is not None
-            else []
-        )
+        git_dir_result = run_git(["rev-parse", "--git-dir"])
+        index_path_result = run_git(["rev-parse", "--git-path", "index"])
+        if git_dir_result.returncode != 0 or index_path_result.returncode != 0:
+            return "", "checkpoint_git_metadata_failed"
+        git_dir = Path(str(git_dir_result.stdout or "").strip())
+        if not git_dir.is_absolute():
+            git_dir = (repository_root / git_dir).resolve(strict=False)
+        index_path = Path(str(index_path_result.stdout or "").strip())
+        if not index_path.is_absolute():
+            index_path = (repository_root / index_path).resolve(strict=False)
+        try:
+            initial_index_bytes = index_path.read_bytes()
+        except FileNotFoundError:
+            initial_index_bytes = b""
+        except OSError:
+            return "", "checkpoint_index_read_failed"
+        initial_index_tree_result = run_git(["write-tree"])
+        initial_index_tree = str(initial_index_tree_result.stdout or "").strip().lower()
         if (
-            staged_status is None
-            or staged_paths != changed_paths
-            or any(status_code[1] != " " for status_code, _paths in staged_status[1])
-            or run_git(["diff", "--quiet", "--"]).returncode != 0
-            or str(run_git(["rev-parse", "--verify", "HEAD"]).stdout or "").strip().lower()
-            != base_sha
+            initial_index_tree_result.returncode != 0
+            or not re.fullmatch(r"[0-9a-f]{40}", initial_index_tree)
         ):
-            unstage_validated_paths()
-            return "", "checkpoint_workspace_changed_after_stage"
-        if run_git(["diff", "--cached", "--check"]).returncode != 0:
-            unstage_validated_paths()
-            return "", "checkpoint_staged_diff_check_failed"
-        tree = run_git(["write-tree"])
-        expected_tree = str(tree.stdout or "").strip().lower()
-        if tree.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", expected_tree):
-            unstage_validated_paths()
-            return "", "checkpoint_tree_failed"
+            return "", "checkpoint_index_tree_failed"
 
-        identity = self._required_async_identity(required_state)
-        persisted = self._ledger().record_required_async_checkpoint(
-            work_id,
-            **identity,
-            parent_sha=base_sha,
-            tree_sha=expected_tree,
-            message=message,
-            repository_root=str(repository_root),
-            workspace_path=str(workspace_root),
+        private_fd, private_name = tempfile.mkstemp(
+            prefix="hermes-async-index-",
+            dir=git_dir,
         )
-        persisted_checkpoint = (
-            persisted.get("checkpoint") if isinstance(persisted, dict) else None
-        )
-        expected_checkpoint = {
-            "parent_sha": base_sha,
-            "tree_sha": expected_tree,
-            "message": message,
-            "repository_root": str(repository_root),
-            "workspace_path": str(workspace_root),
-        }
-        if (
-            not isinstance(persisted_checkpoint, dict)
-            or any(
-                persisted_checkpoint.get(key) != value
-                for key, value in expected_checkpoint.items()
+        os.close(private_fd)
+        os.unlink(private_name)
+        private_index = Path(private_name)
+        private_env = {"GIT_INDEX_FILE": str(private_index)}
+        index_lock = Path(f"{index_path}.lock")
+        index_lock_fd: int | None = None
+
+        def release_index_lock() -> None:
+            nonlocal index_lock_fd
+            if index_lock_fd is not None:
+                os.close(index_lock_fd)
+                index_lock_fd = None
+            try:
+                index_lock.unlink()
+            except FileNotFoundError:
+                pass
+
+        def ref_revert(checkpoint_head: str) -> bool:
+            reverted = run_git(
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "update-ref",
+                    "-m",
+                    "Hermes async checkpoint cancellation",
+                    "HEAD",
+                    base_sha,
+                    checkpoint_head,
+                ]
             )
-        ):
-            unstage_validated_paths()
-            return "", "checkpoint_intent_persistence_failed"
+            return reverted.returncode == 0
 
-        precommit_status = status_snapshot()
-        precommit_tree = run_git(["write-tree"])
-        if (
-            precommit_status is None
-            or sorted(
-                {
-                    path
-                    for _status_code, paths in precommit_status[1]
-                    for path in paths
-                }
+        try:
+            seeded = run_git(
+                ["-c", "core.hooksPath=/dev/null", "read-tree", base_sha],
+                env=private_env,
             )
-            != changed_paths
-            or any(status_code[1] != " " for status_code, _paths in precommit_status[1])
-            or str(precommit_tree.stdout or "").strip().lower() != expected_tree
-            or str(run_git(["rev-parse", "--verify", "HEAD"]).stdout or "").strip().lower()
-            != base_sha
-        ):
-            unstage_validated_paths()
-            return "", "checkpoint_workspace_changed_before_commit"
+            literal_pathspecs = [f":(literal){path}" for path in changed_paths]
+            added = run_git(
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "add",
+                    "-A",
+                    "--",
+                    *literal_pathspecs,
+                ],
+                env=private_env,
+            )
+            if seeded.returncode != 0 or added.returncode != 0:
+                return "", "checkpoint_stage_failed"
+            if run_git(
+                ["diff", "--cached", "--check"],
+                env=private_env,
+            ).returncode != 0:
+                return "", "checkpoint_staged_diff_check_failed"
+            tree = run_git(["write-tree"], env=private_env)
+            expected_tree = str(tree.stdout or "").strip().lower()
+            if tree.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", expected_tree):
+                return "", "checkpoint_tree_failed"
 
-        committed = run_git(
-            [
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "tag.gpgSign=false",
-                "commit",
-                "--no-verify",
-                "--no-gpg-sign",
-                "-m",
-                message,
-            ],
-            timeout=60.0,
-        )
-        if committed.returncode != 0:
-            unstage_validated_paths()
-            logger.warning(
-                "Trusted async checkpoint commit failed for %s: %s",
+            after_stage = status_snapshot()
+            if (
+                after_stage is None
+                or after_stage[0] != initial_status[0]
+                or str(run_git(["rev-parse", "HEAD"]).stdout or "").strip().lower()
+                != base_sha
+            ):
+                return "", "checkpoint_workspace_changed_after_stage"
+            restaged_seed = run_git(
+                ["-c", "core.hooksPath=/dev/null", "read-tree", base_sha],
+                env=private_env,
+            )
+            restaged = run_git(
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "add",
+                    "-A",
+                    "--",
+                    *literal_pathspecs,
+                ],
+                env=private_env,
+            )
+            restaged_tree = run_git(["write-tree"], env=private_env)
+            if (
+                restaged_seed.returncode != 0
+                or restaged.returncode != 0
+                or restaged_tree.returncode != 0
+                or str(restaged_tree.stdout or "").strip().lower() != expected_tree
+            ):
+                return "", "checkpoint_workspace_changed_after_stage"
+
+            persisted = self._ledger().record_required_async_checkpoint(
                 work_id,
-                str(committed.stderr or committed.stdout or "")[:500],
+                **identity,
+                parent_sha=base_sha,
+                tree_sha=expected_tree,
+                message=message,
+                repository_root=str(repository_root),
+                workspace_path=str(workspace_root),
             )
-            return "", "checkpoint_commit_failed"
-        checked = run_git(["diff", "--check"])
-        clean = status_snapshot()
-        final_head = run_git(["rev-parse", "--verify", "HEAD"])
-        verified_head = str(final_head.stdout or "").strip().lower()
-        commit_identity = run_git(
-            ["show", "-s", "--format=%P%x00%T%x00%B", verified_head]
-        )
-        identity_parts = str(commit_identity.stdout or "").split("\0", 2)
-        if (
-            checked.returncode != 0
-            or clean is None
-            or bool(clean[1])
-            or final_head.returncode != 0
-            or not re.fullmatch(r"[0-9a-f]{40}", verified_head)
-            or commit_identity.returncode != 0
-            or len(identity_parts) != 3
-            or identity_parts[0].strip() != base_sha
-            or identity_parts[1].strip() != expected_tree
-            or identity_parts[2].rstrip("\n") != message
-        ):
-            return "", "checkpoint_post_commit_verification_failed"
-        self._ledger().record_required_async_checkpoint(
-            work_id,
-            **identity,
-            parent_sha=base_sha,
-            tree_sha=expected_tree,
-            message=message,
-            repository_root=str(repository_root),
-            workspace_path=str(workspace_root),
-            committed_head_sha=verified_head,
-        )
-        return verified_head, ""
+            persisted_checkpoint = (
+                persisted.get("checkpoint") if isinstance(persisted, dict) else None
+            )
+            expected_checkpoint = {
+                "parent_sha": base_sha,
+                "tree_sha": expected_tree,
+                "message": message,
+                "repository_root": str(repository_root),
+                "workspace_path": str(workspace_root),
+            }
+            if (
+                not isinstance(persisted_checkpoint, dict)
+                or any(
+                    persisted_checkpoint.get(key) != value
+                    for key, value in expected_checkpoint.items()
+                )
+            ):
+                return "", "checkpoint_intent_persistence_failed"
+            cancellation_reason = cancellation_fence()
+            if cancellation_reason:
+                return "", cancellation_reason
+
+            try:
+                index_lock_fd = os.open(
+                    index_lock,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                return "", "checkpoint_index_lock_busy"
+            except OSError:
+                return "", "checkpoint_index_lock_failed"
+            try:
+                current_index_bytes = index_path.read_bytes()
+            except FileNotFoundError:
+                current_index_bytes = b""
+            except OSError:
+                return "", "checkpoint_index_read_failed"
+            if current_index_bytes != initial_index_bytes:
+                return "", "checkpoint_real_index_changed"
+
+            locked_status = status_snapshot()
+            if (
+                locked_status is None
+                or locked_status[0] != initial_status[0]
+                or str(run_git(["rev-parse", "HEAD"]).stdout or "").strip().lower()
+                != base_sha
+            ):
+                return "", "checkpoint_workspace_changed_before_commit"
+            final_seed = run_git(
+                ["-c", "core.hooksPath=/dev/null", "read-tree", base_sha],
+                env=private_env,
+            )
+            final_stage = run_git(
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "add",
+                    "-A",
+                    "--",
+                    *literal_pathspecs,
+                ],
+                env=private_env,
+            )
+            final_tree = run_git(["write-tree"], env=private_env)
+            if (
+                final_seed.returncode != 0
+                or final_stage.returncode != 0
+                or final_tree.returncode != 0
+                or str(final_tree.stdout or "").strip().lower() != expected_tree
+            ):
+                return "", "checkpoint_workspace_changed_before_commit"
+            cancellation_reason = cancellation_fence()
+            if cancellation_reason:
+                return "", cancellation_reason
+
+            committed = run_git(
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit-tree",
+                    expected_tree,
+                    "-p",
+                    base_sha,
+                ],
+                timeout=60.0,
+                input_text=f"{message}\n",
+            )
+            checkpoint_head = str(committed.stdout or "").strip().lower()
+            if (
+                committed.returncode != 0
+                or not re.fullmatch(r"[0-9a-f]{40}", checkpoint_head)
+            ):
+                logger.warning(
+                    "Trusted async checkpoint commit-tree failed for %s: %s",
+                    work_id,
+                    str(committed.stderr or committed.stdout or "")[:500],
+                )
+                return "", "checkpoint_commit_failed"
+            commit_identity = run_git(
+                ["show", "-s", "--format=%P%x00%T%x00%B", checkpoint_head]
+            )
+            identity_parts = str(commit_identity.stdout or "").split("\0", 2)
+            if (
+                commit_identity.returncode != 0
+                or len(identity_parts) != 3
+                or identity_parts[0].strip() != base_sha
+                or identity_parts[1].strip() != expected_tree
+                or identity_parts[2].rstrip("\n") != message
+            ):
+                return "", "checkpoint_commit_identity_failed"
+            cancellation_reason = cancellation_fence()
+            if cancellation_reason:
+                return "", cancellation_reason
+
+            updated = run_git(
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "update-ref",
+                    "-m",
+                    message,
+                    "HEAD",
+                    checkpoint_head,
+                    base_sha,
+                ]
+            )
+            if updated.returncode != 0:
+                return "", "checkpoint_ref_cas_lost"
+            try:
+                current_index_bytes = index_path.read_bytes()
+            except FileNotFoundError:
+                current_index_bytes = b""
+            except OSError:
+                current_index_bytes = b"index-read-failed"
+            if current_index_bytes != initial_index_bytes:
+                if not ref_revert(checkpoint_head):
+                    return "", "checkpoint_ref_revert_failed"
+                return "", "checkpoint_real_index_changed"
+            cancellation_reason = cancellation_fence()
+            if cancellation_reason:
+                if not ref_revert(checkpoint_head):
+                    return "", "checkpoint_cancel_revert_failed"
+                return "", cancellation_reason
+
+            private_index_bytes = private_index.read_bytes()
+            if index_lock_fd is None:
+                ref_revert(checkpoint_head)
+                return "", "checkpoint_index_lock_lost"
+            with os.fdopen(index_lock_fd, "wb", closefd=True) as lock_handle:
+                index_lock_fd = None
+                lock_handle.write(private_index_bytes)
+                lock_handle.flush()
+                os.fsync(lock_handle.fileno())
+            os.replace(index_lock, index_path)
+
+            cancellation_reason = cancellation_fence()
+            if cancellation_reason:
+                reverted = ref_revert(checkpoint_head)
+                try:
+                    live_index_bytes = index_path.read_bytes()
+                except OSError:
+                    live_index_bytes = b"index-read-failed"
+                if live_index_bytes != private_index_bytes:
+                    return "", "checkpoint_cancel_restore_failed"
+                try:
+                    restore_fd = os.open(
+                        index_lock,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                    try:
+                        locked_index_bytes = index_path.read_bytes()
+                    except OSError:
+                        locked_index_bytes = b"index-read-failed"
+                    if locked_index_bytes != private_index_bytes:
+                        os.close(restore_fd)
+                        index_lock.unlink(missing_ok=True)
+                        return "", "checkpoint_cancel_restore_failed"
+                    with os.fdopen(restore_fd, "wb", closefd=True) as restore_handle:
+                        restore_handle.write(initial_index_bytes)
+                        restore_handle.flush()
+                        os.fsync(restore_handle.fileno())
+                    os.replace(index_lock, index_path)
+                except OSError:
+                    return "", "checkpoint_cancel_restore_failed"
+                if not reverted:
+                    return "", "checkpoint_cancel_revert_failed"
+                return "", cancellation_reason
+
+            checked = run_git(["diff", "--check"])
+            clean = status_snapshot()
+            final_head = run_git(["rev-parse", "--verify", "HEAD"])
+            verified_head = str(final_head.stdout or "").strip().lower()
+            final_index_tree = run_git(["write-tree"])
+            if (
+                checked.returncode != 0
+                or clean is None
+                or bool(clean[1])
+                or final_head.returncode != 0
+                or verified_head != checkpoint_head
+                or str(final_index_tree.stdout or "").strip().lower() != expected_tree
+            ):
+                return "", "checkpoint_post_commit_verification_failed"
+            completed_checkpoint = self._ledger().record_required_async_checkpoint(
+                work_id,
+                **identity,
+                parent_sha=base_sha,
+                tree_sha=expected_tree,
+                message=message,
+                repository_root=str(repository_root),
+                workspace_path=str(workspace_root),
+                committed_head_sha=verified_head,
+            )
+            if not isinstance(completed_checkpoint, dict):
+                cancellation_reason = cancellation_fence()
+                if cancellation_reason:
+                    reverted = ref_revert(checkpoint_head)
+                    try:
+                        live_index_bytes = index_path.read_bytes()
+                    except OSError:
+                        live_index_bytes = b"index-read-failed"
+                    if live_index_bytes != private_index_bytes:
+                        return "", "checkpoint_cancel_restore_failed"
+                    try:
+                        restore_fd = os.open(
+                            index_lock,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                        )
+                        try:
+                            locked_index_bytes = index_path.read_bytes()
+                        except OSError:
+                            locked_index_bytes = b"index-read-failed"
+                        if locked_index_bytes != private_index_bytes:
+                            os.close(restore_fd)
+                            index_lock.unlink(missing_ok=True)
+                            return "", "checkpoint_cancel_restore_failed"
+                        with os.fdopen(
+                            restore_fd,
+                            "wb",
+                            closefd=True,
+                        ) as restore_handle:
+                            restore_handle.write(initial_index_bytes)
+                            restore_handle.flush()
+                            os.fsync(restore_handle.fileno())
+                        os.replace(index_lock, index_path)
+                    except OSError:
+                        return "", "checkpoint_cancel_restore_failed"
+                    if not reverted:
+                        return "", "checkpoint_cancel_revert_failed"
+                    return "", cancellation_reason
+                return "", "checkpoint_completion_persistence_failed"
+            return verified_head, ""
+        finally:
+            release_index_lock()
+            try:
+                private_index.unlink()
+            except FileNotFoundError:
+                pass
 
     async def _reconcile_required_async_item(
         self,
@@ -8457,9 +8928,32 @@ class GatewayRunner:
             )
         )
         identity = self._required_async_identity(current)
+
+        async def finalize_cancelled(state: Dict[str, Any]) -> None:
+            cancelled_identity = self._required_async_identity(state)
+            cancelled_reconciliation_id = self._required_async_reconciliation_id(
+                work_id,
+                state,
+            )
+            finalized = await asyncio.to_thread(
+                ledger.finalize_required_async_failure,
+                work_id,
+                **cancelled_identity,
+                final_response=(
+                    "Background attempt work was explicitly stopped before "
+                    "reconciliation completed and will not be resumed automatically."
+                ),
+                reason="required_async_attempt_cancelled",
+                reconciliation_id=cancelled_reconciliation_id,
+            )
+            if isinstance(finalized, dict):
+                await self._resume_finished_discord_work_item(finalized)
+
         if failure:
             reason = (
-                "required_async_outcome_unknown"
+                "required_async_attempt_cancelled"
+                if current.get("attempt_cancelled")
+                else "required_async_outcome_unknown"
                 if current.get("required_outcome_unknown")
                 else "required_async_cancelled"
                 if current.get("required_cancelled")
@@ -8493,6 +8987,14 @@ class GatewayRunner:
             )
         else:
             activated, route = False, "work_item"
+        latest = ledger.required_async_completion_state(work_id)
+        if (
+            isinstance(latest, dict)
+            and self._required_async_identity(latest) == identity
+            and latest.get("attempt_cancelled") is True
+        ):
+            await finalize_cancelled(latest)
+            return
         if route not in {"closeout", "work_item"}:
             finalized = await asyncio.to_thread(
                 ledger.finalize_required_async_failure,
@@ -8527,6 +9029,14 @@ class GatewayRunner:
             )
             if not accepted:
                 return
+        latest = ledger.required_async_completion_state(work_id)
+        if (
+            isinstance(latest, dict)
+            and self._required_async_identity(latest) == identity
+            and latest.get("attempt_cancelled") is True
+        ):
+            await finalize_cancelled(latest)
+            return
         reconciled = await asyncio.to_thread(
             ledger.mark_required_async_reconciled,
             work_id,
@@ -23656,6 +24166,14 @@ class GatewayRunner:
                 ):
                     continue
                 identity = self._required_async_identity(state)
+                attempt_cancelled = ledger.cancel_required_async_attempt(
+                    work_id,
+                    **identity,
+                    reason="session_stop",
+                )
+                if not isinstance(attempt_cancelled, dict):
+                    continue
+                attempt_fenced = attempt_cancelled.get("attempt_cancelled") is True
                 sealed = ledger.seal_required_async_attempt(
                     work_id,
                     **identity,
@@ -23695,7 +24213,11 @@ class GatewayRunner:
                     attempt_id=str(identity.get("attempt_id") or "") or None,
                     reason="session_stop",
                 )
-                stopped += max(len(cancelled_ids), int(result.get("matched") or 0))
+                stopped += max(
+                    int(attempt_fenced),
+                    len(cancelled_ids),
+                    int(result.get("matched") or 0),
+                )
                 refreshed = ledger.required_async_completion_state(work_id)
                 stop_failed = bool(
                     isinstance(refreshed, dict)
@@ -23724,9 +24246,7 @@ class GatewayRunner:
                             "its result was reconciled and will not be resumed automatically."
                         ),
                         reason=(
-                            "required_async_cancelled"
-                            if refreshed.get("has_required")
-                            else "advisory_async_cancelled"
+                            "required_async_attempt_cancelled"
                         ),
                         reconciliation_id=reconciliation_id,
                     )
