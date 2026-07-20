@@ -1414,13 +1414,16 @@ def test_uncertain_push_reobserves_fenced_exact_head_not_moving_branch(
     assert not any(args[:2] == ["git", "push"] for args in calls)
 
 
+@pytest.mark.parametrize("source", ["direct", "fable"])
 def test_new_closeout_pushes_immutable_head_refspec_without_force(
     monkeypatch,
     tmp_path,
+    source,
 ):
     _patch_repo_boundary(monkeypatch)
     calls = []
     state = _state(tmp_path)
+    state["source"] = source
     state["pr"] = {"title": "Test PR", "head_sha": HEAD_SHA}
 
     def run(args, **_kwargs):

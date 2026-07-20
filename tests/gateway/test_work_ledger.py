@@ -76,12 +76,14 @@ def _activated_visual_closeout(
     item: dict,
     *,
     head_sha: str,
+    source: str = "direct",
 ) -> dict:
     attached = ledger.attach_closeout_workspace(
         item["id"],
         workspace_path="/mutable/worktree",
         repository="acme/example",
         branch="feature/visual",
+        source=source,
         mode="enforce",
         policy={
             "merge": "auto",
@@ -2460,7 +2462,11 @@ def test_visual_completion_is_sanitized_and_late_h_receipt_is_rejected_after_h2(
     assert ledger.get(item["id"]) == before
 
 
-def test_verified_h2_publication_invalidates_h_gates_and_active_lease(tmp_path):
+@pytest.mark.parametrize("source", ["direct", "fable"])
+def test_verified_h2_publication_invalidates_h_gates_and_active_lease(
+    tmp_path,
+    source,
+):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     event = _discord_event(
         message_id="closeout-publish-h2",
@@ -2474,7 +2480,12 @@ def test_verified_h2_publication_invalidates_h_gates_and_active_lease(tmp_path):
     )
     assert item is not None
     head_sha = "d" * 40
-    activated = _activated_visual_closeout(ledger, item, head_sha=head_sha)
+    activated = _activated_visual_closeout(
+        ledger,
+        item,
+        head_sha=head_sha,
+        source=source,
+    )
     prior = dict(activated)
     prior["policy"] = {**prior["policy"], "require_review": True}
     prior["review"] = {"status": "approved", "head_sha": head_sha}

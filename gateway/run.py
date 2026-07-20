@@ -2915,6 +2915,84 @@ def _repository_visual_qa_config(
     }
 
 
+def _gateway_action_request_text(event: Any) -> str:
+    """Return the original action request used for shared closeout policy."""
+
+    feature_summary = getattr(event, "feature_summary", None)
+    return (
+        str(feature_summary.get("initial_request") or "").strip()
+        if isinstance(feature_summary, dict)
+        else ""
+    ) or str(getattr(event, "text", "") or "").strip()
+
+
+def _gateway_action_closeout_contract(
+    config: dict[str, Any],
+    *,
+    repository: str,
+    request: str,
+    source: str = "direct",
+    visual_requirement: Any = None,
+    visual_config: Any = None,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve the one trusted closeout contract for Discord action turns."""
+
+    closeout_config = _effective_closeout_repository_config(
+        config.get("closeout"),
+        repository,
+    )
+    surfaces = _closeout_mapping(closeout_config.get("surfaces"))
+    normalized_source = str(source or "direct").strip().lower()
+    surface_enabled = surfaces.get("direct") is not False
+    legacy_fable_lifecycle = ""
+    if normalized_source == "fable":
+        # Bounded migration compatibility for pre-unification installations.
+        # New configs omit both legacy keys and use the ordinary direct policy.
+        # Explicit old opt-outs remain authoritative and cannot silently gain
+        # PR/merge authority after upgrade.
+        surface_enabled = surface_enabled and surfaces.get("fable") is not False
+        fable_config = _closeout_mapping(config.get("fable"))
+        if "git_lifecycle" in fable_config:
+            legacy_fable_lifecycle = str(
+                fable_config.get("git_lifecycle") or "none"
+            ).strip().lower()
+            if legacy_fable_lifecycle not in {"pr", "merge"}:
+                surface_enabled = False
+    mode = (
+        str(closeout_config.get("mode") or "shadow").strip().lower()
+        if surface_enabled
+        else "off"
+    )
+    from hermes_cli.discord_worker_boards import pr_policy_for_request
+
+    pr_lifecycle_policy = pr_policy_for_request(str(request or ""))
+    policy = {
+        "merge": pr_lifecycle_policy["merge_policy"],
+        "pr_open": pr_lifecycle_policy["pr_open_policy"],
+        "early_draft_pr": closeout_config.get("early_draft_pr") is True,
+        "require_local_verification": True,
+        "require_review": False,
+        "require_visual_qa": bool(
+            isinstance(visual_requirement, dict)
+            and visual_requirement.get("level") in {"surface", "artifact"}
+            and isinstance(visual_config, dict)
+            and visual_config.get("mode") == "enforce_explicit"
+        ),
+        "post_merge_requirements": _closeout_mapping(
+            closeout_config.get("post_merge_requirements")
+        ),
+    }
+    if normalized_source == "fable" and legacy_fable_lifecycle in {"pr", "merge"}:
+        policy.update(
+            {
+                "merge": "auto" if legacy_fable_lifecycle == "merge" else "never",
+                "pr_open": "after_review_approval",
+                "early_draft_pr": True,
+            }
+        )
+    return mode, policy
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -3024,11 +3102,9 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
                 [
                     f"[ASYNC CODING WORKER COMPLETE — {delegation_id}]",
                     "Trusted Hermes completion-time post-processing has already run. "
-                    "Review the deterministic evidence below, verify scope_check, "
-                    "parallel_merge, and fable_git_result when present, then report the "
-                    "outcome to the user. Include the PR link when fable_git_result "
-                    "contains one. Do not attribute trusted Git lifecycle actions to "
-                    "the coding worker.",
+                    "Review the deterministic evidence below, verify scope_check and "
+                    "parallel_merge when present, then report the outcome to the user. "
+                    "Do not attribute trusted Git lifecycle actions to the coding worker.",
                     "",
                     f"Original task: {evt.get('task') or evt.get('goal') or ''}",
                     f"Worker cwd: {evt.get('worker_cwd') or ''}",
@@ -3041,25 +3117,9 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
                 ]
             )
 
-        status = str(evt.get("status") or "completed")
-        lines = [
-            f"[ASYNC DELEGATION COMPLETE — {delegation_id}]",
-            "A background subagent dispatched earlier has finished. Review the "
-            "self-contained task source and report the result in this fresh turn.",
-            "",
-            f"Original goal: {evt.get('goal') or ''}",
-        ]
-        if evt.get("context"):
-            lines.append(f"Context provided: {evt['context']}")
-        lines.extend(
-            [
-                f"Role: {evt.get('role') or 'leaf'}   Model: {evt.get('model') or '?'}",
-                f"Status: {status}   Duration: {evt.get('duration_seconds', '?')}s",
-                "--- RESULT ---",
-                str(evt.get("summary") or evt.get("error") or "No result text."),
-            ]
-        )
-        return "\n".join(lines)
+        from tools.process_registry import format_process_notification
+
+        return format_process_notification(evt)
 
     return None
 
@@ -4972,7 +5032,7 @@ class GatewayRunner:
         )
         # Workspace attachment is not a lifecycle handoff. The watcher is
         # notified only after a trusted checkpoint atomically activates the
-        # complete closeout state (for example Fable after commit/push/draft PR).
+        # complete closeout state.
         return state
 
     def _activate_direct_closeout_after_checkpoint(
@@ -5014,28 +5074,8 @@ class GatewayRunner:
             item.get("closeout_authoritative") is True
             or item.get("closeout_activated_at") is not None
         )
-        if state["source"] != "direct":
-            if (
-                state["source"] != "fable"
-                or not already_activated
-                or visual_pending
-                or not state["policy"]["require_visual_qa"]
-            ):
-                return None
-            visual_result = (
-                agent_result.get("visual_qa")
-                if isinstance(agent_result.get("visual_qa"), dict)
-                else {}
-            )
-            applied = ledger.apply_closeout_visual_completion(
-                work_item_id,
-                expected_head_sha=str(state["pr"].get("head_sha") or ""),
-                receipts=visual_result.get("receipts"),
-                min_receipt_order=int(visual_result.get("min_receipt_order") or 0),
-            )
-            if applied is not None:
-                notify_closeout()
-            return applied
+        if state["source"] not in {"direct", "fable"}:
+            return None
 
         runtime_breakdown = (
             agent_result.get("runtime_breakdown")
@@ -13394,46 +13434,15 @@ class GatewayRunner:
                     repository = str(github_origin_repo(action_worktree_cwd) or "")
                 except Exception:
                     repository = ""
-            closeout_cfg = _effective_closeout_repository_config(
-                _pcfg.get("closeout"),
-                repository,
-            )
-            closeout_surfaces = (
-                closeout_cfg.get("surfaces")
-                if isinstance(closeout_cfg.get("surfaces"), dict)
-                else {}
-            )
-            direct_mode = (
-                str(closeout_cfg.get("mode") or "shadow").strip().lower()
-                if not _fable_implementation_turn and closeout_surfaces.get("direct") is not False
-                else "off"
-            )
             visual_requirement = getattr(event, "visual_qa_requirement", None)
-            feature_summary = getattr(event, "feature_summary", None)
-            direct_request = (
-                str(feature_summary.get("initial_request") or "").strip()
-                if isinstance(feature_summary, dict)
-                else ""
-            ) or str(getattr(event, "text", "") or "").strip()
-            from hermes_cli.discord_worker_boards import pr_policy_for_request
-
-            pr_lifecycle_policy = pr_policy_for_request(direct_request)
-            direct_policy = {
-                "merge": pr_lifecycle_policy["merge_policy"],
-                "pr_open": pr_lifecycle_policy["pr_open_policy"],
-                "early_draft_pr": closeout_cfg.get("early_draft_pr") is True,
-                "require_local_verification": True,
-                "require_review": False,
-                "require_visual_qa": bool(
-                    isinstance(visual_requirement, dict)
-                    and visual_requirement.get("level") in {"surface", "artifact"}
-                    and isinstance(getattr(event, "visual_qa_config", None), dict)
-                    and event.visual_qa_config.get("mode") == "enforce_explicit"
-                ),
-                "post_merge_requirements": _closeout_mapping(
-                    closeout_cfg.get("post_merge_requirements")
-                ),
-            }
+            direct_mode, direct_policy = _gateway_action_closeout_contract(
+                _pcfg,
+                repository=repository,
+                request=_gateway_action_request_text(event),
+                source="fable" if _fable_implementation_turn else "direct",
+                visual_requirement=visual_requirement,
+                visual_config=getattr(event, "visual_qa_config", None),
+            )
             self._persist_action_closeout_workspace(
                 event,
                 mutable_path=action_worktree_cwd,
@@ -14027,6 +14036,21 @@ class GatewayRunner:
                         pass
                 except Exception as exc:
                     logger.debug("Discord work ledger agent_running update failed: %s", exc)
+            detached_accounting = []
+            pending_accounting = getattr(
+                self,
+                "_pending_detached_delegation_accounting",
+                None,
+            )
+            if isinstance(pending_accounting, dict):
+                detached_accounting.extend(pending_accounting.pop(session_key, []))
+            event_accounting = getattr(
+                event,
+                "detached_delegation_accounting",
+                None,
+            )
+            if isinstance(event_accounting, dict):
+                detached_accounting.append(event_accounting)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -14052,6 +14076,7 @@ class GatewayRunner:
                 visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
                 visual_qa_config=getattr(event, "visual_qa_config", None),
                 completed_worker_run=getattr(event, "completed_worker_run", None),
+                detached_delegation_accounting=detached_accounting,
                 origin_work_item_id=str(work_item_id or ""),
             )
 
@@ -19901,7 +19926,6 @@ class GatewayRunner:
             build_fable_implementation_instruction,
             build_fable_plan_invocation,
             fable_enabled_toolsets,
-            fable_git_lifecycle_mode,
             fable_metadata,
             fable_reasoning_config,
             fable_session_model_override,
@@ -19952,21 +19976,22 @@ class GatewayRunner:
                     f"in a mutable Git worktree. {session_cwd_error}"
                 )
             if action_worktree_cwd:
-                closeout_config = cfg.get("closeout") if isinstance(cfg.get("closeout"), dict) else {}
-                lifecycle = fable_git_lifecycle_mode(cfg)
-                # Persist identity now, but activation remains the coding
-                # worker's responsibility after trusted commit/push/PR handoff.
-                closeout_mode = "off"
-                requirements = closeout_config.get("post_merge_requirements")
-                closeout_policy = {
-                    "merge": "auto" if lifecycle == "merge" else "never",
-                    "pr_open": "after_review_approval",
-                    "early_draft_pr": True,
-                    "require_local_verification": True,
-                    "require_review": False,
-                    "require_visual_qa": False,
-                    "post_merge_requirements": _closeout_mapping(requirements),
-                }
+                repository = _gateway_repository_for_source(event.source)
+                if not repository:
+                    try:
+                        from hermes_cli.github_remote import github_origin_repo
+
+                        repository = str(github_origin_repo(action_worktree_cwd) or "")
+                    except Exception:
+                        repository = ""
+                closeout_mode, closeout_policy = _gateway_action_closeout_contract(
+                    cfg,
+                    repository=repository,
+                    request=_gateway_action_request_text(event),
+                    source="fable",
+                    visual_requirement=getattr(event, "visual_qa_requirement", None),
+                    visual_config=getattr(event, "visual_qa_config", None),
+                )
                 self._persist_action_closeout_workspace(
                     event,
                     mutable_path=action_worktree_cwd,
@@ -19990,7 +20015,6 @@ class GatewayRunner:
             workdir=session_cwd,
             source_text=original_text,
             platform=event.source.platform.value if event.source.platform else "",
-            git_lifecycle=fable_git_lifecycle_mode(cfg),
         )
         if mode == FABLE_PLAN_MODE:
             msg = build_fable_plan_invocation(request, task_id=session_key)
@@ -21405,11 +21429,9 @@ class GatewayRunner:
             return False
         if mode != "error":
             return True
-        result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
-        return not bool(
-            evt.get("status") in {"completed", "success"}
-            and result.get("success", True)
-        )
+        from tools.async_delegation import async_completion_succeeded
+
+        return not async_completion_succeeded(evt)
 
     async def _inject_async_delegation_completion(
         self,
@@ -21442,6 +21464,11 @@ class GatewayRunner:
         synth_event.background_completion_id = str(
             evt.get("delegation_id") or ""
         )
+        synth_event.detached_delegation_accounting = (
+            dict(evt.get("accounting") or {})
+            if isinstance(evt.get("accounting"), dict)
+            else None
+        )
         origin_work_item_id = str(evt.get("origin_work_item_id") or "").strip()
         synth_event.work_item_id = origin_work_item_id or None
         synth_event.completed_worker_run = (
@@ -21462,6 +21489,13 @@ class GatewayRunner:
         """Finalize visible Discord state when notification config suppresses a turn."""
         delegation_id = str(evt.get("delegation_id") or "")
         session_key = str(evt.get("session_key") or "")
+        accounting = evt.get("accounting")
+        if isinstance(accounting, dict) and accounting:
+            pending = getattr(self, "_pending_detached_delegation_accounting", None)
+            if not isinstance(pending, dict):
+                pending = {}
+                self._pending_detached_delegation_accounting = pending
+            pending.setdefault(session_key, []).append(dict(accounting))
         try:
             from tools.async_delegation import mark_completion_delivered
 
@@ -21491,10 +21525,14 @@ class GatewayRunner:
         try:
             from gateway.platforms.base import ProcessingOutcome
 
+            from tools.async_delegation import async_completion_succeeded
+
             result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
-            success = bool(
-                evt.get("status") in {"completed", "success"}
-                and result.get("success", True)
+            success = async_completion_succeeded(evt)
+            completion_summary = (
+                str(result.get("summary") or result.get("error") or "")
+                if evt.get("kind") == "coding_worker"
+                else str(_format_gateway_process_notification(evt) or "")
             )
             outcome = (
                 ProcessingOutcome.SUCCESS
@@ -21521,7 +21559,7 @@ class GatewayRunner:
                     "Coding workers are still running; completion will arrive "
                     "in a follow-up turn."
                     if pending_background
-                    else str(result.get("summary") or result.get("error") or "")
+                    else completion_summary
                 ),
                 status=(
                     "Running"
@@ -22728,6 +22766,7 @@ class GatewayRunner:
         visual_qa_requirement: Optional[Dict[str, Any]] = None,
         visual_qa_config: Optional[Dict[str, Any]] = None,
         completed_worker_run: Optional[Dict[str, Any]] = None,
+        detached_delegation_accounting: Any = None,
         origin_work_item_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -23785,6 +23824,23 @@ class GatewayRunner:
             agent._closeout_notify = closeout_watcher.notify if closeout_watcher is not None else None
             if isinstance(completed_worker_run, dict) and completed_worker_run:
                 agent.turn_worker_runs = [dict(completed_worker_run)]
+            accounting_items = (
+                detached_delegation_accounting
+                if isinstance(detached_delegation_accounting, list)
+                else [detached_delegation_accounting]
+            )
+            if accounting_items:
+                try:
+                    from tools.delegate_tool import apply_detached_delegation_accounting
+
+                    for accounting in accounting_items:
+                        if isinstance(accounting, dict):
+                            apply_detached_delegation_accounting(agent, accounting)
+                except Exception:
+                    logger.debug(
+                        "Detached delegation accounting application failed",
+                        exc_info=True,
+                    )
             # Per-turn rather than constructor state: cached agents must not
             # carry a previous Discord work item's requirement into a later
             # message. The agent/tool executor owns receipt collection.
@@ -23795,7 +23851,6 @@ class GatewayRunner:
             if (
                 origin_work_item_id
                 and discord_action_runtime
-                and not fable_implementation
                 and visual_qa_config.get("mode") == "enforce_explicit"
                 and visual_qa_requirement.get("level") in {"surface", "artifact"}
             ):
@@ -23816,16 +23871,9 @@ class GatewayRunner:
             # Reset this on every turn so a cached agent cannot leak the wire
             # format into an unrelated non-Fable request.
             agent._anthropic_oauth_tool_name_compat = fable_oauth_tool_name_compat
-            # Fable implementation parents retain the normal Discord tool
-            # surface for inspection/review, while tool execution blocks all
-            # direct repository mutations in favor of the Codex worker.
+            # Retained only as model/provenance metadata; lifecycle and worker
+            # behavior are identical to ordinary Discord action requests.
             agent._fable_implementation_turn = fable_implementation
-            if fable_implementation:
-                from hermes_cli.fable_planner import fable_git_lifecycle_mode
-
-                agent._fable_git_lifecycle = fable_git_lifecycle_mode(user_config)
-            else:
-                agent._fable_git_lifecycle = "none"
             session_model_override = bool(
                 (getattr(self, "_session_model_overrides", {}) or {}).get(session_key)
             )

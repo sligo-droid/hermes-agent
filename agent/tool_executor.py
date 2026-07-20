@@ -216,7 +216,7 @@ def _merge_completed_parallel_coding_result(
         is_error,
         blocked,
     ) = result_entry
-    if function_name != "delegate_coding_task" or blocked or is_error:
+    if function_name != "delegate_coding_task" or blocked:
         return result_entry
 
     try:
@@ -304,6 +304,57 @@ _TERMINAL_MUTATION_PATTERNS = re.compile(
     re.VERBOSE,
 )
 
+_DELEGATION_OBSERVATION_TOOLS = frozenset({
+    "delegate_task",
+    "ha_get_state",
+    "ha_list_entities",
+    "ha_list_services",
+    "read_file",
+    "read_terminal",
+    "search_files",
+    "session_search",
+    "skill_view",
+    "skills_list",
+    "tool_describe",
+    "tool_search",
+    "vision_analyze",
+    "web_extract",
+    "web_search",
+})
+
+
+def _delegation_mutation_block(
+    agent: Any,
+    function_name: str,
+    function_args: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Enforce read-only/broker-only delegate policy after tool-search unwrap."""
+    read_only = bool(getattr(agent, "_delegation_read_only", False))
+    broker_only = bool(getattr(agent, "_delegation_broker_only_mutation", False))
+    if not read_only and not broker_only:
+        return None
+    args = function_args or {}
+    if broker_only and function_name == "request_coding_task":
+        return None
+    if function_name == "terminal":
+        # Shell command surfaces are too expressive for a durable fail-closed
+        # delegated read-only contract. Nominally observational commands can
+        # still write through command-specific options, aliases, hooks, or
+        # pagers (for example git diff/show --output and tree -o).
+        allowed = False
+    elif function_name == "process":
+        allowed = str(args.get("action") or "") in {"list", "poll", "log", "wait"}
+    else:
+        allowed = function_name in _DELEGATION_OBSERVATION_TOOLS
+    if allowed:
+        return None
+    policy = "read-only" if read_only else "broker-only mutation"
+    return (
+        f"Blocked {function_name}: this delegated agent is in {policy} mode. "
+        "Only explicit observation tools are allowed; terminal execution and "
+        "unknown plugin/MCP tools fail closed."
+    )
+
 
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
@@ -367,22 +418,11 @@ def _coding_worker_mutation_block(agent, function_name: str, function_args: Opti
     """Return a guardrail message when Hermes-codebase work skipped the worker."""
     if function_name == "delegate_coding_task":
         return None
-    if getattr(agent, "_fable_implementation_turn", False) and function_name == "delegate_task":
-        return (
-            "Discord /fable implementation must delegate repository work through "
-            "delegate_coding_task with the Codex coding worker, not delegate_task."
-        )
     function_args = function_args or {}
     mutation_tool = function_name in _CODING_WORKER_BLOCKED_MUTATION_TOOLS
     terminal_mutation = function_name == "terminal" and _terminal_command_may_mutate(function_args)
     if not mutation_tool and not terminal_mutation:
         return None
-    if getattr(agent, "_fable_implementation_turn", False):
-        return (
-            "Discord /fable implementation may inspect and review, but every repository "
-            "mutation must go through delegate_coding_task with the Codex coding worker. "
-            "Do not edit directly before or after the worker returns."
-        )
     if str(getattr(agent, "api_mode", "") or "").strip().lower() == "codex_app_server":
         return None
     if not getattr(agent, "_coding_worker_required_this_turn", False):
@@ -777,7 +817,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
         elif block_result is None:
-            block_message = _coding_worker_mutation_block(agent, function_name, function_args)
+            block_message = _delegation_mutation_block(agent, function_name, function_args)
+            if block_message is None:
+                block_message = _coding_worker_mutation_block(agent, function_name, function_args)
             if block_message is None:
                 try:
                     from hermes_cli.plugins import get_pre_tool_call_block_message
@@ -855,15 +897,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug(f"Tool start callback error: {cb_err}")
 
     parallel_coding_group = None
-    if num_tools > 1 and all(
-        name == "delegate_coding_task"
-        for _tc, name, _args, _storage_args, _block_result, _blocked in parsed_calls
+    coding_batch_calls = [
+        item for item in parsed_calls if item[1] == "delegate_coding_task"
+    ]
+    all_batch_calls_are_coding = len(coding_batch_calls) == len(parsed_calls)
+    if len(coding_batch_calls) > 1 and (
+        all_batch_calls_are_coding
+        or all(
+            args.get("background") is True
+            for _tc, _name, args, _storage_args, _block_result, _blocked in coding_batch_calls
+        )
     ):
         parallel_coding_group = {
             "group_id": uuid.uuid4().hex,
             "base_cwd": _parallel_coding_base_cwd(agent),
         }
-        for _tc, _name, args, _storage_args, _block_result, _blocked in parsed_calls:
+        for _tc, _name, args, _storage_args, _block_result, _blocked in coding_batch_calls:
             args["_parallel_group"] = dict(parallel_coding_group)
 
     # ── Concurrent execution ─────────────────────────────────────────
@@ -1024,7 +1073,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             tool_error,
                             exc_info=True,
                         )
-                    if parallel_coding_group is not None:
+                    if (
+                        parallel_coding_group is not None
+                        and parsed_calls[future_indexes[completed_future]][1]
+                        == "delegate_coding_task"
+                        and not parsed_calls[future_indexes[completed_future]][2].get("background")
+                    ):
                         result_index = future_indexes[completed_future]
                         results[result_index] = _merge_completed_parallel_coding_result(
                             results[result_index],
@@ -1307,7 +1361,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif _ts_scope_block is not None:
             _block_msg = _ts_scope_block
         else:
-            _block_msg = _coding_worker_mutation_block(agent, function_name, function_args)
+            _block_msg = _delegation_mutation_block(agent, function_name, function_args)
+            if _block_msg is None:
+                _block_msg = _coding_worker_mutation_block(agent, function_name, function_args)
             if _block_msg is None:
                 try:
                     from hermes_cli.plugins import get_pre_tool_call_block_message

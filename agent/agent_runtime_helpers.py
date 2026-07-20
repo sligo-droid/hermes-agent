@@ -1621,6 +1621,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    # Central delegated-agent mutation policy. Concurrent callers normally
+    # preflight this after tool-search unwrap, but inline/direct invocation must
+    # fail closed too.
+    if not pre_tool_block_checked:
+        from agent.tool_executor import _delegation_mutation_block
+
+        delegation_block = _delegation_mutation_block(
+            agent, function_name, function_args
+        )
+        if delegation_block is not None:
+            return json.dumps({"error": delegation_block}, ensure_ascii=False)
+
     # Check plugin hooks for a block directive before executing anything.
     block_message: Optional[str] = None
     if not pre_tool_block_checked:

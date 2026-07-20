@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -22,16 +20,6 @@ FABLE_REASONING = {"enabled": True, "effort": "high"}
 FABLE_DEFAULT_TOOLSETS = ["file", "terminal", "web", "browser", "discord"]
 FABLE_PLAN_MODE = "plan"
 FABLE_IMPLEMENTATION_MODE = "implementation"
-FABLE_GIT_LIFECYCLE_NONE = "none"
-FABLE_GIT_LIFECYCLE_PR = "pr"
-FABLE_GIT_LIFECYCLE_MERGE = "merge"
-_FABLE_GIT_LIFECYCLE_MODES = frozenset(
-    {
-        FABLE_GIT_LIFECYCLE_NONE,
-        FABLE_GIT_LIFECYCLE_PR,
-        FABLE_GIT_LIFECYCLE_MERGE,
-    }
-)
 
 # Bare Discord `/fable` normally starts an implementation turn.  Keep clear
 # natural-language requests for a plan on the safer plan-only route instead.
@@ -51,28 +39,7 @@ _FABLE_NATURAL_PLAN_INTENT = re.compile(
 
 FABLE_RUNTIME_NOTE = """This is `/fable`: use Claude Fable 5, planning only, inspect repo with read-only tools as needed, save a plan artifact if the plan skill requires it, and do not implement. Do not edit files, create branches, open pull requests, deploy, or claim that implementation, tests, commits, PRs, or deployment happened. Generate a concrete Markdown implementation plan only. Your final answer must contain the full plan markdown, plus the saved path if you wrote one; do not answer with only a brief path/status note. Hermes/gateway will handle Discord delivery, threading, and artifact indexing outside the Fable turn, so do not describe or perform those operational steps."""
 
-FABLE_IMPLEMENTATION_RUNTIME_NOTE = """This is Discord `/fable` implementation mode: use Claude Fable 5 to inspect, coordinate, and review the requested implementation in the normal Discord action-request flow. You may use read-only tools to investigate and review the resulting work. Every repository mutation — including file edits, generated files, dependency changes, tests that write, and git changes — must be performed through `delegate_coding_task` using the Codex coding worker in a mutable git worktree. Choose `worker_tier` deliberately: use `quick` for obvious tiny changes, escalate the tier on retry instead of re-instructing at the same tier, and reserve `max` for rare complete-redesign situations. Front-load what you learned into `relevant_files`, `approach`, `constraints`, and `verification`; a well-briefed cheap worker beats an expensive worker that must rediscover the repository. You may issue several `delegate_coding_task` calls in one response when the tasks are genuinely independent; give each its own `worker_tier`, context pack, and non-overlapping `scope_paths`, which are required for parallel execution. Never parallelize coupled edits such as an API change and its callers, and review the merged result afterward. Prefer `background=true` for one long ungrouped delegation so the thread stays responsive; completion arrives as a follow-up turn, so never claim completion from the dispatch handle. Keep parallel Fable groups synchronous. Use `delegate_task` batch mode only for read-only analysis fan-out across similar items, including proposed content transformations and data-quality assessments; keep every mutation on `delegate_coding_task` and reserve inline Fable work for judgment and review. Do not foreground-watch long external Airflow/DAG/intake/deploy runs; use `terminal(background=True, notify_on_complete=True)` or a bounded cron poller, then continue or end the turn because completion re-enters as a follow-up turn. The Workdir in this request is the pre-provisioned workspace for this turn: pass it as `cwd` when delegating, or omit `cwd` to inherit it; never ask the worker to create a second worktree or clone from the canonical checkout. Ask the worker to stop after local edits and focused verification; it must not stage, commit, push, open or edit PRs, wait for CI, merge, or touch the protected canonical checkout. Trusted Hermes code owns those GitHub lifecycle steps after the worker returns. If `fable_git_result.recovery_required` is true, follow its `next_action`: call `delegate_coding_task` again with the same `cwd` and a focused recovery task; trusted Hermes will prepare the local base merge, Codex will resolve only the file contents and verify them, and trusted Hermes will finalize the PR. Do not use write_file, patch, execute_code, or mutating terminal commands to edit the repository yourself. Do not fall back to OpenCode, Claude Code, or direct Fable edits. If Codex or a mutable worktree is unavailable, report that exact blocker clearly. The Git Lifecycle Policy is gateway-owned, not model-controlled; report the deterministic `fable_git_result` returned by the worker tool and do not claim remote Git actions without that evidence. Attribute a commit, push, PR creation, or merge to trusted Hermes only when the corresponding `commit_performed`, `push_performed`, `pr_created`, or `merge_performed` field is true. When `merge_observed` is true and `merge_performed` is false, say only that Hermes observed the PR already merged; do not attribute the merge to the worker or gateway. Never say that Codex committed, pushed, created the PR, waited for CI, or merged. After the worker returns, inspect and review its result, run only safe read-only verification yourself, and report the outcome concisely."""
-
-
-def fable_claude_code_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Build a scrubbed Claude Code environment pinned to interactive OAuth."""
-    from hermes_constants import _process_user_home
-    from tools.environments.local import _sanitize_subprocess_env
-
-    env = _sanitize_subprocess_env(os.environ if base_env is None else base_env)
-    for key in tuple(env):
-        if key.startswith("ANTHROPIC_") or key == "CLAUDE_CODE_OAUTH_TOKEN":
-            env.pop(key, None)
-
-    account_home = _process_user_home() or Path.home()
-    claude_config_dir = account_home / ".claude"
-    if not (claude_config_dir / ".credentials.json").is_file():
-        raise RuntimeError(
-            "Claude Code OAuth credentials are unavailable for the Fable route; "
-            "run `claude login` for this OS account before using the UI specialist."
-        )
-    env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
-    return env
+FABLE_IMPLEMENTATION_RUNTIME_NOTE = """This is Discord `/fable` implementation mode: use Claude Fable 5 as the model for orchestration, judgment, and review while following Hermes' normal Discord action-request policy. Fable changes model and provenance only; it does not change tool policy, coding-worker routing, mutation authority, visual QA, or trusted closeout behavior. General analysis may use `delegate_task(read_only=true)`; coding uses the normal `delegate_coding_task` worker tiers, structured handoffs, safe background scheduling, scope reservations, isolated parallel worktrees, merge-back, and post-worker behavior. The Workdir in this request is the pre-provisioned mutable workspace: pass it as `cwd` when delegating or omit `cwd` to inherit it, and do not create a second checkout. Coding workers edit and run focused verification locally. The gateway-owned trusted closeout state machine handles commit, push, PR, CI, merge, canonical sync, and durable completion exactly as it does for an ordinary Discord action request. Never claim lifecycle completion from a background dispatch handle or worker prose alone; rely on the gateway's final closeout state."""
 
 
 @dataclass(frozen=True)
@@ -82,24 +49,12 @@ class FablePlanRequest:
     workdir: str = ""
     source_text: str = ""
     platform: str = ""
-    git_lifecycle: str = FABLE_GIT_LIFECYCLE_NONE
     transport: str = FABLE_TRANSPORT
     max_tokens: int = 12000
     timeout_seconds: int = 300
 
 
-@dataclass(frozen=True)
-class FablePlanResult:
-    ok: bool
-    content: str
-    transport: str
-    model: str
-    error: str = ""
-    refusal: bool = False
-
-
 def fable_metadata(
-    result: FablePlanResult | None = None,
     config: dict[str, Any] | None = None,
     *,
     mode: str = FABLE_PLAN_MODE,
@@ -109,7 +64,6 @@ def fable_metadata(
     metadata = {
         "command": "fable",
         "fable_mode": normalized_mode,
-        "git_lifecycle": fable_git_lifecycle_mode(config),
         "route": route,
         "transport": _fable_transport(route),
         "provider": FABLE_PROVIDER,
@@ -136,11 +90,6 @@ def fable_metadata(
                 "kind": "fable_implementation",
             }
         )
-    if result is not None:
-        metadata["transport"] = result.transport
-        metadata["model"] = result.model
-        metadata["ok"] = result.ok
-        metadata["refusal"] = result.refusal
     return metadata
 
 
@@ -152,14 +101,6 @@ def fable_enabled_toolsets(config: dict[str, Any] | None = None) -> list[str]:
         if toolsets:
             return toolsets
     return list(FABLE_DEFAULT_TOOLSETS)
-
-
-def fable_git_lifecycle_mode(config: dict[str, Any] | None = None) -> str:
-    """Resolve the trusted remote-Git capability for Fable implementation turns."""
-    raw = str(_fable_config(config).get("git_lifecycle") or "").strip().lower()
-    if raw in _FABLE_GIT_LIFECYCLE_MODES:
-        return raw
-    return FABLE_GIT_LIFECYCLE_NONE
 
 
 def fable_reasoning_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -245,7 +186,6 @@ def build_fable_implementation_instruction(request: FablePlanRequest) -> str:
         ("Session", request.session_id.strip()),
         ("Platform", request.platform.strip()),
         ("Workdir", request.workdir.strip()),
-        ("Git Lifecycle Policy", request.git_lifecycle.strip()),
         ("Source Text", request.source_text.strip()),
     ]
     rendered = [f"## {title}\n{value.strip()}" for title, value in sections if value]
@@ -369,51 +309,6 @@ def _fable_proxy_session_model_override(cfg: dict[str, Any]) -> tuple[dict[str, 
     }, ""
 
 
-def _is_fable_budget_error(exc: Exception) -> bool:
-    """Return True for Anthropic/Fable budget, quota, billing, or credit exhaustion.
-
-    `/fable` is intentionally pinned to Claude Fable 5. If that route reports
-    budget exhaustion, the command must fail closed instead of using the general
-    auxiliary provider/model fallback machinery.
-    """
-    try:
-        from agent.auxiliary_client import _is_payment_error
-
-        if _is_payment_error(exc):
-            return True
-    except Exception:
-        pass
-
-    status = getattr(exc, "status_code", None)
-    text = str(exc).lower()
-    if status == 402:
-        return True
-    return any(
-        marker in text
-        for marker in (
-            "budget expended",
-            "budget is expended",
-            "budget exhausted",
-            "budget is exhausted",
-            "quota exceeded",
-            "quota_exceeded",
-            "daily quota",
-            "daily limit",
-            "weekly usage limit",
-            "weekly limit",
-            "resource exhausted",
-            "no usable credits",
-            "insufficient funds",
-            "payment required",
-            "balance_depleted",
-            "out of funds",
-            "run out of funds",
-            "not available on the free tier",
-            "model_not_supported_on_free_tier",
-        )
-    )
-
-
 def _fable_budget_error_message(detail: str = "") -> str:
     base = (
         "Fable 5 budget/quota is expended on Hermes' configured Anthropic route; "
@@ -516,7 +411,3 @@ def _is_valid_fable_proxy_base_url(base_url: str) -> bool:
         return parsed.port is None or 0 < parsed.port <= 65535
     except ValueError:
         return False
-
-
-def _error(message: str) -> FablePlanResult:
-    return FablePlanResult(False, "", FABLE_TRANSPORT, FABLE_MODEL, message)

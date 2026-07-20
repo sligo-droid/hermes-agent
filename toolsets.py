@@ -272,6 +272,18 @@ TOOLSETS = {
         "includes": []
     },
 
+    "coding_worker_raw": {
+        "description": "Trusted root coding-worker mutation surface",
+        "tools": ["delegate_coding_task"],
+        "includes": [],
+    },
+
+    "delegated_coding_broker": {
+        "description": "Root-owned coding broker for explicitly authorized orchestrator children",
+        "tools": ["request_coding_task"],
+        "includes": [],
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 

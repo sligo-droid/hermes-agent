@@ -70,21 +70,18 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
-        # toolsets is intentionally NOT exposed to the model — subagents always
-        # inherit the parent's toolsets. Letting the model name toolsets was a
-        # capability-selection surface the model should not control.
-        self.assertNotIn("toolsets", props)
-        self.assertNotIn("toolsets", props["tasks"]["items"]["properties"])
+        self.assertIn("toolsets", props)
+        self.assertIn("toolsets", props["tasks"]["items"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
         self.assertNotIn("max_iterations", props)
         # ACP subprocess transport is operator-controlled via config.yaml, not
         # model-controlled via delegate_task arguments.
-        self.assertNotIn("acp_command", props)
-        self.assertNotIn("acp_args", props)
-        self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
-        self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
+        self.assertIn("acp_command", props)
+        self.assertIn("acp_args", props)
+        self.assertIn("acp_command", props["tasks"]["items"]["properties"])
+        self.assertIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
     def test_schema_description_advertises_runtime_limits(self):
@@ -612,12 +609,12 @@ class TestToolNamePreservation(unittest.TestCase):
             overrides = _build_dynamic_schema_overrides()
 
         props = overrides["parameters"]["properties"]
-        self.assertNotIn("acp_command", props)
-        self.assertNotIn("acp_args", props)
+        self.assertIn("acp_command", props)
+        self.assertIn("acp_args", props)
 
         task_item_props = props["tasks"]["items"]["properties"]
-        self.assertNotIn("acp_command", task_item_props)
-        self.assertNotIn("acp_args", task_item_props)
+        self.assertIn("acp_command", task_item_props)
+        self.assertIn("acp_args", task_item_props)
 
     def test_saved_tool_names_set_on_child_before_run(self):
         """_run_single_child must set _delegate_saved_tool_names on the child
@@ -2564,8 +2561,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
 
-    def test_model_acp_args_not_forwarded(self):
-        """The live model dispatch path strips hidden ACP transport args."""
+    def test_model_acp_args_preserve_public_compatibility(self):
         import run_agent
 
         captured = {}
@@ -2592,11 +2588,11 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 },
             )
 
-        self.assertNotIn("acp_command", captured)
-        self.assertNotIn("acp_args", captured)
+        self.assertEqual(captured["acp_command"], "claude")
+        self.assertEqual(captured["acp_args"], ["--acp", "--stdio"])
         self.assertEqual(captured["goal"], "test")
-        self.assertNotIn("acp_command", captured["tasks"][0])
-        self.assertNotIn("acp_args", captured["tasks"][0])
+        self.assertEqual(captured["tasks"][0]["acp_command"], "codex")
+        self.assertEqual(captured["tasks"][0]["acp_args"], ["--acp"])
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
@@ -2801,14 +2797,13 @@ class TestMaxSpawnDepth(unittest.TestCase):
         with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
             result = _get_max_spawn_depth()
         self.assertEqual(result, 1)
-        self.assertTrue(any("below floor 1" in m for m in cm.output))
+        self.assertTrue(any("out of range [1, 3]" in m for m in cm.output))
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 99})
-    def test_max_spawn_depth_no_upper_ceiling(self, mock_cfg):
-        """No upper ceiling — high values pass through unchanged (cost is the limiter)."""
+    def test_max_spawn_depth_clamped_to_three(self, mock_cfg):
         from tools.delegate_tool import _get_max_spawn_depth
-        self.assertEqual(_get_max_spawn_depth(), 99)
+        self.assertEqual(_get_max_spawn_depth(), 3)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": "not-a-number"})
@@ -2885,15 +2880,15 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertIn("role", task_props)
         self.assertEqual(task_props["role"]["enum"], ["leaf", "orchestrator"])
 
-    def test_schema_omits_acp_transport_fields(self):
+    def test_schema_preserves_acp_transport_compatibility(self):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
 
         task_props = props["tasks"]["items"]["properties"]
-        self.assertNotIn("acp_command", props)
-        self.assertNotIn("acp_args", props)
-        self.assertNotIn("acp_command", task_props)
-        self.assertNotIn("acp_args", task_props)
+        self.assertIn("acp_command", props)
+        self.assertIn("acp_args", props)
+        self.assertIn("acp_command", task_props)
+        self.assertIn("acp_args", task_props)
 
 
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".

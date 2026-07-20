@@ -17,6 +17,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import copy
 import json
 import logging
 
@@ -57,7 +58,16 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 # capability.  It remains part of the top-level core schemas, but is registered
 # in this dedicated toolset so the normal enabled/disabled-toolset filtering can
 # remove it even when a child inherits a composite ``hermes-*`` toolset.
-_DELEGATE_DISABLED_TOOLSETS = frozenset({"canonical_sync"})
+_DELEGATE_DISABLED_TOOLSETS = frozenset(
+    {
+        "canonical_sync",
+        # General delegates never receive the raw coding-worker tool. Trusted
+        # nested mutation, when explicitly granted, goes through the dedicated
+        # root-owned broker toolset instead.
+        "coding_worker_raw",
+        "delegated_coding_broker",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +189,15 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
+_ASYNC_HANDOFF_MAX_AGE_SECONDS = 3600.0
+_coding_broker_locks: Dict[str, threading.Lock] = {}
+_coding_broker_locks_guard = threading.Lock()
+
+
+def _coding_broker_lock(workspace: str) -> threading.Lock:
+    key = os.path.abspath(os.path.expanduser(str(workspace or "")))
+    with _coding_broker_locks_guard:
+        return _coding_broker_locks.setdefault(key, threading.Lock())
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -280,14 +299,14 @@ def _extract_output_tail(
                     pending_call_by_id[tc_id] = str(fn.get("name") or "tool")
 
     # Second pass (reverse): pick tool results, newest first
+    from agent.message_content import flatten_message_text
+
     for msg in reversed(messages):
         if len(tail) >= max_entries:
             break
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
-        content = msg.get("content") or ""
-        if not isinstance(content, str):
-            content = str(content)
+        content = flatten_message_text(msg.get("content"))
         is_error = _looks_like_error_output(content)
         tool_name = pending_call_by_id.get(msg.get("tool_call_id") or "", "tool")
         # Preserve line structure so the overlay's wrapped scroll region can
@@ -347,6 +366,113 @@ def _looks_like_provider_failure_summary(summary: str) -> bool:
     ) and " retr" in text
 
 
+def _delegation_binding(root: Any, workspace_hint: Optional[str] = None) -> Dict[str, str]:
+    """Capture the root identity that makes a structured handoff current."""
+    workspace = str(workspace_hint or _resolve_workspace_hint(root) or "").strip()
+    if workspace:
+        workspace = os.path.realpath(os.path.abspath(os.path.expanduser(workspace)))
+    repository_root = ""
+    if workspace:
+        try:
+            from tools.coding_worker_tool import _reservation_root
+
+            repository_root = str(_reservation_root(workspace) or "")
+        except Exception:
+            repository_root = workspace
+    return {
+        "session_key": str(
+            getattr(root, "gateway_session_key", "")
+            or getattr(root, "session_key", "")
+            or ""
+        ),
+        "session_id": str(getattr(root, "session_id", "") or ""),
+        "turn_id": str(
+            getattr(root, "_current_turn_id", "")
+            or getattr(root, "_current_task_id", "")
+            or ""
+        ),
+        "work_item_id": str(
+            getattr(root, "_origin_work_item_id", "")
+            or getattr(root, "work_item_id", "")
+            or ""
+        ),
+        "workspace": workspace,
+        "repository_root": repository_root,
+    }
+
+
+def _register_structured_handoff(
+    *,
+    child: Any,
+    parent_agent: Any,
+    goal: str,
+    entry: Dict[str, Any],
+    files_read: list[str],
+    files_written: list[str],
+) -> Dict[str, Any]:
+    """Store deterministic delegation evidence on the root orchestrator."""
+    root = getattr(child, "_delegate_root_agent", None) or getattr(
+        parent_agent, "_delegate_root_agent", parent_agent
+    )
+    handoff_id = f"handoff_{getattr(child, '_subagent_id', '') or os.urandom(4).hex()}"
+    broker_results = []
+    broker_registry = getattr(root, "_brokered_coding_results", None)
+    if isinstance(broker_registry, dict):
+        subagent_id = str(getattr(child, "_subagent_id", "") or "")
+        broker_results = [
+            copy.deepcopy(value)
+            for value in broker_registry.values()
+            if isinstance(value, dict)
+            and value.get("requesting_subagent_id") == subagent_id
+        ][-8:]
+    binding = copy.deepcopy(
+        getattr(child, "_delegation_root_binding", None)
+        or _delegation_binding(root)
+    )
+    handoff = {
+        "version": 1,
+        "handoff_id": handoff_id,
+        "created_at": time.time(),
+        "goal": goal,
+        "status": entry.get("status"),
+        "exit_reason": entry.get("exit_reason"),
+        "role": getattr(child, "_delegate_role", "leaf"),
+        "read_only": bool(getattr(child, "_delegation_read_only", False)),
+        "child_session_id": str(getattr(child, "session_id", "") or ""),
+        "subagent_id": str(getattr(child, "_subagent_id", "") or ""),
+        "binding": binding,
+        "files_read": copy.deepcopy(list(files_read)),
+        "files_written": copy.deepcopy(list(files_written)),
+        "tool_trace": copy.deepcopy(list(entry.get("tool_trace") or [])),
+        "tokens": copy.deepcopy(dict(entry.get("tokens") or {})),
+        "broker_results": broker_results,
+    }
+    registry = getattr(root, "_delegation_handoffs", None)
+    if not isinstance(registry, dict):
+        registry = {}
+        try:
+            root._delegation_handoffs = registry
+        except Exception:
+            return copy.deepcopy(handoff)
+    lock = getattr(root, "_delegation_handoffs_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        try:
+            root._delegation_handoffs_lock = lock
+        except Exception:
+            lock = None
+    if lock is not None:
+        with lock:
+            registry[handoff_id] = copy.deepcopy(handoff)
+            while len(registry) > 100:
+                registry.pop(next(iter(registry)))
+    else:
+        registry[handoff_id] = copy.deepcopy(handoff)
+        while len(registry) > 100:
+            registry.pop(next(iter(registry)))
+    return copy.deepcopy(handoff)
+
+
 def _classify_child_result(result: Dict[str, Any]) -> Dict[str, str]:
     """Classify a delegated child using structured run_conversation metadata."""
     summary = result.get("final_response") or ""
@@ -361,6 +487,8 @@ def _classify_child_result(result: Dict[str, Any]) -> Dict[str, str]:
 
     if interrupted:
         return {"status": "interrupted", "exit_reason": "interrupted"}
+    if summary.strip().lower() in {"(empty)", "[empty]"}:
+        return {"status": "failed", "exit_reason": "failed_no_final"}
     if failed and not completed:
         return {"status": "failed", "exit_reason": "provider_failure" if error or summary else "failed"}
     if not completed and _looks_like_provider_failure_summary(summary):
@@ -419,6 +547,11 @@ def _resolve_delegation_model_tier(
     the tier as a unit. This avoids combining a tier model with explicit
     reasoning or an explicitly selected provider that may not serve that model.
     """
+    # Real config loads always carry the root model_tiers mapping. Keep partial
+    # programmatic/legacy delegation dictionaries on their historical parent-
+    # inheritance path instead of silently injecting a built-in tier model.
+    if "model_tiers" not in cfg:
+        return None
     routing = str(cfg.get("model_tier_routing") or "auto").strip().lower()
     if routing in {"", "none", "off", "disabled", "false"}:
         return None
@@ -535,13 +668,18 @@ def _get_max_spawn_depth() -> int:
     clamped = max(_MIN_SPAWN_DEPTH, min(_MAX_SPAWN_DEPTH_CAP, ival))
     if clamped != ival:
         logger.warning(
-            "delegation.max_spawn_depth=%d out of range [%d, %d]; " "clamping to %d",
+            "delegation.max_spawn_depth=%d out of range [%d, %d]; clamping to %d",
             ival,
             _MIN_SPAWN_DEPTH,
             _MAX_SPAWN_DEPTH_CAP,
             clamped,
         )
     return clamped
+
+
+def _get_max_async_children() -> int:
+    """Use the normal delegation concurrency cap for detached work too."""
+    return _get_max_concurrent_children()
 
 
 def _get_orchestrator_enabled() -> bool:
@@ -559,6 +697,62 @@ def _get_orchestrator_enabled() -> bool:
     if isinstance(val, str):
         return val.strip().lower() in {"true", "1", "yes", "on"}
     return True
+
+
+def _get_nested_coding_enabled() -> bool:
+    """Whether root-owned coding brokerage may be granted to orchestrators."""
+    cfg = _load_config()
+    nested = cfg.get("nested_coding") or {}
+    if not isinstance(nested, dict):
+        return False
+    return is_truthy_value(nested.get("enabled"), default=False)
+
+
+def _nested_coding_grant_error(
+    *,
+    requested: bool,
+    background: bool,
+    read_only: bool,
+    role: str,
+    parent_agent: Any,
+    max_spawn_depth: int,
+) -> Optional[str]:
+    """Validate an explicit root-broker grant before child construction."""
+    if not requested:
+        return None
+    if background:
+        return (
+            "Brokered nested coding is foreground-only; retry with "
+            "background=false so the root retains workspace ownership."
+        )
+    if read_only:
+        return (
+            "Read-only delegation cannot request coding mutation. Set "
+            "read_only=false and use the explicit brokered orchestrator capability."
+        )
+    if role != "orchestrator":
+        return "allow_nested_coding requires role='orchestrator'."
+    parent_depth = int(getattr(parent_agent, "_delegate_depth", 0) or 0)
+    if parent_depth != 0:
+        return "Only the root orchestrator may grant brokered nested coding access."
+    if not _get_nested_coding_enabled():
+        return (
+            "Brokered nested coding is disabled by "
+            "delegation.nested_coding.enabled=false."
+        )
+    if not _get_orchestrator_enabled():
+        return (
+            "Brokered nested coding requires delegation.orchestrator_enabled=true; "
+            "the requested orchestrator would otherwise degrade to a leaf."
+        )
+    child_depth = parent_depth + 1
+    if child_depth >= max_spawn_depth:
+        return (
+            "Brokered nested coding requires delegation.max_spawn_depth>=2; "
+            f"the requested orchestrator at depth {child_depth} would otherwise "
+            "degrade to a leaf."
+        )
+    return None
 
 
 def _get_inherit_mcp_toolsets() -> bool:
@@ -689,6 +883,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    read_only: bool = False,
+    brokered_coding: bool = False,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -723,6 +919,26 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if read_only:
+        parts.append(
+            "\n## Enforced Read-Only Mode\n"
+            "This delegation is runtime-enforced read-only. You may inspect the "
+            "repository with explicit observation tools such as read_file and "
+            "search_files, but terminal execution, write_file, patch, execute_code, "
+            "raw coding-worker delegation, and other mutation "
+            "paths are blocked. Do not claim that you changed files. Read-only "
+            "mode propagates to every delegate_task child you create."
+        )
+    elif brokered_coding:
+        parts.append(
+            "\n## Root-Owned Coding Broker\n"
+            "You cannot edit repositories directly and you do not have the raw "
+            "delegate_coding_task tool. For a bounded implementation step, use "
+            "request_coding_task with non-overlapping scope_paths. Hermes' root "
+            "orchestrator owns the authorized cwd, work-item/session identity, "
+            "worker accounting, visual/closeout state, isolation, merge-back, and "
+            "the deterministic result. Coding workers are leaves."
+        )
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -800,6 +1016,9 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
         "clarify",
         "memory",
         "code_execution",
+        "cronjob",
+        "coding_worker_raw",
+        "delegated_coding_broker",
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
 
@@ -1013,6 +1232,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    read_only: bool = False,
+    allow_nested_coding: bool = False,
     runtime_audit_context: Optional[Dict[str, Any]] = None,
 ):
     """
@@ -1037,6 +1258,14 @@ def _build_child_agent(
     max_spawn = _get_max_spawn_depth()
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
     effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+    root_agent = getattr(parent_agent, "_delegate_root_agent", parent_agent)
+    brokered_coding = bool(
+        allow_nested_coding
+        and effective_role == "orchestrator"
+        and child_depth == 1
+        and _get_nested_coding_enabled()
+        and not read_only
+    )
 
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
@@ -1092,14 +1321,19 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+    if brokered_coding and "delegated_coding_broker" not in child_toolsets:
+        child_toolsets.append("delegated_coding_broker")
 
     # Preserve any restrictions already applied to the parent and add the
     # worker-only canonical-sync restriction.  ``disabled_toolsets`` is applied
     # after composite toolsets resolve, so this also covers inherited
     # ``hermes-cli``/platform toolsets that contain the core sync tool.
     parent_disabled_toolsets = getattr(parent_agent, "disabled_toolsets", None) or []
+    disabled_for_child = set(_DELEGATE_DISABLED_TOOLSETS)
+    if brokered_coding:
+        disabled_for_child.discard("delegated_coding_broker")
     child_disabled_toolsets = list(
-        dict.fromkeys([*parent_disabled_toolsets, *_DELEGATE_DISABLED_TOOLSETS])
+        dict.fromkeys([*parent_disabled_toolsets, *sorted(disabled_for_child)])
     )
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
@@ -1110,6 +1344,8 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        read_only=read_only,
+        brokered_coding=brokered_coding,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1180,15 +1416,28 @@ def _build_child_agent(
         else (getattr(parent_agent, "acp_args", []) or [])
     )
 
+    usable_acp_override = override_acp_command
+    if usable_acp_override:
+        import shutil
+
+        if shutil.which(str(usable_acp_override)) is None:
+            logger.warning(
+                "Ignoring delegation ACP command %r because it is not available on PATH",
+                usable_acp_override,
+            )
+            usable_acp_override = None
+            effective_acp_command = None
+            effective_acp_args = []
+
     # When override_provider is set (e.g. delegation.provider: minimax-cn),
     # the subagent must use direct API calls — not the parent's ACP transport.
     # Inheriting acp_command unconditionally causes run_agent.py to initialize
     # CopilotACPClient, bypassing override credentials entirely (issue #16816).
-    if override_provider and not override_acp_command:
+    if override_provider and not usable_acp_override:
         effective_acp_command = None
         effective_acp_args = []
 
-    if override_acp_command:
+    if usable_acp_override:
         # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
         # so run_agent.py initializes the CopilotACPClient.
         effective_provider = "copilot-acp"
@@ -1288,6 +1537,40 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    child._delegation_read_only = bool(read_only)
+    child._delegation_broker_only_mutation = bool(brokered_coding)
+    child._delegate_root_agent = root_agent
+    child._delegation_root_binding = copy.deepcopy(
+        _delegation_binding(root_agent, workspace_hint)
+    )
+    child._delegation_broker_context = (
+        {
+            "enabled": True,
+            "root_agent": root_agent,
+            "authorized_cwd": _resolve_workspace_hint(root_agent) or "",
+            "gateway_session_key": str(
+                getattr(root_agent, "_gateway_session_key", "")
+                or getattr(root_agent, "gateway_session_key", "")
+                or getattr(root_agent, "session_key", "")
+                or ""
+            ),
+            "session_id": str(getattr(root_agent, "session_id", "") or ""),
+            "origin_work_item_id": str(
+                getattr(root_agent, "_origin_work_item_id", "")
+                or getattr(root_agent, "work_item_id", "")
+                or ""
+            ),
+            "turn_id": child._delegation_root_binding.get("turn_id", ""),
+            "visual_qa_requirement": copy.deepcopy(
+                getattr(root_agent, "visual_qa_requirement", None)
+            ),
+            "project_inspection_candidates": copy.deepcopy(
+                getattr(root_agent, "project_inspection_candidates", None)
+            ),
+        }
+        if brokered_coding
+        else None
+    )
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1296,7 +1579,11 @@ def _build_child_agent(
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
-    child_pool = _resolve_child_credential_pool(effective_provider, parent_agent)
+    child_pool = _resolve_child_credential_pool(
+        effective_provider,
+        parent_agent,
+        effective_base_url,
+    )
     if child_pool is not None:
         child._credential_pool = child_pool
 
@@ -1636,7 +1923,9 @@ def _run_single_child(
         import uuid as _uuid
 
         child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
-        parent_task_id = getattr(parent_agent, "_current_task_id", None)
+        parent_task_id = _kwargs.get("parent_task_id") or getattr(
+            parent_agent, "_current_task_id", None
+        )
         wall_start = time.time()
         parent_reads_snapshot = (
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
@@ -1955,6 +2244,15 @@ def _run_single_child(
             }
         )[:40]
 
+        entry["handoff"] = _register_structured_handoff(
+            child=child,
+            parent_agent=parent_agent,
+            goal=goal,
+            entry=entry,
+            files_read=_files_read,
+            files_written=_files_written,
+        )
+
         _output_tail = _extract_output_tail(result, max_entries=8, max_chars=600)
         if status == "failed" and _output_tail:
             entry["output_tail"] = _output_tail
@@ -2098,6 +2396,260 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _detach_background_children(parent_agent: Any, children: list[tuple[int, dict, Any]]) -> None:
+    """Transfer interrupt ownership from the parent turn to async delegation."""
+    active = getattr(parent_agent, "_active_children", None)
+    if not isinstance(active, list):
+        return
+    lock = getattr(parent_agent, "_active_children_lock", None)
+    for _index, _task, child in children:
+        try:
+            if lock:
+                with lock:
+                    active.remove(child)
+            else:
+                active.remove(child)
+        except ValueError:
+            pass
+
+
+def _discard_unstarted_background_children(
+    children: list[tuple[int, dict, Any]],
+    reason: str,
+) -> None:
+    """Close children whose detached batch could not be scheduled."""
+    for _index, _task, child in children:
+        progress = getattr(child, "tool_progress_callback", None)
+        if progress is not None:
+            try:
+                progress(
+                    "subagent.complete",
+                    preview=reason,
+                    status="rejected",
+                    duration_seconds=0,
+                    summary=reason,
+                )
+            except Exception:
+                pass
+        try:
+            _end_failed_child_session(child, "error")
+            if hasattr(child, "close"):
+                child.close()
+        except Exception:
+            logger.debug("Failed to close unscheduled background child", exc_info=True)
+
+
+def _execute_background_children(
+    children: list[tuple[int, dict, Any]],
+    parent_agent: Any,
+    max_children: int,
+    accounting_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run a pre-built fan-out as one detached unit and consolidate results."""
+    started = time.monotonic()
+    if len(children) == 1:
+        index, task, child = children[0]
+        results = [
+            _run_single_child(
+                index,
+                task["goal"],
+                child,
+                parent_agent,
+                parent_task_id=accounting_context.get("parent_task_id"),
+            )
+        ]
+    else:
+        results = []
+        from tools.thread_context import propagate_context_to_thread
+
+        with ThreadPoolExecutor(max_workers=max_children) as executor:
+            futures = {
+                executor.submit(
+                    propagate_context_to_thread(_run_single_child),
+                    task_index=index,
+                    goal=task["goal"],
+                    child=child,
+                    parent_agent=parent_agent,
+                    parent_task_id=accounting_context.get("parent_task_id"),
+                ): index
+                for index, task, child in children
+            }
+            for future, index in list(futures.items()):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append(
+                        {
+                            "task_index": index,
+                            "status": "error",
+                            "summary": None,
+                            "error": str(exc),
+                            "api_calls": 0,
+                            "duration_seconds": 0,
+                        }
+                    )
+        results.sort(key=lambda item: item.get("task_index", 0))
+    accounting = _finalize_detached_results(
+        results,
+        children,
+        accounting_context,
+    )
+    return {
+        "results": results,
+        "total_duration_seconds": round(time.monotonic() - started, 2),
+        "accounting": accounting,
+    }
+
+
+def _capture_detached_accounting_context(parent_agent: Any) -> Dict[str, Any]:
+    """Snapshot parent identity before a background delegation leaves its turn."""
+    root = getattr(parent_agent, "_delegate_root_agent", parent_agent)
+    binding = _delegation_binding(root)
+    return {
+        "version": 1,
+        "accounting_id": f"delegation_accounting_{os.urandom(8).hex()}",
+        "binding": copy.deepcopy(binding),
+        "parent_session_id": str(getattr(parent_agent, "session_id", "") or ""),
+        "parent_turn_id": str(
+            getattr(parent_agent, "_current_turn_id", "")
+            or getattr(parent_agent, "_current_task_id", "")
+            or ""
+        ),
+        "parent_task_id": str(getattr(parent_agent, "_current_task_id", "") or ""),
+    }
+
+
+def _finalize_detached_results(
+    results: list[Dict[str, Any]],
+    children: list[tuple[int, dict, Any]],
+    accounting_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build immutable accounting for the next serialized parent turn."""
+    child_by_index = {index: (task, child) for index, task, child in children}
+    cost_total = 0.0
+    children_accounting: list[Dict[str, Any]] = []
+    for entry in results:
+        child_role = entry.pop("_child_role", None)
+        try:
+            cost_total += float(entry.pop("_child_cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+        task, child = child_by_index.get(entry.get("task_index"), ({}, None))
+        children_accounting.append(
+            {
+                "task": str(task.get("goal") or ""),
+                "summary": str(entry.get("summary") or ""),
+                "child_session_id": str(getattr(child, "session_id", "") or ""),
+                "child_role": child_role,
+                "child_status": str(entry.get("status") or ""),
+                "duration_ms": int((entry.get("duration_seconds") or 0) * 1000),
+            }
+        )
+    return {
+        **copy.deepcopy(accounting_context),
+        "children": children_accounting,
+        "cost_total_usd": cost_total,
+    }
+
+
+def apply_detached_delegation_accounting(
+    parent_agent: Any,
+    accounting: Any,
+) -> bool:
+    """Apply detached callbacks/cost on the next serialized parent turn."""
+    if parent_agent is None or not isinstance(accounting, dict) or accounting.get("version") != 1:
+        return False
+    accounting_id = str(accounting.get("accounting_id") or "")
+    if not accounting_id:
+        return False
+    applied = getattr(parent_agent, "_applied_delegation_accounting_ids", None)
+    if not isinstance(applied, set):
+        applied = set()
+        parent_agent._applied_delegation_accounting_ids = applied
+    if accounting_id in applied:
+        return False
+    expected_binding = accounting.get("binding")
+    current_binding = _delegation_binding(parent_agent)
+    if isinstance(expected_binding, dict):
+        for field in ("session_key", "workspace", "repository_root"):
+            expected = str(expected_binding.get(field) or "")
+            current = str(current_binding.get(field) or "")
+            if expected and current and expected != current:
+                return False
+    applied.add(accounting_id)
+
+    memory_manager = getattr(parent_agent, "_memory_manager", None)
+    try:
+        from hermes_cli.plugins import invoke_hook
+    except Exception:
+        invoke_hook = None
+    for child in accounting.get("children") or []:
+        if not isinstance(child, dict):
+            continue
+        if memory_manager is not None:
+            try:
+                memory_manager.on_delegation(
+                    task=str(child.get("task") or ""),
+                    result=str(child.get("summary") or ""),
+                    child_session_id=str(child.get("child_session_id") or ""),
+                )
+            except Exception:
+                logger.debug("detached delegation memory callback failed", exc_info=True)
+        if invoke_hook is not None:
+            try:
+                invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=str(accounting.get("parent_session_id") or "") or None,
+                    parent_turn_id=str(accounting.get("parent_turn_id") or ""),
+                    child_session_id=str(child.get("child_session_id") or "") or None,
+                    child_role=child.get("child_role"),
+                    child_summary=child.get("summary"),
+                    child_status=child.get("child_status"),
+                    duration_ms=int(child.get("duration_ms") or 0),
+                )
+            except Exception:
+                logger.debug("detached subagent_stop hook failed", exc_info=True)
+
+    try:
+        cost_total = float(accounting.get("cost_total_usd") or 0.0)
+    except (TypeError, ValueError):
+        cost_total = 0.0
+    if cost_total > 0:
+        parent_agent.session_estimated_cost_usd = float(
+            getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0
+        ) + cost_total
+        if getattr(parent_agent, "session_cost_source", "none") in {None, "", "none"}:
+            parent_agent.session_cost_source = "subagent"
+        if getattr(parent_agent, "session_cost_status", "unknown") in {None, "", "unknown"}:
+            parent_agent.session_cost_status = "estimated"
+    return True
+
+
+def _background_context_error(parent_agent: Any) -> str:
+    platform = str(getattr(parent_agent, "platform", "") or "").strip().lower()
+    try:
+        from gateway.session_context import async_delivery_supported, is_cron_execution
+
+        if platform == "cron" or is_cron_execution():
+            return "Background delegation is unavailable in cron sessions."
+        if not async_delivery_supported():
+            return (
+                "Background delegation is unavailable because this session "
+                "cannot receive a later completion turn."
+            )
+    except Exception:
+        if platform == "cron" or os.environ.get("HERMES_CRON_SESSION"):
+            return "Background delegation is unavailable in cron sessions."
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return "Background delegation is unavailable in Kanban worker sessions."
+    return ""
+
+
+def _model_background_value(args: dict, parent_agent: Any = None) -> bool:
+    """Return the caller's optional detached-delegation request."""
+    return is_truthy_value((args or {}).get("background"), default=False)
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2107,6 +2659,9 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    read_only: bool = False,
+    background: bool = False,
+    allow_nested_coding: bool = False,
     parent_agent=None,
 ) -> str:
     """
@@ -2138,8 +2693,24 @@ def delegate_task(
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
         )
 
+    # Read-only is monotonic down the delegation tree. A child cannot turn off
+    # a restriction imposed by its parent.
+    inherited_read_only = bool(getattr(parent_agent, "_delegation_read_only", False))
+    top_read_only = inherited_read_only or is_truthy_value(read_only, default=False)
+    background_requested = is_truthy_value(background, default=False)
+    background = background_requested
+
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    requested_nested_coding = is_truthy_value(allow_nested_coding, default=False)
+    if background:
+        context_error = _background_context_error(parent_agent)
+        if context_error:
+            logger.info(
+                "delegate_task background delivery unavailable (%s); running synchronously",
+                context_error,
+            )
+            background = False
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -2173,16 +2744,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2203,7 +2764,14 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "read_only": top_read_only,
+                "allow_nested_coding": requested_nested_coding,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2211,7 +2779,9 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate every task, including per-task broker grants, before constructing
+    # any child. A batch must fail atomically rather than partially building a
+    # silently degraded leaf for an invalid explicit grant.
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2219,6 +2789,37 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        task["read_only"] = top_read_only or is_truthy_value(
+            task.get("read_only"), default=False
+        )
+        task["allow_nested_coding"] = is_truthy_value(
+            task.get("allow_nested_coding", requested_nested_coding), default=False
+        )
+        task["role"] = _normalize_role(task.get("role") or top_role)
+        grant_error = _nested_coding_grant_error(
+            requested=bool(task["allow_nested_coding"]),
+            background=background_requested,
+            read_only=bool(task["read_only"]),
+            role=task["role"],
+            parent_agent=parent_agent,
+            max_spawn_depth=max_spawn,
+        )
+        if grant_error:
+            return tool_error(f"Task {i}: {grant_error}")
+
+    if background and not all(bool(task.get("read_only")) for task in task_list):
+        return tool_error(
+            "delegate_task background=true requires read_only=true for every task. "
+            "Detached general delegates do not own mutation reservations; use "
+            "delegate_coding_task(background=true) for repository changes."
+        )
+
+    # Resolve delegation credentials only after the whole batch passes policy
+    # validation, so invalid broker grants fail before any child/runtime setup.
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2243,7 +2844,7 @@ def delegate_task(
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
+            effective_role = t["role"]
             model_tier = _resolve_delegation_model_tier(
                 cfg, t["goal"], t.get("context"), effective_role
             )
@@ -2306,6 +2907,8 @@ def delegate_task(
                     model_tier.reasoning_config() if model_tier else None
                 ),
                 role=effective_role,
+                read_only=bool(t.get("read_only")),
+                allow_nested_coding=bool(t.get("allow_nested_coding")),
                 runtime_audit_context={
                     "model_tier": model_tier.name if model_tier is not None else "",
                     "model_tier_source": model_tier_source,
@@ -2319,6 +2922,92 @@ def delegate_task(
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+    if background:
+        accounting_context = _capture_detached_accounting_context(parent_agent)
+        try:
+            from tools.approval import get_current_session_key
+
+            session_key = get_current_session_key(default="")
+        except Exception:
+            session_key = ""
+        session_key = str(
+            session_key
+            or getattr(parent_agent, "gateway_session_key", "")
+            or getattr(parent_agent, "session_key", "")
+            or ""
+        )
+        _detach_background_children(parent_agent, children)
+
+        def _batch_runner() -> Dict[str, Any]:
+            return _execute_background_children(
+                children,
+                parent_agent,
+                max_children,
+                accounting_context,
+            )
+
+        def _batch_interrupt() -> None:
+            for _index, _task, child in children:
+                try:
+                    child.interrupt("Async delegation cancelled")
+                except Exception:
+                    try:
+                        child._interrupt_requested = True
+                    except Exception:
+                        pass
+
+        from tools.async_delegation import dispatch_async_delegation_batch
+
+        goals = [str(task["goal"]) for task in task_list]
+        dispatch = dispatch_async_delegation_batch(
+            goals=goals,
+            context=context,
+            toolsets=toolsets,
+            role=top_role,
+            model=creds.get("model"),
+            session_key=session_key,
+            runner=_batch_runner,
+            interrupt_fn=_batch_interrupt,
+            max_async_children=_get_max_async_children(),
+            origin_work_item_id=str(
+                getattr(parent_agent, "_origin_work_item_id", "")
+                or getattr(parent_agent, "work_item_id", "")
+                or ""
+            ),
+            read_only=all(bool(task.get("read_only")) for task in task_list),
+            task_specs=[
+                {
+                    "goal": str(task.get("goal") or ""),
+                    "context": str(task.get("context") or ""),
+                    "role": str(task.get("role") or top_role),
+                    "read_only": bool(task.get("read_only")),
+                }
+                for task in task_list
+            ],
+        )
+        if dispatch.get("status") == "dispatched":
+            return json.dumps(
+                {
+                    "status": "dispatched",
+                    "mode": "background",
+                    "count": len(goals),
+                    "delegation_id": dispatch["delegation_id"],
+                    "goals": goals,
+                    "read_only": all(bool(task.get("read_only")) for task in task_list),
+                    "note": (
+                        "Delegation is running in the background; its consolidated "
+                        "result will arrive as a follow-up turn. Do not poll or claim "
+                        "completion from this dispatch handle."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        scheduling_error = str(
+            dispatch.get("error") or "Background delegation could not be scheduled."
+        )
+        _discard_unstarted_background_children(children, scheduling_error)
+        return tool_error(scheduling_error)
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
@@ -2552,7 +3241,11 @@ def delegate_task(
     )
 
 
-def _resolve_child_credential_pool(effective_provider: Optional[str], parent_agent):
+def _resolve_child_credential_pool(
+    effective_provider: Optional[str],
+    parent_agent,
+    effective_base_url: Optional[str] = None,
+):
     """Resolve a credential pool for the child agent.
 
     Rules:
@@ -2567,6 +3260,31 @@ def _resolve_child_credential_pool(effective_provider: Optional[str], parent_age
 
     parent_provider = getattr(parent_agent, "provider", None) or ""
     parent_pool = getattr(parent_agent, "_credential_pool", None)
+    if effective_provider == "custom":
+        try:
+            from agent.credential_pool import (
+                get_custom_provider_pool_key,
+                load_pool,
+            )
+
+            child_key = get_custom_provider_pool_key(effective_base_url or "")
+            if not child_key:
+                return None
+            parent_key = get_custom_provider_pool_key(
+                getattr(parent_agent, "base_url", "") or ""
+            )
+            if parent_pool is not None and child_key == parent_key:
+                return parent_pool
+            pool = load_pool(child_key)
+            if pool is not None and pool.has_credentials():
+                return pool
+        except Exception as exc:
+            logger.debug(
+                "Could not load credential pool for custom child endpoint %r: %s",
+                effective_base_url,
+                exc,
+            )
+        return None
     if parent_pool is not None and effective_provider == parent_provider:
         return parent_pool
 
@@ -2612,7 +3330,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
-    if configured_base_url:
+    bedrock_aliases = {"bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon"}
+    if configured_base_url and configured_provider not in bedrock_aliases:
         # When delegation.api_key is not set, return None so _build_child_agent
         # falls back to the parent agent's API key via the credential inheritance
         # path (effective_api_key = override_api_key or parent_api_key). This
@@ -2788,6 +3507,9 @@ def _build_top_level_description() -> str:
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). "
         f"All run in parallel and results are returned together. {nesting_clause}\n\n"
+        "Set background=true only for independent work whose result is not on "
+        "the current critical path. Background completion returns as a later "
+        "turn; never claim completion from the dispatch handle.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -2796,13 +3518,10 @@ def _build_top_level_description() -> str:
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
         "- Single tool call -> just call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
-        "- Durable long-running work that must outlive the current turn -> "
+        "- Durable long-running work that must survive process/session exit -> "
         "use cronjob (action='create') or terminal(background=True, "
-        "notify_on_complete=True) instead. delegate_task runs SYNCHRONOUSLY "
-        "inside the parent turn: if the parent is interrupted (user sends a "
-        "new message, /stop, /new) the child is cancelled with status="
-        "'interrupted' and its work is discarded. Children cannot continue "
-        "in the background.\n\n"
+        "notify_on_complete=True) instead. Detached delegation is bounded but "
+        "not durable; /stop or process shutdown cancels it.\n\n"
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
@@ -2820,6 +3539,11 @@ def _build_top_level_description() -> str:
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
         "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "- read_only=true is enforced at dispatch time and propagates to nested "
+        "delegate_task calls. It blocks file writes, all terminal execution, "
+        "execute_code, and coding-worker mutation.\n"
+        "- background=true requires read_only=true for every task. Detached "
+        "repository mutation belongs on delegate_coding_task.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
         "delegate_task so they can spawn their own workers, but still "
         "cannot use clarify, memory, send_message, or execute_code. "
@@ -2942,12 +3666,9 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Toolsets to enable for this subagent. "
-                    "Default: inherits your enabled toolsets. "
-                    f"Available toolsets: {_TOOLSET_LIST_STR}. "
-                    "Common patterns: ['terminal', 'file'] for code work, "
-                    "['web'] for research, ['browser'] for web interaction, "
-                    "['terminal', 'file', 'web'] for full-stack tasks."
+                    "Toolsets to enable for this subagent. Default: inherits "
+                    "your enabled toolsets. "
+                    f"Available toolsets: {_TOOLSET_LIST_STR}."
                 ),
             },
             "tasks": {
@@ -2963,25 +3684,31 @@ DELEGATE_TASK_SCHEMA = {
                         "toolsets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                            "description": f"Toolsets for this task. Available: {_TOOLSET_LIST_STR}.",
                         },
                         "acp_command": {
                             "type": "string",
-                            "description": (
-                                "Per-task ACP command override (e.g. 'copilot'). "
-                                "Overrides the top-level acp_command for this task only. "
-                                "Do NOT set unless the user explicitly told you an ACP CLI is installed."
-                            ),
+                            "description": "Per-task ACP command override for trusted/operator-controlled callers.",
                         },
                         "acp_args": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Per-task ACP args override. Leave empty unless acp_command is set.",
+                            "description": "Per-task ACP args override.",
                         },
                         "role": {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "read_only": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Enforce read-only execution for this task and all descendants.",
+                        },
+                        "allow_nested_coding": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Root-only coding-broker grant; requires role=orchestrator and read_only=false.",
                         },
                     },
                     "required": ["goal"],
@@ -2996,32 +3723,193 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "read_only": {
+                "type": "boolean",
+                "default": False,
+                "description": "Runtime-enforced repository read-only mode; propagates to descendants.",
+            },
+            "background": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Run as a detached background unit and deliver consolidated "
+                    "completion in a later turn. Requires read_only=true for every "
+                    "task; detached repository mutation uses delegate_coding_task."
+                ),
+            },
+            "allow_nested_coding": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Root-only explicit capability grant. Requires role=orchestrator, "
+                    "read_only=false, and delegation.nested_coding.enabled=true. "
+                    "Exposes only the root-owned coding broker, never the raw tool."
+                ),
+            },
             "acp_command": {
                 "type": "string",
-                "description": (
-                    "Override ACP command for child agents (e.g. 'copilot'). "
-                    "When set, children use ACP subprocess transport instead of inheriting "
-                    "the parent's transport. Requires an ACP-compatible CLI "
-                    "(currently GitHub Copilot CLI via 'copilot --acp --stdio'). "
-                    "See agent/copilot_acp_client.py for the implementation. "
-                    "IMPORTANT: Do NOT set this unless the user has explicitly told you "
-                    "a specific ACP-compatible CLI is installed and configured. "
-                    "Leave empty to use the parent's default transport (Hermes subagents)."
-                ),
+                "description": "Override the ACP command for trusted/operator-controlled callers.",
             },
             "acp_args": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": (
-                    "Arguments for the ACP command (default: ['--acp', '--stdio']). "
-                    "Only used when acp_command is set. "
-                    "Leave empty unless acp_command is explicitly provided."
-                ),
+                "description": "Arguments for the configured ACP command.",
             },
         },
         "required": [],
     },
 }
+
+
+REQUEST_CODING_TASK_SCHEMA = {
+    "name": "request_coding_task",
+    "description": (
+        "Request one synchronous coding worker through Hermes' trusted root "
+        "broker. Available only to explicitly authorized orchestrator children. "
+        "The broker, not this child, owns cwd, work-item/session identity, "
+        "scope reservations, isolation, worker accounting, visual state, and "
+        "trusted closeout."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string", "description": "Concrete bounded implementation task."},
+            "context": {"type": "string", "description": "Analysis and constraints for the root-owned worker."},
+            "worker_tier": {
+                "type": "string",
+                "enum": ["quick", "standard", "thorough", "deep", "max"],
+            },
+            "relevant_files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["path", "note"],
+                },
+            },
+            "approach": {"type": "string"},
+            "constraints": {"type": "string"},
+            "verification": {"type": "string"},
+            "scope_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Required non-overlapping workdir-relative mutation scopes.",
+            },
+            "analysis_handoff_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Root-registered structured delegate handoff IDs to attach.",
+            },
+        },
+        "required": ["task", "scope_paths"],
+    },
+}
+
+
+def request_coding_task(
+    *,
+    task: Optional[str],
+    context: Optional[str],
+    worker_tier: Optional[str],
+    relevant_files: Optional[list[dict[str, str]]],
+    approach: Optional[str],
+    constraints: Optional[str],
+    verification: Optional[str],
+    scope_paths: Optional[list[str]],
+    analysis_handoff_ids: Optional[list[str]],
+    parent_agent: Any,
+) -> str:
+    """Broker nested coding through state owned by the original root agent."""
+    broker = getattr(parent_agent, "_delegation_broker_context", None)
+    if not isinstance(broker, dict) or broker.get("enabled") is not True:
+        return tool_error("request_coding_task requires an explicit root broker grant.")
+    if getattr(parent_agent, "_delegate_role", "leaf") != "orchestrator":
+        return tool_error("request_coding_task is available only to orchestrator children.")
+    if getattr(parent_agent, "_delegation_read_only", False):
+        return tool_error("Read-only delegation cannot request coding mutation.")
+    if not isinstance(scope_paths, list) or not scope_paths:
+        return tool_error("request_coding_task requires non-empty scope_paths.")
+    root_agent = broker.get("root_agent")
+    if root_agent is None:
+        return tool_error("The root coding broker context is unavailable.")
+    authorized_cwd = str(broker.get("authorized_cwd") or "").strip()
+    if not authorized_cwd:
+        return tool_error("The root coding broker has no authorized cwd for this turn.")
+
+    from tools.coding_worker_tool import delegate_coding_task
+
+    with _coding_broker_lock(authorized_cwd):
+        raw = delegate_coding_task(
+            task=task,
+            context=context,
+            cwd=authorized_cwd,
+            worker_tier=worker_tier,
+            relevant_files=relevant_files,
+            approach=approach,
+            constraints=constraints,
+            verification=verification,
+            scope_paths=scope_paths,
+            analysis_handoff_ids=analysis_handoff_ids,
+            background=False,
+            allow_git_pr_lifecycle=False,
+            trusted_allow_git_pr_lifecycle=False,
+            visual_qa_requirement=broker.get("visual_qa_requirement"),
+            project_inspection_candidates=broker.get("project_inspection_candidates"),
+            parent_agent=root_agent,
+            parent_messages=None,
+        )
+    if isinstance(raw, str):
+        root_agent._coding_worker_used_this_turn = True
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return raw
+    if isinstance(payload, dict):
+        result_id = f"broker_result_{os.urandom(6).hex()}"
+        bounded_result = {
+            key: copy.deepcopy(payload.get(key))
+            for key in (
+                "success",
+                "status",
+                "error",
+                "cwd",
+                "backend",
+                "scope_check",
+                "parallel",
+                "parallel_merge",
+                "analysis_handoff_ids",
+            )
+            if key in payload
+        }
+        root_results = getattr(root_agent, "_brokered_coding_results", None)
+        if not isinstance(root_results, dict):
+            root_results = {}
+            root_agent._brokered_coding_results = root_results
+        root_results[result_id] = {
+            "result_id": result_id,
+            "requesting_subagent_id": str(
+                getattr(parent_agent, "_subagent_id", "") or ""
+            ),
+            "task": str(task or "")[:1000],
+            "result": bounded_result,
+        }
+        while len(root_results) > 100:
+            root_results.pop(next(iter(root_results)))
+        payload["broker"] = {
+            "root_owned": True,
+            "authorized_cwd": authorized_cwd,
+            "requesting_subagent_id": getattr(parent_agent, "_subagent_id", ""),
+            "background": False,
+            "gateway_session_key": broker.get("gateway_session_key", ""),
+            "session_id": broker.get("session_id", ""),
+            "origin_work_item_id": broker.get("origin_work_item_id", ""),
+            "result_id": result_id,
+        }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # --- Registry ---
@@ -3040,9 +3928,32 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        read_only=bool(args.get("read_only", False)),
+        background=_model_background_value(args, kw.get("parent_agent")),
+        allow_nested_coding=bool(args.get("allow_nested_coding", False)),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+)
+
+registry.register(
+    name="request_coding_task",
+    toolset="delegated_coding_broker",
+    schema=REQUEST_CODING_TASK_SCHEMA,
+    handler=lambda args, **kw: request_coding_task(
+        task=args.get("task"),
+        context=args.get("context"),
+        worker_tier=args.get("worker_tier"),
+        relevant_files=args.get("relevant_files"),
+        approach=args.get("approach"),
+        constraints=args.get("constraints"),
+        verification=args.get("verification"),
+        scope_paths=args.get("scope_paths"),
+        analysis_handoff_ids=args.get("analysis_handoff_ids"),
+        parent_agent=kw.get("parent_agent"),
+    ),
+    check_fn=check_delegate_requirements,
+    emoji="code",
 )

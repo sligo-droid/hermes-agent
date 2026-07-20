@@ -1187,7 +1187,7 @@ class GatewayWorkLedger:
         expected_head_sha: str,
         verified_head_sha: str,
     ) -> dict[str, Any] | None:
-        """Advance an active direct closeout from exact head H to verified H2.
+        """Advance an active direct/Fable closeout from exact head H to verified H2.
 
         The revision and lease generation fences invalidate any watcher result
         still reconciling H. Head-bound review, visual, CI, readiness, merge,
@@ -1216,7 +1216,7 @@ class GatewayWorkLedger:
             ):
                 return None
             state = normalize_closeout_state(item["closeout"])
-            if state["mode"] == "off" or state["source"] != "direct":
+            if state["mode"] == "off" or state["source"] not in {"direct", "fable"}:
                 return None
             if str(state["pr"].get("head_sha") or "").strip().lower() != expected_head:
                 return None

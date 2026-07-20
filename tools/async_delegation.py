@@ -108,6 +108,25 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _MAX_RETAINED_COMPLETED = 50
 
 
+def async_completion_succeeded(evt: Dict[str, Any]) -> bool:
+    """Return deterministic success for single, coding, and batch events."""
+    status = str(evt.get("status") or "").strip().lower()
+    results = evt.get("results")
+    if evt.get("is_batch") or isinstance(results, list):
+        if status not in {"completed", "success"} or not isinstance(results, list):
+            return False
+        return bool(results) and all(
+            isinstance(item, dict)
+            and str(item.get("status") or "").strip().lower()
+            in {"completed", "success"}
+            for item in results
+        )
+    result = evt.get("result")
+    if isinstance(result, dict) and "success" in result:
+        return status in {"completed", "success"} and result.get("success") is True
+    return status in {"completed", "success"}
+
+
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     """Lazily create (or grow) the shared daemon executor.
 
@@ -192,8 +211,6 @@ def _capture_session_routing() -> Dict[str, str]:
 
 def _completion_requires_delivery_ack(record: Dict[str, Any]) -> bool:
     """Whether gateway-visible state must stay pending until a forged turn runs."""
-    if record.get("kind") != "coding_worker":
-        return False
     platform = str(record.get("platform") or "").strip().lower()
     if not platform:
         parts = str(record.get("session_key") or "").split(":")
@@ -211,10 +228,7 @@ def _prune_completed_locked() -> None:
         (rid, r)
         for rid, r in _records.items()
         if r.get("status") != "running"
-        and not (
-            r.get("kind") == "coding_worker"
-            and r.get("delivery_pending")
-        )
+        and not r.get("delivery_pending")
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -428,15 +442,7 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
         "origin_work_item_id": record.get("origin_work_item_id", ""),
-        "closeout_id": (
-            (
-                deterministic_result.get("fable_git_result", {}).get("closeout_id")
-                if isinstance(deterministic_result, dict)
-                and isinstance(deterministic_result.get("fable_git_result"), dict)
-                else ""
-            )
-            or record.get("closeout_id", "")
-        ),
+        "closeout_id": record.get("closeout_id", ""),
     }
     for field in (
         "platform",
@@ -524,6 +530,9 @@ def dispatch_async_delegation_batch(
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    origin_work_item_id: str = "",
+    read_only: bool = False,
+    task_specs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -568,6 +577,9 @@ def dispatch_async_delegation_batch(
         "is_batch": True,
         "kind": "delegation",
         "delivery_pending": False,
+        "origin_work_item_id": str(origin_work_item_id or "")[:240],
+        "read_only": bool(read_only),
+        "task_specs": [dict(item) for item in (task_specs or [])],
     }
     record.update(_capture_session_routing())
     with _records_lock:
@@ -596,13 +608,18 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
-            if child_results and all(
-                (r.get("status") not in ("completed", "success"))
-                for r in child_results
-            ):
+            successful = sum(
+                1
+                for result in child_results
+                if isinstance(result, dict)
+                and str(result.get("status") or "").strip().lower()
+                in {"completed", "success"}
+            )
+            if not child_results or successful == 0:
                 status = "error"
+            elif successful != len(child_results):
+                status = "partial"
             else:
                 status = "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
@@ -645,7 +662,7 @@ def _finalize_batch(
         record["status"] = status
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
-        record["delivery_pending"] = False
+        record["delivery_pending"] = _completion_requires_delivery_ack(record)
         event_record = dict(record)
         _prune_completed_locked()
 
@@ -683,6 +700,10 @@ def _finalize_batch(
         "total_duration_seconds": combined.get("total_duration_seconds"),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
+        "origin_work_item_id": event_record.get("origin_work_item_id", ""),
+        "read_only": bool(event_record.get("read_only")),
+        "task_specs": event_record.get("task_specs") or [],
+        "accounting": combined.get("accounting"),
     }
     for field in (
         "platform",
@@ -776,3 +797,12 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
+    try:
+        from tools import coding_worker_tool
+
+        with coding_worker_tool._MUTATION_RESERVATIONS_LOCK:
+            coding_worker_tool._MUTATION_RESERVATIONS.clear()
+        with coding_worker_tool._PARALLEL_WORKER_RESERVATIONS_LOCK:
+            coding_worker_tool._PARALLEL_WORKER_RESERVATIONS.clear()
+    except Exception:
+        pass

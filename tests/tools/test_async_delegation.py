@@ -314,7 +314,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
     out = dt.delegate_task(
         goal="the real task", context="ctx",
-        background=True, parent_agent=parent,
+        read_only=True, background=True, parent_agent=parent,
     )
 
     import json
@@ -382,6 +382,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
     out = dt.delegate_task(
         tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
+        read_only=True,
         background=True,
         parent_agent=parent,
     )
@@ -415,11 +416,8 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
-def test_model_dispatch_forces_background():
-    """The MODEL-facing dispatch path forces background=True for any top-level
-    delegation (single task OR batch), and keeps it off for an orchestrator
-    subagent (depth > 0). Direct delegate_task() callers are unaffected (they
-    keep the synchronous default)."""
+def test_model_dispatch_background_is_explicit_and_optional():
+    """Model-facing delegation preserves the public background=false default."""
     import tools.delegate_tool as dt
     from unittest.mock import MagicMock
 
@@ -428,23 +426,82 @@ def test_model_dispatch_forces_background():
     sub = MagicMock()
     sub._delegate_depth = 1
 
-    # Registry-fallback helper: top-level always background, regardless of
-    # single vs batch; subagent never.
-    assert dt._model_background_value({"goal": "x"}, top) is True
+    assert dt._model_background_value({"goal": "x"}, top) is False
     assert dt._model_background_value(
-        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, top
+        {"tasks": [{"goal": "a"}, {"goal": "b"}], "background": True}, top
     ) is True
-    assert dt._model_background_value({"tasks": [{"goal": "a"}]}, top) is True
+    assert dt._model_background_value({"tasks": [{"goal": "a"}]}, top) is False
     assert dt._model_background_value({"goal": "x"}, sub) is False
     assert dt._model_background_value(
-        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, sub
-    ) is False
+        {"tasks": [{"goal": "a"}, {"goal": "b"}], "background": True}, sub
+    ) is True
 
 
-def test_run_agent_dispatch_forces_background():
-    """run_agent._dispatch_delegate_task — the live model path — forces
-    background on for any top-level delegation (single OR batch) and off for a
-    subagent."""
+def test_batch_partial_failure_sets_nonzero_status_and_preserves_accounting():
+    accounting = {
+        "version": 1,
+        "accounting_id": "accounting-1",
+        "children": [],
+        "cost_total_usd": 0.0,
+    }
+    result = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test",
+        session_key="agent:main:discord:thread:1:2",
+        runner=lambda: {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "done"},
+                {"task_index": 1, "status": "failed", "error": "boom"},
+            ],
+            "accounting": accounting,
+        },
+    )
+
+    assert result["status"] == "dispatched"
+    event = _drain_one()
+    assert event["status"] == "partial"
+    assert event["exit_code"] == 1
+    assert event["results"][1]["error"] == "boom"
+    assert event["accounting"] == accounting
+
+
+def test_gateway_analysis_completion_stays_pending_until_delivery(monkeypatch):
+    routing = {
+        "HERMES_SESSION_PLATFORM": "discord",
+        "HERMES_SESSION_CHAT_ID": "1",
+        "HERMES_SESSION_THREAD_ID": "2",
+    }
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": routing.get(name, default),
+    )
+    result = ad.dispatch_async_delegation_batch(
+        goals=["inspect"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test",
+        session_key="agent:main:discord:thread:1:2",
+        read_only=True,
+        runner=lambda: {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "done"}
+            ]
+        },
+    )
+
+    event = _drain_one()
+
+    assert event is not None
+    assert ad.pending_count(kind="delegation") == 1
+    assert ad.mark_completion_delivered(result["delegation_id"]) is True
+    assert ad.pending_count(kind="delegation") == 0
+
+
+def test_run_agent_dispatch_preserves_optional_background():
     from unittest.mock import patch
     import run_agent
 
@@ -460,10 +517,10 @@ def test_run_agent_dispatch_forces_background():
     with patch("tools.delegate_tool.delegate_task", _fake_delegate):
         agent = _FakeAgent()
         run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x"})
-        assert captured["background"] is True
+        assert captured["background"] is False
 
         run_agent.AIAgent._dispatch_delegate_task(
-            agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
+            agent, {"tasks": [{"goal": "a"}, {"goal": "b"}], "background": True}
         )
         assert captured["background"] is True
 
@@ -473,11 +530,7 @@ def test_run_agent_dispatch_forces_background():
         assert captured["background"] is False
 
 
-def test_dispatch_never_forwards_model_toolsets():
-    """The model has no toolsets argument — subagents always inherit the
-    parent's toolsets. Even if a model smuggles a `toolsets` key into the
-    tool-call args, the live dispatch path must NOT forward it to
-    delegate_task (which no longer accepts it) and must not crash."""
+def test_dispatch_preserves_public_toolsets_compatibility():
     from unittest.mock import patch
     import run_agent
 
@@ -494,7 +547,7 @@ def test_dispatch_never_forwards_model_toolsets():
         run_agent.AIAgent._dispatch_delegate_task(
             _FakeAgent(), {"goal": "x", "toolsets": ["web", "terminal"]}
         )
-    assert "toolsets" not in captured
+    assert captured["toolsets"] == ["web", "terminal"]
 
 
 def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
@@ -532,7 +585,12 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
          patch.object(dt, "_run_single_child", side_effect=slow_child), \
          patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
-        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+        out = dt.delegate_task(
+            goal="bg task",
+            read_only=True,
+            background=True,
+            parent_agent=parent,
+        )
 
     import json
     assert json.loads(out)["status"] == "dispatched"

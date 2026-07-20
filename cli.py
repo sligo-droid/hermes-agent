@@ -14823,6 +14823,13 @@ class HermesCLI:
                             try:
                                 from tools.process_registry import process_registry
                                 for _evt, _synth in process_registry.drain_notifications():
+                                    if isinstance(_evt.get("accounting"), dict):
+                                        from tools.delegate_tool import apply_detached_delegation_accounting
+
+                                        apply_detached_delegation_accounting(
+                                            self.agent,
+                                            _evt["accounting"],
+                                        )
                                     self._pending_input.put(_synth)
                             except Exception:
                                 pass
@@ -14951,6 +14958,13 @@ class HermesCLI:
                         try:
                             from tools.process_registry import process_registry
                             for _evt, _synth in process_registry.drain_notifications():
+                                if isinstance(_evt.get("accounting"), dict):
+                                    from tools.delegate_tool import apply_detached_delegation_accounting
+
+                                    apply_detached_delegation_accounting(
+                                        self.agent,
+                                        _evt["accounting"],
+                                    )
                                 self._pending_input.put(_synth)
                         except Exception:
                             pass  # Non-fatal — don't break the main loop

@@ -38,11 +38,33 @@ def _coding_event(**overrides):
             "status": "completed",
             "summary": "Implemented and verified the parser fix.",
             "scope_check": {"clean": True, "out_of_scope_files": []},
-            "fable_git_result": {
-                "pr_created": True,
-                "pr_url": "https://github.com/sligo/example/pull/9",
-            },
         },
+    }
+    event.update(overrides)
+    return event
+
+
+def _analysis_batch_event(**overrides):
+    event = {
+        "type": "async_delegation",
+        "kind": "delegation",
+        "delegation_id": "deleg_batch1",
+        "session_key": "agent:main:discord:thread:111:222",
+        "status": "partial",
+        "is_batch": True,
+        "goals": ["inspect parser", "inspect tests"],
+        "results": [
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "parser summary",
+            },
+            {
+                "task_index": 1,
+                "status": "failed",
+                "error": "provider failed",
+            },
+        ],
     }
     event.update(overrides)
     return event
@@ -110,7 +132,7 @@ def test_coding_worker_completion_message_is_self_contained():
     assert "Original task: implement the parser fix" in text
     assert "DETERMINISTIC RESULT JSON" in text
     assert '"scope_check"' in text
-    assert "https://github.com/sligo/example/pull/9" in text
+    assert "fable_git_result" not in text
     assert "report the outcome to the user" in text
 
 
@@ -122,6 +144,23 @@ def test_coding_worker_completion_respects_background_notification_mode():
     assert runner._async_completion_notification_enabled(_coding_event()) is False
     assert runner._async_completion_notification_enabled(
         _coding_event(status="partial", result={"success": False, "error": "boom"})
+    ) is True
+
+
+def test_gateway_batch_completion_uses_shared_formatter_and_partial_failure_policy():
+    text = _format_gateway_process_notification(_analysis_batch_event())
+
+    assert "ASYNC DELEGATION BATCH COMPLETE" in text
+    assert "TASK 1/2: inspect parser" in text
+    assert "parser summary" in text
+    assert "TASK 2/2: inspect tests" in text
+    assert "provider failed" in text
+
+    runner = object.__new__(GatewayRunner)
+    runner._load_background_notifications_mode = lambda: "error"
+    assert runner._async_completion_notification_enabled(_analysis_batch_event()) is True
+    assert runner._async_completion_notification_enabled(
+        _analysis_batch_event(status="completed")
     ) is True
 
 

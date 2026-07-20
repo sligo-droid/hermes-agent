@@ -63,7 +63,7 @@ def test_coding_worker_guardrail_allows_terminal_after_delegate():
     ) is None
 
 
-def test_fable_implementation_never_unblocks_direct_mutation_after_delegate():
+def test_fable_implementation_uses_normal_post_worker_guardrail():
     agent = _agent(
         _fable_implementation_turn=True,
         _coding_worker_used_this_turn=True,
@@ -75,17 +75,13 @@ def test_fable_implementation_never_unblocks_direct_mutation_after_delegate():
         {"command": "git add . && git commit -m implementation"},
     )
 
-    assert message is not None
-    assert "delegate_coding_task" in message
-    assert "Codex coding worker" in message
+    assert message is None
     assert _coding_worker_mutation_block(
         agent,
         "terminal",
         {"command": "git status --short"},
     ) is None
-    delegation_message = _coding_worker_mutation_block(agent, "delegate_task", {})
-    assert delegation_message is not None
-    assert "delegate_coding_task" in delegation_message
+    assert _coding_worker_mutation_block(agent, "delegate_task", {}) is None
 
 
 def test_fable_implementation_allows_read_only_terminal_with_stderr_duplication():

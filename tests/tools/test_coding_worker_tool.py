@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -106,6 +107,8 @@ def _reset_background_state() -> None:
     with cwt._BACKGROUND_PARALLEL_WORKERS_GUARD:
         cwt._BACKGROUND_PARALLEL_WORKERS.clear()
         cwt._BACKGROUND_PARALLEL_RESULTS.clear()
+    with cwt._PARALLEL_WORKER_RESERVATIONS_LOCK:
+        cwt._PARALLEL_WORKER_RESERVATIONS.clear()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
 
@@ -849,7 +852,7 @@ def test_background_parallel_conflict_keeps_worker_worktree(monkeypatch, tmp_pat
     _reset_background_state()
 
 
-def test_background_parallel_fable_reports_supported_cut_line(tmp_path):
+def test_background_parallel_fable_marker_uses_normal_preflight(tmp_path):
     result = json.loads(
         cwt.delegate_coding_task(
             task="parallel fable",
@@ -859,7 +862,8 @@ def test_background_parallel_fable_reports_supported_cut_line(tmp_path):
         )
     )
 
-    assert "do not yet support _parallel_group" in result["error"]
+    assert "do not yet support _parallel_group" not in result["error"]
+    assert "not a git repository" in result["error"]
 
 
 def test_scope_check_reports_in_scope_changes_as_clean(monkeypatch, tmp_path):
@@ -1510,31 +1514,11 @@ def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, t
     assert "Do not merge PRs" in prompt
 
 
-def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
-    monkeypatch,
-    tmp_path,
+def test_fable_parent_uses_normal_worker_without_local_git_finalizer(
+    monkeypatch, tmp_path
 ):
     FakeSession.instances = []
     FakeSession.results = []
-    canonical = tmp_path / "canonical"
-    worktree = tmp_path / "fable-worktree"
-    canonical.mkdir()
-    for args in (
-        ["init"],
-        ["config", "user.email", "tests@example.invalid"],
-        ["config", "user.name", "Hermes Tests"],
-        ["checkout", "-b", "main"],
-    ):
-        subprocess.run(["git", *args], cwd=canonical, check=True, stdout=subprocess.DEVNULL)
-    (canonical / "tracked.txt").write_text("initial\n", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=canonical, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=canonical, check=True)
-    subprocess.run(
-        ["git", "worktree", "add", "-b", "fable/lifecycle", str(worktree), "HEAD"],
-        cwd=canonical,
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
@@ -1543,153 +1527,28 @@ def test_fable_merge_lifecycle_keeps_worker_local_and_uses_trusted_finalizer(
         "agent.transports.codex_app_server.check_codex_binary",
         lambda: (True, "codex ready"),
     )
-    preparation = SimpleNamespace(
-        success=True,
-        worktree=str(worktree),
-        branch="fable/lifecycle",
-        base_branch="main",
-        repo="sligo-labs/example",
-        pr_url="https://github.com/sligo-labs/example/pull/1",
-        resume_existing_pr=True,
-        recovery_kind="merge_conflict",
-        conflict_files=["src/app.py"],
-        error="",
-    )
-    finalized = SimpleNamespace(
-        success=True,
-        status="merged",
-        error="",
-        as_dict=lambda: {
-            "success": True,
-            "status": "merged",
-            "pr_url": "https://github.com/sligo-labs/example/pull/1",
-        },
-    )
-    prepare = MagicMock(return_value=preparation)
-    finalize = MagicMock(return_value=finalized)
-    monkeypatch.setattr(
-        "hermes_cli.fable_git_finalizer.prepare_fable_git_lifecycle",
-        prepare,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.fable_git_finalizer.finalize_fable_git_lifecycle",
-        finalize,
-    )
-    parent = _fable_parent(worktree)
+    monkeypatch.setitem(sys.modules, "hermes_cli.fable_git_finalizer", None)
+    parent = _fable_parent(tmp_path)
     parent._fable_git_lifecycle = "merge"
 
     result = json.loads(cwt.delegate_coding_task(task="land the requested change", parent_agent=parent))
 
     assert result["success"] is True
-    assert result["fable_git_lifecycle"] == "merge"
-    assert result["fable_git_result"]["status"] == "merged"
+    assert "fable_git_lifecycle" not in result
+    assert "fable_git_result" not in result
     env = FakeSession.instances[0].kwargs["env"]
     assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in env
     assert "HERMES_CODEX_WORKER_WORKSPACE" not in env
     assert "HERMES_CODEX_WORKER_GIT_COMMON_DIR" not in env
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
-    assert "pre-provisioned mutable checkout" in prompt
-    assert "Do not stage files" in prompt
-    assert "Trusted Hermes code owns that GitHub lifecycle" in prompt
-    assert "Trusted Hermes lifecycle recovery has started a local merge" in prompt
-    assert "src/app.py" in prompt
-    assert "trusted Hermes will validate, stage, commit, push" in prompt
+    assert "Fable implementation worker" not in prompt
+    assert "pre-provisioned mutable checkout" not in prompt
+    assert "Trusted Hermes lifecycle recovery" not in prompt
     assert "Git/PR lifecycle is explicitly authorized" not in prompt
-    prepare.assert_called_once_with(str(worktree), "merge")
-    finalize.assert_called_once_with(
-        preparation,
-        mode="merge",
-        task="land the requested change",
-        worker_summary="Changed src/app.py and ran pytest.",
-        closeout_mode="shadow",
-        verification_runtime_breakdown=None,
-        visual_qa_requirement={"level": "none", "target": "", "assertions": []},
-    )
 
 
-def test_fable_closeout_persists_before_worker_completion_and_notifies():
-    calls = []
-
-    class Ledger:
-        def get(self, work_id):
-            return {"id": work_id, "closeout": {"revision": 4}}
-
-        def activate_closeout(self, work_id, state, *, expected_revision):
-            calls.append(("activate", work_id, expected_revision, state))
-            return {**state, "revision": 5}
-
-    notifications = []
-    parent = SimpleNamespace(
-        _origin_work_item_id="work-1",
-        _closeout_ledger=Ledger(),
-        _closeout_notify=lambda work_id: notifications.append(work_id),
-    )
-    state = {
-        "id": "closeout-1",
-        "source": "fable",
-        "mode": "shadow",
-        "workspace": {
-            "path": "/mutable/worktree",
-            "canonical_path": "/canonical",
-            "repository": "acme/example",
-            "branch": "feature/test",
-            "base_branch": "main",
-        },
-        "policy": {"merge": "auto"},
-    }
-
-    persisted, error = cwt._persist_fable_closeout(
-        parent,
-        state,
-        {
-            "closeout": {
-                "mode": "shadow",
-                "surfaces": {"fable": True},
-                "post_merge_requirements": {"ci": True},
-            }
-        },
-    )
-
-    assert error == ""
-    assert persisted["revision"] == 5
-    assert [call[0] for call in calls] == ["activate"]
-    assert calls[0][2] == 4
-    assert calls[0][3]["policy"]["post_merge_requirements"]["ci"] is True
-    assert notifications == ["work-1"]
-
-
-def test_fable_closeout_fails_closed_without_durable_work_item():
-    persisted, error = cwt._persist_fable_closeout(
-        SimpleNamespace(),
-        {"id": "closeout-1", "workspace": {"path": "/mutable"}},
-        {"closeout": {"mode": "shadow", "surfaces": {"fable": True}}},
-    )
-
-    assert persisted is None
-    assert "durable closeout work item" in error
-
-
-def test_background_fable_completion_contains_trusted_git_evidence(monkeypatch, tmp_path):
+def test_background_fable_parent_returns_normal_worker_result(monkeypatch, tmp_path):
     _reset_background_state()
-    canonical = tmp_path / "canonical"
-    worktree = tmp_path / "fable-worktree"
-    canonical.mkdir()
-    for args in (
-        ["init"],
-        ["config", "user.email", "tests@example.invalid"],
-        ["config", "user.name", "Hermes Tests"],
-        ["checkout", "-b", "main"],
-    ):
-        subprocess.run(["git", *args], cwd=canonical, check=True, stdout=subprocess.DEVNULL)
-    (canonical / "tracked.txt").write_text("initial\n", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=canonical, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=canonical, check=True)
-    subprocess.run(
-        ["git", "worktree", "add", "-b", "fable/background", str(worktree), "HEAD"],
-        cwd=canonical,
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
     monkeypatch.setattr(
@@ -1704,40 +1563,8 @@ def test_background_fable_completion_contains_trusted_git_evidence(monkeypatch, 
         "hermes_cli.worker_autoreview.materialize_autoreview_helper",
         lambda workdir: None,
     )
-    preparation = SimpleNamespace(
-        success=True,
-        worktree=str(worktree),
-        branch="fable/background",
-        base_branch="main",
-        repo="sligo-labs/example",
-        pr_url="",
-        resume_existing_pr=False,
-        error="",
-    )
-    finalized = SimpleNamespace(
-        success=True,
-        status="pr_opened",
-        error="",
-        as_dict=lambda: {
-            "success": True,
-            "status": "pr_opened",
-            "commit_performed": True,
-            "push_performed": True,
-            "pr_created": True,
-            "pr_url": "https://github.com/sligo-labs/example/pull/9",
-        },
-    )
-    prepare = MagicMock(return_value=preparation)
-    finalize = MagicMock(return_value=finalized)
-    monkeypatch.setattr(
-        "hermes_cli.fable_git_finalizer.prepare_fable_git_lifecycle",
-        prepare,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.fable_git_finalizer.finalize_fable_git_lifecycle",
-        finalize,
-    )
-    parent = _fable_parent(worktree)
+    monkeypatch.setitem(sys.modules, "hermes_cli.fable_git_finalizer", None)
+    parent = _fable_parent(tmp_path)
     parent._fable_git_lifecycle = "pr"
 
     handle = json.loads(
@@ -1749,11 +1576,9 @@ def test_background_fable_completion_contains_trusted_git_evidence(monkeypatch, 
     )
     assert handle["success"] is True
     event = _drain_background_completion()
-    evidence = event["result"]["fable_git_result"]
-    assert evidence["pr_created"] is True
-    assert evidence["pr_url"].endswith("/pull/9")
-    prepare.assert_called_once_with(str(worktree), "pr")
-    finalize.assert_called_once()
+    assert event["result"]["success"] is True
+    assert "fable_git_result" not in event["result"]
+    assert "fable_git_lifecycle" not in event["result"]
     _reset_background_state()
 
 
@@ -2888,7 +2713,18 @@ def test_preflight_suppresses_missing_worktree_for_required_canonical_cwd(monkey
     assert "BLOCKED:" not in result["error"]
 
 
-def test_fable_delegate_requires_a_mutable_git_worktree(tmp_path):
+def test_fable_marker_does_not_add_a_git_worktree_requirement(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server.check_codex_binary",
+        lambda: (True, "codex ready"),
+    )
+
     result = json.loads(
         cwt.delegate_coding_task(
             task="Implement the feature",
@@ -2896,19 +2732,34 @@ def test_fable_delegate_requires_a_mutable_git_worktree(tmp_path):
         )
     )
 
-    assert "Fable implementation requires a mutable git worktree" in result["error"]
+    assert result["success"] is True
+    assert result["cwd"] == str(tmp_path)
+    assert "fable_git_result" not in result
 
 
-def test_fable_delegate_rejects_opencode_backend(monkeypatch, tmp_path):
+def test_fable_marker_uses_configured_opencode_backend(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"coding_worker": {"backend": "opencode"}})
     monkeypatch.setattr(
         ow,
         "load_coding_worker_backend",
         lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
     )
+    monkeypatch.setattr(
+        ow,
+        "run_opencode_task",
+        lambda *args, **kwargs: SimpleNamespace(
+            final_text="done",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        ),
+    )
 
     result = json.loads(
         cwt.delegate_coding_task(
@@ -2917,11 +2768,11 @@ def test_fable_delegate_rejects_opencode_backend(monkeypatch, tmp_path):
         )
     )
 
-    assert "coding_worker.backend=codex" in result["error"]
-    assert "OpenCode" in result["error"]
+    assert result["success"] is True
+    assert result["backend"] == "opencode"
 
 
-def test_fable_parallel_group_rejects_opencode_and_reports_merge_evidence(
+def test_fable_parallel_group_uses_opencode_and_reports_merge_evidence(
     monkeypatch,
     tmp_path,
 ):
@@ -2938,6 +2789,20 @@ def test_fable_parallel_group_rejects_opencode_and_reports_merge_evidence(
         "load_coding_worker_backend",
         lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
     )
+    monkeypatch.setattr(
+        ow,
+        "run_opencode_task",
+        lambda *args, **kwargs: SimpleNamespace(
+            final_text="done",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        ),
+    )
 
     result = json.loads(
         cwt.delegate_coding_task(
@@ -2947,8 +2812,8 @@ def test_fable_parallel_group_rejects_opencode_and_reports_merge_evidence(
         )
     )
 
-    assert "coding_worker.backend=codex" in result["error"]
-    assert "OpenCode" in result["error"]
+    assert result["success"] is True
+    assert result["backend"] == "opencode"
     worker_cwd = Path(result["parallel"]["worker_cwd"])
     assert result["parallel"] == {
         "group_id": "fable-opencode",
@@ -2969,7 +2834,7 @@ def test_fable_parallel_group_rejects_opencode_and_reports_merge_evidence(
     assert not worker_cwd.exists()
 
 
-def test_fable_parallel_worker_returns_pending_merge_evidence(monkeypatch, tmp_path):
+def test_fable_marker_parallel_worker_returns_pending_merge_evidence(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
     repo = tmp_path / "repo"
@@ -3032,32 +2897,6 @@ def test_fable_parallel_worker_returns_pending_merge_evidence(monkeypatch, tmp_p
     )
     assert merge_result["merged"] is True
     assert not seen["worker_cwd"].exists()
-
-
-def test_fable_delegate_fails_clearly_when_codex_is_unavailable(monkeypatch, tmp_path):
-    from agent import opencode_worker as ow
-
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"coding_worker": {"backend": "codex"}})
-    monkeypatch.setattr(
-        ow,
-        "load_coding_worker_backend",
-        lambda config=None, worker_config=None: ow.BACKEND_CODEX,
-    )
-    monkeypatch.setattr(
-        "agent.transports.codex_app_server.check_codex_binary",
-        lambda: (False, "codex CLI not found"),
-    )
-
-    result = json.loads(
-        cwt.delegate_coding_task(
-            task="Implement the feature",
-            parent_agent=_fable_parent(tmp_path),
-        )
-    )
-
-    assert "requires an available Codex coding worker" in result["error"]
-    assert "codex CLI not found" in result["error"]
 
 
 def test_delegate_opencode_omits_parent_scope_for_legacy_backend(monkeypatch, tmp_path):

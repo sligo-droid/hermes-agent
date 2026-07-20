@@ -6646,6 +6646,11 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
+            accounting = evt.get("accounting")
+            if isinstance(accounting, dict):
+                from tools.delegate_tool import apply_detached_delegation_accounting
+
+                apply_detached_delegation_accounting(session.get("agent"), accounting)
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
@@ -6691,6 +6696,11 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
+            accounting = evt.get("accounting")
+            if isinstance(accounting, dict):
+                from tools.delegate_tool import apply_detached_delegation_accounting
+
+                apply_detached_delegation_accounting(session.get("agent"), accounting)
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:

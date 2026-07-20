@@ -830,7 +830,6 @@ DEFAULT_CONFIG = {
         "mode": "shadow",
         "surfaces": {
             "kanban": False,
-            "fable": True,
             "direct": True,
         },
         "early_draft_pr": False,
@@ -1091,9 +1090,6 @@ DEFAULT_CONFIG = {
         "provider": "anthropic",
         "model": "claude-fable-5",
         "route": "anthropic_oauth",
-        # Trusted Hermes Git finalization stays opt-in: "none", "pr", or "merge".
-        # The Codex worker edits/tests locally; it never owns push or PR mutation.
-        "git_lifecycle": "none",
         # To use an Anthropic-compatible proxy without copying its secret into
         # ANTHROPIC_API_KEY, set route: anthropic_proxy plus key_env and base_url.
         # The named credential remains in the active profile's .env.
@@ -1656,6 +1652,14 @@ DEFAULT_CONFIG = {
         # warning log if out of range.
         "max_spawn_depth": 1,        # depth cap (1 = flat [default], 2 = orchestrator→leaf, 3 = three-level)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # Explicit root-owned mutation brokerage for orchestrator children.
+        # Disabled by default. When enabled, delegate_task still requires
+        # role="orchestrator", read_only=false, allow_nested_coding=true, and
+        # foreground execution. Children receive request_coding_task only;
+        # raw delegate_coding_task/cwd/background/lifecycle authority stays root-owned.
+        "nested_coding": {
+            "enabled": False,
+        },
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,
