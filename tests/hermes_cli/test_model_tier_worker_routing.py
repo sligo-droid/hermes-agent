@@ -99,9 +99,9 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
     assert scheduled == {
         "model_tier": "worker",
         "opencode": {"model": "custom/dev-worker"},
-        "simple_build_reasoning_level": "max",
-        "complex_plan_reasoning_level": "max",
-        "complex_build_reasoning_level": "max",
+        "simple_build_reasoning_level": "xhigh",
+        "complex_plan_reasoning_level": "xhigh",
+        "complex_build_reasoning_level": "xhigh",
     }
     profiles = opencode_worker.load_coding_worker_pass_profiles(
         {

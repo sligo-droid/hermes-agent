@@ -1648,7 +1648,7 @@ DEFAULT_CONFIG = {
                                        # no ceiling). High-reasoning models on large tasks
                                        # (e.g. gpt-5.5 xhigh, opus-4.6) need generous budgets;
                                        # raise if children time out before producing output.
-        "reasoning_effort": "",  # subagent effort: "max", "xhigh", "high", "medium",
+        "reasoning_effort": "",  # subagent effort: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
@@ -2034,7 +2034,7 @@ DEFAULT_CONFIG = {
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
         "action_request_model_tier": "discord_action", # Ordinary Discord action requests use Sol/medium
-        "action_request_complex_model_tier": "advanced", # Complex/risky initial requests use shared Sol/xhigh
+        "action_request_complex_model_tier": "advanced", # Complex/risky initial requests use shared Sol/high
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "action_worktree_warmup": "auto", # auto | off; install JS deps when provisioning action worktrees

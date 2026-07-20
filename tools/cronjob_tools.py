@@ -897,7 +897,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "reasoning_effort": {
                 "type": "string",
-                "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
                 "description": "Optional raw per-job reasoning override. Setting it makes raw job overrides authoritative over model_tier."
             },
             "script": {

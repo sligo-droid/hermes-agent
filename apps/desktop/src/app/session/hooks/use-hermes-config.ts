@@ -36,7 +36,10 @@ function normalizeConfigEffort(value: unknown): string {
 
   const effort = normalize(value)
 
-  return effort === 'false' || effort === 'disabled' ? 'none' : effort
+  if (effort === 'false' || effort === 'disabled') {
+    return 'none'
+  }
+  return effort === 'max' ? 'xhigh' : effort
 }
 
 interface HermesConfigOptions {

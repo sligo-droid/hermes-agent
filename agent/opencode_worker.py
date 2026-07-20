@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional
 BACKEND_CODEX = "codex"
 BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
-_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 0.0
 _DEFAULT_OPENCODE_MODEL = "hermes-codex/gpt-5.6-sol"
 _CODING_WORKER_PASS_NAMES = ("simple_build", "complex_plan", "complex_build")
@@ -1533,9 +1533,6 @@ def _worker_provider_config(model: str, reasoning_level: str) -> tuple[str, dict
             if isinstance(variants, dict):
                 for level in _VALID_REASONING_LEVELS:
                     variants.setdefault(level, {"reasoningEffort": level})
-                # Preserve max literally even if the source provider catalog
-                # came from an older generated worker configuration.
-                variants["max"] = {"reasoningEffort": "max"}
     entry = models.get(model_id)
     if not isinstance(entry, dict):
         raise ValueError(f"OpenCode provider {provider_id!r} cannot represent worker model {model!r}.")
@@ -1601,7 +1598,9 @@ def _plan_prompt(prompt: str) -> str:
 
 
 def _normalize_reasoning_level(value: Any) -> str:
-    raw = str(value or "").strip().lower()
+    from hermes_constants import normalize_reasoning_effort
+
+    raw = normalize_reasoning_effort(value)
     return raw if raw in _VALID_REASONING_LEVELS else ""
 
 

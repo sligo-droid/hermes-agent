@@ -44,7 +44,7 @@ def test_any_raw_job_override_bypasses_job_and_global_tiers(monkeypatch):
     for override in (
         {"model": "job/model"},
         {"provider": "job-provider"},
-        {"reasoning_effort": "max"},
+        {"reasoning_effort": "xhigh"},
     ):
         model, tier = _resolve_cron_agent_model(
             config,

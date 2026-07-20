@@ -40,7 +40,7 @@ _ROLE_DEFAULT_REASONING = {
     "foreman": "xhigh",
     "reviewer": "xhigh",
 }
-_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
 _AUTO_RUNTIME = "auto"
 _WORKER_SCRIPT = Path("hermes_cli") / "kanban_codex_worker.py"
 _CONTAINER_WORKER_SCRIPT = "/hermes/hermes_cli/kanban_codex_worker.py"
@@ -192,11 +192,13 @@ def _role_runtime_settings(
     if raw_reasoning is None or _is_auto(raw_reasoning):
         reasoning = _adaptive_reasoning(role, task)
     else:
-        reasoning = str(raw_reasoning).strip().lower()
+        from hermes_constants import normalize_reasoning_effort
+
+        reasoning = normalize_reasoning_effort(raw_reasoning)
         if reasoning not in _VALID_REASONING_LEVELS:
             reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
             reasoning_source = "default"
-    if role != "reviewer" and reasoning in {"xhigh", "max"}:
+    if role != "reviewer" and reasoning == "xhigh":
         reasoning = "high"
         reasoning_source = "review_only_cap"
 

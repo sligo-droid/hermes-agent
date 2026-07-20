@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+
+import pytest
 import subprocess
 import sys
 
@@ -54,7 +56,7 @@ def test_cron_create_options():
         "cron", "create", "0 9 * * *", "daily task prompt",
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
-        "--model-tier", "advanced", "--reasoning-effort", "max",
+        "--model-tier", "advanced", "--reasoning-effort", "xhigh",
         "--workdir", "/tmp/x",
     ])
     assert ns.schedule == "0 9 * * *"
@@ -65,8 +67,15 @@ def test_cron_create_options():
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.model_tier == "advanced"
-    assert ns.reasoning_effort == "max"
+    assert ns.reasoning_effort == "xhigh"
     assert ns.workdir == "/tmp/x"
+
+
+def test_cron_reasoning_effort_rejects_removed_max_level():
+    parser = _build()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["cron", "create", "30m", "task", "--reasoning-effort", "max"])
 
 
 def test_cron_edit_no_agent_tristate():

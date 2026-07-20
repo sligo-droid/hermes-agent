@@ -470,7 +470,7 @@ def test_invalid_worker_tier_returns_tool_error(tmp_path):
     )
 
     assert "Unknown worker_tier 'impossible'" in result["error"]
-    for tier in ("quick", "standard", "thorough", "deep", "max"):
+    for tier in ("quick", "standard", "thorough", "deep"):
         assert tier in result["error"]
 
 
@@ -482,7 +482,6 @@ def test_coding_worker_schema_exposes_orchestrator_inputs():
         "standard",
         "thorough",
         "deep",
-        "max",
     ]
     assert {"relevant_files", "approach", "constraints", "verification", "scope_paths"} <= set(
         properties
@@ -2671,7 +2670,7 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
         "load_coding_worker_pass_config",
         lambda: {
             "simple_build_reasoning_level": "low",
-            "complex_plan_reasoning_level": "max",
+            "complex_plan_reasoning_level": "high",
             "complex_build_reasoning_level": "high",
         },
     )
@@ -2688,7 +2687,7 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="high"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",

@@ -229,7 +229,6 @@ _UI_SKILLS_BY_TIER = {
     "standard": UI_SPECIALIST_SKILLS[:2],
     "thorough": UI_SPECIALIST_SKILLS,
     "deep": UI_SPECIALIST_SKILLS,
-    "max": UI_SPECIALIST_SKILLS,
 }
 _NO_WORKER_ROUTES = {"review_only_no_worker", "ask_human"}
 

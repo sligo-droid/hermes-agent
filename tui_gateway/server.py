@@ -8308,8 +8308,10 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 return _ok(rid, {"key": key, "value": "clamp"})
 
+            from hermes_constants import VALID_REASONING_EFFORTS
+
             parsed = parse_reasoning_effort(arg)
-            if parsed is None:
+            if arg not in {"none", *VALID_REASONING_EFFORTS} or parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
             _write_config_key("agent.reasoning_effort", arg)
             if session and session.get("agent") is not None:
