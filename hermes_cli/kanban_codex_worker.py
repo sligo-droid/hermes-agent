@@ -1769,10 +1769,12 @@ def _worker_reasoning_effort(role: str) -> str:
     effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
     if effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
         if role != ROLE_REVIEWER and effort in {"xhigh", "max"}:
-            return "medium"
+            return "high"
         return effort
     if role == ROLE_REVIEWER:
         return "xhigh"
+    if role in {ROLE_PLANNER, ROLE_FOREMAN}:
+        return "high"
     return "medium"
 
 

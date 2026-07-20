@@ -518,12 +518,12 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "pass_count": 2,
         "plan_used": True,
         "passes": [
-            {"name": "plan", "agent": "plan", "reasoning": "medium", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "intermediate"},
+            {"name": "plan", "agent": "plan", "reasoning": "high", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
             {"name": "build", "agent": "build", "reasoning": "medium", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "intermediate"},
         ],
     }
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["medium", "medium"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["high", "medium"]
     assert [_option(cmd, "--model") for cmd in calls] == [
         "hermes-codex/gpt-5.6-sol",
         "hermes-codex/gpt-5.6-sol",
@@ -853,11 +853,11 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
 
     assert complex_result.error is None
     assert complex_result.run_profile["passes"] == [
-        {"name": "plan", "agent": "plan", "reasoning": "medium", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
+        {"name": "plan", "agent": "plan", "reasoning": "high", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
         {"name": "build", "agent": "build", "reasoning": "low", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
     ]
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["medium", "low"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["high", "low"]
 
 
 def test_explicit_pass_tier_and_raw_worker_overrides_take_precedence():

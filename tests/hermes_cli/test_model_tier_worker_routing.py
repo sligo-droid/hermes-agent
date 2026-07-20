@@ -37,10 +37,10 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
 
     settings = workers._role_runtime_settings("dev", config)
 
-    assert settings["model_tier"] == "intermediate"
-    assert settings["model"] == "gpt-5.6-sol"
-    assert settings["opencode_model"] == "hermes-codex/gpt-5.6-sol"
-    assert settings["reasoning"] == "medium"
+    assert settings["model_tier"] == "worker"
+    assert settings["model"] == "custom/dev-model"
+    assert settings["opencode_model"] == "custom/dev-worker"
+    assert settings["reasoning"] == "high"
     assert settings["reasoning_source"] == "model_tier"
     assert settings["model_tier_source"] == "role"
     assert settings["worker_tier"] == "quick"
@@ -124,13 +124,13 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
         name: (profile["model_tier"], profile["model"], profile["reasoning_level"])
         for name, profile in profiles.items()
     } == {
-        "simple_build": ("intermediate", "custom/dev-worker", "medium"),
-        "complex_plan": ("intermediate", "custom/dev-worker", "medium"),
-        "complex_build": ("intermediate", "custom/dev-worker", "medium"),
+        "simple_build": ("worker", "custom/dev-worker", "high"),
+        "complex_plan": ("worker", "custom/dev-worker", "high"),
+        "complex_build": ("worker", "custom/dev-worker", "high"),
     }
     assert worker._role_extra_args("dev") == [
         "-c", 'model="custom/dev-model"',
-        "-c", 'model_reasoning_effort="max"',
+        "-c", 'model_reasoning_effort="high"',
         "-c", 'service_tier="normal"',
     ]
 

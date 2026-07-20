@@ -1268,7 +1268,8 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         assert _resolve_delegation_model_tier(cfg, "Fix a typo", None, "leaf").name == "basic"
         assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "leaf").name == "intermediate"
         assert _resolve_delegation_model_tier(cfg, "Audit auth migration", None, "leaf").name == "advanced"
-        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").name == "intermediate"
+        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").name == "advanced"
+        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").reasoning_effort == "high"
         assert _resolve_delegation_model_tier(cfg, "Review the architecture", None, "orchestrator").name == "advanced"
 
     def test_explicit_runtime_fields_bypass_tier_atomically(self):
@@ -1302,7 +1303,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], parent.model)
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
         self.assertEqual(kwargs["provider"], parent.provider)
 
     @patch("tools.delegate_tool._run_single_child")
@@ -2512,7 +2513,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
             task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
-        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
