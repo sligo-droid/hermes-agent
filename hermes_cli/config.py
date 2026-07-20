@@ -2037,8 +2037,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_model_tier": "discord_action", # Ordinary Discord action requests use Sol/medium
-        "action_request_complex_model_tier": "advanced", # Complex/risky initial requests use shared Sol/high
+        "action_request_model_tier": "discord_action", # Accepted Discord action requests use Sol/medium
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "action_worktree_warmup": "auto", # auto | off; install JS deps when provisioning action worktrees
@@ -5023,7 +5022,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             if not quiet:
                 print("  ✓ Added reasoning to the runtime footer fields")
 
-    # ── Version 25 → 26: split routine Discord actions from advanced ──
+    # ── Version 25 → 26: move Discord actions to their route tier ──
     # Only the exact persisted former default is rewritten. Missing values are
     # filled by the normal default migration below, while custom tier names,
     # disabled values, and even differently-cased strings remain untouched.

@@ -2768,12 +2768,12 @@ async def test_reply_native_voice_existing_action_thread_classifies_transcript(
 
 
 @pytest.mark.parametrize(
-    ("trigger", "transcript", "expected_tier", "expected_effort"),
+    ("trigger", "transcript"),
     [
-        ("auto", "Build the approved parser", "discord_action", "medium"),
-        ("mention", "Migrate the production auth schema", "advanced", "high"),
-        ("reply", "Add parser telemetry", "discord_action", "medium"),
-        ("action_channel", "Audit the production permission model", "advanced", "xhigh"),
+        ("auto", "Build the approved parser"),
+        ("mention", "Migrate the production auth schema"),
+        ("reply", "Add parser telemetry"),
+        ("action_channel", "Audit the production permission model"),
     ],
 )
 @pytest.mark.asyncio
@@ -2782,8 +2782,6 @@ async def test_existing_thread_native_voice_promotes_action_from_transcript(
     monkeypatch,
     trigger,
     transcript,
-    expected_tier,
-    expected_effort,
 ):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     if trigger in {"auto", "action_channel"}:
@@ -2836,9 +2834,9 @@ async def test_existing_thread_native_voice_promotes_action_from_transcript(
     tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
     assert tier is not None
     assert (tier.name, tier.model, tier.reasoning_effort) == (
-        expected_tier,
+        "discord_action",
         "gpt-5.6-sol",
-        expected_effort,
+        "medium",
     )
     assert any(
         payload.get("content") == f"> {transcript}"
@@ -3056,10 +3054,10 @@ async def test_unmentioned_voice_action_followup_classifies_transcript(adapter, 
 
 
 @pytest.mark.parametrize(
-    ("transcript", "expected_tier", "expected_effort"),
+    "transcript",
     [
-        ("Build a deploy dashboard", "discord_action", "medium"),
-        ("Migrate the production auth schema", "advanced", "high"),
+        "Build a deploy dashboard",
+        "Migrate the production auth schema",
     ],
 )
 @pytest.mark.asyncio
@@ -3067,8 +3065,6 @@ async def test_native_voice_feature_request_triages_from_transcript(
     adapter,
     monkeypatch,
     transcript,
-    expected_tier,
-    expected_effort,
 ):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
@@ -3118,9 +3114,9 @@ async def test_native_voice_feature_request_triages_from_transcript(
     tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
     assert tier is not None
     assert (tier.name, tier.model, tier.reasoning_effort) == (
-        expected_tier,
+        "discord_action",
         "gpt-5.6-sol",
-        expected_effort,
+        "medium",
     )
     assert event.media_urls == ["/tmp/voice_from_read.ogg"]
     assert event.media_types == ["audio/ogg"]

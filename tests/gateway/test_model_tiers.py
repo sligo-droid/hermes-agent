@@ -32,17 +32,12 @@ def test_gateway_can_disable_its_tier_and_fall_back_to_global_config(monkeypatch
     }
 
 
-def test_discord_complex_implementation_caps_effort_but_keeps_advanced_model():
-    implementation = gateway_run._discord_action_request_model_tier(
-        {},
-        {"initial_request": "Investigate the production race and fix it"},
-    )
-    review = gateway_run._discord_action_request_model_tier(
-        {},
-        {"initial_request": "Audit the production authentication race"},
+def test_discord_action_request_uses_configured_routine_tier():
+    tier = gateway_run._discord_action_request_model_tier(
+        {
+            "discord": {"action_request_model_tier": "intermediate"},
+        }
     )
 
-    assert implementation.name == "advanced"
-    assert implementation.reasoning_effort == "high"
-    assert review.name == "advanced"
-    assert review.reasoning_effort == "xhigh"
+    assert tier.name == "intermediate"
+    assert tier.reasoning_effort == "medium"

@@ -210,18 +210,16 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("initial_request", "expected_tier", "expected_effort"),
+    "initial_request",
     [
-        ("Fix a typo in the README", "discord_action", "medium"),
-        ("Migrate the production auth schema", "advanced", "high"),
+        "Fix a typo in the README",
+        "Test out the new async stuff",
+        "Migrate the production auth schema",
     ],
 )
 @pytest.mark.asyncio
-async def test_discord_action_request_tier_audit_matrix(
-    monkeypatch,
-    initial_request,
-    expected_tier,
-    expected_effort,
+async def test_discord_action_request_uses_routine_tier_regardless_of_keywords(
+    monkeypatch, initial_request
 ):
     _patch_agent_runtime(monkeypatch)
     runner = _make_runner()
@@ -232,48 +230,8 @@ async def test_discord_action_request_tier_audit_matrix(
         intent=True,
     )
 
-    assert result["reasoning_effort"] == expected_effort
-    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
-    assert _CapturingAgent.last_init["reasoning_config"] == {
-        "enabled": True,
-        "effort": expected_effort,
-    }
-    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
-    assert audit["model_tier"] == expected_tier
-    assert audit["runtime_route"] == "discord_action_request"
-
-
-@pytest.mark.parametrize("complex_tier", ["missing-tier", "disabled", ""])
-@pytest.mark.asyncio
-async def test_invalid_or_disabled_complex_tier_falls_back_atomically_to_routine_tier(
-    monkeypatch,
-    complex_tier,
-):
-    _patch_agent_runtime(monkeypatch)
-    monkeypatch.setattr(
-        gateway_run,
-        "_load_gateway_config",
-        lambda: {
-            "discord": {
-                "action_request_model_tier": "discord_action",
-                "action_request_complex_model_tier": complex_tier,
-            }
-        },
-    )
-    runner = _make_runner()
-
-    result = await _run_discord_agent(
-        runner,
-        {
-            "initial_request": "Migrate the production auth schema",
-            "message_id": "300",
-            "kanban_board": None,
-        },
-        intent=True,
-    )
-
-    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
     assert result["reasoning_effort"] == "medium"
+    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
     assert _CapturingAgent.last_init["reasoning_config"] == {
         "enabled": True,
         "effort": "medium",
@@ -281,6 +239,7 @@ async def test_invalid_or_disabled_complex_tier_falls_back_atomically_to_routine
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
     assert audit["model_tier"] == "discord_action"
     assert audit["model_tier_source"] == "route"
+    assert audit["runtime_route"] == "discord_action_request"
 
 
 @pytest.mark.asyncio

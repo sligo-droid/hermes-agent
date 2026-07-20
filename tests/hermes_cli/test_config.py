@@ -862,7 +862,7 @@ class TestDiscordActionTierMigration:
 
         assert raw["_config_version"] == 26
         assert raw["discord"]["action_request_model_tier"] == "discord_action"
-        assert raw["discord"]["action_request_complex_model_tier"] == "advanced"
+        assert "action_request_complex_model_tier" not in raw["discord"]
         assert (
             "discord.action_request_model_tier=discord_action (migrated from former default)"
             in results["config_added"]
@@ -890,7 +890,7 @@ class TestDiscordActionTierMigration:
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
         assert raw["discord"]["action_request_model_tier"] == custom_value
-        assert raw["discord"]["action_request_complex_model_tier"] == "advanced"
+        assert "action_request_complex_model_tier" not in raw["discord"]
         assert not any("migrated from former default" in value for value in results["config_added"])
 
 

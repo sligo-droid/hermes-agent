@@ -1151,7 +1151,7 @@ choose a model and reasoning effort.
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
 | `basic` | GPT-5.6 Luna | `xhigh` | Ordinary gateway sessions |
 | `intermediate` | GPT-5.6 Sol | `medium` | Coding-worker build passes and Kanban `dev` |
-| `discord_action` | GPT-5.6 Sol | `medium` | Simple and ordinary Discord action requests |
+| `discord_action` | GPT-5.6 Sol | `medium` | Accepted Discord action requests |
 | `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
 These defaults follow the supported model/effort frontier: narrow routine work
@@ -1205,7 +1205,6 @@ cron:
 
 discord:
   action_request_model_tier: discord_action
-  action_request_complex_model_tier: advanced
 
 coding_worker:
   backend: codex
@@ -1225,6 +1224,11 @@ kanban:
       reviewer: {model_tier: advanced}
       foreman: {model_tier: advanced}
 ```
+
+Discord intake still distinguishes questions from action requests. Once Hermes
+accepts a message as an action request, it consistently uses
+`discord.action_request_model_tier`; request wording or inferred complexity does
+not select a separate tier.
 
 Coding workers use one `intermediate` build pass for simple work. Complex or
 risky work uses an `advanced` planning pass followed by an `intermediate` build

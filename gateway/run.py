@@ -60,7 +60,7 @@ from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
-from hermes_cli.model_tiers import classify_task_complexity, resolve_model_tier
+from hermes_cli.model_tiers import resolve_model_tier
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -332,40 +332,19 @@ def _discord_action_request_model_tier(
     config: Optional[dict],
     feature_summary: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    """Return the route tier selected from the action's initial request."""
+    """Return the configured tier for accepted Discord action requests.
+
+    ``feature_summary`` remains accepted for compatibility with existing
+    callers, but request wording does not alter the route tier.
+    """
     cfg = config or {}
-    routine_name = cfg_get(
+    tier_name = cfg_get(
         cfg,
         "discord",
         "action_request_model_tier",
         default="discord_action",
     )
-    routine_tier = resolve_model_tier(cfg, routine_name)
-    initial_request = (
-        str(feature_summary.get("initial_request") or "")
-        if isinstance(feature_summary, dict)
-        else ""
-    )
-    if classify_task_complexity(initial_request) == "complex":
-        complex_name = cfg_get(
-            cfg,
-            "discord",
-            "action_request_complex_model_tier",
-            default="advanced",
-        )
-        # Keep the model+reasoning selection atomic. A broken optional complex
-        # route falls back to the configured routine action tier as one unit.
-        # If both are disabled/invalid, callers retain the legacy raw fallback.
-        selected_tier = resolve_model_tier(cfg, complex_name) or routine_tier
-    else:
-        selected_tier = routine_tier
-    from hermes_cli.model_tiers import restrict_model_tier_for_task
-
-    return restrict_model_tier_for_task(
-        cfg,
-        selected_tier,
-        initial_request,
-    )
+    return resolve_model_tier(cfg, tier_name)
 
 
 _MODEL_TIER_UNSET = object()
