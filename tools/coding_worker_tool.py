@@ -81,8 +81,10 @@ def _reservation_root(cwd: str) -> str:
 
 def _reservation_scopes(scope_paths: Any) -> list[PurePosixPath]:
     normalized, error = _normalize_scope_paths(scope_paths)
-    if error or not normalized:
+    if error or normalized is None:
         return [PurePosixPath(".")]
+    if not normalized:
+        return []
     return [PurePosixPath(path) for path in normalized]
 
 
@@ -3650,7 +3652,9 @@ CODING_WORKER_SCHEMA = {
                 "type": "array",
                 "description": (
                     "Optional workdir-relative path prefixes the worker may modify. Hermes "
-                    "deterministically reports any changed files outside these prefixes."
+                    "deterministically reports any changed files outside these prefixes. "
+                    "Parallel coding calls require this field: use non-overlapping prefixes "
+                    "for mutating workers or an explicit empty list for a review-only worker."
                 ),
                 "items": {"type": "string"},
             },
@@ -3668,8 +3672,9 @@ CODING_WORKER_SCHEMA = {
                 "default": False,
                 "description": (
                     "Run the worker in the background and report completion in a "
-                    "later turn; use for long or batchable work when the user "
-                    "should not wait."
+                    "later turn; use only when the current turn does not need the "
+                    "result. Independent synchronous workers can still run in parallel "
+                    "when emitted together with explicit non-overlapping scope_paths."
                 ),
             },
             "route_decision": {

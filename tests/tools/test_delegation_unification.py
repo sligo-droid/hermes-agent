@@ -75,18 +75,18 @@ def test_safe_background_analysis_and_coding_can_schedule_together():
     assert _should_parallelize_tool_batch(calls) is True
 
 
-def test_unsafe_mixed_delegation_batches_stay_sequential():
+def test_mixed_delegation_requires_read_only_analysis_but_not_background_mode():
     mutating_analysis = [
         _call("delegate_task", goal="edit", read_only=False, background=True),
         _call("delegate_coding_task", task="edit", scope_paths=["src"], background=True),
     ]
-    foreground_analysis = [
+    synchronous_analysis = [
         _call("delegate_task", goal="inspect", read_only=True, background=False),
         _call("delegate_coding_task", task="edit", scope_paths=["src"], background=True),
     ]
 
     assert _should_parallelize_tool_batch(mutating_analysis) is False
-    assert _should_parallelize_tool_batch(foreground_analysis) is False
+    assert _should_parallelize_tool_batch(synchronous_analysis) is True
 
 
 def test_parallel_background_coding_subset_requires_non_overlapping_scopes():

@@ -10,7 +10,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -517,6 +517,11 @@ def test_coding_worker_schema_exposes_orchestrator_inputs():
     )
     assert "_parallel_group" not in properties
     assert properties["background"]["default"] is False
+
+
+def test_explicit_empty_scope_reserves_no_mutation_paths():
+    assert cwt._reservation_scopes([]) == []
+    assert cwt._reservation_scopes(None) == [PurePosixPath(".")]
 
 
 def test_required_background_worker_marks_running_before_model_start(

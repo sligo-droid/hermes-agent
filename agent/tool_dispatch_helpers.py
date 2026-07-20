@@ -151,11 +151,8 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
         if tool_name == _CODING_WORKER_TOOL
     )
     if coding_call_count:
-        # Coding workers require a shared worktree/merge-back handshake that
-        # only the coding-only concurrent path installs. Keep mixed batches
-        # sequential even when every non-coding tool is otherwise safe.
         if coding_call_count != len(parsed_calls):
-            return _should_parallelize_safe_background_mixed(parsed_calls)
+            return _should_parallelize_safe_delegation_mixed(parsed_calls)
         return _should_parallelize_coding_worker_batch(parsed_calls)
 
     reserved_paths: list[Path] = []
@@ -178,29 +175,39 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     return True
 
 
-def _should_parallelize_safe_background_mixed(
+def _delegate_task_is_read_only(function_args: dict) -> bool:
+    """Return whether every child in one delegate call is explicitly read-only."""
+
+    tasks = function_args.get("tasks")
+    if isinstance(tasks, list):
+        return bool(tasks) and all(
+            isinstance(task, dict)
+            and task.get("read_only") is True
+            and task.get("allow_nested_coding") is not True
+            for task in tasks
+        )
+    return (
+        function_args.get("read_only") is True
+        and function_args.get("allow_nested_coding") is not True
+    )
+
+
+def _should_parallelize_safe_delegation_mixed(
     parsed_calls: list[tuple[str, dict]],
 ) -> bool:
-    """Allow only detached read-only analysis plus detached coding dispatch."""
+    """Compose explicitly read-only analysis with independently scoped coding."""
+
     coding_calls: list[tuple[str, dict]] = []
     for tool_name, function_args in parsed_calls:
         if tool_name == _CODING_WORKER_TOOL:
-            if function_args.get("background") is not True:
-                return False
             coding_calls.append((tool_name, function_args))
             continue
         if tool_name != "delegate_task":
             return False
-        if function_args.get("background") is not True:
-            return False
-        if function_args.get("read_only") is not True:
-            return False
-        if function_args.get("allow_nested_coding") is True:
+        if not _delegate_task_is_read_only(function_args):
             return False
     if not coding_calls:
         return False
-    if len(coding_calls) == 1:
-        return True
     return _should_parallelize_coding_worker_batch(coding_calls)
 
 
@@ -235,8 +242,12 @@ def _coding_worker_parallel_settings() -> tuple[bool, int]:
 def _normalize_coding_worker_scope_paths(function_args: dict) -> Optional[list[Path]]:
     """Normalize coding-worker scopes consistently with the worker tool."""
     raw_scope_paths = function_args.get("scope_paths")
-    if not isinstance(raw_scope_paths, list) or not raw_scope_paths:
+    if not isinstance(raw_scope_paths, list):
         return None
+    if not raw_scope_paths:
+        # The worker tool already enforces an explicit empty list as a
+        # no-mutation scope, so it cannot overlap a mutating worker.
+        return []
 
     normalized: list[Path] = []
     rendered_paths: set[str] = set()

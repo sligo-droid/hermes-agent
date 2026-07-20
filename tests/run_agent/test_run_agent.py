@@ -2406,6 +2406,69 @@ class TestConcurrentToolExecution:
 
         assert not run_agent._should_parallelize_tool_batch(calls)
 
+    def test_read_only_delegate_composes_with_scoped_coding_workers(self, monkeypatch):
+        self._parallel_coding_config(monkeypatch)
+        calls = [
+            _mock_tool_call(
+                name="delegate_task",
+                arguments=json.dumps(
+                    {
+                        "tasks": [
+                            {"goal": "review one", "read_only": True},
+                            {"goal": "review two", "read_only": True},
+                        ]
+                    }
+                ),
+                call_id="d1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps(
+                    {"task": "edit one", "scope_paths": ["src/one"]}
+                ),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps(
+                    {"task": "review only", "scope_paths": []}
+                ),
+                call_id="c2",
+            ),
+        ]
+
+        assert run_agent._should_parallelize_tool_batch(calls)
+
+    def test_mixed_delegation_requires_explicit_read_only_and_coding_scopes(self, monkeypatch):
+        self._parallel_coding_config(monkeypatch)
+        mutating_analysis = [
+            _mock_tool_call(
+                name="delegate_task",
+                arguments=json.dumps({"goal": "inspect", "read_only": False}),
+                call_id="d1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "edit", "scope_paths": ["src"]}),
+                call_id="c1",
+            ),
+        ]
+        unscoped_coding = [
+            _mock_tool_call(
+                name="delegate_task",
+                arguments=json.dumps({"goal": "inspect", "read_only": True}),
+                call_id="d1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "edit"}),
+                call_id="c1",
+            ),
+        ]
+
+        assert not run_agent._should_parallelize_tool_batch(mutating_analysis)
+        assert not run_agent._should_parallelize_tool_batch(unscoped_coding)
+
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
@@ -2697,6 +2760,98 @@ class TestConcurrentToolExecution:
         assert all(
             json.loads(message["content"])["parallel_merge"]["success"]
             for message in messages
+        )
+
+    def test_mixed_read_only_delegate_and_coding_workers_share_parallel_group(
+        self, agent, monkeypatch, tmp_path
+    ):
+        from agent import tool_dispatch_helpers
+        from tools import coding_worker_tool as cwt
+
+        monkeypatch.setattr(
+            tool_dispatch_helpers,
+            "_coding_worker_parallel_settings",
+            lambda: (True, 3),
+        )
+        monkeypatch.setattr(
+            cwt,
+            "preflight_delegate_coding_task",
+            lambda args, _agent: SimpleNamespace(
+                args=dict(args or {}), suppressed_result=None
+            ),
+        )
+
+        base_cwd = tmp_path / "base"
+        base_cwd.mkdir()
+        agent.session_cwd = str(base_cwd)
+        dispatched_groups = []
+        delegate_calls = []
+
+        monkeypatch.setattr(cwt, "_git_workspace_baseline", lambda _cwd: ("b" * 40, []))
+        monkeypatch.setattr(
+            cwt,
+            "merge_parallel_worker_result",
+            lambda base, worker, group: {
+                "success": True,
+                "base": base,
+                "worker": worker,
+                "group": group,
+            },
+        )
+
+        def fake_delegate(args):
+            delegate_calls.append(args)
+            return json.dumps({"results": [{"status": "success"}]})
+
+        def fake_coding(**kwargs):
+            dispatched_groups.append(kwargs["_parallel_group"])
+            return json.dumps(
+                {
+                    "success": True,
+                    "parallel": {
+                        "worker_cwd": str(tmp_path / f"worker-{kwargs['task']}")
+                    },
+                }
+            )
+
+        monkeypatch.setattr(agent, "_dispatch_delegate_task", fake_delegate)
+        monkeypatch.setattr(cwt, "delegate_coding_task", fake_coding)
+
+        calls = [
+            _mock_tool_call(
+                name="delegate_task",
+                arguments=json.dumps({"goal": "inspect", "read_only": True}),
+                call_id="d1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "review", "scope_paths": []}),
+                call_id="c2",
+            ),
+        ]
+        messages = []
+
+        agent._execute_tool_calls(
+            _mock_assistant_msg(content="", tool_calls=calls),
+            messages,
+            "task-1",
+        )
+
+        assert len(delegate_calls) == 1
+        assert len(dispatched_groups) == 2
+        assert {group["group_id"] for group in dispatched_groups} == {
+            dispatched_groups[0]["group_id"]
+        }
+        assert all(group["base_cwd"] == str(base_cwd.resolve()) for group in dispatched_groups)
+        assert [message["tool_call_id"] for message in messages] == ["d1", "c1", "c2"]
+        assert all(
+            json.loads(message["content"])["parallel_merge"]["success"]
+            for message in messages[1:]
         )
 
     def test_concurrent_handles_tool_error(self, agent):
