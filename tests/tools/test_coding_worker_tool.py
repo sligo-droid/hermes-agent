@@ -2642,7 +2642,7 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="xhigh"',
+        'model_reasoning_effort="medium"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
@@ -2794,18 +2794,69 @@ def test_worker_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_pat
     assert result["success"] is True
     assert seen["worker_config"] == {
         "model_tier": "disabled",
-        "simple_build_reasoning_level": "xhigh",
-        "complex_plan_reasoning_level": "xhigh",
-        "complex_build_reasoning_level": "xhigh",
+        "simple_build_reasoning_level": "medium",
+        "complex_plan_reasoning_level": "medium",
+        "complex_build_reasoning_level": "medium",
         "opencode": {"model": "hermes-codex/gpt-5.6-sol"},
     }
     resolved = ow.load_opencode_config(cfg, worker_config=seen["worker_config"])
     assert resolved["simple_build_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_plan_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_build_model"] == "hermes-codex/gpt-5.6-sol"
-    assert resolved["simple_build_reasoning_level"] == "xhigh"
-    assert resolved["complex_plan_reasoning_level"] == "xhigh"
-    assert resolved["complex_build_reasoning_level"] == "xhigh"
+    assert resolved["simple_build_reasoning_level"] == "medium"
+    assert resolved["complex_plan_reasoning_level"] == "medium"
+    assert resolved["complex_build_reasoning_level"] == "medium"
+
+
+def test_review_task_keeps_deep_worker_reasoning(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "opencode"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+    seen = {}
+
+    def fake_run(prompt, workspace, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            final_text="No findings.",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-review",
+            turn_id="ses-review",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Audit the parser and report findings without changes",
+            worker_tier="deep",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert seen["worker_config"]["complex_plan_reasoning_level"] == "xhigh"
+
+
+def test_exhausted_parent_deadline_blocks_coding_worker_launch(tmp_path):
+    parent = _parent(tmp_path)
+    parent._nested_worker_deadline_monotonic = 0.0
+
+    result = json.loads(
+        cwt.delegate_coding_task(task="fix the parser", parent_agent=parent)
+    )
+
+    assert "nested-worker deadline was exhausted" in result["error"]
 
 
 def test_delegate_opencode_preserves_parent_scope_when_backend_supports_it(monkeypatch, tmp_path):

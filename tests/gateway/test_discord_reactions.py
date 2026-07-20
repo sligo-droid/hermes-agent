@@ -10,6 +10,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.session import SessionSource, build_session_key
+from gateway.work_ledger import GatewayWorkLedger
 
 
 def _ensure_discord_mock():
@@ -1592,6 +1593,128 @@ async def test_thread_followup_reactions_target_origin_message(adapter):
         ("⏳",),
         ("✅",),
     ]
+
+
+@pytest.mark.asyncio
+async def test_expired_work_reconciliation_fetches_thread_origin_without_raw_message(
+    adapter,
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = MessageEvent(
+        text="implement it",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="55",
+            chat_type="thread",
+            thread_id="1000",
+            parent_chat_id="55",
+            guild_id="77",
+            message_id="1000",
+        ),
+        message_id="1000",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    assert ledger.mark_expired(item["id"])
+
+    origin_message = SimpleNamespace(
+        id=1000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="⏳", me=True)],
+    )
+    parent = SimpleNamespace(id=55, fetch_message=AsyncMock(return_value=origin_message))
+    thread = _StatusThread(thread_id=1000, name="Build dashboard")
+    thread.parent = parent
+    thread.parent_id = 55
+    thread.fetch_message = AsyncMock(side_effect=LookupError("not cached"))
+    adapter._client.get_channel = lambda channel_id: thread if channel_id == 1000 else None
+    adapter.gateway_runner = SimpleNamespace(work_ledger=ledger)
+
+    state = await adapter.reconcile_work_ledger_thread_reaction(item)
+
+    assert state == "errored"
+    origin_message.add_reaction.assert_awaited_once_with("❌")
+    assert ledger.pending_terminal_reaction_items() == []
+
+
+@pytest.mark.asyncio
+async def test_later_generic_success_repairs_expired_thread_origin_to_done(adapter, tmp_path):
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="55",
+        chat_type="thread",
+        thread_id="1000",
+        parent_chat_id="55",
+        guild_id="77",
+        message_id="1000",
+    )
+    expired_event = MessageEvent(
+        text="implement it",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="1000",
+    )
+    expired = ledger.accept_event(
+        expired_event,
+        session_key=build_session_key(source),
+        freshness_seconds=60,
+    )
+    assert expired is not None
+    ledger.mark_expired(expired["id"])
+
+    now[0] = 200.0
+    status_event = MessageEvent(
+        text="what is the status?",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="55",
+            chat_type="thread",
+            thread_id="1000",
+            parent_chat_id="55",
+            guild_id="77",
+            message_id="2000",
+        ),
+        message_id="2000",
+    )
+    status_item = ledger.accept_event(
+        status_event,
+        session_key=build_session_key(status_event.source),
+        freshness_seconds=60,
+    )
+    assert status_item is not None
+    assert ledger.mark_completed(status_item["id"])
+    status_event.work_item_id = status_item["id"]
+    status_event.discord_action_request_intent = False
+
+    origin_message = SimpleNamespace(
+        id=1000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="⏳", me=True)],
+    )
+    parent = SimpleNamespace(id=55, fetch_message=AsyncMock(return_value=origin_message))
+    thread = _StatusThread(thread_id=1000, name="Build dashboard")
+    thread.parent = parent
+    thread.parent_id = 55
+    thread.fetch_message = AsyncMock(side_effect=LookupError("not cached"))
+    adapter._client.get_channel = lambda channel_id: thread if channel_id == 1000 else None
+    adapter.gateway_runner = SimpleNamespace(work_ledger=ledger)
+
+    await adapter.on_processing_complete(status_event, ProcessingOutcome.SUCCESS)
+
+    origin_message.add_reaction.assert_awaited_once_with("✅")
+    assert ledger.discord_thread_reaction_state(status_item) == "done"
+    assert ledger.pending_terminal_reaction_items() == []
 
 
 @pytest.mark.asyncio

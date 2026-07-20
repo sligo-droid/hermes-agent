@@ -1262,13 +1262,14 @@ class TestDelegationModelTierRouting(unittest.TestCase):
             **delegation,
         }
 
-    def test_classifier_routes_named_tiers_and_orchestrator_is_advanced(self):
+    def test_classifier_routes_review_only_advanced_tier(self):
         cfg = self._tier_config()
 
         assert _resolve_delegation_model_tier(cfg, "Fix a typo", None, "leaf").name == "basic"
         assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "leaf").name == "intermediate"
         assert _resolve_delegation_model_tier(cfg, "Audit auth migration", None, "leaf").name == "advanced"
-        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").name == "advanced"
+        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").name == "intermediate"
+        assert _resolve_delegation_model_tier(cfg, "Review the architecture", None, "orchestrator").name == "advanced"
 
     def test_explicit_runtime_fields_bypass_tier_atomically(self):
         for key, value in (
@@ -1282,6 +1283,14 @@ class TestDelegationModelTierRouting(unittest.TestCase):
                     self._tier_config(**{key: value}), "Fix a typo", None, "leaf"
                 ) is None
 
+    def test_exhausted_parent_worker_budget_fails_before_launch(self):
+        parent = _make_mock_parent()
+        parent._nested_worker_deadline_monotonic = 0.0
+
+        result = json.loads(delegate_task(goal="Implement the fix", parent_agent=parent))
+
+        self.assertIn("nested-worker deadline was exhausted", result["error"])
+
     def test_disabled_routing_preserves_parent_model_and_reasoning(self):
         parent = _make_mock_parent()
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
@@ -1293,7 +1302,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], parent.model)
-        self.assertIs(kwargs["reasoning_config"], parent.reasoning_config)
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
         self.assertEqual(kwargs["provider"], parent.provider)
 
     @patch("tools.delegate_tool._run_single_child")
@@ -2503,7 +2512,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
             task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
-        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")

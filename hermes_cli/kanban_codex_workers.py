@@ -154,10 +154,28 @@ def _role_runtime_settings(
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
     try:
-        from hermes_cli.model_tiers import resolve_model_tier, resolve_worker_tier
+        from hermes_cli.model_tiers import (
+            resolve_model_tier,
+            resolve_worker_tier,
+            restrict_model_tier_for_task,
+        )
 
         model_tier = resolve_model_tier(cfg, role_cfg.get("model_tier"))
         worker_tier = resolve_worker_tier(cfg, role_cfg.get("worker_tier"))
+        purpose = "review" if role == "reviewer" else "implementation"
+        model_tier = restrict_model_tier_for_task(
+            cfg,
+            model_tier,
+            task,
+            purpose=purpose,
+        )
+        worker_tier = restrict_model_tier_for_task(
+            cfg,
+            worker_tier,
+            task,
+            worker=True,
+            purpose=purpose,
+        )
     except Exception:
         model_tier = None
         worker_tier = None
@@ -178,6 +196,9 @@ def _role_runtime_settings(
         if reasoning not in _VALID_REASONING_LEVELS:
             reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
             reasoning_source = "default"
+    if role != "reviewer" and reasoning in {"xhigh", "max"}:
+        reasoning = "medium"
+        reasoning_source = "review_only_cap"
 
     raw_tier = _config_value_with_auto_env(
         "HERMES_CODEX_WORKER_SERVICE_TIER",

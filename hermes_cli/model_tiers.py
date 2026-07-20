@@ -144,6 +144,49 @@ _EXPLICIT_PLANNING_SIGNALS = (
     "design before",
 )
 
+_IMPLEMENTATION_TASK_SIGNALS = (
+    "implement",
+    "implementation",
+    "fix",
+    "fixes",
+    "patch",
+    "apply",
+    "build",
+    "change",
+    "edit",
+    "modify",
+    "update",
+    "add",
+    "remove",
+    "delete",
+    "refactor",
+    "rewrite",
+    "create",
+    "ship",
+    "deploy",
+    "merge",
+    "commit",
+)
+
+_REVIEW_TASK_SIGNALS = (
+    "review",
+    "audit",
+    "diagnose",
+    "diagnosis",
+    "investigate",
+    "inspect",
+    "assess",
+    "root cause",
+    "trace execution",
+    "read-only",
+    "read only",
+    "no changes",
+    "do not edit",
+    "report findings",
+)
+
+_REVIEW_ONLY_REASONING_EFFORTS = frozenset({"xhigh", "max"})
+
 
 @dataclass(frozen=True)
 class ModelTier:
@@ -186,6 +229,78 @@ def classify_task_complexity(task: Any, context: Any = "") -> str:
     if any(_contains_task_signal(text, signal) for signal in _SIMPLE_TASK_SIGNALS):
         return "simple"
     return "ordinary"
+
+
+def classify_task_purpose(task: Any, context: Any = "") -> str:
+    """Classify a task as explicit review or implementation-capable work.
+
+    Mutation signals always win. Ambiguous analysis defaults to implementation
+    so review-only reasoning cannot leak into a task that may edit state.
+    """
+
+    text = f"{task or ''}\n{context or ''}".lower()
+    if any(_contains_task_signal(text, signal) for signal in _IMPLEMENTATION_TASK_SIGNALS):
+        return "implementation"
+    if any(_contains_task_signal(text, signal) for signal in _REVIEW_TASK_SIGNALS):
+        return "review"
+    return "implementation"
+
+
+def restrict_reasoning_effort_for_task(
+    reasoning_effort: Any,
+    task: Any,
+    context: Any = "",
+    *,
+    purpose: str | None = None,
+) -> str:
+    """Return an implementation-safe reasoning effort for the task."""
+
+    effort = _normalized_name(reasoning_effort)
+    resolved_purpose = _normalized_name(purpose) or classify_task_purpose(task, context)
+    if resolved_purpose != "review" and effort in _REVIEW_ONLY_REASONING_EFFORTS:
+        return "medium"
+    return effort
+
+
+def restrict_model_tier_for_task(
+    config: Mapping[str, Any] | None,
+    tier: ModelTier | None,
+    task: Any,
+    context: Any = "",
+    *,
+    worker: bool = False,
+    purpose: str | None = None,
+) -> ModelTier | None:
+    """Downgrade review-only tiers when a route can implement changes."""
+
+    if tier is None:
+        return None
+    resolved_purpose = _normalized_name(purpose) or classify_task_purpose(task, context)
+    if (
+        resolved_purpose == "review"
+        or tier.reasoning_effort not in _REVIEW_ONLY_REASONING_EFFORTS
+    ):
+        return tier
+    fallback_name = "thorough" if worker else "intermediate"
+    fallback = (
+        resolve_worker_tier(config, fallback_name)
+        if worker
+        else resolve_model_tier(config, fallback_name)
+    )
+    if fallback is None:
+        fallback = tier
+    safe_effort = restrict_reasoning_effort_for_task(
+        fallback.reasoning_effort,
+        task,
+        context,
+        purpose=resolved_purpose,
+    )
+    return ModelTier(
+        name=fallback.name,
+        model=fallback.model,
+        opencode_model=fallback.opencode_model,
+        reasoning_effort=safe_effort,
+    )
 
 
 def _merged_model_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:

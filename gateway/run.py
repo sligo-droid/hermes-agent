@@ -356,8 +356,16 @@ def _discord_action_request_model_tier(
         # Keep the model+reasoning selection atomic. A broken optional complex
         # route falls back to the configured routine action tier as one unit.
         # If both are disabled/invalid, callers retain the legacy raw fallback.
-        return resolve_model_tier(cfg, complex_name) or routine_tier
-    return routine_tier
+        selected_tier = resolve_model_tier(cfg, complex_name) or routine_tier
+    else:
+        selected_tier = routine_tier
+    from hermes_cli.model_tiers import restrict_model_tier_for_task
+
+    return restrict_model_tier_for_task(
+        cfg,
+        selected_tier,
+        initial_request,
+    )
 
 
 _MODEL_TIER_UNSET = object()
@@ -6333,6 +6341,39 @@ class GatewayRunner:
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
             scheduled += 1
+
+        for item in ledger.pending_terminal_reaction_items():
+            work_id = str(item.get("id") or "")
+            try:
+                event = ledger.event_from_item(item)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to rebuild Discord reaction reconciliation item %s: %s",
+                    work_id,
+                    exc,
+                )
+                continue
+            adapter = self._adapter_for_source(event.source)
+            reconcile = getattr(adapter, "reconcile_work_ledger_thread_reaction", None)
+            if not callable(reconcile):
+                continue
+
+            async def _reconcile(
+                persisted_item: Dict[str, Any] = item,
+                callback: Any = reconcile,
+            ) -> None:
+                try:
+                    await callback(persisted_item)
+                except Exception:
+                    logger.warning(
+                        "Discord terminal reaction reconciliation failed for %s",
+                        persisted_item.get("id"),
+                        exc_info=True,
+                    )
+
+            task = asyncio.create_task(_reconcile())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         if scheduled:
             logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
@@ -13997,6 +14038,7 @@ class GatewayRunner:
             # Run the agent
             work_item_id = self._discord_work_item_id_for_event(event, session_key)
             work_item_expected_run_state = None
+            work_item_heartbeat_task = None
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     self._ledger().mark_agent_running(
@@ -14013,6 +14055,31 @@ class GatewayRunner:
                         owner_pid=os.getpid(),
                         process_epoch=self._process_epoch,
                     )
+                    if work_item_expected_run_state is not None:
+                        async def _renew_work_item_lease() -> None:
+                            nonlocal work_item_expected_run_state
+                            while True:
+                                await asyncio.sleep(30.0)
+                                renewed = self._ledger().renew_active_run(
+                                    str(work_item_id),
+                                    session_key=session_key,
+                                    run_generation=run_generation,
+                                    owner_pid=os.getpid(),
+                                    process_epoch=self._process_epoch,
+                                )
+                                if renewed is None:
+                                    logger.warning(
+                                        "Stopped Discord work-item heartbeat after ownership changed for %s",
+                                        work_item_id,
+                                    )
+                                    return
+                                work_item_expected_run_state = self._ledger().run_state_snapshot(
+                                    renewed
+                                )
+
+                        work_item_heartbeat_task = asyncio.create_task(
+                            _renew_work_item_lease()
+                        )
                     try:
                         from agent.provider_progress import record_provider_progress_signal
 
@@ -14027,33 +14094,41 @@ class GatewayRunner:
                         pass
                 except Exception as exc:
                     logger.debug("Discord work ledger agent_running update failed: %s", exc)
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=session_entry.session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                feature_summary=getattr(event, "feature_summary", None),
-                project_summary=getattr(event, "project_summary", None),
-                discord_action_request_intent=getattr(
-                    event,
-                    "discord_action_request_intent",
-                    None,
-                ),
-                fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
-                fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
-                fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
-                fable_transcript_user_message=getattr(event, "fable_transcript_user_message", None),
-                session_cwd_override=session_cwd,
-                visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
-                visual_qa_config=getattr(event, "visual_qa_config", None),
-                completed_worker_run=getattr(event, "completed_worker_run", None),
-                origin_work_item_id=str(work_item_id or ""),
-            )
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=session_entry.session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    feature_summary=getattr(event, "feature_summary", None),
+                    project_summary=getattr(event, "project_summary", None),
+                    discord_action_request_intent=getattr(
+                        event,
+                        "discord_action_request_intent",
+                        None,
+                    ),
+                    fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
+                    fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
+                    fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
+                    fable_transcript_user_message=getattr(event, "fable_transcript_user_message", None),
+                    session_cwd_override=session_cwd,
+                    visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
+                    visual_qa_config=getattr(event, "visual_qa_config", None),
+                    completed_worker_run=getattr(event, "completed_worker_run", None),
+                    origin_work_item_id=str(work_item_id or ""),
+                )
+            finally:
+                if work_item_heartbeat_task is not None:
+                    work_item_heartbeat_task.cancel()
+                    try:
+                        await work_item_heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
 
             _pending_background_workers = self._session_has_pending_background_workers(
                 session_key,
@@ -23475,6 +23550,13 @@ class GatewayRunner:
                         _cleanup_msg_ids.append(str(mid))
                 _fut.add_done_callback(_track_status_id)
 
+        _nested_worker_timeout_raw = _float_env("HERMES_AGENT_TIMEOUT", 1800)
+        _nested_worker_deadline = (
+            time.monotonic() + _nested_worker_timeout_raw
+            if _nested_worker_timeout_raw > 0
+            else None
+        )
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -23994,6 +24076,7 @@ class GatewayRunner:
                 return response
 
             agent.clarify_callback = _clarify_callback_sync
+            agent._nested_worker_deadline_monotonic = _nested_worker_deadline
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent

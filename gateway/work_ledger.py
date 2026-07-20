@@ -105,6 +105,38 @@ def _bounded_delivery_message_ids(
     return tuple(normalized)
 
 
+def _discord_thread_key(item: Any) -> tuple[str, str, str] | None:
+    """Return the durable Discord thread identity for a work item."""
+
+    if not isinstance(item, dict) or str(item.get("platform") or "") != "discord":
+        return None
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    thread_id = str(source.get("thread_id") or "").strip()
+    if not thread_id and str(source.get("chat_type") or "").strip() == "thread":
+        thread_id = str(source.get("chat_id") or "").strip()
+    if not thread_id:
+        return None
+    return (
+        str(source.get("guild_id") or "").strip(),
+        str(source.get("parent_chat_id") or "").strip(),
+        thread_id,
+    )
+
+
+def _discord_item_order(item: dict[str, Any]) -> tuple[float, int, float, str]:
+    message_id = str(item.get("message_id") or "").strip()
+    try:
+        snowflake = int(message_id)
+    except (TypeError, ValueError):
+        snowflake = 0
+    return (
+        float(item.get("created_at") or 0),
+        snowflake,
+        float(item.get("updated_at") or 0),
+        str(item.get("id") or ""),
+    )
+
+
 _PROJECT_SOURCE_KEYS = frozenset(
     {
         "project_path",
@@ -2136,6 +2168,7 @@ class GatewayWorkLedger:
             item["active_run"] = None
         item.pop("claim_pid", None)
         item["lease_until"] = now + LEASE_SECONDS
+        item["expires_at"] = max(float(item.get("expires_at") or 0), now + LEASE_SECONDS)
         _record_provider_progress(item, "ledger_status_claimed", status="claimed")
         self._write(data)
         return dict(item)
@@ -2173,6 +2206,7 @@ class GatewayWorkLedger:
             item["active_run"] = None
         item.pop("claim_pid", None)
         item["lease_until"] = now + LEASE_SECONDS
+        item["expires_at"] = max(float(item.get("expires_at") or 0), now + LEASE_SECONDS)
         for key in (
             "agent_done_at",
             "blocked_at",
@@ -2207,6 +2241,46 @@ class GatewayWorkLedger:
         _record_provider_progress(item, "ledger_status_agent_running", status="agent_running")
         self._write(data)
         return True
+
+    @_locked_ledger_mutation
+    def renew_active_run(
+        self,
+        work_id: str,
+        *,
+        session_key: str,
+        run_generation: int,
+        owner_pid: int,
+        process_epoch: str,
+        lease_seconds: float = LEASE_SECONDS,
+    ) -> dict[str, Any] | None:
+        """Renew one exact active run without reviving stale ownership."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict) or item.get("status") not in _RUN_OWNED_STATUSES:
+            return None
+        active_run = item.get("active_run") if isinstance(item.get("active_run"), dict) else {}
+        if (
+            str(active_run.get("session_key") or "") != str(session_key or "")
+            or _positive_int(active_run.get("generation")) != _positive_int(run_generation)
+            or _positive_int(active_run.get("owner_pid")) != _positive_int(owner_pid)
+            or str(active_run.get("process_epoch") or "") != str(process_epoch or "")
+        ):
+            return None
+        try:
+            duration = max(1.0, float(lease_seconds))
+        except (TypeError, ValueError, OverflowError):
+            duration = LEASE_SECONDS
+        now = self._now()
+        lease_until = now + duration
+        active_run = dict(active_run)
+        active_run["lease_until"] = lease_until
+        item["active_run"] = active_run
+        item["lease_until"] = lease_until
+        item["expires_at"] = max(float(item.get("expires_at") or 0), lease_until)
+        item["updated_at"] = now
+        self._write(data)
+        return dict(item)
 
     @_locked_ledger_mutation
     def mark_agent_done(
@@ -2553,9 +2627,91 @@ class GatewayWorkLedger:
             if delivery_status not in {"completed", "uncertain"} or summary_pending:
                 return False
         item["status"] = "expired"
-        item["updated_at"] = self._now()
+        now = self._now()
+        item["updated_at"] = now
+        item["expired_at"] = now
+        item["active_run"] = None
+        item.pop("claim_pid", None)
+        item["lease_until"] = None
+        item["summary_status"] = "Interrupted"
+        item["final_response"] = (
+            "Work was interrupted before completion and could not be resumed "
+            "within the recovery window."
+        )
+        item["terminal_reaction_state"] = "errored"
+        item["terminal_reaction_sync_pending"] = True
         self._write(data)
         return True
+
+    def discord_thread_reaction_state(self, item_or_work_id: Any) -> str | None:
+        """Aggregate durable work into one reaction state for a Discord thread."""
+
+        if isinstance(item_or_work_id, dict):
+            target = item_or_work_id
+        else:
+            target = self.get(str(item_or_work_id or ""))
+        key = _discord_thread_key(target)
+        if key is None:
+            return None
+        candidates = [
+            item
+            for item in self._read().get("items", {}).values()
+            if isinstance(item, dict) and _discord_thread_key(item) == key
+        ]
+        if any(str(item.get("status") or "") in INCOMPLETE_STATUSES for item in candidates):
+            return "running"
+        terminal = [
+            item
+            for item in candidates
+            if str(item.get("status") or "") in TERMINAL_STATUSES
+        ]
+        if not terminal:
+            return None
+        latest_status = str(max(terminal, key=_discord_item_order).get("status") or "")
+        if latest_status == "completed":
+            return "done"
+        if latest_status == "blocked":
+            return "blocked"
+        return "errored"
+
+    def pending_terminal_reaction_items(self) -> list[dict[str, Any]]:
+        """Return one representative item for every pending Discord thread sync."""
+
+        representatives: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in self._read().get("items", {}).values():
+            if not isinstance(item, dict) or item.get("terminal_reaction_sync_pending") is not True:
+                continue
+            key = _discord_thread_key(item)
+            if key is None:
+                continue
+            current = representatives.get(key)
+            if current is None or _discord_item_order(item) > _discord_item_order(current):
+                representatives[key] = dict(item)
+        return list(representatives.values())
+
+    @_locked_ledger_mutation
+    def mark_discord_thread_reaction_synced(self, item_or_work_id: Any) -> bool:
+        """Clear pending terminal-reaction markers for one Discord thread."""
+
+        data = self._read()
+        target = (
+            item_or_work_id
+            if isinstance(item_or_work_id, dict)
+            else data.get("items", {}).get(str(item_or_work_id or ""))
+        )
+        key = _discord_thread_key(target)
+        if key is None:
+            return False
+        changed = False
+        for item in data.get("items", {}).values():
+            if not isinstance(item, dict) or _discord_thread_key(item) != key:
+                continue
+            if item.pop("terminal_reaction_sync_pending", None) is not None:
+                changed = True
+            item.pop("terminal_reaction_state", None)
+        if changed:
+            self._write(data)
+        return changed
 
     def incomplete_items(self) -> list[dict[str, Any]]:
         now = self._now()

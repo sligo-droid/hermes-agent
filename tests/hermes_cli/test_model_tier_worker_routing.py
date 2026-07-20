@@ -37,14 +37,35 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
 
     settings = workers._role_runtime_settings("dev", config)
 
-    assert settings["model_tier"] == "worker"
-    assert settings["model"] == "custom/dev-model"
-    assert settings["opencode_model"] == "custom/dev-worker"
-    assert settings["reasoning"] == "max"
+    assert settings["model_tier"] == "intermediate"
+    assert settings["model"] == "gpt-5.6-sol"
+    assert settings["opencode_model"] == "hermes-codex/gpt-5.6-sol"
+    assert settings["reasoning"] == "medium"
     assert settings["reasoning_source"] == "model_tier"
     assert settings["model_tier_source"] == "role"
     assert settings["worker_tier"] == "quick"
     assert settings["worker_tier_source"] == "role"
+
+
+def test_reviewer_role_keeps_review_only_advanced_reasoning(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    config = {
+        "model_tiers": {
+            "advanced": {
+                "model": "custom/reviewer",
+                "opencode_model": "custom/reviewer-worker",
+                "reasoning_effort": "xhigh",
+            }
+        },
+        "roles": {"reviewer": {"model_tier": "advanced"}},
+    }
+
+    settings = workers._role_runtime_settings("reviewer", config, {"title": "Review PR"})
+
+    assert settings["model_tier"] == "advanced"
+    assert settings["reasoning"] == "xhigh"
 
 
 def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeypatch):
@@ -103,9 +124,9 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
         name: (profile["model_tier"], profile["model"], profile["reasoning_level"])
         for name, profile in profiles.items()
     } == {
-        "simple_build": ("worker", "custom/dev-worker", "max"),
-        "complex_plan": ("worker", "custom/dev-worker", "max"),
-        "complex_build": ("worker", "custom/dev-worker", "max"),
+        "simple_build": ("intermediate", "custom/dev-worker", "medium"),
+        "complex_plan": ("intermediate", "custom/dev-worker", "medium"),
+        "complex_build": ("intermediate", "custom/dev-worker", "medium"),
     }
     assert worker._role_extra_args("dev") == [
         "-c", 'model="custom/dev-model"',
