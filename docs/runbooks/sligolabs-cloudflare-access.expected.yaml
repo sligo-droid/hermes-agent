@@ -14,7 +14,7 @@ access:
     - domain: claw.sligolabs.com
       action: allow
     - domain: pid.sligolabs.com
-      action: bypass
+      action: allow
 
   # Keep these entries aligned with the hosts actually used by monitoring and
   # Chronos. Add/remove host-specific entries here; do not broaden their paths.

@@ -49,7 +49,7 @@ def _applications() -> list[dict]:
     return [
         _human_app("*.sligolabs.com"),
         _human_app("claw.sligolabs.com"),
-        _bypass_app("pid.sligolabs.com"),
+        _human_app("pid.sligolabs.com"),
         _bypass_app("sligo.sligolabs.com/webhooks/*"),
         _bypass_app("hermes.sligolabs.com/api/status"),
         _bypass_app("hermes.sligolabs.com/api/cron/fire"),
@@ -196,16 +196,16 @@ def test_wrong_machine_action_is_drift(tmp_path, capsys):
     assert "expected bypass" in stdout
 
 
-def test_wildcard_and_pid_precedence_issues_are_drift(tmp_path, capsys):
+def test_wildcard_and_pid_action_issues_are_drift(tmp_path, capsys):
     apps = [app for app in _applications() if app["domain"] != "*.sligolabs.com"]
     pid = next(app for app in apps if app["domain"] == "pid.sligolabs.com")
-    pid["policies"][0]["decision"] = "allow"
+    pid["policies"][0]["decision"] = "bypass"
 
     result, stdout, _stderr = _run(tmp_path, apps, capsys)
 
     assert result == 1
     assert "required application missing: *.sligolabs.com" in stdout
-    assert "pid.sligolabs.com expected bypass" in stdout
+    assert "pid.sligolabs.com expected allow" in stdout
 
 
 def test_unapproved_exact_override_and_dev_namespace_are_drift(tmp_path, capsys):
