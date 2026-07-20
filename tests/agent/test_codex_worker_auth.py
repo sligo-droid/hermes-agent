@@ -1,7 +1,17 @@
 import json
 import time
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_codex_home(tmp_path, monkeypatch):
+    codex_home = tmp_path / "default-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
 
 class FakePool:
@@ -80,6 +90,141 @@ def test_prepare_worker_home_writes_complete_pool_auth(tmp_path, monkeypatch):
     assert payload["tokens"]["id_token"] == "pool-id"
     assert payload["tokens"]["account_id"] == "acct-pool"
     assert not (tmp_path / "worker-codex" / "credentials.json").exists()
+
+
+def test_prepare_worker_home_prefers_api_key_provider_without_persisting_secret(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from agent import credential_pool
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "cliproxy"\n'
+        '[model_providers.cliproxy]\n'
+        'name = "CLIProxyAPI"\n'
+        'base_url = "http://127.0.0.1:8317/v1"\n'
+        'wire_api = "responses"\n'
+        'env_key = "CLI_PROXY_API_KEY"\n'
+        'requires_openai_auth = false\n',
+        encoding="utf-8",
+    )
+    _write_codex_auth(
+        source_home,
+        access="stale-access",
+        refresh="stale-refresh",
+        id_token="stale-id",
+    )
+    provider_secret = "test-provider-secret-not-for-disk"
+    source_env = {
+        "CODEX_HOME": str(source_home),
+        "CLI_PROXY_API_KEY": provider_secret,
+    }
+    entry = SimpleNamespace(
+        id="pool-1",
+        access_token="pool-access",
+        refresh_token="pool-refresh",
+        id_token="pool-id",
+        last_status=None,
+    )
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
+
+    worker_home = tmp_path / "worker-codex"
+    credential_id = prepare_codex_worker_home(worker_home, source_env=source_env)
+
+    config_text = (worker_home / "config.toml").read_text(encoding="utf-8")
+    config = tomllib.loads(config_text)
+    assert credential_id is None
+    assert worker_home.is_dir()
+    assert not worker_home.is_symlink()
+    assert not (worker_home / "auth.json").exists()
+    assert config["model_provider"] == "cliproxy"
+    assert config["model_providers"]["cliproxy"] == {
+        "name": "CLIProxyAPI",
+        "base_url": "http://127.0.0.1:8317/v1",
+        "wire_api": "responses",
+        "env_key": "CLI_PROXY_API_KEY",
+        "requires_openai_auth": False,
+    }
+    assert provider_secret not in config_text
+    assert provider_secret not in caplog.text
+
+
+def test_create_worker_home_exposes_provider_env_only_in_lease(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import create_codex_worker_home
+
+    hermes_home = tmp_path / "hermes-home"
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "cliproxy"\n'
+        '[model_providers.cliproxy]\n'
+        'base_url = "http://127.0.0.1:8317/v1"\n'
+        'wire_api = "responses"\n'
+        'env_key = "CLI_PROXY_API_KEY"\n'
+        'requires_openai_auth = false\n',
+        encoding="utf-8",
+    )
+    provider_secret = "test-provider-secret-in-memory"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    lease = create_codex_worker_home(
+        source_env={
+            "CODEX_HOME": str(source_home),
+            "CLI_PROXY_API_KEY": provider_secret,
+        },
+        prefix="test-provider-",
+    )
+
+    assert lease.credential_id is None
+    assert lease.provider_env == {"CLI_PROXY_API_KEY": provider_secret}
+    assert provider_secret not in (lease.path / "config.toml").read_text(encoding="utf-8")
+    assert not (lease.path / "auth.json").exists()
+    lease.cleanup()
+
+
+def test_api_key_provider_without_runtime_key_does_not_fall_back_to_oauth(
+    tmp_path,
+    monkeypatch,
+):
+    from agent import credential_pool
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "cliproxy"\n'
+        '[model_providers.cliproxy]\n'
+        'base_url = "http://127.0.0.1:8317/v1"\n'
+        'wire_api = "responses"\n'
+        'env_key = "CLI_PROXY_API_KEY"\n'
+        'requires_openai_auth = false\n',
+        encoding="utf-8",
+    )
+    entry = SimpleNamespace(
+        id="pool-1",
+        access_token="pool-access",
+        refresh_token="pool-refresh",
+        id_token="pool-id",
+        last_status=None,
+    )
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
+
+    worker_home = tmp_path / "worker-codex"
+    credential_id = prepare_codex_worker_home(
+        worker_home,
+        source_env={"CODEX_HOME": str(source_home)},
+    )
+
+    config = tomllib.loads((worker_home / "config.toml").read_text(encoding="utf-8"))
+    assert credential_id is None
+    assert not worker_home.is_symlink()
+    assert not (worker_home / "auth.json").exists()
+    assert config["model_provider"] == "cliproxy"
+    assert config["model_providers"]["cliproxy"]["requires_openai_auth"] is False
 
 
 def test_create_worker_home_lease_cleans_up_auth_material(tmp_path, monkeypatch):
