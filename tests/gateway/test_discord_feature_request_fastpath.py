@@ -213,7 +213,7 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     ("initial_request", "expected_tier", "expected_effort"),
     [
         ("Fix a typo in the README", "discord_action", "medium"),
-        ("Migrate the production auth schema", "advanced", "xhigh"),
+        ("Migrate the production auth schema", "advanced", "high"),
     ],
 )
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ def test_ui_specialist_skills_vary_by_known_worker_tier():
         "taste-skill",
         "claude-design",
     )
-    for tier in ("thorough", "deep", "max"):
+    for tier in ("thorough", "deep"):
         assert ui_specialist_skills_for_tier(tier) == (
             "taste-skill",
             "claude-design",

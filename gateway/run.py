@@ -18377,7 +18377,7 @@ class GatewayRunner:
         """
         import yaml
 
-        from hermes_constants import parse_reasoning_effort
+        from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
 
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
@@ -18458,7 +18458,7 @@ class GatewayRunner:
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
         parsed = parse_reasoning_effort(effort)
-        if parsed is None:
+        if effort not in {"none", *VALID_REASONING_EFFORTS} or parsed is None:
             return t(
                 "gateway.reasoning.unknown_arg",
                 arg=effort or raw_args.lower(),

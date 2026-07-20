@@ -10111,7 +10111,7 @@ class HermesCLI:
             display_state = "on ✓" if self.show_reasoning else "off"
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state}{_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|show|hide> [--global]{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|show|hide> [--global]{_RST}")
             return
 
         # Display toggle
@@ -10132,10 +10132,12 @@ class HermesCLI:
             return
 
         # Effort level change
+        from hermes_constants import VALID_REASONING_EFFORTS
+
         parsed = _parse_reasoning_config(arg)
-        if parsed is None:
+        if arg not in {"none", *VALID_REASONING_EFFORTS} or parsed is None:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh, max{_RST}")
+            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh{_RST}")
             _cprint(f"  {_DIM}Display:      show, hide{_RST}")
             return
 

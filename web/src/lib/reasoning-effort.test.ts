@@ -14,9 +14,13 @@ describe("normalizeEffort", () => {
   });
 
   it("passes through every valid effort level", () => {
-    for (const level of ["none", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+    for (const level of ["none", "minimal", "low", "medium", "high", "xhigh"]) {
       expect(normalizeEffort(level)).toBe(level);
     }
+  });
+
+  it("normalizes legacy max to xhigh", () => {
+    expect(normalizeEffort("max")).toBe("xhigh");
   });
 
   it("is case- and whitespace-insensitive", () => {
@@ -41,8 +45,9 @@ describe("EFFORT_OPTIONS", () => {
   it("covers the real reasoning levels plus thinking-off", () => {
     // Invariant against hermes_constants.VALID_REASONING_EFFORTS + 'none'.
     const values = new Set(EFFORT_OPTIONS.map((o) => o.value));
-    for (const level of ["none", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+    for (const level of ["none", "minimal", "low", "medium", "high", "xhigh"]) {
       expect(values.has(level)).toBe(true);
     }
+    expect(values.has("max")).toBe(false);
   });
 });

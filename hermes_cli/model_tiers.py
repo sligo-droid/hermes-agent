@@ -13,7 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+from hermes_constants import (
+    VALID_REASONING_EFFORTS,
+    normalize_reasoning_effort,
+    parse_reasoning_effort,
+)
 
 
 DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
@@ -35,11 +39,11 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "advanced": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "xhigh",
+        "reasoning_effort": "high",
     },
     # Route-specific tier for ordinary Discord action orchestration. It is
     # intentionally outside MODEL_TIER_LADDER so worker/delegation stepping
-    # continues to treat ``advanced`` as the shared Sol/xhigh ceiling.
+    # continues to treat ``advanced`` as the shared Sol/high ceiling.
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
@@ -64,11 +68,6 @@ DEFAULT_WORKER_TIERS: dict[str, dict[str, str]] = {
         "reasoning_effort": "medium",
     },
     "deep": {
-        "model": "gpt-5.6-sol",
-        "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "xhigh",
-    },
-    "max": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "xhigh",
@@ -185,7 +184,7 @@ _REVIEW_TASK_SIGNALS = (
     "report findings",
 )
 
-_REVIEW_ONLY_REASONING_EFFORTS = frozenset({"xhigh", "max"})
+_REVIEW_SPILLOVER_REASONING_EFFORT = "xhigh"
 
 
 @dataclass(frozen=True)
@@ -253,11 +252,13 @@ def restrict_reasoning_effort_for_task(
     *,
     purpose: str | None = None,
 ) -> str:
-    """Return an implementation-safe reasoning effort for the task."""
+    """Apply the review spillover and implementation ceiling for a task."""
 
-    effort = _normalized_name(reasoning_effort)
+    effort = normalize_reasoning_effort(reasoning_effort)
     resolved_purpose = _normalized_name(purpose) or classify_task_purpose(task, context)
-    if resolved_purpose != "review" and effort in _REVIEW_ONLY_REASONING_EFFORTS:
+    if resolved_purpose == "review" and effort == "high":
+        return _REVIEW_SPILLOVER_REASONING_EFFORT
+    if resolved_purpose != "review" and effort == _REVIEW_SPILLOVER_REASONING_EFFORT:
         return "high"
     return effort
 
@@ -276,17 +277,14 @@ def restrict_model_tier_for_task(
     if tier is None:
         return None
     resolved_purpose = _normalized_name(purpose) or classify_task_purpose(task, context)
-    if (
-        resolved_purpose == "review"
-        or tier.reasoning_effort not in _REVIEW_ONLY_REASONING_EFFORTS
-    ):
-        return tier
     safe_effort = restrict_reasoning_effort_for_task(
         tier.reasoning_effort,
         task,
         context,
         purpose=resolved_purpose,
     )
+    if safe_effort == tier.reasoning_effort:
+        return tier
     return ModelTier(
         name=tier.name,
         model=tier.model,
@@ -366,7 +364,7 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
 
     model = str(raw_tier.get("model") or "").strip()
     opencode_model = str(raw_tier.get("opencode_model") or model).strip()
-    reasoning_effort = _normalized_name(raw_tier.get("reasoning_effort"))
+    reasoning_effort = normalize_reasoning_effort(raw_tier.get("reasoning_effort"))
     if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
         return None
 
@@ -390,7 +388,7 @@ def resolve_worker_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTie
 
     model = str(raw_tier.get("model") or "").strip()
     opencode_model = str(raw_tier.get("opencode_model") or model).strip()
-    reasoning_effort = _normalized_name(raw_tier.get("reasoning_effort"))
+    reasoning_effort = normalize_reasoning_effort(raw_tier.get("reasoning_effort"))
     if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
         return None
 

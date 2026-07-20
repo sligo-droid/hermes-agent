@@ -1325,7 +1325,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], "route/advanced")
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "max"})
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
         self.assertEqual(kwargs["provider"], parent.provider)
         self.assertEqual(kwargs["base_url"], parent.base_url)
         self.assertEqual(

@@ -1692,8 +1692,10 @@ def _env_run_id(task_id: str) -> Optional[int]:
 
 
 def _scheduled_opencode_reasoning(default: str) -> str:
-    effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
-    if effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+    from hermes_constants import normalize_reasoning_effort
+
+    effort = normalize_reasoning_effort(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "")
+    if effort in {"minimal", "low", "medium", "high", "xhigh"}:
         return effort
     return default
 
@@ -1766,9 +1768,11 @@ def _role_extra_args(role: str) -> list[str]:
 
 
 def _worker_reasoning_effort(role: str) -> str:
-    effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
-    if effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
-        if role != ROLE_REVIEWER and effort in {"xhigh", "max"}:
+    from hermes_constants import normalize_reasoning_effort
+
+    effort = normalize_reasoning_effort(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "")
+    if effort in {"minimal", "low", "medium", "high", "xhigh"}:
+        if role != ROLE_REVIEWER and effort == "xhigh":
             return "high"
         return effort
     if role == ROLE_REVIEWER:

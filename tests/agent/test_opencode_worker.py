@@ -918,7 +918,7 @@ def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
     }
 
 
-def test_generated_max_variant_is_never_rewritten_or_normalized(monkeypatch):
+def test_legacy_max_variant_request_normalizes_to_xhigh(monkeypatch):
     monkeypatch.setattr(
         ow,
         "_opencode_provider_config_for_model",
@@ -933,10 +933,12 @@ def test_generated_max_variant_is_never_rewritten_or_normalized(monkeypatch):
         },
     )
 
-    _, provider = ow._worker_provider_config("hermes-codex/gpt-5.6-sol", "max")
+    normalized = ow._normalize_reasoning_level("max")
+    _, provider = ow._worker_provider_config("hermes-codex/gpt-5.6-sol", normalized)
 
-    assert provider["models"]["gpt-5.6-sol"]["variants"]["max"] == {
-        "reasoningEffort": "max"
+    assert normalized == "xhigh"
+    assert provider["models"]["gpt-5.6-sol"]["variants"]["xhigh"] == {
+        "reasoningEffort": "xhigh"
     }
 
 
@@ -961,7 +963,7 @@ def test_unrepresentable_isolated_variant_fails_before_process(monkeypatch, tmp_
     )
 
     assert called is False
-    assert "cannot represent variant 'max'" in (result.error or "")
+    assert "cannot represent variant 'xhigh'" in (result.error or "")
 
 
 def test_auth_error_is_classified(monkeypatch, tmp_path):

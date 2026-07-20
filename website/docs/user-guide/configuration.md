@@ -1125,7 +1125,7 @@ Control how much "thinking" the model does before responding:
 
 ```yaml
 agent:
-  reasoning_effort: ""   # empty = medium (default). Options: none, minimal, low, medium, high, xhigh, max
+  reasoning_effort: ""   # empty = medium (default). Options: none, minimal, low, medium, high, xhigh
 ```
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
@@ -1152,11 +1152,13 @@ choose a model and reasoning effort.
 | `basic` | GPT-5.6 Luna | `xhigh` | Ordinary gateway sessions |
 | `intermediate` | GPT-5.6 Sol | `medium` | Coding-worker build passes and Kanban `dev` |
 | `discord_action` | GPT-5.6 Sol | `medium` | Simple and ordinary Discord action requests |
-| `advanced` | GPT-5.6 Sol | `xhigh` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
+| `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
 These defaults follow the supported model/effort frontier: narrow routine work
 uses Luna, moderately scoped build passes use Sol at `medium`, and complex
-planning moves to Sol at `xhigh`.
+planning moves to Sol at `high`. Existing explicit review/diagnosis criteria
+spill `high` over to `xhigh`; implementation-capable work remains capped at
+`high`.
 
 Coding workers also expose named selection tiers:
 
@@ -1166,11 +1168,9 @@ Coding workers also expose named selection tiers:
 | `standard` | GPT-5.6 Luna | `xhigh` |
 | `thorough` | GPT-5.6 Sol | `medium` |
 | `deep` | GPT-5.6 Sol | `xhigh` |
-| `max` | GPT-5.6 Sol | `xhigh` |
 
-`max` remains as a compatibility tier name but is capped at `xhigh` because
-coding workers can implement changes. Explicit raw model/reasoning overrides
-remain available for operators with a different policy.
+Worker tiers that resolve to `xhigh` are capped at `high` for implementation.
+The same explicit review/diagnosis criteria may use the `xhigh` spillover.
 
 The defaults live under `model_tiers`; route settings reference a tier by name:
 
@@ -1191,7 +1191,7 @@ model_tiers:
   advanced:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol
-    reasoning_effort: xhigh
+    reasoning_effort: high
   discord_action:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol
@@ -1243,8 +1243,9 @@ OpenCode model and per-pass reasoning fields. The UI visual specialist is a
 model-neutral behavioral profile: it adds UI-focused skills and route evidence,
 then uses the configured Codex or OpenCode coding-worker backend. Explicit
 `worker_tier` selection and the normal coding-worker pass-tier precedence apply.
-OpenCode's `max` variant is forwarded literally as `reasoning.effort=max`; it is
-not normalized or aliased to `xhigh`.
+Legacy Hermes `max` values normalize to `xhigh`. Provider adapters may still
+translate `xhigh` to an upstream provider's protocol-level `max` value when
+that provider requires it.
 
 Kanban role tiers are also atomic and authoritative. When a role resolves a
 valid `model_tier`, that tier's model and effort override legacy per-role

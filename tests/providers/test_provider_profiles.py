@@ -339,12 +339,12 @@ class TestOpenRouterProfile:
 
         Covers the full real config range produced by
         ``hermes_constants.parse_reasoning_effort`` —
-        ``VALID_REASONING_EFFORTS = (minimal, low, medium, high, xhigh, max)``.
+        ``VALID_REASONING_EFFORTS = (minimal, low, medium, high, xhigh)``.
         """
         p = get_provider_profile("openrouter")
         model = "anthropic/claude-fable-5"
         assert self._is_mandatory(model)  # fixture really is mandatory
-        for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
+        for effort in ("minimal", "low", "medium", "high", "xhigh"):
             eb, tl = p.build_api_kwargs_extras(
                 reasoning_config={"enabled": True, "effort": effort},
                 supports_reasoning=True,
@@ -367,9 +367,8 @@ class TestOpenRouterProfile:
 
     def test_mandatory_anthropic_verbosity_is_value_agnostic_passthrough(self):
         """The mapping passes the effort value through verbatim — it must NOT
-        clamp or whitelist. ``xhigh`` and ``max`` are real config values, and
-        OpenRouter accepts both for Claude (live-proven in #43432), so a
-        forward value must survive
+        clamp or whitelist. Provider-level callers may still supply protocol
+        values beyond Hermes' selectable ladder, so a forward value must survive
         rather than be silently dropped. The OpenAI SDK type only literals
         ``low|medium|high`` but it's a TypedDict (no runtime validation), so the
         extended scale reaches the wire untouched."""
