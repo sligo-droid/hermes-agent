@@ -1164,8 +1164,18 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
         "repo_root": repo_root,
     }
 
+    try:
+        from hermes_cli.worktree_runtime import prepare_worktree_dependency_links
+
+        dependency_notes = prepare_worktree_dependency_links(wt_path)
+    except Exception as exc:
+        logger.debug("Worktree dependency reuse skipped for %s: %s", wt_path, exc)
+        dependency_notes = []
+
     print(f"\033[32m✓ Worktree created:\033[0m {wt_path}")
     print(f"  Branch: {branch_name}")
+    for note in dependency_notes:
+        print(f"  {note}")
 
     return info
 

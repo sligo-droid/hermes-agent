@@ -16,6 +16,7 @@ Keep durable project state in the narrowest repo-owned source: code/tests/config
 ## Working Rules
 
 - Prefer `.venv`, then `venv`, then `$HOME/.hermes/hermes-agent/venv` for shared-worktree installs.
+  In a linked worktree, run `hermes worktrees prepare .` before installing dependencies; exact-lock `.venv` and pnpm trees are reused from the durable primary checkout.
   ```bash
   source .venv/bin/activate   # or: source venv/bin/activate
   ```

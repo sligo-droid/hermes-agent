@@ -19,6 +19,7 @@ import pytest
 from agent.transports.codex_app_server_session import TurnResult
 from hermes_cli import plugins
 from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli.worktree_runtime import WorktreeRecord
 from tools import async_delegation as ad
 from tools import coding_worker_tool as cwt
 from tools.process_registry import process_registry
@@ -3479,7 +3480,7 @@ def test_delegate_includes_repo_state_preflight(monkeypatch, tmp_path):
     assert result["success"] is True
 
 
-def test_prepare_pnpm_dependency_links_disabled_by_default(monkeypatch, tmp_path):
+def test_prepare_pnpm_dependency_links_can_be_disabled(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     worktree = tmp_path / "worktree"
     package = repo / "dashboard"
@@ -3491,9 +3492,7 @@ def test_prepare_pnpm_dependency_links_disabled_by_default(monkeypatch, tmp_path
         (root / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
     (source_package / "node_modules").mkdir()
 
-    monkeypatch.delenv("HERMES_CODING_WORKER_PNPM_LINKS", raising=False)
-    monkeypatch.setattr(cwt, "_repo_root_for_path", lambda path: repo)
-    monkeypatch.setattr(cwt, "_git_worktree_paths", lambda root: [repo, worktree])
+    monkeypatch.setenv("HERMES_CODING_WORKER_PNPM_LINKS", "0")
 
     assert cwt._prepare_pnpm_dependency_links(str(repo)) == []
     assert not (package / "node_modules").exists()
@@ -3512,12 +3511,24 @@ def test_prepare_pnpm_dependency_links_reuses_matching_worktree_when_enabled(mon
     (source_package / "node_modules").mkdir()
 
     monkeypatch.setenv("HERMES_CODING_WORKER_PNPM_LINKS", "1")
-    monkeypatch.setattr(cwt, "_repo_root_for_path", lambda path: repo)
-    monkeypatch.setattr(cwt, "_git_worktree_paths", lambda root: [repo, worktree])
+    monkeypatch.setattr(
+        "hermes_cli.worktree_runtime.repo_root_for_path",
+        lambda path: repo,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worktree_runtime.git_worktree_records",
+        lambda root: [
+            WorktreeRecord(str(worktree)),
+            WorktreeRecord(str(repo)),
+        ],
+    )
 
     notes = cwt._prepare_pnpm_dependency_links(str(repo))
 
-    assert notes == [f"linked {package / 'node_modules'} -> {source_package / 'node_modules'}"]
+    assert notes == [
+        f"linked {package / 'node_modules'} -> {source_package / 'node_modules'} "
+        "(exact lock; unlink before running an install or changing dependencies)"
+    ]
     assert (package / "node_modules").is_symlink()
     assert (package / "node_modules").resolve() == (source_package / "node_modules").resolve()
 
@@ -3536,8 +3547,17 @@ def test_prepare_pnpm_dependency_links_requires_matching_lock(monkeypatch, tmp_p
     (source_package / "node_modules").mkdir()
 
     monkeypatch.setenv("HERMES_CODING_WORKER_PNPM_LINKS", "1")
-    monkeypatch.setattr(cwt, "_repo_root_for_path", lambda path: repo)
-    monkeypatch.setattr(cwt, "_git_worktree_paths", lambda root: [repo, worktree])
+    monkeypatch.setattr(
+        "hermes_cli.worktree_runtime.repo_root_for_path",
+        lambda path: repo,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worktree_runtime.git_worktree_records",
+        lambda root: [
+            WorktreeRecord(str(worktree)),
+            WorktreeRecord(str(repo)),
+        ],
+    )
 
     assert cwt._prepare_pnpm_dependency_links(str(repo)) == []
     assert not (package / "node_modules").exists()

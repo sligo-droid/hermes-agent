@@ -2017,6 +2017,23 @@ DEFAULT_CONFIG = {
     # http://127.0.0.1:8000 for self-hosted local Honcho.
     "honcho": {},
 
+    # Linked-worktree runtime efficiency. Exact-lock dependency reuse is safe
+    # by default because links always target the repository's durable primary
+    # worktree. Cleanup remains conservative: only clean, inactive worktrees
+    # whose commits are reachable from a remote are eligible.
+    "worktrees": {
+        "dependency_reuse": {
+            "pnpm": True,
+            "python_venv": True,
+        },
+        "cleanup": {
+            "enabled": True,
+            "retention_days": 7,
+            "min_interval_hours": 24,
+            "max_per_run": 25,
+        },
+    },
+
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").
     # Empty string means use server-local time.
     "timezone": "",

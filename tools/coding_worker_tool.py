@@ -1716,166 +1716,35 @@ def _parent_skill_context(
     return "\n\n".join(sections)
 
 
-_PNPM_SCAN_SKIP_DIRS = {
-    ".git",
-    ".hermes",
-    ".next",
-    ".svelte-kit",
-    ".turbo",
-    ".venv",
-    "build",
-    "dist",
-    "node_modules",
-    "venv",
-}
-
-
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _repo_root_for_path(path: Path) -> Optional[Path]:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=str(path),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    raw = result.stdout.strip()
-    if not raw:
-        return None
-    try:
-        return Path(raw).resolve()
-    except Exception:
-        return Path(raw)
-
-
-def _git_worktree_paths(repo_root: Path) -> list[Path]:
-    try:
-        result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception:
-        return []
-    if result.returncode != 0:
-        return []
-    paths: list[Path] = []
-    for line in result.stdout.splitlines():
-        if not line.startswith("worktree "):
-            continue
-        raw = line[len("worktree ") :].strip()
-        if not raw:
-            continue
-        try:
-            paths.append(Path(raw).resolve())
-        except Exception:
-            paths.append(Path(raw))
-    return paths
-
-
-def _pnpm_package_roots(workdir: Path, *, max_depth: int = 4) -> list[Path]:
-    roots: list[Path] = []
-
-    def consider(path: Path) -> None:
-        if (path / "package.json").is_file() and (path / "pnpm-lock.yaml").is_file():
-            try:
-                resolved = path.resolve()
-            except Exception:
-                resolved = path
-            if resolved not in roots:
-                roots.append(resolved)
-
-    consider(workdir)
-    for current, dirs, files in os.walk(workdir):
-        current_path = Path(current)
-        try:
-            rel_parts = current_path.relative_to(workdir).parts
-        except Exception:
-            rel_parts = ()
-        dirs[:] = [d for d in dirs if d not in _PNPM_SCAN_SKIP_DIRS]
-        if len(rel_parts) >= max_depth:
-            dirs[:] = []
-        if "package.json" in files and "pnpm-lock.yaml" in files:
-            consider(current_path)
-    return roots
-
-
 def _prepare_pnpm_dependency_links(workdir: str) -> list[str]:
-    """Optionally reuse compatible pnpm node_modules trees across worktrees.
+    """Compatibility wrapper for exact-lock pnpm reuse."""
+    from hermes_cli.worktree_runtime import prepare_worktree_dependency_links
 
-    Git worktrees intentionally do not copy ignored dependency directories. For
-    pnpm projects that means every fresh worktree often pays an install before
-    basic checks can run. When another worktree of the same repo already has a
-    matching lockfile and `node_modules`, an explicitly enabled symlink can
-    avoid that install. This is disabled by default because packaging tools may
-    otherwise resolve dependencies outside the active checkout. Set
-    ``HERMES_CODING_WORKER_PNPM_LINKS=1`` to opt in. Lockfile mismatch falls
-    back to the worker's normal install.
-    """
-    enabled_values = {"1", "true", "yes", "on"}
-    if os.getenv("HERMES_CODING_WORKER_PNPM_LINKS", "").strip().lower() not in enabled_values:
-        return []
-    try:
-        root = Path(workdir).resolve()
-    except Exception:
-        root = Path(workdir)
-    repo_root = _repo_root_for_path(root)
-    if repo_root is None:
-        return []
-    worktrees = _git_worktree_paths(repo_root)
-    if not worktrees:
-        return []
-    notes: list[str] = []
-    for package_root in _pnpm_package_roots(root):
-        node_modules = package_root / "node_modules"
-        if node_modules.exists() or node_modules.is_symlink():
-            continue
-        lockfile = package_root / "pnpm-lock.yaml"
-        try:
-            rel_package = package_root.relative_to(repo_root)
-            lock_hash = _hash_file(lockfile)
-        except Exception:
-            continue
-        for worktree_root in worktrees:
-            try:
-                candidate_root = (worktree_root / rel_package).resolve()
-            except Exception:
-                candidate_root = worktree_root / rel_package
-            if candidate_root == package_root:
-                continue
-            candidate_modules = candidate_root / "node_modules"
-            candidate_lock = candidate_root / "pnpm-lock.yaml"
-            if not candidate_modules.is_dir() or not candidate_lock.is_file():
-                continue
-            try:
-                if _hash_file(candidate_lock) != lock_hash:
-                    continue
-            except Exception:
-                continue
-            try:
-                node_modules.symlink_to(candidate_modules, target_is_directory=True)
-            except Exception:
-                continue
-            note = f"linked {node_modules} -> {candidate_modules}"
-            notes.append(note)
-            break
-    return notes
+    return [
+        note
+        for note in prepare_worktree_dependency_links(workdir)
+        if "node_modules" in note
+    ]
+
+
+def _prepare_worktree_dependency_links(
+    workdir: str,
+    scope_paths: Optional[list[str]],
+) -> list[str]:
+    from hermes_cli.worktree_runtime import (
+        dependency_reuse_for_scopes,
+        prepare_worktree_dependency_links,
+    )
+
+    include_pnpm, include_python_venv = dependency_reuse_for_scopes(
+        workdir,
+        scope_paths,
+    )
+    return prepare_worktree_dependency_links(
+        workdir,
+        include_pnpm=include_pnpm,
+        include_python_venv=include_python_venv,
+    )
 
 
 def _delegate_coding_task_impl(
@@ -2126,7 +1995,11 @@ def _delegate_coding_task_impl(
         context=context_text,
     )
     repo_state_notes = _repo_state_guard_notes(workdir) if repo_specific_preflight else ""
-    dependency_notes = _prepare_pnpm_dependency_links(workdir) if repo_specific_preflight else []
+    dependency_notes = (
+        _prepare_worktree_dependency_links(workdir, normalized_scope_paths)
+        if repo_specific_preflight
+        else []
+    )
     try:
         from hermes_cli.worker_autoreview import autoreview_prompt_note, materialize_autoreview_helper
 
