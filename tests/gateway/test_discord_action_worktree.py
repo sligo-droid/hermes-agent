@@ -120,6 +120,38 @@ def test_closeout_repository_overrides_are_generic_and_nested():
     }
 
 
+def test_action_workspace_origin_overrides_stale_discord_mapping(tmp_path, caplog):
+    repo = tmp_path / "PID"
+    _init_repo(repo)
+    _run(repo, "remote", "add", "origin", "https://github.com/sligo-labs/PID.git")
+    source = _source(repo)
+    source.project_github_url = "https://github.com/sligo-droid/PID"
+
+    with caplog.at_level(logging.WARNING):
+        repository = gateway_run._gateway_repository_for_source(
+            source,
+            workspace_path=str(repo),
+        )
+
+    assert repository == "sligo-labs/PID"
+    assert "repository mapping mismatch" in caplog.text
+    mode, _policy = gateway_run._gateway_action_closeout_contract(
+        {
+            "closeout": {
+                "mode": "shadow",
+                "surfaces": {"direct": True},
+                "repositories": {
+                    "sligo-labs/PID": {"mode": "enforce"},
+                },
+            }
+        },
+        repository=repository,
+        request="implement and ship this end-to-end",
+        source="direct",
+    )
+    assert mode == "enforce"
+
+
 def test_discord_acceptance_applies_repository_visual_override(tmp_path, monkeypatch):
     config = {
         "agent": {"visual_qa": {"mode": "shadow", "max_followup_turns": 1}},
@@ -927,6 +959,126 @@ def test_required_closeout_rejects_dirty_host_workspace(tmp_path, monkeypatch):
         False,
         "workspace_head_not_clean_or_verified",
     )
+    assert captured == {}
+    assert notifications == []
+
+
+def test_required_closeout_checkpoints_union_scoped_async_mutation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "tests").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (repo / "tests" / "test_parser.py").write_text("def test_value(): pass\n", encoding="utf-8")
+    runner, captured, notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            },
+            "worker-b": {
+                "required": True,
+                "completed_at": 2.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["tests"],
+                    "scope_check": {"clean": True, "scope_paths": ["tests"]},
+                },
+            },
+        }
+    }
+
+    activated, route = runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    )
+
+    assert (activated, route) == (True, "closeout")
+    checkpoint_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    assert checkpoint_sha != base_sha
+    assert _run(repo, "status", "--porcelain").stdout == ""
+    assert captured["state"]["local_verification"]["head_sha"] == checkpoint_sha
+    assert notifications == ["work-1"]
+
+
+def test_required_closeout_checkpoints_merged_sibling_worktree_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    worker = tmp_path / "repo-pw-live-case"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    _run(repo, "worktree", "add", "-b", "worker/live", str(worker), "HEAD")
+    (repo / "src").mkdir()
+    (repo / "src" / "live.py").write_text("READY = True\n", encoding="utf-8")
+    runner, captured, _notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(worker),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                    "parallel_merge": {"merged": True, "success": True},
+                },
+            }
+        }
+    }
+
+    activated, route = runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    )
+
+    assert (activated, route) == (True, "closeout")
+    assert captured["state"]["local_verification"]["status"] == "passed"
+
+
+def test_required_closeout_refuses_checkpoint_from_dirty_baseline(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runner, captured, notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "initial_dirty_paths": ["unrelated.txt"],
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+
+    activated, route = runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    )
+
+    assert (activated, route) == (False, "checkpoint_baseline_was_dirty")
     assert captured == {}
     assert notifications == []
 

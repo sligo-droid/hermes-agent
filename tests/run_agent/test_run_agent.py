@@ -2609,7 +2609,12 @@ class TestConcurrentToolExecution:
         release_slow = threading.Event()
         dispatched = []
         merge_calls = []
+        baseline_calls = []
         coordinating_thread = threading.get_ident()
+
+        def fake_baseline(cwd):
+            baseline_calls.append(cwd)
+            return "a" * 40, []
 
         def fake_delegate_coding_task(**kwargs):
             dispatched.append(kwargs)
@@ -2637,6 +2642,7 @@ class TestConcurrentToolExecution:
             return {"success": True, "worker_cwd": worker_cwd}
 
         monkeypatch.setattr(cwt, "delegate_coding_task", fake_delegate_coding_task)
+        monkeypatch.setattr(cwt, "_git_workspace_baseline", fake_baseline)
         monkeypatch.setattr(
             cwt,
             "merge_parallel_worker_result",
@@ -2676,6 +2682,9 @@ class TestConcurrentToolExecution:
         assert {group["base_cwd"] for group in parallel_groups} == {
             str(base_cwd.resolve())
         }
+        assert {group["base_sha"] for group in parallel_groups} == {"a" * 40}
+        assert {tuple(group["initial_dirty_paths"]) for group in parallel_groups} == {()}
+        assert baseline_calls == [str(base_cwd.resolve())]
         group_id = parallel_groups[0]["group_id"]
         assert [Path(call[1]).name for call in merge_calls] == [
             "worker-fast",

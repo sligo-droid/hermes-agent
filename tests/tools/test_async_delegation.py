@@ -304,6 +304,55 @@ def test_advisory_delegation_remains_memory_only(monkeypatch):
     assert _drain_one() is not None
 
 
+def test_discord_advisory_batch_persists_under_exact_attempt(monkeypatch):
+    calls = []
+    ledger = _FakeRequiredLedger(calls)
+    executor = _CapturingExecutor(calls)
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["review code", "review tests"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="agent:main:discord:thread:1:2",
+        runner=lambda: {
+            "results": [
+                {"status": "completed", "summary": "Code is clean."},
+                {"status": "completed", "summary": "Tests are sufficient."},
+            ]
+        },
+        origin_work_item_id="work-1",
+        origin_run_generation=7,
+        origin_attempt_id="epoch:7",
+        origin_attempt_order=9,
+        origin_owner_pid=123,
+        origin_process_epoch="epoch",
+        read_only=True,
+        task_specs=[
+            {"goal": "review code", "read_only": True},
+            {"goal": "review tests", "read_only": True},
+        ],
+    )
+
+    assert result["status"] == "dispatched"
+    register = next(call for call in calls if call[0] == "register")
+    assert register[2]["kind"] == "advisory"
+    assert register[2]["required"] is False
+    executor.worker()
+    completion = next(call for call in calls if call[0] == "complete")[2]
+    assert completion["success"] is True
+    assert completion["evidence"]["advisory_results"] == [
+        {"goal": "review code", "status": "completed", "summary": "Code is clean."},
+        {"goal": "review tests", "status": "completed", "summary": "Tests are sufficient."},
+    ]
+    event = process_registry.completion_queue.get_nowait()
+    assert event["kind"] == "advisory"
+    assert event["origin_attempt_id"] == "epoch:7"
+
+
 def test_interrupt_session_is_scoped_and_fences_late_success(monkeypatch):
     calls = []
     ledger = _FakeRequiredLedger(calls)

@@ -7,22 +7,18 @@ parent agent dispatches trusted work on a module-level daemon executor and
 returns a handle immediately, so the user and the model can keep working.
 
 When the child finishes, a completion event is pushed onto the SHARED
-``process_registry.completion_queue`` with ``type="async_delegation"``. For
-required Discord coding workers, terminal state is first committed to the
-gateway work ledger; the queue is only a compatibility wakeup. Advisory
-``delegate_task`` results remain best-effort and in-memory. The
-CLI (``cli.py`` process_loop) and gateway (``_run_process_watcher`` /
-``completion_queue`` drain) already poll that queue while the agent is idle
-and forge a fresh user/internal turn from each event. We deliberately reuse
-that rail rather than reaching into a running agent loop:
+``process_registry.completion_queue`` with ``type="async_delegation"``. For a
+Discord work-item attempt, both required coding and advisory read-only results
+are first committed to the gateway work ledger; the queue is only a wakeup and
+never becomes a model turn. Non-work-item CLI and gateway delegations retain
+the legacy best-effort follow-up-turn behavior.
 
-  - completions surface as a NEW turn when the agent is idle, never spliced
+  - legacy completions surface as a NEW turn when the agent is idle, never spliced
     between a tool result and an assistant message. That keeps strict
     message-role alternation legal and the prompt cache intact (hard
     invariant: never mutate past context).
-  - we inherit the queue's de-dup, crash-recovery checkpoint, and the
-    existing CLI + gateway drain wiring for free — no new drain loops in the
-    two largest files in the repo.
+  - Discord attempt aggregation inherits the ledger's exact-attempt fencing,
+    terminal delivery de-duplication, and crash recovery without model replay.
 
 The completion payload carries a RICH, self-contained task-source block (the
 original goal, the context the parent supplied, toolsets, model, dispatch
@@ -300,11 +296,21 @@ def _capture_session_routing() -> Dict[str, str]:
     return captured
 
 
-def _is_required_coding_dispatch(record: Dict[str, Any]) -> bool:
-    """Whether the work ledger is the canonical owner for this dispatch."""
+def _is_durable_attempt_dispatch(record: Dict[str, Any]) -> bool:
+    """Whether the Discord work ledger owns this dispatch's delivery."""
     return bool(
-        record.get("kind") == "coding_worker"
-        and str(record.get("origin_work_item_id") or "").strip()
+        str(record.get("origin_work_item_id") or "").strip()
+        and _normalized_generation(record.get("origin_run_generation"))
+        and str(record.get("origin_attempt_id") or "").strip()
+        and _normalized_generation(record.get("origin_attempt_order"))
+    )
+
+
+def _is_required_coding_dispatch(record: Dict[str, Any]) -> bool:
+    """Whether this durable dispatch gates the originating attempt."""
+    return bool(
+        _is_durable_attempt_dispatch(record)
+        and record.get("kind") == "coding_worker"
     )
 
 
@@ -333,9 +339,9 @@ def _register_required_async_dispatch(record: Dict[str, Any]) -> Optional[str]:
     """Register one required coding dispatch before executor submission.
 
     Returns an error string when registration was rejected or unavailable.
-    Advisory delegations intentionally never touch the durable work ledger.
+    Non-attempt delegations intentionally never touch the durable work ledger.
     """
-    if not _is_required_coding_dispatch(record):
+    if not _is_durable_attempt_dispatch(record):
         return None
     try:
         ledger = _required_async_ledger()
@@ -350,6 +356,13 @@ def _register_required_async_dispatch(record: Dict[str, Any]) -> Optional[str]:
             registered_at=record.get("dispatched_at"),
             closeout_id=record.get("closeout_id"),
             scope_paths=record.get("origin_scope_paths"),
+            kind=(
+                "coding_worker"
+                if record.get("kind") == "coding_worker"
+                else "advisory"
+            ),
+            required=record.get("kind") == "coding_worker",
+            evidence=record.get("registration_evidence"),
         )
         registered_dispatch = _required_dispatch_state(
             registered,
@@ -372,7 +385,52 @@ def _coding_terminal_fields(
     record: Dict[str, Any],
     result: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Return bounded deterministic terminal evidence for the work ledger."""
+    """Return bounded terminal evidence for one durable attempt dispatch."""
+    if record.get("kind") != "coding_worker":
+        raw_results = result.get("results") if isinstance(result.get("results"), list) else []
+        task_specs = record.get("task_specs") if isinstance(record.get("task_specs"), list) else []
+        advisory_results: List[Dict[str, str]] = []
+        for index, raw_result in enumerate(raw_results[:_MAX_TERMINAL_EVIDENCE_ITEMS]):
+            if not isinstance(raw_result, dict):
+                continue
+            task_spec = task_specs[index] if index < len(task_specs) and isinstance(task_specs[index], dict) else {}
+            entry: Dict[str, str] = {}
+            for key, value in (
+                ("goal", task_spec.get("goal")),
+                ("status", raw_result.get("status")),
+                ("summary", raw_result.get("summary")),
+                ("error", raw_result.get("error")),
+            ):
+                text = str(value or "")[:_MAX_TERMINAL_EVIDENCE_TEXT]
+                if text:
+                    entry[key] = text
+            if entry:
+                advisory_results.append(entry)
+        summaries = [
+            entry["summary"]
+            for entry in advisory_results
+            if entry.get("summary")
+        ]
+        errors = [
+            entry["error"]
+            for entry in advisory_results
+            if entry.get("error")
+        ]
+        if not advisory_results and result.get("error"):
+            advisory_results.append(
+                {
+                    "goal": str(record.get("goal") or "")[:_MAX_TERMINAL_EVIDENCE_TEXT],
+                    "status": str(result.get("status") or "error")[:_MAX_TERMINAL_EVIDENCE_TEXT],
+                    "error": str(result.get("error") or "")[:_MAX_TERMINAL_EVIDENCE_TEXT],
+                }
+            )
+        return {
+            "summary": "\n".join(summaries[:8]) or result.get("summary"),
+            "error": "\n".join(errors[:8]) or result.get("error"),
+            "closeout_id": "",
+            "evidence": {"advisory_results": advisory_results},
+        }
+
     deterministic = result.get("result")
     deterministic = deterministic if isinstance(deterministic, dict) else {}
     coding_event = result.get("_async_coding_worker")
@@ -407,6 +465,9 @@ def _coding_terminal_fields(
         ),
         "worker_cwd": bounded_text(coding_event.get("worker_cwd")),
     }
+    initial_dirty_paths = bounded_strings(deterministic.get("initial_dirty_paths"))
+    if initial_dirty_paths:
+        evidence["initial_dirty_paths"] = initial_dirty_paths
     changed = deterministic.get("changed")
     if isinstance(changed, bool):
         evidence["changed"] = changed
@@ -504,11 +565,11 @@ def _persist_required_async_terminal(
     submit_failure: bool = False,
 ) -> bool:
     """Persist terminal required-work state before any volatile queue wakeup."""
-    if not _is_required_coding_dispatch(record):
+    if not _is_durable_attempt_dispatch(record):
         return True
     if not record.get("required_async_registered"):
         logger.error(
-            "Required async dispatch %s reached terminal state without registration",
+            "Durable async dispatch %s reached terminal state without registration",
             record.get("delegation_id"),
         )
         return False
@@ -541,7 +602,7 @@ def _persist_required_async_terminal(
             )
     except Exception:  # noqa: BLE001 - detached worker must not crash
         logger.exception(
-            "Could not persist required async terminal state for %s",
+            "Could not persist durable async terminal state for %s",
             record.get("delegation_id"),
         )
         return False
@@ -735,7 +796,7 @@ def dispatch_async_delegation(
         # get_hermes_home() under the right profile.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        if _is_required_coding_dispatch(record):
+        if _is_durable_attempt_dispatch(record):
             failed_result = {
                 "status": "submit_failed",
                 "summary": "",
@@ -902,7 +963,7 @@ def _push_completion_event(
     try:
         from tools.process_registry import process_registry
     except Exception as exc:  # pragma: no cover
-        if _is_required_coding_dispatch(record):
+        if _is_durable_attempt_dispatch(record):
             logger.error(
                 "Async delegation %s finished but process_registry import failed; "
                 "durable result remains available for reconciliation: %s",
@@ -1069,6 +1130,11 @@ def dispatch_async_delegation_batch(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     origin_work_item_id: str = "",
+    origin_run_generation: Optional[int] = None,
+    origin_attempt_id: str = "",
+    origin_attempt_order: Optional[int] = None,
+    origin_owner_pid: Optional[int] = None,
+    origin_process_epoch: str = "",
     read_only: bool = False,
     task_specs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
@@ -1116,8 +1182,24 @@ def dispatch_async_delegation_batch(
         "kind": "delegation",
         "delivery_pending": False,
         "origin_work_item_id": str(origin_work_item_id or "")[:240],
+        "origin_run_generation": _normalized_generation(origin_run_generation),
+        "origin_attempt_id": str(origin_attempt_id or "")[:240],
+        "origin_attempt_order": _normalized_generation(origin_attempt_order),
+        "origin_owner_pid": int(origin_owner_pid or os.getpid()),
+        "origin_process_epoch": str(origin_process_epoch or "")[:240],
+        "origin_scope_paths": [],
         "read_only": bool(read_only),
         "task_specs": [dict(item) for item in (task_specs or [])],
+        "registration_evidence": {
+            "advisory_results": [
+                {
+                    "goal": str(item.get("goal") or ""),
+                    "status": "registered",
+                }
+                for item in (task_specs or [])
+                if isinstance(item, dict)
+            ]
+        },
     }
     record.update(_capture_session_routing())
     with _records_lock:
@@ -1140,6 +1222,14 @@ def dispatch_async_delegation_batch(
         _records[delegation_id] = record
 
     executor = _get_executor(max_async_children)
+    registration_error = _register_required_async_dispatch(record)
+    if registration_error:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {
+            "status": "rejected",
+            "error": f"Failed to register durable async dispatch: {registration_error}",
+        }
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
@@ -1175,8 +1265,21 @@ def dispatch_async_delegation_batch(
         # Propagate the dispatching profile to the detached batch children.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
-        with _records_lock:
-            _records.pop(delegation_id, None)
+        if _is_durable_attempt_dispatch(record):
+            _complete_record(
+                delegation_id,
+                {
+                    "status": "submit_failed",
+                    "results": [],
+                    "error": f"Failed to schedule async delegation batch: {exc}",
+                },
+                "submit_failed",
+                enqueue=False,
+                submit_failure=True,
+            )
+        else:
+            with _records_lock:
+                _records.pop(delegation_id, None)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -1192,17 +1295,39 @@ def dispatch_async_delegation_batch(
 def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
-    """Mark a batch record complete and push ONE combined completion event."""
+    """Durably terminalize a batch, then push one compatibility wakeup."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("_terminalized") or record.get("_terminalizing"):
+            return
+        record["_terminalizing"] = True
+        record["status"] = status
+        record["completed_at"] = time.time()
+        record["interrupt_fn"] = None
+        record["completion_success"] = status in {"completed", "success"}
+        terminal_record = dict(record)
+
+    durable_accepted = _persist_required_async_terminal(
+        terminal_record,
+        combined,
+        status,
+    )
+
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None:
             return
-        record["status"] = status
-        record["completed_at"] = time.time()
-        record["interrupt_fn"] = None
-        record["delivery_pending"] = _completion_requires_delivery_ack(record)
+        record.pop("_terminalizing", None)
+        record["_terminalized"] = True
+        record["required_async_terminal_accepted"] = durable_accepted
+        record["delivery_pending"] = bool(
+            durable_accepted and _completion_requires_delivery_ack(record)
+        )
         event_record = dict(record)
         _prune_completed_locked()
+
+    if not durable_accepted:
+        return
 
     try:
         from tools.process_registry import process_registry
@@ -1239,6 +1364,10 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "origin_work_item_id": event_record.get("origin_work_item_id", ""),
+        "origin_run_generation": event_record.get("origin_run_generation"),
+        "origin_attempt_id": event_record.get("origin_attempt_id", ""),
+        "origin_attempt_order": event_record.get("origin_attempt_order"),
+        "kind": "advisory",
         "read_only": bool(event_record.get("read_only")),
         "task_specs": event_record.get("task_specs") or [],
         "accounting": combined.get("accounting"),
@@ -1261,11 +1390,20 @@ def _finalize_batch(
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            delegation_id, exc,
-        )
+        if _is_durable_attempt_dispatch(event_record):
+            logger.error(
+                "Async delegation batch %s: failed to enqueue completion event; "
+                "durable result remains available for reconciliation: %s",
+                delegation_id,
+                exc,
+            )
+        else:
+            logger.error(
+                "Async delegation batch %s: failed to enqueue completion event; "
+                "result lost: %s",
+                delegation_id,
+                exc,
+            )
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:

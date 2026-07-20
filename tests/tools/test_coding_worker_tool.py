@@ -686,7 +686,10 @@ def test_background_dispatch_returns_handle_and_records_worker_run(monkeypatch, 
         "worker_cwd": str(repo),
         "model_tier": "trivial",
         "scope_paths": ["src"],
-        "note": "worker running; completion will arrive as a follow-up turn",
+        "note": (
+            "worker running; its result is attached to the originating attempt "
+            "and will be included in that attempt's single terminal response"
+        ),
     }
     assert handle["delegation_id"].startswith("deleg_")
     assert parent.turn_worker_runs[0]["background"] is True

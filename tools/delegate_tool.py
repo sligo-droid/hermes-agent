@@ -2980,6 +2980,28 @@ def delegate_task(
 
     if background:
         accounting_context = _capture_detached_accounting_context(parent_agent)
+        raw_work_item_id = (
+            getattr(parent_agent, "_origin_work_item_id", "")
+            or getattr(parent_agent, "work_item_id", "")
+            or ""
+        )
+        origin_work_item_id = (
+            raw_work_item_id if isinstance(raw_work_item_id, str) else ""
+        )
+        raw_attempt_id = getattr(
+            parent_agent,
+            "_origin_work_item_attempt_id",
+            "",
+        )
+        origin_attempt_id = raw_attempt_id if isinstance(raw_attempt_id, str) else ""
+        raw_process_epoch = getattr(
+            parent_agent,
+            "_origin_work_item_process_epoch",
+            "",
+        )
+        origin_process_epoch = (
+            raw_process_epoch if isinstance(raw_process_epoch, str) else ""
+        )
         try:
             from tools.approval import get_current_session_key
 
@@ -3025,11 +3047,24 @@ def delegate_task(
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
-            origin_work_item_id=str(
-                getattr(parent_agent, "_origin_work_item_id", "")
-                or getattr(parent_agent, "work_item_id", "")
-                or ""
+            origin_work_item_id=origin_work_item_id,
+            origin_run_generation=getattr(
+                parent_agent,
+                "_origin_work_item_generation",
+                None,
             ),
+            origin_attempt_id=origin_attempt_id,
+            origin_attempt_order=getattr(
+                parent_agent,
+                "_origin_work_item_attempt_order",
+                None,
+            ),
+            origin_owner_pid=getattr(
+                parent_agent,
+                "_origin_work_item_owner_pid",
+                None,
+            ),
+            origin_process_epoch=origin_process_epoch,
             read_only=all(bool(task.get("read_only")) for task in task_list),
             task_specs=[
                 {
@@ -3051,9 +3086,9 @@ def delegate_task(
                     "goals": goals,
                     "read_only": all(bool(task.get("read_only")) for task in task_list),
                     "note": (
-                        "Delegation is running in the background; its consolidated "
-                        "result will arrive as a follow-up turn. Do not poll or claim "
-                        "completion from this dispatch handle."
+                        "Delegation is running in the background. Its result is attached "
+                        "to this originating attempt and will be included in the single "
+                        "terminal response when ready; do not poll this dispatch handle."
                     ),
                 },
                 ensure_ascii=False,

@@ -2650,6 +2650,45 @@ def _clean_git_head_sha(cwd: str) -> str:
     )
 
 
+def _git_workspace_baseline(cwd: str) -> tuple[str, list[str]]:
+    """Return exact starting head and bounded dirty paths for closeout fencing."""
+    if not cwd:
+        return "", []
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return "", []
+    sha = str(head.stdout or "").strip().lower()
+    if head.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        sha = ""
+    dirty_paths: list[str] = []
+    if status.returncode == 0:
+        for line in str(status.stdout or "").splitlines()[:32]:
+            path = line[3:].strip() if len(line) >= 4 else ""
+            if " -> " in path:
+                path = path.rsplit(" -> ", 1)[-1]
+            if path:
+                dirty_paths.append(path[:1000])
+    return sha, dirty_paths
+
+
 def _complete_background_parallel_result(
     payload: dict[str, Any],
     startup: _BackgroundCodingStartup,
@@ -2747,6 +2786,18 @@ def _dispatch_background_coding_task(
     )
 
     def _runner() -> dict[str, Any]:
+        if isinstance(parallel_group, dict) and parallel_group.get("base_sha"):
+            base_sha = str(parallel_group.get("base_sha") or "")
+            initial_dirty_paths = list(
+                parallel_group.get("initial_dirty_paths") or []
+            )
+        else:
+            baseline_cwd = (
+                str(parallel_group.get("base_cwd") or "")
+                if isinstance(parallel_group, dict)
+                else _resolve_cwd(call_kwargs.get("cwd"), parent_agent)
+            )
+            base_sha, initial_dirty_paths = _git_workspace_baseline(baseline_cwd)
         try:
             raw_result = delegate_coding_task(
                 **call_kwargs,
@@ -2774,6 +2825,10 @@ def _dispatch_background_coding_task(
             }
         _complete_background_parallel_result(payload, startup)
         if origin_work_item_id:
+            if base_sha:
+                payload["base_sha"] = base_sha
+            if initial_dirty_paths:
+                payload["initial_dirty_paths"] = initial_dirty_paths
             evidence_cwd = startup.worker_cwd
             parallel_merge = payload.get("parallel_merge")
             if (
@@ -2954,7 +3009,10 @@ def _dispatch_background_coding_task(
         "worker_cwd": startup.worker_cwd,
         "model_tier": startup.model_tier,
         "scope_paths": list(startup.scope_paths),
-        "note": "worker running; completion will arrive as a follow-up turn",
+        "note": (
+            "worker running; its result is attached to the originating attempt "
+            "and will be included in that attempt's single terminal response"
+        ),
     }
     if startup.parallel_group:
         handle["parallel"] = {

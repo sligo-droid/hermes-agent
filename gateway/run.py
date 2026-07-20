@@ -2866,8 +2866,16 @@ def _effective_closeout_repository_config(
     return effective
 
 
-def _gateway_repository_for_source(source: Any) -> str:
-    """Resolve one configured Discord project's normalized GitHub identity."""
+def _gateway_repository_for_source(
+    source: Any,
+    *,
+    workspace_path: str = "",
+) -> str:
+    """Resolve the actual target checkout's normalized GitHub identity.
+
+    Discord mapping metadata is a fallback. Once a mutable action workspace is
+    resolved, its origin is authoritative for repository-scoped closeout policy.
+    """
 
     try:
         from hermes_cli.github_remote import (
@@ -2878,14 +2886,21 @@ def _gateway_repository_for_source(source: Any) -> str:
         configured = github_repo_from_value(
             getattr(source, "project_github_url", "")
         )
-        if configured:
-            return str(configured)
-        project_path = str(getattr(source, "project_path", "") or "").strip()
-        if project_path:
-            repository = github_origin_repo(project_path)
-            if repository:
-                return str(repository)
-        return ""
+        target_path = str(workspace_path or "").strip()
+        if not target_path:
+            target_path = str(getattr(source, "project_path", "") or "").strip()
+        actual = github_origin_repo(target_path) if target_path else ""
+        if actual:
+            if configured and str(configured).lower() != str(actual).lower():
+                logger.warning(
+                    "Discord repository mapping mismatch; using target workspace origin "
+                    "for closeout policy (configured=%s actual=%s workspace=%s)",
+                    str(configured)[:160],
+                    str(actual)[:160],
+                    target_path[:240],
+                )
+            return str(actual)
+        return str(configured or "")
     except Exception:
         return ""
 
@@ -7682,9 +7697,9 @@ class GatewayRunner:
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
 
-        # Advisory detached subagents still re-enter as best-effort fresh turns.
-        # Required coding-worker queue events only wake deterministic ledger
-        # reconciliation; the ledger scan also repairs lost queue wakeups.
+        # Discord work-item completions only wake deterministic attempt-level
+        # reconciliation. Legacy non-work-item delegations retain best-effort
+        # fresh turns; the ledger scan repairs lost durable queue wakeups.
         self._start_owned_runner(
             "async-delegation-notifications",
             self._async_delegation_watcher,
@@ -7724,7 +7739,11 @@ class GatewayRunner:
             return []
         raw = state.get("dispatches")
         if isinstance(raw, dict):
-            rows = list(raw.values())
+            rows = [
+                {"delegation_id": str(delegation_id), **dict(row)}
+                for delegation_id, row in raw.items()
+                if isinstance(row, dict)
+            ]
         elif isinstance(raw, list):
             rows = raw
         else:
@@ -7821,35 +7840,84 @@ class GatewayRunner:
         success: bool,
     ) -> str:
         rows = GatewayRunner._required_async_dispatch_rows(state)
-        summaries: list[str] = []
-        errors: list[str] = []
+        required_summaries: list[str] = []
+        required_errors: list[str] = []
+        advisory_summaries: list[str] = []
+        advisory_errors: list[str] = []
         for row in rows:
+            evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+            if row.get("required") is False or row.get("kind") == "advisory":
+                for result in evidence.get("advisory_results") or []:
+                    if not isinstance(result, dict):
+                        continue
+                    summary = str(result.get("summary") or "").strip()
+                    error = str(result.get("error") or "").strip()
+                    if summary and summary not in advisory_summaries:
+                        advisory_summaries.append(summary[:800])
+                    if error and error not in advisory_errors:
+                        advisory_errors.append(error[:800])
+                continue
             summary = str(row.get("summary") or "").strip()
             error = str(row.get("error") or "").strip()
-            if summary and summary not in summaries:
-                summaries.append(summary[:800])
-            if error and error not in errors:
-                errors.append(error[:800])
+            if summary and summary not in required_summaries:
+                required_summaries.append(summary[:800])
+            if error and error not in required_errors:
+                required_errors.append(error[:800])
         if success:
-            body = "\n".join(f"- {summary}" for summary in summaries[:8])
-            return (
-                "Required coding workers completed successfully."
-                + (f"\n\n{body}" if body else "")
+            sections: list[str] = []
+            if isinstance(state, dict) and state.get("has_required"):
+                sections.append("Required coding workers completed successfully.")
+                if required_summaries:
+                    sections.append(
+                        "\n".join(f"- {summary}" for summary in required_summaries[:8])
+                    )
+            else:
+                sections.append("Background advisory work completed.")
+            if advisory_summaries:
+                sections.append(
+                    "Advisory results available at completion:\n"
+                    + "\n".join(f"- {summary}" for summary in advisory_summaries[:8])
+                )
+            if advisory_errors:
+                sections.append(
+                    "Advisory work that did not complete:\n"
+                    + "\n".join(f"- {error}" for error in advisory_errors[:8])
+                )
+            return "\n\n".join(sections)
+        if (
+            isinstance(state, dict)
+            and not state.get("has_required")
+            and state.get("advisory_failed")
+        ):
+            lead = (
+                "Background advisory work did not produce a usable result, so the "
+                "request was blocked without replaying the task."
             )
-        if isinstance(state, dict) and state.get("outcome_unknown"):
+        elif isinstance(state, dict) and state.get("required_outcome_unknown"):
             lead = (
                 "Required coding work could not be verified after gateway recovery. "
                 "At least one worker outcome is unknown, so Hermes did not retry or "
                 "replay the work automatically."
             )
-        elif isinstance(state, dict) and state.get("cancelled"):
+        elif isinstance(state, dict) and state.get("required_cancelled"):
             lead = "Required coding work was cancelled and will not be resumed automatically."
         elif isinstance(state, dict) and state.get("malformed"):
             lead = "Required coding work has incomplete durable evidence and was blocked safely."
         else:
             lead = "A required coding worker failed, so the request was blocked safely."
-        details = errors or summaries
+        details = (
+            required_errors
+            or required_summaries
+            or advisory_errors
+            or advisory_summaries
+        )
         body = "\n".join(f"- {detail}" for detail in details[:8])
+        if advisory_summaries and isinstance(state, dict) and state.get("has_required"):
+            body += (
+                ("\n\n" if body else "")
+                + "Advisory results available before the block:\n"
+                + "\n".join(f"- {summary}" for summary in advisory_summaries[:8])
+            )
         return lead + (f"\n\n{body}" if body else "")
 
     def _activate_required_async_closeout(
@@ -7882,7 +7950,12 @@ class GatewayRunner:
             return False, "unsupported_closeout_source"
 
         rows = sorted(
-            self._required_async_dispatch_rows(required_state),
+            [
+                row
+                for row in self._required_async_dispatch_rows(required_state)
+                if row.get("required") is not False
+                and row.get("kind") != "advisory"
+            ],
             key=lambda row: (
                 float(row.get("completed_at") or 0),
                 str(row.get("delegation_id") or ""),
@@ -7899,7 +7972,8 @@ class GatewayRunner:
                 return False, "worker_scope_check_failed"
             merge = evidence.get("parallel_merge")
             if isinstance(merge, dict) and (
-                merge.get("success") is False
+                merge.get("merged") is not True
+                or merge.get("success") is False
                 or merge.get("recovery_required") is True
                 or merge.get("merge_pending") is True
                 or merge.get("error")
@@ -7912,8 +7986,16 @@ class GatewayRunner:
             else {}
         )
         verified_head = str(latest_evidence.get("head_sha") or "").strip().lower()
-        if not rows or not workspace or not verified_head:
+        if not rows or not workspace:
             return False, "missing_dispatch_evidence"
+        if not verified_head:
+            verified_head, checkpoint_reason = self._checkpoint_required_async_workspace(
+                work_id,
+                rows,
+                workspace,
+            )
+            if not verified_head:
+                return False, checkpoint_reason
 
         visual_result: dict[str, Any] = {}
         if closeout["policy"]["require_visual_qa"]:
@@ -7945,6 +8027,140 @@ class GatewayRunner:
             "workspace_head_not_clean_or_verified",
         )
 
+    @staticmethod
+    def _checkpoint_required_async_workspace(
+        work_id: str,
+        rows: list[dict[str, Any]],
+        workspace: str,
+    ) -> tuple[str, str]:
+        """Create one trusted local checkpoint for successful async mutation.
+
+        Coding workers are intentionally denied Git lifecycle authority. This
+        bridge commits only an exact clean-baseline, scope-checked aggregate in
+        the already-resolved action worktree, then hands the resulting head to
+        trusted closeout. It never pushes, opens a PR, or invokes a model.
+        """
+
+        import subprocess
+
+        root = Path(str(workspace or "")).expanduser().resolve(strict=False)
+        if not root.is_dir():
+            return "", "checkpoint_workspace_missing"
+        base_shas: set[str] = set()
+        allowed_prefixes: list[str] = []
+        for row in rows:
+            evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+            scope_check = evidence.get("scope_check")
+            if not isinstance(scope_check, dict) or scope_check.get("clean") is not True:
+                return "", "checkpoint_scope_evidence_missing"
+            if evidence.get("initial_dirty_paths"):
+                return "", "checkpoint_baseline_was_dirty"
+            base_sha = str(evidence.get("base_sha") or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+                return "", "checkpoint_base_head_missing"
+            base_shas.add(base_sha)
+            parallel_merge = (
+                evidence.get("parallel_merge")
+                if isinstance(evidence.get("parallel_merge"), dict)
+                else None
+            )
+            if parallel_merge is not None:
+                if parallel_merge.get("merged") is not True:
+                    return "", "parallel_merge_incomplete"
+                # Isolated workers live in sibling worktrees. Their scope paths
+                # are already expressed against the base action workspace that
+                # received the trusted merge-back.
+                worker_prefix = ""
+            else:
+                worker_cwd = Path(
+                    str(evidence.get("worker_cwd") or root)
+                ).expanduser().resolve(strict=False)
+                try:
+                    worker_prefix = worker_cwd.relative_to(root).as_posix().strip(".")
+                except ValueError:
+                    return "", "checkpoint_worker_outside_workspace"
+            scopes = evidence.get("scope_paths") or scope_check.get("scope_paths") or []
+            if not scopes:
+                allowed_prefixes.append(worker_prefix.strip("/"))
+            for scope in scopes:
+                normalized = str(scope or "").replace("\\", "/").strip("/")
+                prefix = "/".join(
+                    part for part in (worker_prefix.strip("/"), normalized) if part
+                )
+                allowed_prefixes.append(prefix)
+        if len(base_shas) != 1:
+            return "", "checkpoint_base_head_conflict"
+
+        def run_git(args: list[str], *, timeout: float = 30.0) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", *args],
+                cwd=root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+
+        head = run_git(["rev-parse", "--verify", "HEAD"])
+        current_head = str(head.stdout or "").strip().lower()
+        if head.returncode != 0 or current_head not in base_shas:
+            return "", "checkpoint_base_head_moved"
+        status = run_git(["status", "--porcelain=v1", "--untracked-files=all"])
+        if status.returncode != 0:
+            return "", "checkpoint_status_failed"
+        changed_paths: list[str] = []
+        for line in str(status.stdout or "").splitlines():
+            path = line[3:].strip() if len(line) >= 4 else ""
+            if " -> " in path:
+                path = path.rsplit(" -> ", 1)[-1]
+            if path:
+                changed_paths.append(path.replace("\\", "/").strip("/"))
+        if not changed_paths:
+            return current_head, ""
+
+        def allowed(path: str) -> bool:
+            return any(
+                not prefix
+                or path == prefix
+                or path.startswith(prefix.rstrip("/") + "/")
+                for prefix in allowed_prefixes
+            )
+
+        if not allowed_prefixes or any(not allowed(path) for path in changed_paths):
+            return "", "checkpoint_changed_paths_out_of_scope"
+        if run_git(["diff", "--check"]).returncode != 0:
+            return "", "checkpoint_diff_check_failed"
+        added = run_git(["add", "-A", "--", "."])
+        if added.returncode != 0:
+            return "", "checkpoint_stage_failed"
+        if run_git(["diff", "--cached", "--check"]).returncode != 0:
+            run_git(["reset", "--mixed", "HEAD", "--"])
+            return "", "checkpoint_staged_diff_check_failed"
+        message = f"Hermes async work {str(work_id or '')[:12]}"
+        committed = run_git(["commit", "-m", message], timeout=60.0)
+        if committed.returncode != 0:
+            run_git(["reset", "--mixed", "HEAD", "--"])
+            logger.warning(
+                "Trusted async checkpoint commit failed for %s: %s",
+                work_id,
+                str(committed.stderr or committed.stdout or "")[:500],
+            )
+            return "", "checkpoint_commit_failed"
+        checked = run_git(["diff", "--check"])
+        clean = run_git(["status", "--porcelain=v1", "--untracked-files=all"])
+        final_head = run_git(["rev-parse", "--verify", "HEAD"])
+        verified_head = str(final_head.stdout or "").strip().lower()
+        if (
+            checked.returncode != 0
+            or clean.returncode != 0
+            or str(clean.stdout or "").strip()
+            or final_head.returncode != 0
+            or not re.fullmatch(r"[0-9a-f]{40}", verified_head)
+        ):
+            return "", "checkpoint_post_commit_verification_failed"
+        return verified_head, ""
+
     async def _reconcile_required_async_item(
         self,
         work_id: str,
@@ -7969,19 +8185,24 @@ class GatewayRunner:
         failure = bool(
             current.get("failed")
             or current.get("sticky_failure")
-            or current.get("cancelled")
-            or current.get("outcome_unknown")
             or current.get("malformed")
+            or (
+                not current.get("has_required")
+                and int(current.get("advisory_succeeded") or 0) == 0
+                and int(current.get("advisory_failed") or 0) > 0
+            )
         )
         identity = self._required_async_identity(current)
         if failure:
             reason = (
                 "required_async_outcome_unknown"
-                if current.get("outcome_unknown")
+                if current.get("required_outcome_unknown")
                 else "required_async_cancelled"
-                if current.get("cancelled")
+                if current.get("required_cancelled")
                 else "required_async_malformed"
                 if current.get("malformed")
+                else "advisory_async_completion_failed"
+                if not current.get("has_required")
                 else "required_async_completion_failed"
             )
             finalized = await asyncio.to_thread(
@@ -7999,12 +8220,15 @@ class GatewayRunner:
                 await self._resume_finished_discord_work_item(finalized)
             return
 
-        activated, route = await asyncio.to_thread(
-            self._activate_required_async_closeout,
-            work_id,
-            item,
-            current,
-        )
+        if current.get("has_required"):
+            activated, route = await asyncio.to_thread(
+                self._activate_required_async_closeout,
+                work_id,
+                item,
+                current,
+            )
+        else:
+            activated, route = False, "work_item"
         if route not in {"closeout", "work_item"}:
             finalized = await asyncio.to_thread(
                 ledger.finalize_required_async_failure,
@@ -14166,7 +14390,10 @@ class GatewayRunner:
                 "was not used as the agent working directory."
             )
         if action_worktree_cwd:
-            repository = _gateway_repository_for_source(source)
+            repository = _gateway_repository_for_source(
+                source,
+                workspace_path=action_worktree_cwd,
+            )
             if not repository:
                 try:
                     from hermes_cli.github_remote import github_origin_repo
@@ -20814,7 +21041,10 @@ class GatewayRunner:
                     f"in a mutable Git worktree. {session_cwd_error}"
                 )
             if action_worktree_cwd:
-                repository = _gateway_repository_for_source(event.source)
+                repository = _gateway_repository_for_source(
+                    event.source,
+                    workspace_path=action_worktree_cwd,
+                )
                 if not repository:
                     try:
                         from hermes_cli.github_remote import github_origin_repo
@@ -22280,12 +22510,14 @@ class GatewayRunner:
     ) -> bool:
         """Forge a fresh internal turn for one detached completion event."""
         if (
-            evt.get("kind") == "coding_worker"
-            and str(evt.get("origin_work_item_id") or "").strip()
+            str(evt.get("origin_work_item_id") or "").strip()
+            and evt.get("origin_run_generation")
+            and str(evt.get("origin_attempt_id") or "").strip()
+            and evt.get("origin_attempt_order")
         ):
-            # Required coding completions are lifecycle evidence, not user
-            # prompts.  Never run them through an arbitrary tool-capable model
-            # turn, even if a legacy caller reaches this helper directly.
+            # Discord attempt completions are durable evidence, not user
+            # prompts. Never run required or advisory results through an
+            # arbitrary tool-capable model turn.
             return self._record_required_async_queue_event(evt)
         source = self._build_process_event_source(evt)
         if not source:
@@ -22424,6 +22656,23 @@ class GatewayRunner:
                 else {}
             ),
         }
+        if evt.get("kind") != "coding_worker":
+            task_specs = evt.get("task_specs") if isinstance(evt.get("task_specs"), list) else []
+            results = evt.get("results") if isinstance(evt.get("results"), list) else []
+            evidence["advisory_results"] = [
+                {
+                    "goal": str(
+                        task_specs[index].get("goal")
+                        if index < len(task_specs) and isinstance(task_specs[index], dict)
+                        else ""
+                    ),
+                    "status": str(raw.get("status") or ""),
+                    "summary": str(raw.get("summary") or ""),
+                    "error": str(raw.get("error") or ""),
+                }
+                for index, raw in enumerate(results[:16])
+                if isinstance(raw, dict)
+            ]
         for source, key in (
             (result, "changed"),
             (parallel_merge, "merged"),
@@ -22500,11 +22749,13 @@ class GatewayRunner:
                     delegation_id = str(evt.get("delegation_id") or "")
                     if delegation_id and delegation_id in seen:
                         continue
-                    required_coding = bool(
-                        evt.get("kind") == "coding_worker"
-                        and str(evt.get("origin_work_item_id") or "").strip()
+                    durable_attempt = bool(
+                        str(evt.get("origin_work_item_id") or "").strip()
+                        and evt.get("origin_run_generation")
+                        and str(evt.get("origin_attempt_id") or "").strip()
+                        and evt.get("origin_attempt_order")
                     )
-                    if required_coding:
+                    if durable_attempt:
                         accepted = self._record_required_async_queue_event(evt)
                         if accepted:
                             try:
@@ -24811,6 +25062,8 @@ class GatewayRunner:
             agent._origin_work_item_attempt_order = required_turn_identity[
                 "attempt_order"
             ]
+            agent._origin_work_item_owner_pid = os.getpid()
+            agent._origin_work_item_process_epoch = str(self._process_epoch)
             closeout_watcher = getattr(self, "trusted_closeout_watcher", None)
             agent._closeout_notify = closeout_watcher.notify if closeout_watcher is not None else None
             if isinstance(completed_worker_run, dict) and completed_worker_run:

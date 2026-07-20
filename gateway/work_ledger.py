@@ -58,7 +58,8 @@ _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 _MAX_CONFIRMED_MESSAGE_IDS = 128
 _MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
 _MAX_REQUIRED_ASYNC_COMPLETIONS = 64
-_REQUIRED_ASYNC_SCHEMA_VERSION = 2
+_REQUIRED_ASYNC_SCHEMA_VERSION = 3
+_SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS = frozenset({2, 3})
 _REQUIRED_ASYNC_DISPATCH_STATES = frozenset(
     {"registered", "running", "terminal", "cancelled", "outcome_unknown"}
 )
@@ -66,6 +67,7 @@ _REQUIRED_ASYNC_PENDING_STATES = frozenset({"registered", "running"})
 _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT = 1000
 _MAX_REQUIRED_ASYNC_SCOPE_PATHS = 32
 _MAX_REQUIRED_ASYNC_TEST_REFS = 16
+_MAX_ASYNC_ADVISORY_RESULTS = 16
 _CLOSEOUT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CLOSEOUT_VISUAL_STATUSES = frozenset(
     {"passed", "failed", "blocked", "uncertain", "missing"}
@@ -509,7 +511,7 @@ def _bounded_required_async_evidence(value: Any) -> dict[str, Any]:
     for key in ("changed", "merged"):
         if isinstance(raw.get(key), bool):
             evidence[key] = raw[key]
-    for key in ("scope_paths", "changed_paths"):
+    for key in ("scope_paths", "changed_paths", "initial_dirty_paths"):
         paths = _bounded_required_async_strings(
             raw.get(key),
             limit=_MAX_REQUIRED_ASYNC_SCOPE_PATHS,
@@ -585,6 +587,21 @@ def _bounded_required_async_evidence(value: Any) -> dict[str, Any]:
                 worker_run[key] = raw_worker_run[key]
         if worker_run:
             evidence["worker_run"] = worker_run
+    raw_advisory_results = raw.get("advisory_results")
+    if isinstance(raw_advisory_results, list):
+        advisory_results: list[dict[str, str]] = []
+        for raw_result in raw_advisory_results[:_MAX_ASYNC_ADVISORY_RESULTS]:
+            if not isinstance(raw_result, Mapping):
+                continue
+            result: dict[str, str] = {}
+            for key in ("goal", "status", "summary", "error"):
+                text = _bounded_required_async_text(raw_result.get(key))
+                if text:
+                    result[key] = text
+            if result:
+                advisory_results.append(result)
+        if advisory_results:
+            evidence["advisory_results"] = advisory_results
     return evidence
 
 
@@ -604,7 +621,17 @@ def _normalized_required_async_dispatch(
         success = raw.get("success") is True
     elif state in {"cancelled", "outcome_unknown"}:
         success = False
+    kind = str(raw.get("kind") or "").strip().lower()
+    if kind not in {"coding_worker", "advisory"}:
+        kind = "coding_worker"
+        if raw.get("kind") not in {None, ""}:
+            malformed = True
+    required = raw.get("required") is not False
+    if kind == "advisory":
+        required = False
     dispatch = {
+        "kind": kind,
+        "required": required,
         "state": state,
         "success": success,
         "status": _bounded_run_state_text(raw.get("status")),
@@ -636,7 +663,10 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
     raw_version = raw.get("schema_version")
     legacy = present and raw_version is None
     malformed = present and not isinstance(raw_value, dict)
-    if raw_version is not None and _positive_int(raw_version) != _REQUIRED_ASYNC_SCHEMA_VERSION:
+    if (
+        raw_version is not None
+        and _positive_int(raw_version) not in _SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS
+    ):
         malformed = True
     generation = _positive_int(raw.get("generation"))
     attempt_id = _bounded_run_state_text(raw.get("attempt_id"))
@@ -708,27 +738,61 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
             "completed_at": dispatch.get("completed_at"),
             "closeout_id": str(dispatch.get("closeout_id") or ""),
         }
-    pending_count = sum(
+    required_dispatches = {
+        delegation_id: dispatch
+        for delegation_id, dispatch in dispatches.items()
+        if dispatch.get("required") is True
+    }
+    advisory_dispatches = {
+        delegation_id: dispatch
+        for delegation_id, dispatch in dispatches.items()
+        if dispatch.get("required") is not True
+    }
+    required_pending_count = sum(
         dispatch["state"] in _REQUIRED_ASYNC_PENDING_STATES
-        for dispatch in dispatches.values()
+        for dispatch in required_dispatches.values()
     )
+    advisory_pending_count = sum(
+        dispatch["state"] in _REQUIRED_ASYNC_PENDING_STATES
+        for dispatch in advisory_dispatches.values()
+    )
+    pending_count = required_pending_count + advisory_pending_count
     cancelled = sum(dispatch["state"] == "cancelled" for dispatch in dispatches.values())
     outcome_unknown = sum(
         dispatch["state"] == "outcome_unknown" for dispatch in dispatches.values()
     )
+    required_cancelled = sum(
+        dispatch["state"] == "cancelled" for dispatch in required_dispatches.values()
+    )
+    required_outcome_unknown = sum(
+        dispatch["state"] == "outcome_unknown"
+        for dispatch in required_dispatches.values()
+    )
+    advisory_failed = sum(
+        dispatch["state"] in {"cancelled", "outcome_unknown"}
+        or (
+            dispatch["state"] == "terminal"
+            and dispatch.get("success") is not True
+        )
+        for dispatch in advisory_dispatches.values()
+    )
     sticky_failure = bool(
         malformed
         or raw.get("sticky_failure") is True
-        or cancelled
-        or outcome_unknown
+        or required_cancelled
+        or required_outcome_unknown
         or any(
             dispatch["state"] == "terminal" and dispatch.get("success") is not True
-            for dispatch in dispatches.values()
+            for dispatch in required_dispatches.values()
         )
     )
     all_terminal = bool(dispatches) and pending_count == 0
+    required_terminal = bool(required_dispatches) and required_pending_count == 0
+    advisory_terminal = bool(advisory_dispatches) and advisory_pending_count == 0
+    completion_terminal = required_terminal if required_dispatches else advisory_terminal
     if (malformed or (sealed and sticky_failure)) and not dispatches:
         all_terminal = True
+        completion_terminal = True
     owns_recovery = bool(present and reconciled_at is None)
     return {
         "schema_version": _REQUIRED_ASYNC_SCHEMA_VERSION,
@@ -746,9 +810,14 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
         "dispatches": dispatches,
         "outcomes": outcomes,
         "pending_count": pending_count,
+        "required_pending_count": required_pending_count,
+        "advisory_pending_count": advisory_pending_count,
         "all_terminal": all_terminal,
+        "completion_terminal": completion_terminal,
+        "has_required": bool(required_dispatches),
+        "has_advisory": bool(advisory_dispatches),
         "ready_to_reconcile": bool(
-            owns_recovery and sealed and all_terminal and reconciled_at is None
+            owns_recovery and sealed and completion_terminal and reconciled_at is None
         ),
         "present": present,
         "owns_recovery": owns_recovery,
@@ -756,8 +825,19 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
         "sticky_failure": sticky_failure,
         "failure_reason": _bounded_run_state_text(raw.get("failure_reason")),
         "succeeded": sum(outcome["success"] is True for outcome in outcomes.values()),
+        "required_succeeded": sum(
+            dispatch["state"] == "terminal" and dispatch.get("success") is True
+            for dispatch in required_dispatches.values()
+        ),
+        "advisory_succeeded": sum(
+            dispatch["state"] == "terminal" and dispatch.get("success") is True
+            for dispatch in advisory_dispatches.values()
+        ),
+        "advisory_failed": advisory_failed,
         "cancelled": cancelled,
+        "required_cancelled": required_cancelled,
         "outcome_unknown": outcome_unknown,
+        "required_outcome_unknown": required_outcome_unknown,
         "malformed": malformed,
     }
 
@@ -1163,7 +1243,7 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
             "required_async_completions": {
                 "generation": required_async["generation"],
                 "failed": True,
-                "succeeded": required_async["succeeded"],
+                "succeeded": required_async["required_succeeded"],
             },
         }
     gate_summary_status = str(item.get("summary_status") or "Complete")
@@ -1595,8 +1675,16 @@ class GatewayWorkLedger:
         registered_at: float | None = None,
         closeout_id: str | None = None,
         scope_paths: Any = None,
+        kind: str = "coding_worker",
+        required: bool = True,
+        evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Register one actual executor dispatch before submission begins."""
+        """Register one actual executor dispatch before submission begins.
+
+        The historical method name is retained for compatibility. ``required``
+        distinguishes coding work that gates reconciliation from advisory
+        read-only work whose result is included only when it is ready.
+        """
 
         data = self._read()
         item = data.get("items", {}).get(work_id)
@@ -1629,21 +1717,31 @@ class GatewayWorkLedger:
         epoch = _bounded_run_state_text(process_epoch, limit=_RUN_STATE_EPOCH_LIMIT)
         pid = _bounded_run_state_int(owner_pid or os.getpid())
         closeout = _bounded_run_state_text(closeout_id)
-        evidence = _bounded_required_async_evidence({"scope_paths": scope_paths})
+        dispatch_kind = str(kind or "coding_worker").strip().lower()
+        if dispatch_kind not in {"coding_worker", "advisory"}:
+            return None
+        is_required = bool(required) and dispatch_kind == "coding_worker"
+        bounded_evidence = _bounded_required_async_evidence(
+            {**dict(evidence or {}), "scope_paths": scope_paths}
+        )
         if isinstance(existing, dict):
             if (
                 existing.get("state") == "registered"
+                and existing.get("kind") == dispatch_kind
+                and existing.get("required") is is_required
                 and int(existing.get("owner_pid") or 0) == pid
                 and str(existing.get("process_epoch") or "") == epoch
                 and str(existing.get("closeout_id") or "") == closeout
                 and existing.get("evidence", {}).get("scope_paths", [])
-                == evidence.get("scope_paths", [])
+                == bounded_evidence.get("scope_paths", [])
             ):
                 return state
             return None
         if len(dispatches) >= _MAX_REQUIRED_ASYNC_COMPLETIONS:
             return None
         dispatches[completion_id] = {
+            "kind": dispatch_kind,
+            "required": is_required,
             "state": "registered",
             "success": None,
             "status": "registered",
@@ -1657,7 +1755,7 @@ class GatewayWorkLedger:
             "closeout_id": closeout,
             "summary": "",
             "error": "",
-            "evidence": evidence,
+            "evidence": bounded_evidence,
         }
         state["dispatches"] = dispatches
         return self._persist_required_async_state(
@@ -1757,6 +1855,8 @@ class GatewayWorkLedger:
             # Compatibility for callers from before durable dispatch
             # registration. New producer code always registers first.
             existing = {
+                "kind": "coding_worker",
+                "required": True,
                 "state": "registered",
                 "success": None,
                 "status": "registered",
@@ -1793,8 +1893,9 @@ class GatewayWorkLedger:
                 }
             )
             dispatches[completion_id] = dispatch
-            state["sticky_failure"] = True
-            state["failure_reason"] = "required_async_conflicting_replay"
+            if existing.get("required") is True:
+                state["sticky_failure"] = True
+                state["failure_reason"] = "required_async_conflicting_replay"
         else:
             dispatch = dict(existing)
             combined_evidence = dict(dispatch.get("evidence") or {})
@@ -1817,7 +1918,7 @@ class GatewayWorkLedger:
                 }
             )
             dispatches[completion_id] = dispatch
-            if not incoming_success:
+            if not incoming_success and dispatch.get("required") is True:
                 state["sticky_failure"] = True
                 state["failure_reason"] = "required_async_completion_failed"
         state["dispatches"] = dispatches
@@ -1956,12 +2057,13 @@ class GatewayWorkLedger:
         state.update(
             {
                 "dispatches": dispatches,
-                "sticky_failure": True,
-                "failure_reason": "required_async_dispatch_cancelled",
                 "cancelled_at": now,
                 "cancellation_reason": _bounded_required_async_text(reason),
             }
         )
+        if dispatch.get("required") is True:
+            state["sticky_failure"] = True
+            state["failure_reason"] = "required_async_dispatch_cancelled"
         return self._persist_required_async_state(
             data,
             item,
@@ -2028,7 +2130,7 @@ class GatewayWorkLedger:
         if context is None:
             return None
         item, state = context
-        if not state["sealed"] or not state["all_terminal"]:
+        if not state["sealed"] or not state["completion_terminal"]:
             return None
         incoming_id = _bounded_run_state_text(reconciliation_id)
         if state["reconciled_at"] is not None:
@@ -2067,7 +2169,7 @@ class GatewayWorkLedger:
             if not isinstance(item, dict):
                 continue
             state = _required_async_completion_state(item)
-            if not state["owns_recovery"] or state["malformed"]:
+            if state["malformed"]:
                 continue
             dispatches = dict(state["dispatches"])
             changed = False
@@ -2092,13 +2194,14 @@ class GatewayWorkLedger:
                 changed = True
             if not changed:
                 continue
-            state.update(
-                {
-                    "dispatches": dispatches,
-                    "sticky_failure": True,
-                    "failure_reason": "required_async_outcome_unknown",
-                }
-            )
+            state["dispatches"] = dispatches
+            if any(
+                dispatch.get("required") is True
+                and dispatch.get("state") == "outcome_unknown"
+                for dispatch in dispatches.values()
+            ):
+                state["sticky_failure"] = True
+                state["failure_reason"] = "required_async_outcome_unknown"
             if not any(
                 dispatch.get("state") in _REQUIRED_ASYNC_PENDING_STATES
                 for dispatch in dispatches.values()
@@ -2138,7 +2241,7 @@ class GatewayWorkLedger:
         if context is None:
             return None
         item, state = context
-        if not state["sealed"] or not state["all_terminal"]:
+        if not state["sealed"] or not state["completion_terminal"]:
             return None
         terminal_delivery = (
             item.get("terminal_delivery")
@@ -2184,7 +2287,7 @@ class GatewayWorkLedger:
                         "attempt_id": state["attempt_id"],
                         "attempt_order": state["attempt_order"],
                         "failed": state["failed"],
-                        "succeeded": state["succeeded"],
+                        "succeeded": state["required_succeeded"],
                     },
                 },
                 "terminal_delivery": {

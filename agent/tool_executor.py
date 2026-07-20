@@ -908,9 +908,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             for _tc, _name, args, _storage_args, _block_result, _blocked in coding_batch_calls
         )
     ):
+        parallel_base_cwd = _parallel_coding_base_cwd(agent)
+        try:
+            from tools.coding_worker_tool import _git_workspace_baseline
+
+            parallel_base_sha, parallel_initial_dirty_paths = _git_workspace_baseline(
+                parallel_base_cwd
+            )
+        except Exception:
+            parallel_base_sha, parallel_initial_dirty_paths = "", []
         parallel_coding_group = {
             "group_id": uuid.uuid4().hex,
-            "base_cwd": _parallel_coding_base_cwd(agent),
+            "base_cwd": parallel_base_cwd,
+            "base_sha": parallel_base_sha,
+            "initial_dirty_paths": parallel_initial_dirty_paths,
         }
         for _tc, _name, args, _storage_args, _block_result, _blocked in coding_batch_calls:
             args["_parallel_group"] = dict(parallel_coding_group)
