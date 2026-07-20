@@ -23,14 +23,14 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "reasoning_effort": "medium",
     },
     "basic": {
-        "model": "gpt-5.6-terra",
-        "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "high",
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
     },
     "intermediate": {
-        "model": "gpt-5.6-terra",
-        "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "max",
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "medium",
     },
     "advanced": {
         "model": "gpt-5.6-sol",
@@ -51,17 +51,17 @@ DEFAULT_WORKER_TIERS: dict[str, dict[str, str]] = {
     "quick": {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",
     },
     "standard": {
-        "model": "gpt-5.6-terra",
-        "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "medium",
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
     },
     "thorough": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
     },
     "deep": {
         "model": "gpt-5.6-sol",
@@ -71,7 +71,7 @@ DEFAULT_WORKER_TIERS: dict[str, dict[str, str]] = {
     "max": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "max",
+        "reasoning_effort": "xhigh",
     },
 }
 

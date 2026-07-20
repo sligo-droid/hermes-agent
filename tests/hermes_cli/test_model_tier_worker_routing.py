@@ -59,8 +59,8 @@ def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeyp
     settings = workers._role_runtime_settings("dev", config)
 
     assert settings["model_tier"] == "intermediate"
-    assert settings["model"] == "gpt-5.6-terra"
-    assert settings["reasoning"] == "max"
+    assert settings["model"] == "gpt-5.6-sol"
+    assert settings["reasoning"] == "medium"
     assert settings["reasoning_source"] == "model_tier"
 
 

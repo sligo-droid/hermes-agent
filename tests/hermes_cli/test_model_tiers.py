@@ -56,8 +56,8 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "medium",
-        "basic": "high",
-        "intermediate": "max",
+        "basic": "xhigh",
+        "intermediate": "medium",
         "advanced": "xhigh",
         "discord_action": "medium",
     }
@@ -66,8 +66,8 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "gpt-5.6-luna",
-        "basic": "gpt-5.6-terra",
-        "intermediate": "gpt-5.6-terra",
+        "basic": "gpt-5.6-luna",
+        "intermediate": "gpt-5.6-sol",
         "advanced": "gpt-5.6-sol",
         "discord_action": "gpt-5.6-sol",
     }
@@ -121,11 +121,11 @@ def test_invalid_tier_is_rejected_without_leaking_into_runtime():
 
 def test_default_worker_tiers_resolve_to_expected_model_and_effort():
     expected = {
-        "quick": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "low"),
-        "standard": ("gpt-5.6-terra", "hermes-codex/gpt-5.6-terra", "medium"),
-        "thorough": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "high"),
+        "quick": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "medium"),
+        "standard": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "xhigh"),
+        "thorough": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "medium"),
         "deep": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "xhigh"),
-        "max": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "max"),
+        "max": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "xhigh"),
     }
 
     assert tuple(DEFAULT_WORKER_TIERS) == tuple(expected)

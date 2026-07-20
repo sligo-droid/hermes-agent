@@ -142,20 +142,20 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path, caplog):
     audit = json.loads(audit_record.message.split("coding_worker_runtime ", 1)[1])
     assert audit["runtime_route"] == "coding_worker"
     assert audit["passes"][0]["model_tier"] == "intermediate"
-    assert audit["passes"][0]["reasoning"] == "max"
+    assert audit["passes"][0]["reasoning"] == "medium"
     assert result.run_profile == {
         "kind": "one_pass_simple_build",
         "label": "1-pass simple build",
         "pass_count": 1,
         "plan_used": False,
         "passes": [{
-            "name": "build", "agent": "build", "reasoning": "max",
-            "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate",
+            "name": "build", "agent": "build", "reasoning": "medium",
+            "model": "hermes-codex/gpt-5.6-sol", "model_tier": "intermediate",
         }],
     }
     assert _option(calls[0], "--agent") == "build"
-    assert _option(calls[0], "--variant") == "max"
-    assert _option(calls[0], "--model") == "hermes-codex/gpt-5.6-terra"
+    assert _option(calls[0], "--variant") == "medium"
+    assert _option(calls[0], "--model") == "hermes-codex/gpt-5.6-sol"
     assert "--pure" in calls[0]
     assert "Hermes worker brief:\nfix typo in README" in calls[0][3]
     assert "--file" not in calls[0]
@@ -200,11 +200,11 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     )
 
     assert result.error is None
-    assert seen_payload["model"] == "hermes-codex/gpt-5.6-terra"
+    assert seen_payload["model"] == "hermes-codex/gpt-5.6-sol"
     assert seen_payload["mcp"] == {}
     models = seen_payload["provider"]["hermes-codex"]["models"]
-    assert {"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"} <= set(models)
-    assert models["gpt-5.6-terra"]["variants"]["high"] == {
+    assert {"gpt-5.6-luna", "gpt-5.6-sol"} <= set(models)
+    assert models["gpt-5.6-sol"]["variants"]["high"] == {
         "reasoningEffort": "high"
     }
     assert seen_config_home is not None
@@ -519,13 +519,14 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         "plan_used": True,
         "passes": [
             {"name": "plan", "agent": "plan", "reasoning": "xhigh", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "advanced"},
-            {"name": "build", "agent": "build", "reasoning": "max", "model": "hermes-codex/gpt-5.6-terra", "model_tier": "intermediate"},
+            {"name": "build", "agent": "build", "reasoning": "medium", "model": "hermes-codex/gpt-5.6-sol", "model_tier": "intermediate"},
         ],
     }
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "max"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "medium"]
     assert [_option(cmd, "--model") for cmd in calls] == [
-        "hermes-codex/gpt-5.6-sol", "hermes-codex/gpt-5.6-terra"
+        "hermes-codex/gpt-5.6-sol",
+        "hermes-codex/gpt-5.6-sol",
     ]
     assert "OpenCode plan to follow:" in briefs[1]
 
@@ -873,11 +874,11 @@ def test_explicit_pass_tier_and_raw_worker_overrides_take_precedence():
     assert profiles["simple_build"] == {
         "model_tier": "basic",
         "model": "hermes-codex/custom-worker",
-        "codex_model": "gpt-5.6-terra",
+        "codex_model": "gpt-5.6-luna",
         "reasoning_level": "high",
     }
     assert profiles["complex_plan"]["codex_model"] == "gpt-5.6-sol"
-    assert profiles["complex_build"]["codex_model"] == "gpt-5.6-terra"
+    assert profiles["complex_build"]["codex_model"] == "gpt-5.6-sol"
 
 
 def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
@@ -895,9 +896,9 @@ def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
 
     assert tiered["simple_build"] == {
         "model_tier": "intermediate",
-        "model": "hermes-codex/gpt-5.6-terra",
-        "codex_model": "gpt-5.6-terra",
-        "reasoning_level": "max",
+        "model": "hermes-codex/gpt-5.6-sol",
+        "codex_model": "gpt-5.6-sol",
+        "reasoning_level": "medium",
     }
     assert disabled["simple_build"] == {
         "model_tier": "",
@@ -914,7 +915,7 @@ def test_generated_max_variant_is_never_rewritten_or_normalized(monkeypatch):
         lambda model: {
             "npm": "@ai-sdk/openai-compatible",
             "models": {
-                "gpt-5.6-terra": {
+                "gpt-5.6-sol": {
                     "reasoning": True,
                     "variants": {"max": {"reasoningEffort": "xhigh"}},
                 }
@@ -922,9 +923,9 @@ def test_generated_max_variant_is_never_rewritten_or_normalized(monkeypatch):
         },
     )
 
-    _, provider = ow._worker_provider_config("hermes-codex/gpt-5.6-terra", "max")
+    _, provider = ow._worker_provider_config("hermes-codex/gpt-5.6-sol", "max")
 
-    assert provider["models"]["gpt-5.6-terra"]["variants"]["max"] == {
+    assert provider["models"]["gpt-5.6-sol"]["variants"]["max"] == {
         "reasoningEffort": "max"
     }
 

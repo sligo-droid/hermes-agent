@@ -1149,13 +1149,28 @@ choose a model and reasoning effort.
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
-| `basic` | GPT-5.6 Terra | `high` | Ordinary gateway sessions |
-| `intermediate` | GPT-5.6 Terra | `max` | Coding-worker build passes and Kanban `dev` |
+| `basic` | GPT-5.6 Luna | `xhigh` | Ordinary gateway sessions |
+| `intermediate` | GPT-5.6 Sol | `medium` | Coding-worker build passes and Kanban `dev` |
 | `discord_action` | GPT-5.6 Sol | `medium` | Simple and ordinary Discord action requests |
 | `advanced` | GPT-5.6 Sol | `xhigh` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
-These defaults are runtime-aware: routine routes use lower effort, build passes
-use Terra at `max`, and complex planning moves to Sol at `xhigh`.
+These defaults follow the supported model/effort frontier: narrow routine work
+uses Luna, moderately scoped build passes use Sol at `medium`, and complex
+planning moves to Sol at `xhigh`.
+
+Coding workers also expose named selection tiers:
+
+| Worker tier | Model | Effort |
+|-------------|-------|--------|
+| `quick` | GPT-5.6 Luna | `medium` |
+| `standard` | GPT-5.6 Luna | `xhigh` |
+| `thorough` | GPT-5.6 Sol | `medium` |
+| `deep` | GPT-5.6 Sol | `xhigh` |
+| `max` | GPT-5.6 Sol | `xhigh` |
+
+`max` remains as a compatibility tier name but is capped at `xhigh` because
+coding workers can implement changes. Explicit raw model/reasoning overrides
+remain available for operators with a different policy.
 
 The defaults live under `model_tiers`; route settings reference a tier by name:
 
@@ -1166,13 +1181,13 @@ model_tiers:
     opencode_model: hermes-codex/gpt-5.6-luna
     reasoning_effort: medium
   basic:
-    model: gpt-5.6-terra
-    opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: high
+    model: gpt-5.6-luna
+    opencode_model: hermes-codex/gpt-5.6-luna
+    reasoning_effort: xhigh
   intermediate:
-    model: gpt-5.6-terra
-    opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: max
+    model: gpt-5.6-sol
+    opencode_model: hermes-codex/gpt-5.6-sol
+    reasoning_effort: medium
   advanced:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol

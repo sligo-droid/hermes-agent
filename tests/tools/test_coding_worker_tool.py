@@ -225,9 +225,9 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert FakeSession.instances[0].kwargs["scope_purpose"] == "Codex coding worker build pass"
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -254,8 +254,8 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
-            "model": "gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
         },
     ]
@@ -407,26 +407,26 @@ def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
     assert result["success"] is True
     assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
     assert result["ui_work_route"]["actual_model"] == "gpt-5.6-sol"
-    assert result["ui_work_route"]["actual_reasoning_effort"] == "high"
+    assert result["ui_work_route"]["actual_reasoning_effort"] == "medium"
     assert [session.kwargs["extra_args"] for session in FakeSession.instances] == [
         [
             "-c",
             'model="gpt-5.6-sol"',
             "-c",
-            'model_reasoning_effort="high"',
+            'model_reasoning_effort="medium"',
         ],
         [
             "-c",
             'model="gpt-5.6-sol"',
             "-c",
-            'model_reasoning_effort="high"',
+            'model_reasoning_effort="medium"',
         ],
     ]
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
             "model": "gpt-5.6-sol",
-            "reasoning": "high",
+            "reasoning": "medium",
             "tier": "thorough",
         },
     ]
@@ -452,8 +452,8 @@ def test_backend_error_marks_recorded_worker_run_failed(monkeypatch, tmp_path):
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
-            "model": "gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
             "failed": True,
         },
@@ -1342,8 +1342,8 @@ def test_ui_specialist_route_uses_normal_codex_backend_and_skills(monkeypatch, t
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
-            "model": "gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
         },
     ]
@@ -2050,15 +2050,15 @@ def test_ui_work_uses_normal_codex_model_tier(monkeypatch, tmp_path):
         "popular-web-designs",
     ]
     assert route["actual_backend"] == "codex"
-    assert route["actual_model"] == "gpt-5.6-terra"
-    assert route["actual_reasoning_effort"] == "max"
+    assert route["actual_model"] == "gpt-5.6-sol"
+    assert route["actual_reasoning_effort"] == "medium"
     assert result["backend"] == "codex"
     assert len(FakeSession.instances) == 1
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
     assert "UI specialist skill loading" in FakeSession.instances[0].run_calls[0]["user_input"]
 
@@ -2131,9 +2131,9 @@ def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monk
     assert "visual ui work" in route["advisory_reason"]
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
 
 
@@ -2204,9 +2204,9 @@ def test_legacy_ui_runtime_settings_do_not_change_codex_execution(monkeypatch, t
     assert len(FakeSession.instances) == 1
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
 
 
@@ -2233,9 +2233,9 @@ def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
     assert result["ui_work_route"]["matched"] is False
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
 
 
@@ -2646,9 +2646,9 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
     assert "Do not edit repository files" in FakeSession.instances[0].run_calls[0]["user_input"]
     assert "Codex plan to follow:" in FakeSession.instances[1].run_calls[0]["user_input"]
@@ -2692,7 +2692,7 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="high"',
     ]
@@ -2748,8 +2748,8 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert parent.turn_worker_runs == [
         {
             "backend": "opencode",
-            "model": "hermes-codex/gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "hermes-codex/gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
         },
     ]
