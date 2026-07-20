@@ -3821,6 +3821,40 @@ def test_required_async_legacy_outcomes_normalize_without_losing_compatibility(t
     assert state["outcomes"]["legacy-worker"]["success"] is True
 
 
+def test_required_async_v2_checkpoint_mutation_upgrades_schema(tmp_path):
+    ledger, work_id = _required_async_ledger(tmp_path)
+    assert _register_required_dispatch(ledger, work_id, "worker-v2")
+    assert _complete_required_dispatch(ledger, work_id, "worker-v2")
+    assert ledger.seal_required_async_attempt(
+        work_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+    )
+    data = ledger._read()
+    data["items"][work_id]["required_async_completions"]["schema_version"] = 2
+    ledger._write(data)
+
+    state = ledger.record_required_async_checkpoint(
+        work_id,
+        generation=7,
+        attempt_id="boot-a:7",
+        attempt_order=10,
+        parent_sha="a" * 40,
+        tree_sha="b" * 40,
+        message="Hermes async checkpoint work-v2",
+        repository_root=str(tmp_path / "repo"),
+        workspace_path=str(tmp_path / "repo" / "nested"),
+    )
+
+    assert state is not None
+    assert state["schema_version"] == 4
+    assert state["checkpoint"]["tree_sha"] == "b" * 40
+    stored = ledger.get(work_id)["required_async_completions"]
+    assert stored["schema_version"] == 4
+    assert stored["checkpoint"]["parent_sha"] == "a" * 40
+
+
 @pytest.mark.parametrize(
     "raw_state",
     [

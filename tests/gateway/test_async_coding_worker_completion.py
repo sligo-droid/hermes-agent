@@ -695,7 +695,10 @@ async def test_successful_required_attempt_hands_off_lifecycle_without_terminal_
     runner._resume_finished_discord_work_item.assert_not_awaited()
 
 
-def test_successful_required_evidence_hands_off_to_existing_closeout(tmp_path):
+def test_successful_required_evidence_hands_off_to_existing_closeout(
+    tmp_path,
+    monkeypatch,
+):
     ledger, work_item_id, _session_key = _registered_required_attempt(tmp_path)
     ledger.attach_closeout_workspace(
         work_item_id,
@@ -717,6 +720,17 @@ def test_successful_required_evidence_hands_off_to_existing_closeout(tmp_path):
     runner._ledger = lambda: ledger
     runner._activate_closeout_at_verified_head = MagicMock(
         return_value={"status": "pending"}
+    )
+    runner._checkpoint_required_async_workspace = MagicMock(
+        return_value=("a" * 40, "")
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=str(tmp_path),
+            stderr="",
+        ),
     )
 
     activated, route = runner._activate_required_async_closeout(
@@ -1343,13 +1357,58 @@ def test_stop_seals_required_attempt_before_scoped_interrupt(tmp_path, monkeypat
         (
             session_key,
             {
-                "kind": "coding_worker",
+                "kind": None,
                 "origin_work_item_id": work_item_id,
                 "attempt_id": "boot-a:7",
                 "reason": "session_stop",
             },
         )
     ]
+
+
+def test_stop_fences_delegate_only_attempt_after_restart_and_ignores_late_success(
+    tmp_path,
+):
+    ad._reset_for_tests()
+    ledger, work_item_id, session_key = _reaction_work_item(tmp_path)
+    identity = {
+        "generation": 7,
+        "attempt_id": "boot-a:7",
+        "attempt_order": 10,
+    }
+    assert ledger.register_required_async_dispatch(
+        work_item_id,
+        delegation_id="deleg-advisory-only",
+        owner_pid=123,
+        process_epoch="boot-a",
+        kind="advisory",
+        required=False,
+        **identity,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: ledger
+    runner._background_tasks = set()
+
+    # No volatile async-delegation record exists, matching a restarted gateway.
+    assert runner._stop_required_async_for_session(session_key) == 1
+
+    stopped = ledger.required_async_completion_state(work_item_id)
+    assert stopped["dispatches"]["deleg-advisory-only"]["state"] == "cancelled"
+    assert stopped["reconciled_at"] is not None
+    item = ledger.get(work_item_id)
+    assert item["status"] == "blocked"
+    assert item["blocked_reason"] == "advisory_async_cancelled"
+
+    late = ledger.record_required_async_completion(
+        work_item_id,
+        delegation_id="deleg-advisory-only",
+        success=True,
+        status="completed",
+        **identity,
+    )
+    assert late["dispatches"]["deleg-advisory-only"]["state"] == "cancelled"
+    assert ledger.get(work_item_id)["status"] == "blocked"
+    ad._reset_for_tests()
 
 
 @pytest.mark.asyncio

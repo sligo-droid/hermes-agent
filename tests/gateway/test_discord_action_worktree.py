@@ -563,8 +563,31 @@ def _direct_closeout_runner(
         item["closeout"]["status"] = "waiting_for_ci"
 
     class Ledger:
+        checkpoint = None
+
         def get(self, work_id):
             return item if work_id == item["id"] else None
+
+        def record_required_async_checkpoint(self, work_id, **kwargs):
+            incoming = {
+                key: kwargs[key]
+                for key in (
+                    "parent_sha",
+                    "tree_sha",
+                    "message",
+                    "repository_root",
+                    "workspace_path",
+                )
+            }
+            if kwargs.get("committed_head_sha"):
+                incoming["committed_head_sha"] = kwargs["committed_head_sha"]
+            if self.checkpoint and self.checkpoint.get("committed_head_sha"):
+                incoming.setdefault(
+                    "committed_head_sha",
+                    self.checkpoint["committed_head_sha"],
+                )
+            self.checkpoint = incoming
+            return {"checkpoint": dict(incoming)}
 
         def activate_closeout(self, work_id, state, *, expected_revision):
             captured.update(
@@ -873,7 +896,7 @@ def test_direct_closeout_activates_clean_verified_exact_head(
     assert notifications == ["work-1"]
 
 
-def _required_closeout_state(head_sha: str) -> dict:
+def _required_closeout_state(head_sha: str, repo: Path) -> dict:
     return {
         "dispatches": {
             "deleg-required": {
@@ -881,14 +904,86 @@ def _required_closeout_state(head_sha: str) -> dict:
                 "completed_at": 1.0,
                 "evidence": {
                     "head_sha": head_sha,
+                    "base_sha": head_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["allowed"],
                     "scope_check": {
                         "clean": True,
                         "out_of_scope_files": [],
+                        "scope_paths": ["allowed"],
                     },
                 },
             }
         }
     }
+
+
+def _durable_required_closeout_runner(
+    tmp_path: Path,
+    workspace: Path,
+    *,
+    base_sha: str,
+    scope_paths: list[str],
+) -> tuple[gateway_run.GatewayRunner, GatewayWorkLedger, str]:
+    ledger = GatewayWorkLedger(tmp_path / "durable-required-closeout.json")
+    event = MessageEvent(
+        text="implement the scoped change",
+        source=_source(workspace),
+        message_id="durable-required-closeout",
+    )
+    session_key = "agent:main:discord:thread:thread-123"
+    item = ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=7,
+        owner_pid=os.getpid(),
+        process_epoch="checkpoint-test",
+    )
+    identity = {
+        "generation": 7,
+        "attempt_id": "checkpoint-test:7",
+        "attempt_order": 10,
+    }
+    assert ledger.begin_required_async_attempt(item["id"], **identity)
+    assert ledger.register_required_async_dispatch(
+        item["id"],
+        delegation_id="worker-checkpoint",
+        owner_pid=os.getpid(),
+        process_epoch="checkpoint-test",
+        scope_paths=scope_paths,
+        **identity,
+    )
+    assert ledger.record_required_async_completion(
+        item["id"],
+        delegation_id="worker-checkpoint",
+        success=True,
+        status="completed",
+        evidence={
+            "base_sha": base_sha,
+            "worker_cwd": str(workspace),
+            "scope_paths": scope_paths,
+            "scope_check": {"clean": True, "scope_paths": scope_paths},
+        },
+        **identity,
+    )
+    assert ledger.seal_required_async_attempt(item["id"], **identity)
+    assert ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path=str(workspace),
+        source="direct",
+        mode="enforce",
+        policy={"require_local_verification": True},
+    )
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = ledger
+    runner.trusted_closeout_watcher = SimpleNamespace(notify=lambda _work_id: None)
+    return runner, ledger, item["id"]
 
 
 def test_required_closeout_activates_clean_matching_host_head(tmp_path, monkeypatch):
@@ -904,7 +999,7 @@ def test_required_closeout_activates_clean_matching_host_head(tmp_path, monkeypa
     activated, route = runner._activate_required_async_closeout(
         "work-1",
         runner.work_ledger.get("work-1"),
-        _required_closeout_state(head_sha),
+        _required_closeout_state(head_sha, repo),
     )
 
     assert (activated, route) == (True, "closeout")
@@ -927,12 +1022,12 @@ def test_required_closeout_rejects_mismatched_host_head(tmp_path, monkeypatch):
     activated, route = runner._activate_required_async_closeout(
         "work-1",
         runner.work_ledger.get("work-1"),
-        _required_closeout_state("a" * 40),
+        _required_closeout_state("a" * 40, repo),
     )
 
     assert (activated, route) == (
         False,
-        "workspace_head_not_clean_or_verified",
+        "checkpoint_base_head_moved",
     )
     assert captured == {}
     assert notifications == []
@@ -952,12 +1047,12 @@ def test_required_closeout_rejects_dirty_host_workspace(tmp_path, monkeypatch):
     activated, route = runner._activate_required_async_closeout(
         "work-1",
         runner.work_ledger.get("work-1"),
-        _required_closeout_state(head_sha),
+        _required_closeout_state(head_sha, repo),
     )
 
     assert (activated, route) == (
         False,
-        "workspace_head_not_clean_or_verified",
+        "checkpoint_changed_paths_out_of_scope",
     )
     assert captured == {}
     assert notifications == []
@@ -1081,6 +1176,277 @@ def test_required_closeout_refuses_checkpoint_from_dirty_baseline(tmp_path, monk
     assert (activated, route) == (False, "checkpoint_baseline_was_dirty")
     assert captured == {}
     assert notifications == []
+
+
+def test_required_closeout_replays_exact_checkpoint_after_activation_crash(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runner, ledger, work_id = _durable_required_closeout_runner(
+        tmp_path,
+        repo,
+        base_sha=base_sha,
+        scope_paths=["src"],
+    )
+    state = ledger.required_async_completion_state(work_id)
+    item = ledger.get(work_id)
+    original_activate = runner._activate_closeout_at_verified_head
+    monkeypatch.setattr(
+        runner,
+        "_activate_closeout_at_verified_head",
+        MagicMock(side_effect=RuntimeError("crash after checkpoint commit")),
+    )
+
+    with pytest.raises(RuntimeError, match="crash after checkpoint commit"):
+        runner._activate_required_async_closeout(work_id, item, state)
+
+    checkpoint_head = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    assert checkpoint_head != base_sha
+    persisted = ledger.required_async_completion_state(work_id)
+    assert persisted["checkpoint"]["parent_sha"] == base_sha
+    assert persisted["checkpoint"]["committed_head_sha"] == checkpoint_head
+
+    restarted = object.__new__(gateway_run.GatewayRunner)
+    restarted.work_ledger = ledger
+    restarted.trusted_closeout_watcher = SimpleNamespace(notify=lambda _work_id: None)
+    monkeypatch.setattr(
+        restarted,
+        "_activate_closeout_at_verified_head",
+        original_activate,
+    )
+    activated, route = restarted._activate_required_async_closeout(
+        work_id,
+        ledger.get(work_id),
+        persisted,
+    )
+
+    assert (activated, route) == (True, "closeout")
+    assert ledger.get(work_id)["closeout_authoritative"] is True
+
+
+def test_required_closeout_rejects_worker_created_clean_commit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "worker.py").write_text("WORKER = True\n", encoding="utf-8")
+    _run(repo, "add", "src/worker.py")
+    _run(repo, "commit", "-m", "worker-created commit")
+    runner, captured, notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+
+    assert runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    ) == (False, "checkpoint_base_head_moved")
+    assert captured == {}
+    assert notifications == []
+
+
+def test_required_closeout_exact_staging_handles_delete_and_rename(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "src").mkdir()
+    (repo / "src" / "delete.py").write_text("DELETE = True\n", encoding="utf-8")
+    (repo / "src" / "old.py").write_text("OLD = True\n", encoding="utf-8")
+    _run(repo, "add", "src")
+    _run(repo, "commit", "-m", "add scoped files")
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src" / "delete.py").unlink()
+    (repo / "src" / "old.py").rename(repo / "src" / "renamed.py")
+    runner, _captured, _notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+
+    assert runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    ) == (True, "closeout")
+    assert not (repo / "src" / "delete.py").exists()
+    assert not (repo / "src" / "old.py").exists()
+    assert (repo / "src" / "renamed.py").exists()
+    assert _run(repo, "status", "--porcelain").stdout == ""
+
+
+def test_required_closeout_fences_concurrent_out_of_scope_staging(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runner, captured, notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+    original_run = subprocess.run
+    injected = False
+
+    def racing_run(*args, **kwargs):
+        nonlocal injected
+        result = original_run(*args, **kwargs)
+        command = args[0] if args else kwargs.get("args")
+        if (
+            not injected
+            and isinstance(command, list)
+            and command[:3] == ["git", "add", "-A"]
+        ):
+            injected = True
+            (repo / "outside.txt").write_text("concurrent\n", encoding="utf-8")
+            original_run(
+                ["git", "add", "outside.txt"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        return result
+
+    monkeypatch.setattr(subprocess, "run", racing_run)
+
+    assert runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    ) == (False, "checkpoint_workspace_changed_after_stage")
+    assert _run(repo, "rev-parse", "HEAD").stdout.strip() == base_sha
+    assert "outside.txt" in _run(repo, "diff", "--cached", "--name-only").stdout
+    assert captured == {}
+    assert notifications == []
+
+
+def test_required_closeout_disables_hooks_and_commit_signing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "src").mkdir()
+    (repo / "src" / "parser.py").write_text("VALUE = 1\n", encoding="utf-8")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\nprintf 'ran\\n' > hook-ran.txt\ngit add hook-ran.txt\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    _run(repo, "config", "commit.gpgSign", "true")
+    _run(repo, "config", "user.signingkey", "definitely-missing")
+    _run(repo, "config", "gpg.program", "/bin/false")
+    runner, _captured, _notifications = _direct_closeout_runner(repo, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(repo),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+
+    assert runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    ) == (True, "closeout")
+    assert not (repo / "hook-ran.txt").exists()
+    assert _run(repo, "status", "--porcelain").stdout == ""
+
+
+def test_required_closeout_nested_workspace_uses_git_toplevel(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    nested = repo / "packages" / "app"
+    nested.mkdir(parents=True)
+    (nested / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+    _run(repo, "add", "packages/app/baseline.txt")
+    _run(repo, "commit", "-m", "add nested workspace")
+    base_sha = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    (nested / "src").mkdir()
+    (nested / "src" / "app.py").write_text("READY = True\n", encoding="utf-8")
+    runner, captured, notifications = _direct_closeout_runner(nested, mode="enforce")
+    state = {
+        "dispatches": {
+            "worker-a": {
+                "required": True,
+                "completed_at": 1.0,
+                "evidence": {
+                    "base_sha": base_sha,
+                    "worker_cwd": str(nested),
+                    "scope_paths": ["src"],
+                    "scope_check": {"clean": True, "scope_paths": ["src"]},
+                },
+            }
+        }
+    }
+
+    assert runner._activate_required_async_closeout(
+        "work-1",
+        runner.work_ledger.get("work-1"),
+        state,
+    ) == (True, "closeout")
+    assert captured["state"]["local_verification"]["status"] == "passed"
+    assert _run(repo, "status", "--porcelain").stdout == ""
+    assert notifications == ["work-1"]
 
 
 def test_direct_closeout_accepts_git_toplevel_for_nested_workspace(

@@ -44,7 +44,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from contextlib import contextmanager as _contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime
 from typing import Dict, Optional, Any, List, Union
 
@@ -7980,22 +7980,32 @@ class GatewayRunner:
             ):
                 return False, "parallel_merge_incomplete"
         workspace = str(closeout["workspace"].get("path") or "").strip()
-        latest_evidence = (
-            rows[-1].get("evidence")
-            if rows and isinstance(rows[-1].get("evidence"), dict)
-            else {}
-        )
-        verified_head = str(latest_evidence.get("head_sha") or "").strip().lower()
         if not rows or not workspace:
             return False, "missing_dispatch_evidence"
-        if not verified_head:
-            verified_head, checkpoint_reason = self._checkpoint_required_async_workspace(
-                work_id,
-                rows,
-                workspace,
+        try:
+            import subprocess
+
+            top_level = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=Path(workspace).expanduser().resolve(strict=False),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
             )
-            if not verified_head:
-                return False, checkpoint_reason
+        except Exception:
+            return False, "checkpoint_repository_root_failed"
+        repository_root = str(top_level.stdout or "").strip()
+        if top_level.returncode != 0 or not repository_root:
+            return False, "checkpoint_repository_root_failed"
+        verified_head, checkpoint_reason = self._checkpoint_required_async_workspace(
+            work_id,
+            rows,
+            workspace,
+            required_state,
+        )
+        if not verified_head:
+            return False, checkpoint_reason
 
         visual_result: dict[str, Any] = {}
         if closeout["policy"]["require_visual_qa"]:
@@ -8018,7 +8028,7 @@ class GatewayRunner:
 
         activated = self._activate_closeout_at_verified_head(
             work_id,
-            repository_root=workspace,
+            repository_root=repository_root,
             verified_head_sha=verified_head,
             visual_result=visual_result,
         )
@@ -8027,11 +8037,12 @@ class GatewayRunner:
             "workspace_head_not_clean_or_verified",
         )
 
-    @staticmethod
     def _checkpoint_required_async_workspace(
+        self,
         work_id: str,
         rows: list[dict[str, Any]],
         workspace: str,
+        required_state: dict[str, Any],
     ) -> tuple[str, str]:
         """Create one trusted local checkpoint for successful async mutation.
 
@@ -8043,9 +8054,47 @@ class GatewayRunner:
 
         import subprocess
 
-        root = Path(str(workspace or "")).expanduser().resolve(strict=False)
-        if not root.is_dir():
+        workspace_root = Path(str(workspace or "")).expanduser().resolve(strict=False)
+        if not workspace_root.is_dir():
             return "", "checkpoint_workspace_missing"
+
+        def run_git(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            timeout: float = 30.0,
+            text: bool = True,
+        ) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", *args],
+                cwd=cwd or repository_root,
+                text=text,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+
+        top_level = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=workspace_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        if top_level.returncode != 0:
+            return "", "checkpoint_repository_root_failed"
+        repository_root = Path(str(top_level.stdout or "").strip()).resolve(strict=False)
+        if not repository_root.is_dir():
+            return "", "checkpoint_repository_root_failed"
+        try:
+            workspace_prefix = workspace_root.relative_to(repository_root).as_posix()
+        except ValueError:
+            return "", "checkpoint_workspace_outside_repository"
+        workspace_prefix = "" if workspace_prefix == "." else workspace_prefix.strip("/")
+
         base_shas: set[str] = set()
         allowed_prefixes: list[str] = []
         for row in rows:
@@ -8073,50 +8122,132 @@ class GatewayRunner:
                 worker_prefix = ""
             else:
                 worker_cwd = Path(
-                    str(evidence.get("worker_cwd") or root)
+                    str(evidence.get("worker_cwd") or workspace_root)
                 ).expanduser().resolve(strict=False)
                 try:
-                    worker_prefix = worker_cwd.relative_to(root).as_posix().strip(".")
+                    worker_prefix = worker_cwd.relative_to(workspace_root).as_posix()
+                    if worker_prefix == ".":
+                        worker_prefix = ""
                 except ValueError:
                     return "", "checkpoint_worker_outside_workspace"
             scopes = evidence.get("scope_paths") or scope_check.get("scope_paths") or []
             if not scopes:
-                allowed_prefixes.append(worker_prefix.strip("/"))
+                return "", "checkpoint_scope_evidence_missing"
             for scope in scopes:
-                normalized = str(scope or "").replace("\\", "/").strip("/")
+                raw_scope = str(scope or "").replace("\\", "/").strip()
+                scope_path = PurePosixPath(raw_scope)
+                if (
+                    not raw_scope
+                    or scope_path.is_absolute()
+                    or ".." in scope_path.parts
+                ):
+                    return "", "checkpoint_scope_evidence_invalid"
+                normalized = "" if str(scope_path) == "." else str(scope_path).strip("/")
                 prefix = "/".join(
-                    part for part in (worker_prefix.strip("/"), normalized) if part
+                    part
+                    for part in (
+                        workspace_prefix,
+                        worker_prefix.strip("/"),
+                        normalized,
+                    )
+                    if part
                 )
                 allowed_prefixes.append(prefix)
         if len(base_shas) != 1:
             return "", "checkpoint_base_head_conflict"
-
-        def run_git(args: list[str], *, timeout: float = 30.0) -> subprocess.CompletedProcess:
-            return subprocess.run(
-                ["git", *args],
-                cwd=root,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                check=False,
-            )
-
+        base_sha = next(iter(base_shas))
+        message = f"Hermes async checkpoint {str(work_id or '')}"
         head = run_git(["rev-parse", "--verify", "HEAD"])
         current_head = str(head.stdout or "").strip().lower()
-        if head.returncode != 0 or current_head not in base_shas:
-            return "", "checkpoint_base_head_moved"
-        status = run_git(["status", "--porcelain=v1", "--untracked-files=all"])
-        if status.returncode != 0:
+        if head.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", current_head):
+            return "", "checkpoint_head_failed"
+
+        def status_snapshot() -> tuple[bytes, list[tuple[str, tuple[str, ...]]]] | None:
+            result = run_git(
+                ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                text=False,
+            )
+            if result.returncode != 0:
+                return None
+            raw = bytes(result.stdout or b"")
+            parts = raw.split(b"\0")
+            entries: list[tuple[str, tuple[str, ...]]] = []
+            index = 0
+            while index < len(parts):
+                record = parts[index]
+                index += 1
+                if not record:
+                    continue
+                if len(record) < 4:
+                    return None
+                status_code = record[:2].decode("ascii", "replace")
+                first = record[3:].decode("utf-8", "surrogateescape").replace("\\", "/")
+                paths = [first.strip("/")]
+                if "R" in status_code or "C" in status_code:
+                    if index >= len(parts) or not parts[index]:
+                        return None
+                    paths.append(
+                        parts[index]
+                        .decode("utf-8", "surrogateescape")
+                        .replace("\\", "/")
+                        .strip("/")
+                    )
+                    index += 1
+                if not all(paths):
+                    return None
+                entries.append((status_code, tuple(paths)))
+            return raw, entries
+
+        initial_status = status_snapshot()
+        if initial_status is None:
             return "", "checkpoint_status_failed"
-        changed_paths: list[str] = []
-        for line in str(status.stdout or "").splitlines():
-            path = line[3:].strip() if len(line) >= 4 else ""
-            if " -> " in path:
-                path = path.rsplit(" -> ", 1)[-1]
-            if path:
-                changed_paths.append(path.replace("\\", "/").strip("/"))
+        _initial_raw, initial_entries = initial_status
+        changed_paths = sorted(
+            {path for _status_code, paths in initial_entries for path in paths}
+        )
+
+        checkpoint = (
+            required_state.get("checkpoint")
+            if isinstance(required_state.get("checkpoint"), dict)
+            else None
+        )
+        if current_head != base_sha:
+            if changed_paths:
+                return "", "checkpoint_base_head_moved"
+            if not isinstance(checkpoint, dict):
+                return "", "checkpoint_base_head_moved"
+            if (
+                str(checkpoint.get("parent_sha") or "") != base_sha
+                or str(checkpoint.get("message") or "") != message
+                or Path(str(checkpoint.get("repository_root") or "")).resolve(strict=False)
+                != repository_root
+                or Path(str(checkpoint.get("workspace_path") or "")).resolve(strict=False)
+                != workspace_root
+                or (
+                    checkpoint.get("committed_head_sha")
+                    and str(checkpoint.get("committed_head_sha") or "") != current_head
+                )
+            ):
+                return "", "checkpoint_identity_mismatch"
+            commit_identity = run_git(
+                ["show", "-s", "--format=%P%x00%T%x00%B", current_head]
+            )
+            identity_parts = str(commit_identity.stdout or "").split("\0", 2)
+            if (
+                commit_identity.returncode != 0
+                or len(identity_parts) != 3
+                or identity_parts[0].strip() != base_sha
+                or identity_parts[1].strip() != str(checkpoint.get("tree_sha") or "")
+                or identity_parts[2].rstrip("\n") != message
+            ):
+                return "", "checkpoint_identity_mismatch"
+            return current_head, ""
+
         if not changed_paths:
+            if isinstance(checkpoint, dict) and str(checkpoint.get("tree_sha") or ""):
+                base_tree = run_git(["rev-parse", f"{base_sha}^{{tree}}"])
+                if str(base_tree.stdout or "").strip() != str(checkpoint.get("tree_sha") or ""):
+                    return "", "checkpoint_intent_worktree_missing"
             return current_head, ""
 
         def allowed(path: str) -> bool:
@@ -8131,16 +8262,130 @@ class GatewayRunner:
             return "", "checkpoint_changed_paths_out_of_scope"
         if run_git(["diff", "--check"]).returncode != 0:
             return "", "checkpoint_diff_check_failed"
-        added = run_git(["add", "-A", "--", "."])
+
+        before_stage = status_snapshot()
+        head_before_stage = run_git(["rev-parse", "--verify", "HEAD"])
+        if (
+            before_stage is None
+            or sorted(
+                {
+                    path
+                    for _status_code, paths in before_stage[1]
+                    for path in paths
+                }
+            )
+            != changed_paths
+            or str(head_before_stage.stdout or "").strip().lower() != base_sha
+        ):
+            return "", "checkpoint_workspace_changed_before_stage"
+
+        literal_pathspecs = [f":(literal){path}" for path in changed_paths]
+        added = run_git(["add", "-A", "--", *literal_pathspecs])
         if added.returncode != 0:
             return "", "checkpoint_stage_failed"
+
+        def unstage_validated_paths() -> None:
+            run_git(["reset", "--mixed", base_sha, "--", *literal_pathspecs])
+
+        staged_status = status_snapshot()
+        staged_paths = (
+            sorted(
+                {
+                    path
+                    for _status_code, paths in staged_status[1]
+                    for path in paths
+                }
+            )
+            if staged_status is not None
+            else []
+        )
+        if (
+            staged_status is None
+            or staged_paths != changed_paths
+            or any(status_code[1] != " " for status_code, _paths in staged_status[1])
+            or run_git(["diff", "--quiet", "--"]).returncode != 0
+            or str(run_git(["rev-parse", "--verify", "HEAD"]).stdout or "").strip().lower()
+            != base_sha
+        ):
+            unstage_validated_paths()
+            return "", "checkpoint_workspace_changed_after_stage"
         if run_git(["diff", "--cached", "--check"]).returncode != 0:
-            run_git(["reset", "--mixed", "HEAD", "--"])
+            unstage_validated_paths()
             return "", "checkpoint_staged_diff_check_failed"
-        message = f"Hermes async work {str(work_id or '')[:12]}"
-        committed = run_git(["commit", "-m", message], timeout=60.0)
+        tree = run_git(["write-tree"])
+        expected_tree = str(tree.stdout or "").strip().lower()
+        if tree.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", expected_tree):
+            unstage_validated_paths()
+            return "", "checkpoint_tree_failed"
+
+        identity = self._required_async_identity(required_state)
+        persisted = self._ledger().record_required_async_checkpoint(
+            work_id,
+            **identity,
+            parent_sha=base_sha,
+            tree_sha=expected_tree,
+            message=message,
+            repository_root=str(repository_root),
+            workspace_path=str(workspace_root),
+        )
+        persisted_checkpoint = (
+            persisted.get("checkpoint") if isinstance(persisted, dict) else None
+        )
+        expected_checkpoint = {
+            "parent_sha": base_sha,
+            "tree_sha": expected_tree,
+            "message": message,
+            "repository_root": str(repository_root),
+            "workspace_path": str(workspace_root),
+        }
+        if (
+            not isinstance(persisted_checkpoint, dict)
+            or any(
+                persisted_checkpoint.get(key) != value
+                for key, value in expected_checkpoint.items()
+            )
+        ):
+            unstage_validated_paths()
+            return "", "checkpoint_intent_persistence_failed"
+
+        precommit_status = status_snapshot()
+        precommit_tree = run_git(["write-tree"])
+        if (
+            precommit_status is None
+            or sorted(
+                {
+                    path
+                    for _status_code, paths in precommit_status[1]
+                    for path in paths
+                }
+            )
+            != changed_paths
+            or any(status_code[1] != " " for status_code, _paths in precommit_status[1])
+            or str(precommit_tree.stdout or "").strip().lower() != expected_tree
+            or str(run_git(["rev-parse", "--verify", "HEAD"]).stdout or "").strip().lower()
+            != base_sha
+        ):
+            unstage_validated_paths()
+            return "", "checkpoint_workspace_changed_before_commit"
+
+        committed = run_git(
+            [
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "tag.gpgSign=false",
+                "commit",
+                "--no-verify",
+                "--no-gpg-sign",
+                "-m",
+                message,
+            ],
+            timeout=60.0,
+        )
         if committed.returncode != 0:
-            run_git(["reset", "--mixed", "HEAD", "--"])
+            unstage_validated_paths()
             logger.warning(
                 "Trusted async checkpoint commit failed for %s: %s",
                 work_id,
@@ -8148,17 +8393,36 @@ class GatewayRunner:
             )
             return "", "checkpoint_commit_failed"
         checked = run_git(["diff", "--check"])
-        clean = run_git(["status", "--porcelain=v1", "--untracked-files=all"])
+        clean = status_snapshot()
         final_head = run_git(["rev-parse", "--verify", "HEAD"])
         verified_head = str(final_head.stdout or "").strip().lower()
+        commit_identity = run_git(
+            ["show", "-s", "--format=%P%x00%T%x00%B", verified_head]
+        )
+        identity_parts = str(commit_identity.stdout or "").split("\0", 2)
         if (
             checked.returncode != 0
-            or clean.returncode != 0
-            or str(clean.stdout or "").strip()
+            or clean is None
+            or bool(clean[1])
             or final_head.returncode != 0
             or not re.fullmatch(r"[0-9a-f]{40}", verified_head)
+            or commit_identity.returncode != 0
+            or len(identity_parts) != 3
+            or identity_parts[0].strip() != base_sha
+            or identity_parts[1].strip() != expected_tree
+            or identity_parts[2].rstrip("\n") != message
         ):
             return "", "checkpoint_post_commit_verification_failed"
+        self._ledger().record_required_async_checkpoint(
+            work_id,
+            **identity,
+            parent_sha=base_sha,
+            tree_sha=expected_tree,
+            message=message,
+            repository_root=str(repository_root),
+            workspace_path=str(workspace_root),
+            committed_head_sha=verified_head,
+        )
         return verified_head, ""
 
     async def _reconcile_required_async_item(
@@ -23370,7 +23634,7 @@ class GatewayRunner:
             return 0
 
     def _stop_required_async_for_session(self, session_key: str) -> int:
-        """Seal and durably cancel required coding work for explicit /stop."""
+        """Seal and fence all durable attempt work for explicit ``/stop``."""
 
         if not session_key:
             return 0
@@ -23398,19 +23662,55 @@ class GatewayRunner:
                 )
                 if not isinstance(sealed, dict):
                     continue
+                cancelled_ids: set[str] = set()
+                for delegation_id, dispatch in dict(
+                    sealed.get("dispatches") or {}
+                ).items():
+                    if (
+                        not isinstance(dispatch, dict)
+                        or dispatch.get("state") not in {"registered", "running"}
+                    ):
+                        continue
+                    cancelled = ledger.cancel_required_async_dispatch(
+                        work_id,
+                        delegation_id=str(delegation_id),
+                        **identity,
+                        reason="session_stop",
+                        status="cancelled",
+                    )
+                    cancelled_dispatch = (
+                        cancelled.get("dispatches", {}).get(str(delegation_id))
+                        if isinstance(cancelled, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(cancelled_dispatch, dict)
+                        and cancelled_dispatch.get("state") == "cancelled"
+                    ):
+                        cancelled_ids.add(str(delegation_id))
                 result = interrupt_session(
                     session_key,
-                    kind="coding_worker",
+                    kind=None,
                     origin_work_item_id=work_id,
                     attempt_id=str(identity.get("attempt_id") or "") or None,
                     reason="session_stop",
                 )
-                stopped += int(result.get("matched") or 0)
+                stopped += max(len(cancelled_ids), int(result.get("matched") or 0))
                 refreshed = ledger.required_async_completion_state(work_id)
+                stop_failed = bool(
+                    isinstance(refreshed, dict)
+                    and (
+                        refreshed.get("failed")
+                        or (
+                            not refreshed.get("has_required")
+                            and int(refreshed.get("advisory_failed") or 0) > 0
+                        )
+                    )
+                )
                 if (
                     isinstance(refreshed, dict)
                     and refreshed.get("ready_to_reconcile") is True
-                    and not refreshed.get("failed")
+                    and stop_failed
                 ):
                     reconciliation_id = self._required_async_reconciliation_id(
                         work_id,
@@ -23420,23 +23720,31 @@ class GatewayRunner:
                         work_id,
                         **self._required_async_identity(refreshed),
                         final_response=(
-                            "Required coding work was explicitly stopped before "
+                            "Background attempt work was explicitly stopped before "
                             "its result was reconciled and will not be resumed automatically."
                         ),
-                        reason="required_async_cancelled",
+                        reason=(
+                            "required_async_cancelled"
+                            if refreshed.get("has_required")
+                            else "advisory_async_cancelled"
+                        ),
                         reconciliation_id=reconciliation_id,
                     )
                     if isinstance(finalized, dict):
-                        stopped += 1
-                        task = asyncio.create_task(
-                            self._resume_finished_discord_work_item(finalized)
-                        )
-                        background = self.__dict__.setdefault(
-                            "_background_tasks",
-                            set(),
-                        )
-                        background.add(task)
-                        task.add_done_callback(background.discard)
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = None
+                        if loop is not None:
+                            task = loop.create_task(
+                                self._resume_finished_discord_work_item(finalized)
+                            )
+                            background = self.__dict__.setdefault(
+                                "_background_tasks",
+                                set(),
+                            )
+                            background.add(task)
+                            task.add_done_callback(background.discard)
             if stopped:
                 self.__dict__.setdefault(
                     "_required_async_reconcile_event",
@@ -23445,7 +23753,7 @@ class GatewayRunner:
             return stopped
         except Exception:
             logger.exception(
-                "Failed to stop required coding work for session %s",
+                "Failed to stop durable attempt work for session %s",
                 session_key,
             )
             return 0

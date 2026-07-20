@@ -3438,6 +3438,27 @@ def delegate_coding_task(
     _release_reservation_on_finish: bool = False,
 ) -> str:
     """Reserve mutation ownership, then use the normal coding-worker path."""
+    durable_background_attempt = bool(
+        background
+        and parent_agent is not None
+        and str(
+            getattr(parent_agent, "_origin_work_item_id", "")
+            or getattr(parent_agent, "work_item_id", "")
+            or ""
+        ).strip()
+        and getattr(parent_agent, "_origin_work_item_generation", None)
+        and str(
+            getattr(parent_agent, "_origin_work_item_attempt_id", "") or ""
+        ).strip()
+        and getattr(parent_agent, "_origin_work_item_attempt_order", None)
+    )
+    if durable_background_attempt and (
+        not isinstance(scope_paths, list) or not scope_paths
+    ):
+        return tool_error(
+            "Durable background coding work requires non-empty scope_paths "
+            "before the worker can start."
+        )
     owns_reservation = _reservation_id is None
     reservation_id = _reservation_id
     if owns_reservation:

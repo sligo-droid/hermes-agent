@@ -307,7 +307,8 @@ def _is_durable_attempt_dispatch(record: Dict[str, Any]) -> bool:
 
 
 def _is_required_coding_dispatch(record: Dict[str, Any]) -> bool:
-    """Whether this durable dispatch gates the originating attempt."""
+    """Whether this durable dispatch must be running before coding starts."""
+
     return bool(
         _is_durable_attempt_dispatch(record)
         and record.get("kind") == "coding_worker"
@@ -1466,20 +1467,21 @@ def interrupt_all(reason: str = "shutdown") -> int:
 def interrupt_session(
     session_key: str,
     *,
-    kind: str = "coding_worker",
+    kind: Optional[str] = "coding_worker",
     origin_work_item_id: Optional[str] = None,
     attempt_id: Optional[str] = None,
     reason: str = "session_stop",
 ) -> Dict[str, Any]:
     """Fence and signal only matching background work for one session.
 
-    Required Discord coding dispatches are durably cancelled before their
-    interrupt callback is invoked, so a late successful worker result cannot
-    repaint the cancellation. The returned diagnostics are deliberately
-    bounded for gateway control-command responses.
+    Durable Discord attempt dispatches are cancelled before their interrupt
+    callback is invoked, so late coding or advisory results cannot repaint the
+    cancellation. Pass ``kind=None`` to fence every durable kind for the
+    attempt. The returned diagnostics are deliberately bounded for gateway
+    control-command responses.
     """
     normalized_session = str(session_key or "")
-    normalized_kind = str(kind or "coding_worker")
+    normalized_kind = str(kind or "").strip()
     normalized_work_id = str(origin_work_item_id or "").strip()
     normalized_attempt_id = str(attempt_id or "").strip()
     with _records_lock:
@@ -1488,7 +1490,10 @@ def interrupt_session(
             for record in _records.values()
             if record.get("status") == "running"
             and record.get("session_key", "") == normalized_session
-            and record.get("kind", "delegation") == normalized_kind
+            and (
+                not normalized_kind
+                or record.get("kind", "delegation") == normalized_kind
+            )
             and (
                 not normalized_work_id
                 or str(record.get("origin_work_item_id") or "")
@@ -1507,7 +1512,7 @@ def interrupt_session(
     for target in targets:
         delegation_id = str(target.get("delegation_id") or "")
         durable_ok = True
-        if _is_required_coding_dispatch(target):
+        if _is_durable_attempt_dispatch(target):
             try:
                 cancelled = _required_async_ledger().cancel_required_async_dispatch(
                     str(target["origin_work_item_id"]),

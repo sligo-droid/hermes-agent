@@ -58,8 +58,8 @@ _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 _MAX_CONFIRMED_MESSAGE_IDS = 128
 _MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
 _MAX_REQUIRED_ASYNC_COMPLETIONS = 64
-_REQUIRED_ASYNC_SCHEMA_VERSION = 3
-_SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS = frozenset({2, 3})
+_REQUIRED_ASYNC_SCHEMA_VERSION = 4
+_SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS = frozenset({2, 3, 4})
 _REQUIRED_ASYNC_DISPATCH_STATES = frozenset(
     {"registered", "running", "terminal", "cancelled", "outcome_unknown"}
 )
@@ -68,6 +68,7 @@ _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT = 1000
 _MAX_REQUIRED_ASYNC_SCOPE_PATHS = 32
 _MAX_REQUIRED_ASYNC_TEST_REFS = 16
 _MAX_ASYNC_ADVISORY_RESULTS = 16
+_REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT = 1000
 _CLOSEOUT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CLOSEOUT_VISUAL_STATUSES = frozenset(
     {"passed", "failed", "blocked", "uncertain", "missing"}
@@ -605,6 +606,50 @@ def _bounded_required_async_evidence(value: Any) -> dict[str, Any]:
     return evidence
 
 
+def _bounded_required_async_checkpoint(
+    value: Any,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Normalize one trusted checkpoint intent without accepting partial identity."""
+
+    if value is None:
+        return None, False
+    if not isinstance(value, Mapping):
+        return None, True
+    parent_sha = str(value.get("parent_sha") or "").strip().lower()
+    tree_sha = str(value.get("tree_sha") or "").strip().lower()
+    message = _bounded_required_async_text(value.get("message"))
+    repository_root = str(value.get("repository_root") or "").strip()[
+        :_REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT
+    ]
+    workspace_path = str(value.get("workspace_path") or "").strip()[
+        :_REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT
+    ]
+    committed_head_sha = str(value.get("committed_head_sha") or "").strip().lower()
+    malformed = bool(
+        not _CLOSEOUT_SHA_RE.fullmatch(parent_sha)
+        or not _CLOSEOUT_SHA_RE.fullmatch(tree_sha)
+        or not message
+        or not repository_root
+        or not workspace_path
+        or (
+            committed_head_sha
+            and not _CLOSEOUT_SHA_RE.fullmatch(committed_head_sha)
+        )
+    )
+    if malformed:
+        return None, True
+    checkpoint = {
+        "parent_sha": parent_sha,
+        "tree_sha": tree_sha,
+        "message": message,
+        "repository_root": repository_root,
+        "workspace_path": workspace_path,
+    }
+    if committed_head_sha:
+        checkpoint["committed_head_sha"] = committed_head_sha
+    return checkpoint, False
+
+
 def _normalized_required_async_dispatch(
     raw_dispatch: Any,
     *,
@@ -689,6 +734,11 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
             dispatch, dispatch_malformed = _normalized_required_async_dispatch(raw_dispatch)
             malformed = malformed or dispatch_malformed
             dispatches[normalized_id] = dispatch
+
+    checkpoint, checkpoint_malformed = _bounded_required_async_checkpoint(
+        raw.get("checkpoint")
+    )
+    malformed = malformed or checkpoint_malformed
 
     raw_outcomes = raw.get("outcomes") if isinstance(raw.get("outcomes"), dict) else {}
     if legacy or (raw_outcomes and not dispatches):
@@ -808,6 +858,7 @@ def _required_async_completion_state(item: Any) -> dict[str, Any]:
             raw.get("cancellation_reason")
         ),
         "dispatches": dispatches,
+        "checkpoint": checkpoint,
         "outcomes": outcomes,
         "pending_count": pending_count,
         "required_pending_count": required_pending_count,
@@ -886,6 +937,11 @@ def _required_async_payload(state: Mapping[str, Any]) -> dict[str, Any]:
         payload["cancellation_reason"] = cancellation_reason
     if state.get("sticky_failure") is True:
         payload["sticky_failure"] = True
+    checkpoint, checkpoint_malformed = _bounded_required_async_checkpoint(
+        state.get("checkpoint")
+    )
+    if checkpoint is not None and not checkpoint_malformed:
+        payload["checkpoint"] = checkpoint
     return payload
 
 
@@ -2107,6 +2163,70 @@ class GatewayWorkLedger:
             state,
             refresh_gate=True,
         )
+
+    @_locked_ledger_mutation
+    def record_required_async_checkpoint(
+        self,
+        work_id: str,
+        *,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        parent_sha: str,
+        tree_sha: str,
+        message: str,
+        repository_root: str,
+        workspace_path: str,
+        committed_head_sha: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist or complete the exact trusted checkpoint identity idempotently."""
+
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        if not state["sealed"] or not state["completion_terminal"]:
+            return None
+        incoming, malformed = _bounded_required_async_checkpoint(
+            {
+                "parent_sha": parent_sha,
+                "tree_sha": tree_sha,
+                "message": message,
+                "repository_root": repository_root,
+                "workspace_path": workspace_path,
+                "committed_head_sha": committed_head_sha,
+            }
+        )
+        if malformed or incoming is None:
+            return None
+        existing = state.get("checkpoint")
+        if isinstance(existing, dict):
+            identity_keys = (
+                "parent_sha",
+                "tree_sha",
+                "message",
+                "repository_root",
+                "workspace_path",
+            )
+            if any(existing.get(key) != incoming.get(key) for key in identity_keys):
+                return None
+            existing_head = str(existing.get("committed_head_sha") or "")
+            incoming_head = str(incoming.get("committed_head_sha") or "")
+            if existing_head and incoming_head and existing_head != incoming_head:
+                return None
+            if existing_head and not incoming_head:
+                incoming["committed_head_sha"] = existing_head
+            if existing == incoming:
+                return state
+        state["checkpoint"] = incoming
+        return self._persist_required_async_state(data, item, state)
 
     @_locked_ledger_mutation
     def mark_required_async_reconciled(

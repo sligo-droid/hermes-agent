@@ -630,6 +630,7 @@ def test_required_background_preflight_failure_is_durably_terminalized(
         cwt.delegate_coding_task(
             task="use missing cwd",
             cwd=str(tmp_path / "missing" / "repo"),
+            scope_paths=["src"],
             background=True,
             parent_agent=parent,
         )
@@ -641,6 +642,40 @@ def test_required_background_preflight_failure_is_durably_terminalized(
     assert completion["success"] is False
     assert completion["status"] == "preflight_failed"
     assert process_registry.completion_queue.empty()
+    _reset_background_state()
+
+
+@pytest.mark.parametrize("scope_paths", [None, []])
+def test_durable_background_worker_rejects_omitted_scopes_before_dispatch(
+    monkeypatch,
+    tmp_path,
+    scope_paths,
+):
+    _reset_background_state()
+    parent = _parent(tmp_path)
+    parent._origin_work_item_id = "discord-work"
+    parent._origin_work_item_generation = 4
+    parent._origin_work_item_attempt_id = "gateway-epoch:4"
+    parent._origin_work_item_attempt_order = 11
+    monkeypatch.setattr(
+        ad,
+        "_required_async_ledger",
+        lambda: (_ for _ in ()).throw(AssertionError("dispatch must not register")),
+    )
+    FakeSession.instances = []
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="mutate without a declared scope",
+            scope_paths=scope_paths,
+            background=True,
+            parent_agent=parent,
+        )
+    )
+
+    assert "requires non-empty scope_paths" in result["error"]
+    assert FakeSession.instances == []
+    assert ad.active_count() == 0
     _reset_background_state()
 
 
