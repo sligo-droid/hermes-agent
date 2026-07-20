@@ -261,7 +261,7 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert sent_embed.title == "Generating..."
     assert sent_embed.description is None
     fields = {field.name: field.value for field in sent_embed.fields}
-    assert fields["Status"] == "👀 In progress"
+    assert fields["Status"] == "⏳ In progress"
     assert fields["Branch"] == "[feature/summary](https://github.com/acme/hermes-project/tree/feature/summary)"
     assert "Feature Branch URL" not in fields
     assert all(field.name != "Generated Title" for field in sent_embed.fields)
@@ -435,7 +435,7 @@ async def test_feature_summary_adds_status_reaction_to_embed_message(
     assert handle is not None
     assert bool(handle["kanban_board"]) is expects_board
     message = handle["_message_obj"]
-    message.add_reaction.assert_awaited_once_with("👀")
+    message.add_reaction.assert_awaited_once_with("⏳")
 
 
 @pytest.mark.asyncio
@@ -1223,7 +1223,7 @@ async def test_foreman_goal_embed_posts_to_source_thread_and_hides_source_links(
     assert "Affected Task" not in fields
     assert "Discord Thread" not in fields
     assert fields["Foreman Kanban"] == "https://hermes.example.test/workers/foreman-abc"
-    sent_message.add_reaction.assert_awaited_once_with("👀")
+    sent_message.add_reaction.assert_awaited_once_with("⏳")
 
 
 @pytest.mark.asyncio
@@ -1281,8 +1281,8 @@ async def test_foreman_feature_summary_uses_source_task_state_over_done_board(ad
 
     assert synced == "source-active"
     active_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
-    assert active_fields["Status"] == "👀 In progress"
-    message.add_reaction.assert_awaited_once_with("👀")
+    assert active_fields["Status"] == "⏳ In progress"
+    message.add_reaction.assert_awaited_once_with("⏳")
 
     conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
     try:
@@ -1320,7 +1320,7 @@ def test_feature_summary_kanban_status_labels(adapter):
         status=adapter._feature_kanban_summary_status({"kanban_board": {"slug": "board"}}) or "Running",
     )
     active_fields = {field.name: field.value for field in active_embed.fields}
-    assert active_fields["Status"] == "👀 In progress"
+    assert active_fields["Status"] == "⏳ In progress"
 
     adapter._feature_kanban_reaction_state = MagicMock(return_value="running")
     running_embed = adapter._build_feature_summary_embed(
@@ -1402,7 +1402,7 @@ async def test_kanban_feature_summary_update_uses_board_snapshot(adapter, monkey
     edited_embed = message.edit.await_args.kwargs["embed"]
     fields = {field.name: field.value for field in edited_embed.fields}
     assert edited_embed.title == "Project Link Summary"
-    assert fields["Status"] == "👀 In progress"
+    assert fields["Status"] == "⏳ In progress"
     assert fields["Concise Outcome"] != "Pending"
     assert "Kanban" in fields["Concise Outcome"] or "ticket" in fields["Concise Outcome"]
     assert fields["Branch"] == "[discord/200](https://github.com/acme/hermes-project/tree/discord/200)"

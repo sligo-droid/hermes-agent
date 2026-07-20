@@ -2065,7 +2065,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return "❌ Failed"
         if lower in {"running", "working"}:
             return "⏳ Running"
-        return "👀 In progress"
+        return "⏳ In progress"
 
     def _summary_color(self, status: str):
         try:
@@ -2172,7 +2172,7 @@ class DiscordAdapter(BasePlatformAdapter):
     def _feature_kanban_reaction_emoji(self, state: Optional[str]) -> Optional[str]:
         return {
             "done": "✅",
-            "active": "👀",
+            "active": "⏳",
             "running": "⏳",
             "blocked": "❓",
             "errored": "❌",
@@ -2317,7 +2317,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return "❌"
         if lower in {"running", "working"}:
             return "⏳"
-        return "👀"
+        return "⏳"
 
     def _feature_summary_uses_kanban_reactions(self, handle: Optional[Dict[str, Any]]) -> bool:
         if not isinstance(handle, dict) or "kanban_board" not in handle:
