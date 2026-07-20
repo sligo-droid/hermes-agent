@@ -42,10 +42,26 @@ def _run(
 def _successful_check_rollup(value: Any) -> tuple[bool, int, list[dict[str, str]]]:
     if not isinstance(value, list) or not value:
         return False, 0, []
-    checks: list[dict[str, str]] = []
-    for raw in value:
+    latest: dict[tuple[str, str, str], tuple[tuple[str, int], dict[str, Any]]] = {}
+    for index, raw in enumerate(value):
         if not isinstance(raw, dict):
-            return False, len(checks), checks
+            return False, 0, []
+        kind = str(raw.get("__typename") or "")
+        name = str(raw.get("name") or raw.get("context") or kind or "check")[:160]
+        workflow = str(raw.get("workflowName") or "")[:160]
+        timestamps = [
+            str(raw.get(field) or "")
+            for field in ("completedAt", "startedAt")
+            if str(raw.get(field) or "") not in {"", "0001-01-01T00:00:00Z"}
+        ]
+        rank = (max(timestamps, default=""), index)
+        identity = (kind.casefold(), workflow.casefold(), name.casefold())
+        previous = latest.get(identity)
+        if previous is None or rank >= previous[0]:
+            latest[identity] = (rank, raw)
+
+    checks: list[dict[str, str]] = []
+    for _rank, raw in latest.values():
         kind = str(raw.get("__typename") or "")
         name = str(raw.get("name") or raw.get("context") or kind or "check")[:160]
         workflow = str(raw.get("workflowName") or "")[:160]

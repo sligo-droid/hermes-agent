@@ -76,6 +76,55 @@ def test_observer_adopts_only_exact_merged_green_pr(tmp_path):
     assert state["ci"]["total"] == 2
 
 
+def test_observer_uses_latest_check_run_after_rerun(tmp_path):
+    payload = {
+        "number": 1035,
+        "url": "https://github.com/sligo-labs/PID/pull/1035",
+        "state": "MERGED",
+        "headRefOid": HEAD,
+        "headRefName": "discord-action/pid-test",
+        "baseRefName": "main",
+        "mergeCommit": {"oid": MERGE},
+        "statusCheckRollup": [
+            {
+                "__typename": "CheckRun",
+                "workflowName": "PR Body Format",
+                "name": "pr body",
+                "startedAt": "2026-07-20T22:13:10Z",
+                "completedAt": "2026-07-20T22:13:32Z",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+            },
+            {
+                "__typename": "CheckRun",
+                "workflowName": "PR Body Format",
+                "name": "pr body",
+                "startedAt": "2026-07-20T22:14:27Z",
+                "completedAt": "2026-07-20T22:14:49Z",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+            },
+        ],
+    }
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
+        if args[1] == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, HEAD + "\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    state = observe_merged_direct_closeout(
+        _item(tmp_path),
+        "Done: https://github.com/sligo-labs/PID/pull/1035",
+        run=run,
+    )
+
+    assert state is not None
+    assert state["ci"]["status"] == "passed"
+    assert state["ci"]["total"] == 1
+
+
 def test_observer_rejects_unrelated_or_non_green_pr(tmp_path):
     assert observe_merged_direct_closeout(
         _item(tmp_path),
