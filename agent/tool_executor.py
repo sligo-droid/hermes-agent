@@ -900,14 +900,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     coding_batch_calls = [
         item for item in parsed_calls if item[1] == "delegate_coding_task"
     ]
-    all_batch_calls_are_coding = len(coding_batch_calls) == len(parsed_calls)
-    if len(coding_batch_calls) > 1 and (
-        all_batch_calls_are_coding
-        or all(
-            args.get("background") is True
-            for _tc, _name, args, _storage_args, _block_result, _blocked in coding_batch_calls
-        )
-    ):
+    mixed_coding_batch = bool(coding_batch_calls) and len(coding_batch_calls) < len(parsed_calls)
+    if len(coding_batch_calls) > 1 or mixed_coding_batch:
         parallel_base_cwd = _parallel_coding_base_cwd(agent)
         try:
             from tools.coding_worker_tool import _git_workspace_baseline

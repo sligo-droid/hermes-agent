@@ -1207,7 +1207,34 @@ def _is_explicitly_healthy_runtime_match(match: re.Match[str]) -> bool:
     return bool(healthy_state and zero_gap)
 
 
-def _incomplete_final_markers(text: str) -> list[str]:
+def _canonical_sync_explicitly_not_required(item: dict[str, Any]) -> bool:
+    """Return whether the persisted closeout contract opts out of local sync."""
+
+    closeout = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+    policy = closeout.get("policy") if isinstance(closeout.get("policy"), dict) else {}
+    requirements = (
+        policy.get("post_merge_requirements")
+        if isinstance(policy.get("post_merge_requirements"), dict)
+        else {}
+    )
+    return requirements.get("canonical_sync") is False
+
+
+def _is_canonical_checkout_only_gap(text: str, match: re.Match[str]) -> bool:
+    """Return whether a runtime-gap match concerns only the local checkout."""
+
+    context = text[max(0, match.start() - 120) : min(len(text), match.end() + 260)]
+    if not re.search(r"\bcanonical\s+checkout\b", context, flags=re.IGNORECASE):
+        return False
+    return not re.search(
+        r"\b(?:deployed|private|production|live)\s+runtime\b|"
+        r"\b(?:live|runtime|process)\s+pickup\b",
+        context,
+        flags=re.IGNORECASE,
+    )
+
+
+def _incomplete_final_markers(text: str, item: dict[str, Any] | None = None) -> list[str]:
     """Return incomplete-delivery markers while filtering known summary noise."""
 
     text = _without_verification_downgrade_lines(text)
@@ -1221,6 +1248,13 @@ def _incomplete_final_markers(text: str) -> list[str]:
             if reason == "runtime_not_synced" and _is_explicitly_healthy_runtime_match(match):
                 continue
             if reason == "runtime_not_synced" and _is_preserved_protected_checkout_gap(text, match):
+                continue
+            if (
+                reason == "runtime_not_synced"
+                and isinstance(item, dict)
+                and _canonical_sync_explicitly_not_required(item)
+                and _is_canonical_checkout_only_gap(text, match)
+            ):
                 continue
             if reason == "runtime_not_synced" and re.search(
                 r"\b(?:live\s+)?runtime\s+pickup\b", snippet, flags=re.IGNORECASE
@@ -1346,7 +1380,7 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
         )
         return _apply_visual_qa_completion(item, gate)
 
-    matched = _incomplete_final_markers(final_text)
+    matched = _incomplete_final_markers(final_text, item)
     runtime_handoff_missing = _deferred_runtime_watch_missing_markers(final_text) if intent == "full_lifecycle" else []
     if not matched:
         if runtime_handoff_missing:

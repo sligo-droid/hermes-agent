@@ -1363,6 +1363,70 @@ def test_full_lifecycle_allows_preserved_protected_checkout_when_production_is_c
     assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
 
 
+def test_closeout_policy_allows_optional_canonical_checkout_to_remain_unsynced(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement the feature")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        canonical_path="/tmp/project",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={
+            "post_merge_requirements": {
+                "canonical_sync": False,
+                "deployment": False,
+            }
+        },
+    )
+    assert attached is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "Done. PR checks, main CI, and Vercel deployment passed. "
+            "The PR was squash-merged. Canonical checkout sync was intentionally "
+            "blocked: it is protected, 50 commits behind, and contains a pre-existing "
+            "deletion. I preserved that work rather than bypassing the guard."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
+
+
+def test_optional_canonical_sync_does_not_hide_private_runtime_lag(tmp_path):
+    item = {
+        "platform": "discord",
+        "source": {"project_path": "/tmp/project"},
+        "text": "Ship the runtime change",
+        "closeout": {
+            "policy": {
+                "post_merge_requirements": {"canonical_sync": False}
+            }
+        },
+    }
+
+    gate = classify_delivery_completion(
+        item,
+        "PR merged, but the private runtime is still behind and not synced.",
+    )
+
+    assert gate["allowed_to_complete"] is False
+    assert gate["matched_markers"] == ["runtime_not_synced"]
+
+
 def test_full_lifecycle_allows_background_watch_after_live_pickup(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Schedule the Airflow DAG")

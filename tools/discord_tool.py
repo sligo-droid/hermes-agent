@@ -253,6 +253,23 @@ def _format_message(message: Dict[str, Any]) -> Dict[str, Any]:
                 "title": embed.get("title"),
                 "description": embed.get("description"),
                 "url": embed.get("url"),
+                "color": embed.get("color"),
+                "timestamp": embed.get("timestamp"),
+                "fields": [
+                    {
+                        "name": field.get("name"),
+                        "value": field.get("value"),
+                        "inline": field.get("inline", False),
+                    }
+                    for field in embed.get("fields", [])
+                    if isinstance(field, dict)
+                ],
+                "footer": {
+                    "text": (embed.get("footer") or {}).get("text"),
+                    "icon_url": (embed.get("footer") or {}).get("icon_url"),
+                }
+                if isinstance(embed.get("footer"), dict)
+                else None,
             }
             for embed in message.get("embeds", [])
         ],

@@ -19,6 +19,7 @@ from tools.discord_tool import (
     _discord_request,
     _enrich_403,
     _get_bot_token,
+    _format_message,
     _initialize_promoted_thread_feature_summary,
     _load_allowed_actions_config,
     _reset_capability_cache,
@@ -120,6 +121,49 @@ class TestChannelTypeNames:
 
     def test_unknown_type(self):
         assert _channel_type_name(99) == "unknown(99)"
+
+
+def test_format_message_preserves_summary_embed_fields():
+    formatted = _format_message(
+        {
+            "id": "summary-1",
+            "channel_id": "thread-1",
+            "author": {"id": "bot-1", "username": "Hermes"},
+            "embeds": [
+                {
+                    "type": "rich",
+                    "title": "Work summary",
+                    "description": "Finished successfully",
+                    "color": 0x57F287,
+                    "timestamp": "2026-07-20T18:00:00+00:00",
+                    "fields": [
+                        {"name": "Status", "value": "Complete", "inline": True},
+                        {
+                            "name": "Agent Trace URL",
+                            "value": "https://traces.com/s/example/full",
+                        },
+                    ],
+                    "footer": {"text": "Hermes", "icon_url": "https://example/icon.png"},
+                }
+            ],
+        }
+    )
+
+    embed = formatted["embeds"][0]
+    assert embed["color"] == 0x57F287
+    assert embed["timestamp"] == "2026-07-20T18:00:00+00:00"
+    assert embed["fields"] == [
+        {"name": "Status", "value": "Complete", "inline": True},
+        {
+            "name": "Agent Trace URL",
+            "value": "https://traces.com/s/example/full",
+            "inline": False,
+        },
+    ]
+    assert embed["footer"] == {
+        "text": "Hermes",
+        "icon_url": "https://example/icon.png",
+    }
 
 
 # ---------------------------------------------------------------------------
