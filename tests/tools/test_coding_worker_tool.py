@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,10 +32,14 @@ class FakeSession:
         self.closed = False
         self.run_calls = []
         self.auth_payload = None
+        self.config_payload = None
         if kwargs.get("codex_home"):
             auth_path = Path(kwargs["codex_home"]) / "auth.json"
             if auth_path.exists():
                 self.auth_payload = json.loads(auth_path.read_text(encoding="utf-8"))
+            config_path = Path(kwargs["codex_home"]) / "config.toml"
+            if config_path.exists():
+                self.config_payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
         FakeSession.instances.append(self)
 
     def __enter__(self):
@@ -56,10 +61,13 @@ class FakeSession:
 
 
 @pytest.fixture(autouse=True)
-def _default_codex_backend(monkeypatch):
+def _default_codex_backend(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
     monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: "codex")
+    codex_home = tmp_path / "default-codex-home"
+    codex_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
 
 def _parent(tmp_path, api_mode="chat_completions"):
@@ -1607,6 +1615,48 @@ def test_default_codex_route_keeps_openrouter_key_scrubbed(monkeypatch, tmp_path
     env = FakeSession.instances[0].kwargs["env"]
     assert "OPENROUTER_API_KEY" not in env
     assert "_HERMES_FORCE_OPENROUTER_API_KEY" not in env
+
+
+def test_codex_route_inherits_selected_provider_env_key(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    codex_home = tmp_path / "host-codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model_provider = "cliproxy"\n'
+        '[model_providers.cliproxy]\n'
+        'name = "CLIProxyAPI"\n'
+        'base_url = "http://127.0.0.1:8317/v1"\n'
+        'wire_api = "responses"\n'
+        'env_key = "CLI_PROXY_API_KEY"\n'
+        'requires_openai_auth = false\n',
+        encoding="utf-8",
+    )
+    provider_secret = "test-worker-provider-secret"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CLI_PROXY_API_KEY", provider_secret)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Fix the parser bug.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    session = FakeSession.instances[0]
+    assert session.kwargs["env"]["CLI_PROXY_API_KEY"] == provider_secret
+    assert "_HERMES_FORCE_CLI_PROXY_API_KEY" not in session.kwargs["env"]
+    assert session.auth_payload is None
+    assert session.config_payload["model_provider"] == "cliproxy"
+    provider = session.config_payload["model_providers"]["cliproxy"]
+    assert provider["env_key"] == "CLI_PROXY_API_KEY"
+    assert provider["requires_openai_auth"] is False
+    assert provider_secret not in json.dumps(session.config_payload)
 
 
 def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, tmp_path):

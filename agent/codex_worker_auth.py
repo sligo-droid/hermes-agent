@@ -5,14 +5,36 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import tomllib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INHERITED_PROVIDER_KEYS = (
+    "name",
+    "base_url",
+    "wire_api",
+    "env_key",
+    "env_key_instructions",
+    "requires_openai_auth",
+    "request_max_retries",
+    "stream_max_retries",
+    "stream_idle_timeout_ms",
+)
+
+
+@dataclass(frozen=True)
+class _CodexApiKeyProvider:
+    name: str
+    config: dict[str, str | bool | int]
+    env_key: str
+    env_value: str | None
 
 
 class CodexWorkerHomeLease:
@@ -22,9 +44,15 @@ class CodexWorkerHomeLease:
     Hermes-owned credential home. Cleanup removes only the leased path.
     """
 
-    def __init__(self, path: Path, credential_id: Optional[str]):
+    def __init__(
+        self,
+        path: Path,
+        credential_id: Optional[str],
+        provider_env: dict[str, str] | None = None,
+    ):
         self.path = path
         self.credential_id = credential_id
+        self.provider_env = dict(provider_env or {})
 
     def cleanup(self) -> None:
         cleanup_codex_worker_home(self.path)
@@ -234,6 +262,64 @@ def _copy_codex_file(
             pass
 
 
+def _source_codex_home(source_env: dict[str, str] | None = None) -> Path:
+    env = os.environ if source_env is None else source_env
+    return Path(env.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+
+
+def _load_parent_codex_config(
+    *,
+    source_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    try:
+        with (_source_codex_home(source_env) / "config.toml").open("rb") as config_file:
+            loaded = tomllib.load(config_file)
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _parent_api_key_provider(
+    *,
+    source_env: dict[str, str] | None = None,
+) -> _CodexApiKeyProvider | None:
+    parent_config = _load_parent_codex_config(source_env=source_env)
+    provider_name = parent_config.get("model_provider")
+    if not isinstance(provider_name, str) or not provider_name.strip():
+        return None
+    provider_name = provider_name.strip()
+
+    providers = parent_config.get("model_providers")
+    provider = providers.get(provider_name) if isinstance(providers, dict) else None
+    if not isinstance(provider, dict) or provider.get("requires_openai_auth") is not False:
+        return None
+
+    env_key = provider.get("env_key")
+    if not isinstance(env_key, str) or not _ENV_KEY_RE.fullmatch(env_key.strip()):
+        return None
+    env_key = env_key.strip()
+    env = os.environ if source_env is None else source_env
+    env_value = env.get(env_key)
+    if not isinstance(env_value, str) or not env_value.strip():
+        env_value = None
+
+    inherited: dict[str, str | bool | int] = {}
+    for key in _INHERITED_PROVIDER_KEYS:
+        value = provider.get(key)
+        if isinstance(value, bool) or isinstance(value, str) or (
+            isinstance(value, int) and not isinstance(value, bool)
+        ):
+            inherited[key] = value
+    inherited["env_key"] = env_key
+    inherited["requires_openai_auth"] = False
+    return _CodexApiKeyProvider(
+        name=provider_name,
+        config=inherited,
+        env_key=env_key,
+        env_value=env_value,
+    )
+
+
 def _codex_auth_has_id_token(codex_home: Path) -> bool:
     auth_path = codex_home / "auth.json"
     if not auth_path.is_file():
@@ -264,12 +350,8 @@ def _parent_worker_config_settings(
     if not _inherit_fast_mode_enabled():
         return {}
 
-    env = os.environ if source_env is None else source_env
-    source_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
-    try:
-        with (source_home / "config.toml").open("rb") as config_file:
-            parent_config = tomllib.load(config_file)
-    except Exception:
+    parent_config = _load_parent_codex_config(source_env=source_env)
+    if not parent_config:
         return {}
 
     settings: dict[str, str | bool] = {}
@@ -302,9 +384,11 @@ def _write_minimal_config(
     codex_home: Path,
     *,
     source_env: dict[str, str] | None = None,
+    api_key_provider: _CodexApiKeyProvider | None = None,
+    overwrite: bool = False,
 ) -> None:
     config = codex_home / "config.toml"
-    if config.exists():
+    if config.exists() and not overwrite:
         return
     settings = _parent_worker_config_settings(source_env=source_env)
     lines = [
@@ -319,6 +403,8 @@ def _write_minimal_config(
     ):
         if key in settings:
             lines.append(f"{key} = {json.dumps(settings[key])}")
+    if api_key_provider is not None:
+        lines.append(f"model_provider = {json.dumps(api_key_provider.name)}")
     if "features.fast_mode" in settings:
         lines.extend(
             [
@@ -335,6 +421,14 @@ def _write_minimal_config(
     if memory_lines:
         lines.append("[memories]")
         lines.extend(memory_lines)
+    if api_key_provider is not None:
+        lines.append(f"[model_providers.{json.dumps(api_key_provider.name)}]")
+        for key, value in api_key_provider.config.items():
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            else:
+                rendered = json.dumps(value)
+            lines.append(f"{key} = {rendered}")
     lines.append("")
     config.write_text(
         "\n".join(lines),
@@ -466,6 +560,25 @@ def prepare_codex_worker_home(
     """
     path = Path(codex_home).expanduser()
 
+    api_key_provider = _parent_api_key_provider(source_env=source_env)
+    if api_key_provider is not None:
+        if path.is_symlink():
+            path.unlink()
+        path.mkdir(parents=True, exist_ok=True)
+        auth_path = path / "auth.json"
+        if auth_path.is_file():
+            try:
+                auth_path.unlink()
+            except OSError:
+                pass
+        _write_minimal_config(
+            path,
+            source_env=source_env,
+            api_key_provider=api_key_provider,
+            overwrite=True,
+        )
+        return None
+
     pool, entry = select_codex_worker_credential(parent_agent)
     credential_id = None
     copied_fallback_auth = False
@@ -518,6 +631,7 @@ def create_codex_worker_home(
     except OSError:
         pass
     path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
+    api_key_provider = _parent_api_key_provider(source_env=source_env)
     try:
         credential_id = prepare_codex_worker_home(
             path,
@@ -528,7 +642,12 @@ def create_codex_worker_home(
     except Exception:
         cleanup_codex_worker_home(path)
         raise
-    return CodexWorkerHomeLease(path, credential_id)
+    provider_env = (
+        {api_key_provider.env_key: api_key_provider.env_value}
+        if api_key_provider is not None and api_key_provider.env_value is not None
+        else None
+    )
+    return CodexWorkerHomeLease(path, credential_id, provider_env)
 
 
 def cleanup_codex_worker_home(codex_home: Path | str | None) -> None:

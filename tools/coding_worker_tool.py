@@ -2292,6 +2292,7 @@ def _delegate_coding_task_impl(
         )
         codex_home = codex_home_lease.path
         inherited_credential_id = codex_home_lease.credential_id
+        worker_env.update(codex_home_lease.provider_env)
     except Exception:
         codex_home = None
         codex_home_lease = None
