@@ -319,7 +319,7 @@ discord:
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   action_request_model_tier: discord_action          # Simple/ordinary actions: Sol/medium
-  action_request_complex_model_tier: advanced        # Complex/risky actions: Sol/xhigh
+  action_request_complex_model_tier: advanced        # Complex/risky actions: Sol/high
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
@@ -857,4 +857,3 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-

@@ -132,7 +132,7 @@ async def test_create_cron_job_normalizes_representative_core_fields(
 
     assert job["name"] == "full-core-mapping"
     assert job["model_tier"] == "advanced"
-    assert job["reasoning_effort"] == "max"
+    assert job["reasoning_effort"] == "xhigh"
     assert job["base_url"] == "https://example.invalid/v1"
     assert job["script"] == str(scripts_dir / "collect-status.py")
     assert job["no_agent"] is True

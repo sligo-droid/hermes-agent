@@ -21,7 +21,6 @@ export const EFFORT_OPTIONS: ReadonlyArray<EffortOption> = [
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
   { value: "xhigh", label: "Extra High" },
-  { value: "max", label: "Max" },
 ];
 
 export const VALID_EFFORTS: ReadonlySet<string> = new Set(
@@ -31,7 +30,10 @@ export const VALID_EFFORTS: ReadonlySet<string> = new Set(
 /** Normalize a raw `agent.reasoning_effort` config value to a selectable
  *  option. Empty/unknown → `medium` (Hermes' default when unset). */
 export function normalizeEffort(raw: unknown): string {
-  const value = String(raw ?? "").trim().toLowerCase();
+  const value = String(raw ?? "")
+    .trim()
+    .toLowerCase();
   if (!value) return "medium";
+  if (value === "max") return "xhigh";
   return VALID_EFFORTS.has(value) ? value : "medium";
 }

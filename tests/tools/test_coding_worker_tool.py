@@ -228,9 +228,9 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert FakeSession.instances[0].kwargs["scope_purpose"] == "Codex coding worker build pass"
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -257,8 +257,8 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
-            "model": "gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
         },
     ]
@@ -410,26 +410,26 @@ def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
     assert result["success"] is True
     assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
     assert result["ui_work_route"]["actual_model"] == "gpt-5.6-sol"
-    assert result["ui_work_route"]["actual_reasoning_effort"] == "high"
+    assert result["ui_work_route"]["actual_reasoning_effort"] == "medium"
     assert [session.kwargs["extra_args"] for session in FakeSession.instances] == [
         [
             "-c",
             'model="gpt-5.6-sol"',
             "-c",
-            'model_reasoning_effort="high"',
+            'model_reasoning_effort="medium"',
         ],
         [
             "-c",
             'model="gpt-5.6-sol"',
             "-c",
-            'model_reasoning_effort="high"',
+            'model_reasoning_effort="medium"',
         ],
     ]
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
             "model": "gpt-5.6-sol",
-            "reasoning": "high",
+            "reasoning": "medium",
             "tier": "thorough",
         },
     ]
@@ -455,8 +455,8 @@ def test_backend_error_marks_recorded_worker_run_failed(monkeypatch, tmp_path):
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
-            "model": "gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
             "failed": True,
         },
@@ -473,7 +473,7 @@ def test_invalid_worker_tier_returns_tool_error(tmp_path):
     )
 
     assert "Unknown worker_tier 'impossible'" in result["error"]
-    for tier in ("quick", "standard", "thorough", "deep", "max"):
+    for tier in ("quick", "standard", "thorough", "deep"):
         assert tier in result["error"]
 
 
@@ -485,7 +485,6 @@ def test_coding_worker_schema_exposes_orchestrator_inputs():
         "standard",
         "thorough",
         "deep",
-        "max",
     ]
     assert {"relevant_files", "approach", "constraints", "verification", "scope_paths"} <= set(
         properties
@@ -1346,8 +1345,8 @@ def test_ui_specialist_route_uses_normal_codex_backend_and_skills(monkeypatch, t
     assert parent.turn_worker_runs == [
         {
             "backend": "codex",
-            "model": "gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
         },
     ]
@@ -1875,15 +1874,15 @@ def test_ui_work_uses_normal_codex_model_tier(monkeypatch, tmp_path):
         "popular-web-designs",
     ]
     assert route["actual_backend"] == "codex"
-    assert route["actual_model"] == "gpt-5.6-terra"
-    assert route["actual_reasoning_effort"] == "max"
+    assert route["actual_model"] == "gpt-5.6-sol"
+    assert route["actual_reasoning_effort"] == "medium"
     assert result["backend"] == "codex"
     assert len(FakeSession.instances) == 1
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
     assert "UI specialist skill loading" in FakeSession.instances[0].run_calls[0]["user_input"]
 
@@ -1956,9 +1955,9 @@ def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monk
     assert "visual ui work" in route["advisory_reason"]
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
 
 
@@ -2029,9 +2028,9 @@ def test_legacy_ui_runtime_settings_do_not_change_codex_execution(monkeypatch, t
     assert len(FakeSession.instances) == 1
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
 
 
@@ -2058,9 +2057,9 @@ def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
     assert result["ui_work_route"]["matched"] is False
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
 
 
@@ -2467,13 +2466,13 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="xhigh"',
+        'model_reasoning_effort="high"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="medium"',
     ]
     assert "Do not edit repository files" in FakeSession.instances[0].run_calls[0]["user_input"]
     assert "Codex plan to follow:" in FakeSession.instances[1].run_calls[0]["user_input"]
@@ -2496,7 +2495,7 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
         "load_coding_worker_pass_config",
         lambda: {
             "simple_build_reasoning_level": "low",
-            "complex_plan_reasoning_level": "max",
+            "complex_plan_reasoning_level": "high",
             "complex_build_reasoning_level": "high",
         },
     )
@@ -2513,11 +2512,11 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="max"',
+        'model_reasoning_effort="high"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
-        'model="gpt-5.6-terra"',
+        'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="high"',
     ]
@@ -2573,8 +2572,8 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert parent.turn_worker_runs == [
         {
             "backend": "opencode",
-            "model": "hermes-codex/gpt-5.6-terra",
-            "reasoning": "max",
+            "model": "hermes-codex/gpt-5.6-sol",
+            "reasoning": "medium",
             "tier": None,
         },
     ]
@@ -2619,18 +2618,69 @@ def test_worker_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_pat
     assert result["success"] is True
     assert seen["worker_config"] == {
         "model_tier": "disabled",
-        "simple_build_reasoning_level": "xhigh",
-        "complex_plan_reasoning_level": "xhigh",
-        "complex_build_reasoning_level": "xhigh",
+        "simple_build_reasoning_level": "high",
+        "complex_plan_reasoning_level": "high",
+        "complex_build_reasoning_level": "high",
         "opencode": {"model": "hermes-codex/gpt-5.6-sol"},
     }
     resolved = ow.load_opencode_config(cfg, worker_config=seen["worker_config"])
     assert resolved["simple_build_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_plan_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_build_model"] == "hermes-codex/gpt-5.6-sol"
-    assert resolved["simple_build_reasoning_level"] == "xhigh"
-    assert resolved["complex_plan_reasoning_level"] == "xhigh"
-    assert resolved["complex_build_reasoning_level"] == "xhigh"
+    assert resolved["simple_build_reasoning_level"] == "high"
+    assert resolved["complex_plan_reasoning_level"] == "high"
+    assert resolved["complex_build_reasoning_level"] == "high"
+
+
+def test_review_task_keeps_deep_worker_reasoning(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "opencode"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+    seen = {}
+
+    def fake_run(prompt, workspace, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            final_text="No findings.",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-review",
+            turn_id="ses-review",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Audit the parser and report findings without changes",
+            worker_tier="deep",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert seen["worker_config"]["complex_plan_reasoning_level"] == "xhigh"
+
+
+def test_exhausted_parent_deadline_blocks_coding_worker_launch(tmp_path):
+    parent = _parent(tmp_path)
+    parent._nested_worker_deadline_monotonic = 0.0
+
+    result = json.loads(
+        cwt.delegate_coding_task(task="fix the parser", parent_agent=parent)
+    )
+
+    assert "nested-worker deadline was exhausted" in result["error"]
 
 
 def test_delegate_opencode_preserves_parent_scope_when_backend_supports_it(monkeypatch, tmp_path):

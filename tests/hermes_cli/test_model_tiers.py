@@ -5,10 +5,13 @@ from hermes_cli.model_tiers import (
     DEFAULT_WORKER_TIERS,
     MODEL_TIER_LADDER,
     classify_task_complexity,
+    classify_task_purpose,
     resolve_adjacent_model_tier,
     resolve_model_tier,
     resolve_model_tier_offset,
     resolve_worker_tier,
+    restrict_model_tier_for_task,
+    restrict_reasoning_effort_for_task,
 )
 
 
@@ -56,9 +59,9 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "medium",
-        "basic": "high",
-        "intermediate": "max",
-        "advanced": "xhigh",
+        "basic": "xhigh",
+        "intermediate": "medium",
+        "advanced": "high",
         "discord_action": "medium",
     }
     assert {
@@ -66,8 +69,8 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "gpt-5.6-luna",
-        "basic": "gpt-5.6-terra",
-        "intermediate": "gpt-5.6-terra",
+        "basic": "gpt-5.6-luna",
+        "intermediate": "gpt-5.6-sol",
         "advanced": "gpt-5.6-sol",
         "discord_action": "gpt-5.6-sol",
     }
@@ -119,13 +122,47 @@ def test_invalid_tier_is_rejected_without_leaking_into_runtime():
     ) is None
 
 
+def test_review_spills_high_to_xhigh_and_implementation_caps_at_high():
+    assert classify_task_purpose("Review the authentication flow and report findings") == "review"
+    assert classify_task_purpose("Review the flow and fix the race") == "implementation"
+    assert classify_task_purpose("Analyze the request") == "implementation"
+
+    advanced = resolve_model_tier({}, "advanced")
+    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").name == "advanced"
+    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").reasoning_effort == "high"
+    assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").name == "advanced"
+    assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").reasoning_effort == "xhigh"
+    assert restrict_reasoning_effort_for_task("max", "Apply the patch") == "high"
+    assert restrict_reasoning_effort_for_task("max", "Review the authentication flow") == "xhigh"
+    assert restrict_reasoning_effort_for_task("high", "Review the authentication flow") == "xhigh"
+    assert restrict_reasoning_effort_for_task("xhigh", "Diagnose the incident") == "xhigh"
+
+
+def test_implementation_cap_preserves_custom_advanced_model():
+    config = {
+        "model_tiers": {
+            "advanced": {"model": "custom/advanced", "reasoning_effort": "xhigh"},
+            "intermediate": {"model": "custom/intermediate", "reasoning_effort": "xhigh"},
+        }
+    }
+
+    restricted = restrict_model_tier_for_task(
+        config,
+        resolve_model_tier(config, "advanced"),
+        "Build the feature",
+    )
+
+    assert restricted.name == "advanced"
+    assert restricted.model == "custom/advanced"
+    assert restricted.reasoning_effort == "high"
+
+
 def test_default_worker_tiers_resolve_to_expected_model_and_effort():
     expected = {
-        "quick": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "low"),
-        "standard": ("gpt-5.6-terra", "hermes-codex/gpt-5.6-terra", "medium"),
-        "thorough": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "high"),
+        "quick": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "medium"),
+        "standard": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "xhigh"),
+        "thorough": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "medium"),
         "deep": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "xhigh"),
-        "max": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "max"),
     }
 
     assert tuple(DEFAULT_WORKER_TIERS) == tuple(expected)
@@ -162,6 +199,7 @@ def test_worker_tier_config_override_merges_with_defaults():
 
 
 def test_invalid_worker_tier_is_rejected():
+    assert resolve_worker_tier({}, "max") is None
     assert resolve_worker_tier({}, "unknown") is None
     assert resolve_worker_tier(
         {
@@ -204,6 +242,16 @@ def test_standalone_coding_worker_uses_its_named_tier():
     resolved = load_opencode_config(config)
 
     assert resolved["model"] == "custom/feature-worker"
-    assert resolved["simple_build_reasoning_level"] == "max"
-    assert resolved["complex_plan_reasoning_level"] == "max"
-    assert resolved["complex_build_reasoning_level"] == "max"
+    assert resolved["simple_build_reasoning_level"] == "high"
+    assert resolved["complex_plan_reasoning_level"] == "high"
+    assert resolved["complex_build_reasoning_level"] == "high"
+
+
+def test_legacy_max_tier_effort_normalizes_to_xhigh():
+    tier = resolve_model_tier(
+        {"model_tiers": {"legacy": {"model": "custom/model", "reasoning_effort": "max"}}},
+        "legacy",
+    )
+
+    assert tier is not None
+    assert tier.reasoning_effort == "xhigh"

@@ -13,7 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+from hermes_constants import (
+    VALID_REASONING_EFFORTS,
+    normalize_reasoning_effort,
+    parse_reasoning_effort,
+)
 
 
 DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
@@ -23,23 +27,23 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "reasoning_effort": "medium",
     },
     "basic": {
-        "model": "gpt-5.6-terra",
-        "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "high",
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
     },
     "intermediate": {
-        "model": "gpt-5.6-terra",
-        "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "max",
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "medium",
     },
     "advanced": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "xhigh",
+        "reasoning_effort": "high",
     },
     # Route-specific tier for ordinary Discord action orchestration. It is
     # intentionally outside MODEL_TIER_LADDER so worker/delegation stepping
-    # continues to treat ``advanced`` as the shared Sol/xhigh ceiling.
+    # continues to treat ``advanced`` as the shared Sol/high ceiling.
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
@@ -51,27 +55,22 @@ DEFAULT_WORKER_TIERS: dict[str, dict[str, str]] = {
     "quick": {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",
     },
     "standard": {
-        "model": "gpt-5.6-terra",
-        "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "medium",
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
     },
     "thorough": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
     },
     "deep": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "xhigh",
-    },
-    "max": {
-        "model": "gpt-5.6-sol",
-        "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "max",
     },
 }
 
@@ -144,6 +143,49 @@ _EXPLICIT_PLANNING_SIGNALS = (
     "design before",
 )
 
+_IMPLEMENTATION_TASK_SIGNALS = (
+    "implement",
+    "implementation",
+    "fix",
+    "fixes",
+    "patch",
+    "apply",
+    "build",
+    "change",
+    "edit",
+    "modify",
+    "update",
+    "add",
+    "remove",
+    "delete",
+    "refactor",
+    "rewrite",
+    "create",
+    "ship",
+    "deploy",
+    "merge",
+    "commit",
+)
+
+_REVIEW_TASK_SIGNALS = (
+    "review",
+    "audit",
+    "diagnose",
+    "diagnosis",
+    "investigate",
+    "inspect",
+    "assess",
+    "root cause",
+    "trace execution",
+    "read-only",
+    "read only",
+    "no changes",
+    "do not edit",
+    "report findings",
+)
+
+_REVIEW_SPILLOVER_REASONING_EFFORT = "xhigh"
+
 
 @dataclass(frozen=True)
 class ModelTier:
@@ -186,6 +228,69 @@ def classify_task_complexity(task: Any, context: Any = "") -> str:
     if any(_contains_task_signal(text, signal) for signal in _SIMPLE_TASK_SIGNALS):
         return "simple"
     return "ordinary"
+
+
+def classify_task_purpose(task: Any, context: Any = "") -> str:
+    """Classify a task as explicit review or implementation-capable work.
+
+    Mutation signals always win. Ambiguous analysis defaults to implementation
+    so review-only reasoning cannot leak into a task that may edit state.
+    """
+
+    text = f"{task or ''}\n{context or ''}".lower()
+    if any(_contains_task_signal(text, signal) for signal in _IMPLEMENTATION_TASK_SIGNALS):
+        return "implementation"
+    if any(_contains_task_signal(text, signal) for signal in _REVIEW_TASK_SIGNALS):
+        return "review"
+    return "implementation"
+
+
+def restrict_reasoning_effort_for_task(
+    reasoning_effort: Any,
+    task: Any,
+    context: Any = "",
+    *,
+    purpose: str | None = None,
+) -> str:
+    """Apply the review spillover and implementation ceiling for a task."""
+
+    effort = normalize_reasoning_effort(reasoning_effort)
+    resolved_purpose = _normalized_name(purpose) or classify_task_purpose(task, context)
+    if resolved_purpose == "review" and effort == "high":
+        return _REVIEW_SPILLOVER_REASONING_EFFORT
+    if resolved_purpose != "review" and effort == _REVIEW_SPILLOVER_REASONING_EFFORT:
+        return "high"
+    return effort
+
+
+def restrict_model_tier_for_task(
+    config: Mapping[str, Any] | None,
+    tier: ModelTier | None,
+    task: Any,
+    context: Any = "",
+    *,
+    worker: bool = False,
+    purpose: str | None = None,
+) -> ModelTier | None:
+    """Preserve the selected tier while capping implementation reasoning."""
+
+    if tier is None:
+        return None
+    resolved_purpose = _normalized_name(purpose) or classify_task_purpose(task, context)
+    safe_effort = restrict_reasoning_effort_for_task(
+        tier.reasoning_effort,
+        task,
+        context,
+        purpose=resolved_purpose,
+    )
+    if safe_effort == tier.reasoning_effort:
+        return tier
+    return ModelTier(
+        name=tier.name,
+        model=tier.model,
+        opencode_model=tier.opencode_model,
+        reasoning_effort=safe_effort,
+    )
 
 
 def _merged_model_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -259,7 +364,7 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
 
     model = str(raw_tier.get("model") or "").strip()
     opencode_model = str(raw_tier.get("opencode_model") or model).strip()
-    reasoning_effort = _normalized_name(raw_tier.get("reasoning_effort"))
+    reasoning_effort = normalize_reasoning_effort(raw_tier.get("reasoning_effort"))
     if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
         return None
 
@@ -283,7 +388,7 @@ def resolve_worker_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTie
 
     model = str(raw_tier.get("model") or "").strip()
     opencode_model = str(raw_tier.get("opencode_model") or model).strip()
-    reasoning_effort = _normalized_name(raw_tier.get("reasoning_effort"))
+    reasoning_effort = normalize_reasoning_effort(raw_tier.get("reasoning_effort"))
     if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
         return None
 

@@ -2709,7 +2709,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.reasoning.reset_done")
         if effort == "none":
             parsed = {"enabled": False}
-        elif effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+        elif effort in {"minimal", "low", "medium", "high", "xhigh"}:
             parsed = {"enabled": True, "effort": effort}
         else:
             return t(

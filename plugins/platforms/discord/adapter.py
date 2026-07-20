@@ -4394,6 +4394,57 @@ class DiscordAdapter(BasePlatformAdapter):
             result.append(message)
         return result
 
+    def _work_ledger_for_reactions(self) -> Any:
+        runner = getattr(self, "gateway_runner", None)
+        ledger = getattr(runner, "work_ledger", None)
+        if ledger is not None:
+            return ledger
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            return GatewayWorkLedger()
+        except Exception:
+            return None
+
+    async def reconcile_work_ledger_thread_reaction(
+        self,
+        item: Dict[str, Any],
+        state: Optional[str] = None,
+    ) -> Optional[str]:
+        """Repair a thread-origin reaction using only persisted ledger metadata."""
+
+        ledger = self._work_ledger_for_reactions()
+        if ledger is None or not isinstance(item, dict):
+            return None
+        resolved_state = state or ledger.discord_thread_reaction_state(item)
+        emoji = self._feature_kanban_reaction_emoji(resolved_state)
+        if not emoji:
+            return None
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        thread_id = str(source.get("thread_id") or "").strip()
+        if not thread_id and str(source.get("chat_type") or "").strip() == "thread":
+            thread_id = str(source.get("chat_id") or "").strip()
+        message = None
+        if thread_id:
+            thread = await self._resolve_summary_channel(thread_id)
+            if thread is not None:
+                message = await self._thread_origin_message(thread)
+        else:
+            channel_id = str(source.get("chat_id") or "").strip()
+            message_id = str(item.get("message_id") or source.get("message_id") or "").strip()
+            channel = await self._resolve_summary_channel(channel_id)
+            fetch_message = getattr(channel, "fetch_message", None)
+            if callable(fetch_message) and message_id.isdigit():
+                try:
+                    message = await fetch_message(int(message_id))
+                except Exception:
+                    message = None
+        if message is None or not hasattr(message, "add_reaction"):
+            return None
+        await self._set_message_reaction_state(message, emoji)
+        ledger.mark_discord_thread_reaction_synced(item)
+        return resolved_state
+
     async def _mark_feature_summary_running(self, event: MessageEvent) -> None:
         handle = getattr(event, "feature_summary", None)
         if isinstance(handle, dict):
@@ -5030,7 +5081,20 @@ class DiscordAdapter(BasePlatformAdapter):
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
+        ledger = self._work_ledger_for_reactions()
+        work_item = None
+        ledger_state = None
+        work_item_id = str(getattr(event, "work_item_id", "") or "").strip()
+        if ledger is not None and work_item_id:
+            try:
+                work_item = ledger.get(work_item_id)
+                if isinstance(work_item, dict):
+                    ledger_state = ledger.discord_thread_reaction_state(work_item)
+            except Exception as exc:
+                logger.debug("[%s] Failed to aggregate Discord work reaction: %s", self.name, exc)
         if not self._action_lifecycle_enabled(event):
+            if isinstance(work_item, dict) and ledger_state:
+                await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
             return
         is_fable_event = self._is_fable_event(event)
         kanban_state = None
@@ -5042,13 +5106,20 @@ class DiscordAdapter(BasePlatformAdapter):
                     kanban_state,
                 )
         kanban_emoji = self._feature_kanban_reaction_emoji(kanban_state)
+        ledger_emoji = self._feature_kanban_reaction_emoji(ledger_state)
         has_feature_summary = getattr(event, "feature_summary", None) is not None
         messages = await self._processing_reaction_messages(event)
+        if not messages and isinstance(work_item, dict) and ledger_state:
+            await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
+            return
         for message in messages:
             if not hasattr(message, "add_reaction"):
                 continue
             if kanban_emoji:
                 await self._set_message_reaction_state(message, kanban_emoji)
+                continue
+            if ledger_emoji:
+                await self._set_message_reaction_state(message, ledger_emoji)
                 continue
             if not has_feature_summary:
                 if outcome == ProcessingOutcome.SUCCESS:
@@ -5064,6 +5135,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._set_message_reaction_state(message, "❌")
             else:
                 await self._set_message_reaction_state(message, None)
+        if ledger is not None and isinstance(work_item, dict) and ledger_state:
+            ledger.mark_discord_thread_reaction_synced(work_item)
 
     async def send(
         self,
@@ -7086,7 +7159,7 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, f"/model {name}".strip())
 
         @tree.command(name="reasoning", description="Show or change reasoning effort")
-        @discord.app_commands.describe(effort="Reasoning effort: none, minimal, low, medium, high, xhigh, or max.")
+        @discord.app_commands.describe(effort="Reasoning effort: none, minimal, low, medium, high, or xhigh.")
         async def slash_reasoning(interaction: discord.Interaction, effort: str = ""):
             await self._run_simple_slash(interaction, f"/reasoning {effort}".strip())
 

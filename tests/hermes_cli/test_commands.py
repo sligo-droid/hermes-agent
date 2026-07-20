@@ -74,14 +74,13 @@ class TestCommandRegistry:
 
     def test_reasoning_subcommands_are_in_logical_order(self):
         reasoning = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "reasoning")
-        assert reasoning.subcommands[:7] == (
+        assert reasoning.subcommands[:6] == (
             "none",
             "minimal",
             "low",
             "medium",
             "high",
             "xhigh",
-            "max",
         )
 
     def test_opencode_is_cli_only_builtin(self):
@@ -646,7 +645,8 @@ class TestSubcommands:
         assert "/reasoning" in SUBCOMMANDS
         subs = SUBCOMMANDS["/reasoning"]
         assert "high" in subs
-        assert "max" in subs
+        assert "xhigh" in subs
+        assert "max" not in subs
         assert "show" in subs
         assert "hide" in subs
 
@@ -683,7 +683,8 @@ class TestSubcommandCompletion:
         completions = _completions(SlashCommandCompleter(), "/reasoning ")
         texts = {c.text for c in completions}
         assert "high" in texts
-        assert "max" in texts
+        assert "xhigh" in texts
+        assert "max" not in texts
         assert "show" in texts
 
     def test_fast_subcommand_completion_after_space(self):
