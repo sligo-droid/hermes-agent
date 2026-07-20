@@ -830,7 +830,6 @@ DEFAULT_CONFIG = {
         "mode": "shadow",
         "surfaces": {
             "kanban": False,
-            "fable": True,
             "direct": True,
         },
         "early_draft_pr": False,
@@ -1091,9 +1090,6 @@ DEFAULT_CONFIG = {
         "provider": "anthropic",
         "model": "claude-fable-5",
         "route": "anthropic_oauth",
-        # Trusted Hermes Git finalization stays opt-in: "none", "pr", or "merge".
-        # The Codex worker edits/tests locally; it never owns push or PR mutation.
-        "git_lifecycle": "none",
         # To use an Anthropic-compatible proxy without copying its secret into
         # ANTHROPIC_API_KEY, set route: anthropic_proxy plus key_env and base_url.
         # The named credential remains in the active profile's .env.
@@ -1648,7 +1644,7 @@ DEFAULT_CONFIG = {
                                        # no ceiling). High-reasoning models on large tasks
                                        # (e.g. gpt-5.5 xhigh, opus-4.6) need generous budgets;
                                        # raise if children time out before producing output.
-        "reasoning_effort": "",  # subagent effort: "max", "xhigh", "high", "medium",
+        "reasoning_effort": "",  # subagent effort: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
@@ -1656,6 +1652,14 @@ DEFAULT_CONFIG = {
         # warning log if out of range.
         "max_spawn_depth": 1,        # depth cap (1 = flat [default], 2 = orchestrator→leaf, 3 = three-level)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # Explicit root-owned mutation brokerage for orchestrator children.
+        # Disabled by default. When enabled, delegate_task still requires
+        # role="orchestrator", read_only=false, allow_nested_coding=true, and
+        # foreground execution. Children receive request_coding_task only;
+        # raw delegate_coding_task/cwd/background/lifecycle authority stays root-owned.
+        "nested_coding": {
+            "enabled": False,
+        },
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,
@@ -2032,8 +2036,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
         "feature_request_channels": "", # Legacy alias for action_request_channels
-        "action_request_model_tier": "discord_action", # Ordinary Discord action requests use Sol/medium
-        "action_request_complex_model_tier": "advanced", # Complex/risky initial requests use shared Sol/xhigh
+        "action_request_model_tier": "discord_action", # Accepted Discord action requests use Sol/medium
         "action_request_reasoning_effort": "xhigh", # Legacy fallback when action_request_model_tier is disabled
         "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "action_worktree_warmup": "auto", # auto | off; install JS deps when provisioning action worktrees
@@ -2514,7 +2517,7 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
-        # Gateway sessions use Terra/high independently of model.default, which
+        # Gateway sessions use Luna/xhigh independently of model.default, which
         # remains the normal CLI/TUI default.
         "model_tier": "basic",
         # When false (default), any file path the agent emits is delivered
@@ -5016,7 +5019,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             if not quiet:
                 print("  ✓ Added reasoning to the runtime footer fields")
 
-    # ── Version 25 → 26: split routine Discord actions from advanced ──
+    # ── Version 25 → 26: move Discord actions to their route tier ──
     # Only the exact persisted former default is rewritten. Missing values are
     # filled by the normal default migration below, while custom tier names,
     # disabled values, and even differently-cased strings remain untouched.

@@ -4957,6 +4957,12 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import delegate_task as _delegate_task
+        read_only = bool(function_args.get("read_only", False))
+        if getattr(self, "_coding_worker_required_this_turn", False):
+            # General analysis delegation remains available on every routed
+            # coding turn, but repository mutation stays on the trusted coding
+            # worker path. This is deliberately not a Fable-only rule.
+            read_only = True
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
@@ -4966,6 +4972,9 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            read_only=read_only,
+            background=bool(function_args.get("background", False)),
+            allow_nested_coding=bool(function_args.get("allow_nested_coding", False)),
             parent_agent=self,
         )
 
@@ -4988,7 +4997,9 @@ class AIAgent:
             constraints=function_args.get("constraints"),
             verification=function_args.get("verification"),
             scope_paths=function_args.get("scope_paths"),
+            analysis_handoff_ids=function_args.get("analysis_handoff_ids"),
             route_decision=function_args.get("route_decision"),
+            background=bool(function_args.get("background", False)),
             parent_agent=self,
             parent_messages=parent_messages,
         )

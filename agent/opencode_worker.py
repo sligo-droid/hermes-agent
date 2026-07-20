@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional
 BACKEND_CODEX = "codex"
 BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
-_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 0.0
 _DEFAULT_OPENCODE_MODEL = "hermes-codex/gpt-5.6-sol"
 _CODING_WORKER_PASS_NAMES = ("simple_build", "complex_plan", "complex_build")
@@ -304,7 +304,7 @@ def load_coding_worker_model_tier(
         return None
 
 
-def _coding_worker_tiers_disabled(
+def _coding_worker_model_tiers_disabled(
     coding_cfg: dict[str, Any], worker_config: Optional[dict[str, Any]]
 ) -> bool:
     source = worker_config if worker_config is not None and "model_tier" in worker_config else coding_cfg
@@ -315,6 +315,8 @@ def load_coding_worker_pass_profiles(
     config: Optional[dict[str, Any]] = None,
     *,
     worker_config: Optional[dict[str, Any]] = None,
+    task: Any = "",
+    context: Any = "",
 ) -> dict[str, dict[str, str]]:
     """Resolve each coding-worker pass to one atomic model tier or raw fallback."""
     cfg = config
@@ -333,9 +335,13 @@ def load_coding_worker_pass_profiles(
     explicit_model = str(worker_opencode.get("model") or "").strip()
     legacy_model = str(explicit_model or raw_opencode.get("model") or _DEFAULT_OPENCODE_MODEL).strip()
     global_tier_name = worker_cfg.get("model_tier") if "model_tier" in worker_cfg else coding_cfg.get("model_tier")
-    tiers_disabled = _coding_worker_tiers_disabled(coding_cfg, worker_config)
+    tiers_disabled = _coding_worker_model_tiers_disabled(coding_cfg, worker_config)
 
-    from hermes_cli.model_tiers import resolve_model_tier
+    from hermes_cli.model_tiers import (
+        resolve_model_tier,
+        restrict_model_tier_for_task,
+        restrict_reasoning_effort_for_task,
+    )
 
     profiles: dict[str, dict[str, str]] = {}
     legacy_efforts = {
@@ -356,12 +362,25 @@ def load_coding_worker_pass_profiles(
         reasoning_key = f"{pass_name}_reasoning_level"
         explicit_reasoning = worker_cfg.get(reasoning_key) if reasoning_key in worker_cfg else None
         configured_reasoning = coding_cfg.get(reasoning_key)
-        model = explicit_model or (tier.opencode_model if tier is not None else legacy_model)
         reasoning = (
             explicit_reasoning
             if explicit_reasoning is not None
             else tier.reasoning_effort if tier is not None else configured_reasoning or legacy_efforts[pass_name]
         )
+        safe_reasoning = restrict_reasoning_effort_for_task(
+            reasoning,
+            task,
+            context,
+        )
+        if safe_reasoning != str(reasoning or "").strip().lower():
+            tier = restrict_model_tier_for_task(
+                cfg,
+                tier,
+                task,
+                context,
+            )
+        reasoning = safe_reasoning
+        model = explicit_model or (tier.opencode_model if tier is not None else legacy_model)
         profiles[pass_name] = {
             "model_tier": tier.name if tier is not None else "",
             "model": _direct_opencode_model(model),
@@ -375,6 +394,8 @@ def load_coding_worker_pass_config(
     config: Optional[dict[str, Any]] = None,
     *,
     worker_config: Optional[dict[str, Any]] = None,
+    task: Any = "",
+    context: Any = "",
 ) -> dict[str, str]:
     cfg = config
     if cfg is None:
@@ -385,7 +406,12 @@ def load_coding_worker_pass_config(
         except Exception:
             cfg = {}
 
-    profiles = load_coding_worker_pass_profiles(cfg, worker_config=worker_config)
+    profiles = load_coding_worker_pass_profiles(
+        cfg,
+        worker_config=worker_config,
+        task=task,
+        context=context,
+    )
     result: dict[str, str] = {}
     for pass_name, profile in profiles.items():
         result[f"{pass_name}_reasoning_level"] = profile["reasoning_level"]
@@ -398,6 +424,8 @@ def load_opencode_config(
     config: Optional[dict[str, Any]] = None,
     *,
     worker_config: Optional[dict[str, Any]] = None,
+    task: Any = "",
+    context: Any = "",
 ) -> dict[str, Any]:
     cfg = config
     if cfg is None:
@@ -416,7 +444,12 @@ def load_opencode_config(
     if worker_config and isinstance(worker_config.get("opencode"), dict):
         opencode_cfg.update(worker_config["opencode"])
 
-    pass_cfg = load_coding_worker_pass_config(cfg, worker_config=worker_config)
+    pass_cfg = load_coding_worker_pass_config(
+        cfg,
+        worker_config=worker_config,
+        task=task,
+        context=context,
+    )
     model_tier = load_coding_worker_model_tier(cfg, worker_config=worker_config)
     if model_tier is not None and not (
         worker_config
@@ -576,6 +609,7 @@ def run_opencode_task(
     *,
     timeout: float,
     context_for_classification: str = "",
+    task_for_purpose: Any = None,
     force_plan: Optional[bool] = None,
     title: str = "",
     config: Optional[dict[str, Any]] = None,
@@ -584,7 +618,12 @@ def run_opencode_task(
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     scope_session_key: str = "",
 ) -> OpenCodeRunResult:
-    cfg = load_opencode_config(config, worker_config=worker_config)
+    cfg = load_opencode_config(
+        config,
+        worker_config=worker_config,
+        task=prompt if task_for_purpose is None else task_for_purpose,
+        context=context_for_classification,
+    )
     needs_plan = (
         bool(force_plan)
         if force_plan is not None
@@ -1494,9 +1533,6 @@ def _worker_provider_config(model: str, reasoning_level: str) -> tuple[str, dict
             if isinstance(variants, dict):
                 for level in _VALID_REASONING_LEVELS:
                     variants.setdefault(level, {"reasoningEffort": level})
-                # Preserve max literally even if the source provider catalog
-                # came from an older generated worker configuration.
-                variants["max"] = {"reasoningEffort": "max"}
     entry = models.get(model_id)
     if not isinstance(entry, dict):
         raise ValueError(f"OpenCode provider {provider_id!r} cannot represent worker model {model!r}.")
@@ -1562,7 +1598,9 @@ def _plan_prompt(prompt: str) -> str:
 
 
 def _normalize_reasoning_level(value: Any) -> str:
-    raw = str(value or "").strip().lower()
+    from hermes_constants import normalize_reasoning_effort
+
+    raw = normalize_reasoning_effort(value)
     return raw if raw in _VALID_REASONING_LEVELS else ""
 
 

@@ -30,11 +30,32 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
     assert settings["model_tier"] == "worker"
     assert settings["model"] == "custom/dev-model"
     assert settings["opencode_model"] == "custom/dev-worker"
-    assert settings["reasoning"] == "max"
+    assert settings["reasoning"] == "high"
     assert settings["reasoning_source"] == "model_tier"
     assert settings["model_tier_source"] == "role"
     assert "worker_tier" not in settings
     assert "worker_tier_source" not in settings
+
+
+def test_reviewer_role_keeps_review_only_advanced_reasoning(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    config = {
+        "model_tiers": {
+            "advanced": {
+                "model": "custom/reviewer",
+                "opencode_model": "custom/reviewer-worker",
+                "reasoning_effort": "xhigh",
+            }
+        },
+        "roles": {"reviewer": {"model_tier": "advanced"}},
+    }
+
+    settings = workers._role_runtime_settings("reviewer", config, {"title": "Review PR"})
+
+    assert settings["model_tier"] == "advanced"
+    assert settings["reasoning"] == "xhigh"
 
 
 def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeypatch):
@@ -49,8 +70,8 @@ def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeyp
     settings = workers._role_runtime_settings("dev", config)
 
     assert settings["model_tier"] == "intermediate"
-    assert settings["model"] == "gpt-5.6-terra"
-    assert settings["reasoning"] == "max"
+    assert settings["model"] == "gpt-5.6-sol"
+    assert settings["reasoning"] == "medium"
     assert settings["reasoning_source"] == "model_tier"
 
 
@@ -68,9 +89,9 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
     assert scheduled == {
         "model_tier": "worker",
         "opencode": {"model": "custom/dev-worker"},
-        "simple_build_reasoning_level": "max",
-        "complex_plan_reasoning_level": "max",
-        "complex_build_reasoning_level": "max",
+        "simple_build_reasoning_level": "xhigh",
+        "complex_plan_reasoning_level": "xhigh",
+        "complex_build_reasoning_level": "xhigh",
     }
     profiles = opencode_worker.load_coding_worker_pass_profiles(
         {
@@ -93,13 +114,13 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
         name: (profile["model_tier"], profile["model"], profile["reasoning_level"])
         for name, profile in profiles.items()
     } == {
-        "simple_build": ("worker", "custom/dev-worker", "max"),
-        "complex_plan": ("worker", "custom/dev-worker", "max"),
-        "complex_build": ("worker", "custom/dev-worker", "max"),
+        "simple_build": ("worker", "custom/dev-worker", "high"),
+        "complex_plan": ("worker", "custom/dev-worker", "high"),
+        "complex_build": ("worker", "custom/dev-worker", "high"),
     }
     assert worker._role_extra_args("dev") == [
         "-c", 'model="custom/dev-model"',
-        "-c", 'model_reasoning_effort="max"',
+        "-c", 'model_reasoning_effort="high"',
         "-c", 'service_tier="normal"',
     ]
 

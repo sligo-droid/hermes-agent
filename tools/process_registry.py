@@ -1535,6 +1535,64 @@ class ProcessRegistry:
 process_registry = ProcessRegistry()
 
 
+def _format_async_delegation(evt: dict) -> str:
+    delegation_id = evt.get("delegation_id") or evt.get("session_id") or "unknown"
+    results = evt.get("results")
+    if evt.get("is_batch") or isinstance(results, list):
+        results = results or []
+        goals = evt.get("goals") or []
+        task_specs = evt.get("task_specs") or []
+        lines = [
+            f"[ASYNC DELEGATION BATCH COMPLETE — {delegation_id}]",
+            f"Status: {evt.get('status', 'unknown')}",
+        ]
+        if evt.get("context"):
+            lines.append(f"Context you provided: {evt['context']}")
+        if evt.get("toolsets"):
+            lines.append(f"Toolsets: {', '.join(evt['toolsets'])}")
+        if evt.get("read_only"):
+            lines.append("Mode: enforced read-only")
+        for item in sorted(results, key=lambda value: value.get("task_index", 0)):
+            index = int(item.get("task_index", 0) or 0)
+            goal = goals[index] if index < len(goals) else item.get("goal", "")
+            lines.extend(
+                [
+                    "",
+                    f"--- TASK {index + 1}/{max(len(results), len(goals), 1)}: {goal} ---",
+                    f"Status: {item.get('status', 'unknown')}",
+                    str(item.get("summary") or item.get("error") or "No result text."),
+                ]
+            )
+            if index < len(task_specs) and task_specs[index].get("context"):
+                lines.append(f"Task context: {task_specs[index]['context']}")
+            if item.get("handoff"):
+                lines.append(
+                    "Structured handoff: "
+                    + json.dumps(item["handoff"], ensure_ascii=False, sort_keys=True)
+                )
+        return "\n".join(lines)
+
+    lines = [
+        f"[ASYNC DELEGATION COMPLETE — {delegation_id}]",
+        f"Original goal: {evt.get('goal', '')}",
+        f"Status: {evt.get('status', 'unknown')}",
+    ]
+    if evt.get("context"):
+        lines.append(f"Context you provided: {evt['context']}")
+    if evt.get("toolsets"):
+        lines.append(f"Toolsets: {', '.join(evt['toolsets'])}")
+    if evt.get("api_calls") is not None:
+        lines.append(f"API calls: {evt.get('api_calls', 0)}")
+    if evt.get("status") not in {"completed", "success"}:
+        lines.append(
+            "The delegation did not complete successfully: "
+            + str(evt.get("error") or "unknown error")
+        )
+    else:
+        lines.append(str(evt.get("summary") or "No result text."))
+    return "\n".join(lines)
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -1547,6 +1605,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
+
+    if evt_type == "async_delegation":
+        return _format_async_delegation(evt)
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")

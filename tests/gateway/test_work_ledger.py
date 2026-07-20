@@ -76,12 +76,14 @@ def _activated_visual_closeout(
     item: dict,
     *,
     head_sha: str,
+    source: str = "direct",
 ) -> dict:
     attached = ledger.attach_closeout_workspace(
         item["id"],
         workspace_path="/mutable/worktree",
         repository="acme/example",
         branch="feature/visual",
+        source=source,
         mode="enforce",
         policy={
             "merge": "auto",
@@ -468,6 +470,120 @@ def test_agent_run_guard_requires_exact_active_generation(monkeypatch, tmp_path)
         process_epoch="boot-a",
         registry_active=False,
     ) is False
+
+
+def test_active_run_renewal_extends_exact_owner_lease_and_freshness(tmp_path):
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])
+    event = _discord_event(message_id="heartbeat")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=10)
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=7,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+
+    now[0] = 3690.0
+    renewed = ledger.renew_active_run(
+        item["id"],
+        session_key=session_key,
+        run_generation=7,
+        owner_pid=4242,
+        process_epoch="boot-a",
+        lease_seconds=30,
+    )
+
+    assert renewed is not None
+    assert renewed["lease_until"] == 3720.0
+    assert renewed["active_run"]["lease_until"] == 3720.0
+    assert renewed["expires_at"] == 3720.0
+    assert renewed["updated_at"] == 3690.0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"session_key": "wrong"},
+        {"run_generation": 8},
+        {"owner_pid": 4343},
+        {"process_epoch": "boot-b"},
+    ],
+)
+def test_active_run_renewal_rejects_wrong_exact_owner(tmp_path, override):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id=f"wrong-owner-{next(iter(override))}")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=7,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+    kwargs = {
+        "session_key": session_key,
+        "run_generation": 7,
+        "owner_pid": 4242,
+        "process_epoch": "boot-a",
+        **override,
+    }
+
+    assert ledger.renew_active_run(item["id"], **kwargs) is None
+
+
+def test_expiration_terminalizes_active_run_and_marks_reaction_repair(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _discord_event(message_id="expired-run")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    assert ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=3,
+        owner_pid=4242,
+        process_epoch="boot-a",
+    )
+
+    assert ledger.mark_expired(item["id"])
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "expired"
+    assert stored["active_run"] is None
+    assert stored["lease_until"] is None
+    assert stored["summary_status"] == "Interrupted"
+    assert stored["terminal_reaction_sync_pending"] is True
+    assert stored["terminal_reaction_state"] == "errored"
+
+
+def test_discord_thread_reaction_uses_latest_terminal_after_incomplete_clears(tmp_path):
+    now = [100.0]
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now[0])
+    first_event = _discord_event(message_id="first")
+    first = ledger.accept_event(
+        first_event,
+        session_key=build_session_key(first_event.source),
+        freshness_seconds=60,
+    )
+    assert first is not None
+    ledger.mark_expired(first["id"])
+
+    now[0] = 200.0
+    second_event = _discord_event(message_id="second")
+    second = ledger.accept_event(
+        second_event,
+        session_key=build_session_key(second_event.source),
+        freshness_seconds=60,
+    )
+    assert second is not None
+    assert ledger.discord_thread_reaction_state(second) == "running"
+    assert ledger.mark_completed(second["id"])
+    assert ledger.discord_thread_reaction_state(second) == "done"
 
 
 def test_run_state_cas_finalizes_only_unchanged_active_run(tmp_path):
@@ -1906,6 +2022,85 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_startup_replays_recently_heartbeating_dead_process_work(tmp_path):
+    now = [time.time()]
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(
+        tmp_path / "work_ledger.json",
+        now_fn=lambda: now[0],
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._background_tasks = set()
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+
+    event = _discord_event(message_id=_discord_snowflake_at(now[0]))
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=10,
+    )
+    assert item is not None
+    assert runner.work_ledger.mark_agent_running(
+        item["id"],
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=99999999,
+        process_epoch="dead-process",
+    )
+    now[0] += 3590
+    assert runner.work_ledger.renew_active_run(
+        item["id"],
+        session_key=session_key,
+        run_generation=4,
+        owner_pid=99999999,
+        process_epoch="dead-process",
+    )
+    now[0] += 20
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciles_reaction_for_newly_expired_work(tmp_path):
+    now = [100.0]
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(
+        tmp_path / "work_ledger.json",
+        now_fn=lambda: now[0],
+    )
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
+        reconcile_work_ledger_thread_reaction=AsyncMock(return_value="errored"),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._background_tasks = set()
+
+    event = _discord_event(message_id="startup-expired")
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=10,
+    )
+    assert item is not None
+    now[0] = 200.0
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_awaited()
+    adapter.reconcile_work_ledger_thread_reaction.assert_awaited_once()
+    assert runner.work_ledger.get(item["id"])["status"] == "expired"
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_reuses_original_discord_work_item(tmp_path):
     runner = object.__new__(GatewayRunner)
     runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
@@ -2460,7 +2655,11 @@ def test_visual_completion_is_sanitized_and_late_h_receipt_is_rejected_after_h2(
     assert ledger.get(item["id"]) == before
 
 
-def test_verified_h2_publication_invalidates_h_gates_and_active_lease(tmp_path):
+@pytest.mark.parametrize("source", ["direct", "fable"])
+def test_verified_h2_publication_invalidates_h_gates_and_active_lease(
+    tmp_path,
+    source,
+):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     event = _discord_event(
         message_id="closeout-publish-h2",
@@ -2474,7 +2673,12 @@ def test_verified_h2_publication_invalidates_h_gates_and_active_lease(tmp_path):
     )
     assert item is not None
     head_sha = "d" * 40
-    activated = _activated_visual_closeout(ledger, item, head_sha=head_sha)
+    activated = _activated_visual_closeout(
+        ledger,
+        item,
+        head_sha=head_sha,
+        source=source,
+    )
     prior = dict(activated)
     prior["policy"] = {**prior["policy"], "require_review": True}
     prior["review"] = {"status": "approved", "head_sha": head_sha}

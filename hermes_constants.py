@@ -393,22 +393,35 @@ def agent_browser_runnable(path: str | None) -> bool:
 
 
 VALID_REASONING_EFFORTS = (
-    "minimal", "low", "medium", "high", "xhigh", "max",
+    "minimal", "low", "medium", "high", "xhigh",
 )
 VALID_MODEL_VERBOSITIES = ("low", "medium", "high")
+
+
+def normalize_reasoning_effort(effort: Any) -> str:
+    """Normalize a Hermes reasoning effort, including legacy aliases.
+
+    ``max`` was removed from the Hermes reasoning ladder. Existing persisted
+    values remain compatible by resolving to the new spillover ceiling,
+    ``xhigh``; new user-facing selectors should expose only
+    ``VALID_REASONING_EFFORTS``.
+    """
+    normalized = str(effort or "").strip().lower()
+    return "xhigh" if normalized == "max" else normalized
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max".
+    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh".
+    Legacy ``max`` values normalize to ``xhigh``.
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none".
     Returns {"enabled": True, "effort": <level>} for valid effort levels.
     """
     if not effort or not effort.strip():
         return None
-    effort = effort.strip().lower()
+    effort = normalize_reasoning_effort(effort)
     if effort == "none":
         return {"enabled": False}
     if effort in VALID_REASONING_EFFORTS:

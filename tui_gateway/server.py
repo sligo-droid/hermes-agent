@@ -6646,6 +6646,11 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
+            accounting = evt.get("accounting")
+            if isinstance(accounting, dict):
+                from tools.delegate_tool import apply_detached_delegation_accounting
+
+                apply_detached_delegation_accounting(session.get("agent"), accounting)
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
@@ -6691,6 +6696,11 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
+            accounting = evt.get("accounting")
+            if isinstance(accounting, dict):
+                from tools.delegate_tool import apply_detached_delegation_accounting
+
+                apply_detached_delegation_accounting(session.get("agent"), accounting)
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
@@ -8308,8 +8318,10 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 return _ok(rid, {"key": key, "value": "clamp"})
 
+            from hermes_constants import VALID_REASONING_EFFORTS
+
             parsed = parse_reasoning_effort(arg)
-            if parsed is None:
+            if arg not in {"none", *VALID_REASONING_EFFORTS} or parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
             _write_config_key("agent.reasoning_effort", arg)
             if session and session.get("agent") is not None:

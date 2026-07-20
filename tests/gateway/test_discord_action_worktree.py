@@ -94,7 +94,7 @@ def test_closeout_repository_overrides_are_generic_and_nested():
     effective = gateway_run._effective_closeout_repository_config(
         {
             "mode": "shadow",
-            "surfaces": {"direct": False, "fable": True},
+            "surfaces": {"direct": False, "kanban": True},
             "early_draft_pr": False,
             "post_merge_requirements": {"ci": False, "restart": False},
             "repositories": {
@@ -111,7 +111,7 @@ def test_closeout_repository_overrides_are_generic_and_nested():
     )
 
     assert effective["mode"] == "enforce"
-    assert effective["surfaces"] == {"direct": True, "fable": True}
+    assert effective["surfaces"] == {"direct": True, "kanban": True}
     assert effective["early_draft_pr"] is True
     assert effective["visual_qa"] == {"mode": "enforce_explicit"}
     assert effective["post_merge_requirements"] == {
@@ -621,6 +621,54 @@ def _successful_verification_result(mutable, *, mutation_generation=0, mutation_
     }
 
 
+def test_fable_closeout_compatibility_preserves_legacy_opt_outs():
+    base = {
+        "closeout": {
+            "mode": "enforce",
+            "surfaces": {"direct": True},
+        }
+    }
+
+    ordinary_mode, ordinary_policy = gateway_run._gateway_action_closeout_contract(
+        base,
+        repository="acme/example",
+        request="implement and merge this",
+        source="fable",
+    )
+    none_mode, _ = gateway_run._gateway_action_closeout_contract(
+        {**base, "fable": {"git_lifecycle": "none"}},
+        repository="acme/example",
+        request="implement and merge this",
+        source="fable",
+    )
+    disabled_mode, _ = gateway_run._gateway_action_closeout_contract(
+        {
+            **base,
+            "closeout": {
+                **base["closeout"],
+                "surfaces": {"direct": True, "fable": False},
+            },
+        },
+        repository="acme/example",
+        request="implement and merge this",
+        source="fable",
+    )
+    pr_mode, pr_policy = gateway_run._gateway_action_closeout_contract(
+        {**base, "fable": {"git_lifecycle": "pr"}},
+        repository="acme/example",
+        request="implement and merge this",
+        source="fable",
+    )
+
+    assert ordinary_mode == "enforce"
+    assert ordinary_policy["merge"] == "auto"
+    assert none_mode == "off"
+    assert disabled_mode == "off"
+    assert pr_mode == "enforce"
+    assert pr_policy["merge"] == "never"
+    assert pr_policy["early_draft_pr"] is True
+
+
 def test_direct_closeout_rejects_verification_followed_by_mutation(
     tmp_path,
     monkeypatch,
@@ -757,17 +805,23 @@ def test_direct_closeout_does_not_activate_dirty_workspace(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("source", ["direct", "fable"])
 def test_direct_closeout_activates_clean_verified_exact_head(
     tmp_path,
     monkeypatch,
     mode,
+    source,
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     canonical = tmp_path / "canonical"
     mutable = tmp_path / "mutable"
     _init_repo(canonical)
     _run(canonical, "worktree", "add", "-b", "discord/action-test", str(mutable), "HEAD")
-    runner, captured, notifications = _direct_closeout_runner(mutable, mode=mode)
+    runner, captured, notifications = _direct_closeout_runner(
+        mutable,
+        mode=mode,
+        source=source,
+    )
     head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
 
     activated = runner._activate_direct_closeout_after_checkpoint(
@@ -969,21 +1023,26 @@ def test_final_fable_closeout_applies_parent_visual_to_published_exact_head(
         activated=True,
         source="fable",
     )
-    result = {
-        "visual_qa": {
-            "receipts": [{"status": "passed"}],
-            "min_receipt_order": 7,
-        }
+    first_head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
+    (mutable / "fable-correction.txt").write_text("corrected\n", encoding="utf-8")
+    _run(mutable, "add", "fable-correction.txt")
+    _run(mutable, "commit", "-m", "fable correction")
+    result = _successful_verification_result(mutable)
+    result["visual_qa"] = {
+        "receipts": [{"status": "passed"}],
+        "min_receipt_order": 7,
     }
     head_sha = _run(mutable, "rev-parse", "HEAD").stdout.strip()
 
     applied = runner._activate_direct_closeout_after_checkpoint("work-1", result)
 
     assert applied is not None
+    assert captured["published_from_head_sha"] == first_head_sha
+    assert captured["published_head_sha"] == head_sha
     assert captured["applied_head_sha"] == head_sha
     assert captured["min_receipt_order"] == 7
     assert applied["visual_qa"] == {"status": "passed", "head_sha": head_sha}
-    assert notifications == ["work-1"]
+    assert notifications == ["work-1", "work-1"]
 
 
 def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunner:
@@ -1041,6 +1100,106 @@ def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunn
         }
     )
     return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fable_implementation", [False, True])
+async def test_action_runtime_installs_visual_checkpoint_callback_for_fable_and_direct(
+    tmp_path,
+    monkeypatch,
+    fable_implementation,
+):
+    import sys
+    import types
+
+    class CapturingAgent:
+        instance = None
+
+        def __init__(self, **_kwargs):
+            self.tools = []
+            type(self).instance = self
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": "done",
+                "messages": [],
+                "api_calls": 1,
+                "model": "claude-fable-5" if fable_implementation else "gpt-5.6",
+                "provider": "anthropic" if fable_implementation else "openai",
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"tools": {"discord": {"enabled": ["all"]}}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda _config, _platform: {"core", "terminal"},
+    )
+
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    runner._run_agent = gateway_run.GatewayRunner._run_agent.__get__(
+        runner,
+        gateway_run.GatewayRunner,
+    )
+    model = "claude-fable-5" if fable_implementation else "gpt-5.6"
+    provider = "anthropic" if fable_implementation else "openai"
+    runtime = {"provider": provider, "api_key": "fake"}
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (model, runtime)
+    runner._resolve_turn_agent_config = lambda *_args, **_kwargs: {
+        "model": model,
+        "runtime": runtime,
+        "request_overrides": {},
+    }
+    runner._activate_direct_closeout_after_checkpoint = MagicMock(
+        return_value={"status": "pending"}
+    )
+    source = _source(tmp_path)
+
+    await runner._run_agent(
+        message="Implement the responsive dashboard.",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key="agent:main:discord:thread:thread-123",
+        feature_summary={"initial_request": "Implement the responsive dashboard."},
+        fable_plan_metadata=(
+            {
+                "command": "fable",
+                "fable_mode": "implementation",
+            }
+            if fable_implementation
+            else None
+        ),
+        session_cwd_override=str(tmp_path),
+        visual_qa_requirement={
+            "level": "surface",
+            "target": "dashboard",
+            "assertions": ["no horizontal overflow"],
+        },
+        visual_qa_config={"mode": "enforce_explicit"},
+        origin_work_item_id="work-1",
+    )
+
+    callback = CapturingAgent.instance._visual_qa_stop_callback
+    assert callable(callback)
+    callback({"mutation_generation": 1, "mutation_boundary": 2})
+    runner._activate_direct_closeout_after_checkpoint.assert_called_once_with(
+        "work-1",
+        {
+            "runtime_breakdown": {
+                "mutation_generation": 1,
+                "mutation_boundary": 2,
+            }
+        },
+        visual_pending=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -1275,11 +1434,13 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
         ("Implement this and open a PR only; do not merge it.", "never"),
     ],
 )
+@pytest.mark.parametrize("fable_implementation", [False, True])
 async def test_direct_closeout_policy_preserves_pr_lifecycle_intent(
     tmp_path,
     monkeypatch,
     initial_request,
     expected_merge,
+    fable_implementation,
 ):
     canonical_root = tmp_path / "canonical"
     canonical = canonical_root / "PID"
@@ -1314,6 +1475,15 @@ async def test_direct_closeout_policy_preserves_pr_lifecycle_intent(
         message_id="message-1",
     )
     event.feature_summary = {"initial_request": initial_request}
+    if fable_implementation:
+        event.fable_plan_metadata = {
+            "command": "fable",
+            "fable_mode": "implementation",
+        }
+        runner._run_agent.return_value.update(
+            model="claude-fable-5",
+            provider="anthropic",
+        )
 
     response = await runner._handle_message_with_agent(
         event,
@@ -1323,6 +1493,69 @@ async def test_direct_closeout_policy_preserves_pr_lifecycle_intent(
     )
 
     assert response == "done"
-    assert captured["closeout"]["source"] == "direct"
+    assert captured["closeout"]["source"] == (
+        "fable" if fable_implementation else "direct"
+    )
+    assert captured["closeout"]["mode"] == "shadow"
     assert captured["closeout"]["policy"]["merge"] == expected_merge
     assert captured["closeout"]["policy"]["pr_open"] == "after_review_approval"
+
+
+@pytest.mark.asyncio
+async def test_fable_action_fallback_honors_legacy_closeout_opt_out(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    config = _config(canonical)
+    config["closeout"] = {
+        "mode": "enforce",
+        "surfaces": {"direct": True},
+    }
+    config["fable"] = {"git_lifecycle": "none"}
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake"},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100_000,
+    )
+
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    runner._persist_action_closeout_workspace = lambda _event, **kwargs: captured.update(
+        closeout=kwargs
+    )
+    event = MessageEvent(
+        text="Proceed with Fable.",
+        source=_source(canonical),
+        message_id="message-1",
+    )
+    event.feature_summary = _feature_summary()
+    event.fable_plan_metadata = {
+        "command": "fable",
+        "fable_mode": "implementation",
+    }
+    runner._run_agent.return_value.update(
+        model="claude-fable-5",
+        provider="anthropic",
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        event.source,
+        "agent:main:discord:thread:thread-123",
+        1,
+    )
+
+    assert response == "done"
+    assert captured["closeout"]["source"] == "fable"
+    assert captured["closeout"]["mode"] == "off"

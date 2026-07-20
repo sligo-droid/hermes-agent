@@ -4,9 +4,6 @@ from types import SimpleNamespace
 
 from hermes_cli.fable_planner import (
     FABLE_DEFAULT_TOOLSETS,
-    FABLE_GIT_LIFECYCLE_MERGE,
-    FABLE_GIT_LIFECYCLE_NONE,
-    FABLE_GIT_LIFECYCLE_PR,
     FABLE_IMPLEMENTATION_MODE,
     FABLE_MODEL,
     FABLE_PLAN_MODE,
@@ -15,7 +12,6 @@ from hermes_cli.fable_planner import (
     build_fable_plan_invocation,
     build_fable_user_instruction,
     fable_enabled_toolsets,
-    fable_git_lifecycle_mode,
     fable_metadata,
     fable_reasoning_config,
     fable_session_model_override,
@@ -320,35 +316,27 @@ def test_discord_fable_parser_routes_explicit_and_natural_plan_requests_plan_onl
         assert parse_fable_command_args(request) == (FABLE_PLAN_MODE, request)
 
 
-def test_build_fable_implementation_instruction_requires_codex_delegation():
+def test_build_fable_implementation_instruction_uses_normal_worker_policy():
     packet = build_fable_implementation_instruction(
         FablePlanRequest(prompt="add feature", platform="discord", session_id="s1")
     )
 
     assert "add feature" in packet
+    assert "normal Discord action-request policy" in packet
+    assert "changes model and provenance only" in packet
+    assert "delegate_task(read_only=true)" in packet
     assert "delegate_coding_task" in packet
-    assert "Codex coding worker" in packet
     assert "Choose `model_tier` deliberately" in packet
     assert "`trivial`, `basic`, `intermediate`, or `advanced`" in packet
     assert "reasoning_effort" in packet
     assert "worker_tier" not in packet
-    assert "Front-load what you learned into `relevant_files`" in packet
-    assert "several `delegate_coding_task` calls in one response" in packet
-    assert "non-overlapping `scope_paths`" in packet
-    assert "Never parallelize coupled edits" in packet
-    assert "review the merged result afterward" in packet
-    assert "only for read-only analysis fan-out" in packet
-    assert "proposed content transformations and data-quality assessments" in packet
-    assert "keep every mutation on `delegate_coding_task`" in packet
-    assert "Do not foreground-watch long external Airflow/DAG/intake/deploy runs" in packet
-    assert "bounded cron poller" in packet
-    assert "completion re-enters as a follow-up turn" in packet
-    assert "Do not fall back to OpenCode" in packet
-    assert "`fable_git_result.recovery_required`" in packet
-    assert "call `delegate_coding_task` again with the same `cwd`" in packet
-    assert "`merge_performed`" in packet
-    assert "`merge_observed`" in packet
-    assert "Never say that Codex committed" in packet
+    assert "scope reservations" in packet
+    assert "isolated parallel worktrees" in packet
+    assert "gateway-owned trusted closeout state machine" in packet
+    assert "handles commit, push, PR, CI, merge" in packet
+    assert "exactly as it does for an ordinary Discord action request" in packet
+    assert "worker prose alone" in packet
+    assert "fable_git_result" not in packet
 
 
 def test_build_fable_plan_invocation_uses_plan_skill(monkeypatch):
@@ -377,7 +365,7 @@ def test_default_config_pins_fable_route():
     assert DEFAULT_CONFIG["fable"]["provider"] == "anthropic"
     assert DEFAULT_CONFIG["fable"]["model"] == FABLE_MODEL
     assert DEFAULT_CONFIG["fable"]["route"] == "anthropic_oauth"
-    assert DEFAULT_CONFIG["fable"]["git_lifecycle"] == FABLE_GIT_LIFECYCLE_NONE
+    assert "git_lifecycle" not in DEFAULT_CONFIG["fable"]
     assert DEFAULT_CONFIG["fable"]["enabled_toolsets"] == FABLE_DEFAULT_TOOLSETS
 
 
@@ -387,13 +375,6 @@ def test_fable_enabled_toolsets_defaults_to_compact_budget():
 
 def test_fable_enabled_toolsets_allows_config_override():
     assert fable_enabled_toolsets(config={"fable": {"enabled_toolsets": ["file", "web"]}}) == ["file", "web"]
-
-
-def test_fable_git_lifecycle_defaults_closed_and_normalizes_known_modes():
-    assert fable_git_lifecycle_mode({}) == FABLE_GIT_LIFECYCLE_NONE
-    assert fable_git_lifecycle_mode({"fable": {"git_lifecycle": "PR"}}) == FABLE_GIT_LIFECYCLE_PR
-    assert fable_git_lifecycle_mode({"fable": {"git_lifecycle": "merge"}}) == FABLE_GIT_LIFECYCLE_MERGE
-    assert fable_git_lifecycle_mode({"fable": {"git_lifecycle": "anything"}}) == FABLE_GIT_LIFECYCLE_NONE
 
 
 def test_fable_reasoning_config_uses_configured_discord_feature_effort():
@@ -432,7 +413,7 @@ def test_fable_implementation_metadata_is_not_a_plan_artifact():
     metadata = fable_metadata(mode=FABLE_IMPLEMENTATION_MODE)
 
     assert metadata["fable_mode"] == FABLE_IMPLEMENTATION_MODE
-    assert metadata["git_lifecycle"] == FABLE_GIT_LIFECYCLE_NONE
+    assert "git_lifecycle" not in metadata
     assert metadata["kind"] == "fable_implementation"
     assert "plan_artifact_kind" not in metadata
 

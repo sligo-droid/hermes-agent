@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import copy
 import os
 import re
 import subprocess
@@ -20,7 +21,7 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS, resolve_model_tier
-from hermes_constants import VALID_REASONING_EFFORTS
+from hermes_constants import VALID_REASONING_EFFORTS, normalize_reasoning_effort
 from tools.parallel_worker_worktrees import (
     ParallelWorkerContext as _ParallelWorkerContext,
     merge_parallel_worker_result_unlocked as _merge_parallel_worker_result_locked,
@@ -48,7 +49,130 @@ _CODING_WORKER_FALLBACK_ENV_KEYS = frozenset({
     "PATH",
     "SSH_AUTH_SOCK",
 })
-_BACKGROUND_ROUTE_MARKER = "_hermes_background_coding_worker"
+_MUTATION_RESERVATIONS_LOCK = threading.Lock()
+_MUTATION_RESERVATIONS: dict[str, dict[str, Any]] = {}
+_PARALLEL_WORKER_RESERVATIONS_LOCK = threading.Lock()
+_PARALLEL_WORKER_RESERVATIONS: dict[str, str] = {}
+
+
+def _reservation_root(cwd: str) -> str:
+    path = Path(str(cwd or "")).expanduser().resolve(strict=False)
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(path),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0 and str(proc.stdout or "").strip():
+            return str(Path(proc.stdout.strip()).resolve(strict=False))
+    except Exception:
+        pass
+    return str(path)
+
+
+def _reservation_scopes(scope_paths: Any) -> list[PurePosixPath]:
+    normalized, error = _normalize_scope_paths(scope_paths)
+    if error or not normalized:
+        return [PurePosixPath(".")]
+    return [PurePosixPath(path) for path in normalized]
+
+
+def _scope_prefix_overlap(left: PurePosixPath, right: PurePosixPath) -> bool:
+    if str(left) == "." or str(right) == ".":
+        return True
+    common = min(len(left.parts), len(right.parts))
+    return left.parts[:common] == right.parts[:common]
+
+
+def _acquire_mutation_reservation(
+    *, cwd: str, scope_paths: Any, parallel_group: Any
+) -> tuple[Optional[str], Optional[str]]:
+    root = _reservation_root(cwd)
+    scopes = _reservation_scopes(scope_paths)
+    group_id = (
+        str(parallel_group.get("group_id") or "")
+        if isinstance(parallel_group, dict)
+        else ""
+    )
+    isolated = bool(group_id)
+    with _MUTATION_RESERVATIONS_LOCK:
+        for existing in _MUTATION_RESERVATIONS.values():
+            if existing["root"] != root:
+                continue
+            # Sharing a repository is safe only inside the same trusted
+            # isolated-worktree group and only for non-overlapping scopes.
+            same_isolated_group = bool(
+                isolated
+                and existing.get("isolated")
+                and existing.get("group_id") == group_id
+            )
+            overlaps = any(
+                _scope_prefix_overlap(left, right)
+                for left in scopes
+                for right in existing["scopes"]
+            )
+            if not same_isolated_group or overlaps:
+                return None, (
+                    "Coding-worker capacity reached for this repository: the "
+                    "requested mutation scope is already reserved. "
+                    f"root={root}; requested_scopes={[str(p) for p in scopes]}; "
+                    f"active_scopes={[str(p) for p in existing['scopes']]}. "
+                    "Wait for the active worker, retry synchronously with "
+                    "background=false after it completes, or use one trusted "
+                    "parallel group with non-overlapping scope_paths."
+                )
+        reservation_id = f"coding_res_{uuid.uuid4().hex[:12]}"
+        _MUTATION_RESERVATIONS[reservation_id] = {
+            "root": root,
+            "scopes": scopes,
+            "isolated": isolated,
+            "group_id": group_id,
+            "created_at": time.time(),
+        }
+    return reservation_id, None
+
+
+def _release_mutation_reservation(reservation_id: Optional[str]) -> None:
+    if not reservation_id:
+        return
+    with _MUTATION_RESERVATIONS_LOCK:
+        _MUTATION_RESERVATIONS.pop(str(reservation_id), None)
+
+
+def _transfer_parallel_worker_reservation(
+    raw_result: Any,
+    reservation_id: Optional[str],
+) -> bool:
+    """Bind a reservation to an isolated worktree until merge finalization."""
+    if not reservation_id:
+        return False
+    try:
+        payload = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+    except (TypeError, ValueError):
+        return False
+    parallel = payload.get("parallel") if isinstance(payload, dict) else None
+    worker_cwd = parallel.get("worker_cwd") if isinstance(parallel, dict) else None
+    if not (
+        isinstance(worker_cwd, str)
+        and worker_cwd.strip()
+        and parallel.get("merge_pending") is True
+    ):
+        return False
+    key = str(Path(worker_cwd).expanduser().resolve(strict=False))
+    with _PARALLEL_WORKER_RESERVATIONS_LOCK:
+        _PARALLEL_WORKER_RESERVATIONS[key] = str(reservation_id)
+    return True
+
+
+def _release_parallel_worker_reservation(worker_cwd: str) -> None:
+    key = str(Path(worker_cwd).expanduser().resolve(strict=False))
+    with _PARALLEL_WORKER_RESERVATIONS_LOCK:
+        reservation_id = _PARALLEL_WORKER_RESERVATIONS.pop(key, None)
+    _release_mutation_reservation(reservation_id)
 
 
 def check_coding_worker_requirements() -> bool:
@@ -311,6 +435,80 @@ def _context_pack_lines(
     return lines
 
 
+def _resolve_analysis_handoffs(
+    parent_agent: Any,
+    handoff_ids: Any,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Resolve model-supplied IDs against root-owned immutable handoff records."""
+    if handoff_ids is None:
+        return [], None
+    if not isinstance(handoff_ids, list):
+        return [], "analysis_handoff_ids must be an array of handoff IDs."
+    root = getattr(parent_agent, "_delegate_root_agent", parent_agent)
+    registry = getattr(root, "_delegation_handoffs", None)
+    if not isinstance(registry, dict):
+        return [], "No structured delegation handoffs are registered for this root turn."
+    from tools.delegate_tool import (
+        _ASYNC_HANDOFF_MAX_AGE_SECONDS,
+        _delegation_binding,
+    )
+
+    current_binding = copy.deepcopy(
+        getattr(parent_agent, "_delegation_root_binding", None)
+        or _delegation_binding(root)
+    )
+    binding_fields = (
+        "session_key",
+        "session_id",
+        "work_item_id",
+        "workspace",
+        "repository_root",
+    )
+    resolved: list[dict[str, Any]] = []
+    for raw in handoff_ids:
+        handoff_id = str(raw or "").strip()
+        value = registry.get(handoff_id)
+        if not handoff_id or not isinstance(value, dict):
+            return [], f"Unknown analysis handoff ID: {handoff_id or '<empty>'}."
+        expected_binding = value.get("binding")
+        mismatch = not isinstance(expected_binding, dict) or any(
+            str(expected_binding.get(field) or "")
+            != str(current_binding.get(field) or "")
+            for field in binding_fields
+        )
+        expected_turn = (
+            str(expected_binding.get("turn_id") or "")
+            if isinstance(expected_binding, dict)
+            else ""
+        )
+        current_turn = str(current_binding.get("turn_id") or "")
+        cross_turn = bool(expected_turn and current_turn and expected_turn != current_turn)
+        created_at = value.get("created_at")
+        try:
+            age_seconds = max(0.0, time.time() - float(created_at))
+        except (TypeError, ValueError):
+            age_seconds = float("inf")
+        if cross_turn and not (
+            value.get("read_only") is True
+            and age_seconds <= _ASYNC_HANDOFF_MAX_AGE_SECONDS
+        ):
+            mismatch = True
+        if mismatch:
+            lock = getattr(root, "_delegation_handoffs_lock", None)
+            if lock is not None:
+                with lock:
+                    registry.pop(handoff_id, None)
+            else:
+                registry.pop(handoff_id, None)
+            return [], (
+                f"Stale or mismatched analysis handoff ID: {handoff_id}. "
+                "The handoff is not bound to this root session, work item, and "
+                "workspace, or its cross-turn read-only lease expired."
+            )
+        resolved.append(copy.deepcopy(value))
+    return resolved, None
+
+
 def _normalize_scope_paths(scope_paths: Any) -> tuple[Optional[list[str]], Optional[str]]:
     if scope_paths is None:
         return None, None
@@ -440,25 +638,32 @@ def merge_parallel_worker_result(
 ) -> dict[str, Any]:
     """Apply one isolated worker diff to the turn workspace under a group lock."""
     resolved_worker_cwd = str(Path(worker_cwd).expanduser().resolve())
-    with _BACKGROUND_PARALLEL_WORKERS_GUARD:
-        completed = _BACKGROUND_PARALLEL_RESULTS.pop(resolved_worker_cwd, None)
-        if completed is not None:
-            return dict(completed)
-        if resolved_worker_cwd in _BACKGROUND_PARALLEL_WORKERS:
-            return {
-                "group_id": str(group_id),
-                "worker_cwd": resolved_worker_cwd,
-                "merged": False,
-                "merge_pending": True,
-                "merge_conflicts": [],
-                "worktree_kept": True,
-            }
-    with _parallel_merge_lock_for(str(group_id)):
-        return _merge_parallel_worker_result_locked(
-            str(Path(base_cwd).expanduser().resolve()),
-            resolved_worker_cwd,
-            str(group_id),
-        )
+    should_release = False
+    try:
+        with _BACKGROUND_PARALLEL_WORKERS_GUARD:
+            completed = _BACKGROUND_PARALLEL_RESULTS.pop(resolved_worker_cwd, None)
+            if completed is not None:
+                should_release = True
+                return dict(completed)
+            if resolved_worker_cwd in _BACKGROUND_PARALLEL_WORKERS:
+                return {
+                    "group_id": str(group_id),
+                    "worker_cwd": resolved_worker_cwd,
+                    "merged": False,
+                    "merge_pending": True,
+                    "merge_conflicts": [],
+                    "worktree_kept": True,
+                }
+        should_release = True
+        with _parallel_merge_lock_for(str(group_id)):
+            return _merge_parallel_worker_result_locked(
+                str(Path(base_cwd).expanduser().resolve()),
+                resolved_worker_cwd,
+                str(group_id),
+            )
+    finally:
+        if should_release:
+            _release_parallel_worker_reservation(resolved_worker_cwd)
 
 
 def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
@@ -631,56 +836,6 @@ def _mutable_worktree_for_canonical_cwd(workdir: str) -> str | None:
     return str(candidates[0]) if candidates else None
 
 
-def _is_fable_implementation_parent(parent_agent: Any) -> bool:
-    """Whether this delegated turn is a Discord Fable implementation parent."""
-    return bool(getattr(parent_agent, "_fable_implementation_turn", False))
-
-
-def _fable_mutable_worktree_error(workdir: str) -> str | None:
-    """Return a clear error unless *workdir* is an editable git worktree."""
-    try:
-        path = Path(str(workdir)).expanduser().resolve(strict=False)
-    except Exception:
-        path = Path(str(workdir))
-    if not path.is_dir():
-        return (
-            "Fable implementation requires a mutable git worktree, but the configured "
-            f"working directory does not exist: {workdir}."
-        )
-    if not os.access(path, os.W_OK):
-        return (
-            "Fable implementation requires a mutable git worktree, but the configured "
-            f"working directory is not writable: {path}."
-        )
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree", "--is-bare-repository"],
-            cwd=str(path),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception as exc:
-        return (
-            "Fable implementation requires a mutable git worktree, but Git could not "
-            f"inspect {path}: {exc}."
-        )
-    values = [line.strip().lower() for line in str(proc.stdout or "").splitlines()]
-    if proc.returncode != 0 or not values or values[0] != "true":
-        return (
-            "Fable implementation requires a mutable git worktree; "
-            f"{path} is not inside a Git worktree."
-        )
-    if len(values) > 1 and values[1] == "true":
-        return (
-            "Fable implementation requires a mutable git worktree; "
-            f"{path} is a bare Git repository."
-        )
-    return None
-
-
 def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_agent: Any) -> DelegateCodingTaskPreflight:
     """Normalize/suppress malformed worker starts before visible execution."""
 
@@ -691,18 +846,6 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
     )
     args["task"] = task_text
     args["context"] = context_text
-    if bool(args.get("background")) and not (
-        isinstance(args.get("route_decision"), dict)
-        and args["route_decision"].get(_BACKGROUND_ROUTE_MARKER) is True
-    ):
-        # ``run_agent.AIAgent._dispatch_coding_task`` predates the public
-        # background field and intentionally forwards only its bounded argument
-        # allowlist. Carry the request through its already-forwarded
-        # route_decision slot, then unwrap it inside this owned tool module.
-        args["route_decision"] = {
-            _BACKGROUND_ROUTE_MARKER: True,
-            "value": args.get("route_decision"),
-        }
     if not task_text:
         return DelegateCodingTaskPreflight(
             args=args,
@@ -722,16 +865,8 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
         canonical_error = None
     worker_required = bool(
         getattr(parent_agent, "_coding_worker_required_this_turn", False)
-        or _is_fable_implementation_parent(parent_agent)
     )
     if not canonical_error:
-        if _is_fable_implementation_parent(parent_agent):
-            worktree_error = _fable_mutable_worktree_error(workdir)
-            if worktree_error:
-                return DelegateCodingTaskPreflight(
-                    args=args,
-                    suppressed_result=tool_error(worktree_error),
-                )
         return DelegateCodingTaskPreflight(args=args)
     if not worker_required:
         return DelegateCodingTaskPreflight(args=args)
@@ -747,13 +882,6 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
                 f"coding worker to mutable worktree {repaired_cwd} before launch."
             ),
         )
-        if _is_fable_implementation_parent(parent_agent):
-            worktree_error = _fable_mutable_worktree_error(repaired_cwd)
-            if worktree_error:
-                return DelegateCodingTaskPreflight(
-                    args=args,
-                    suppressed_result=tool_error(worktree_error),
-                )
         return DelegateCodingTaskPreflight(args=args)
 
     return DelegateCodingTaskPreflight(
@@ -764,18 +892,6 @@ def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_
             "Create or select a Hermes worktree and retry with cwd set to that absolute path."
         ),
     )
-
-
-def _unwrap_background_route_decision(
-    background: bool,
-    route_decision: Any,
-) -> tuple[bool, Any]:
-    if (
-        isinstance(route_decision, dict)
-        and route_decision.get(_BACKGROUND_ROUTE_MARKER) is True
-    ):
-        return True, route_decision.get("value")
-    return bool(background), route_decision
 
 
 def _workspace_fallback_for_missing_cwd(workdir: str) -> tuple[str, dict[str, str]] | tuple[None, None]:
@@ -824,10 +940,15 @@ def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: s
         parameters = inspect.signature(run_opencode_task).parameters
     except (TypeError, ValueError):
         parameters = {}
-    if "scope_session_key" in parameters or any(
+    accepts_kwargs = any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
-    ):
+    )
+    if parameters and not accepts_kwargs:
+        scoped_kwargs = {
+            key: value for key, value in scoped_kwargs.items() if key in parameters
+        }
+    if "scope_session_key" in parameters or accepts_kwargs:
         scoped_kwargs["scope_session_key"] = scope_session_key
     try:
         return run_opencode_task(*args, **scoped_kwargs)
@@ -839,6 +960,27 @@ def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: s
         ):
             raise
         return run_opencode_task(*args, **kwargs)
+
+
+def _load_worker_pass_settings(
+    loader: Any,
+    *,
+    task: str,
+    context: str,
+    worker_config: Optional[dict[str, Any]] = None,
+) -> Any:
+    """Pass task-purpose context while tolerating legacy test/plugin loaders."""
+
+    kwargs: dict[str, Any] = {"task": task, "context": context}
+    if worker_config is not None:
+        kwargs["worker_config"] = worker_config
+    try:
+        return loader(**kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        fallback = {"worker_config": worker_config} if worker_config is not None else {}
+        return loader(**fallback)
 
 
 def _worker_project_context(workdir: str) -> str:
@@ -1067,12 +1209,6 @@ def _git_common_dir_outside_workspace(workdir: str) -> str | None:
     except Exception:
         return None
     return None if _path_inside(common_dir, workspace) else str(common_dir)
-
-
-def _fable_git_lifecycle_mode(parent_agent: Any) -> str:
-    """Read the gateway-owned Fable capability without trusting model input."""
-    raw = str(getattr(parent_agent, "_fable_git_lifecycle", "") or "").strip().lower()
-    return raw if raw in {"pr", "merge"} else "none"
 
 
 def _coding_worker_fallback_env(extra: dict[str, str]) -> dict[str, str]:
@@ -1522,75 +1658,6 @@ def _prepare_pnpm_dependency_links(workdir: str) -> list[str]:
     return notes
 
 
-def _persist_fable_closeout(
-    parent_agent: Any,
-    closeout_state: dict[str, Any],
-    loaded_config: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str]:
-    """Persist lifecycle handoff before a coding-worker result can complete."""
-
-    work_item_id = str(
-        getattr(parent_agent, "_origin_work_item_id", "")
-        or getattr(parent_agent, "work_item_id", "")
-        or ""
-    ).strip()
-    if not work_item_id:
-        return None, (
-            "Fable Git lifecycle requires a durable closeout work item; "
-            "refusing to report completion without a persistence sink."
-        )
-    closeout_cfg = loaded_config.get("closeout") if isinstance(loaded_config.get("closeout"), dict) else {}
-    surfaces = closeout_cfg.get("surfaces") if isinstance(closeout_cfg.get("surfaces"), dict) else {}
-    if surfaces.get("fable") is False or str(closeout_cfg.get("mode") or "shadow").lower() == "off":
-        return None, (
-            "Fable Git lifecycle closeout is disabled for this surface; "
-            "refusing to fall back to synchronous CI polling."
-        )
-    try:
-        from gateway.work_ledger import GatewayWorkLedger
-        from hermes_cli.trusted_closeout import normalize_closeout_state
-
-        ledger = getattr(parent_agent, "_closeout_ledger", None) or GatewayWorkLedger()
-        state = normalize_closeout_state(closeout_state)
-        state["mode"] = str(closeout_cfg.get("mode") or state.get("mode") or "shadow").lower()
-        post_merge = closeout_cfg.get("post_merge_requirements")
-        if isinstance(post_merge, dict):
-            state["policy"]["post_merge_requirements"] = {
-                key: post_merge.get(key) is True
-                for key in ("canonical_sync", "ci", "deployment", "production_qa", "restart")
-            }
-        existing_item = ledger.get(work_item_id)
-        if not isinstance(existing_item, dict):
-            return None, "Fable Git lifecycle work item is unavailable in the durable closeout ledger."
-        existing_state = (
-            existing_item.get("closeout")
-            if isinstance(existing_item.get("closeout"), dict)
-            else {}
-        )
-        persisted = ledger.activate_closeout(
-            work_item_id,
-            state,
-            expected_revision=int(existing_state.get("revision") or 0),
-        )
-        if persisted is None:
-            return None, "Fable Git lifecycle closeout revision changed before atomic activation completed."
-        try:
-            from gateway.trusted_closeout_watcher import mark_closeout_dirty
-
-            mark_closeout_dirty(work_item_id)
-        except Exception:
-            pass
-        notify = getattr(parent_agent, "_closeout_notify", None)
-        if callable(notify):
-            try:
-                notify(work_item_id)
-            except Exception:
-                pass
-        return persisted, ""
-    except Exception as exc:
-        return None, f"Fable Git lifecycle closeout persistence failed: {exc}"
-
-
 def _delegate_coding_task_impl(
     task: Optional[str] = None,
     context: Optional[str] = None,
@@ -1603,6 +1670,7 @@ def _delegate_coding_task_impl(
     constraints: Optional[str] = None,
     verification: Optional[str] = None,
     scope_paths: Optional[list[str]] = None,
+    analysis_handoff_ids: Optional[list[str]] = None,
     allow_git_pr_lifecycle: bool = False,
     trusted_allow_git_pr_lifecycle: bool = False,
     route_decision: Any = None,
@@ -1638,6 +1706,11 @@ def _delegate_coding_task_impl(
     normalized_scope_paths, scope_error = _normalize_scope_paths(scope_paths)
     if scope_error:
         return tool_error(scope_error)
+    analysis_handoffs, handoff_error = _resolve_analysis_handoffs(
+        parent_agent, analysis_handoff_ids
+    )
+    if handoff_error:
+        return tool_error(handoff_error)
 
     try:
         from hermes_cli.config import load_config
@@ -1647,6 +1720,7 @@ def _delegate_coding_task_impl(
         loaded_config = {}
 
     selected_model_tier = None
+    tier_reasoning_override = None
     if model_tier is not None:
         selected_model_tier = resolve_model_tier(loaded_config, model_tier)
         if selected_model_tier is None:
@@ -1655,38 +1729,51 @@ def _delegate_coding_task_impl(
                 f"Unknown model_tier {model_tier!r}. Configure it under model_tiers "
                 f"or use a built-in tier: {built_in_tiers}."
             )
+        from hermes_cli.model_tiers import restrict_model_tier_for_task
+
+        unrestricted_model_tier = selected_model_tier
+        selected_model_tier = restrict_model_tier_for_task(
+            loaded_config,
+            selected_model_tier,
+            task_text,
+            context_text,
+            worker=True,
+        )
+        if (
+            selected_model_tier is not None
+            and selected_model_tier.reasoning_effort
+            != unrestricted_model_tier.reasoning_effort
+        ):
+            tier_reasoning_override = selected_model_tier.reasoning_effort
     selected_reasoning_effort = None
     if reasoning_effort is not None:
-        selected_reasoning_effort = str(reasoning_effort or "").strip().lower()
+        selected_reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         if selected_reasoning_effort not in VALID_REASONING_EFFORTS:
             valid_efforts = ", ".join(VALID_REASONING_EFFORTS)
             return tool_error(
                 f"Unknown reasoning_effort {reasoning_effort!r}. "
                 f"Valid efforts: {valid_efforts}."
             )
+        from hermes_cli.model_tiers import restrict_reasoning_effort_for_task
+
+        selected_reasoning_effort = restrict_reasoning_effort_for_task(
+            selected_reasoning_effort,
+            task_text,
+            context_text,
+        )
     model_tier_config = _model_tier_config(
         selected_model_tier,
-        selected_reasoning_effort,
+        selected_reasoning_effort or tier_reasoning_override,
     )
 
-    fable_implementation = _is_fable_implementation_parent(parent_agent)
-    fable_git_lifecycle = _fable_git_lifecycle_mode(parent_agent)
     allow_git_pr_lifecycle = _trusted_git_pr_lifecycle_enabled(
         parent_agent,
         bool(allow_git_pr_lifecycle),
         trusted_allow_git_pr_lifecycle,
     )
-    # Fable follows the same ownership split as the Kanban coding lanes:
-    # Codex owns implementation and focused verification, while trusted Hermes
-    # code owns commit/push/PR/CI/merge. Never give the Fable child GitHub
-    # authority or linked-worktree Git metadata merely because the parent
-    # lifecycle policy is ``pr`` or ``merge``.
-    if fable_implementation:
-        allow_git_pr_lifecycle = False
     allow_git_pr_merge = False
     workdir = _resolve_cwd(cwd, parent_agent)
     _parallel_context: Optional[_ParallelWorkerContext] = None
-    fable_git_preparation = None
     cwd_fallback_metadata: dict[str, str] | None = None
     if not Path(workdir).exists():
         fallback_workdir, cwd_fallback_metadata = _workspace_fallback_for_missing_cwd(workdir)
@@ -1710,77 +1797,7 @@ def _delegate_coding_task_impl(
     except Exception:
         canonical_error = None
     if canonical_error:
-        if fable_implementation:
-            repaired_cwd = _mutable_worktree_for_canonical_cwd(workdir)
-            if repaired_cwd:
-                workdir = repaired_cwd
-            else:
-                return tool_error(
-                    "Fable implementation requires a mutable /home/droid/workspaces/ "
-                    f"worktree for protected canonical cwd {workdir}; refusing direct Fable edits."
-                )
-        else:
-            return tool_error(canonical_error)
-    if fable_implementation:
-        worktree_error = _fable_mutable_worktree_error(workdir)
-        if worktree_error:
-            return tool_error(worktree_error)
-        if fable_git_lifecycle in {"pr", "merge"}:
-            try:
-                from hermes_cli.fable_git_finalizer import prepare_fable_git_lifecycle
-
-                fable_git_preparation = prepare_fable_git_lifecycle(
-                    workdir,
-                    fable_git_lifecycle,
-                )
-            except Exception as exc:
-                return tool_error(
-                    "Fable Git lifecycle preflight failed before the Codex worker "
-                    f"started: {exc}"
-                )
-            if not fable_git_preparation.success:
-                return tool_error(fable_git_preparation.error)
-            if getattr(fable_git_preparation, "resume_existing_pr", False):
-                recovery_kind = str(
-                    getattr(fable_git_preparation, "recovery_kind", "") or ""
-                )
-                conflict_files = list(
-                    getattr(fable_git_preparation, "conflict_files", []) or []
-                )
-                if recovery_kind == "merge_conflict":
-                    recovery_note = (
-                        "Trusted Hermes lifecycle recovery has started a local merge of "
-                        f"origin/{fable_git_preparation.base_branch} into the existing PR "
-                        f"branch {fable_git_preparation.branch}. Resolve the file contents "
-                        "for these conflicts, then run focused verification: "
-                        + ", ".join(conflict_files)
-                        + ". Do not run git add, commit, push, PR, CI, or merge commands; "
-                        "trusted Hermes will validate, stage, commit, push, wait for checks, "
-                        "and merge after you return."
-                    )
-                elif recovery_kind == "base_refresh":
-                    recovery_note = (
-                        "Trusted Hermes lifecycle recovery has prepared a non-conflicting "
-                        f"local merge of origin/{fable_git_preparation.base_branch} into the "
-                        f"existing PR branch {fable_git_preparation.branch}. Review the merged "
-                        "result and run focused verification, but do not stage, commit, push, "
-                        "or touch the PR; trusted Hermes owns finalization."
-                    )
-                elif recovery_kind == "merged_pr_observation":
-                    recovery_note = (
-                        f"Trusted Hermes found that PR {fable_git_preparation.pr_url} "
-                        "is already merged and aligned this owned worktree to the remote "
-                        "base. Perform only the requested read-only/focused verification; "
-                        "do not attribute the earlier commit, push, or merge to this Codex "
-                        "worker or to the current Hermes finalization attempt."
-                    )
-                else:
-                    recovery_note = (
-                        f"Trusted Hermes is resuming existing PR {fable_git_preparation.pr_url} "
-                        "for this owned branch. Inspect the current files and run the requested "
-                        "focused verification; do not stage, commit, push, or touch the PR."
-                    )
-                context_text = _prepend_context_note(context_text, recovery_note)
+        return tool_error(canonical_error)
 
     if _parallel_request is not None:
         try:
@@ -1806,57 +1823,29 @@ def _delegate_coding_task_impl(
             backend = load_coding_worker_backend(config=loaded_config)
         except TypeError:
             backend = load_coding_worker_backend()
-    except Exception as exc:
-        if fable_implementation:
-            return tool_error(
-                "Fable implementation requires the Codex coding worker, but Hermes could not "
-                f"load that backend: {exc}. Refusing to fall back to OpenCode."
-            )
+    except Exception:
         BACKEND_CODEX = "codex"
         BACKEND_OPENCODE = "opencode"
         backend = "codex"
 
-    if fable_implementation:
-        if backend != BACKEND_CODEX:
-            return tool_error(
-                "Fable implementation requires coding_worker.backend=codex; "
-                "refusing to fall back to OpenCode or direct Fable edits."
-            )
-        try:
-            from agent.transports.codex_app_server import check_codex_binary
+    try:
+        from hermes_cli.ui_work_routing import resolve_ui_work_route
 
-            codex_ok, codex_detail = check_codex_binary()
-        except Exception as exc:
-            codex_ok, codex_detail = False, str(exc)
-        if not codex_ok:
-            return tool_error(
-                "Fable implementation requires an available Codex coding worker; "
-                f"{codex_detail}. Refusing to fall back to OpenCode or direct Fable edits."
-            )
-
-    if fable_implementation:
-        # A Fable parent may review the Codex worker result, but must never
-        # route a mutation through the Claude Code visual-specialist path.
+        ui_route = resolve_ui_work_route(
+            loaded_config,
+            task=task_text,
+            context=context_text,
+            cwd=workdir,
+            backend=backend,
+            route_decision=route_decision,
+            model_tier=(
+                selected_model_tier.name
+                if selected_model_tier is not None
+                else model_tier
+            ),
+        )
+    except Exception:
         ui_route = None
-    else:
-        try:
-            from hermes_cli.ui_work_routing import resolve_ui_work_route
-
-            ui_route = resolve_ui_work_route(
-                loaded_config,
-                task=task_text,
-                context=context_text,
-                cwd=workdir,
-                backend=backend,
-                route_decision=route_decision,
-                model_tier=(
-                    selected_model_tier.name
-                    if selected_model_tier is not None
-                    else model_tier
-                ),
-            )
-        except Exception:
-            ui_route = None
     ui_route_metadata = (
         ui_route.metadata()
         if ui_route is not None
@@ -1944,6 +1933,14 @@ def _delegate_coding_task_impl(
         else _load_coding_worker_timeout()
     )
     timeout = max(30.0, timeout)
+    if _background_startup is None:
+        from agent.worker_budget import remaining_nested_worker_budget
+
+        timeout = remaining_nested_worker_budget(parent_agent, timeout)
+        if timeout <= 0:
+            return tool_error(
+                "Parent turn nested-worker deadline was exhausted before coding-worker launch."
+            )
 
     worker_label = "OpenCode" if backend == BACKEND_OPENCODE else "Codex"
     worker_prompt_parts = [
@@ -1951,18 +1948,6 @@ def _delegate_coding_task_impl(
         "Work in the requested repository, make direct file edits when needed, "
         "and run focused checks that fit the task.",
     ]
-    if fable_implementation:
-        worker_prompt_parts.append(
-            "This is a Fable implementation worker. The requested workdir is a "
-            "pre-provisioned mutable checkout; work there and do not create a second "
-            "worktree or clone from the canonical checkout."
-        )
-        worker_prompt_parts.append(
-            "Stop at local file edits and focused verification. Do not stage files, "
-            "create commits, push branches, open or edit pull requests, wait for CI, "
-            "merge, or mutate the protected canonical checkout. Trusted Hermes code "
-            "owns that GitHub lifecycle after you return."
-        )
     if allow_git_pr_lifecycle:
         if allow_git_pr_merge:
             worker_prompt_parts.append(
@@ -2086,6 +2071,15 @@ def _delegate_coding_task_impl(
     worker_prompt_parts.extend(
         _context_pack_lines(relevant_files, approach, constraints, verification)
     )
+    if analysis_handoffs:
+        worker_prompt_parts.extend(
+            [
+                "",
+                "Root-registered structured analysis handoffs (deterministic evidence; "
+                "the prose summary is not authoritative beyond these fields):",
+                json.dumps(analysis_handoffs, ensure_ascii=True, sort_keys=True),
+            ]
+        )
     worker_prompt_parts.extend(["", "Task:", task_text])
     if context_text:
         worker_prompt_parts.extend(["", "Context from Hermes:", context_text])
@@ -2131,6 +2125,7 @@ def _delegate_coding_task_impl(
         opencode_kwargs = {
             "timeout": timeout,
             "context_for_classification": classification_context,
+            "task_for_purpose": task_text,
             "title": "Hermes delegated coding task",
             "on_event": _touch_opencode_activity,
         }
@@ -2139,7 +2134,11 @@ def _delegate_coding_task_impl(
             opencode_kwargs["worker_config"] = opencode_worker_config
         if allow_git_pr_lifecycle:
             opencode_kwargs["env"] = worker_env
-        opencode_runtime = load_opencode_config(worker_config=opencode_worker_config)
+        opencode_runtime = load_opencode_config(
+            worker_config=opencode_worker_config,
+            task=task_text,
+            context=context_text,
+        )
         opencode_needs_plan = looks_complex_or_risky(
             worker_prompt,
             classification_context,
@@ -2218,6 +2217,9 @@ def _delegate_coding_task_impl(
             "tool_iterations": result.tool_iterations,
             "ui_work_route": ui_route_metadata,
             "task_inferred_from_context": task_inferred_from_context,
+            "analysis_handoff_ids": [
+                str(item.get("handoff_id") or "") for item in analysis_handoffs
+            ],
         }
         if cwd_fallback_metadata is not None:
             payload["cwd_fallback"] = cwd_fallback_metadata
@@ -2279,16 +2281,20 @@ def _delegate_coding_task_impl(
     agents: list[str] = []
     plan_text = ""
     turns = []
-    default_profiles = load_coding_worker_pass_profiles(
-        loaded_config,
+    default_profiles = _load_worker_pass_settings(
+        load_coding_worker_pass_profiles,
         worker_config=model_tier_config,
+        task=task_text,
+        context=context_text,
     )
     turn = None
     codex_run = None
     try:
-        default_pass_cfg = load_coding_worker_pass_config(
-            loaded_config,
+        default_pass_cfg = _load_worker_pass_settings(
+            load_coding_worker_pass_config,
             worker_config=model_tier_config,
+            task=task_text,
+            context=context_text,
         )
         pass_cfg = default_pass_cfg
         route_attempts = [([], pass_cfg, default_profiles)]
@@ -2441,71 +2447,6 @@ def _delegate_coding_task_impl(
         if normalized_scope_paths is not None
         else None
     )
-    fable_git_result = None
-    lifecycle_error = ""
-    if (
-        success
-        and fable_implementation
-        and fable_git_lifecycle in {"pr", "merge"}
-        and fable_git_preparation is not None
-    ):
-        try:
-            from hermes_cli.fable_git_finalizer import finalize_fable_git_lifecycle
-
-            closeout_cfg = (
-                loaded_config.get("closeout")
-                if isinstance(loaded_config.get("closeout"), dict)
-                else {}
-            )
-            closeout_surfaces = (
-                closeout_cfg.get("surfaces")
-                if isinstance(closeout_cfg.get("surfaces"), dict)
-                else {}
-            )
-            configured_closeout_mode = (
-                "off"
-                if closeout_surfaces.get("fable") is False
-                else str(closeout_cfg.get("mode") or "shadow").strip().lower()
-            )
-            finalized = finalize_fable_git_lifecycle(
-                fable_git_preparation,
-                mode=fable_git_lifecycle,
-                task=task_text,
-                worker_summary=turn.final_text,
-                closeout_mode=configured_closeout_mode,
-                verification_runtime_breakdown=getattr(turn, "runtime_breakdown", None),
-                visual_qa_requirement=originating_visual_requirement,
-            )
-            fable_git_result = finalized.as_dict()
-            closeout_state = getattr(finalized, "closeout_state", None)
-            if finalized.success and isinstance(closeout_state, dict) and closeout_state:
-                persisted, persistence_error = _persist_fable_closeout(
-                    parent_agent,
-                    closeout_state,
-                    loaded_config,
-                )
-                if persisted is None:
-                    if configured_closeout_mode == "enforce":
-                        success = False
-                        lifecycle_error = persistence_error
-                        fable_git_result["success"] = False
-                        fable_git_result["error"] = persistence_error
-                        fable_git_result["status"] = "closeout_persistence_blocked"
-                    else:
-                        # Shadow state is diagnostic only and cannot displace or
-                        # fail the authorized legacy Fable finalizer.
-                        fable_git_result["closeout_persistence_error"] = persistence_error
-                else:
-                    fable_git_result["closeout_state"] = persisted
-                    fable_git_result["closeout_revision"] = persisted.get("revision")
-            if not finalized.success:
-                success = False
-                lifecycle_error = finalized.error or (
-                    f"Fable Git lifecycle stopped at {finalized.status}."
-                )
-        except Exception as exc:
-            success = False
-            lifecycle_error = f"Fable Git lifecycle finalization failed: {exc}"
     tool_iterations = sum(getattr(item, "tool_iterations", 0) or 0 for item in turns)
     projected_message_count = sum(
         len(getattr(item, "projected_messages", []) or []) for item in turns
@@ -2521,7 +2462,7 @@ def _delegate_coding_task_impl(
         "success": success,
         "status": "completed" if success else "partial",
         "summary": turn.final_text,
-        "error": turn.error or lifecycle_error or None,
+        "error": turn.error or None,
         "interrupted": turn.interrupted,
         "duration_seconds": duration,
         "cwd": workdir,
@@ -2534,10 +2475,10 @@ def _delegate_coding_task_impl(
         "projected_message_count": projected_message_count,
         "ui_work_route": ui_route_metadata,
         "task_inferred_from_context": task_inferred_from_context,
-        "fable_git_lifecycle": fable_git_lifecycle if fable_implementation else "none",
+        "analysis_handoff_ids": [
+            str(item.get("handoff_id") or "") for item in analysis_handoffs
+        ],
     }
-    if fable_git_result is not None:
-        payload["fable_git_result"] = fable_git_result
     if scope_check is not None:
         payload["scope_check"] = scope_check
     if cwd_fallback_metadata is not None:
@@ -2587,6 +2528,7 @@ def _background_context_pack(
     approach: Optional[str],
     constraints: Optional[str],
     verification: Optional[str],
+    analysis_handoff_ids: Optional[list[str]],
 ) -> dict[str, Any]:
     return {
         "context": str(context or "").strip(),
@@ -2594,6 +2536,7 @@ def _background_context_pack(
         "approach": str(approach or "").strip(),
         "constraints": str(constraints or "").strip(),
         "verification": str(verification or "").strip(),
+        "analysis_handoff_ids": list(analysis_handoff_ids or []),
     }
 
 
@@ -2644,13 +2587,19 @@ def _complete_background_parallel_result(
                 "merge-back before continuing."
             ),
         }
-    with _BACKGROUND_PARALLEL_WORKERS_GUARD:
-        _BACKGROUND_PARALLEL_RESULTS[resolved_worker_cwd] = dict(
-            payload["parallel_merge"]
-        )
-        _BACKGROUND_PARALLEL_WORKERS.discard(resolved_worker_cwd)
-        while len(_BACKGROUND_PARALLEL_RESULTS) > 100:
-            _BACKGROUND_PARALLEL_RESULTS.pop(next(iter(_BACKGROUND_PARALLEL_RESULTS)))
+    finally:
+        try:
+            with _BACKGROUND_PARALLEL_WORKERS_GUARD:
+                _BACKGROUND_PARALLEL_RESULTS[resolved_worker_cwd] = dict(
+                    payload["parallel_merge"]
+                )
+                _BACKGROUND_PARALLEL_WORKERS.discard(resolved_worker_cwd)
+                while len(_BACKGROUND_PARALLEL_RESULTS) > 100:
+                    _BACKGROUND_PARALLEL_RESULTS.pop(
+                        next(iter(_BACKGROUND_PARALLEL_RESULTS))
+                    )
+        finally:
+            _release_parallel_worker_reservation(resolved_worker_cwd)
 
 
 def _dispatch_background_coding_task(
@@ -2669,13 +2618,6 @@ def _dispatch_background_coding_task(
             "coding_worker.background.enabled=false. Run synchronously with "
             "background=false or enable the setting."
         )
-    if parallel_group is not None and _is_fable_implementation_parent(parent_agent):
-        return tool_error(
-            "Background Fable coding workers do not yet support _parallel_group. "
-            "Run the grouped Fable workers synchronously, or dispatch one "
-            "background Fable worker without a parallel group."
-        )
-
     task_text, context_text, _inferred = _normalize_task_and_context(
         call_kwargs.get("task"),
         call_kwargs.get("context"),
@@ -2688,6 +2630,7 @@ def _dispatch_background_coding_task(
             approach=call_kwargs.get("approach"),
             constraints=call_kwargs.get("constraints"),
             verification=call_kwargs.get("verification"),
+            analysis_handoff_ids=call_kwargs.get("analysis_handoff_ids"),
         ),
         parallel_group=(
             dict(parallel_group) if isinstance(parallel_group, dict) else None
@@ -2853,7 +2796,7 @@ def _dispatch_background_coding_task(
     return json.dumps(handle, ensure_ascii=False)
 
 
-def delegate_coding_task(
+def _delegate_coding_task_dispatch(
     task: Optional[str] = None,
     context: Optional[str] = None,
     cwd: Optional[str] = None,
@@ -2865,6 +2808,7 @@ def delegate_coding_task(
     constraints: Optional[str] = None,
     verification: Optional[str] = None,
     scope_paths: Optional[list[str]] = None,
+    analysis_handoff_ids: Optional[list[str]] = None,
     background: bool = False,
     allow_git_pr_lifecycle: bool = False,
     trusted_allow_git_pr_lifecycle: bool = False,
@@ -2875,12 +2819,11 @@ def delegate_coding_task(
     parent_messages: Optional[list[dict]] = None,
     _parallel_group: Optional[dict[str, Any]] = None,
     _background_startup: Optional[_BackgroundCodingStartup] = None,
+    _reservation_id: Optional[str] = None,
+    _release_reservation_on_finish: bool = False,
 ) -> str:
     """Run a coding worker, isolating trusted parallel calls in linked worktrees."""
-    background, route_decision = _unwrap_background_route_decision(
-        background,
-        route_decision,
-    )
+    background = bool(background)
     call_kwargs = {
         "task": task,
         "context": context,
@@ -2893,6 +2836,7 @@ def delegate_coding_task(
         "constraints": constraints,
         "verification": verification,
         "scope_paths": scope_paths,
+        "analysis_handoff_ids": analysis_handoff_ids,
         "allow_git_pr_lifecycle": allow_git_pr_lifecycle,
         "trusted_allow_git_pr_lifecycle": trusted_allow_git_pr_lifecycle,
         "route_decision": route_decision,
@@ -2904,6 +2848,8 @@ def delegate_coding_task(
     if _background_startup is not None:
         call_kwargs["_background_startup"] = _background_startup
     if background:
+        call_kwargs["_reservation_id"] = _reservation_id
+        call_kwargs["_release_reservation_on_finish"] = True
         try:
             from hermes_cli.config import load_config
 
@@ -2971,6 +2917,106 @@ def delegate_coding_task(
             "worktree_kept": False,
         }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def delegate_coding_task(
+    task: Optional[str] = None,
+    context: Optional[str] = None,
+    cwd: Optional[str] = None,
+    turn_timeout_seconds: Optional[float] = None,
+    model_tier: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    relevant_files: Optional[list[dict[str, str]]] = None,
+    approach: Optional[str] = None,
+    constraints: Optional[str] = None,
+    verification: Optional[str] = None,
+    scope_paths: Optional[list[str]] = None,
+    analysis_handoff_ids: Optional[list[str]] = None,
+    background: bool = False,
+    allow_git_pr_lifecycle: bool = False,
+    trusted_allow_git_pr_lifecycle: bool = False,
+    route_decision: Any = None,
+    visual_qa_requirement: Optional[dict[str, Any]] = None,
+    project_inspection_candidates: Optional[list[dict[str, Any]]] = None,
+    parent_agent: Any = None,
+    parent_messages: Optional[list[dict]] = None,
+    _parallel_group: Optional[dict[str, Any]] = None,
+    _background_startup: Optional[_BackgroundCodingStartup] = None,
+    _reservation_id: Optional[str] = None,
+    _release_reservation_on_finish: bool = False,
+) -> str:
+    """Reserve mutation ownership, then use the normal coding-worker path."""
+    owns_reservation = _reservation_id is None
+    reservation_id = _reservation_id
+    if owns_reservation:
+        try:
+            reservation_cwd = (
+                str(_parallel_group.get("base_cwd") or "")
+                if isinstance(_parallel_group, dict)
+                else _resolve_cwd(cwd, parent_agent)
+            )
+        except Exception as exc:
+            return tool_error(f"could not resolve coding-worker cwd: {exc}")
+        reservation_id, reservation_error = _acquire_mutation_reservation(
+            cwd=reservation_cwd,
+            scope_paths=scope_paths,
+            parallel_group=_parallel_group,
+        )
+        if reservation_error:
+            return tool_error(reservation_error)
+
+    transferred_to_background = False
+    transferred_to_parallel = False
+    try:
+        result = _delegate_coding_task_dispatch(
+            task=task,
+            context=context,
+            cwd=cwd,
+            turn_timeout_seconds=turn_timeout_seconds,
+            model_tier=model_tier,
+            reasoning_effort=reasoning_effort,
+            relevant_files=relevant_files,
+            approach=approach,
+            constraints=constraints,
+            verification=verification,
+            scope_paths=scope_paths,
+            analysis_handoff_ids=analysis_handoff_ids,
+            background=background,
+            allow_git_pr_lifecycle=allow_git_pr_lifecycle,
+            trusted_allow_git_pr_lifecycle=trusted_allow_git_pr_lifecycle,
+            route_decision=route_decision,
+            visual_qa_requirement=visual_qa_requirement,
+            project_inspection_candidates=project_inspection_candidates,
+            parent_agent=parent_agent,
+            parent_messages=parent_messages,
+            _parallel_group=_parallel_group,
+            _background_startup=_background_startup,
+            _reservation_id=reservation_id,
+            _release_reservation_on_finish=_release_reservation_on_finish,
+        )
+        if background and owns_reservation:
+            try:
+                parsed = json.loads(result)
+                transferred_to_background = bool(
+                    isinstance(parsed, dict)
+                    and parsed.get("success") is True
+                    and parsed.get("background") is True
+                )
+            except Exception:
+                transferred_to_background = False
+        if not background and _parallel_group is not None:
+            transferred_to_parallel = _transfer_parallel_worker_reservation(
+                result,
+                reservation_id,
+            )
+        return result
+    finally:
+        if (
+            (_release_reservation_on_finish or owns_reservation)
+            and not transferred_to_background
+            and not transferred_to_parallel
+        ):
+            _release_mutation_reservation(reservation_id)
 
 
 CODING_WORKER_SCHEMA = {
@@ -3078,6 +3124,15 @@ CODING_WORKER_SCHEMA = {
                 ),
                 "items": {"type": "string"},
             },
+            "analysis_handoff_ids": {
+                "type": "array",
+                "description": (
+                    "Structured delegate handoff IDs previously returned by "
+                    "delegate_task. Hermes resolves them from root-owned state; "
+                    "unknown or fabricated IDs are rejected."
+                ),
+                "items": {"type": "string"},
+            },
             "background": {
                 "type": "boolean",
                 "default": False,
@@ -3133,6 +3188,9 @@ CODING_WORKER_SCHEMA = {
 
 registry.register(
     name="delegate_coding_task",
+    # Preserve legacy public membership: enabling/disabling ``delegation``
+    # still grants/revokes both delegation tools. ``coding_worker_raw`` remains
+    # a static atomic subtraction alias used to strip mutation from children.
     toolset="delegation",
     schema=CODING_WORKER_SCHEMA,
     handler=lambda args, **kw: delegate_coding_task(
@@ -3147,6 +3205,7 @@ registry.register(
         constraints=args.get("constraints"),
         verification=args.get("verification"),
         scope_paths=args.get("scope_paths"),
+        analysis_handoff_ids=args.get("analysis_handoff_ids"),
         background=bool(args.get("background", False)),
         allow_git_pr_lifecycle=False,
         trusted_allow_git_pr_lifecycle=False,

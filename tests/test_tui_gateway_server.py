@@ -7445,6 +7445,77 @@ def test_notification_poller_delivers_completion(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
+def test_notification_poller_applies_detached_accounting_before_completion_turn(
+    monkeypatch,
+):
+    """Detached callbacks and cost are serialized before the follow-up turn."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    observed_costs = []
+
+    class _Agent:
+        session_estimated_cost_usd = 0.1
+        session_cost_source = "none"
+        session_cost_status = "unknown"
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            observed_costs.append(self.session_estimated_cost_usd)
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    agent = _Agent()
+    sess = _session(agent=agent)
+    server._sessions["sid_accounting"] = sess
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    isolated_queue.put(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_accounting",
+            "status": "completed",
+            "goal": "inspect",
+            "summary": "done",
+            "accounting": {
+                "version": 1,
+                "accounting_id": "accounting_1",
+                "binding": {},
+                "children": [],
+                "cost_total_usd": 0.3,
+            },
+        }
+    )
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_accounting", sess)
+
+        assert observed_costs == [0.4]
+        assert agent.session_estimated_cost_usd == 0.4
+        assert agent.session_cost_source == "subagent"
+        assert agent.session_cost_status == "estimated"
+    finally:
+        server._sessions.pop("sid_accounting", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
 def test_notification_poller_skips_consumed(monkeypatch):
     """Already-consumed completions are not dispatched by the poller."""
     import queue as _queue_mod

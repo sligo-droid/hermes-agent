@@ -1125,7 +1125,7 @@ Control how much "thinking" the model does before responding:
 
 ```yaml
 agent:
-  reasoning_effort: ""   # empty = medium (default). Options: none, minimal, low, medium, high, xhigh, max
+  reasoning_effort: ""   # empty = medium (default). Options: none, minimal, low, medium, high, xhigh
 ```
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
@@ -1149,13 +1149,16 @@ choose a model and reasoning effort.
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
-| `basic` | GPT-5.6 Terra | `high` | Ordinary gateway sessions |
-| `intermediate` | GPT-5.6 Terra | `max` | Coding-worker build passes and Kanban `dev` |
-| `discord_action` | GPT-5.6 Sol | `medium` | Simple and ordinary Discord action requests |
-| `advanced` | GPT-5.6 Sol | `xhigh` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
+| `basic` | GPT-5.6 Luna | `xhigh` | Ordinary gateway sessions |
+| `intermediate` | GPT-5.6 Sol | `medium` | Coding-worker build passes and Kanban `dev` |
+| `discord_action` | GPT-5.6 Sol | `medium` | Accepted Discord action requests |
+| `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
-These defaults are runtime-aware: routine routes use lower effort, build passes
-use Terra at `max`, and complex planning moves to Sol at `xhigh`.
+These defaults follow the supported model/effort frontier: narrow routine work
+uses Luna, moderately scoped build passes use Sol at `medium`, and complex
+planning moves to Sol at `high`. Existing explicit review/diagnosis criteria
+spill `high` over to `xhigh`; implementation-capable work remains capped at
+`high`.
 
 The defaults live under `model_tiers`; route settings reference a tier by name:
 
@@ -1166,17 +1169,17 @@ model_tiers:
     opencode_model: hermes-codex/gpt-5.6-luna
     reasoning_effort: medium
   basic:
-    model: gpt-5.6-terra
-    opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: high
+    model: gpt-5.6-luna
+    opencode_model: hermes-codex/gpt-5.6-luna
+    reasoning_effort: xhigh
   intermediate:
-    model: gpt-5.6-terra
-    opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: max
+    model: gpt-5.6-sol
+    opencode_model: hermes-codex/gpt-5.6-sol
+    reasoning_effort: medium
   advanced:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol
-    reasoning_effort: xhigh
+    reasoning_effort: high
   discord_action:
     model: gpt-5.6-sol
     opencode_model: hermes-codex/gpt-5.6-sol
@@ -1190,7 +1193,6 @@ cron:
 
 discord:
   action_request_model_tier: discord_action
-  action_request_complex_model_tier: advanced
 
 coding_worker:
   backend: codex
@@ -1211,6 +1213,11 @@ kanban:
       foreman: {model_tier: advanced}
 ```
 
+Discord intake still distinguishes questions from action requests. Once Hermes
+accepts a message as an action request, it consistently uses
+`discord.action_request_model_tier`; request wording or inferred complexity does
+not select a separate tier.
+
 Coding workers use one `intermediate` build pass for simple work. Complex or
 risky work uses an `advanced` planning pass followed by an `intermediate` build
 pass.
@@ -1227,9 +1234,11 @@ Set it to `disabled` to turn off tier routing globally and use the legacy raw
 OpenCode model and per-pass reasoning fields. The UI visual specialist is a
 model-neutral behavioral profile: it adds UI-focused skills and route evidence,
 then uses the configured Codex or OpenCode coding-worker backend. Explicit
-`worker_tier` selection and the normal coding-worker pass-tier precedence apply.
-OpenCode's `max` variant is forwarded literally as `reasoning.effort=max`; it is
-not normalized or aliased to `xhigh`.
+`model_tier` selection and the normal coding-worker pass-tier precedence apply;
+`reasoning_effort` is available only as an explicit per-call override.
+Legacy Hermes `max` values normalize to `xhigh`. Provider adapters may still
+translate `xhigh` to an upstream provider's protocol-level `max` value when
+that provider requires it.
 
 Kanban role tiers are also atomic and authoritative. When a role resolves a
 valid `model_tier`, that tier's model and effort override legacy per-role
@@ -1259,22 +1268,30 @@ CLI/TUI default remains `model.default`.
 ## Fable
 
 Discord `/fable <request>` uses the Fable implementation route; `/fable plan
-<request>` remains plan-only. Implementation turns receive a per-thread mutable
-Git worktree and delegate all repository mutations to the Codex coding worker.
+<request>` remains plan-only. An implementation turn changes only the selected
+model and provenance. It receives the same per-thread mutable Git worktree,
+tool policy, coding-worker routing, visual-QA checkpoints, and gateway-owned
+trusted closeout state machine as an ordinary Discord action request.
 
 ```yaml
-fable:
-  git_lifecycle: none   # none | pr | merge
+closeout:
+  mode: shadow          # off | shadow | enforce
+  surfaces:
+    direct: true        # applies equally to ordinary and Fable action turns
 ```
 
-`none` (the default) permits local implementation only. With every mode, the
-Codex worker stops after local edits and focused verification: it cannot stage,
-commit, push, mutate a PR, or touch the protected canonical checkout. `pr`
-authorizes trusted Hermes finalizer code to commit the worker diff, push the
-owned branch, and open a non-draft PR. `merge` additionally waits for reported
-checks, merges the PR, verifies the merge, and synchronizes the protected
-canonical checkout through the narrow orchestrator path. It never authorizes a
-direct worker update to `main`.
+The closeout policy is derived from the same request text and repository
+overrides for both models. Coding workers edit and run focused verification
+locally; after an exact verified checkpoint, the trusted gateway watcher owns
+commit, push, PR, CI, merge, and canonical synchronization. The former
+Fable-specific finalizer is no longer used. New installations use the ordinary
+trusted closeout policy for Fable implementation turns. During migration,
+Hermes still honors two legacy safety
+settings conservatively: `fable.git_lifecycle: none` or
+`closeout.surfaces.fable: false` keeps Fable closeout off. An explicit legacy
+`pr` value permits PR closeout but never merge; `merge` permits the unified
+closeout merge policy. Remove the legacy keys to make Fable follow the same
+repository closeout policy as ordinary Discord action requests.
 
 Hermes writes the effective route to `turn_runtime_summary` log records. Audit
 fields include `model_tier`, `model_tier_source`, `runtime_route`,
@@ -1880,6 +1897,8 @@ delegation:
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
+  nested_coding:
+    enabled: false                          # Opt-in root-owned coding broker for foreground depth-1 orchestrators; requires max_spawn_depth >= 2.
 ```
 
 **Automatic named-tier routing:** By default, `delegate_task` selects `basic` for simple work, `intermediate` for ordinary work, and `advanced` for complex/risky work or orchestrators. Model and reasoning effort come from the tier together. Set `model_tier_routing: off` (or `disabled`) to turn this off; children then inherit the parent model and reasoning unless the raw overrides below are set.
@@ -1895,6 +1914,17 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 **Precedence:** explicit `delegation.base_url` / `provider` / `model` / `reasoning_effort` settings → automatic named tier → parent inheritance when tier routing is off. `delegation.base_url` takes precedence over `delegation.provider`. Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter). Any explicit raw runtime override bypasses the automatic tier atomically, preventing a tier model from leaking into an explicitly selected provider route.
 
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
+
+`delegate_task(background=true)` is limited to `read_only=true` tasks because
+detached general delegates do not own repository mutation reservations. Use
+`delegate_coding_task(background=true)` for detached implementation work. The
+two tools may run together when the general delegation is read-only and coding
+scopes do not overlap.
+
+With `nested_coding.enabled: true`, a root may explicitly grant a foreground
+depth-1 orchestrator `request_coding_task`. The child never receives raw
+`delegate_coding_task`: the root retains the authorized workdir, synchronous
+execution, scope reservations, worker accounting, and lifecycle authority.
 
 ## Coding Worker Routes
 

@@ -1016,6 +1016,12 @@ def create_job(
     normalized_model_tier = normalized_model_tier or None
     normalized_model = normalized_model or None
     normalized_provider = normalized_provider or None
+    if normalized_reasoning_effort:
+        from hermes_constants import VALID_REASONING_EFFORTS, normalize_reasoning_effort
+
+        normalized_reasoning_effort = normalize_reasoning_effort(normalized_reasoning_effort)
+        if normalized_reasoning_effort not in {"none", *VALID_REASONING_EFFORTS}:
+            raise ValueError(f"Unknown reasoning effort: {reasoning_effort}")
     normalized_reasoning_effort = normalized_reasoning_effort or None
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
@@ -1184,6 +1190,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         for field in ("model_tier", "model", "provider", "reasoning_effort"):
             if field in updates:
                 updates[field] = str(updates[field] or "").strip() or None
+        if updates.get("reasoning_effort"):
+            from hermes_constants import VALID_REASONING_EFFORTS, normalize_reasoning_effort
+
+            updates["reasoning_effort"] = normalize_reasoning_effort(updates["reasoning_effort"])
+            if updates["reasoning_effort"] not in {"none", *VALID_REASONING_EFFORTS}:
+                raise ValueError(f"Unknown reasoning effort: {updates['reasoning_effort']}")
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

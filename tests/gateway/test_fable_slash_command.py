@@ -178,7 +178,7 @@ async def test_fable_implementation_preprovisions_worktree_for_worker_prompt(mon
 
     def fake_build(request):
         assert request.workdir == "/workspaces/fable-pid"
-        assert request.git_lifecycle == "merge"
+        assert not hasattr(request, "git_lifecycle")
         return "FABLE IMPLEMENTATION: build X"
 
     monkeypatch.setattr("gateway.run._resolve_gateway_turn_cwd", fake_worktree)
@@ -189,13 +189,13 @@ async def test_fable_implementation_preprovisions_worktree_for_worker_prompt(mon
     )
     monkeypatch.setattr(
         "gateway.run._load_gateway_runtime_config",
-        lambda: {"fable": {"git_lifecycle": "merge"}},
+        lambda: {"closeout": {"mode": "enforce", "surfaces": {"direct": True}}},
     )
 
     result = await GatewayRunner._handle_message(runner, event)
 
     assert isinstance(result, MetadataReply)
-    assert result.metadata["git_lifecycle"] == "merge"
+    assert "git_lifecycle" not in result.metadata
     assert event.source.project_path == "/workspaces/fable-pid"
     runner._cache_session_source.assert_called_once_with(
         build_session_key(event.source), event.source
@@ -542,7 +542,6 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
         "_load_gateway_config",
         lambda: {
             "tools": {"discord": {"enabled": ["all"]}},
-            "fable": {"git_lifecycle": "pr"},
         },
     )
     import hermes_cli.tools_config as tools_config
@@ -573,8 +572,6 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
         "command": "fable",
         "fable_mode": "implementation",
         "route": "anthropic_proxy",
-        # Metadata is informational; the agent capability comes from config.
-        "git_lifecycle": "merge",
         "anthropic_oauth_tool_name_compat": True,
     }
     session_entry = _session_entry_for_event(event)
@@ -599,7 +596,7 @@ def test_fable_implementation_keeps_normal_discord_toolsets(monkeypatch):
     assert captured["fallback_model"] is None
     assert captured["providers_allowed"] == ["anthropic"]
     assert CapturingAgent.instance._fable_implementation_turn is True
-    assert CapturingAgent.instance._fable_git_lifecycle == "pr"
+    assert not hasattr(CapturingAgent.instance, "_fable_git_lifecycle")
     assert CapturingAgent.instance._anthropic_oauth_tool_name_compat is True
 
 

@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 _CODING_WORKER_PRE_TOOL_ALLOWED_TOOLS = frozenset({
+    "delegate_task",
     "delegate_coding_task",
 })
 

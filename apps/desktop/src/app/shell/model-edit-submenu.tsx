@@ -24,8 +24,7 @@ const EFFORT_OPTIONS = [
   { value: 'low', labelKey: 'low' },
   { value: 'medium', labelKey: 'medium' },
   { value: 'high', labelKey: 'high' },
-  { value: 'xhigh', labelKey: 'xhigh' },
-  { value: 'max', labelKey: 'max' }
+  { value: 'xhigh', labelKey: 'xhigh' }
 ] as const
 
 /** How "fast" is achieved for a given model — two different mechanisms:
@@ -244,6 +243,9 @@ function normalizeEffort(effort: string): string {
   // Thinking off → no effort selected in the radio group.
   if (value === 'none') {
     return ''
+  }
+  if (value === 'max') {
+    return 'xhigh'
   }
 
   return EFFORT_OPTIONS.some(option => option.value === value) ? value : 'medium'

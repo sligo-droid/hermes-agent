@@ -155,7 +155,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
         # only the coding-only concurrent path installs. Keep mixed batches
         # sequential even when every non-coding tool is otherwise safe.
         if coding_call_count != len(parsed_calls):
-            return False
+            return _should_parallelize_safe_background_mixed(parsed_calls)
         return _should_parallelize_coding_worker_batch(parsed_calls)
 
     reserved_paths: list[Path] = []
@@ -176,6 +176,32 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
                 return False
 
     return True
+
+
+def _should_parallelize_safe_background_mixed(
+    parsed_calls: list[tuple[str, dict]],
+) -> bool:
+    """Allow only detached read-only analysis plus detached coding dispatch."""
+    coding_calls: list[tuple[str, dict]] = []
+    for tool_name, function_args in parsed_calls:
+        if tool_name == _CODING_WORKER_TOOL:
+            if function_args.get("background") is not True:
+                return False
+            coding_calls.append((tool_name, function_args))
+            continue
+        if tool_name != "delegate_task":
+            return False
+        if function_args.get("background") is not True:
+            return False
+        if function_args.get("read_only") is not True:
+            return False
+        if function_args.get("allow_nested_coding") is True:
+            return False
+    if not coding_calls:
+        return False
+    if len(coding_calls) == 1:
+        return True
+    return _should_parallelize_coding_worker_batch(coding_calls)
 
 
 def _coding_worker_parallel_settings() -> tuple[bool, int]:
