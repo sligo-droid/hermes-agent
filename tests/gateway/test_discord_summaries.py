@@ -2771,7 +2771,7 @@ async def test_reply_native_voice_existing_action_thread_classifies_transcript(
     ("trigger", "transcript", "expected_tier", "expected_effort"),
     [
         ("auto", "Build the approved parser", "discord_action", "medium"),
-        ("mention", "Migrate the production auth schema", "advanced", "xhigh"),
+        ("mention", "Migrate the production auth schema", "intermediate", "medium"),
         ("reply", "Add parser telemetry", "discord_action", "medium"),
         ("action_channel", "Audit the production permission model", "advanced", "xhigh"),
     ],
@@ -3059,7 +3059,7 @@ async def test_unmentioned_voice_action_followup_classifies_transcript(adapter, 
     ("transcript", "expected_tier", "expected_effort"),
     [
         ("Build a deploy dashboard", "discord_action", "medium"),
-        ("Migrate the production auth schema", "advanced", "xhigh"),
+        ("Migrate the production auth schema", "intermediate", "medium"),
     ],
 )
 @pytest.mark.asyncio

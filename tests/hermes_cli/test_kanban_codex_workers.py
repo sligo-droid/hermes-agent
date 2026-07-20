@@ -2308,7 +2308,7 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["cmd"] == workers._host_worker_cmd()
     assert captured["cwd"] == str(workspace.resolve())
     assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
-    assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "xhigh"
+    assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "medium"
     assert captured["env"]["HERMES_CODEX_WORKER_SERVICE_TIER"] == "normal"
     assert captured["env"]["HERMES_KANBAN_BOARD"] == board.slug
     assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
@@ -2847,8 +2847,8 @@ def test_role_worker_logs_named_tier_and_runtime_sources(monkeypatch, tmp_path):
     assert log is not None
     assert (
         "[kanban dispatcher] scheduled Codex role worker: "
-        "role=planner reasoning=xhigh mode=fast "
-        "model=gpt-5.6-sol tier=advanced tier_source=role "
+        "role=planner reasoning=medium mode=fast "
+        "model=gpt-5.6-sol tier=intermediate tier_source=role "
         "reasoning_source=model_tier service_tier=fast "
         "service_tier_source=explicit"
     ) in log
@@ -2891,7 +2891,7 @@ def test_planner_worker_env_carries_effective_opencode_backend(monkeypatch, tmp_
     assert "HERMES_CODEX_WORKER_CREDENTIAL_ID" not in captured["env"]
     log = kanban_db.read_worker_log(task.id, board=board.slug)
     assert log is not None
-    assert "scheduled OpenCode role worker: role=planner reasoning=xhigh mode=normal" in log
+    assert "scheduled OpenCode role worker: role=planner reasoning=medium mode=normal" in log
 
 
 def test_command_center_repair_foreman_uses_codex_with_codex_config(monkeypatch, tmp_path):
@@ -2942,7 +2942,7 @@ def test_command_center_repair_foreman_uses_codex_with_codex_config(monkeypatch,
     assert captured["env"]["CODEX_HOME"].endswith(f"/homes/{task.id}")
     log = kanban_db.read_worker_log(task.id, board=board)
     assert log is not None
-    assert "scheduled Codex role worker: role=foreman reasoning=xhigh mode=normal" in log
+    assert "scheduled Codex role worker: role=foreman reasoning=medium mode=normal" in log
 
 
 def test_foreman_worker_env_defaults_to_codex(monkeypatch, tmp_path):
@@ -2990,7 +2990,7 @@ def test_foreman_worker_env_defaults_to_codex(monkeypatch, tmp_path):
     assert captured["env"]["CODEX_HOME"].endswith(f"/{task.id}")
     log = kanban_db.read_worker_log(task.id, board=board)
     assert log is not None
-    assert "scheduled Codex role worker: role=foreman reasoning=xhigh mode=normal" in log
+    assert "scheduled Codex role worker: role=foreman reasoning=medium mode=normal" in log
 
 
 def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
@@ -3054,7 +3054,7 @@ def test_dev_runtime_auto_keeps_risky_and_retry_work_high(monkeypatch):
 
     assert risky_settings["reasoning"] == "high"
     assert risky_settings["service_tier"] == "normal"
-    assert retry_settings["reasoning"] == "xhigh"
+    assert retry_settings["reasoning"] == "medium"
     assert retry_settings["service_tier"] == "normal"
 
 
@@ -3085,21 +3085,21 @@ def test_runtime_explicit_config_and_env_override_auto(monkeypatch):
         "service_tier": "normal",
     }
     settings = workers._role_runtime_settings("dev", cfg, task)
-    assert settings["reasoning"] == "xhigh"
+    assert settings["reasoning"] == "medium"
     assert settings["service_tier"] == "fast"
 
 
-def test_planner_and_reviewer_auto_remain_xhigh(monkeypatch):
+def test_only_reviewer_auto_remains_xhigh(monkeypatch):
     from hermes_cli import kanban_codex_workers as workers
 
     monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
     task = SimpleNamespace(title="Plan work", body="", consecutive_failures=0)
 
-    assert workers._role_runtime_settings("planner", {}, task)["reasoning"] == "xhigh"
+    assert workers._role_runtime_settings("planner", {}, task)["reasoning"] == "medium"
     assert workers._role_runtime_settings("reviewer", {}, task)["reasoning"] == "xhigh"
 
 
-def test_role_runtime_preserves_explicit_max_reasoning(monkeypatch):
+def test_role_runtime_caps_explicit_max_reasoning_for_planner(monkeypatch):
     from hermes_cli import kanban_codex_workers as workers
 
     monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
@@ -3108,8 +3108,8 @@ def test_role_runtime_preserves_explicit_max_reasoning(monkeypatch):
         {"roles": {"planner": {"reasoning": "max", "service_tier": "normal"}}},
     )
 
-    assert settings["reasoning"] == "max"
-    assert settings["reasoning_source"] == "explicit"
+    assert settings["reasoning"] == "medium"
+    assert settings["reasoning_source"] == "review_only_cap"
 
 
 def test_dispatch_recovers_recorded_role_result_before_dead_pid_crash(monkeypatch, tmp_path):
@@ -3520,9 +3520,9 @@ def test_role_extra_args_default_reasoning_by_role(monkeypatch):
     monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
     monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
 
-    assert worker._role_extra_args("planner")[1] == 'model_reasoning_effort="xhigh"'
+    assert worker._role_extra_args("planner")[1] == 'model_reasoning_effort="medium"'
     assert worker._role_extra_args("reviewer")[1] == 'model_reasoning_effort="xhigh"'
-    assert worker._role_extra_args("foreman")[1] == 'model_reasoning_effort="xhigh"'
+    assert worker._role_extra_args("foreman")[1] == 'model_reasoning_effort="medium"'
     assert worker._role_extra_args("dev")[1] == 'model_reasoning_effort="medium"'
 
 
@@ -4982,7 +4982,7 @@ def test_foreman_role_prompt_and_guards_allow_repair_mutation(monkeypatch, tmp_p
     assert worker._role_read_only_discord_env(ROLE_FOREMAN) == {}
 
 
-def test_foreman_runtime_defaults_to_xhigh_normal():
+def test_foreman_runtime_defaults_to_medium_normal():
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli.discord_worker_boards import ROLE_FOREMAN
@@ -4991,19 +4991,19 @@ def test_foreman_runtime_defaults_to_xhigh_normal():
     os.environ.pop("HERMES_CODEX_WORKER_SERVICE_TIER", None)
     settings = workers._role_runtime_settings(ROLE_FOREMAN, {}, None)
 
-    assert settings["reasoning"] == "xhigh"
+    assert settings["reasoning"] == "medium"
     assert settings["service_tier"] == "normal"
-    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "xhigh"
+    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "medium"
 
 
-def test_native_codex_worker_accepts_max_reasoning_override(monkeypatch):
+def test_native_codex_worker_caps_max_reasoning_override_for_foreman(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_FOREMAN
 
     monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "max")
 
-    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "max"
-    assert worker._role_extra_args(ROLE_FOREMAN)[1] == 'model_reasoning_effort="max"'
+    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "medium"
+    assert worker._role_extra_args(ROLE_FOREMAN)[1] == 'model_reasoning_effort="medium"'
 
 
 def test_foreman_completed_output_completes_repair_task_without_dev_checkpoint(monkeypatch, tmp_path):

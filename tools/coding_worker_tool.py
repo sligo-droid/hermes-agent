@@ -820,10 +820,15 @@ def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: s
         parameters = inspect.signature(run_opencode_task).parameters
     except (TypeError, ValueError):
         parameters = {}
-    if "scope_session_key" in parameters or any(
+    accepts_kwargs = any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
-    ):
+    )
+    if parameters and not accepts_kwargs:
+        scoped_kwargs = {
+            key: value for key, value in scoped_kwargs.items() if key in parameters
+        }
+    if "scope_session_key" in parameters or accepts_kwargs:
         scoped_kwargs["scope_session_key"] = scope_session_key
     try:
         return run_opencode_task(*args, **scoped_kwargs)
@@ -835,6 +840,27 @@ def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: s
         ):
             raise
         return run_opencode_task(*args, **kwargs)
+
+
+def _load_worker_pass_settings(
+    loader: Any,
+    *,
+    task: str,
+    context: str,
+    worker_config: Optional[dict[str, Any]] = None,
+) -> Any:
+    """Pass task-purpose context while tolerating legacy test/plugin loaders."""
+
+    kwargs: dict[str, Any] = {"task": task, "context": context}
+    if worker_config is not None:
+        kwargs["worker_config"] = worker_config
+    try:
+        return loader(**kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        fallback = {"worker_config": worker_config} if worker_config is not None else {}
+        return loader(**fallback)
 
 
 def _worker_project_context(workdir: str) -> str:
@@ -1649,6 +1675,15 @@ def _delegate_coding_task_impl(
             return tool_error(
                 f"Unknown worker_tier {worker_tier!r}. Valid tiers: {valid_tiers}."
             )
+        from hermes_cli.model_tiers import restrict_model_tier_for_task
+
+        selected_worker_tier = restrict_model_tier_for_task(
+            loaded_config,
+            selected_worker_tier,
+            task_text,
+            context_text,
+            worker=True,
+        )
     worker_tier_config = (
         _worker_tier_config(selected_worker_tier)
         if selected_worker_tier is not None
@@ -1930,6 +1965,14 @@ def _delegate_coding_task_impl(
         else _load_coding_worker_timeout()
     )
     timeout = max(30.0, timeout)
+    if _background_startup is None:
+        from agent.worker_budget import remaining_nested_worker_budget
+
+        timeout = remaining_nested_worker_budget(parent_agent, timeout)
+        if timeout <= 0:
+            return tool_error(
+                "Parent turn nested-worker deadline was exhausted before coding-worker launch."
+            )
 
     worker_label = "OpenCode" if backend == BACKEND_OPENCODE else "Codex"
     worker_prompt_parts = [
@@ -2117,6 +2160,7 @@ def _delegate_coding_task_impl(
         opencode_kwargs = {
             "timeout": timeout,
             "context_for_classification": classification_context,
+            "task_for_purpose": task_text,
             "title": "Hermes delegated coding task",
             "on_event": _touch_opencode_activity,
         }
@@ -2125,7 +2169,11 @@ def _delegate_coding_task_impl(
             opencode_kwargs["worker_config"] = opencode_worker_config
         if allow_git_pr_lifecycle:
             opencode_kwargs["env"] = worker_env
-        opencode_runtime = load_opencode_config(worker_config=opencode_worker_config)
+        opencode_runtime = load_opencode_config(
+            worker_config=opencode_worker_config,
+            task=task_text,
+            context=context_text,
+        )
         opencode_needs_plan = looks_complex_or_risky(
             worker_prompt,
             classification_context,
@@ -2267,7 +2315,11 @@ def _delegate_coding_task_impl(
             for pass_name in ("simple_build", "complex_plan", "complex_build")
         }
     else:
-        default_profiles = load_coding_worker_pass_profiles()
+        default_profiles = _load_worker_pass_settings(
+            load_coding_worker_pass_profiles,
+            task=task_text,
+            context=context_text,
+        )
     turn = None
     codex_run = None
     try:
@@ -2278,11 +2330,20 @@ def _delegate_coding_task_impl(
                 "complex_build_reasoning_level": selected_worker_tier.reasoning_effort,
             }
             if selected_worker_tier is not None
-            else load_coding_worker_pass_config()
+            else _load_worker_pass_settings(
+                load_coding_worker_pass_config,
+                task=task_text,
+                context=context_text,
+            )
         )
         worker_config = _merge_worker_config(None, worker_tier_config)
         pass_cfg = (
-            load_coding_worker_pass_config(worker_config=worker_config)
+            _load_worker_pass_settings(
+                load_coding_worker_pass_config,
+                worker_config=worker_config,
+                task=task_text,
+                context=context_text,
+            )
             if worker_config is not None and selected_worker_tier is None
             else default_pass_cfg
         )

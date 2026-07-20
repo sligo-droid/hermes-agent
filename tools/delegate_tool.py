@@ -428,7 +428,11 @@ def _resolve_delegation_model_tier(
     ):
         return None
 
-    from hermes_cli.model_tiers import classify_task_complexity, resolve_model_tier
+    from hermes_cli.model_tiers import (
+        classify_task_complexity,
+        resolve_model_tier,
+        restrict_model_tier_for_task,
+    )
 
     if role == "orchestrator":
         tier_name = "advanced"
@@ -438,7 +442,13 @@ def _resolve_delegation_model_tier(
             "ordinary": "intermediate",
             "complex": "advanced",
         }[classify_task_complexity(goal, context)]
-    return resolve_model_tier({"model_tiers": cfg.get("model_tiers") or {}}, tier_name)
+    tier_config = {"model_tiers": cfg.get("model_tiers") or {}}
+    return restrict_model_tier_for_task(
+        tier_config,
+        resolve_model_tier(tier_config, tier_name),
+        goal,
+        context,
+    )
 
 
 def _get_max_concurrent_children() -> int:
@@ -1212,6 +1222,25 @@ def _build_child_agent(
                 )
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    try:
+        from hermes_cli.model_tiers import restrict_reasoning_effort_for_task
+
+        current_effort = (
+            str(child_reasoning.get("effort") or "")
+            if isinstance(child_reasoning, dict)
+            else ""
+        )
+        safe_effort = restrict_reasoning_effort_for_task(
+            current_effort,
+            goal,
+            context,
+        )
+        if current_effort and safe_effort != current_effort:
+            from hermes_constants import parse_reasoning_effort
+
+            child_reasoning = parse_reasoning_effort(safe_effort)
+    except Exception as exc:
+        logger.debug("Could not enforce delegated review-only reasoning: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -1644,7 +1673,25 @@ def _run_single_child(
 
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
-        child_timeout = _get_child_timeout()
+        from agent.worker_budget import remaining_nested_worker_budget
+
+        child_timeout = remaining_nested_worker_budget(
+            parent_agent,
+            _get_child_timeout(),
+        )
+        if child_timeout <= 0:
+            duration = round(time.monotonic() - child_start, 2)
+            child_end_reason = "timeout"
+            return {
+                "task_index": task_index,
+                "status": "timeout",
+                "summary": None,
+                "error": "Parent turn nested-worker deadline was exhausted before launch.",
+                "exit_reason": "timeout",
+                "api_calls": 0,
+                "duration_seconds": duration,
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         try:
             _timeout_executor = ThreadPoolExecutor(
                 max_workers=1,
@@ -2125,6 +2172,13 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    from agent.worker_budget import remaining_nested_worker_budget
+
+    if remaining_nested_worker_budget(parent_agent, _get_child_timeout()) <= 0:
+        return tool_error(
+            "Parent turn nested-worker deadline was exhausted before delegation launch."
+        )
 
     if _interpreter_shutdown_in_progress():
         return tool_error(_delegation_shutdown_message())

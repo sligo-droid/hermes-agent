@@ -5,10 +5,13 @@ from hermes_cli.model_tiers import (
     DEFAULT_WORKER_TIERS,
     MODEL_TIER_LADDER,
     classify_task_complexity,
+    classify_task_purpose,
     resolve_adjacent_model_tier,
     resolve_model_tier,
     resolve_model_tier_offset,
     resolve_worker_tier,
+    restrict_model_tier_for_task,
+    restrict_reasoning_effort_for_task,
 )
 
 
@@ -119,6 +122,38 @@ def test_invalid_tier_is_rejected_without_leaking_into_runtime():
     ) is None
 
 
+def test_xhigh_and_max_reasoning_are_review_only():
+    assert classify_task_purpose("Review the authentication flow and report findings") == "review"
+    assert classify_task_purpose("Review the flow and fix the race") == "implementation"
+    assert classify_task_purpose("Analyze the request") == "implementation"
+
+    advanced = resolve_model_tier({}, "advanced")
+    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").name == "intermediate"
+    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").reasoning_effort == "medium"
+    assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").name == "advanced"
+    assert restrict_reasoning_effort_for_task("max", "Apply the patch") == "medium"
+    assert restrict_reasoning_effort_for_task("xhigh", "Diagnose the incident") == "xhigh"
+
+
+def test_implementation_fallback_caps_custom_intermediate_xhigh_override():
+    config = {
+        "model_tiers": {
+            "advanced": {"model": "custom/advanced", "reasoning_effort": "xhigh"},
+            "intermediate": {"model": "custom/intermediate", "reasoning_effort": "xhigh"},
+        }
+    }
+
+    restricted = restrict_model_tier_for_task(
+        config,
+        resolve_model_tier(config, "advanced"),
+        "Build the feature",
+    )
+
+    assert restricted.name == "intermediate"
+    assert restricted.model == "custom/intermediate"
+    assert restricted.reasoning_effort == "medium"
+
+
 def test_default_worker_tiers_resolve_to_expected_model_and_effort():
     expected = {
         "quick": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "medium"),
@@ -204,6 +239,6 @@ def test_standalone_coding_worker_uses_its_named_tier():
     resolved = load_opencode_config(config)
 
     assert resolved["model"] == "custom/feature-worker"
-    assert resolved["simple_build_reasoning_level"] == "max"
-    assert resolved["complex_plan_reasoning_level"] == "max"
-    assert resolved["complex_build_reasoning_level"] == "max"
+    assert resolved["simple_build_reasoning_level"] == "medium"
+    assert resolved["complex_plan_reasoning_level"] == "medium"
+    assert resolved["complex_build_reasoning_level"] == "medium"
