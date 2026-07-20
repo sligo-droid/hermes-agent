@@ -3323,6 +3323,49 @@ class GatewayWorkLedger:
             self._write(data)
             return dict(item)
 
+    @_locked_ledger_mutation
+    def adopt_observed_direct_closeout(
+        self,
+        work_id: str,
+        closeout_state: dict[str, Any],
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> dict[str, Any] | None:
+        """Adopt a read-only, exact merged-PR observation before delivery."""
+
+        from hermes_cli.trusted_closeout import (
+            closeout_terminal_eligible,
+            normalize_closeout_state,
+        )
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        if (
+            not isinstance(item, dict)
+            or not _run_state_matches(item, expected_run_state)
+            or item.get("closeout_authoritative") is True
+            or not isinstance(item.get("closeout"), dict)
+        ):
+            return None
+        current = normalize_closeout_state(item["closeout"])
+        state = normalize_closeout_state(closeout_state)
+        if (
+            current["source"] not in {"direct", "fable"}
+            or state["source"] != current["source"]
+            or state["mode"] != "enforce"
+            or not closeout_terminal_eligible(state)
+        ):
+            return None
+        state["revision"] = int(current.get("revision") or 0) + 1
+        state["lease_generation"] = int(current.get("lease_generation") or 0)
+        state["lease"] = {"owner": "", "until": None}
+        item["closeout"] = state
+        item["closeout_authoritative"] = True
+        item["closeout_activated_at"] = self._now()
+        item["updated_at"] = item["closeout_activated_at"]
+        self._write(data)
+        return dict(item)
+
     def claim_terminal_delivery(
         self,
         work_id: str,

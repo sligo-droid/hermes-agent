@@ -253,7 +253,15 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
     if pr_open_policy not in PR_OPEN_POLICIES:
         pr_open_policy = "after_review_approval"
 
+    raw_required_checks = ci.get("required") if isinstance(ci.get("required"), list) else []
     required_checks = [
+        {
+            "workflow": _bounded_text(item.get("workflow"), limit=160),
+            "check": _bounded_text(item.get("check"), limit=160),
+        }
+        for item in raw_required_checks[:100]
+        if isinstance(item, Mapping) and _bounded_text(item.get("check"), limit=160)
+    ] or [
         {"workflow": workflow, "check": check}
         for workflow, check in REQUIRED_PR_CHECKS
     ]
@@ -315,7 +323,7 @@ def normalize_closeout_state(value: Any = None) -> dict[str, Any]:
         "ci": {
             "head_sha": ci_head_sha if _SHA_RE.fullmatch(ci_head_sha) else "",
             "status": _safe_status(ci.get("status"), default="not_checked"),
-            "total": _safe_int(ci.get("total"), maximum=len(REQUIRED_PR_CHECKS)),
+            "total": _safe_int(ci.get("total"), maximum=100),
             "failed": failed,
             "wait_state": _safe_status(ci.get("wait_state"), default="queued"),
             "required": required_checks,

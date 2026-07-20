@@ -238,8 +238,54 @@ def test_worktree_runtime_defaults_enable_safe_reuse_and_bounded_cleanup():
         "enabled": True,
         "retention_days": 7,
         "min_interval_hours": 24,
+        "action_retention_minutes": 15,
+        "action_min_interval_minutes": 5,
         "max_per_run": 25,
     }
+
+
+def test_terminal_action_cleanup_uses_prompt_action_retention(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    captured = {}
+    def terminal_paths(**kwargs):
+        captured["older_than"] = kwargs["older_than"]
+        return []
+
+    ledger = SimpleNamespace(terminal_action_worktree_paths=terminal_paths)
+    monkeypatch.setattr(wr.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(
+        wr,
+        "cleanup_worktrees",
+        lambda paths, **kwargs: {
+            "scanned": 0,
+            "eligible": 0,
+            "removed": [],
+            "errors": [],
+            "reasons": {},
+            "decisions": [],
+            "older_than_days": kwargs["older_than_days"],
+        },
+    )
+
+    result = wr.maybe_cleanup_terminal_action_worktrees(
+        ledger,
+        {
+            "worktrees": {
+                "cleanup": {
+                    "action_retention_minutes": 15,
+                    "action_min_interval_minutes": 5,
+                }
+            }
+        },
+        tmp_path / "workspaces",
+    )
+
+    assert captured["older_than"] == 9_100.0
+    assert result["older_than_days"] == 15 / (24 * 60)
+    assert wr.terminal_action_cleanup_interval_seconds(
+        {"worktrees": {"cleanup": {"action_min_interval_minutes": 5}}}
+    ) == 300
 
 
 def test_dedupe_skips_locked_worktree(tmp_path, monkeypatch):
