@@ -2854,6 +2854,75 @@ class TestConcurrentToolExecution:
             for message in messages[1:]
         )
 
+    def test_single_coding_worker_is_isolated_when_composed_with_read_only_delegate(
+        self, agent, monkeypatch, tmp_path
+    ):
+        from agent import tool_dispatch_helpers
+        from tools import coding_worker_tool as cwt
+
+        monkeypatch.setattr(
+            tool_dispatch_helpers,
+            "_coding_worker_parallel_settings",
+            lambda: (True, 3),
+        )
+        monkeypatch.setattr(
+            cwt,
+            "preflight_delegate_coding_task",
+            lambda args, _agent: SimpleNamespace(
+                args=dict(args or {}), suppressed_result=None
+            ),
+        )
+
+        base_cwd = tmp_path / "base"
+        base_cwd.mkdir()
+        agent.session_cwd = str(base_cwd)
+        dispatched_groups = []
+        monkeypatch.setattr(cwt, "_git_workspace_baseline", lambda _cwd: ("c" * 40, []))
+        monkeypatch.setattr(
+            cwt,
+            "merge_parallel_worker_result",
+            lambda _base, _worker, _group: {"success": True},
+        )
+        monkeypatch.setattr(
+            agent,
+            "_dispatch_delegate_task",
+            lambda _args: json.dumps({"results": [{"status": "success"}]}),
+        )
+
+        def fake_coding(**kwargs):
+            dispatched_groups.append(kwargs["_parallel_group"])
+            return json.dumps(
+                {
+                    "success": True,
+                    "parallel": {"worker_cwd": str(tmp_path / "worker-one")},
+                }
+            )
+
+        monkeypatch.setattr(cwt, "delegate_coding_task", fake_coding)
+        calls = [
+            _mock_tool_call(
+                name="delegate_task",
+                arguments=json.dumps({"goal": "inspect", "read_only": True}),
+                call_id="d1",
+            ),
+            _mock_tool_call(
+                name="delegate_coding_task",
+                arguments=json.dumps({"task": "one", "scope_paths": ["src/one"]}),
+                call_id="c1",
+            ),
+        ]
+        messages = []
+
+        agent._execute_tool_calls(
+            _mock_assistant_msg(content="", tool_calls=calls),
+            messages,
+            "task-1",
+        )
+
+        assert len(dispatched_groups) == 1
+        assert dispatched_groups[0]["base_cwd"] == str(base_cwd.resolve())
+        assert json.loads(messages[1]["content"])["parallel_merge"]["success"] is True
+
     def test_concurrent_handles_tool_error(self, agent):
         """If one tool raises, others should still complete."""
         tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
