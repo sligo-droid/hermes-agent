@@ -4263,6 +4263,34 @@ class GatewayWorkLedger:
             items.append(dict(item))
         return items
 
+    def terminal_action_worktree_paths(self, *, older_than: float) -> list[str]:
+        """Return action worktrees whose persisted users are all old and terminal."""
+
+        by_path: dict[str, dict[str, Any]] = {}
+        terminal_statuses = {"completed", "blocked", "expired", "failed"}
+        for item in self._read().get("items", {}).values():
+            if not isinstance(item, dict):
+                continue
+            closeout = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+            workspace = (
+                closeout.get("workspace")
+                if isinstance(closeout.get("workspace"), dict)
+                else {}
+            )
+            path = str(workspace.get("path") or "").strip()
+            if not path:
+                continue
+            state = by_path.setdefault(path, {"safe": True, "latest": 0.0})
+            updated_at = float(item.get("updated_at") or 0.0)
+            state["latest"] = max(float(state["latest"]), updated_at)
+            if str(item.get("status") or "") not in terminal_statuses:
+                state["safe"] = False
+        return sorted(
+            path
+            for path, state in by_path.items()
+            if state["safe"] and float(state["latest"]) <= float(older_than)
+        )
+
     @staticmethod
     def agent_run_active(
         item: dict[str, Any],

@@ -11039,7 +11039,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
-        "version", "webhook", "whatsapp", "chat", "secrets", "security",
+        "version", "webhook", "whatsapp", "worktrees", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -12450,6 +12450,17 @@ Examples:
     )
     from hermes_cli.checkpoints import register_cli as _register_checkpoints_cli
     _register_checkpoints_cli(checkpoints_parser)
+
+    # =========================================================================
+    # worktrees command
+    # =========================================================================
+    worktrees_parser = subparsers.add_parser(
+        "worktrees",
+        help="Prepare, inspect, and conservatively clean linked worktrees",
+    )
+    from hermes_cli.worktree_runtime import register_cli as _register_worktrees_cli
+
+    _register_worktrees_cli(worktrees_parser)
 
     # =========================================================================
     # import command

@@ -1232,6 +1232,39 @@ def test_ledger_records_discord_board_final_response_provenance(tmp_path, monkey
     ]
 
 
+def test_terminal_action_worktree_paths_require_every_user_to_be_old_and_terminal(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    first = ledger.accept_event(
+        _repo_discord_event(message_id="terminal-one"),
+        session_key="terminal-one",
+        freshness_seconds=60,
+    )
+    second = ledger.accept_event(
+        _repo_discord_event(message_id="terminal-two"),
+        session_key="terminal-two",
+        freshness_seconds=60,
+    )
+    assert first is not None and second is not None
+    for item in (first, second):
+        attached = ledger.attach_closeout_workspace(
+            item["id"],
+            workspace_path="/tmp/project-discord-action-shared",
+            repository="acme/project",
+            branch="feature/test",
+            mode="enforce",
+        )
+        assert attached is not None
+
+    ledger.mark_completed(first["id"])
+    assert ledger.terminal_action_worktree_paths(older_than=200) == []
+
+    ledger.mark_blocked(second["id"], reason="done")
+    assert ledger.terminal_action_worktree_paths(older_than=99) == []
+    assert ledger.terminal_action_worktree_paths(older_than=200) == [
+        "/tmp/project-discord-action-shared"
+    ]
+
+
 def test_repo_backed_self_declared_incomplete_response_is_blocked(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event()

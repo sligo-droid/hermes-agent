@@ -239,7 +239,10 @@ def test_action_worktree_warmup_lockfile_detection_matrix(
     if expected_command is None:
         assert calls == []
     else:
-        assert calls == [(expected_command, tmp_path, 180.0)]
+        assert len(calls) == 1
+        assert calls[0][0] == expected_command
+        assert calls[0][1] == tmp_path
+        assert calls[0][2] == pytest.approx(180.0, abs=0.02)
         assert " ok" in caplog.text
     assert expected_log in caplog.text
 
@@ -291,7 +294,7 @@ def test_action_worktree_warmup_timeout_does_not_fail_provisioning(
 
     def _timeout(command, *, cwd, timeout):
         assert cwd.parent == workspaces
-        assert timeout == 0.25
+        assert timeout == pytest.approx(0.25, abs=0.02)
         raise subprocess.TimeoutExpired(command, timeout, output="still installing")
 
     monkeypatch.setattr(
@@ -332,7 +335,7 @@ def test_action_worktree_warmup_failure_does_not_fail_provisioning(
 
     def _failure(command, *, cwd, timeout):
         assert cwd.parent == workspaces
-        assert timeout == 180.0
+        assert timeout == pytest.approx(180.0, abs=0.02)
         return subprocess.CompletedProcess(command, 17, stdout=noisy_output)
 
     monkeypatch.setattr(
@@ -356,6 +359,46 @@ def test_action_worktree_warmup_failure_does_not_fail_provisioning(
     assert "install failed" in caplog.text
     assert "sk-exampletoken1234567890" not in caplog.text
     assert "x" * 801 not in caplog.text
+
+
+def test_action_worktree_warmup_detects_nested_pnpm_package(tmp_path, monkeypatch):
+    package = tmp_path / "dashboard"
+    package.mkdir()
+    (package / "package.json").write_text('{"name":"dashboard"}', encoding="utf-8")
+    (package / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_discord_action_worktree_warmup",
+        lambda command, *, cwd, timeout: (
+            calls.append((command, cwd, timeout))
+            or subprocess.CompletedProcess(command, 0, stdout="ready")
+        ),
+    )
+
+    gateway_run._discord_action_worktree_warmup(tmp_path, {})
+
+    assert calls[0][0] == ["pnpm", "install", "--frozen-lockfile", "--prefer-offline"]
+    assert calls[0][1] == package
+
+
+def test_action_worktree_warmup_skips_prepared_dependency_link(tmp_path, monkeypatch, caplog):
+    (tmp_path / "package.json").write_text('{"name":"root"}', encoding="utf-8")
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    shared = tmp_path.parent / "shared-node-modules"
+    shared.mkdir()
+    (tmp_path / "node_modules").symlink_to(shared, target_is_directory=True)
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_discord_action_worktree_warmup",
+        lambda *_args, **_kwargs: pytest.fail("linked dependencies must skip install"),
+    )
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        gateway_run._discord_action_worktree_warmup(tmp_path, {})
+
+    assert "exact-lock node_modules link already prepared" in caplog.text
 
 
 def test_normal_action_creates_and_reuses_thread_worktree(tmp_path, monkeypatch):

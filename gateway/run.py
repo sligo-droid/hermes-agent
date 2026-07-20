@@ -2414,6 +2414,28 @@ def _discord_action_worktree_warmup_command(
     return None, None
 
 
+def _discord_action_worktree_warmup_targets(
+    worktree_root: Path,
+) -> list[tuple[Path, str, Optional[list[str]]]]:
+    """Return root and nested JS package roots without traversing build output."""
+
+    try:
+        from hermes_cli.worktree_runtime import javascript_package_roots
+
+        package_roots = javascript_package_roots(worktree_root)
+    except Exception:
+        package_roots = [worktree_root]
+    root_manager, _root_command = _discord_action_worktree_warmup_command(worktree_root)
+    if root_manager and worktree_root.resolve(strict=False) not in package_roots:
+        package_roots.insert(0, worktree_root.resolve(strict=False))
+    targets: list[tuple[Path, str, Optional[list[str]]]] = []
+    for package_root in package_roots:
+        manager, command = _discord_action_worktree_warmup_command(package_root)
+        if manager:
+            targets.append((package_root, manager, command))
+    return targets
+
+
 def _run_discord_action_worktree_warmup(
     command: list[str],
     *,
@@ -2479,15 +2501,8 @@ def _discord_action_worktree_warmup(
         )
         return
 
-    manager, command = _discord_action_worktree_warmup_command(worktree_root)
-    if manager == "yarn":
-        logger.info(
-            "Discord action worktree provisioning for %s: warmup skipped: "
-            "yarn.lock has ambiguous yarn variants",
-            worktree_root,
-        )
-        return
-    if command is None:
+    targets = _discord_action_worktree_warmup_targets(worktree_root)
+    if not targets:
         logger.info(
             "Discord action worktree provisioning for %s: warmup skipped: no lockfile",
             worktree_root,
@@ -2509,63 +2524,92 @@ def _discord_action_worktree_warmup(
 
     import subprocess
 
-    started = time.monotonic()
-    try:
-        completed = _run_discord_action_worktree_warmup(
-            command,
-            cwd=worktree_root,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
+    overall_started = time.monotonic()
+    for package_root, manager, command in targets:
+        if manager == "yarn":
+            logger.info(
+                "Discord action worktree provisioning for %s: warmup skipped: "
+                "yarn.lock has ambiguous yarn variants",
+                package_root,
+            )
+            continue
+        modules = package_root / "node_modules"
+        if modules.is_symlink():
+            logger.info(
+                "Discord action worktree provisioning for %s: warmup skipped: "
+                "exact-lock node_modules link already prepared",
+                package_root,
+            )
+            continue
+        if command is None:
+            continue
+        elapsed_total = time.monotonic() - overall_started
+        remaining = timeout - elapsed_total
+        if remaining <= 0:
+            logger.warning(
+                "Discord action worktree provisioning for %s: warmup failed "
+                "(continuing): total timeout %.1fs exhausted",
+                package_root,
+                timeout,
+            )
+            return
+        started = time.monotonic()
+        try:
+            completed = _run_discord_action_worktree_warmup(
+                command,
+                cwd=package_root,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            detail = _discord_action_worktree_warmup_output(
+                getattr(exc, "stdout", None)
+                or getattr(exc, "output", None)
+                or getattr(exc, "stderr", None)
+            )
+            logger.warning(
+                "Discord action worktree provisioning for %s: warmup failed "
+                "(continuing): %s timed out after %.1fs (%.1fs elapsed)%s",
+                package_root,
+                manager,
+                remaining,
+                elapsed,
+                f": {detail}" if detail else "",
+            )
+            return
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            detail = _discord_action_worktree_warmup_output(exc)
+            logger.warning(
+                "Discord action worktree provisioning for %s: warmup failed "
+                "(continuing): %s could not run after %.1fs: %s",
+                package_root,
+                manager,
+                elapsed,
+                detail,
+            )
+            continue
+
         elapsed = time.monotonic() - started
-        detail = _discord_action_worktree_warmup_output(
-            getattr(exc, "stdout", None)
-            or getattr(exc, "output", None)
-            or getattr(exc, "stderr", None)
-        )
+        if completed.returncode == 0:
+            logger.info(
+                "Discord action worktree provisioning for %s: warmup %s %.1fs ok",
+                package_root,
+                manager,
+                elapsed,
+            )
+            continue
+
+        detail = _discord_action_worktree_warmup_output(completed.stdout)
         logger.warning(
-            "Discord action worktree provisioning for %s: warmup failed "
-            "(continuing): %s timed out after %.1fs (%.1fs elapsed)%s",
-            worktree_root,
+            "Discord action worktree provisioning for %s: warmup failed (continuing): "
+            "%s exited %s after %.1fs%s",
+            package_root,
             manager,
-            timeout,
+            completed.returncode,
             elapsed,
             f": {detail}" if detail else "",
         )
-        return
-    except Exception as exc:
-        elapsed = time.monotonic() - started
-        detail = _discord_action_worktree_warmup_output(exc)
-        logger.warning(
-            "Discord action worktree provisioning for %s: warmup failed "
-            "(continuing): %s could not run after %.1fs: %s",
-            worktree_root,
-            manager,
-            elapsed,
-            detail,
-        )
-        return
-
-    elapsed = time.monotonic() - started
-    if completed.returncode == 0:
-        logger.info(
-            "Discord action worktree provisioning for %s: warmup %s %.1fs ok",
-            worktree_root,
-            manager,
-            elapsed,
-        )
-        return
-
-    detail = _discord_action_worktree_warmup_output(completed.stdout)
-    logger.warning(
-        "Discord action worktree provisioning for %s: warmup failed (continuing): "
-        "%s exited %s after %.1fs%s",
-        worktree_root,
-        manager,
-        completed.returncode,
-        elapsed,
-        f": {detail}" if detail else "",
-    )
 
 
 def _discord_action_worktree_target(
@@ -2750,6 +2794,21 @@ def _discord_action_worktree_cwd(
                 f"Git could not create mutable action worktree {target_path}: {exc}"
             )
         if created.returncode == 0:
+            try:
+                from hermes_cli.worktree_runtime import prepare_worktree_dependency_links
+
+                for note in prepare_worktree_dependency_links(target_path, config):
+                    logger.info(
+                        "Discord action worktree provisioning for %s: %s",
+                        target_path,
+                        note,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Discord action worktree dependency reuse skipped for %s: %s",
+                    target_path,
+                    exc,
+                )
             _discord_action_worktree_warmup(target_path, config)
             return _reuse_cwd(target_path)
 
@@ -7123,6 +7182,27 @@ class GatewayRunner:
         except RuntimeError:
             self._gateway_loop = None
         logger.info("Session storage: %s", self.config.sessions_dir)
+        try:
+            from hermes_cli.worktree_runtime import maybe_cleanup_terminal_action_worktrees
+
+            cleanup_result = await asyncio.to_thread(
+                maybe_cleanup_terminal_action_worktrees,
+                self.work_ledger,
+                _load_gateway_runtime_config(),
+                _DISCORD_ACTION_WORKTREE_ROOT,
+            )
+            if cleanup_result.get("removed"):
+                logger.info(
+                    "Action worktree cleanup removed %d old terminal worktree(s)",
+                    len(cleanup_result["removed"]),
+                )
+            if cleanup_result.get("errors"):
+                logger.warning(
+                    "Action worktree cleanup encountered %d error(s)",
+                    len(cleanup_result["errors"]),
+                )
+        except Exception as exc:
+            logger.debug("Action worktree cleanup skipped: %s", exc)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
