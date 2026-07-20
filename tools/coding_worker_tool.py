@@ -2749,6 +2749,24 @@ def _dispatch_background_coding_task(
         dispatch_async_delegation,
     )
 
+    origin_work_item_id = str(
+        getattr(parent_agent, "_origin_work_item_id", "")
+        or getattr(parent_agent, "work_item_id", "")
+        or ""
+    )
+    origin_run_generation = getattr(
+        parent_agent,
+        "_origin_work_item_generation",
+        None,
+    )
+    origin_attempt_id = str(
+        getattr(parent_agent, "_origin_work_item_attempt_id", "") or ""
+    )
+    origin_attempt_order = getattr(
+        parent_agent,
+        "_origin_work_item_attempt_order",
+        None,
+    )
     dispatch = dispatch_async_delegation(
         goal=task_text,
         context=context_text,
@@ -2759,11 +2777,10 @@ def _dispatch_background_coding_task(
         runner=_runner,
         max_async_children=get_coding_worker_background_max_concurrent(loaded_config),
         kind="coding_worker",
-        origin_work_item_id=str(
-            getattr(parent_agent, "_origin_work_item_id", "")
-            or getattr(parent_agent, "work_item_id", "")
-            or ""
-        ),
+        origin_work_item_id=origin_work_item_id,
+        origin_run_generation=origin_run_generation,
+        origin_attempt_id=origin_attempt_id,
+        origin_attempt_order=origin_attempt_order,
     )
     if dispatch.get("status") != "dispatched":
         error = str(
@@ -2788,6 +2805,21 @@ def _dispatch_background_coding_task(
         discard_async_delegation(delegation_id)
         startup.release.set()
         return startup.preflight_result
+    if origin_work_item_id:
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            GatewayWorkLedger().begin_required_async_attempt(
+                origin_work_item_id,
+                attempt_id=origin_attempt_id,
+                attempt_order=origin_attempt_order,
+                generation=origin_run_generation,
+            )
+        except Exception:
+            logger.debug(
+                "Could not initialize required async completion attempt",
+                exc_info=True,
+            )
 
     handle: dict[str, Any] = {
         "success": True,

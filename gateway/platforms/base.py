@@ -1408,6 +1408,20 @@ class MessageEvent:
     work_replay: bool = False
     defer_work_completion: bool = False
 
+    # Detached completion lifecycle metadata. Visibility is deliberately
+    # separate from processing: a suppressed completion still runs its internal
+    # continuation and closeout callbacks, but cannot emit user-facing output.
+    background_completion_id: Optional[str] = None
+    background_completion_kind: Optional[str] = None
+    background_completion_success: Optional[bool] = None
+    background_completion_generation: Optional[int] = None
+    suppress_user_output: bool = False
+    participates_in_work_lifecycle: bool = True
+    background_completion_required_failed: bool = False
+    background_completion_attempt_id: Optional[str] = None
+    background_completion_attempt_order: Optional[int] = None
+    processing_completion_future: Any = None
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -3176,6 +3190,13 @@ class BasePlatformAdapter(ABC):
                 complete_event,
                 complete_outcome,
             )
+            completion_future = getattr(
+                complete_event,
+                "processing_completion_future",
+                None,
+            )
+            if completion_future is not None and not completion_future.done():
+                completion_future.set_result(complete_outcome)
 
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
@@ -4031,7 +4052,11 @@ class BasePlatformAdapter(ABC):
 
     def _mark_work_item_completed(self, event: MessageEvent, result=None) -> None:
         work_item_id = getattr(event, "work_item_id", None)
-        if not work_item_id or getattr(event, "defer_work_completion", False):
+        if (
+            not work_item_id
+            or not getattr(event, "participates_in_work_lifecycle", True)
+            or getattr(event, "defer_work_completion", False)
+        ):
             return
         try:
             from gateway.work_ledger import GatewayWorkLedger
@@ -4050,7 +4075,11 @@ class BasePlatformAdapter(ABC):
 
     def _mark_work_item_delivery_started(self, event: MessageEvent) -> bool:
         work_item_id = getattr(event, "work_item_id", None)
-        if not work_item_id or getattr(event, "defer_work_completion", False):
+        if (
+            not work_item_id
+            or not getattr(event, "participates_in_work_lifecycle", True)
+            or getattr(event, "defer_work_completion", False)
+        ):
             return True
         try:
             from gateway.work_ledger import GatewayWorkLedger
@@ -4069,7 +4098,11 @@ class BasePlatformAdapter(ABC):
 
     def _release_work_item_delivery_attempt(self, event: MessageEvent) -> None:
         work_item_id = getattr(event, "work_item_id", None)
-        if not work_item_id or getattr(event, "defer_work_completion", False):
+        if (
+            not work_item_id
+            or not getattr(event, "participates_in_work_lifecycle", True)
+            or getattr(event, "defer_work_completion", False)
+        ):
             return
         try:
             from gateway.work_ledger import GatewayWorkLedger
@@ -4091,7 +4124,11 @@ class BasePlatformAdapter(ABC):
 
     def _mark_work_item_response_delivered(self, event: MessageEvent, result=None) -> None:
         work_item_id = getattr(event, "work_item_id", None)
-        if not work_item_id or getattr(event, "defer_work_completion", False):
+        if (
+            not work_item_id
+            or not getattr(event, "participates_in_work_lifecycle", True)
+            or getattr(event, "defer_work_completion", False)
+        ):
             return
         try:
             from gateway.work_ledger import GatewayWorkLedger
@@ -4119,7 +4156,11 @@ class BasePlatformAdapter(ABC):
         """Persist an unsafe or partially confirmed logical-send outcome."""
 
         work_item_id = getattr(event, "work_item_id", None)
-        if not work_item_id or getattr(event, "defer_work_completion", False):
+        if (
+            not work_item_id
+            or not getattr(event, "participates_in_work_lifecycle", True)
+            or getattr(event, "defer_work_completion", False)
+        ):
             return
         try:
             from gateway.work_ledger import GatewayWorkLedger
@@ -4155,6 +4196,7 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        suppress_user_output = bool(getattr(event, "suppress_user_output", False))
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -4206,14 +4248,18 @@ class BasePlatformAdapter(ABC):
             _keep_typing_sig = None
         if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
             _keep_typing_kwargs["stop_event"] = interrupt_event
-        typing_task = asyncio.create_task(
-            self._keep_typing(
-                event.source.chat_id,
-                **_keep_typing_kwargs,
+        typing_task = None
+        if not suppress_user_output:
+            typing_task = asyncio.create_task(
+                self._keep_typing(
+                    event.source.chat_id,
+                    **_keep_typing_kwargs,
+                )
             )
-        )
 
         async def _stop_typing_task() -> None:
+            if typing_task is None:
+                return
             typing_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(typing_task), timeout=0.5)
@@ -4239,6 +4285,8 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            if suppress_user_output:
+                response = None
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
@@ -4629,21 +4677,22 @@ class BasePlatformAdapter(ABC):
             processing_outcome = ProcessingOutcome.FAILURE
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception:
-                pass  # Last resort — don't let error reporting crash the handler
+            if not suppress_user_output:
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception:
+                    pass  # Last resort — don't let error reporting crash the handler
         finally:
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
@@ -4672,6 +4721,7 @@ class BasePlatformAdapter(ABC):
             if (
                 not post_delivery_callback_present
                 and getattr(event, "work_item_id", None)
+                and getattr(event, "participates_in_work_lifecycle", True)
                 and (getattr(event, "feature_summary", None) or getattr(event, "project_summary", None))
             ):
                 post_delivery_ok = False

@@ -5005,7 +5005,10 @@ class DiscordAdapter(BasePlatformAdapter):
     @staticmethod
     def _action_lifecycle_enabled(event: MessageEvent) -> bool:
         """Return whether this turn may mutate action summary/reaction state."""
-        return getattr(event, "discord_action_request_intent", None) is not False
+        return (
+            getattr(event, "discord_action_request_intent", None) is not False
+            and getattr(event, "participates_in_work_lifecycle", True)
+        )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
@@ -5018,6 +5021,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._reactions_enabled():
             return
         if not self._action_lifecycle_enabled(event):
+            return
+        if (
+            getattr(event, "background_completion_kind", None) == "coding_worker"
+            and getattr(event, "background_completion_required_failed", False)
+        ):
+            # A required failure is a sticky work-item outcome. Leave the
+            # existing terminal failure reaction in place while its internal
+            # continuation performs ledger/summary closeout.
             return
         await self._mark_feature_summary_running(event)
         messages = await self._processing_reaction_messages(event)

@@ -143,9 +143,15 @@ def pending_count(
     *,
     kind: Optional[str] = None,
     session_key: Optional[str] = None,
+    origin_work_item_id: Optional[str] = None,
+    origin_run_generation: Optional[int] = None,
+    origin_attempt_id: Optional[str] = None,
     exclude_delegation_id: Optional[str] = None,
 ) -> int:
     """Count running or completed-but-not-delivered background units."""
+    work_item_id = str(origin_work_item_id or "").strip()
+    generation = _normalized_generation(origin_run_generation)
+    attempt_id = str(origin_attempt_id or "").strip()
     with _records_lock:
         return sum(
             1
@@ -157,7 +163,86 @@ def pending_count(
             )
             and (kind is None or record.get("kind", "delegation") == kind)
             and (session_key is None or record.get("session_key", "") == session_key)
+            and (
+                not work_item_id
+                or str(record.get("origin_work_item_id") or "") == work_item_id
+            )
+            and (
+                generation is None
+                or _normalized_generation(record.get("origin_run_generation"))
+                == generation
+            )
+            and (
+                not attempt_id
+                or str(record.get("origin_attempt_id") or "") == attempt_id
+            )
         )
+
+
+def _normalized_generation(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        generation = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return generation if generation > 0 else None
+
+
+def completion_state(
+    *,
+    session_key: Optional[str] = None,
+    origin_work_item_id: Optional[str] = None,
+    origin_run_generation: Optional[int] = None,
+    origin_attempt_id: Optional[str] = None,
+    exclude_delegation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the bounded live aggregate for one originating work generation.
+
+    Coding workers are required lifecycle work. Ordinary ``delegate_task``
+    children are advisory and are reported separately so they can never hold or
+    complete the originating feature reaction.
+    """
+    work_item_id = str(origin_work_item_id or "").strip()
+    generation = _normalized_generation(origin_run_generation)
+    attempt_id = str(origin_attempt_id or "").strip()
+    required_pending = 0
+    advisory_pending = 0
+    required_failed = False
+    required_succeeded = 0
+    with _records_lock:
+        for delegation_id, record in _records.items():
+            if session_key is not None and record.get("session_key", "") != session_key:
+                continue
+            if work_item_id and str(record.get("origin_work_item_id") or "") != work_item_id:
+                continue
+            if (
+                generation is not None
+                and _normalized_generation(record.get("origin_run_generation"))
+                != generation
+            ):
+                continue
+            if attempt_id and str(record.get("origin_attempt_id") or "") != attempt_id:
+                continue
+            pending = delegation_id != exclude_delegation_id and (
+                record.get("status") == "running" or bool(record.get("delivery_pending"))
+            )
+            if record.get("kind") == "coding_worker":
+                if pending:
+                    required_pending += 1
+                success = record.get("completion_success")
+                if success is False:
+                    required_failed = True
+                elif success is True:
+                    required_succeeded += 1
+            elif pending:
+                advisory_pending += 1
+    return {
+        "required_pending": required_pending,
+        "required_failed": required_failed,
+        "required_succeeded": required_succeeded,
+        "advisory_pending": advisory_pending,
+    }
 
 
 def _new_delegation_id() -> str:
@@ -237,6 +322,9 @@ def dispatch_async_delegation(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     kind: str = "delegation",
     origin_work_item_id: str = "",
+    origin_run_generation: Optional[int] = None,
+    origin_attempt_id: str = "",
+    origin_attempt_order: Optional[int] = None,
     closeout_id: str = "",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
@@ -285,6 +373,9 @@ def dispatch_async_delegation(
         "kind": str(kind or "delegation"),
         "delivery_pending": False,
         "origin_work_item_id": str(origin_work_item_id or "")[:240],
+        "origin_run_generation": _normalized_generation(origin_run_generation),
+        "origin_attempt_id": str(origin_attempt_id or "")[:240],
+        "origin_attempt_order": _normalized_generation(origin_attempt_order),
         "closeout_id": str(closeout_id or "")[:240],
     }
     record.update(_capture_session_routing())
@@ -361,6 +452,17 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["delivery_pending"] = _completion_requires_delivery_ack(record)
+        deterministic_result = result.get("result")
+        if (
+            record.get("kind") == "coding_worker"
+            and isinstance(deterministic_result, dict)
+        ):
+            record["completion_success"] = bool(
+                status in {"completed", "success"}
+                and deterministic_result.get("success") is True
+            )
+        else:
+            record["completion_success"] = status in {"completed", "success"}
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
         _prune_completed_locked()
@@ -428,6 +530,9 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
         "origin_work_item_id": record.get("origin_work_item_id", ""),
+        "origin_run_generation": record.get("origin_run_generation"),
+        "origin_attempt_id": record.get("origin_attempt_id", ""),
+        "origin_attempt_order": record.get("origin_attempt_order"),
         "closeout_id": (
             (
                 deterministic_result.get("fable_git_result", {}).get("closeout_id")

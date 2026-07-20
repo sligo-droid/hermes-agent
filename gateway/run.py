@@ -1789,6 +1789,7 @@ from gateway.platforms.base import (
     MetadataReply,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     _reply_anchor_for_event,
     get_confirmed_message_ids,
     is_logical_send_retry_safe,
@@ -4744,6 +4745,9 @@ class GatewayRunner:
     def _session_has_pending_background_workers(
         session_key: str,
         *,
+        work_item_id: Optional[str] = None,
+        origin_run_generation: Optional[int] = None,
+        origin_attempt_id: Optional[str] = None,
         exclude_delegation_id: Optional[str] = None,
     ) -> bool:
         if not session_key:
@@ -4754,10 +4758,149 @@ class GatewayRunner:
             return pending_count(
                 kind="coding_worker",
                 session_key=session_key,
+                origin_work_item_id=work_item_id,
+                origin_run_generation=origin_run_generation,
+                origin_attempt_id=origin_attempt_id,
                 exclude_delegation_id=exclude_delegation_id,
             ) > 0
         except Exception:
             return False
+
+    @staticmethod
+    def _background_completion_success(evt: dict) -> bool:
+        result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+        return bool(
+            evt.get("status") in {"completed", "success"}
+            and result.get("success", True)
+        )
+
+    def _async_completion_lifecycle_state(self, event: MessageEvent) -> str:
+        """Return advisory/stale/running/failed/succeeded for a completion turn."""
+        kind = str(getattr(event, "background_completion_kind", "") or "")
+        if not kind:
+            return "ordinary"
+        if kind != "coding_worker" or not getattr(
+            event,
+            "participates_in_work_lifecycle",
+            True,
+        ):
+            return "advisory"
+
+        work_item_id = str(getattr(event, "work_item_id", "") or "").strip()
+        if not work_item_id:
+            return "stale"
+        completion_id = str(
+            getattr(event, "background_completion_id", "") or ""
+        ) or None
+        generation = getattr(event, "background_completion_generation", None)
+        try:
+            from tools.async_delegation import completion_state
+
+            live = completion_state(
+                session_key=self._session_key_for_source(event.source),
+                origin_work_item_id=work_item_id,
+                origin_run_generation=generation,
+                origin_attempt_id=getattr(
+                    event,
+                    "background_completion_attempt_id",
+                    None,
+                ),
+                exclude_delegation_id=completion_id,
+            )
+        except Exception:
+            live = {}
+        if int(live.get("required_pending") or 0) > 0:
+            return "running"
+
+        ledger_fn = getattr(self, "_ledger", None)
+        if not callable(ledger_fn):
+            return (
+                "failed"
+                if getattr(event, "background_completion_success", None) is False
+                else "running"
+            )
+        try:
+            ledger = ledger_fn()
+            item = ledger.get(work_item_id)
+        except Exception:
+            return (
+                "failed"
+                if getattr(event, "background_completion_success", None) is False
+                else "running"
+            )
+        if not isinstance(item, dict):
+            return "stale"
+
+        required_state_fn = getattr(ledger, "required_async_completion_state", None)
+        required = required_state_fn(work_item_id) if callable(required_state_fn) else None
+        if isinstance(required, dict):
+            required_attempt_id = str(required.get("attempt_id") or "")
+            event_attempt_id = str(
+                getattr(event, "background_completion_attempt_id", "") or ""
+            )
+            if required_attempt_id and event_attempt_id != required_attempt_id:
+                return "stale"
+            try:
+                required_generation = int(required.get("generation") or 0)
+                event_generation = int(generation or 0)
+            except (TypeError, ValueError):
+                required_generation = event_generation = 0
+            if required_generation and event_generation < required_generation:
+                return "stale"
+        if isinstance(required, dict) and required.get("failed"):
+            return "failed"
+        if live.get("required_failed"):
+            return "failed"
+        if getattr(event, "background_completion_success", None) is False:
+            return "failed"
+
+        gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
+        status = str(item.get("status") or "")
+        summary_status = str(item.get("summary_status") or "").strip().lower()
+        if gate.get("reason") == "required_async_completion_failed":
+            return "failed"
+        if summary_status in {
+            "failed",
+            "failure",
+            "error",
+            "errored",
+            "interrupted",
+            "blocked",
+        }:
+            return "failed"
+        if item.get("closeout_authoritative") is True and isinstance(
+            item.get("closeout"),
+            dict,
+        ):
+            try:
+                from hermes_cli.trusted_closeout import (
+                    closeout_terminal_eligible,
+                    normalize_closeout_state,
+                )
+
+                closeout = normalize_closeout_state(item["closeout"])
+                if (
+                    status == "completed"
+                    and gate.get("allowed_to_complete", True)
+                    and closeout_terminal_eligible(closeout)
+                ):
+                    return "succeeded"
+                closeout_status = str(closeout.get("status") or "").lower()
+                if closeout_status in {"failed", "blocked", "error", "errored"}:
+                    return "failed"
+                return "running"
+            except Exception:
+                return "running"
+        if status in {"failed", "blocked", "cancelled", "expired"}:
+            return "failed"
+        if (
+            status == "completed"
+            and gate.get("allowed_to_complete", True)
+            and summary_status
+            in {"complete", "completed", "done", "success", "succeeded"}
+        ):
+            return "succeeded"
+        return "running"
 
     def _install_background_worker_reaction_gate(self, adapter: Any) -> None:
         """Keep Discord action reactions pending while detached workers remain."""
@@ -4773,6 +4916,19 @@ class GatewayRunner:
             return
 
         async def _gated_processing_complete(event: MessageEvent, outcome: Any) -> None:
+            lifecycle_state = self._async_completion_lifecycle_state(event)
+            if lifecycle_state in {"advisory", "stale"}:
+                return
+            if lifecycle_state == "running":
+                if callable(original_start):
+                    await original_start(event)
+                return
+            if lifecycle_state == "failed":
+                await original_complete(event, ProcessingOutcome.FAILURE)
+                return
+            if lifecycle_state == "succeeded":
+                await original_complete(event, ProcessingOutcome.SUCCESS)
+                return
             try:
                 session_key = self._session_key_for_source(event.source)
             except Exception:
@@ -4782,6 +4938,17 @@ class GatewayRunner:
             ) or None
             if self._session_has_pending_background_workers(
                 session_key,
+                work_item_id=str(getattr(event, "work_item_id", "") or "") or None,
+                origin_run_generation=getattr(
+                    event,
+                    "background_completion_generation",
+                    None,
+                ),
+                origin_attempt_id=getattr(
+                    event,
+                    "background_completion_attempt_id",
+                    None,
+                ),
                 exclude_delegation_id=completion_id,
             ):
                 if callable(original_start):
@@ -6093,6 +6260,8 @@ class GatewayRunner:
         event: MessageEvent,
         session_key: str,
     ) -> Optional[str]:
+        if not getattr(event, "participates_in_work_lifecycle", True):
+            return None
         work_item_id = getattr(event, "work_item_id", None)
         if work_item_id or getattr(event.source, "platform", None) != Platform.DISCORD:
             return str(work_item_id) if work_item_id else None
@@ -14053,10 +14222,24 @@ class GatewayRunner:
                 visual_qa_config=getattr(event, "visual_qa_config", None),
                 completed_worker_run=getattr(event, "completed_worker_run", None),
                 origin_work_item_id=str(work_item_id or ""),
+                suppress_user_output=bool(
+                    getattr(event, "suppress_user_output", False)
+                ),
             )
 
             _pending_background_workers = self._session_has_pending_background_workers(
                 session_key,
+                work_item_id=str(work_item_id or "") or None,
+                origin_run_generation=getattr(
+                    event,
+                    "background_completion_generation",
+                    None,
+                ),
+                origin_attempt_id=getattr(
+                    event,
+                    "background_completion_attempt_id",
+                    None,
+                ),
                 exclude_delegation_id=_background_completion_id or None,
             )
             if _pending_background_workers:
@@ -14530,7 +14713,15 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if (
+                not getattr(event, "suppress_user_output", False)
+                and self._should_send_voice_reply(
+                    event,
+                    response,
+                    agent_messages,
+                    already_sent=_already_sent,
+                )
+            ):
                 await self._send_voice_reply(event, response)
 
             if _already_sent and not agent_result.get("failed"):
@@ -14606,7 +14797,11 @@ class GatewayRunner:
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if (
+                agent_result.get("already_sent")
+                and not agent_result.get("failed")
+                and not getattr(event, "suppress_user_output", False)
+            ):
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -14706,17 +14901,6 @@ class GatewayRunner:
                 "Try again or use /reset to start a fresh session."
             )
         finally:
-            if _background_completion_id:
-                try:
-                    from tools.async_delegation import mark_completion_delivered
-
-                    mark_completion_delivered(_background_completion_id)
-                except Exception:
-                    logger.debug(
-                        "Could not acknowledge async completion %s",
-                        _background_completion_id,
-                        exc_info=True,
-                    )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -17049,6 +17233,29 @@ class GatewayRunner:
             return fallback
         if not isinstance(item, dict):
             return fallback
+        if item.get("closeout_authoritative") is True and isinstance(
+            item.get("closeout"),
+            dict,
+        ):
+            try:
+                from hermes_cli.trusted_closeout import (
+                    closeout_terminal_eligible,
+                    normalize_closeout_state,
+                )
+
+                closeout = normalize_closeout_state(item["closeout"])
+                if not closeout_terminal_eligible(closeout):
+                    closeout_status = str(closeout.get("status") or "").lower()
+                    if closeout_status in {
+                        "failed",
+                        "blocked",
+                        "error",
+                        "errored",
+                    }:
+                        return "Failed"
+                    return "Running"
+            except Exception:
+                return "Running"
         gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else None
         if gate and not gate.get("allowed_to_complete"):
             return str(gate.get("summary_status") or item.get("summary_status") or "Blocked")
@@ -17222,6 +17429,17 @@ class GatewayRunner:
         ) or None
         pending_background = self._session_has_pending_background_workers(
             session_key,
+            work_item_id=str(getattr(event, "work_item_id", "") or "") or None,
+            origin_run_generation=getattr(
+                event,
+                "background_completion_generation",
+                None,
+            ),
+            origin_attempt_id=getattr(
+                event,
+                "background_completion_attempt_id",
+                None,
+            ),
             exclude_delegation_id=completion_id,
         )
         status = (
@@ -21415,6 +21633,8 @@ class GatewayRunner:
         self,
         synth_text: str,
         evt: dict,
+        *,
+        suppress_user_output: bool = False,
     ) -> bool:
         """Forge a fresh internal turn for one detached completion event."""
         source = self._build_process_event_source(evt)
@@ -21442,8 +21662,30 @@ class GatewayRunner:
         synth_event.background_completion_id = str(
             evt.get("delegation_id") or ""
         )
+        kind = str(evt.get("kind") or "delegation")
+        synth_event.background_completion_kind = kind
+        synth_event.background_completion_success = self._background_completion_success(evt)
+        synth_event.background_completion_generation = evt.get(
+            "origin_run_generation"
+        )
+        synth_event.background_completion_attempt_id = str(
+            evt.get("origin_attempt_id") or ""
+        ) or None
+        synth_event.background_completion_attempt_order = evt.get(
+            "origin_attempt_order"
+        )
+        synth_event.suppress_user_output = bool(suppress_user_output)
         origin_work_item_id = str(evt.get("origin_work_item_id") or "").strip()
-        synth_event.work_item_id = origin_work_item_id or None
+        synth_event.participates_in_work_lifecycle = bool(
+            kind == "coding_worker" and origin_work_item_id
+        )
+        if not synth_event.participates_in_work_lifecycle:
+            synth_event.discord_action_request_intent = False
+        synth_event.work_item_id = (
+            origin_work_item_id
+            if synth_event.participates_in_work_lifecycle and origin_work_item_id
+            else None
+        )
         synth_event.completed_worker_run = (
             dict(evt.get("worker_run") or {})
             if evt.get("kind") == "coding_worker"
@@ -21453,120 +21695,61 @@ class GatewayRunner:
             self._hydrate_discord_continuation_event_from_work_item(
                 synth_event,
                 str(evt.get("session_key") or ""),
-                allow_session_fallback=not bool(origin_work_item_id),
+                allow_session_fallback=False,
+            )
+        if synth_event.participates_in_work_lifecycle and synth_event.work_item_id:
+            try:
+                required_state = self._ledger().record_required_async_completion(
+                    str(synth_event.work_item_id),
+                    delegation_id=str(evt.get("delegation_id") or ""),
+                    success=bool(synth_event.background_completion_success),
+                    generation=evt.get("origin_run_generation"),
+                    attempt_id=evt.get("origin_attempt_id"),
+                    attempt_order=evt.get("origin_attempt_order"),
+                    status=str(evt.get("status") or ""),
+                    completed_at=evt.get("completed_at"),
+                    closeout_id=str(evt.get("closeout_id") or ""),
+                )
+                synth_event.background_completion_required_failed = bool(
+                    isinstance(required_state, dict)
+                    and required_state.get("failed")
+                )
+            except Exception:
+                logger.debug(
+                    "Could not persist required async completion %s",
+                    evt.get("delegation_id", "unknown"),
+                    exc_info=True,
+                )
+        if isinstance(adapter, BasePlatformAdapter):
+            synth_event.processing_completion_future = (
+                asyncio.get_running_loop().create_future()
             )
         await adapter.handle_message(synth_event)
-        return True
-
-    async def _finalize_suppressed_async_completion(self, evt: dict) -> None:
-        """Finalize visible Discord state when notification config suppresses a turn."""
-        delegation_id = str(evt.get("delegation_id") or "")
-        session_key = str(evt.get("session_key") or "")
+        completion_future = synth_event.processing_completion_future
+        if completion_future is not None:
+            await completion_future
         try:
             from tools.async_delegation import mark_completion_delivered
 
-            mark_completion_delivered(delegation_id)
+            mark_completion_delivered(synth_event.background_completion_id or "")
         except Exception:
-            pass
-        source = self._build_process_event_source(evt)
-        if source is None or source.platform != Platform.DISCORD:
-            return
-        adapter = self._adapter_for_source(source)
-        if adapter is None:
-            return
-        event = MessageEvent(
-            text="",
-            message_type=MessageType.TEXT,
-            source=source,
-            internal=True,
-        )
-        event.background_completion_id = delegation_id
-        origin_work_item_id = str(evt.get("origin_work_item_id") or "").strip()
-        event.work_item_id = origin_work_item_id or None
-        self._hydrate_discord_continuation_event_from_work_item(
-            event,
-            str(evt.get("session_key") or ""),
-            allow_session_fallback=not bool(origin_work_item_id),
-        )
-        try:
-            from gateway.platforms.base import ProcessingOutcome
+            logger.debug(
+                "Could not acknowledge async completion %s",
+                synth_event.background_completion_id,
+                exc_info=True,
+            )
+        return True
 
-            result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
-            success = bool(
-                evt.get("status") in {"completed", "success"}
-                and result.get("success", True)
+    async def _finalize_suppressed_async_completion(self, evt: dict) -> None:
+        """Compatibility wrapper: suppressed completions still run internally."""
+        self._enrich_async_delegation_routing(evt)
+        synth_text = _format_gateway_process_notification(evt)
+        if synth_text:
+            await self._inject_async_delegation_completion(
+                synth_text,
+                evt,
+                suppress_user_output=True,
             )
-            outcome = (
-                ProcessingOutcome.SUCCESS
-                if success
-                else ProcessingOutcome.FAILURE
-            )
-            await adapter.on_processing_complete(event, outcome)
-            pending_background = self._session_has_pending_background_workers(
-                session_key,
-                exclude_delegation_id=delegation_id or None,
-            )
-            work_item_id = getattr(event, "work_item_id", None)
-            final_status = "Complete" if success else "Failed"
-            if not pending_background:
-                final_status = self._discord_ledger_summary_status(
-                    work_item_id,
-                    final_status,
-                )
-            summary_ok = await self._update_discord_summaries(
-                source=source,
-                feature_summary=getattr(event, "feature_summary", None),
-                project_summary=getattr(event, "project_summary", None),
-                final_response=(
-                    "Coding workers are still running; completion will arrive "
-                    "in a follow-up turn."
-                    if pending_background
-                    else str(result.get("summary") or result.get("error") or "")
-                ),
-                status=(
-                    "Running"
-                    if pending_background
-                    else final_status
-                ),
-                session_id=(
-                    str(getattr(event, "session_id", "") or "").strip()
-                    or None
-                ),
-            )
-            if summary_ok and work_item_id and not pending_background:
-                try:
-                    ledger = self._ledger()
-                    snapshot_fn = getattr(ledger, "run_state_snapshot", None)
-                    get_fn = getattr(ledger, "get", None)
-                    if callable(snapshot_fn) and callable(get_fn):
-                        stored = get_fn(str(work_item_id)) or {}
-                        expected_run_state = snapshot_fn(stored)
-                        if (
-                            expected_run_state["active_run"] is not None
-                            or expected_run_state["status"] in {"claimed", "agent_running"}
-                        ):
-                            return
-                        if ledger.mark_summary_updated(str(work_item_id)):
-                            expected_run_state = {
-                                **expected_run_state,
-                                "status": "summary_updated",
-                            }
-                        ledger.mark_completed(
-                            str(work_item_id),
-                            expected_run_state=expected_run_state,
-                        )
-                    else:
-                        # Preserve lightweight legacy/test ledger adapters that
-                        # do not implement the durable run-state CAS surface.
-                        ledger.mark_summary_updated(str(work_item_id))
-                        ledger.mark_completed(str(work_item_id))
-                except Exception:
-                    logger.debug(
-                        "Suppressed async ledger finalization failed",
-                        exc_info=True,
-                    )
-        except Exception:
-            logger.debug("Suppressed async reaction finalization failed", exc_info=True)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain shared async completions and serialize them as fresh turns."""
@@ -21598,17 +21781,15 @@ class GatewayRunner:
                     if delegation_id and delegation_id in seen:
                         continue
                     self._enrich_async_delegation_routing(evt)
-                    if not self._async_completion_notification_enabled(evt):
-                        await self._finalize_suppressed_async_completion(evt)
-                        if delegation_id:
-                            seen.add(delegation_id)
-                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
                     accepted = await self._inject_async_delegation_completion(
                         synth_text,
                         evt,
+                        suppress_user_output=(
+                            not self._async_completion_notification_enabled(evt)
+                        ),
                     )
                     if accepted and delegation_id:
                         seen.add(delegation_id)
@@ -22398,6 +22579,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        suppress_user_output: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -22495,7 +22677,7 @@ class GatewayRunner:
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
-        if _streaming_enabled:
+        if _streaming_enabled and not suppress_user_output:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                 _adapter = self._adapter_for_source(source)
@@ -22541,7 +22723,7 @@ class GatewayRunner:
 
         # Send typing indicator
         _adapter = self._adapter_for_source(source)
-        if _adapter:
+        if _adapter and not suppress_user_output:
             try:
                 await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
@@ -22729,6 +22911,7 @@ class GatewayRunner:
         visual_qa_config: Optional[Dict[str, Any]] = None,
         completed_worker_run: Optional[Dict[str, Any]] = None,
         origin_work_item_id: Optional[str] = None,
+        suppress_user_output: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -22761,6 +22944,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                suppress_user_output=suppress_user_output,
             )
             if isinstance(proxy_result, dict):
                 # A remote proxy does not expose local mutation ordering, so
@@ -22870,11 +23054,14 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        if suppress_user_output:
+            tool_progress_enabled = False
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and not suppress_user_output
             and bool(
                 resolve_display_setting(
                     user_config,
@@ -22899,7 +23086,7 @@ class GatewayRunner:
         # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
         _cleanup_progress = bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
-        )
+        ) and not suppress_user_output
         _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
         if _cleanup_adapter is not None and (
             type(_cleanup_adapter).delete_message is BasePlatformAdapter.delete_message
@@ -23054,7 +23241,7 @@ class GatewayRunner:
         # stop_typing(source.chat_id) cleanup cancels the same thread loop.
         _typing_adapter = self._adapter_for_source(source)
         _send_typing = getattr(_typing_adapter, "send_typing", None)
-        if _send_typing is not None:
+        if _send_typing is not None and not suppress_user_output:
             try:
                 await _send_typing(source.chat_id, metadata=_progress_metadata)
             except Exception:
@@ -23426,7 +23613,9 @@ class GatewayRunner:
             )
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
+        _status_adapter = (
+            None if suppress_user_output else self._adapter_for_source(source)
+        )
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
@@ -23585,7 +23774,7 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
+            _want_stream_deltas = _streaming_enabled and not suppress_user_output
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
@@ -23781,6 +23970,18 @@ class GatewayRunner:
             # Durable closeout identifiers are per-turn state. Coding workers
             # must persist lifecycle handoff before reporting completion.
             agent._origin_work_item_id = str(origin_work_item_id or "")
+            agent._origin_work_item_generation = run_generation
+            agent._origin_work_item_attempt_id = (
+                f"{self._process_epoch}:{int(run_generation or 0)}"
+                if origin_work_item_id
+                else ""
+            )
+            try:
+                agent._origin_work_item_attempt_order = int(
+                    str(self._process_epoch).split("-", 1)[0]
+                ) + max(0, int(run_generation or 0))
+            except (TypeError, ValueError):
+                agent._origin_work_item_attempt_order = 0
             closeout_watcher = getattr(self, "trusted_closeout_watcher", None)
             agent._closeout_notify = closeout_watcher.notify if closeout_watcher is not None else None
             if isinstance(completed_worker_run, dict) and completed_worker_run:
@@ -24675,6 +24876,8 @@ class GatewayRunner:
             )
         ):
             _NOTIFY_INTERVAL = None
+        if suppress_user_output:
+            _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
         async def _notify_long_running():
@@ -25207,6 +25410,9 @@ class GatewayRunner:
                     fable_reasoning_config=fable_reasoning_config,
                     session_cwd_override=session_cwd,
                     origin_work_item_id=next_origin_work_item_id,
+                    suppress_user_output=bool(
+                        getattr(pending_event, "suppress_user_output", False)
+                    ) if pending_event is not None else False,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

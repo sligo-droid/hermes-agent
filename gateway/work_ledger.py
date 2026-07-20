@@ -57,6 +57,7 @@ _RUN_STATE_INT_LIMIT = (1 << 63) - 1
 _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 _MAX_CONFIRMED_MESSAGE_IDS = 128
 _MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
+_MAX_REQUIRED_ASYNC_COMPLETIONS = 64
 _CLOSEOUT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CLOSEOUT_VISUAL_STATUSES = frozenset(
     {"passed", "failed", "blocked", "uncertain", "missing"}
@@ -432,6 +433,37 @@ def _bounded_run_state_lease(value: Any) -> float | None:
     return max(-_RUN_STATE_LEASE_LIMIT, min(_RUN_STATE_LEASE_LIMIT, lease))
 
 
+def _required_async_completion_state(item: Any) -> dict[str, Any]:
+    source = item if isinstance(item, dict) else {}
+    raw = source.get("required_async_completions")
+    raw = raw if isinstance(raw, dict) else {}
+    generation = _positive_int(raw.get("generation"))
+    attempt_id = _bounded_run_state_text(raw.get("attempt_id"))
+    attempt_order = _positive_int(raw.get("attempt_order"))
+    outcomes: dict[str, dict[str, Any]] = {}
+    raw_outcomes = raw.get("outcomes") if isinstance(raw.get("outcomes"), dict) else {}
+    for delegation_id, raw_outcome in list(raw_outcomes.items())[-_MAX_REQUIRED_ASYNC_COMPLETIONS:]:
+        if not isinstance(raw_outcome, dict):
+            continue
+        normalized_id = _bounded_run_state_text(delegation_id)
+        if not normalized_id:
+            continue
+        outcomes[normalized_id] = {
+            "success": raw_outcome.get("success") is True,
+            "status": _bounded_run_state_text(raw_outcome.get("status")),
+            "completed_at": _bounded_run_state_lease(raw_outcome.get("completed_at")),
+            "closeout_id": _bounded_run_state_text(raw_outcome.get("closeout_id")),
+        }
+    return {
+        "generation": generation,
+        "attempt_id": attempt_id,
+        "attempt_order": attempt_order,
+        "outcomes": outcomes,
+        "failed": any(outcome["success"] is False for outcome in outcomes.values()),
+        "succeeded": sum(outcome["success"] is True for outcome in outcomes.values()),
+    }
+
+
 def _normalize_run_state_snapshot(item: Any) -> dict[str, Any]:
     """Return the bounded ownership fields used by finalization CAS checks."""
 
@@ -709,6 +741,21 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
     final_text = str(final_response if final_response is not None else item.get("final_response") or "")
     repo_backed = _repo_backed_discord_item(item)
     intent = _delivery_intent_for_item(item) if repo_backed else "generic"
+    required_async = _required_async_completion_state(item)
+    if required_async["failed"]:
+        return {
+            "allowed_to_complete": False,
+            "summary_status": "Failed",
+            "terminal_status": "blocked",
+            "reason": "required_async_completion_failed",
+            "delivery_intent": intent,
+            "repo_backed": repo_backed,
+            "required_async_completions": {
+                "generation": required_async["generation"],
+                "failed": True,
+                "succeeded": required_async["succeeded"],
+            },
+        }
     gate_summary_status = str(item.get("summary_status") or "Complete")
     if gate_summary_status.lower() == "blocked":
         gate_summary_status = "Complete"
@@ -1040,6 +1087,166 @@ class GatewayWorkLedger:
     def get(self, work_id: str) -> dict[str, Any] | None:
         item = self._read().get("items", {}).get(work_id)
         return dict(item) if isinstance(item, dict) else None
+
+    def required_async_completion_state(self, work_id: str) -> dict[str, Any] | None:
+        item = self._read().get("items", {}).get(work_id)
+        if not isinstance(item, dict):
+            return None
+        return _required_async_completion_state(item)
+
+    @_locked_ledger_mutation
+    def begin_required_async_attempt(
+        self,
+        work_id: str,
+        *,
+        attempt_id: str | None,
+        attempt_order: int | None,
+        generation: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Start or resume one authoritative required-work dispatch attempt."""
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return None
+        incoming_id = _bounded_run_state_text(attempt_id)
+        incoming_order = _positive_int(attempt_order)
+        incoming_generation = _positive_int(generation)
+        state = _required_async_completion_state(item)
+        current_order = int(state["attempt_order"] or 0)
+        current_id = str(state["attempt_id"] or "")
+        if current_order and incoming_order < current_order:
+            return state
+        if (
+            current_order
+            and incoming_order == current_order
+            and current_id
+            and incoming_id != current_id
+        ):
+            return state
+        if incoming_id and incoming_id == current_id:
+            return state
+        item["required_async_completions"] = {
+            "attempt_id": incoming_id,
+            "attempt_order": incoming_order,
+            "generation": incoming_generation,
+            "outcomes": {},
+        }
+        existing_gate = (
+            item.get("completion_gate")
+            if isinstance(item.get("completion_gate"), dict)
+            else {}
+        )
+        if existing_gate.get("reason") == "required_async_completion_failed":
+            item.pop("completion_gate", None)
+            if str(item.get("summary_status") or "").lower() == "failed":
+                item.pop("summary_status", None)
+        item["updated_at"] = self._now()
+        self._write(data)
+        return _required_async_completion_state(item)
+
+    @_locked_ledger_mutation
+    def record_required_async_completion(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        success: bool,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        status: str | None = None,
+        completed_at: float | None = None,
+        closeout_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Latch one required coding outcome on its exact work generation.
+
+        Replays of the same delegation are idempotent. A lower or unversioned
+        stale event cannot mutate a newer persisted generation, while the first
+        event from a newer generation atomically replaces the older aggregate.
+        """
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return None
+        completion_id = _bounded_run_state_text(delegation_id)
+        if not completion_id:
+            return None
+        incoming_generation = _positive_int(generation)
+        incoming_attempt_id = _bounded_run_state_text(attempt_id)
+        incoming_attempt_order = _positive_int(attempt_order)
+        state = _required_async_completion_state(item)
+        current_attempt_id = str(state["attempt_id"] or "")
+        current_attempt_order = int(state["attempt_order"] or 0)
+        current_generation = int(state["generation"] or 0)
+        if current_attempt_order and incoming_attempt_order < current_attempt_order:
+            return state
+        if (
+            current_attempt_order
+            and incoming_attempt_order == current_attempt_order
+            and current_attempt_id
+            and incoming_attempt_id != current_attempt_id
+        ):
+            return state
+        newer_attempt = incoming_attempt_order > current_attempt_order
+        if not newer_attempt and current_generation and (
+            not incoming_generation or incoming_generation < current_generation
+        ):
+            return state
+        if (
+            newer_attempt
+            or (
+                not current_attempt_order
+                and incoming_generation > current_generation
+            )
+        ):
+            state = {
+                "generation": incoming_generation,
+                "attempt_id": incoming_attempt_id,
+                "attempt_order": incoming_attempt_order,
+                "outcomes": {},
+                "failed": False,
+                "succeeded": 0,
+            }
+        outcomes = dict(state["outcomes"])
+        existing = outcomes.get(completion_id)
+        if isinstance(existing, dict):
+            # Conflicting replays fail closed; success can never repaint a
+            # previously recorded failure for the same completion id.
+            success = bool(success and existing.get("success") is True)
+        outcomes[completion_id] = {
+            "success": bool(success),
+            "status": _bounded_run_state_text(status),
+            "completed_at": _bounded_run_state_lease(
+                completed_at if completed_at is not None else self._now()
+            ),
+            "closeout_id": _bounded_run_state_text(closeout_id),
+        }
+        if len(outcomes) > _MAX_REQUIRED_ASYNC_COMPLETIONS:
+            outcomes = dict(list(outcomes.items())[-_MAX_REQUIRED_ASYNC_COMPLETIONS:])
+        item["required_async_completions"] = {
+            "generation": incoming_generation or current_generation,
+            "attempt_id": incoming_attempt_id or current_attempt_id,
+            "attempt_order": incoming_attempt_order or current_attempt_order,
+            "outcomes": outcomes,
+        }
+        required_state = _required_async_completion_state(item)
+        if required_state["failed"]:
+            gate = classify_delivery_completion(item)
+            item["completion_gate"] = gate
+            item["summary_status"] = str(gate.get("summary_status") or "Failed")
+        else:
+            existing_gate = (
+                item.get("completion_gate")
+                if isinstance(item.get("completion_gate"), dict)
+                else {}
+            )
+            if existing_gate.get("reason") == "required_async_completion_failed":
+                item.pop("completion_gate", None)
+                if str(item.get("summary_status") or "").lower() == "failed":
+                    item.pop("summary_status", None)
+        item["updated_at"] = self._now()
+        self._write(data)
+        return required_state
 
     @staticmethod
     def run_state_snapshot(item: Any) -> dict[str, Any]:
@@ -2204,6 +2411,10 @@ class GatewayWorkLedger:
             }
         if session_id:
             item["session_id"] = str(session_id)
+        if _required_async_completion_state(item)["failed"]:
+            gate = classify_delivery_completion(item)
+            item["completion_gate"] = gate
+            item["summary_status"] = str(gate.get("summary_status") or "Failed")
         _record_provider_progress(item, "ledger_status_agent_running", status="agent_running")
         self._write(data)
         return True
