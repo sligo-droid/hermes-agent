@@ -16,19 +16,9 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
                 "reasoning_effort": "max",
             }
         },
-        "coding_worker": {
-            "worker_tiers": {
-                "quick": {
-                    "model": "custom/quick-model",
-                    "opencode_model": "custom/quick-worker",
-                    "reasoning_effort": "low",
-                }
-            }
-        },
         "roles": {
             "dev": {
                 "model_tier": "worker",
-                "worker_tier": "quick",
                 "reasoning": "low",
                 "service_tier": "normal",
             }
@@ -43,8 +33,8 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
     assert settings["reasoning"] == "max"
     assert settings["reasoning_source"] == "model_tier"
     assert settings["model_tier_source"] == "role"
-    assert settings["worker_tier"] == "quick"
-    assert settings["worker_tier_source"] == "role"
+    assert "worker_tier" not in settings
+    assert "worker_tier_source" not in settings
 
 
 def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeypatch):
@@ -126,8 +116,6 @@ def test_host_spawner_forwards_tier_models_to_the_child(monkeypatch, tmp_path):
         "reasoning_source": "model_tier",
         "model_tier": "worker",
         "model_tier_source": "role",
-        "worker_tier": "quick",
-        "worker_tier_source": "role",
         "model": "custom/dev-model",
         "opencode_model": "custom/dev-worker",
         "service_tier": "normal",
@@ -157,7 +145,7 @@ def test_host_spawner_forwards_tier_models_to_the_child(monkeypatch, tmp_path):
     ) == 123
     assert captured["env"]["HERMES_CODEX_WORKER_MODEL_TIER"] == "worker"
     assert captured["env"]["HERMES_CODEX_WORKER_MODEL_TIER_SOURCE"] == "role"
-    assert captured["env"]["HERMES_CODEX_WORKER_TIER"] == "quick"
-    assert captured["env"]["HERMES_CODEX_WORKER_TIER_SOURCE"] == "role"
+    assert "HERMES_CODEX_WORKER_TIER" not in captured["env"]
+    assert "HERMES_CODEX_WORKER_TIER_SOURCE" not in captured["env"]
     assert captured["env"]["HERMES_CODEX_WORKER_MODEL"] == "custom/dev-model"
     assert captured["env"]["HERMES_OPENCODE_WORKER_MODEL"] == "custom/dev-worker"

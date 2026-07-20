@@ -19,7 +19,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from hermes_cli.model_tiers import DEFAULT_WORKER_TIERS, resolve_worker_tier
+from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS, resolve_model_tier
+from hermes_constants import VALID_REASONING_EFFORTS
 from tools.parallel_worker_worktrees import (
     ParallelWorkerContext as _ParallelWorkerContext,
     merge_parallel_worker_result_unlocked as _merge_parallel_worker_result_locked,
@@ -147,7 +148,7 @@ class _BackgroundCodingStartup:
     release: threading.Event = field(default_factory=threading.Event)
     preflight_result: Optional[str] = None
     worker_cwd: str = ""
-    worker_tier: str = "default"
+    model_tier: str = "default"
     scope_paths: list[str] = field(default_factory=list)
     backend: str = ""
     worker_run: Optional[dict[str, Any]] = None
@@ -156,7 +157,7 @@ class _BackgroundCodingStartup:
         self,
         *,
         worker_cwd: str,
-        worker_tier: Optional[str],
+        model_tier: Optional[str],
         scope_paths: Optional[list[str]],
         backend: str,
         worker_run: Optional[dict[str, Any]],
@@ -164,7 +165,7 @@ class _BackgroundCodingStartup:
         """Publish deterministic dispatch metadata, then await parent release."""
         if not self.ready.is_set():
             self.worker_cwd = str(worker_cwd or "")
-            self.worker_tier = str(worker_tier or "default")
+            self.model_tier = str(model_tier or "default")
             self.scope_paths = list(scope_paths or [])
             self.backend = str(backend or "")
             self.worker_run = worker_run
@@ -189,15 +190,18 @@ def _codex_model_args(model: str) -> list[str]:
     return ["-c", f"model={json.dumps(selected_model)}"] if selected_model else []
 
 
-def _worker_tier_config(tier: Any) -> dict[str, Any]:
-    """Build a pass-wide OpenCode override for an orchestrator worker tier."""
-    return {
-        "model_tier": "disabled",
-        "simple_build_reasoning_level": tier.reasoning_effort,
-        "complex_plan_reasoning_level": tier.reasoning_effort,
-        "complex_build_reasoning_level": tier.reasoning_effort,
-        "opencode": {"model": tier.opencode_model},
-    }
+def _model_tier_config(
+    tier: Any,
+    reasoning_effort: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Build per-call overrides on top of configured coding-worker passes."""
+    config: dict[str, Any] = {}
+    if tier is not None:
+        config["model_tier"] = tier.name
+    if reasoning_effort:
+        for pass_name in ("simple_build", "complex_plan", "complex_build"):
+            config[f"{pass_name}_reasoning_level"] = reasoning_effort
+    return config or None
 
 
 def _start_worker_run(
@@ -206,7 +210,7 @@ def _start_worker_run(
     backend: str,
     model: str,
     reasoning: str,
-    tier: Optional[str],
+    model_tier: Optional[str],
     background: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Append a best-effort per-turn worker record before execution starts."""
@@ -214,7 +218,7 @@ def _start_worker_run(
         "backend": str(backend or "").strip(),
         "model": str(model or "").strip(),
         "reasoning": str(reasoning or "").strip(),
-        "tier": str(tier).strip() if tier else None,
+        "model_tier": str(model_tier).strip() if model_tier else None,
         "failed": True,
     }
     if background:
@@ -1592,7 +1596,8 @@ def _delegate_coding_task_impl(
     context: Optional[str] = None,
     cwd: Optional[str] = None,
     turn_timeout_seconds: Optional[float] = None,
-    worker_tier: Optional[str] = None,
+    model_tier: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     relevant_files: Optional[list[dict[str, str]]] = None,
     approach: Optional[str] = None,
     constraints: Optional[str] = None,
@@ -1641,18 +1646,27 @@ def _delegate_coding_task_impl(
     except Exception:
         loaded_config = {}
 
-    selected_worker_tier = None
-    if worker_tier is not None:
-        selected_worker_tier = resolve_worker_tier(loaded_config, worker_tier)
-        if selected_worker_tier is None:
-            valid_tiers = ", ".join(DEFAULT_WORKER_TIERS)
+    selected_model_tier = None
+    if model_tier is not None:
+        selected_model_tier = resolve_model_tier(loaded_config, model_tier)
+        if selected_model_tier is None:
+            built_in_tiers = ", ".join(DEFAULT_MODEL_TIERS)
             return tool_error(
-                f"Unknown worker_tier {worker_tier!r}. Valid tiers: {valid_tiers}."
+                f"Unknown model_tier {model_tier!r}. Configure it under model_tiers "
+                f"or use a built-in tier: {built_in_tiers}."
             )
-    worker_tier_config = (
-        _worker_tier_config(selected_worker_tier)
-        if selected_worker_tier is not None
-        else None
+    selected_reasoning_effort = None
+    if reasoning_effort is not None:
+        selected_reasoning_effort = str(reasoning_effort or "").strip().lower()
+        if selected_reasoning_effort not in VALID_REASONING_EFFORTS:
+            valid_efforts = ", ".join(VALID_REASONING_EFFORTS)
+            return tool_error(
+                f"Unknown reasoning_effort {reasoning_effort!r}. "
+                f"Valid efforts: {valid_efforts}."
+            )
+    model_tier_config = _model_tier_config(
+        selected_model_tier,
+        selected_reasoning_effort,
     )
 
     fable_implementation = _is_fable_implementation_parent(parent_agent)
@@ -1835,10 +1849,10 @@ def _delegate_coding_task_impl(
                 cwd=workdir,
                 backend=backend,
                 route_decision=route_decision,
-                worker_tier=(
-                    selected_worker_tier.name
-                    if selected_worker_tier is not None
-                    else worker_tier
+                model_tier=(
+                    selected_model_tier.name
+                    if selected_model_tier is not None
+                    else model_tier
                 ),
             )
         except Exception:
@@ -2120,7 +2134,7 @@ def _delegate_coding_task_impl(
             "title": "Hermes delegated coding task",
             "on_event": _touch_opencode_activity,
         }
-        opencode_worker_config = _merge_worker_config(None, worker_tier_config)
+        opencode_worker_config = _merge_worker_config(None, model_tier_config)
         if opencode_worker_config is not None:
             opencode_kwargs["worker_config"] = opencode_worker_config
         if allow_git_pr_lifecycle:
@@ -2138,15 +2152,19 @@ def _delegate_coding_task_impl(
             backend="opencode",
             model=actual_model,
             reasoning=actual_reasoning,
-            tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+            model_tier=(
+                selected_model_tier.name
+                if selected_model_tier is not None
+                else None
+            ),
             background=_background_startup is not None,
         )
         if _background_startup is not None:
             _background_startup.mark_ready(
                 worker_cwd=workdir,
-                worker_tier=(
-                    selected_worker_tier.name
-                    if selected_worker_tier is not None
+                model_tier=(
+                    selected_model_tier.name
+                    if selected_model_tier is not None
                     else None
                 ),
                 scope_paths=normalized_scope_paths,
@@ -2261,31 +2279,18 @@ def _delegate_coding_task_impl(
     agents: list[str] = []
     plan_text = ""
     turns = []
-    if selected_worker_tier is not None:
-        default_profiles = {
-            pass_name: {"codex_model": selected_worker_tier.model}
-            for pass_name in ("simple_build", "complex_plan", "complex_build")
-        }
-    else:
-        default_profiles = load_coding_worker_pass_profiles()
+    default_profiles = load_coding_worker_pass_profiles(
+        loaded_config,
+        worker_config=model_tier_config,
+    )
     turn = None
     codex_run = None
     try:
-        default_pass_cfg = (
-            {
-                "simple_build_reasoning_level": selected_worker_tier.reasoning_effort,
-                "complex_plan_reasoning_level": selected_worker_tier.reasoning_effort,
-                "complex_build_reasoning_level": selected_worker_tier.reasoning_effort,
-            }
-            if selected_worker_tier is not None
-            else load_coding_worker_pass_config()
+        default_pass_cfg = load_coding_worker_pass_config(
+            loaded_config,
+            worker_config=model_tier_config,
         )
-        worker_config = _merge_worker_config(None, worker_tier_config)
-        pass_cfg = (
-            load_coding_worker_pass_config(worker_config=worker_config)
-            if worker_config is not None and selected_worker_tier is None
-            else default_pass_cfg
-        )
+        pass_cfg = default_pass_cfg
         route_attempts = [([], pass_cfg, default_profiles)]
 
         for active_ui_codex_args, pass_cfg, pass_profiles in route_attempts:
@@ -2304,15 +2309,19 @@ def _delegate_coding_task_impl(
                 backend="codex",
                 model=_attempt_model(initial_pass),
                 reasoning=pass_cfg[f"{initial_pass}_reasoning_level"],
-                tier=selected_worker_tier.name if selected_worker_tier is not None else None,
+                model_tier=(
+                    selected_model_tier.name
+                    if selected_model_tier is not None
+                    else None
+                ),
                 background=_background_startup is not None,
             )
             if _background_startup is not None:
                 _background_startup.mark_ready(
                     worker_cwd=workdir,
-                    worker_tier=(
-                        selected_worker_tier.name
-                        if selected_worker_tier is not None
+                    model_tier=(
+                        selected_model_tier.name
+                        if selected_model_tier is not None
                         else None
                     ),
                     scope_paths=normalized_scope_paths,
@@ -2737,7 +2746,7 @@ def _dispatch_background_coding_task(
                 "task": startup.task,
                 "context_pack": startup.context_pack,
                 "worker_cwd": startup.worker_cwd,
-                "worker_tier": startup.worker_tier,
+                "model_tier": startup.model_tier,
                 "scope_paths": startup.scope_paths,
                 "worker_run": worker_run,
                 "parallel_group": startup.parallel_group,
@@ -2772,7 +2781,7 @@ def _dispatch_background_coding_task(
         context=context_text,
         toolsets=["coding_worker"],
         role="coding_worker",
-        model=str(call_kwargs.get("worker_tier") or ""),
+        model=str(call_kwargs.get("model_tier") or ""),
         session_key=session_key,
         runner=_runner,
         max_async_children=get_coding_worker_background_max_concurrent(loaded_config),
@@ -2826,7 +2835,7 @@ def _dispatch_background_coding_task(
         "background": True,
         "delegation_id": delegation_id,
         "worker_cwd": startup.worker_cwd,
-        "worker_tier": startup.worker_tier,
+        "model_tier": startup.model_tier,
         "scope_paths": list(startup.scope_paths),
         "note": "worker running; completion will arrive as a follow-up turn",
     }
@@ -2849,7 +2858,8 @@ def delegate_coding_task(
     context: Optional[str] = None,
     cwd: Optional[str] = None,
     turn_timeout_seconds: Optional[float] = None,
-    worker_tier: Optional[str] = None,
+    model_tier: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     relevant_files: Optional[list[dict[str, str]]] = None,
     approach: Optional[str] = None,
     constraints: Optional[str] = None,
@@ -2876,7 +2886,8 @@ def delegate_coding_task(
         "context": context,
         "cwd": cwd,
         "turn_timeout_seconds": turn_timeout_seconds,
-        "worker_tier": worker_tier,
+        "model_tier": model_tier,
+        "reasoning_effort": reasoning_effort,
         "relevant_files": relevant_files,
         "approach": approach,
         "constraints": constraints,
@@ -3000,17 +3011,23 @@ CODING_WORKER_SCHEMA = {
                     "minimum 30 seconds."
                 ),
             },
-            "worker_tier": {
+            "model_tier": {
                 "type": "string",
-                "enum": list(DEFAULT_WORKER_TIERS),
                 "description": (
-                    "Orchestrator-selected worker model/reasoning tier. "
-                    "quick = trivial mechanical changes (rename, copy edit, config tweak); "
-                    "standard = ordinary small features and fixes; "
-                    "thorough = multi-file features, refactors, tricky bugs; "
-                    "deep = complex cross-cutting work; "
-                    "max = RARE: reach for this only under exceptional circumstances "
-                    "such as a complete re-design; expensive and slow."
+                    "Optional canonical model tier for this worker call. "
+                    "trivial = obvious tiny mechanical changes; basic = straightforward "
+                    "bounded work; intermediate = ordinary multi-step implementation; "
+                    "advanced = the hardest cross-cutting or high-risk work. Custom names "
+                    "configured under model_tiers are also valid. Omit to use the configured "
+                    "coding-worker pass profiles."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": list(VALID_REASONING_EFFORTS),
+                "description": (
+                    "Rare per-call reasoning override. This changes only reasoning effort, "
+                    "not the model selected by model_tier or the configured pass profile."
                 ),
             },
             "relevant_files": {
@@ -3123,7 +3140,8 @@ registry.register(
         context=args.get("context"),
         cwd=args.get("cwd"),
         turn_timeout_seconds=args.get("turn_timeout_seconds"),
-        worker_tier=args.get("worker_tier"),
+        model_tier=args.get("model_tier"),
+        reasoning_effort=args.get("reasoning_effort"),
         relevant_files=args.get("relevant_files"),
         approach=args.get("approach"),
         constraints=args.get("constraints"),

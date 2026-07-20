@@ -1265,7 +1265,7 @@ def _resolve_task_ui_work_route(
     *,
     workspace: str,
     backend: str,
-    worker_tier: str = "",
+    model_tier: str = "",
 ) -> UIWorkRouteDecision | None:
     if role != ROLE_DEV:
         return None
@@ -1288,7 +1288,7 @@ def _resolve_task_ui_work_route(
         route_decision=route_decision,
         # Skill breadth follows trusted scheduler setup, never planner-authored
         # task prose or route-decision metadata.
-        worker_tier=worker_tier,
+        model_tier=model_tier,
     )
     if not decision.matched and decision.selected_route == "default_coding_worker":
         return None
@@ -1366,15 +1366,17 @@ def _attach_ui_work_route(
         pass
 
 
-def _trusted_scheduled_worker_tier() -> str:
-    """Return the scheduler-resolved UI skill tier, if one was supplied."""
+def _trusted_scheduled_model_tier() -> str:
+    """Return the scheduler-resolved model tier, if one was supplied."""
 
     source = str(
-        os.environ.get("HERMES_CODEX_WORKER_TIER_SOURCE") or "none"
+        os.environ.get("HERMES_CODEX_WORKER_MODEL_TIER_SOURCE") or "none"
     ).strip().lower()
     if source != "role":
         return ""
-    return str(os.environ.get("HERMES_CODEX_WORKER_TIER") or "").strip().lower()
+    return str(
+        os.environ.get("HERMES_CODEX_WORKER_MODEL_TIER") or ""
+    ).strip().lower()
 
 
 def _run_role_backend(
@@ -1395,7 +1397,7 @@ def _run_role_backend(
         role,
         workspace=workspace,
         backend="opencode" if uses_opencode else "codex",
-        worker_tier=_trusted_scheduled_worker_tier(),
+        model_tier=_trusted_scheduled_model_tier(),
     )
     route_prompt = _ui_work_route_prompt(ui_work_route)
     if route_prompt:

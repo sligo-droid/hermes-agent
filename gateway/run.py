@@ -123,13 +123,16 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
     "cleanup, credential, discoverability, or follow-up PRs unless they are required "
     "to correct a regression introduced by this task or the user explicitly asks. "
     "Record non-critical follow-ups instead of expanding the active turn. "
-    "Choose delegate_coding_task worker_tier deliberately: use quick for obvious tiny "
-    "changes, escalate the tier on retry instead of re-instructing at the same tier, "
-    "and reserve max for rare complete-redesign situations. Front-load what you learned "
-    "into relevant_files, approach, constraints, and verification; a well-briefed cheap "
-    "worker beats an expensive worker that must rediscover the repository. You may issue "
+    "Choose delegate_coding_task model_tier deliberately: use trivial for obvious tiny "
+    "changes, basic for straightforward bounded work, intermediate for ordinary multi-step "
+    "implementation, and advanced for the hardest work. Escalate model_tier on retry instead "
+    "of re-instructing at the same tier. Set reasoning_effort only for exceptional overrides; "
+    "routine routing should use the effort bundled with the model tier. Front-load what you "
+    "learned into relevant_files, approach, constraints, and verification; a well-briefed "
+    "lower-tier worker beats a higher-tier worker that must rediscover the repository. "
+    "You may issue "
     "several delegate_coding_task calls in one response when the tasks are genuinely "
-    "independent; give each its own worker_tier, context pack, and non-overlapping "
+    "independent; give each its own model_tier, context pack, and non-overlapping "
     "scope_paths, which are required for parallel execution. Never parallelize coupled "
     "edits such as an API change and its callers, and review the merged result afterward. "
     "Prefer background=true for long or batchable coding delegations so the thread stays "
@@ -3033,7 +3036,7 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
                     "",
                     f"Original task: {evt.get('task') or evt.get('goal') or ''}",
                     f"Worker cwd: {evt.get('worker_cwd') or ''}",
-                    f"Worker tier: {evt.get('worker_tier') or 'default'}",
+                    f"Model tier: {evt.get('model_tier') or 'default'}",
                     "Scope paths: " + json.dumps(evt.get("scope_paths") or []),
                     "Original context pack:",
                     json.dumps(context_pack, ensure_ascii=False, indent=2),

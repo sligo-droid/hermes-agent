@@ -860,7 +860,7 @@ class TestDiscordActionTierMigration:
             results = migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 26
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert raw["discord"]["action_request_model_tier"] == "discord_action"
         assert raw["discord"]["action_request_complex_model_tier"] == "advanced"
         assert (
@@ -892,6 +892,44 @@ class TestDiscordActionTierMigration:
         assert raw["discord"]["action_request_model_tier"] == custom_value
         assert raw["discord"]["action_request_complex_model_tier"] == "advanced"
         assert not any("migrated from former default" in value for value in results["config_added"])
+
+
+class TestCodingWorkerTierMigration:
+    def test_migrate_to_v27_removes_duplicate_worker_tier_catalog(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 26,
+                    "model_tiers": {
+                        "custom": {
+                            "model": "custom/model",
+                            "reasoning_effort": "high",
+                        }
+                    },
+                    "coding_worker": {
+                        "worker_tiers": {
+                            "quick": {
+                                "model": "legacy/quick",
+                                "reasoning_effort": "low",
+                            }
+                        },
+                        "backend": "codex",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert "worker_tiers" not in raw["coding_worker"]
+        assert raw["coding_worker"]["backend"] == "codex"
+        assert raw["model_tiers"]["custom"]["model"] == "custom/model"
+        assert "coding_worker.worker_tiers (removed; use model_tiers)" in results["config_added"]
 
 
 class TestDiscordChannelPromptsConfig:

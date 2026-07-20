@@ -226,7 +226,7 @@ import yaml
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD
-from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS, DEFAULT_WORKER_TIERS
+from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS
 
 
 # =============================================================================
@@ -1674,7 +1674,6 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "backend": "codex",  # opencode | codex
         "inherit_fast_mode": True,
-        "worker_tiers": copy.deepcopy(DEFAULT_WORKER_TIERS),
         # Pass tiers are atomic model/reasoning bundles. model_tier is an
         # optional compatibility-wide override; "disabled" temporarily turns
         # off all pass-tier routing and restores the legacy raw settings below.
@@ -2374,9 +2373,7 @@ DEFAULT_CONFIG = {
                 # legacy per-role reasoning value remains supported only when
                 # the role's tier is disabled or invalid.
                 "planner": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
-                # ``worker_tier`` only controls tier-aware UI skill breadth;
-                # it does not override the Kanban role's model or reasoning.
-                "dev": {"model_tier": "intermediate", "worker_tier": "", "service_tier": "auto", "max_runtime_seconds": 3600},
+                "dev": {"model_tier": "intermediate", "service_tier": "auto", "max_runtime_seconds": 3600},
                 "foreman": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
                 "reviewer": {"model_tier": "advanced", "service_tier": "auto", "max_runtime_seconds": 1800},
             },
@@ -2738,7 +2735,7 @@ DEFAULT_CONFIG = {
 
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 26,
+    "_config_version": 27,
 }
 
 # =============================================================================
@@ -5038,6 +5035,22 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             )
             if not quiet:
                 print("  ✓ Migrated routine Discord action requests to discord_action")
+
+    # ── Version 26 → 27: remove the duplicate coding-worker tier catalog ──
+    # Coding workers now use the canonical root-level model_tiers catalog.
+    # Remove the stale map instead of preserving a second routing taxonomy.
+    if current_ver < 27:
+        config = read_raw_config()
+        coding_worker = config.get("coding_worker")
+        if isinstance(coding_worker, dict) and "worker_tiers" in coding_worker:
+            coding_worker.pop("worker_tiers", None)
+            config["coding_worker"] = coding_worker
+            save_config(config)
+            results["config_added"].append(
+                "coding_worker.worker_tiers (removed; use model_tiers)"
+            )
+            if not quiet:
+                print("  ✓ Removed coding_worker.worker_tiers; use model_tiers")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")

@@ -53,6 +53,7 @@ def _make_runner():
     runner._service_tier = None
     runner._provider_routing = {}
     runner._fallback_model = None
+    runner._process_epoch = "1-test"
     runner._running_agents = {}
     runner._pending_model_notes = {}
     runner._session_db = None
@@ -184,7 +185,9 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "Once the requested change is merged" in init["ephemeral_system_prompt"]
     assert "do not open extra cleanup" in init["ephemeral_system_prompt"]
     assert "Record non-critical follow-ups" in init["ephemeral_system_prompt"]
-    assert "Choose delegate_coding_task worker_tier deliberately" in init["ephemeral_system_prompt"]
+    assert "Choose delegate_coding_task model_tier deliberately" in init["ephemeral_system_prompt"]
+    assert "Set reasoning_effort only for exceptional overrides" in init["ephemeral_system_prompt"]
+    assert "worker_tier" not in init["ephemeral_system_prompt"]
     assert "Front-load what you learned into relevant_files" in init["ephemeral_system_prompt"]
     assert "several delegate_coding_task calls in one response" in init["ephemeral_system_prompt"]
     assert "non-overlapping scope_paths" in init["ephemeral_system_prompt"]

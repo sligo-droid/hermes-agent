@@ -2,13 +2,11 @@
 
 from hermes_cli.config import DEFAULT_CONFIG
 from hermes_cli.model_tiers import (
-    DEFAULT_WORKER_TIERS,
     MODEL_TIER_LADDER,
     classify_task_complexity,
     resolve_adjacent_model_tier,
     resolve_model_tier,
     resolve_model_tier_offset,
-    resolve_worker_tier,
 )
 
 
@@ -119,60 +117,13 @@ def test_invalid_tier_is_rejected_without_leaking_into_runtime():
     ) is None
 
 
-def test_default_worker_tiers_resolve_to_expected_model_and_effort():
-    expected = {
-        "quick": ("gpt-5.6-luna", "hermes-codex/gpt-5.6-luna", "low"),
-        "standard": ("gpt-5.6-terra", "hermes-codex/gpt-5.6-terra", "medium"),
-        "thorough": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "high"),
-        "deep": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "xhigh"),
-        "max": ("gpt-5.6-sol", "hermes-codex/gpt-5.6-sol", "max"),
-    }
-
-    assert tuple(DEFAULT_WORKER_TIERS) == tuple(expected)
-    assert DEFAULT_CONFIG["coding_worker"]["worker_tiers"] == DEFAULT_WORKER_TIERS
-    assert {
-        name: (
-            resolve_worker_tier({}, name).model,
-            resolve_worker_tier({}, name).opencode_model,
-            resolve_worker_tier({}, name).reasoning_effort,
-        )
-        for name in expected
-    } == expected
-
-
-def test_worker_tier_config_override_merges_with_defaults():
-    tier = resolve_worker_tier(
-        {
-            "coding_worker": {
-                "worker_tiers": {
-                    "standard": {
-                        "model": "custom/worker",
-                        "reasoning_effort": "high",
-                    }
-                }
-            }
-        },
-        "standard",
-    )
-
-    assert tier is not None
-    assert tier.model == "custom/worker"
-    assert tier.opencode_model == "custom/worker"
-    assert tier.reasoning_effort == "high"
-
-
-def test_invalid_worker_tier_is_rejected():
-    assert resolve_worker_tier({}, "unknown") is None
-    assert resolve_worker_tier(
-        {
-            "coding_worker": {
-                "worker_tiers": {
-                    "quick": {"model": "custom/quick", "reasoning_effort": "ultra"}
-                }
-            }
-        },
-        "quick",
-    ) is None
+def test_coding_worker_has_no_independent_or_deprecated_tier_catalog():
+    assert "worker_tiers" not in DEFAULT_CONFIG["coding_worker"]
+    assert resolve_model_tier({}, "quick") is None
+    assert resolve_model_tier({}, "standard") is None
+    assert resolve_model_tier({}, "thorough") is None
+    assert resolve_model_tier({}, "deep") is None
+    assert resolve_model_tier({}, "max") is None
 
 
 def test_delegation_classifier_is_deterministic_and_risk_wins_over_simple_text():

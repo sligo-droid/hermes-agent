@@ -561,7 +561,7 @@ def _push_completion_event(
                 "task": coding_event.get("task") or record.get("goal", ""),
                 "context_pack": coding_event.get("context_pack") or {},
                 "worker_cwd": coding_event.get("worker_cwd") or "",
-                "worker_tier": coding_event.get("worker_tier") or "default",
+                "model_tier": coding_event.get("model_tier") or "default",
                 "scope_paths": list(coding_event.get("scope_paths") or []),
                 "worker_run": coding_event.get("worker_run") or {},
                 "parallel_group": coding_event.get("parallel_group"),

@@ -5126,7 +5126,7 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     assert "[REDACTED_PATH]" in rendered
 
 
-def test_dev_role_backend_uses_trusted_tier_for_planner_ui_route(monkeypatch, tmp_path):
+def test_dev_role_backend_uses_trusted_model_tier_for_planner_ui_route(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import config as config_mod
     from hermes_cli import kanban_codex_worker as worker
@@ -5135,8 +5135,8 @@ def test_dev_role_backend_uses_trusted_tier_for_planner_ui_route(monkeypatch, tm
 
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
-    monkeypatch.setenv("HERMES_CODEX_WORKER_TIER", "quick")
-    monkeypatch.setenv("HERMES_CODEX_WORKER_TIER_SOURCE", "role")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL_TIER", "trivial")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL_TIER_SOURCE", "role")
     monkeypatch.setattr(worker, "_role_uses_opencode", lambda role, task: False)
     monkeypatch.setattr(worker, "_materialize_role_autoreview", lambda workspace, role: "")
     events = []
@@ -5163,7 +5163,7 @@ def test_dev_role_backend_uses_trusted_tier_for_planner_ui_route(monkeypatch, tm
 
     task = SimpleNamespace(
         title="R1: Smoke ui_visual_specialist route with tiny Command Center visual polish",
-        body='Recorded planner route decision for this ticket: {"route":"ui_visual_specialist","worker_tier":"max","rationale":"Command Center visual polish smoke"}',
+        body='Recorded planner route decision for this ticket: {"route":"ui_visual_specialist","model_tier":"advanced","rationale":"Command Center visual polish smoke"}',
         result=None,
     )
 
@@ -5174,7 +5174,8 @@ def test_dev_role_backend_uses_trusted_tier_for_planner_ui_route(monkeypatch, tm
     assert route["selected_provider"] == ""
     assert route["selected_model"] == ""
     assert route["route_decision_source"] == "planner"
-    assert route["worker_tier"] == "quick"
+    assert route["model_tier"] == "trivial"
+    assert "worker_tier" not in route
     assert route["recommended_skills"] == ["taste-skill"]
     assert "selected_route: ui_visual_specialist" in captured["prompt"]
     assert "recommended_skills: taste-skill" in captured["prompt"]

@@ -28,7 +28,8 @@ def test_dispatch_coding_task_forwards_route_decision(monkeypatch):
             "context": "Focus on visual implementation.",
             "cwd": "/tmp/project",
             "turn_timeout_seconds": 600,
-            "worker_tier": "thorough",
+            "model_tier": "advanced",
+            "reasoning_effort": "high",
             "relevant_files": [{"path": "src/app.py", "note": "entry point"}],
             "approach": "Keep the change local.",
             "constraints": "Do not change the API.",
@@ -40,7 +41,9 @@ def test_dispatch_coding_task_forwards_route_decision(monkeypatch):
     )
 
     assert json.loads(result) == {"success": True}
-    assert captured["worker_tier"] == "thorough"
+    assert captured["model_tier"] == "advanced"
+    assert captured["reasoning_effort"] == "high"
+    assert "worker_tier" not in captured
     assert captured["relevant_files"] == [
         {"path": "src/app.py", "note": "entry point"}
     ]

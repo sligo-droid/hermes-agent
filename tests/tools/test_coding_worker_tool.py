@@ -256,7 +256,7 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
             "backend": "codex",
             "model": "gpt-5.6-terra",
             "reasoning": "max",
-            "tier": None,
+            "model_tier": None,
         },
     ]
 
@@ -383,7 +383,7 @@ def test_context_pack_is_injected_before_task(monkeypatch, tmp_path):
     assert prompt.index("## Context from orchestrator") < prompt.index("\nTask:\nfix the parser")
 
 
-def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
+def test_model_tier_and_reasoning_override_codex_runtime(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = [
         TurnResult(final_text="Plan", thread_id="thread-plan", turn_id="turn-plan"),
@@ -398,7 +398,8 @@ def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
     result = json.loads(
         cwt.delegate_coding_task(
             task="fix the production auth race",
-            worker_tier="thorough",
+            model_tier="advanced",
+            reasoning_effort="high",
             route_decision={"route": "ui_visual_specialist"},
             parent_agent=parent,
         )
@@ -427,7 +428,7 @@ def test_worker_tier_overrides_codex_model_and_reasoning(monkeypatch, tmp_path):
             "backend": "codex",
             "model": "gpt-5.6-sol",
             "reasoning": "high",
-            "tier": "thorough",
+            "model_tier": "advanced",
         },
     ]
 
@@ -454,36 +455,52 @@ def test_backend_error_marks_recorded_worker_run_failed(monkeypatch, tmp_path):
             "backend": "codex",
             "model": "gpt-5.6-terra",
             "reasoning": "max",
-            "tier": None,
+            "model_tier": None,
             "failed": True,
         },
     ]
 
 
-def test_invalid_worker_tier_returns_tool_error(tmp_path):
+def test_invalid_model_tier_returns_tool_error(tmp_path):
     result = json.loads(
         cwt.delegate_coding_task(
             task="fix the parser",
-            worker_tier="impossible",
+            model_tier="impossible",
             parent_agent=_parent(tmp_path),
         )
     )
 
-    assert "Unknown worker_tier 'impossible'" in result["error"]
-    for tier in ("quick", "standard", "thorough", "deep", "max"):
+    assert "Unknown model_tier 'impossible'" in result["error"]
+    for tier in ("trivial", "basic", "intermediate", "advanced"):
         assert tier in result["error"]
+
+
+def test_invalid_reasoning_effort_returns_tool_error(tmp_path):
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            reasoning_effort="ultra",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert "Unknown reasoning_effort 'ultra'" in result["error"]
 
 
 def test_coding_worker_schema_exposes_orchestrator_inputs():
     properties = cwt.CODING_WORKER_SCHEMA["parameters"]["properties"]
 
-    assert properties["worker_tier"]["enum"] == [
-        "quick",
-        "standard",
-        "thorough",
-        "deep",
+    assert properties["model_tier"]["type"] == "string"
+    assert "enum" not in properties["model_tier"]
+    assert properties["reasoning_effort"]["enum"] == [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
         "max",
     ]
+    assert "worker_tier" not in properties
     assert {"relevant_files", "approach", "constraints", "verification", "scope_paths"} <= set(
         properties
     )
@@ -519,7 +536,7 @@ def test_background_dispatch_returns_handle_and_records_worker_run(monkeypatch, 
     handle = json.loads(
         cwt.delegate_coding_task(
             task="update the parser",
-            worker_tier="quick",
+            model_tier="trivial",
             scope_paths=["src"],
             background=True,
             parent_agent=parent,
@@ -532,13 +549,13 @@ def test_background_dispatch_returns_handle_and_records_worker_run(monkeypatch, 
         "background": True,
         "delegation_id": handle["delegation_id"],
         "worker_cwd": str(repo),
-        "worker_tier": "quick",
+        "model_tier": "trivial",
         "scope_paths": ["src"],
         "note": "worker running; completion will arrive as a follow-up turn",
     }
     assert handle["delegation_id"].startswith("deleg_")
     assert parent.turn_worker_runs[0]["background"] is True
-    assert parent.turn_worker_runs[0]["tier"] == "quick"
+    assert parent.turn_worker_runs[0]["model_tier"] == "trivial"
     assert process_registry.completion_queue.empty()
 
     gate.set()
@@ -1178,7 +1195,7 @@ def test_turn_worker_runs_append_is_thread_safe():
             backend="codex",
             model=f"model-{index}",
             reasoning="medium",
-            tier=None,
+            model_tier=None,
         )
 
     with ThreadPoolExecutor(max_workers=32) as executor:
@@ -1344,7 +1361,7 @@ def test_ui_specialist_route_uses_normal_codex_backend_and_skills(monkeypatch, t
             "backend": "codex",
             "model": "gpt-5.6-terra",
             "reasoning": "max",
-            "tier": None,
+            "model_tier": None,
         },
     ]
 
@@ -1925,7 +1942,8 @@ def test_registry_forwards_orchestrator_worker_inputs(monkeypatch, tmp_path):
             {
                 "task": "polish the AI budget dashboard",
                 "route_decision": route_decision,
-                "worker_tier": "thorough",
+                "model_tier": "advanced",
+                "reasoning_effort": "high",
                 "relevant_files": relevant_files,
                 "approach": "Patch the existing component.",
                 "constraints": "Preserve the public props.",
@@ -1938,7 +1956,9 @@ def test_registry_forwards_orchestrator_worker_inputs(monkeypatch, tmp_path):
 
     assert result == {"success": True}
     assert captured["route_decision"] is route_decision
-    assert captured["worker_tier"] == "thorough"
+    assert captured["model_tier"] == "advanced"
+    assert captured["reasoning_effort"] == "high"
+    assert "worker_tier" not in captured
     assert captured["relevant_files"] is relevant_files
     assert captured["approach"] == "Patch the existing component."
     assert captured["constraints"] == "Preserve the public props."
@@ -2669,7 +2689,7 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ow,
         "load_coding_worker_pass_config",
-        lambda: {
+        lambda config=None, worker_config=None: {
             "simple_build_reasoning_level": "low",
             "complex_plan_reasoning_level": "max",
             "complex_build_reasoning_level": "high",
@@ -2750,12 +2770,12 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
             "backend": "opencode",
             "model": "hermes-codex/gpt-5.6-terra",
             "reasoning": "max",
-            "tier": None,
+            "model_tier": None,
         },
     ]
 
 
-def test_worker_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_path):
+def test_model_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -2786,19 +2806,13 @@ def test_worker_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_pat
     result = json.loads(
         cwt.delegate_coding_task(
             task="fix the parser",
-            worker_tier="deep",
+            model_tier="advanced",
             parent_agent=_parent(tmp_path),
         )
     )
 
     assert result["success"] is True
-    assert seen["worker_config"] == {
-        "model_tier": "disabled",
-        "simple_build_reasoning_level": "xhigh",
-        "complex_plan_reasoning_level": "xhigh",
-        "complex_build_reasoning_level": "xhigh",
-        "opencode": {"model": "hermes-codex/gpt-5.6-sol"},
-    }
+    assert seen["worker_config"] == {"model_tier": "advanced"}
     resolved = ow.load_opencode_config(cfg, worker_config=seen["worker_config"])
     assert resolved["simple_build_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_plan_model"] == "hermes-codex/gpt-5.6-sol"

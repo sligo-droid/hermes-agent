@@ -162,7 +162,7 @@ class UIWorkRouteDecision:
     advisory_matched: bool = False
     advisory_reason: str = ""
     launch_worker: bool = True
-    worker_tier: str = ""
+    model_tier: str = ""
 
     def metadata(self) -> dict[str, Any]:
         metadata = {
@@ -185,10 +185,10 @@ class UIWorkRouteDecision:
             "fallback_reason": self.fallback_reason,
             "advisory_matched": self.advisory_matched,
             "advisory_reason": self.advisory_reason,
-            "worker_tier": self.worker_tier,
+            "model_tier": self.model_tier,
         }
         metadata["recommended_skills"] = (
-            list(ui_specialist_skills_for_tier(self.worker_tier))
+            list(ui_specialist_skills_for_model_tier(self.model_tier))
             if self.selected_route == _UI_SPECIALIST_ROUTE
             else []
         )
@@ -199,7 +199,7 @@ def ui_specialist_skill_prompt(decision: UIWorkRouteDecision | None) -> str:
     """Return worker prompt text for UI-specialist skill loading."""
     if decision is None or decision.selected_route != _UI_SPECIALIST_ROUTE:
         return ""
-    selected_skills = ui_specialist_skills_for_tier(decision.worker_tier)
+    selected_skills = ui_specialist_skills_for_model_tier(decision.model_tier)
     skills = ", ".join(f"`{name}`" for name in selected_skills)
     return (
         "UI specialist skill loading: before frontend/UI edits, load and use "
@@ -224,21 +224,22 @@ class _RouteDecisionInput:
 _DEFAULT_ROUTE = "default_coding_worker"
 _UI_SPECIALIST_ROUTE = "ui_visual_specialist"
 UI_SPECIALIST_SKILLS = ("taste-skill", "claude-design", "popular-web-designs")
-_UI_SKILLS_BY_TIER = {
-    "quick": UI_SPECIALIST_SKILLS[:1],
-    "standard": UI_SPECIALIST_SKILLS[:2],
-    "thorough": UI_SPECIALIST_SKILLS,
-    "deep": UI_SPECIALIST_SKILLS,
-    "max": UI_SPECIALIST_SKILLS,
+_UI_SKILLS_BY_MODEL_TIER = {
+    "trivial": UI_SPECIALIST_SKILLS[:1],
+    "basic": UI_SPECIALIST_SKILLS[:2],
+    "intermediate": UI_SPECIALIST_SKILLS,
+    "advanced": UI_SPECIALIST_SKILLS,
 }
 _NO_WORKER_ROUTES = {"review_only_no_worker", "ask_human"}
 
 
-def ui_specialist_skills_for_tier(tier: Any) -> tuple[str, ...]:
-    """Return tier-aware UI skills; unknown/omitted tiers keep legacy breadth."""
+def ui_specialist_skills_for_model_tier(model_tier: Any) -> tuple[str, ...]:
+    """Return model-tier-aware UI skills; unknown/omitted tiers use all skills."""
 
-    normalized = str(tier or "").strip().lower()
-    return _UI_SKILLS_BY_TIER.get(normalized, UI_SPECIALIST_SKILLS)
+    normalized = str(model_tier or "").strip().lower()
+    return _UI_SKILLS_BY_MODEL_TIER.get(normalized, UI_SPECIALIST_SKILLS)
+
+
 _ROUTE_ALIASES = {
     "default": _DEFAULT_ROUTE,
     "default_worker": _DEFAULT_ROUTE,
@@ -442,7 +443,7 @@ def resolve_ui_work_route(
     project: str = "",
     backend: str = "codex",
     route_decision: Any = None,
-    worker_tier: Any = None,
+    model_tier: Any = None,
 ) -> UIWorkRouteDecision:
     """Return a secret-free UI-work routing decision.
 
@@ -462,10 +463,10 @@ def resolve_ui_work_route(
     requested = _normalize_route_decision(route_decision)
     normalized_backend = str(backend or "opencode").strip().lower() or "opencode"
 
-    normalized_worker_tier = str(worker_tier or "").strip().lower()
+    normalized_model_tier = str(model_tier or "").strip().lower()
     base_fields = {
         "backend": normalized_backend,
-        "worker_tier": normalized_worker_tier,
+        "model_tier": normalized_model_tier,
         "route_decision": requested.route,
         "route_decision_source": requested.source,
         "route_decision_confidence": requested.confidence,

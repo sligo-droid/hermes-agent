@@ -328,7 +328,10 @@ def test_build_fable_implementation_instruction_requires_codex_delegation():
     assert "add feature" in packet
     assert "delegate_coding_task" in packet
     assert "Codex coding worker" in packet
-    assert "Choose `worker_tier` deliberately" in packet
+    assert "Choose `model_tier` deliberately" in packet
+    assert "`trivial`, `basic`, `intermediate`, or `advanced`" in packet
+    assert "reasoning_effort" in packet
+    assert "worker_tier" not in packet
     assert "Front-load what you learned into `relevant_files`" in packet
     assert "several `delegate_coding_task` calls in one response" in packet
     assert "non-overlapping `scope_paths`" in packet
