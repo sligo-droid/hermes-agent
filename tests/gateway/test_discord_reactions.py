@@ -431,7 +431,7 @@ async def test_top_level_feature_summary_reactions_target_triggering_user_messag
 @pytest.mark.parametrize(
     ("state", "emoji"),
     [
-        ("active", "👀"),
+        ("active", "⏳"),
         ("running", "⏳"),
         ("done", "✅"),
         ("blocked", "❓"),
@@ -1995,8 +1995,8 @@ async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter, monkeyp
     followup_message.add_reaction.assert_not_awaited()
     followup_message.remove_reaction.assert_not_awaited()
     assert [call.args for call in origin_message.add_reaction.await_args_list] == [
-        ("👀",),
-        ("👀",),
+        ("⏳",),
+        ("⏳",),
     ]
 
 
