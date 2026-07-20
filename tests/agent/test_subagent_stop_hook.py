@@ -62,6 +62,7 @@ def _stub_child_builder(monkeypatch):
         child = MagicMock()
         child._delegate_saved_tool_names = []
         child._credential_pool = None
+        child.session_id = f"child-session-{task_index}"
         return child
 
     monkeypatch.setattr(
@@ -135,6 +136,7 @@ class TestSingleTask:
             )
 
         assert captured[0]["parent_session_id"] == "sess-xyz"
+        assert captured[0]["child_session_id"] == "child-session-0"
 
 
 # ── batch mode ────────────────────────────────────────────────────────────

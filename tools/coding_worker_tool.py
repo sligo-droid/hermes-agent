@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import json
 import copy
+import logging
 import os
 import re
 import subprocess
@@ -30,6 +31,9 @@ from tools.parallel_worker_worktrees import (
 from tools.registry import registry, tool_error
 
 
+logger = logging.getLogger(__name__)
+
+
 DEFAULT_CODING_WORKER_GIT_SSH_COMMAND = "ssh -F /dev/null"
 _PARALLEL_MERGE_LOCKS: dict[str, threading.Lock] = {}
 _PARALLEL_MERGE_LOCKS_GUARD = threading.Lock()
@@ -37,6 +41,7 @@ _BACKGROUND_PARALLEL_WORKERS: set[str] = set()
 _BACKGROUND_PARALLEL_RESULTS: dict[str, dict[str, Any]] = {}
 _BACKGROUND_PARALLEL_WORKERS_GUARD = threading.Lock()
 _TURN_WORKER_RUNS_LOCK = threading.Lock()
+_WORKER_OBSERVER_CONTEXTS: dict[int, dict[str, Any]] = {}
 _CODING_WORKER_FALLBACK_ENV_KEYS = frozenset({
     "ALL_PROXY",
     "GIT_CONFIG_GLOBAL",
@@ -352,6 +357,19 @@ def _model_tier_config(
     return config or None
 
 
+def _observer_safe_text(value: Any, limit: int) -> str:
+    """Force-redact and bound observer-only text before hook delivery."""
+    if limit <= 0:
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(str(value or ""), force=True)[:limit]
+    except Exception:
+        logger.debug("observer text redaction failed", exc_info=True)
+        return ""
+
+
 def _start_worker_run(
     parent_agent: Any,
     *,
@@ -360,17 +378,52 @@ def _start_worker_run(
     reasoning: str,
     model_tier: Optional[str],
     background: bool = False,
+    task: str = "",
+    cwd: str = "",
 ) -> Optional[dict[str, Any]]:
     """Append a best-effort per-turn worker record before execution starts."""
+    start_hook_enabled = stop_hook_enabled = False
+    try:
+        from hermes_cli.plugins import has_hook
+
+        start_hook_enabled = has_hook("coding_worker_start")
+        stop_hook_enabled = has_hook("coding_worker_stop")
+    except Exception:
+        pass
+    backend_value = str(backend or "").strip()
+    model_value = str(model or "").strip()
+    reasoning_value = str(reasoning or "").strip()
+    model_tier_value = str(model_tier).strip() if model_tier else None
     record: dict[str, Any] = {
-        "backend": str(backend or "").strip(),
-        "model": str(model or "").strip(),
-        "reasoning": str(reasoning or "").strip(),
-        "model_tier": str(model_tier).strip() if model_tier else None,
+        "backend": backend_value,
+        "model": model_value,
+        "reasoning": reasoning_value,
+        "model_tier": model_tier_value,
         "failed": True,
     }
     if background:
         record["background"] = True
+    observer_context: Optional[dict[str, Any]] = None
+    if start_hook_enabled or stop_hook_enabled:
+        root_agent = getattr(parent_agent, "_delegate_root_agent", parent_agent)
+        observer_context = {
+            "worker_session_id": f"coding_{uuid.uuid4().hex}",
+            "root_session_id": str(getattr(root_agent, "session_id", "") or ""),
+            "parent_session_id": str(getattr(parent_agent, "session_id", "") or ""),
+            "parent_turn_id": str(
+                getattr(parent_agent, "_current_turn_id", "")
+                or getattr(parent_agent, "_current_task_id", "")
+                or ""
+            ),
+            "platform": str(getattr(parent_agent, "platform", "") or ""),
+            "backend": backend_value,
+            "model": model_value,
+            "reasoning": reasoning_value,
+            "model_tier": model_tier_value,
+            "task": _observer_safe_text(task, 100_000),
+            "cwd": _observer_safe_text(cwd, 4_096),
+            "started_at": time.time(),
+        }
     try:
         with _TURN_WORKER_RUNS_LOCK:
             runs = getattr(parent_agent, "turn_worker_runs", None)
@@ -378,8 +431,21 @@ def _start_worker_run(
                 runs = []
                 parent_agent.turn_worker_runs = runs
             runs.append(record)
+            if observer_context is not None:
+                _WORKER_OBSERVER_CONTEXTS[id(record)] = observer_context
     except Exception:
         return None
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        if start_hook_enabled and observer_context is not None:
+            invoke_hook(
+                "coding_worker_start",
+                **observer_context,
+                background=bool(background),
+            )
+    except Exception:
+        logger.debug("coding_worker_start hook failed", exc_info=True)
     return record
 
 
@@ -396,14 +462,125 @@ def _update_worker_run(
     record["reasoning"] = str(reasoning or "").strip()
 
 
-def _finish_worker_run(record: Optional[dict[str, Any]], *, failed: bool) -> None:
-    """Finalize the failure marker without affecting worker execution."""
+def _observer_safe_worker_messages(messages: Any) -> list[dict[str, Any]]:
+    """Return a bounded, secret-redacted OpenAI-shaped worker transcript."""
+    if not isinstance(messages, list):
+        return []
+
+    safe: list[dict[str, Any]] = []
+    remaining = 2_000_000
+    for raw in messages[:400]:
+        if not isinstance(raw, dict) or remaining <= 0:
+            continue
+        item: dict[str, Any] = {}
+        role = str(raw.get("role") or "").strip()
+        if role not in {"user", "assistant", "tool"}:
+            continue
+        item["role"] = role
+        for key in ("content", "reasoning"):
+            value = raw.get(key)
+            if value is None:
+                if key == "content":
+                    item[key] = None
+                continue
+            text = _observer_safe_text(value, 100_000)
+            if len(text) > remaining:
+                text = text[:remaining]
+            item[key] = text
+            remaining -= len(text)
+        tool_call_id = raw.get("tool_call_id")
+        if isinstance(tool_call_id, str):
+            item["tool_call_id"] = tool_call_id[:512]
+        tool_calls = raw.get("tool_calls")
+        if isinstance(tool_calls, list):
+            try:
+                encoded = _observer_safe_text(
+                    json.dumps(tool_calls, ensure_ascii=False),
+                    min(200_000, remaining),
+                )
+                item["tool_calls"] = json.loads(encoded)
+                remaining -= len(encoded)
+            except (TypeError, ValueError):
+                pass
+        safe.append(item)
+    return safe
+
+
+def _observer_safe_worker_events(events: Any) -> list[dict[str, Any]]:
+    """Bound and redact backend-native events before observer delivery."""
+    if not isinstance(events, list):
+        return []
+    safe: list[dict[str, Any]] = []
+    remaining = 2_000_000
+    for raw in events[:400]:
+        if not isinstance(raw, dict) or remaining <= 0:
+            continue
+        try:
+            encoded = json.dumps(raw, ensure_ascii=False, default=str)
+            encoded = _observer_safe_text(encoded, min(100_000, remaining))
+            parsed = json.loads(encoded)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            safe.append(parsed)
+            remaining -= len(encoded)
+    return safe
+
+
+def _finish_worker_run(
+    record: Optional[dict[str, Any]],
+    *,
+    failed: bool,
+    status: str = "",
+    summary: Any = None,
+    error: Any = None,
+    duration_seconds: Any = None,
+    thread_id: Any = None,
+    turn_id: Any = None,
+    worker_messages: Any = None,
+    worker_events: Any = None,
+) -> None:
+    """Finalize the worker record and emit one fail-open observer closeout."""
     if record is None:
         return
     if failed:
         record["failed"] = True
     else:
         record.pop("failed", None)
+    with _TURN_WORKER_RUNS_LOCK:
+        observer_context = _WORKER_OBSERVER_CONTEXTS.pop(id(record), None)
+    if observer_context is None:
+        return
+    try:
+        ended_at = time.time()
+        try:
+            duration = float(duration_seconds)
+        except (TypeError, ValueError):
+            duration = max(
+                0.0,
+                ended_at - float(observer_context.get("started_at") or ended_at),
+            )
+        payload = {**observer_context, **record}
+        payload.update(
+            status=str(status or ("failed" if failed else "completed"))[:64],
+            failed=bool(failed),
+            summary=_observer_safe_text(summary, 100_000),
+            error=_observer_safe_text(error, 20_000),
+            duration_ms=max(0, int(duration * 1000)),
+            ended_at=ended_at,
+            thread_id=str(thread_id or "")[:512],
+            turn_id=str(turn_id or "")[:512],
+            worker_messages=_observer_safe_worker_messages(worker_messages),
+        )
+        safe_events = _observer_safe_worker_events(worker_events)
+        if safe_events:
+            payload["worker_events"] = safe_events
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if has_hook("coding_worker_stop"):
+            invoke_hook("coding_worker_stop", **payload)
+    except Exception:
+        logger.debug("coding_worker_stop hook failed", exc_info=True)
 
 
 def _merge_worker_config(
@@ -2181,50 +2358,80 @@ def _delegate_coding_task_impl(
                 else None
             ),
             background=_background_startup is not None,
+            task=task_text,
+            cwd=workdir,
         )
-        if (
-            _background_startup is not None
-            and not _background_startup.mark_ready(
-                worker_cwd=workdir,
-                model_tier=(
-                    selected_model_tier.name
-                    if selected_model_tier is not None
-                    else None
-                ),
-                scope_paths=normalized_scope_paths,
-                backend="opencode",
-                worker_run=opencode_run,
-            )
-        ):
-            _finish_worker_run(opencode_run, failed=True)
-            return tool_error(
-                _background_startup.cancel_reason
-                or "background coding worker was cancelled before startup"
-            )
-        result = _call_opencode_task(
-            run_opencode_task,
-            worker_prompt,
-            workdir,
-            scope_session_key=getattr(parent_agent, "session_key", ""),
-            **opencode_kwargs,
-        )
-        duration = round(time.monotonic() - started, 2)
-        success = bool(result.final_text) and not result.error and not result.interrupted
-        run_profile = getattr(result, "run_profile", None)
-        profile_passes = run_profile.get("passes") if isinstance(run_profile, dict) else None
-        if isinstance(profile_passes, list) and profile_passes:
-            executed_passes = len(getattr(result, "agents", []) or [])
-            profile_index = min(max(executed_passes - 1, 0), len(profile_passes) - 1)
-            actual_pass = profile_passes[profile_index]
-            if isinstance(actual_pass, dict):
-                actual_model = actual_pass.get("model") or actual_model
-                actual_reasoning = actual_pass.get("reasoning") or actual_reasoning
-                _update_worker_run(
-                    opencode_run,
-                    model=actual_model,
-                    reasoning=actual_reasoning,
+        try:
+            if (
+                _background_startup is not None
+                and not _background_startup.mark_ready(
+                    worker_cwd=workdir,
+                    model_tier=(
+                        selected_model_tier.name
+                        if selected_model_tier is not None
+                        else None
+                    ),
+                    scope_paths=normalized_scope_paths,
+                    backend="opencode",
+                    worker_run=opencode_run,
                 )
-        _finish_worker_run(opencode_run, failed=not success)
+            ):
+                _finish_worker_run(
+                    opencode_run,
+                    failed=True,
+                    status="cancelled",
+                    error=(
+                        _background_startup.cancel_reason
+                        or "background coding worker was cancelled before startup"
+                    ),
+                )
+                return tool_error(
+                    _background_startup.cancel_reason
+                    or "background coding worker was cancelled before startup"
+                )
+            result = _call_opencode_task(
+                run_opencode_task,
+                worker_prompt,
+                workdir,
+                scope_session_key=getattr(parent_agent, "session_key", ""),
+                **opencode_kwargs,
+            )
+            duration = round(time.monotonic() - started, 2)
+            success = bool(result.final_text) and not result.error and not result.interrupted
+            run_profile = getattr(result, "run_profile", None)
+            profile_passes = run_profile.get("passes") if isinstance(run_profile, dict) else None
+            if isinstance(profile_passes, list) and profile_passes:
+                executed_passes = len(getattr(result, "agents", []) or [])
+                profile_index = min(max(executed_passes - 1, 0), len(profile_passes) - 1)
+                actual_pass = profile_passes[profile_index]
+                if isinstance(actual_pass, dict):
+                    actual_model = actual_pass.get("model") or actual_model
+                    actual_reasoning = actual_pass.get("reasoning") or actual_reasoning
+                    _update_worker_run(
+                        opencode_run,
+                        model=actual_model,
+                        reasoning=actual_reasoning,
+                    )
+            _finish_worker_run(
+                opencode_run,
+                failed=not success,
+                status="completed" if success else "partial",
+                summary=result.final_text,
+                error=result.error,
+                duration_seconds=duration,
+                thread_id=result.thread_id,
+                turn_id=result.turn_id,
+                worker_events=getattr(result, "events", None),
+            )
+        except BaseException as exc:
+            _finish_worker_run(
+                opencode_run,
+                failed=True,
+                status="failed",
+                error=exc,
+                duration_seconds=time.monotonic() - started,
+            )
+            raise
         if ui_route_metadata.get("selected_route") == "ui_visual_specialist":
             ui_route_metadata = {
                 **ui_route_metadata,
@@ -2353,6 +2560,8 @@ def _delegate_coding_task_impl(
                     else None
                 ),
                 background=_background_startup is not None,
+                task=task_text,
+                cwd=workdir,
             )
             if (
                 _background_startup is not None
@@ -2368,7 +2577,15 @@ def _delegate_coding_task_impl(
                     worker_run=codex_run,
                 )
             ):
-                _finish_worker_run(codex_run, failed=True)
+                _finish_worker_run(
+                    codex_run,
+                    failed=True,
+                    status="cancelled",
+                    error=(
+                        _background_startup.cancel_reason
+                        or "background coding worker was cancelled before startup"
+                    ),
+                )
                 return tool_error(
                     _background_startup.cancel_reason
                     or "background coding worker was cancelled before startup"
@@ -2431,7 +2648,17 @@ def _delegate_coding_task_impl(
                             workdir,
                             normalized_scope_paths,
                         )
-                    _finish_worker_run(codex_run, failed=True)
+                    _finish_worker_run(
+                        codex_run,
+                        failed=True,
+                        status="partial",
+                        summary=plan_turn.final_text,
+                        error=plan_turn.error,
+                        duration_seconds=duration,
+                        thread_id=plan_turn.thread_id,
+                        turn_id=plan_turn.turn_id,
+                        worker_messages=plan_turn.projected_messages,
+                    )
                     return json.dumps(payload, ensure_ascii=False)
                 plan_text = plan_turn.final_text.strip()
 
@@ -2485,6 +2712,20 @@ def _delegate_coding_task_impl(
                         )
             turns.append(turn)
             break
+    except BaseException as exc:
+        _finish_worker_run(
+            codex_run,
+            failed=True,
+            status="failed",
+            error=exc,
+            duration_seconds=time.monotonic() - started,
+            worker_messages=[
+                message
+                for completed_turn in turns
+                for message in (getattr(completed_turn, "projected_messages", []) or [])
+            ],
+        )
+        raise
     finally:
         if codex_home is not None and inherited_credential_id:
             try:
@@ -2497,12 +2738,31 @@ def _delegate_coding_task_impl(
             codex_home_lease.cleanup()
 
     if turn is None:
-        _finish_worker_run(codex_run, failed=True)
+        _finish_worker_run(
+            codex_run,
+            failed=True,
+            status="failed",
+            error="coding worker did not produce a build turn",
+        )
         return tool_error("coding worker did not produce a build turn")
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted
-    _finish_worker_run(codex_run, failed=not success)
+    _finish_worker_run(
+        codex_run,
+        failed=not success,
+        status="completed" if success else "partial",
+        summary=turn.final_text,
+        error=turn.error,
+        duration_seconds=duration,
+        thread_id=turn.thread_id,
+        turn_id=turn.turn_id,
+        worker_messages=[
+            message
+            for completed_turn in turns
+            for message in (getattr(completed_turn, "projected_messages", []) or [])
+        ],
+    )
     scope_check = (
         _scope_check(workdir, normalized_scope_paths)
         if normalized_scope_paths is not None

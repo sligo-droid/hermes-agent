@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.transports.codex_app_server_session import TurnResult
+from hermes_cli import plugins
 from hermes_cli.config import DEFAULT_CONFIG
 from tools import async_delegation as ad
 from tools import coding_worker_tool as cwt
@@ -2775,6 +2776,70 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
             "model_tier": None,
         },
     ]
+
+
+def test_opencode_exception_emits_failed_observer_closeout(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    starts = []
+    stops = []
+    manager._hooks["coding_worker_start"] = [lambda **kwargs: starts.append(kwargs)]
+    manager._hooks["coding_worker_stop"] = [lambda **kwargs: stops.append(kwargs)]
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    secret = "sk-secretsecretsecret"
+
+    def fail_run(*_args, **_kwargs):
+        raise RuntimeError(f"Authorization: Bearer {secret}")
+
+    monkeypatch.setattr(ow, "run_opencode_task", fail_run)
+    parent = _parent(tmp_path)
+    parent.session_id = "parent-session"
+    parent._current_turn_id = "parent-turn"
+
+    with pytest.raises(RuntimeError, match="Authorization"):
+        cwt.delegate_coding_task(task="fix parser", parent_agent=parent)
+
+    assert len(starts) == len(stops) == 1
+    assert stops[0]["worker_session_id"] == starts[0]["worker_session_id"]
+    assert stops[0]["status"] == "failed"
+    assert stops[0]["failed"] is True
+    assert secret not in stops[0]["error"]
+    assert id(parent.turn_worker_runs[0]) not in cwt._WORKER_OBSERVER_CONTEXTS
+
+
+def test_codex_exception_emits_failed_observer_closeout(monkeypatch, tmp_path):
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    starts = []
+    stops = []
+    manager._hooks["coding_worker_start"] = [lambda **kwargs: starts.append(kwargs)]
+    manager._hooks["coding_worker_stop"] = [lambda **kwargs: stops.append(kwargs)]
+    secret = "sk-secretsecretsecret"
+
+    class FailingSession(FakeSession):
+        def run_turn(self, **kwargs):
+            self.run_calls.append(kwargs)
+            raise RuntimeError(f"Authorization: Bearer {secret}")
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FailingSession,
+    )
+    parent = _parent(tmp_path)
+    parent.session_id = "parent-session"
+    parent._current_turn_id = "parent-turn"
+
+    with pytest.raises(RuntimeError, match="Authorization"):
+        cwt.delegate_coding_task(task="fix parser", parent_agent=parent)
+
+    assert len(starts) == len(stops) == 1
+    assert stops[0]["worker_session_id"] == starts[0]["worker_session_id"]
+    assert stops[0]["status"] == "failed"
+    assert stops[0]["failed"] is True
+    assert secret not in stops[0]["error"]
+    assert id(parent.turn_worker_runs[0]) not in cwt._WORKER_OBSERVER_CONTEXTS
 
 
 def test_model_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_path):

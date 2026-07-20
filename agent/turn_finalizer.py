@@ -494,6 +494,15 @@ def finalize_turn(
         _invoke_hook(
             "on_session_end",
             session_id=agent.session_id,
+            parent_session_id=getattr(agent, "_parent_session_id", None),
+            root_session_id=str(
+                getattr(
+                    getattr(agent, "_delegate_root_agent", agent),
+                    "session_id",
+                    agent.session_id,
+                )
+                or agent.session_id
+            ),
             task_id=effective_task_id,
             turn_id=turn_id,
             completed=completed,

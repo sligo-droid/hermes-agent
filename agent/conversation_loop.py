@@ -746,6 +746,15 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
+            parent_session_id=getattr(agent, "_parent_session_id", None),
+            root_session_id=str(
+                getattr(
+                    getattr(agent, "_delegate_root_agent", agent),
+                    "session_id",
+                    agent.session_id,
+                )
+                or agent.session_id
+            ),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
         )

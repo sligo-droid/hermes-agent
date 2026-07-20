@@ -222,6 +222,23 @@ and `child_goal`.
 Observers can use these hooks to model nested trajectories while keeping child
 agent execution linked to the parent turn that spawned it.
 
+### Coding Worker Lifecycle
+
+Coding-worker hooks describe bounded Codex/OpenCode runs launched through
+`delegate_coding_task`:
+
+| Hook | When it fires |
+| --- | --- |
+| `coding_worker_start` | A coding-worker run is about to execute. |
+| `coding_worker_stop` | The run completes, fails, or is cancelled. |
+
+Both hooks include a stable observer-only `worker_session_id`,
+`root_session_id`, `parent_session_id`, `parent_turn_id`, backend/model fields,
+and timing metadata. `coding_worker_stop` may also include bounded, secret-
+redacted `worker_messages` projected from the worker runtime. Observer plugins
+can persist those messages as a related trace without adding them to the
+parent conversation or changing worker execution.
+
 ## Payload Safety
 
 Observer payloads are designed for telemetry consumers, not raw object access.

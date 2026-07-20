@@ -1221,6 +1221,40 @@ def _build_child_progress_callback(
     return _callback
 
 
+def _emit_subagent_start(
+    *,
+    child: Any,
+    parent_agent: Any,
+    root_agent: Any,
+    parent_subagent_id: Any,
+    subagent_id: str,
+    role: str,
+    goal: str,
+) -> None:
+    """Emit the public child-start observer payload without affecting launch."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "subagent_start",
+            root_session_id=str(getattr(root_agent, "session_id", "") or "") or None,
+            parent_session_id=str(getattr(parent_agent, "session_id", "") or "") or None,
+            parent_turn_id=str(
+                getattr(parent_agent, "_current_turn_id", "")
+                or getattr(parent_agent, "_current_task_id", "")
+                or ""
+            ),
+            parent_subagent_id=str(parent_subagent_id or "") or None,
+            child_session_id=str(getattr(child, "session_id", "") or "") or None,
+            child_subagent_id=str(subagent_id or "") or None,
+            child_role=role,
+            child_goal=goal,
+            platform=getattr(parent_agent, "platform", None) or "",
+        )
+    except Exception:
+        logger.debug("subagent_start hook invocation failed", exc_info=True)
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1634,6 +1668,16 @@ def _build_child_agent(
             child_progress_cb("subagent.spawn_requested", preview=goal)
         except Exception as exc:
             logger.debug("spawn_requested relay failed: %s", exc)
+
+    _emit_subagent_start(
+        child=child,
+        parent_agent=parent_agent,
+        root_agent=root_agent,
+        parent_subagent_id=parent_subagent_id,
+        subagent_id=subagent_id,
+        role=effective_role,
+        goal=goal,
+    )
 
     return child
 
@@ -2588,6 +2632,7 @@ def _finalize_detached_results(
                 "task": str(task.get("goal") or ""),
                 "summary": str(entry.get("summary") or ""),
                 "child_session_id": str(getattr(child, "session_id", "") or ""),
+                "child_subagent_id": str(getattr(child, "_subagent_id", "") or ""),
                 "child_role": child_role,
                 "child_status": str(entry.get("status") or ""),
                 "duration_ms": int((entry.get("duration_seconds") or 0) * 1000),
@@ -2647,9 +2692,14 @@ def apply_detached_delegation_accounting(
             try:
                 invoke_hook(
                     "subagent_stop",
+                    root_session_id=str(
+                        (accounting.get("binding") or {}).get("session_id") or ""
+                    )
+                    or None,
                     parent_session_id=str(accounting.get("parent_session_id") or "") or None,
                     parent_turn_id=str(accounting.get("parent_turn_id") or ""),
                     child_session_id=str(child.get("child_session_id") or "") or None,
+                    child_subagent_id=str(child.get("child_subagent_id") or "") or None,
                     child_role=child.get("child_role"),
                     child_summary=child.get("summary"),
                     child_status=child.get("child_status"),
@@ -3266,6 +3316,16 @@ def delegate_task(
     # _run_single_child (or the fabricated-entry branches above) before the
     # child was closed.
     _parent_session_id = getattr(parent_agent, "session_id", None)
+    _root_session_id = getattr(
+        getattr(parent_agent, "_delegate_root_agent", parent_agent),
+        "session_id",
+        _parent_session_id,
+    )
+    _parent_turn_id = str(
+        getattr(parent_agent, "_current_turn_id", "")
+        or getattr(parent_agent, "_current_task_id", "")
+        or ""
+    )
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
     except Exception:
@@ -3276,8 +3336,12 @@ def delegate_task(
     # closed; we fold them into the parent in one pass alongside the
     # subagent_stop hook loop so we don't walk `results` twice.
     _children_cost_total = 0.0
+    _observer_child_by_index = {
+        index: child for index, _task, child in children
+    }
     for entry in results:
         child_role = entry.pop("_child_role", None)
+        observer_child = _observer_child_by_index.get(entry.get("task_index"))
         child_cost = entry.pop("_child_cost_usd", 0.0)
         try:
             if child_cost:
@@ -3289,7 +3353,15 @@ def delegate_task(
         try:
             _invoke_hook(
                 "subagent_stop",
+                root_session_id=str(_root_session_id or "") or None,
                 parent_session_id=_parent_session_id,
+                parent_turn_id=_parent_turn_id,
+                child_session_id=(
+                    str(getattr(observer_child, "session_id", "") or "") or None
+                ),
+                child_subagent_id=(
+                    str(getattr(observer_child, "_subagent_id", "") or "") or None
+                ),
                 child_role=child_role,
                 child_summary=entry.get("summary"),
                 child_status=entry.get("status"),
