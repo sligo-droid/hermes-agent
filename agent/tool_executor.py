@@ -62,6 +62,46 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _agent_has_pending_steer(agent) -> bool:
+    checker = getattr(agent, "_has_pending_steer", None)
+    if callable(checker):
+        return bool(checker())
+    return bool(getattr(agent, "_pending_steer", None))
+
+
+def append_steer_skipped_tool_results(
+    agent,
+    messages: list,
+    tool_calls: list,
+    *,
+    stage: str = "steer-skipped tool result",
+    inject_guidance: bool = True,
+) -> int:
+    """Pair unstarted calls with synthetic results at a steer boundary."""
+    calls = list(tool_calls or [])
+    for tool_call in calls:
+        name = tool_call.function.name
+        messages.append(
+            make_tool_result_message(
+                name,
+                (
+                    f"[Tool execution skipped — {name} was not started because "
+                    "new user guidance arrived. Replan before taking more actions.]"
+                ),
+                tool_call.id,
+                effect_disposition="none",
+            )
+        )
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"{stage} {name}",
+        )
+    if calls and inject_guidance:
+        agent._apply_pending_steer_to_tool_results(messages, len(calls))
+    return len(calls)
+
+
 def _storage_safe_tool_args(tool_name: str, args: dict) -> dict:
     """Return callback/persistence-safe args without changing execution args."""
     if not isinstance(args, dict):
@@ -905,6 +945,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+    # Linearization point for the whole submitted parallel batch. Guidance
+    # accepted before this check skips every call; guidance accepted after it
+    # treats the batch as already submitted and lets it finish naturally.
+    if _agent_has_pending_steer(agent):
+        append_steer_skipped_tool_results(
+            agent,
+            messages,
+            tool_calls,
+            stage="pre-submit steer-skipped tool result",
+        )
+        rewrite_messages = getattr(agent, "_rewrite_messages_to_session_db", None)
+        if callable(rewrite_messages):
+            rewrite_messages(messages)
+        return
     _tool_budget = _budget_for_agent(agent)
 
     # ── Pre-flight: interrupt check ──────────────────────────────────
@@ -1620,12 +1674,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             stage=f"tool result {name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Drain between results, but defer the final result until after
-        # aggregate budgeting so the user guidance cannot be truncated.
-        if i < num_tools - 1:
-            agent._apply_pending_steer_to_tool_results(messages, 1)
-
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
@@ -1649,7 +1697,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> bool:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1658,7 +1706,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    steer_boundary_hit = False
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
+        # Linearization point for this sequential call. Guidance accepted
+        # before the check skips this and all later calls; guidance accepted
+        # after it lets this one active call finish, then stops the batch.
+        if _agent_has_pending_steer(agent):
+            append_steer_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i - 1:],
+                stage="pre-execution steer-skipped tool result",
+            )
+            rewrite_messages = getattr(agent, "_rewrite_messages_to_session_db", None)
+            if callable(rewrite_messages):
+                rewrite_messages(messages)
+            return True
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -1700,7 +1763,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages,
                 stage=f"invalid tool arguments {function_name}",
             )
-            agent._apply_pending_steer_to_tool_results(messages, 1)
+            if _agent_has_pending_steer(agent) and i < len(assistant_message.tool_calls):
+                append_steer_skipped_tool_results(
+                    agent,
+                    messages,
+                    assistant_message.tool_calls[i:],
+                )
+                steer_boundary_hit = True
+                break
             continue
 
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
@@ -2326,13 +2396,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Drain pending steer BETWEEN individual tool calls so the
-        # injection lands as soon as a tool finishes. Defer the final
-        # tool until after aggregate budgeting so guidance is not truncated.
-        if i < len(assistant_message.tool_calls):
-            agent._apply_pending_steer_to_tool_results(messages, 1)
-
         if not agent.quiet_mode:
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -2355,6 +2418,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 ))
             break
 
+        if _agent_has_pending_steer(agent):
+            remaining_calls = assistant_message.tool_calls[i:]
+            if remaining_calls:
+                append_steer_skipped_tool_results(
+                    agent,
+                    messages,
+                    remaining_calls,
+                )
+                steer_boundary_hit = True
+                break
+            if not finalize:
+                # The containing segmented dispatcher owns later calls and
+                # will attach the still-pending guidance to their final skip.
+                steer_boundary_hit = True
+                break
+
         if agent.tool_delay > 0 and i < len(assistant_message.tool_calls):
             time.sleep(agent.tool_delay)
 
@@ -2372,6 +2451,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         rewrite_messages = getattr(agent, "_rewrite_messages_to_session_db", None)
         if callable(rewrite_messages):
             rewrite_messages(messages)
+    return steer_boundary_hit
 
 
 
@@ -2406,7 +2486,22 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    stop_after_segment = False
+    for segment_index, (kind, calls) in enumerate(segments):
+        if stop_after_segment or _agent_has_pending_steer(agent):
+            later_calls = [
+                tc
+                for _later_kind, later_segment in segments[segment_index:]
+                for tc in later_segment
+            ]
+            append_steer_skipped_tool_results(
+                agent,
+                messages,
+                later_calls,
+                stage="segmented steer-skipped tool result",
+            )
+            stop_after_segment = True
+            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -2414,10 +2509,26 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 finalize=False,
             )
         else:
-            execute_tool_calls_sequential(
+            stop_after_segment = bool(execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
-            )
+            ))
+
+        if _agent_has_pending_steer(agent):
+            later_calls = [
+                tc
+                for _later_kind, later_segment in segments[segment_index + 1:]
+                for tc in later_segment
+            ]
+            if later_calls:
+                append_steer_skipped_tool_results(
+                    agent,
+                    messages,
+                    later_calls,
+                    stage="segmented steer-skipped tool result",
+                )
+            stop_after_segment = True
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)
@@ -2429,10 +2540,14 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             config=_tool_budget,
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
+        rewrite_messages = getattr(agent, "_rewrite_messages_to_session_db", None)
+        if callable(rewrite_messages):
+            rewrite_messages(messages)
 
 
 __all__ = [
     "execute_tool_calls_concurrent",
     "execute_tool_calls_sequential",
     "execute_tool_calls_segmented",
+    "append_steer_skipped_tool_results",
 ]

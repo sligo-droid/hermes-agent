@@ -612,7 +612,12 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    _close_and_take = getattr(agent, "_close_steer_intake_and_take", None)
+    _leftover_steer = (
+        _close_and_take()
+        if callable(_close_and_take)
+        else agent._drain_pending_steer()
+    )
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

@@ -498,7 +498,7 @@ def load_cli_config() -> Dict[str, Any]:
             "streaming": True,
             "background_process_notifications": "all",
             "classic_resize_full_clear": True,
-            "busy_input_mode": "interrupt",
+            "busy_input_mode": "steer",
             "persistent_output": True,
             "persistent_output_max_lines": 200,
 
@@ -3682,16 +3682,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             enabled=CLI_CONFIG["display"].get("persistent_output", True),
             max_lines=CLI_CONFIG["display"].get("persistent_output_max_lines", 200),
         )
-        # busy_input_mode: "interrupt" (Enter interrupts current run),
-        # "queue" (Enter queues for next turn), or "steer" (Enter injects
-        # mid-run via /steer, arriving after the next tool call).
-        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "interrupt")).strip().lower()
+        # busy_input_mode: "steer" (safe mid-run guidance), "queue" (a
+        # separate next turn), or "interrupt" (destructive replacement).
+        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "steer")).strip().lower()
         if _bim == "queue":
             self.busy_input_mode = "queue"
         elif _bim == "steer":
             self.busy_input_mode = "steer"
-        else:
+        elif _bim == "interrupt":
             self.busy_input_mode = "interrupt"
+        else:
+            self.busy_input_mode = "steer"
 
         # self.verbose ONLY controls global DEBUG logging (root logger level).
         # display.tool_progress="verbose" controls tool-call rendering (full args,
@@ -10494,11 +10495,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 else:
                     _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "steer":
-            # Inject a message after the next tool call without interrupting.
-            # If the agent is actively running, push the text into the agent's
-            # pending_steer slot — the drain hook in _execute_tool_calls_*
-            # will append it to the next tool result's content. If no agent
-            # is running, fall back to queue semantics (same as /queue).
+            # Inject guidance at the next safe boundary without interrupting.
+            # If the agent is actively running, offer it to the locked steer
+            # lifecycle. Closed/unsupported turns fall back to queue semantics.
             parts = cmd_original.split(None, 1)
             payload = parts[1].strip() if len(parts) > 1 else ""
             if not payload:
@@ -10507,12 +10506,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 try:
                     accepted = self.agent.steer(payload)
                 except Exception as exc:
-                    _cprint(f"  Steer failed: {exc}")
+                    self._pending_input.put(payload)
+                    _cprint(f"  Steer failed ({exc}) — queued for the immediate next turn.")
                 else:
                     if accepted:
-                        _cprint(f"  ⏩ Steer queued — arrives after the next tool call: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+                        _cprint(f"  ⏩ Steered into the current run — applies at the next safe boundary: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                     else:
-                        _cprint("  Steer rejected (empty payload).")
+                        self._pending_input.put(payload)
+                        _cprint("  Live steering closed — queued for the immediate next turn.")
             else:
                 # No active run — treat as a normal next-turn message.
                 self._pending_input.put(payload)
@@ -11569,8 +11570,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             /busy               Show current busy input mode
             /busy status        Show current busy input mode
             /busy queue         Queue input for the next turn instead of interrupting
-            /busy steer         Inject Enter mid-run via /steer (after next tool call)
-            /busy interrupt     Interrupt the current run on Enter (default)
+            /busy steer         Apply Enter at the next safe mid-run boundary
+            /busy interrupt     Destructively interrupt the current run on Enter
         """
         parts = cmd.strip().split(maxsplit=1)
         if len(parts) < 2 or parts[1].strip().lower() == "status":
@@ -11578,7 +11579,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self.busy_input_mode == "queue":
                 _behavior = "queues for next turn"
             elif self.busy_input_mode == "steer":
-                _behavior = "steers into current run (after next tool call)"
+                _behavior = "steers into the current run at the next safe boundary"
             else:
                 _behavior = "interrupts current run"
             _cprint(f"  {_DIM}Enter while busy: {_behavior}{_RST}")
@@ -11596,7 +11597,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if arg == "queue":
                 behavior = "Enter will queue follow-up input while Hermes is busy."
             elif arg == "steer":
-                behavior = "Enter will steer your message into the current run (after the next tool call)."
+                behavior = "Enter will steer your message into the current run at the next safe boundary."
             else:
                 behavior = "Enter will interrupt the current run while Hermes is busy."
             _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (saved to config){_RST}")
@@ -14365,7 +14366,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Re-queue the interrupt message (and any that arrived while we were
             # processing the first) as the next prompt for process_loop.
-            # Only reached when busy_input_mode == "interrupt" (the default).
+            # Only reached when busy_input_mode == "interrupt".
             # In "queue" mode Enter routes directly to _pending_input so this
             # block is never hit.
             if pending_message and hasattr(self, '_pending_input'):
@@ -15202,7 +15203,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 accepted = False
                             if accepted:
                                 preview = text[:80] + ("..." if len(text) > 80 else "")
-                                _cprint(f"  {_ACCENT}⏩ Steered: '{preview}'{_RST}")
+                                _cprint(f"  {_ACCENT}⏩ Steered for the next safe boundary: '{preview}'{_RST}")
                             else:
                                 _effective_mode = "queue"
                     if _effective_mode == "queue":

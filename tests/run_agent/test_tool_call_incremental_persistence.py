@@ -23,6 +23,7 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import threading
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
@@ -141,6 +142,76 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     assert last[-1]["role"] == "assistant"
     assert last[-1]["tool_calls"][0]["id"] == "c1"
     assert result["final_response"] == "done"
+
+
+def test_steer_during_provider_call_skips_every_unstarted_tool():
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(arguments='{"query":"one"}', call_id="c1"),
+        _mock_tool_call(arguments='{"query":"two"}', call_id="c2"),
+    ]
+    responses = iter(
+        [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=tool_calls),
+            _mock_response(content="replanned", finish_reason="stop"),
+        ]
+    )
+
+    def _provider_call(**_kwargs):
+        response = next(responses)
+        if response.choices[0].finish_reason == "tool_calls":
+            assert agent.steer("use a safer approach") is True
+        return response
+
+    agent.client.chat.completions.create.side_effect = _provider_call
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls") as execute,
+    ):
+        result = agent.run_conversation("search something")
+
+    execute.assert_not_called()
+    tool_results = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
+    assert all("was not started" in str(m["content"]) for m in tool_results)
+    assert "use a safer approach" in str(tool_results[-1]["content"])
+    assert result["final_response"] == "replanned"
+
+
+def test_late_final_response_steer_becomes_one_continuation():
+    agent = _make_agent()
+    provider_entered = threading.Event()
+    release_provider = threading.Event()
+
+    def _provider_call(**_kwargs):
+        provider_entered.set()
+        assert release_provider.wait(timeout=10)
+        return _mock_response(content="done", finish_reason="stop")
+
+    agent.client.chat.completions.create.side_effect = _provider_call
+    result_box = {}
+
+    def _run():
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result_box["result"] = agent.run_conversation("finish")
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    assert provider_entered.wait(timeout=10)
+    assert agent.steer("one continuation") is True
+    release_provider.set()
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+
+    result = result_box["result"]
+    assert result["pending_steer"] == "one continuation"
+    assert agent.steer("too late") is False
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +334,7 @@ def test_final_budget_and_steer_mutations_replace_incremental_sqlite_rows(tmp_pa
     agent._session_db_created = False
     agent._last_flushed_db_idx = 0
     agent._ensure_db_session()
-    agent._pending_steer = "keep the final guidance"
+    agent._open_steer_intake()
 
     tool_call = _mock_tool_call(name="web_search", call_id="c1")
     assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
@@ -271,6 +342,7 @@ def test_final_budget_and_steer_mutations_replace_incremental_sqlite_rows(tmp_pa
 
     def _budget(tool_messages, **_kwargs):
         tool_messages[-1]["content"] = "aggregate-budgeted-result"
+        agent.steer("keep the final guidance")
         return tool_messages
 
     with (

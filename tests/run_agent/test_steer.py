@@ -23,6 +23,9 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._steer_intake_open = False
+    agent._steer_supported = False
+    agent._open_steer_intake()
     return agent
 
 
@@ -70,6 +73,32 @@ class TestSteerDrain:
     def test_drain_on_empty_returns_none(self):
         agent = _bare_agent()
         assert agent._drain_pending_steer() is None
+
+    def test_close_rejects_new_guidance(self):
+        agent = _bare_agent()
+        assert agent._close_steer_intake_and_take() is None
+        assert agent.steer("too late") is False
+
+    def test_racing_close_never_accepts_and_loses_text(self):
+        for _ in range(100):
+            agent = _bare_agent()
+            gate = threading.Barrier(2)
+            outcome = {}
+
+            def send():
+                gate.wait()
+                outcome["accepted"] = agent.steer("race")
+
+            thread = threading.Thread(target=send)
+            thread.start()
+            gate.wait()
+            pending = agent._close_steer_intake_and_take()
+            thread.join()
+
+            if outcome["accepted"]:
+                assert pending == "race"
+            else:
+                assert pending is None
 
 
 class TestSteerInjection:
@@ -140,12 +169,9 @@ class TestSteerInjection:
         assert new_content[1]["type"] == "text"
         assert "extra note" in new_content[1]["text"]
 
-    def test_restashed_when_no_tool_result_in_batch(self):
-        """If the 'batch' contains no tool-role messages (e.g. all skipped
-        after an interrupt), the steer should be put back into the pending
-        slot so the caller's fallback path can deliver it."""
+    def test_no_target_does_not_take_and_fifo_is_preserved(self):
         agent = _bare_agent()
-        agent.steer("ping")
+        agent.steer("first")
         messages = [
             {"role": "user", "content": "x"},
             {"role": "assistant", "content": "y"},
@@ -153,10 +179,12 @@ class TestSteerInjection:
         # Claim there were N tool msgs, but the tail has none — simulates
         # the interrupt-cancelled case.
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
-        # Messages untouched
         assert messages[-1]["content"] == "y"
-        # And the steer is back in pending so the fallback can grab it
-        assert agent._pending_steer == "ping"
+        agent.steer("second")
+        target = {"role": "tool", "content": "result", "tool_call_id": "t"}
+        messages.append(target)
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert "first\nsecond" in target["content"]
 
 
 class TestSteerThreadSafety:
@@ -199,6 +227,14 @@ class TestSteerClearedOnInterrupt:
         assert agent._pending_steer == "will be dropped"
 
         agent.clear_interrupt()
+        assert agent._pending_steer is None
+
+
+class TestUnsupportedSteering:
+    def test_codex_app_server_style_turn_rejects_live_steer(self):
+        agent = _bare_agent()
+        agent._open_steer_intake(supported=False)
+        assert agent.steer("cannot be consumed") is False
         assert agent._pending_steer is None
 
 

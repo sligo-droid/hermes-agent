@@ -243,12 +243,12 @@ Where the terminal cannot distinguish them, `Alt+Enter` and `Ctrl+J` continue to
 
 ## Interrupting the Agent
 
-You can interrupt the agent at any point:
+You can redirect or interrupt the agent at any point:
 
-- **Type a new message + Enter** while the agent is working — it interrupts and processes your new instructions
+- **Type a new message + Enter** while the agent is working — by default it steers the current run at the next safe boundary
 - **`Ctrl+C`** — interrupt the current operation (press twice within 2s to force exit)
-- In-progress terminal commands are killed immediately (SIGTERM, then SIGKILL after 1s)
-- Multiple messages typed during interrupt are combined into one prompt
+- **`/queue <prompt>`** — always creates a separate later turn
+- **`/stop`** — destructively stops the active run
 
 ### Busy Input Mode
 
@@ -256,19 +256,19 @@ The `display.busy_input_mode` config key controls what happens when you press En
 
 | Mode | Behavior |
 |------|----------|
-| `"interrupt"` (default) | Your message interrupts the current operation and is processed immediately |
+| `"steer"` (default) | Already-started work finishes, later unstarted calls are skipped, and the model replans with your guidance at the next safe boundary |
 | `"queue"` | Your message is silently queued and sent as the next turn after the agent finishes |
-| `"steer"` | Your message is injected into the current run via `/steer`, arriving at the agent after the next tool call — no interrupt, no new turn |
+| `"interrupt"` | Your message destructively interrupts the current operation and is processed as the next turn |
 
 ```yaml
 # ~/.hermes/config.yaml
 display:
-  busy_input_mode: "steer"   # or "queue" or "interrupt" (default)
+  busy_input_mode: "steer"   # default; or "queue" / "interrupt"
 ```
 
-`"queue"` mode is useful when you want to prepare follow-up messages without accidentally canceling in-flight work. `"steer"` mode is useful when you want to redirect the agent mid-task without interrupting — e.g. "actually, also check the tests" while it's still editing code. Unknown values fall back to `"interrupt"`.
+`"queue"` is useful when the follow-up must be an independent turn. `"steer"` redirects the current task without cancelling a provider request, active tool, or already-submitted parallel segment. Unknown values fall back to `"steer"`.
 
-`"steer"` has two automatic fallbacks: if the agent hasn't started yet, or if images are attached, the message falls back to `"queue"` behavior so nothing is lost.
+If steering is unsupported, the turn has already closed, the agent is still starting, or images are attached, Hermes queues the original message for the immediate next turn instead of claiming it was steered.
 
 You can also change it inside the CLI:
 

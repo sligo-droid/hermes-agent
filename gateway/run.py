@@ -3804,8 +3804,8 @@ class _GatewayRunnerCore(
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
-    _busy_input_mode: str = "interrupt"
-    _busy_text_mode: str = "interrupt"
+    _busy_input_mode: str = "steer"
+    _busy_text_mode: str = "steer"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
@@ -4996,6 +4996,22 @@ class _GatewayRunnerCore(
         else:
             pending_slot[session_key] = queued_event
 
+    def _prepend_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+        """Put an event back at the head without disturbing later FIFO order."""
+        if adapter is None:
+            return
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            return
+        queued_events = getattr(self, "_queued_events", None)
+        if queued_events is None:
+            queued_events = {}
+            self._queued_events = queued_events
+        existing_head = pending_slot.get(session_key)
+        if existing_head is not None:
+            queued_events.setdefault(session_key, []).insert(0, existing_head)
+        pending_slot[session_key] = queued_event
+
     def _enqueue_internal_completion(
         self,
         session_key: str,
@@ -5418,37 +5434,34 @@ class _GatewayRunnerCore(
 
     @staticmethod
     def _load_busy_input_mode() -> str:
-        """Load gateway drain-time busy-input behavior from config/env."""
+        """Resolve explicit new/legacy settings before the steer default."""
         mode = os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "").strip().lower()
+        cfg = _load_gateway_runtime_config()
         if not mode:
-            cfg = _load_gateway_runtime_config()
-            mode = str(cfg_get(cfg, "display", "busy_input_mode", default="") or "").strip().lower()
-        if mode == "queue":
-            return "queue"
-        if mode == "steer":
-            return "steer"
-        return "interrupt"
+            mode = str(
+                cfg_get(cfg, "display", "busy_input_mode", default="") or ""
+            ).strip().lower()
+        if mode in {"interrupt", "queue", "steer"}:
+            return mode
+
+        legacy = os.getenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "").strip().lower()
+        if not legacy:
+            legacy = str(
+                cfg_get(cfg, "display", "busy_text_mode", default="") or ""
+            ).strip().lower()
+        if legacy in {"interrupt", "queue"}:
+            return legacy
+        return "steer"
 
     @staticmethod
     def _load_busy_text_mode() -> str:
         """Resolve normal busy TEXT follow-up behavior.
 
-        ``busy_input_mode`` is the source of truth for new configurations.
-        The legacy ``busy_text_mode`` knob remains an explicit override so
-        existing queue-based setups keep their behavior.
+        ``busy_input_mode`` is authoritative when explicitly set. The legacy
+        ``busy_text_mode`` key is consulted only when the new key is absent so
+        existing queue-based setups retain their behavior.
         """
-        legacy = os.getenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "").strip().lower()
-        if not legacy:
-            cfg = _load_gateway_runtime_config()
-            legacy = str(
-                cfg_get(cfg, "display", "busy_text_mode", default="") or ""
-            ).strip().lower()
-        if legacy == "interrupt":
-            return "interrupt"
-        if legacy == "queue":
-            return "queue"
-        input_mode = GatewayRunner._load_busy_input_mode()
-        return "queue" if input_mode == "queue" else "interrupt"
+        return GatewayRunner._load_busy_input_mode()
 
     @staticmethod
     def _load_restart_drain_timeout() -> float:
@@ -6158,6 +6171,72 @@ class _GatewayRunnerCore(
             self._ledger().claim(str(item["id"]))
         return item
 
+    def _try_steer_busy_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        running_agent=None,
+    ) -> str:
+        """Try one live steer, otherwise queue the original event once.
+
+        Returns ``accepted`` when the current Hermes turn owns the text,
+        ``queued`` when a live agent rejected/failed the steer, and
+        ``unsupported`` when no steer-capable agent exists yet.  Both fallback
+        outcomes have already queued ``event`` unchanged for the next turn.
+        """
+        if running_agent is None:
+            running_agent = self._running_agents.get(session_key)
+        text = (event.text or "").strip()
+        if (
+            running_agent is None
+            or running_agent is _AGENT_PENDING_SENTINEL
+            or not hasattr(running_agent, "steer")
+            or not text
+        ):
+            self._queue_or_replace_pending_event(session_key, event)
+            return "unsupported"
+        try:
+            accepted = bool(running_agent.steer(text))
+        except Exception as exc:
+            logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
+            accepted = False
+        if accepted:
+            return "accepted"
+        self._queue_or_replace_pending_event(session_key, event)
+        return "queued"
+
+    def _busy_steer_ack_enabled_for_event(self, event: MessageEvent) -> bool:
+        from gateway.display_config import resolve_display_setting
+
+        override = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
+        if override is not None:
+            return override.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(
+            resolve_display_setting(
+                _load_gateway_config(),
+                _platform_config_key(event.source.platform),
+                "busy_steer_ack_enabled",
+                True,
+            )
+        )
+
+    def _should_send_busy_steer_ack(self, session_key: str) -> bool:
+        """Show the first accepted steer per run, then rate-limit repeats."""
+        now = time.time()
+        generations = self.__dict__.get("_session_run_generation") or {}
+        generation = int(generations.get(session_key, 0))
+        seen = self.__dict__.setdefault("_busy_steer_ack_generation", {})
+        ack_ts = self.__dict__.setdefault("_busy_steer_ack_ts", {})
+        if seen.get(session_key) != generation:
+            seen[session_key] = generation
+            ack_ts[session_key] = now
+            return True
+        if now - float(ack_ts.get(session_key, 0)) < 30:
+            return False
+        ack_ts[session_key] = now
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -6335,34 +6414,26 @@ class _GatewayRunnerCore(
                 session_key,
             )
             effective_mode = "queue"
-        steered = False
+        steer_outcome = None
         if effective_mode == "steer":
-            steer_text = (event.text or "").strip()
-            can_steer = (
-                steer_text
-                and running_agent is not None
-                and running_agent is not _AGENT_PENDING_SENTINEL
-                and hasattr(running_agent, "steer")
+            steer_outcome = self._try_steer_busy_event(
+                event,
+                session_key,
+                running_agent=running_agent,
             )
-            if can_steer:
-                try:
-                    steered = bool(running_agent.steer(steer_text))
-                except Exception as exc:
-                    logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
-                    steered = False
-            if not steered:
-                # Fall back to queue (merge into pending messages, no interrupt)
+            if steer_outcome != "accepted":
                 effective_mode = "queue"
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
-        if not steered:
+        if steer_outcome is None:
             self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
+        is_steer_fallback = steer_outcome in {"queued", "unsupported"}
 
         # If not in queue/steer mode, interrupt the running agent immediately.
         # This aborts in-flight tool calls and causes the agent loop to exit
@@ -6393,13 +6464,11 @@ class _GatewayRunnerCore(
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
-        # Debounce: only send an acknowledgment once every 30 seconds per session
-        # to avoid spamming the user when they send multiple messages quickly
+        # Debounce generic busy acknowledgements once every 30 seconds.  Steer
+        # acknowledgements use a separate per-run limiter below so the first
+        # accepted steer is never hidden by an earlier queue/interrupt ack.
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
-        last_ack = self._busy_ack_ts.get(session_key, 0)
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
 
         from gateway.display_config import resolve_display_setting
         platform_key = _platform_config_key(event.source.platform)
@@ -6407,25 +6476,14 @@ class _GatewayRunnerCore(
         # Steering already changed the live run. Allow operators to suppress
         # only the confirmation bubble without disabling steer itself.
         if is_steer_mode:
-            steer_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
-            if steer_ack_env is not None:
-                steer_ack_enabled = steer_ack_env.strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }
-            else:
-                steer_ack_enabled = bool(
-                    resolve_display_setting(
-                        _load_gateway_config(),
-                        platform_key,
-                        "busy_steer_ack_enabled",
-                        True,
-                    )
-                )
-            if not steer_ack_enabled:
+            if not self._should_send_busy_steer_ack(session_key):
+                return True
+            if not self._busy_steer_ack_enabled_for_event(event):
                 logger.debug("Busy steer ack suppressed for session %s", session_key)
+                return True
+        else:
+            last_ack = self._busy_ack_ts.get(session_key, 0)
+            if now - last_ack < _BUSY_ACK_COOLDOWN:
                 return True
 
         self._busy_ack_ts[session_key] = now
@@ -6465,7 +6523,7 @@ class _GatewayRunnerCore(
         if is_steer_mode:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
+                f"It will apply at the next safe boundary."
             )
         elif is_queue_mode and demoted_for_subagents:
             # #30170 — explain the demotion so the user knows their
@@ -6479,6 +6537,11 @@ class _GatewayRunnerCore(
             message = (
                 f"⏳ Compressing context{status_detail} — your message is queued for "
                 f"when it finishes (use /stop to cancel everything)."
+            )
+        elif is_steer_fallback:
+            message = (
+                f"⏳ Queued for the immediate next turn{status_detail}. "
+                f"The current run could not accept live steering."
             )
         elif is_queue_mode:
             message = (
@@ -15482,11 +15545,9 @@ class _GatewayRunnerCore(
                     return "Queued for the next turn."
                 return f"Queued for the next turn. ({depth} queued)"
 
-            # /steer <prompt> — inject mid-run after the next tool call.
-            # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
-            # iterations inside the same agent run, by appending to the
-            # last tool result's content. No interrupt, no new user turn,
-            # no role-alternation violation.
+            # /steer <prompt> — guide the live run at its next safe boundary.
+            # Unlike /queue, it stays in the same turn when intake is open;
+            # otherwise the stripped prompt is queued immediately.
             if _cmd_def_inner and _cmd_def_inner.name == "steer":
                 steer_text = event.get_command_args().strip()
                 if not steer_text:
@@ -15494,39 +15555,46 @@ class _GatewayRunnerCore(
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent is _AGENT_PENDING_SENTINEL:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
-                    adapter = self._adapter_for_source(source)
-                    if adapter:
-                        queued_event = MessageEvent(
-                            text=steer_text,
-                            message_type=MessageType.TEXT,
-                            source=event.source,
-                            message_id=event.message_id,
-                            channel_prompt=event.channel_prompt,
-                        )
-                        adapter._pending_messages[_quick_key] = queued_event
-                    return "Agent still starting — /steer queued for the next turn."
+                    queued_event = dataclasses.replace(
+                        event,
+                        text=steer_text,
+                        message_type=MessageType.TEXT,
+                    )
+                    self._queue_or_replace_pending_event(_quick_key, queued_event)
+                    return "Agent still starting — queued for the immediate next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
                         accepted = running_agent.steer(steer_text)
                     except Exception as exc:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
-                        return f"⚠️ Steer failed: {exc}"
+                        queued_event = dataclasses.replace(
+                            event,
+                            text=steer_text,
+                            message_type=MessageType.TEXT,
+                        )
+                        self._queue_or_replace_pending_event(_quick_key, queued_event)
+                        return "Live steering failed — queued for the immediate next turn."
                     if accepted:
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
-                        return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-                    return "Steer rejected (empty payload)."
-                # Running agent is missing or lacks steer() — fall back to queue.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    queued_event = MessageEvent(
+                        return (
+                            "⏩ Steered into the current run; it will apply at the "
+                            f"next safe boundary: '{preview}'"
+                        )
+                    queued_event = dataclasses.replace(
+                        event,
                         text=steer_text,
                         message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        channel_prompt=event.channel_prompt,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
-                return "No active agent — /steer queued for the next turn."
+                    self._queue_or_replace_pending_event(_quick_key, queued_event)
+                    return "Live steering closed — queued for the immediate next turn."
+                # Running agent is missing or lacks steer() — fall back to queue.
+                queued_event = dataclasses.replace(
+                    event,
+                    text=steer_text,
+                    message_type=MessageType.TEXT,
+                )
+                self._queue_or_replace_pending_event(_quick_key, queued_event)
+                return "No live steering support — queued for the immediate next turn."
 
             # /model must not be used while the agent is running.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
@@ -15648,7 +15716,8 @@ class _GatewayRunnerCore(
             )
             _started_at = self._running_agents_ts.get(_quick_key, 0)
             if (
-                source.platform == Platform.TELEGRAM
+                self._busy_input_mode == "interrupt"
+                and source.platform == Platform.TELEGRAM
                 and event.message_type == MessageType.TEXT
                 and _telegram_followup_grace > 0
                 and _started_at
@@ -15680,8 +15749,14 @@ class _GatewayRunnerCore(
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
-                # Queue the message so it will be picked up after the
-                # agent starts.
+                if self._busy_input_mode == "steer":
+                    self._try_steer_busy_event(
+                        event,
+                        _quick_key,
+                        running_agent=running_agent,
+                    )
+                    return "⏳ Queued for the immediate next turn — the agent is still starting."
+                # Queue the message so it will be picked up after the agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(
@@ -15705,23 +15780,22 @@ class _GatewayRunnerCore(
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             if self._busy_input_mode == "steer":
-                # Steer mode: inject text into the running agent mid-run via
-                # agent.steer().  Falls back to queue semantics if the payload
-                # is empty, the agent lacks steer(), or steer() rejects.
-                steer_text = (event.text or "").strip()
-                steered = False
-                if steer_text and hasattr(running_agent, "steer"):
-                    try:
-                        steered = bool(running_agent.steer(steer_text))
-                    except Exception as exc:
-                        logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
-                        steered = False
-                if steered:
+                steer_outcome = self._try_steer_busy_event(
+                    event,
+                    _quick_key,
+                    running_agent=running_agent,
+                )
+                if steer_outcome == "accepted":
                     logger.debug("PRIORITY steer for session %s", _quick_key)
+                    if (
+                        os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
+                        and self._should_send_busy_steer_ack(_quick_key)
+                        and self._busy_steer_ack_enabled_for_event(event)
+                    ):
+                        return "⏩ Steered into the current run; it will apply at the next safe boundary."
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                return "⏳ Queued for the immediate next turn — live steering was unavailable."
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
             # cascades through ``_active_children`` and aborts in-flight
@@ -30126,11 +30200,17 @@ class _GatewayRunnerCore(
             # (e.g. during the final API call), the agent couldn't inject it
             # and returned it in result["pending_steer"]. Deliver it as the
             # next user turn so it isn't silently dropped.
-            if result and not pending and not pending_event:
+            if result:
                 _leftover_steer = result.get("pending_steer")
                 if _leftover_steer:
-                    pending = _leftover_steer
-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+                    if pending_event and adapter and session_key:
+                        self._prepend_fifo(session_key, pending_event, adapter)
+                        pending_event = None
+                        pending = _leftover_steer
+                    elif not pending:
+                        pending = _leftover_steer
+                    if pending == _leftover_steer:
+                        logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
@@ -35342,11 +35422,17 @@ class _GatewayRunnerCore(
                 # (e.g. during the final API call), the agent couldn't inject it
                 # and returned it in result["pending_steer"]. Deliver it as the
                 # next user turn so it isn't silently dropped.
-                if result and not pending and not pending_event:
+                if result:
                     _leftover_steer = result.get("pending_steer")
                     if _leftover_steer:
-                        pending = _leftover_steer
-                        logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+                        if pending_event and adapter and session_key:
+                            self._prepend_fifo(session_key, pending_event, adapter)
+                            pending_event = None
+                            pending = _leftover_steer
+                        elif not pending:
+                            pending = _leftover_steer
+                        if pending == _leftover_steer:
+                            logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
                 # Safety net: if the pending text is a slash command (e.g. "/stop",
                 # "/new"), discard it — commands should never be passed to the agent

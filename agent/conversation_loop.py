@@ -1198,6 +1198,12 @@ def run_conversation(
     # keyed by (provider, pool-entry-id).
     agent._auth_pool_refresh_counts = {}
 
+    # Only Hermes' normal loop can consume the in-process steer buffer.
+    # codex_app_server owns its own turn protocol, so leave intake closed and
+    # make callers queue an immediate continuation instead of acknowledging a
+    # steer that the external runtime will never see.
+    agent._open_steer_intake(supported=agent.api_mode != "codex_app_server")
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -1304,45 +1310,27 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
-        if _pre_api_steer:
-            _injected = False
+        _pre_api_target = None
+        if agent._has_pending_steer():
             for _si in range(len(messages) - 1, -1, -1):
                 _sm = messages[_si]
                 if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-
-                    marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
-                    if isinstance(existing, str):
-                        _sm["content"] = existing + marker
-                    else:
-                        # Multimodal content blocks — append text block
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            _sm["content"] = blocks
-                        except Exception:
-                            pass
-                    _injected = True
-                    logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
-                        _si,
-                    )
+                    _pre_api_target = _sm
                     break
-            if not _injected:
-                # No tool message to inject into — put it back so
-                # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
+        if _pre_api_target is not None:
+            _pre_api_steer = agent._take_pending_steer()
+            if _pre_api_steer:
+                from agent.prompt_builder import format_steer_marker
+
+                marker = format_steer_marker(_pre_api_steer)
+                existing = _pre_api_target.get("content", "")
+                if isinstance(existing, str):
+                    _pre_api_target["content"] = existing + marker
                 else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                    blocks = list(existing) if existing else []
+                    blocks.append({"type": "text", "text": marker.lstrip()})
+                    _pre_api_target["content"] = blocks
+                logger.debug("Pre-API-call steer injected into existing tool result")
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -5453,6 +5441,38 @@ def run_conversation(
                         tc for tc in assistant_message.tool_calls
                         if tc.function.name in agent.valid_tool_names
                     ]
+
+                # A steer may arrive while the provider is deciding which
+                # tools to call.  At this boundary none of the emitted calls
+                # has started, so pair every valid call with a synthetic skip,
+                # attach the guidance once, and immediately let the model
+                # replan.  The assistant/tool tail remains role-valid and no
+                # new side effect begins under stale instructions.
+                if agent._has_pending_steer():
+                    from agent.tool_executor import append_steer_skipped_tool_results
+
+                    append_steer_skipped_tool_results(
+                        agent,
+                        messages,
+                        assistant_message.tool_calls,
+                        stage="provider-boundary steer-skipped tool result",
+                        inject_guidance=bool(assistant_message.tool_calls),
+                    )
+                    if not assistant_message.tool_calls and _invalid_batch_calls:
+                        agent._apply_pending_steer_to_tool_results(
+                            messages,
+                            len(_invalid_batch_calls),
+                        )
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception as exc:
+                        logger.warning(
+                            "Incremental steer-boundary persistence failed "
+                            "(session=%s): %s",
+                            agent.session_id or "none",
+                            exc,
+                        )
+                    continue
 
                 try:
                     # Persist the assistant tool-call turn before any tool

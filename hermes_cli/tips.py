@@ -109,7 +109,7 @@ TIPS = [
     "Set display.streaming: true to see tokens appear in real time as the model generates.",
     "Set display.show_reasoning: true to watch the model's chain-of-thought reasoning.",
     "Set display.compact: true to reduce whitespace in output for denser information.",
-    "Set display.busy_input_mode: queue to queue messages instead of interrupting the agent, or steer to inject them mid-run via /steer.",
+    "Busy input steers safely by default; use /queue for a separate next turn or /stop to cancel the run.",
     "Set display.resume_display: minimal to skip the full conversation recap on session resume.",
     "Set compression.threshold: 0.50 to control when auto-compression fires (default: 50% of context).",
     "Set agent.max_turns: 200 to let the agent take more tool-calling steps per turn.",
@@ -339,7 +339,7 @@ TIPS = [
     "The skills quarantine at ~/.hermes/skills/.hub/quarantine/ holds skills pending security review.",
 
     # --- Advanced Slash Commands ---
-    '/steer <prompt> injects a note after the next tool call — nudge direction mid-task without interrupting.',
+    '/steer <prompt> guides the current run at its next safe boundary without cancelling work already started.',
     '/goal <text> sets a standing Ralph-loop objective — Hermes auto-continues turn after turn until a judge says done.',
     '/snapshot create [label] saves a full state snapshot of Hermes config; /snapshot restore <id> reverts later.',
     '/copy [N] copies the last assistant response to your clipboard, or the Nth-from-last with a number.',
