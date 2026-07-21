@@ -1464,6 +1464,87 @@ class TestCodingWorkerTierMigration:
         assert "coding_worker.worker_tiers (removed; use model_tiers)" in results["config_added"]
 
 
+class TestReservedModelTierMigration:
+    def test_migration_strips_reserved_tiers_and_obsolete_routing_only(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 33,
+                    "model_tiers": {
+                        "basic": {
+                            "model": "gpt-5.6-terra",
+                            "reasoning_effort": "high",
+                        },
+                        "intermediate": {
+                            "model": "gpt-5.6-terra",
+                            "reasoning_effort": "max",
+                        },
+                        "feature": {
+                            "model": "custom/feature",
+                            "reasoning_effort": "high",
+                        },
+                    },
+                    "delegation": {
+                        "model_tier_routing": "off",
+                        "max_concurrent_children": 7,
+                    },
+                    "memory": {"user_char_limit": 1900},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert raw["model_tiers"] == {
+            "feature": {
+                "model": "custom/feature",
+                "reasoning_effort": "high",
+            }
+        }
+        assert raw["delegation"] == {"max_concurrent_children": 7}
+        assert raw["memory"]["user_char_limit"] == 1900
+        assert any("reserved built-in model_tiers" in item for item in results["config_added"])
+
+    def test_save_strips_reserved_tier_copies_from_current_config(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": DEFAULT_CONFIG["_config_version"],
+                    "model_tiers": {
+                        "basic": {
+                            "model": "gpt-5.6-terra",
+                            "reasoning_effort": "high",
+                        },
+                        "feature": {
+                            "model": "custom/feature",
+                            "reasoning_effort": "medium",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            loaded = load_config()
+            assert loaded["model_tiers"] == {
+                "feature": {
+                    "model": "custom/feature",
+                    "reasoning_effort": "medium",
+                }
+            }
+            save_config(loaded)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["model_tiers"] == loaded["model_tiers"]
+
+
 class TestDiscordChannelPromptsConfig:
     def test_default_config_includes_discord_channel_prompts(self):
         assert DEFAULT_CONFIG["discord"]["channel_prompts"] == {}

@@ -6206,6 +6206,7 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            model_tier=function_args.get("model_tier"),
             read_only=read_only,
             background=bool(function_args.get("background", False)),
             allow_nested_coding=bool(function_args.get("allow_nested_coding", False)),

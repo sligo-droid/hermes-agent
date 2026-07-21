@@ -71,6 +71,8 @@ class TestDelegateRequirements(unittest.TestCase):
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
+        self.assertIn("model_tier", props)
+        self.assertIn("model_tier", props["tasks"]["items"]["properties"])
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
         self.assertIn("toolsets", props["tasks"]["items"]["properties"])
@@ -1295,7 +1297,7 @@ class TestSubagentCostRollup(unittest.TestCase):
                     "backend": "delegate",
                     "model": "gpt-5.6-terra",
                     "reasoning": "xhigh",
-                    "model_tier": "intermediate",
+                    "model_tier": None,
                     "failed": False,
                 }
             ],
@@ -1454,38 +1456,41 @@ class TestDelegationCredentialInheritance(unittest.TestCase):
 class TestDelegationModelTierRouting(unittest.TestCase):
     def _tier_config(self, **delegation):
         return {
-            "model_tier_routing": "auto",
             "model_tiers": {
-                "basic": {"model": "route/basic", "reasoning_effort": "low"},
-                "intermediate": {"model": "route/intermediate", "reasoning_effort": "high"},
-                "advanced": {"model": "route/advanced", "reasoning_effort": "max"},
+                "feature": {
+                    "model": "route/feature",
+                    "opencode_model": "route/feature-worker",
+                    "reasoning_effort": "high",
+                },
             },
             **delegation,
         }
 
-    def test_classifier_routes_review_only_advanced_tier(self):
+    def test_explicit_trivial_resolves_to_builtin_luna_medium(self):
         cfg = self._tier_config()
 
-        assert _resolve_delegation_model_tier(cfg, "Fix a typo", None, "leaf").name == "basic"
-        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "leaf").name == "intermediate"
-        assert _resolve_delegation_model_tier(cfg, "Audit auth migration", None, "leaf").name == "advanced"
-        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").name == "advanced"
-        # Named-tier max is automatic xhigh, then ambiguous implementation-capable
-        # work is capped to high.
-        assert _resolve_delegation_model_tier(cfg, "Summarize this module", None, "orchestrator").reasoning_effort == "high"
-        assert _resolve_delegation_model_tier(cfg, "Review the architecture", None, "orchestrator").name == "advanced"
+        tier = _resolve_delegation_model_tier(cfg, "trivial")
+        assert tier.name == "trivial"
+        assert tier.model == "gpt-5.6-luna"
+        assert tier.reasoning_effort == "medium"
+        assert _resolve_delegation_model_tier(cfg, None) is None
+        assert _resolve_delegation_model_tier(cfg, "feature").model == "route/feature"
 
-    def test_explicit_runtime_fields_bypass_tier_atomically(self):
-        for key, value in (
-            ("provider", "openrouter"),
-            ("base_url", "https://example.test/v1"),
-            ("model", "explicit/model"),
-            ("reasoning_effort", "max"),
-        ):
-            with self.subTest(key=key):
-                assert _resolve_delegation_model_tier(
-                    self._tier_config(**{key: value}), "Fix a typo", None, "leaf"
-                ) is None
+    def test_unknown_explicit_tier_fails_before_child_launch(self):
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    goal="bounded task",
+                    model_tier="missing",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("unknown model_tier 'missing'", result["error"])
+        MockAgent.assert_not_called()
 
     def test_exhausted_parent_worker_budget_fails_before_launch(self):
         parent = _make_mock_parent()
@@ -1495,22 +1500,34 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         self.assertIn("nested-worker deadline was exhausted", result["error"])
 
-    def test_disabled_routing_preserves_parent_model_and_reasoning(self):
+    def test_omitted_tier_inherits_parent_for_readme_text_with_async(self):
         parent = _make_mock_parent()
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
 
-        with patch("tools.delegate_tool._load_config", return_value=self._tier_config(model_tier_routing="off")), \
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
              patch("run_agent.AIAgent") as MockAgent:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
             MockAgent.return_value = MagicMock()
-            _build_child_agent(0, "Fix a typo", None, None, None, 10, 1, parent)
+            delegate_task(
+                goal="Review README text containing an incidental async example",
+                read_only=True,
+                parent_agent=parent,
+            )
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], parent.model)
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
         self.assertEqual(kwargs["provider"], parent.provider)
 
     @patch("tools.delegate_tool._run_single_child")
-    def test_each_task_reaches_aiagent_with_atomic_tier(self, mock_run):
+    def test_explicit_tier_reaches_aiagent_without_keyword_rewrite(self, mock_run):
         mock_run.return_value = {
             "task_index": 0,
             "status": "completed",
@@ -1524,25 +1541,61 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
              patch("run_agent.AIAgent") as MockAgent:
             MockAgent.return_value = MagicMock()
-            delegate_task(goal="Investigate the auth race", parent_agent=parent)
+            delegate_task(
+                goal="Review the implementation and report findings",
+                model_tier="advanced",
+                parent_agent=parent,
+            )
 
         kwargs = MockAgent.call_args.kwargs
-        self.assertEqual(kwargs["model"], "route/advanced")
-        # Explicit review work keeps the named-tier automatic xhigh ceiling.
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
         self.assertEqual(kwargs["provider"], parent.provider)
         self.assertEqual(kwargs["base_url"], parent.base_url)
         self.assertEqual(
             MockAgent.return_value._runtime_audit_context,
             {
                 "model_tier": "advanced",
-                "model_tier_source": "classifier",
+                "model_tier_source": "explicit",
                 "runtime_route": "delegation",
                 "runtime_role": "leaf",
-                "runtime_pass": "complex",
+                "runtime_pass": "selected",
                 "reasoning_source": "model_tier",
             },
         )
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_top_level_and_per_task_tier_propagation(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            delegate_task(
+                tasks=[
+                    {"goal": "bounded task"},
+                    {"goal": "hard task", "model_tier": "advanced"},
+                ],
+                model_tier="trivial",
+                parent_agent=parent,
+            )
+
+        calls = MockAgent.call_args_list
+        self.assertEqual([call.kwargs["model"] for call in calls], [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+        ])
+        self.assertEqual([call.kwargs["reasoning_config"]["effort"] for call in calls], [
+            "medium",
+            "high",
+        ])
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     @patch("tools.delegate_tool._run_single_child")
@@ -1575,10 +1628,48 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         self.assertEqual(kwargs["api_mode"], "anthropic_messages")
         self.assertNotEqual(kwargs["model"], "route/advanced")
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_explicit_tier_is_validated_against_configured_provider(
+        self, mock_run, mock_resolve
+    ):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+        mock_resolve.return_value = {
+            "provider": "openrouter",
+            "model": "gpt-5.6-luna",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "provider-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent()
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value=self._tier_config(provider="openrouter"),
+        ), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            delegate_task(
+                goal="tiny bounded check",
+                model_tier="trivial",
+                parent_agent=parent,
+            )
+
+        mock_resolve.assert_called_once_with(
+            requested="openrouter",
+            target_model="gpt-5.6-luna",
+        )
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "gpt-5.6-luna")
+
     def test_default_does_not_leak_to_unrelated_routes(self):
         from hermes_cli.config import DEFAULT_CONFIG
 
-        self.assertEqual(DEFAULT_CONFIG["delegation"]["model_tier_routing"], "auto")
+        self.assertNotIn("model_tier_routing", DEFAULT_CONFIG["delegation"])
         self.assertNotIn("model_tier_routing", DEFAULT_CONFIG["cron"])
         self.assertNotIn("model_tier_routing", DEFAULT_CONFIG["kanban"])
         self.assertNotIn("model_tier_routing", DEFAULT_CONFIG.get("ui_work", {}))
@@ -2797,7 +2888,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
             task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
-        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
@@ -2873,6 +2964,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "model_tier": "trivial",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -2888,6 +2980,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["acp_command"], "claude")
         self.assertEqual(captured["acp_args"], ["--acp", "--stdio"])
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["model_tier"], "trivial")
         self.assertEqual(captured["tasks"][0]["acp_command"], "codex")
         self.assertEqual(captured["tasks"][0]["acp_args"], ["--acp"])
 

@@ -959,6 +959,20 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
         "origin_ui_session_id": "",
         "parent_session_id": None,
         "dispatched_at": 1.0,
+        "model": None,
+        "is_batch": True,
+        "task_specs": [
+            {
+                "goal": "small",
+                "model_tier": "trivial",
+                "model": "gpt-5.6-luna",
+            },
+            {
+                "goal": "hard",
+                "model_tier": "advanced",
+                "model": "gpt-5.6-sol",
+            },
+        ],
     }
     ad._persist_dispatch(record)
     with ad._DB_LOCK, ad._connect() as conn:
@@ -973,7 +987,13 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
     assert durable["delivery_state"] == "pending"
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
-    assert restored.get_nowait()["status"] == "unknown"
+    recovered_event = restored.get_nowait()
+    assert recovered_event["status"] == "unknown"
+    assert recovered_event["model"] is None
+    assert [spec["model_tier"] for spec in recovered_event["task_specs"]] == [
+        "trivial",
+        "advanced",
+    ]
 
 
 def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch):
@@ -1202,6 +1222,109 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert "done: a" in text and "done: b" in text and "done: c" in text
     # No more events — it's a single combined completion, not N of them.
     assert _drain_one() is None
+
+
+def _capture_tiered_background_batch(monkeypatch, *, tasks, model_tier):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent.model = "parent/model"
+    parent.reasoning_config = {"enabled": True, "effort": "medium"}
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    captured = {}
+    cfg = {
+        "max_iterations": 50,
+        "max_concurrent_children": 3,
+        "max_spawn_depth": 1,
+        "orchestrator_enabled": True,
+        "model_tiers": {},
+    }
+
+    def fake_build_child(**kwargs):
+        child = MagicMock()
+        child.model = kwargs.get("model") or parent.model
+        child._delegate_role = kwargs.get("role") or "leaf"
+        child._subagent_id = f"child-{len(parent._active_children)}"
+        child.tool_progress_callback = None
+        return child
+
+    def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return {"status": "dispatched", "delegation_id": "deleg_tier_metadata"}
+
+    monkeypatch.setattr(dt, "_load_config", lambda: cfg)
+    monkeypatch.setattr(dt, "_background_context_error", lambda _parent: "")
+    monkeypatch.setattr(dt, "_build_child_agent", fake_build_child)
+    monkeypatch.setattr(
+        "tools.delegation_live_log.create_live_transcripts",
+        lambda task_list, context: (None, [None] * len(task_list), []),
+    )
+    monkeypatch.setattr(ad, "dispatch_async_delegation_batch", fake_dispatch)
+
+    out = dt.delegate_task(
+        tasks=tasks,
+        model_tier=model_tier,
+        read_only=True,
+        background=True,
+        parent_agent=parent,
+    )
+
+    assert json.loads(out)["status"] == "dispatched"
+    return captured
+
+
+def test_background_homogeneous_explicit_tier_records_shared_model(monkeypatch):
+    captured = _capture_tiered_background_batch(
+        monkeypatch,
+        tasks=[{"goal": "a"}, {"goal": "b"}],
+        model_tier="trivial",
+    )
+
+    assert captured["model"] == "gpt-5.6-luna"
+    assert captured["task_specs"] == [
+        {
+            "goal": "a",
+            "context": "",
+            "role": "leaf",
+            "read_only": True,
+            "model_tier": "trivial",
+            "model": "gpt-5.6-luna",
+        },
+        {
+            "goal": "b",
+            "context": "",
+            "role": "leaf",
+            "read_only": True,
+            "model_tier": "trivial",
+            "model": "gpt-5.6-luna",
+        },
+    ]
+
+
+def test_background_mixed_tiers_omit_aggregate_model_and_preserve_each_task(monkeypatch):
+    captured = _capture_tiered_background_batch(
+        monkeypatch,
+        tasks=[
+            {"goal": "small"},
+            {"goal": "hard", "model_tier": "advanced"},
+        ],
+        model_tier="trivial",
+    )
+
+    assert captured["model"] is None
+    assert [spec["model_tier"] for spec in captured["task_specs"]] == [
+        "trivial",
+        "advanced",
+    ]
+    assert [spec["model"] for spec in captured["task_specs"]] == [
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+    ]
 
 
 def test_model_dispatch_background_is_explicit_and_optional():

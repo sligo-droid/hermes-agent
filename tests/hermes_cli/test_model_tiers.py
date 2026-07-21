@@ -15,6 +15,7 @@ from hermes_cli.model_tiers import (
 
 def test_default_routes_reference_resolvable_tiers():
     tiers = DEFAULT_CONFIG["model_tiers"]
+    assert tiers == {}
     route_names = {
         "gateway": DEFAULT_CONFIG["gateway"]["model_tier"],
         "cron": DEFAULT_CONFIG["cron"]["model_tier"],
@@ -92,12 +93,13 @@ def test_builtin_tier_ladder_steps_in_order_and_rejects_custom_or_edge_tiers():
     assert resolve_model_tier_offset({}, "basic", 0) is None
 
 
-def test_partial_custom_tier_override_keeps_required_default_fields():
+def test_reserved_builtin_tier_override_is_ignored():
     tier = resolve_model_tier(
         {
             "model_tiers": {
                 "basic": {
-                    "model": "custom/luna",
+                    "model": "gpt-5.6-terra",
+                    "opencode_model": "hermes-codex/gpt-5.6-terra",
                     "reasoning_effort": "high",
                 }
             }
@@ -106,8 +108,28 @@ def test_partial_custom_tier_override_keeps_required_default_fields():
     )
 
     assert tier is not None
-    assert tier.model == "custom/luna"
-    assert tier.opencode_model == "custom/luna"
+    assert tier.model == "gpt-5.6-luna"
+    assert tier.opencode_model == "hermes-codex/gpt-5.6-luna"
+    assert tier.reasoning_effort == "xhigh"
+
+
+def test_custom_non_reserved_tier_resolves_atomically():
+    tier = resolve_model_tier(
+        {
+            "model_tiers": {
+                "feature": {
+                    "model": "custom/feature",
+                    "opencode_model": "custom/feature-worker",
+                    "reasoning_effort": "high",
+                }
+            }
+        },
+        "feature",
+    )
+
+    assert tier is not None
+    assert tier.model == "custom/feature"
+    assert tier.opencode_model == "custom/feature-worker"
     assert tier.reasoning_effort == "high"
 
 
@@ -134,22 +156,21 @@ def test_review_spills_high_to_xhigh_and_implementation_caps_at_high():
     assert restrict_reasoning_effort_for_task("xhigh", "Diagnose the incident") == "xhigh"
 
 
-def test_implementation_cap_preserves_custom_advanced_model():
+def test_implementation_cap_preserves_custom_tier_model():
     config = {
         "model_tiers": {
-            "advanced": {"model": "custom/advanced", "reasoning_effort": "xhigh"},
-            "intermediate": {"model": "custom/intermediate", "reasoning_effort": "xhigh"},
+            "feature": {"model": "custom/feature", "reasoning_effort": "xhigh"},
         }
     }
 
     restricted = restrict_model_tier_for_task(
         config,
-        resolve_model_tier(config, "advanced"),
+        resolve_model_tier(config, "feature"),
         "Build the feature",
     )
 
-    assert restricted.name == "advanced"
-    assert restricted.model == "custom/advanced"
+    assert restricted.name == "feature"
+    assert restricted.model == "custom/feature"
     assert restricted.reasoning_effort == "high"
 
 

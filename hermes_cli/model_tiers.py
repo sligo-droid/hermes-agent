@@ -51,6 +51,11 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     },
 }
 
+# Built-in names are reserved runtime policy, not user configuration. Persisted
+# ``model_tiers`` entries may add genuinely custom names, but they must never
+# shadow these code-owned definitions.
+RESERVED_MODEL_TIER_NAMES: frozenset[str] = frozenset(DEFAULT_MODEL_TIERS)
+
 # Ordered built-in execution tiers. Custom tier names remain valid for normal
 # routing, but cannot be stepped because their relative ordering is unknown.
 MODEL_TIER_LADDER: tuple[str, ...] = (
@@ -272,10 +277,12 @@ def restrict_model_tier_for_task(
 
 
 def _merged_model_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Merge partial user tier overrides onto the built-in catalog.
+    """Combine code-owned built-ins with user-defined custom tiers.
 
     Gateway and cron deliberately use raw config reads, so this merge must not
     rely on ``load_config()`` having already deep-merged ``DEFAULT_CONFIG``.
+    Reserved built-in names are ignored even when raw YAML still contains an
+    obsolete persisted copy from an older Hermes release.
     """
     tiers: dict[str, Any] = copy.deepcopy(DEFAULT_MODEL_TIERS)
     configured = config.get("model_tiers") if isinstance(config, Mapping) else None
@@ -284,23 +291,47 @@ def _merged_model_tiers(config: Mapping[str, Any] | None) -> dict[str, Any]:
 
     for raw_name, raw_tier in configured.items():
         name = _normalized_name(raw_name)
-        if not name:
+        if not name or name in RESERVED_MODEL_TIER_NAMES:
             continue
         if not isinstance(raw_tier, Mapping):
             tiers[name] = raw_tier
             continue
-        inherited = tiers.get(name)
-        if isinstance(inherited, Mapping):
-            merged = dict(inherited)
-            merged.update(raw_tier)
-            # A tier is an atomic model/effort choice. If a user changes only
-            # its runtime model, do not silently keep the old worker model.
-            if "model" in raw_tier and "opencode_model" not in raw_tier:
-                merged["opencode_model"] = raw_tier["model"]
-            tiers[name] = merged
-        else:
-            tiers[name] = dict(raw_tier)
+        tiers[name] = dict(raw_tier)
     return tiers
+
+
+def strip_reserved_model_tier_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return config without obsolete built-in tier copies or hidden routing.
+
+    Custom tier names and every unrelated setting are preserved. The helper is
+    shared by load/save normalization and the versioned migration so stale raw
+    YAML cannot affect runtime behavior or be written back on a later save.
+    """
+    if not isinstance(config, Mapping):
+        return {}
+
+    result = dict(config)
+    changed = False
+
+    configured = result.get("model_tiers")
+    if isinstance(configured, Mapping):
+        custom_tiers = {
+            raw_name: copy.deepcopy(raw_tier)
+            for raw_name, raw_tier in configured.items()
+            if _normalized_name(raw_name) not in RESERVED_MODEL_TIER_NAMES
+        }
+        if len(custom_tiers) != len(configured):
+            result["model_tiers"] = custom_tiers
+            changed = True
+
+    delegation = result.get("delegation")
+    if isinstance(delegation, Mapping) and "model_tier_routing" in delegation:
+        clean_delegation = dict(delegation)
+        clean_delegation.pop("model_tier_routing", None)
+        result["delegation"] = clean_delegation
+        changed = True
+
+    return result if changed else dict(config)
 
 
 def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier | None:

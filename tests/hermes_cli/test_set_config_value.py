@@ -124,6 +124,31 @@ class TestConfigYamlRouting:
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
 
+    def test_reserved_builtin_model_tier_cannot_be_persisted(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("model_tiers.basic.model", "gpt-5.6-terra")
+
+        assert "code-owned built-in model tier" in capsys.readouterr().err
+        assert _read_config(_isolated_hermes_home) == ""
+
+    def test_obsolete_delegation_tier_routing_cannot_be_persisted(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("delegation.model_tier_routing", "off")
+
+        assert "setting is obsolete" in capsys.readouterr().err
+        assert _read_config(_isolated_hermes_home) == ""
+
+    def test_custom_model_tier_can_be_persisted_without_unknown_warning(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("model_tiers.local_fast.model", "local/qwen-coder")
+
+        captured = capsys.readouterr()
+        assert "not a recognized config key" not in captured.out
+        assert "local/qwen-coder" in _read_config(_isolated_hermes_home)
+
 
 # ---------------------------------------------------------------------------
 # Empty / falsy values — regression tests for #4277

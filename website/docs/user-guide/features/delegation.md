@@ -15,7 +15,8 @@ Delegation is synchronous by default. A model may explicitly request `background
 ```python
 delegate_task(
     goal="Debug why tests fail",
-    context="Error: assertion in test_foo.py line 42"
+    context="Error: assertion in test_foo.py line 42",
+    model_tier="intermediate"
 )
 ```
 
@@ -27,9 +28,16 @@ Up to 3 concurrent subagents by default (configurable, no hard ceiling):
 delegate_task(tasks=[
     {"goal": "Research topic A", "context": "Focus on recent primary sources"},
     {"goal": "Research topic B", "context": "Compare the leading explanations"},
-    {"goal": "Fix the build", "context": "Project root: /home/user/project"}
-])
+    {"goal": "Fix the build", "context": "Project root: /home/user/project", "model_tier": "advanced"}
+], model_tier="intermediate")
 ```
+
+Choose tiers from actual task difficulty: `trivial` for obvious tiny work,
+`basic` for straightforward bounded work, `intermediate` for ordinary
+multi-step work, and `advanced` only for the hardest cross-cutting or high-risk
+work. Goal/context keywords do not select a tier. A per-task batch value
+overrides the top-level batch default; omission inherits the parent runtime
+model and reasoning.
 
 ## How Subagent Context Works
 
