@@ -143,7 +143,7 @@ These focused results establish the owner handoffs, not release sign-off.
 
 The staged candidate is clean of unresolved, unstaged and untracked paths. Ruff, Python compilation, whitespace checks and the deterministic local autoreview helper passed.
 
-- Fork smoke gate: 1,175 passed under the standard four-worker wrapper.
+- Fork smoke gate: 1,176 passed under the standard four-worker wrapper after the clean-CI fixture correction.
 - Instrumented inherited aggregate: 45,598 passed, 918 failed and 120 skipped in 51 minutes, with no inode, logging-handler or fixture cascade. The failures were captured in a JUnit report and an immutable `lastfailed` snapshot.
 - Fresh-process classification: all 155 unique aggregate-failing files pass when each file runs in its own wrapper process with one worker, pytest caching disabled and a unique disk-backed temp root:
   - Core: 21/21 files.
@@ -171,6 +171,11 @@ The xhigh failure-gate audit classified all 918 aggregate failures as follows:
 File counts overlap because two dashboard test files contained both independently reproducible and aggregate-only nodes. The immutable failing-node snapshot used for classification has SHA-256 `7cdafce9d1e2441648aeb2dbf4edfba591b35128c8ebc4438ea1aa502c2c1362`.
 
 The 885 failures that disappear in fresh processes show repeated module/class identity, registry, `HERMES_HOME`, CWD and callback state leakage between files. The strongest identified cause is test fixtures that delete and reimport broad core package graphs without restoring the original module objects; already-collected tests then retain stale classes, registries and `ContextVar` instances. Production does not perform that package-wide eviction pattern. The accepted release gate is therefore the fork-owned smoke suite plus fresh-process verification of every inherited aggregate-failing file, followed by required PR CI. Any independently reproducible failure remains blocking.
+
+The first clean required-CI run exposed two environment/build-order contracts hidden by the development host, both now corrected without runtime behavior changes:
+
+- Kanban backend-child tests now explicitly select `terminal.home_mode=profile` when asserting strict profile-local `HOME`, and separately cover the upstream 0.19 host-auto behavior that retains the real user home. The implementation was already correct and unchanged.
+- The frontend lane now builds the generated private `@hermes/ink` package before TUI typechecks and tests. From a clean `npm ci` with no ignored `dist/`, the exact sequence passes all 1,234 TUI tests and the production TUI build.
 
 ## Residual risks and required verification
 
