@@ -1812,7 +1812,6 @@ def _delegate_coding_task_impl(
         loaded_config = {}
 
     selected_model_tier = None
-    tier_reasoning_override = None
     if model_tier is not None:
         selected_model_tier = resolve_model_tier(loaded_config, model_tier)
         if selected_model_tier is None:
@@ -1821,22 +1820,6 @@ def _delegate_coding_task_impl(
                 f"Unknown model_tier {model_tier!r}. Configure it under model_tiers "
                 f"or use a built-in tier: {built_in_tiers}."
             )
-        from hermes_cli.model_tiers import restrict_model_tier_for_task
-
-        unrestricted_model_tier = selected_model_tier
-        selected_model_tier = restrict_model_tier_for_task(
-            loaded_config,
-            selected_model_tier,
-            task_text,
-            context_text,
-            worker=True,
-        )
-        if (
-            selected_model_tier is not None
-            and selected_model_tier.reasoning_effort
-            != unrestricted_model_tier.reasoning_effort
-        ):
-            tier_reasoning_override = selected_model_tier.reasoning_effort
     selected_reasoning_effort = None
     if reasoning_effort is not None:
         selected_reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -1855,7 +1838,7 @@ def _delegate_coding_task_impl(
         )
     model_tier_config = _model_tier_config(
         selected_model_tier,
-        selected_reasoning_effort or tier_reasoning_override,
+        selected_reasoning_effort,
     )
 
     allow_git_pr_lifecycle = _trusted_git_pr_lifecycle_enabled(
@@ -3468,7 +3451,8 @@ CODING_WORKER_SCHEMA = {
             "model_tier": {
                 "type": "string",
                 "description": (
-                    "Optional canonical model tier for this worker call. "
+                    "Optional canonical model tier chosen from the actual difficulty of this "
+                    "worker call, not incidental keywords in its text. "
                     "trivial = obvious tiny mechanical changes; basic = straightforward "
                     "bounded work; intermediate = ordinary multi-step implementation; "
                     "advanced = the hardest cross-cutting or high-risk work. Custom names "

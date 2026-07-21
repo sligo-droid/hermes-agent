@@ -3478,7 +3478,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 33,
+    "_config_version": 34,
 }
 
 # Keep fork-owned lifecycle, worker-routing, Discord, and Command Center
@@ -6503,6 +6503,28 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "delegations too."
                 )
 
+    # ── Version 33 → 34: reserve built-in model tiers and remove hidden routing ──
+    # Built-in tiers are now code-owned policy. Older configs commonly contain
+    # materialized copies (including stale Terra mappings) that must not shadow
+    # the canonical definitions. Preserve custom tier names and all unrelated
+    # config while also removing delegation.model_tier_routing, whose keyword
+    # classifier is no longer part of ordinary delegation.
+    if current_ver < 34:
+        config = read_raw_config()
+        from hermes_cli.model_tiers import strip_reserved_model_tier_config
+
+        cleaned = strip_reserved_model_tier_config(config)
+        if cleaned != config:
+            _persist_migration(cleaned)
+            results["config_added"].append(
+                "reserved built-in model_tiers and delegation.model_tier_routing (removed)"
+            )
+            if not quiet:
+                print(
+                    "  ✓ Removed persisted built-in model tiers and obsolete "
+                    "delegation.model_tier_routing; custom tiers were preserved."
+                )
+
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
     # Users can hand-edit mcp_servers, and older installs may already contain a
     # malicious entry. Preserve the stanza for auditability but mark it
@@ -7673,7 +7695,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
-                config = _deep_merge(config, user_config)
+                from hermes_cli.model_tiers import strip_reserved_model_tier_config
+
+                config = _deep_merge(
+                    config,
+                    strip_reserved_model_tier_config(user_config),
+                )
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
@@ -7726,6 +7753,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+        from hermes_cli.model_tiers import strip_reserved_model_tier_config
+
+        expanded = strip_reserved_model_tier_config(expanded)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -7889,10 +7919,16 @@ def save_config(
             config = _merge_partial_save(_raw_for_paths, config)
         # ----------------------------------------------------------------
 
-        current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        from hermes_cli.model_tiers import strip_reserved_model_tier_config
+
+        current_normalized = strip_reserved_model_tier_config(
+            _normalize_root_model_keys(_normalize_max_turns_config(config))
+        )
         normalized = current_normalized
         raw_existing = (
-            _normalize_root_model_keys(_normalize_max_turns_config(_raw_for_paths))
+            strip_reserved_model_tier_config(
+                _normalize_root_model_keys(_normalize_max_turns_config(_raw_for_paths))
+            )
             if _raw_for_paths
             else {}
         )
@@ -8870,6 +8906,7 @@ def _default_value_for_key(dotted_key: str):
 # or ``providers.openrouter.api_key`` without us needing to know server names.
 _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "providers",
+    "model_tiers",
     "credential_pool_strategies",
     "mcp_servers",
     "hooks",
@@ -9049,6 +9086,26 @@ def set_config_value(key: str, value: str, force: bool = False):
     """
     if is_managed():
         managed_error("set configuration values")
+        return
+    normalized_key = str(key or "").strip().lower()
+    key_segments = normalized_key.split(".")
+    if len(key_segments) >= 2 and key_segments[0] == "model_tiers":
+        from hermes_cli.model_tiers import RESERVED_MODEL_TIER_NAMES
+
+        if key_segments[1] in RESERVED_MODEL_TIER_NAMES:
+            print(
+                f"Cannot set '{key}': {key_segments[1]!r} is a code-owned built-in "
+                "model tier. Add a custom non-reserved name under model_tiers instead.",
+                file=sys.stderr,
+            )
+            return
+    if normalized_key == "delegation.model_tier_routing":
+        print(
+            "Cannot set 'delegation.model_tier_routing': the setting is obsolete. "
+            "Choose model_tier explicitly on delegate_task, or omit it to inherit "
+            "the parent runtime.",
+            file=sys.stderr,
+        )
         return
     # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
     # the user — the next load would override it anyway. Hard-reject and name the

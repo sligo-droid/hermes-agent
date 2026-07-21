@@ -11,11 +11,10 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS
-
-
 FORK_DEFAULT_ADDITIONS = {
-    "model_tiers": copy.deepcopy(DEFAULT_MODEL_TIERS),
+    # Built-ins live exclusively in hermes_cli.model_tiers. This config section
+    # is reserved for genuinely custom tier names.
+    "model_tiers": {},
     "projects": {},
     "agent": {
         "codex_app_server_turn_timeout": 1800,
@@ -108,7 +107,7 @@ FORK_DEFAULT_ADDITIONS = {
         "classic_resize_full_clear": True,
     },
     "dashboard": {"host": "127.0.0.1", "port": 9119},
-    "delegation": {"model_tier_routing": "auto", "nested_coding": {"enabled": False}},
+    "delegation": {"nested_coding": {"enabled": False}},
     "coding_worker": {
         "enabled": True,
         "backend": "codex",

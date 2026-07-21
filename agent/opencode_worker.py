@@ -343,6 +343,19 @@ def load_coding_worker_pass_profiles(
         restrict_reasoning_effort_for_task,
     )
 
+    per_call_tier_keys = {
+        "model_tier",
+        "simple_build_reasoning_level",
+        "complex_plan_reasoning_level",
+        "complex_build_reasoning_level",
+    }
+    explicit_call_tier = bool(
+        worker_config is not None
+        and "model_tier" in worker_config
+        and str(worker_config.get("model_tier") or "").strip()
+        and set(worker_config).issubset(per_call_tier_keys)
+    )
+
     profiles: dict[str, dict[str, str]] = {}
     legacy_efforts = {
         "simple_build": "medium",
@@ -368,10 +381,14 @@ def load_coding_worker_pass_profiles(
             else tier.reasoning_effort if tier is not None else configured_reasoning or legacy_efforts[pass_name]
         )
         reasoning = _normalize_reasoning_level(reasoning)
-        safe_reasoning = restrict_reasoning_effort_for_task(
-            reasoning,
-            task,
-            context,
+        safe_reasoning = (
+            reasoning
+            if explicit_call_tier
+            else restrict_reasoning_effort_for_task(
+                reasoning,
+                task,
+                context,
+            )
         )
         if safe_reasoning != str(reasoning or "").strip().lower():
             tier = restrict_model_tier_for_task(

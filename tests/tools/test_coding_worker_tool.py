@@ -2960,7 +2960,7 @@ def test_model_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_path
     assert resolved["complex_build_reasoning_level"] == "high"
 
 
-def test_review_task_keeps_advanced_model_tier_reasoning(monkeypatch, tmp_path):
+def test_explicit_coding_worker_tier_is_not_keyword_rewritten(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -2997,7 +2997,15 @@ def test_review_task_keeps_advanced_model_tier_reasoning(monkeypatch, tmp_path):
     )
 
     assert result["success"] is True
-    assert seen["worker_config"]["complex_plan_reasoning_level"] == "xhigh"
+    assert seen["worker_config"] == {"model_tier": "advanced"}
+    resolved = ow.load_opencode_config(
+        cfg,
+        worker_config=seen["worker_config"],
+        task="Audit the parser and report findings without changes",
+    )
+    assert resolved["simple_build_reasoning_level"] == "high"
+    assert resolved["complex_plan_reasoning_level"] == "high"
+    assert resolved["complex_build_reasoning_level"] == "high"
 
 
 def test_exhausted_parent_deadline_blocks_coding_worker_launch(tmp_path):

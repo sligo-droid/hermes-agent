@@ -604,49 +604,22 @@ def _inherit_parent_base_url(parent_agent: Any, fallback: Optional[str]) -> Opti
 
 
 def _resolve_delegation_model_tier(
-    cfg: Dict[str, Any], goal: str, context: Optional[str], role: str
+    cfg: Dict[str, Any], requested_tier: Any
 ):
-    """Resolve the atomic model/reasoning tier for one delegated task.
+    """Resolve an explicitly selected tier for one delegated task.
 
-    Raw delegation runtime settings are an explicit route and therefore bypass
-    the tier as a unit. This avoids combining a tier model with explicit
-    reasoning or an explicitly selected provider that may not serve that model.
+    Ordinary delegation never infers a tier from goal/context text. A blank
+    value means inherit the parent runtime (subject to explicit operator-owned
+    ``delegation`` provider/model settings); a non-blank unknown name is
+    rejected by ``delegate_task`` before any child starts.
     """
-    # Real config loads always carry the root model_tiers mapping. Keep partial
-    # programmatic/legacy delegation dictionaries on their historical parent-
-    # inheritance path instead of silently injecting a built-in tier model.
-    if "model_tiers" not in cfg:
+    tier_name = str(requested_tier or "").strip()
+    if not tier_name:
         return None
-    routing = str(cfg.get("model_tier_routing") or "auto").strip().lower()
-    if routing in {"", "none", "off", "disabled", "false"}:
-        return None
-    if any(
-        str(cfg.get(key) or "").strip()
-        for key in ("provider", "base_url", "model", "reasoning_effort")
-    ):
-        return None
+    from hermes_cli.model_tiers import resolve_model_tier
 
-    from hermes_cli.model_tiers import (
-        classify_task_complexity,
-        resolve_model_tier,
-        restrict_model_tier_for_task,
-    )
-
-    if role == "orchestrator":
-        tier_name = "advanced"
-    else:
-        tier_name = {
-            "simple": "basic",
-            "ordinary": "intermediate",
-            "complex": "advanced",
-        }[classify_task_complexity(goal, context)]
     tier_config = {"model_tiers": cfg.get("model_tiers") or {}}
-    return restrict_model_tier_for_task(
-        tier_config,
-        resolve_model_tier(tier_config, tier_name),
-        goal,
-        context,
-    )
+    return resolve_model_tier(tier_config, tier_name)
 
 
 def _get_max_concurrent_children() -> int:
@@ -1627,43 +1600,27 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: explicit delegation override > routed tier > parent.
+    # Resolve reasoning config: explicit per-call tier > operator delegation
+    # override > parent. Goal/context keywords never rewrite the selected or
+    # inherited reasoning level.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = override_reasoning_config or parent_reasoning
-    try:
-        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
-        if delegation_effort:
-            from hermes_constants import parse_reasoning_effort
+    if override_reasoning_config is None:
+        try:
+            delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
+            if delegation_effort:
+                from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
-    try:
-        from hermes_cli.model_tiers import restrict_reasoning_effort_for_task
-
-        current_effort = (
-            str(child_reasoning.get("effort") or "")
-            if isinstance(child_reasoning, dict)
-            else ""
-        )
-        safe_effort = restrict_reasoning_effort_for_task(
-            current_effort,
-            goal,
-            context,
-        )
-        if current_effort and safe_effort != current_effort:
-            from hermes_constants import parse_reasoning_effort
-
-            child_reasoning = parse_reasoning_effort(safe_effort)
-    except Exception as exc:
-        logger.debug("Could not enforce delegated review-only reasoning: %s", exc)
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -3107,6 +3064,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    model_tier: Optional[str] = None,
     read_only: bool = False,
     background: bool = False,
     allow_nested_coding: bool = False,
@@ -3116,13 +3074,16 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, and model_tier)
+      - Batch:  provide tasks array [{goal, context, role, model_tier}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+    Per-task model_tier likewise beats the top-level value. When omitted, the
+    child inherits the parent runtime model and reasoning unless an explicit
+    operator-owned delegation runtime override is configured.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3224,6 +3185,7 @@ def delegate_task(
                 "context": context,
                 "toolsets": toolsets,
                 "role": top_role,
+                "model_tier": model_tier,
                 "read_only": top_read_only,
                 "allow_nested_coding": requested_nested_coding,
             }
@@ -3251,6 +3213,9 @@ def delegate_task(
             task.get("allow_nested_coding", requested_nested_coding), default=False
         )
         task["role"] = _normalize_role(task.get("role") or top_role)
+        task["model_tier"] = (
+            task.get("model_tier") if "model_tier" in task else model_tier
+        )
         grant_error = _nested_coding_grant_error(
             requested=bool(task["allow_nested_coding"]),
             background=background_requested,
@@ -3269,12 +3234,35 @@ def delegate_task(
             "delegate_coding_task(background=true) for repository changes."
         )
 
-    # Resolve delegation credentials only after the whole batch passes policy
-    # validation, so invalid broker grants fail before any child/runtime setup.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    # Resolve every task's explicit tier and provider credentials before any
+    # child/runtime setup so a bad batch fails atomically. Tier selection is
+    # per-task because a batch may deliberately mix difficulty levels.
+    task_runtimes: List[tuple[Any, Dict[str, Any]]] = []
+    credential_cache: Dict[Optional[str], Dict[str, Any]] = {}
+    for i, task in enumerate(task_list):
+        requested_tier = str(task.get("model_tier") or "").strip()
+        resolved_tier = _resolve_delegation_model_tier(cfg, requested_tier)
+        if requested_tier and resolved_tier is None:
+            from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS
+
+            built_ins = ", ".join(DEFAULT_MODEL_TIERS)
+            return tool_error(
+                f"Task {i}: unknown model_tier {requested_tier!r}. Configure a "
+                f"custom tier under model_tiers or use a built-in tier: {built_ins}."
+            )
+        target_model = resolved_tier.model if resolved_tier else None
+        task_creds = credential_cache.get(target_model)
+        if task_creds is None:
+            try:
+                task_creds = _resolve_delegation_credentials(
+                    cfg,
+                    parent_agent,
+                    target_model=target_model,
+                )
+            except ValueError as exc:
+                return tool_error(str(exc))
+            credential_cache[target_model] = task_creds
+        task_runtimes.append((resolved_tier, task_creds))
 
     overall_start = time.monotonic()
     results = []
@@ -3333,32 +3321,20 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = t["role"]
-            model_tier = _resolve_delegation_model_tier(
-                cfg, t["goal"], t.get("context"), effective_role
-            )
-            from hermes_cli.model_tiers import classify_task_complexity
-
-            task_complexity = classify_task_complexity(
-                t["goal"], t.get("context")
-            )
-            routing = str(cfg.get("model_tier_routing") or "auto").strip().lower()
+            resolved_tier, creds = task_runtimes[i]
             explicit_runtime = any(
                 str(cfg.get(key) or "").strip()
                 for key in ("provider", "base_url", "model", "reasoning_effort")
             )
             raw_reasoning_effort = str(cfg.get("reasoning_effort") or "").strip()
-            if model_tier is not None:
-                model_tier_source = (
-                    "orchestrator" if effective_role == "orchestrator" else "classifier"
-                )
+            if resolved_tier is not None:
+                model_tier_source = "explicit"
                 reasoning_source = "model_tier"
             else:
                 model_tier_source = (
-                    "disabled"
-                    if routing in {"", "none", "off", "disabled", "false"}
-                    else "explicit_override"
+                    "explicit_override"
                     if explicit_runtime
-                    else "unresolved"
+                    else "parent"
                 )
                 if raw_reasoning_effort:
                     from hermes_constants import parse_reasoning_effort
@@ -3375,7 +3351,7 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"] or (model_tier.model if model_tier else None),
+                model=(resolved_tier.model if resolved_tier else creds["model"]),
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -3394,15 +3370,15 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 override_reasoning_config=(
-                    model_tier.reasoning_config() if model_tier else None
+                    resolved_tier.reasoning_config() if resolved_tier else None
                 ),
                 role=effective_role,
                 read_only=bool(t.get("read_only")),
                 allow_nested_coding=bool(t.get("allow_nested_coding")),
                 runtime_audit_context={
-                    "model_tier": model_tier.name if model_tier is not None else "",
+                    "model_tier": resolved_tier.name if resolved_tier is not None else "",
                     "model_tier_source": model_tier_source,
-                    "runtime_pass": task_complexity,
+                    "runtime_pass": "selected" if resolved_tier is not None else "inherited",
                     "reasoning_source": reasoning_source,
                 },
             )
@@ -3501,12 +3477,47 @@ def delegate_task(
         from tools.async_delegation import dispatch_async_delegation_batch
 
         goals = [str(task["goal"]) for task in task_list]
+        background_task_specs: List[Dict[str, Any]] = []
+        for i, (_index, task, child) in enumerate(children):
+            resolved_tier, task_creds = task_runtimes[i]
+            child_model = getattr(child, "model", None)
+            if not isinstance(child_model, str) or not child_model.strip():
+                child_model = (
+                    resolved_tier.model
+                    if resolved_tier is not None
+                    else task_creds.get("model")
+                    or getattr(parent_agent, "model", None)
+                )
+            normalized_child_model = str(child_model or "").strip() or None
+            background_task_specs.append(
+                {
+                    "goal": str(task.get("goal") or ""),
+                    "context": str(task.get("context") or ""),
+                    "role": str(task.get("role") or top_role),
+                    "read_only": bool(task.get("read_only")),
+                    "model_tier": (
+                        resolved_tier.name if resolved_tier is not None else None
+                    ),
+                    "model": normalized_child_model,
+                }
+            )
+        batch_models = [
+            str(spec.get("model") or "").strip() or None
+            for spec in background_task_specs
+        ]
+        shared_batch_model = (
+            batch_models[0]
+            if batch_models
+            and batch_models[0] is not None
+            and all(model == batch_models[0] for model in batch_models)
+            else None
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=goals,
             context=context,
             toolsets=toolsets,
             role=top_role,
-            model=creds.get("model"),
+            model=shared_batch_model,
             session_key=session_key,
             origin_ui_session_id=origin_ui_session_id,
             parent_session_id=getattr(parent_agent, "session_id", None),
@@ -3532,15 +3543,7 @@ def delegate_task(
             ),
             origin_process_epoch=origin_process_epoch,
             read_only=all(bool(task.get("read_only")) for task in task_list),
-            task_specs=[
-                {
-                    "goal": str(task.get("goal") or ""),
-                    "context": str(task.get("context") or ""),
-                    "role": str(task.get("role") or top_role),
-                    "read_only": bool(task.get("read_only")),
-                }
-                for task in task_list
-            ],
+            task_specs=background_task_specs,
             delegation_id=live_deleg_id,
         )
         if dispatch.get("status") == "dispatched":
@@ -3894,8 +3897,17 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    *,
+    target_model: Optional[str] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
+
+    ``target_model`` is the task's explicit named-tier model. It overrides the
+    legacy ``delegation.model`` value and is passed through provider resolution
+    so provider compatibility/auth validation still runs before child launch.
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
@@ -3915,7 +3927,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
-    configured_model = str(cfg.get("model") or "").strip() or None
+    configured_model = str(target_model or cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
@@ -4155,6 +4167,11 @@ def _build_top_level_description() -> str:
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
+        "- Choose model_tier from actual task difficulty, not incidental words "
+        "in the goal/context: trivial for obvious tiny work, basic for "
+        "straightforward bounded work, intermediate for ordinary multi-step "
+        "work, and advanced only for the hardest cross-cutting or high-risk "
+        "work. Omit model_tier to inherit your runtime model and reasoning.\n"
         "- If the user is writing in a non-English language, or asked for "
         "output in a specific language / tone / style, say so in 'context' "
         "(e.g. \"respond in Chinese\", \"return output in Japanese\"). "
@@ -4198,7 +4215,8 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "When provided, top-level goal/context/role are ignored. Top-level "
+        "model_tier remains the batch default; a per-task model_tier overrides it."
     )
 
 
@@ -4333,6 +4351,16 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model_tier": {
+                            "type": "string",
+                            "description": (
+                                "Per-task difficulty tier overriding the top-level value. "
+                                "Choose from actual task difficulty: trivial for obvious tiny "
+                                "work, basic for straightforward bounded work, intermediate for "
+                                "ordinary multi-step work, or advanced only for the hardest "
+                                "cross-cutting/high-risk work. Custom configured names are valid."
+                            ),
+                        },
                         "read_only": {
                             "type": "boolean",
                             "default": False,
@@ -4355,6 +4383,17 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "model_tier": {
+                "type": "string",
+                "description": (
+                    "Optional difficulty tier for a single task or the default for every "
+                    "batch item. Choose based on actual task difficulty: trivial for obvious "
+                    "tiny work, basic for straightforward bounded work, intermediate for "
+                    "ordinary multi-step work, and advanced only for the hardest cross-cutting "
+                    "or high-risk work. Custom configured names are valid. Omit to inherit "
+                    "the parent runtime model and reasoning."
+                ),
             },
             "read_only": {
                 "type": "boolean",
@@ -4417,7 +4456,8 @@ REQUEST_CODING_TASK_SCHEMA = {
             "model_tier": {
                 "type": "string",
                 "description": (
-                    "Optional canonical model tier for the root-owned coding worker. "
+                    "Optional canonical model tier chosen from the actual difficulty of the "
+                    "root-owned coding task, not incidental keywords in its text. "
                     "Custom names configured under model_tiers are valid. Omit to use "
                     "the configured coding-worker pass profiles."
                 ),
@@ -4603,6 +4643,7 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        model_tier=args.get("model_tier"),
         read_only=bool(args.get("read_only", False)),
         background=_model_background_value(args, kw.get("parent_agent")),
         allow_nested_coding=bool(args.get("allow_nested_coding", False)),

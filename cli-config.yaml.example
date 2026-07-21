@@ -221,28 +221,13 @@ model:
 # =============================================================================
 # Named Model Tiers
 # =============================================================================
-# Model and reasoning effort are selected atomically for runtime routes.
-model_tiers:
-  trivial:
-    model: gpt-5.6-luna
-    opencode_model: hermes-codex/gpt-5.6-luna
-    reasoning_effort: medium
-  basic:
-    model: gpt-5.6-terra
-    opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: high
-  intermediate:
-    model: gpt-5.6-terra
-    opencode_model: hermes-codex/gpt-5.6-terra
-    reasoning_effort: max
-  advanced:
-    model: gpt-5.6-sol
-    opencode_model: hermes-codex/gpt-5.6-sol
-    reasoning_effort: xhigh
-  discord_action:
-    model: gpt-5.6-sol
-    opencode_model: hermes-codex/gpt-5.6-sol
-    reasoning_effort: medium
+# Built-ins (trivial, basic, intermediate, advanced, discord_action) are
+# code-owned and cannot be overridden in config.yaml. Add only custom names:
+# model_tiers:
+#   local_fast:
+#     model: local/qwen-coder
+#     opencode_model: local/qwen-coder
+#     reasoning_effort: medium
 
 # =============================================================================
 # Git Worktree Isolation
