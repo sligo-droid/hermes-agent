@@ -119,7 +119,6 @@ def _get_cached_signing_key(url: str, token: str):
             raise ValueError("token key ID is not in the refreshed JWKS")
         return signing_key
 
-
 def verify_nas_fire_token(
     *,
     token: str,

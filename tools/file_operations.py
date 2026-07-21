@@ -37,6 +37,7 @@ from tools.binary_extensions import BINARY_EXTENSIONS
 from agent.file_safety import (
     build_write_denied_paths,
     build_write_denied_prefixes,
+    get_write_denied_error,
     is_write_denied as _shared_is_write_denied,
 )
 
@@ -510,6 +511,25 @@ LINTERS = {
     '.rs': 'rustfmt --check {file} 2>&1',
 }
 
+# Extensions where the per-file shell linter is structurally weaker than
+# a real LSP server AND produces phantom errors on real-world projects:
+#
+# - ``.ts``: ``tsc --noEmit FILE.ts`` ignores ``tsconfig.json`` and
+#   defaults to no-lib / ES5, so ES2015+ standard-library references report
+#   as missing.  ``tsserver`` via LSP respects the project configuration.
+# - ``.go``: ``go vet FILE.go`` fails outside a module / GOPATH; ``gopls``
+#   is the canonical replacement.
+# - ``.rs``: ``rustfmt --check FILE.rs`` is style, not type-checking, and
+#   rejects non-Cargo project files; ``rust-analyzer`` is the canonical
+#   replacement.
+#
+# When the LSP service is configured and ``enabled_for(path)`` for one of
+# these extensions, ``_check_lint`` skips the shell linter and relies on the
+# separate ``lsp_diagnostics`` channel.  Python ``py_compile`` and JavaScript
+# ``node --check`` remain unconditional because they are fast, file-local,
+# and correct.
+_SHELL_LINTER_LSP_REDUNDANT = frozenset({'.ts', '.go', '.rs'})
+
 
 # Patterns that indicate the linter base command exists on PATH but
 # couldn't actually run — e.g. ``npx tsc`` when tsc isn't installed in
@@ -576,6 +596,18 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
     """In-process YAML syntax check.  Returns (ok, error_message).
 
     Skipped gracefully if PyYAML isn't installed — YAML parsing is optional.
+
+    Deliberately a *syntax-only* scan (``yaml.parse``), not ``safe_load``:
+    loading rejects perfectly valid YAML that merely isn't a single plain
+    document — multi-document streams (``---``-separated Kubernetes
+    manifests raise ``ComposerError``) and application-defined tags
+    (CloudFormation ``!Sub``/``!Ref``, Ansible ``!vault`` raise
+    ``ConstructorError``).  Those are content conventions for whatever
+    consumes the file, not syntax errors, and this linter's verdict is
+    used as a fail-closed WRITE gate in ``write_file`` — a false positive
+    here refuses a legitimate write outright.  ``yaml.parse`` still
+    catches real scanner/parser failures (unclosed quotes, bad
+    indentation, tab-mangled block maps).
     """
     try:
         import yaml as _yaml
@@ -583,7 +615,8 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
         # PyYAML not available — skip silently, caller treats as no linter.
         return True, "__SKIP__"
     try:
-        _yaml.safe_load(content)
+        for _event in _yaml.parse(content):
+            pass
         return True, ""
     except _yaml.YAMLError as e:
         return False, f"YAMLError: {e}"
@@ -638,6 +671,21 @@ LINTERS_INPROC = {
     '.yml': _lint_yaml_inproc,
     '.toml': _lint_toml_inproc,
 }
+
+# Subset of LINTERS_INPROC that the pre-write fail-closed gate in
+# ``write_file`` (see below) refuses on, rather than merely reporting.
+# Deliberately excludes ``.py``: unlike JSON/YAML/TOML (atomic structured
+# data blobs where "doesn't parse" always means "corrupt"), ``.py`` is
+# used throughout this codebase's own test fixtures as a generic
+# stand-in extension for arbitrary non-Python text content (e.g.
+# ``tests/tools/test_file_operations.py``'s
+# ``TestPatchReplacePostWriteVerification`` writes "hello world" /
+# "hi world" through a ``*.py`` path purely to exercise write-mechanics,
+# not Python validity). Hard-refusing on invalid Python would treat that
+# established, exercised pattern as an error and break it. Python source
+# keeps the existing (unchanged) post-write lint-delta *report* — still
+# visible to the caller, just not a write-blocking refusal.
+_FAIL_CLOSED_INPROC_EXTS = frozenset({'.json', '.yaml', '.yml', '.toml'})
 
 # Max limits for read operations
 MAX_LINES = 2000
@@ -892,7 +940,19 @@ class ShellFileOperations(FileOperations):
         return path
     
     def _escape_shell_arg(self, arg: str) -> str:
-        """Escape a string for safe use in shell commands."""
+        """Escape a string for safe use in shell commands.
+
+        On Windows native drive paths (``C:\\Users\\x`` / ``C:/Users/x``)
+        and mixed MSYS leftovers (``/c/Users\\x``) are rewritten to the
+        Git Bash ``/c/Users/x`` form via ``_bash_safe_path``: bash eats
+        backslashes and MSYS otherwise mangles drive paths into the
+        ``Directory \\drivers\\etc does not exist`` failure class. Reuses
+        the env-layer translator so shell file ops and the terminal ``cd``
+        agree on the path form. No-op off Windows and for plain POSIX paths.
+        """
+        from tools.environments.local import _bash_safe_path
+
+        arg = _bash_safe_path(arg)
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
@@ -1211,8 +1271,9 @@ class ShellFileOperations(FileOperations):
 
     def _python_delete(self, path: str, recursive: bool) -> WriteResult:
         path = self._expand_path(path)
-        if _is_write_denied(path):
-            return WriteResult(error=f"Delete denied: {path} is a protected path")
+        denied = get_write_denied_error(path, verb="Delete")
+        if denied:
+            return WriteResult(error=denied)
 
         # We can't shell out to ``rm`` here — it doesn't exist on Windows
         # ``cmd.exe`` or PowerShell, so this code path is what's left when
@@ -1257,8 +1318,9 @@ class ShellFileOperations(FileOperations):
         src = self._expand_path(src)
         dst = self._expand_path(dst)
         for p in (src, dst):
-            if _is_write_denied(p):
-                return WriteResult(error=f"Move denied: {p} is a protected path")
+            denied = get_write_denied_error(p, verb="Move")
+            if denied:
+                return WriteResult(error=denied)
         result = self._exec(
             f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}"
         )
@@ -1278,12 +1340,21 @@ class ShellFileOperations(FileOperations):
         files. The content never appears in the shell command string —
         only the file path does.
 
-        After the write, runs a post-first / pre-lazy lint check via
-        ``_check_lint_delta()``.  If the new content is clean, the lint
-        call is O(one parse).  If the new content has errors, the pre-write
-        content is linted too and only errors newly introduced by this
-        write are surfaced — pre-existing problems are filtered out so
-        the agent isn't distracted chasing them.
+        Before anything touches disk, a fail-closed syntax gate runs
+        against the CANDIDATE content: if ``path``'s extension is in
+        ``_FAIL_CLOSED_INPROC_EXTS`` (JSON/YAML/TOML — structured data
+        formats where a parse failure always means corruption) and the
+        candidate content doesn't parse, the write is refused outright.
+        No temp file, no rename, nothing on disk changes.
+
+        After a write that clears the gate, runs a post-first / pre-lazy
+        lint check via ``_check_lint_delta()``.  If the new content is
+        clean, the lint call is O(one parse).  If the new content has
+        errors the gate didn't already catch (i.e. errors from a linter
+        outside ``_FAIL_CLOSED_INPROC_EXTS``, such as Python), the
+        pre-write content is linted too and only errors newly introduced
+        by this write are surfaced — pre-existing problems are filtered
+        out so the agent isn't distracted chasing them.
 
         Args:
             path: File path to write
@@ -1296,8 +1367,47 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
-            return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+        denied = get_write_denied_error(path)
+        if denied:
+            return WriteResult(error=denied)
+
+        # ── Fail-closed pre-write syntax gate ───────────────────────────
+        # Validate the CANDIDATE content BEFORE any bytes touch disk —
+        # previously this only ran as a post-write lint *report* that the
+        # caller could ignore (or that ``files_modified`` gating wouldn't
+        # catch, since a lint failure never set the top-level ``error``
+        # key). A structured-format write that doesn't even parse (mashed
+        # quotes, truncated generation, wrong indentation dialect) is a
+        # corrupt write, not a style nit — refuse it outright instead of
+        # writing first and reporting the damage afterward.
+        #
+        # Scope: only extensions in ``_FAIL_CLOSED_INPROC_EXTS`` (JSON/
+        # YAML/TOML). ``.py`` deliberately keeps its pre-existing,
+        # non-blocking lint-delta *report* instead of a hard refusal — see
+        # ``_FAIL_CLOSED_INPROC_EXTS``'s docstring above for why. Extensions
+        # with no in-process linter at all (including ones only covered by
+        # a shell linter) are completely unaffected — this gate never runs
+        # for them, so behavior there is unchanged.
+        #
+        # Checked against the raw ``content`` argument, before the
+        # BOM/CRLF preservation shims below run. Those shims exist purely
+        # to match the on-disk file's existing conventions; linting
+        # post-shim would false-positive a JSONDecodeError on a
+        # legitimately BOM-marked JSON file purely because this method
+        # re-adds the marker the read layer strips — see
+        # ``_file_has_bom``/``_UTF8_BOM`` below.
+        ext = os.path.splitext(path)[1].lower()
+        inproc_linter = LINTERS_INPROC.get(ext) if ext in _FAIL_CLOSED_INPROC_EXTS else None
+        if inproc_linter is not None:
+            _ok, _lint_err = inproc_linter(content)
+            if not _ok and _lint_err != "__SKIP__":
+                return WriteResult(
+                    error=(
+                        f"Refusing to write '{path}': candidate content fails "
+                        f"{ext} syntax validation ({_lint_err}). The file was "
+                        "NOT created or modified. Fix the content and retry."
+                    )
+                )
 
         # Capture pre-write content.  Two consumers want it:
         #
@@ -1314,7 +1424,6 @@ class ShellFileOperations(FileOperations):
         # the UNION of in-process lint coverage and LSP coverage.  For
         # extensions outside both sets (binaries, opaque formats),
         # skipping the read keeps the hot path fast.
-        ext = os.path.splitext(path)[1].lower()
         pre_content: Optional[str] = None
         want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
         if want_pre:
@@ -1442,8 +1551,9 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
-            return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+        denied = get_write_denied_error(path)
+        if denied:
+            return PatchResult(error=denied)
 
         # Read current content
         read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
@@ -1618,6 +1728,16 @@ class ShellFileOperations(FileOperations):
         if ext not in LINTERS:
             return LintResult(skipped=True, message=f"No linter for {ext} files")
 
+        # When an active local LSP definitively claims the file, it provides
+        # stronger diagnostics than these per-file shell commands.  Do not
+        # suppress the fallback if the service is absent, disabled, remote,
+        # or errors while checking the path.
+        if ext in _SHELL_LINTER_LSP_REDUNDANT and self._lsp_will_handle(path):
+            return LintResult(
+                skipped=True,
+                message=f"LSP server handles {ext} — shell linter skipped",
+            )
+
         linter_cmd = LINTERS[ext]
         # Extract the base command (first word)
         base_cmd = linter_cmd.split()[0]
@@ -1780,6 +1900,28 @@ class ShellFileOperations(FileOperations):
             if ext_lower in srv.extensions:
                 return True
         return False
+
+    def _lsp_will_handle(self, path: str) -> bool:
+        """Return whether an active local LSP service will lint ``path``.
+
+        This is deliberately stricter than :meth:`_lsp_handles_extension`:
+        it requires a configured service and ``enabled_for(path)`` to pass,
+        which accounts for workspace discovery, disabled servers, and broken
+        server/path pairs.  Any uncertainty leaves the shell linter enabled.
+        """
+        if not self._lsp_local_only():
+            return False
+        try:
+            from agent.lsp import get_service
+            svc = get_service()
+        except Exception:  # noqa: BLE001
+            return False
+        if svc is None:
+            return False
+        try:
+            return bool(svc.enabled_for(path))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _snapshot_lsp_baseline(self, path: str) -> None:
         """Capture pre-edit LSP diagnostics so the post-write delta is correct.
@@ -2219,9 +2361,12 @@ class ShellFileOperations(FileOperations):
         """Fallback search using grep."""
         cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
         
-        # Exclude hidden directories (matching ripgrep's default behavior).
-        # This prevents searching inside .hub/index-cache/, .git/, etc.
-        cmd_parts.append("--exclude-dir='.*'")
+        # Exclude hidden descendants (matching ripgrep's default behavior).
+        # Do not use the broader ``.*`` glob here: it also matches the ``.``
+        # operand below, causing grep to skip the entire tree. The two globs
+        # cover ordinary dot-directories and the rarer ``..name`` form while
+        # leaving ``.`` itself searchable.
+        cmd_parts.extend(["--exclude-dir='.[!.]*'", "--exclude-dir='..?*'"])
         
         # Add context if requested
         if context > 0:
@@ -2237,20 +2382,32 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")
         
-        # Add pattern and path
+        # Add the pattern now; the path is selected below after probing
+        # whether it is a directory in the execution environment.
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+
+        # GNU grep applies --exclude-dir to every directory component of an
+        # explicit operand, including hidden ancestors outside the requested
+        # search root. Thus a perfectly ordinary search under ~/.cache or
+        # ~/.hermes returned no matches at all. Search directory roots from
+        # inside the root so only descendants are candidates for exclusion.
+        # The probe runs through the backend, so remote/container paths work
+        # just like local paths.
+        escaped_path = self._escape_shell_arg(path)
+        search_is_dir = self._exec(f"test -d {escaped_path}", timeout=60).exit_code == 0
+        if search_is_dir:
+            search_cmd = f"cd {escaped_path} && " + " ".join(cmd_parts + ["."])
+        else:
+            search_cmd = " ".join(cmd_parts + [escaped_path])
         
         # Fetch generously so we can compute total before slicing
         fetch_limit = limit + offset + (200 if context > 0 else 0)
-        cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])
-        
         # `set -o pipefail` so grep's exit status propagates through `| head`
         # (without it the pipeline reports head's 0, masking grep's error 2).
         # A truncating head makes grep exit 141 (SIGPIPE) on an otherwise
         # successful search; the strict `== 2` guard below ignores that, so
         # pipefail does not turn truncated results into false errors.
-        cmd = "set -o pipefail; " + " ".join(cmd_parts)
+        cmd = f"set -o pipefail; {search_cmd} | head -n {fetch_limit}"
         result = self._exec(cmd, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
@@ -2269,8 +2426,18 @@ class ShellFileOperations(FileOperations):
             return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
 
         stdout = payload
+
+        def restore_root(found_path: str) -> str:
+            """Restore the caller's directory root after the internal cd."""
+            if not search_is_dir:
+                return found_path
+            relative = found_path[2:] if found_path.startswith("./") else found_path
+            if path in {".", "./"}:
+                return relative
+            return os.path.join(path, relative)
+
         if output_mode == "files_only":
-            all_files = [f for f in stdout.strip().split('\n') if f]
+            all_files = [restore_root(f) for f in stdout.strip().split('\n') if f]
             total = len(all_files)
             page = all_files[offset:offset + limit]
             return SearchResult(
@@ -2287,7 +2454,7 @@ class ShellFileOperations(FileOperations):
                     parts = line.rsplit(':', 1)
                     if len(parts) == 2:
                         try:
-                            counts[parts[0]] = int(parts[1])
+                            counts[restore_root(parts[0])] = int(parts[1])
                         except ValueError:
                             pass
             return SearchResult(
@@ -2312,7 +2479,7 @@ class ShellFileOperations(FileOperations):
                 m = _match_re.match(line)
                 if m:
                     matches.append(SearchMatch(
-                        path=(m.group(1) or '') + m.group(2),
+                        path=restore_root((m.group(1) or '') + m.group(2)),
                         line_number=int(m.group(3)),
                         content=m.group(4)[:500]
                     ))
@@ -2322,7 +2489,7 @@ class ShellFileOperations(FileOperations):
                     parsed = _parse_search_context_line(line)
                     if parsed:
                         matches.append(SearchMatch(
-                            path=parsed[0],
+                            path=restore_root(parsed[0]),
                             line_number=parsed[1],
                             content=parsed[2][:500]
                         ))

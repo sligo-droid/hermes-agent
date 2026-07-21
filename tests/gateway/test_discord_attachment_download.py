@@ -362,8 +362,11 @@ class TestHandleMessageUsesAuthenticatedRead:
         assert event.media_types == ["image/png"]
 
     @pytest.mark.asyncio
-    async def test_mentioned_discord_voice_message_is_cached_for_stt(self, monkeypatch):
-        """A tagged Discord voice message should reach the gateway as voice audio."""
+    async def test_attachment_voice_marker_is_cached_for_stt_without_message_flag(
+        self,
+        monkeypatch,
+    ):
+        """Attachment voice markers classify native notes without message flags."""
         adapter = _make_adapter()
         bot_user = SimpleNamespace(id=999, bot=True)
         adapter._client = SimpleNamespace(user=bot_user)
@@ -397,8 +400,7 @@ class TestHandleMessageUsesAuthenticatedRead:
             content_type=None,
             size=len(_OGG_BYTES),
             read=AsyncMock(return_value=_OGG_BYTES),
-            duration_secs=2.0,
-            waveform=b"fake",
+            is_voice_message=lambda: True,
         )
 
         from datetime import datetime, timezone
@@ -413,7 +415,6 @@ class TestHandleMessageUsesAuthenticatedRead:
             channel=channel,
             guild=channel.guild,
             author=SimpleNamespace(id=42, display_name="U", name="U", bot=False),
-            flags=SimpleNamespace(voice=True),
         )
 
         with patch(

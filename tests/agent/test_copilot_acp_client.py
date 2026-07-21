@@ -209,7 +209,11 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             target = home / ".ssh" / "id_rsa"
             target.parent.mkdir(parents=True, exist_ok=True)
 
-            with patch("agent.copilot_acp_client.is_write_denied", return_value=True, create=True):
+            with patch(
+                "agent.copilot_acp_client.get_write_denied_error",
+                return_value="Write denied: protected",
+                create=True,
+            ):
                 response = self._dispatch(
                     {
                         "jsonrpc": "2.0",
@@ -248,6 +252,7 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
                 )
 
         self.assertIn("error", response)
+        self.assertIn("HERMES_WRITE_SAFE_ROOT", str(response["error"]))
         self.assertFalse(outside.exists())
 
 
@@ -287,6 +292,7 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
 
     monkeypatch.setenv("HOME", str(real_home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "real")
 
     captured = {}
     client = _make_home_client(tmp_path)

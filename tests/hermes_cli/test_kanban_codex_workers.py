@@ -1050,6 +1050,7 @@ def test_backend_child_env_bridges_profile_cli_paths(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("HOME", "/home/operator")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-control-state")
 
     env = worker._backend_child_env({"HERMES_KANBAN_WORKSPACE": "/workspace"})
@@ -1071,12 +1072,33 @@ def test_backend_child_env_respects_explicit_path(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes-home"
     (hermes_home / "home" / ".foundry" / "bin").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", "/home/operator")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
 
     env = worker._backend_child_env({"PATH": "/explicit/bin"})
 
     assert env["HOME"] == str(hermes_home / "home")
     assert env["PATH"] == "/explicit/bin"
+
+
+def test_backend_child_env_auto_keeps_real_home_on_host(monkeypatch, tmp_path):
+    import hermes_constants
+    from hermes_cli import kanban_codex_worker as worker
+
+    hermes_home = tmp_path / "hermes-home"
+    (hermes_home / "home" / ".foundry" / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", "/home/runner")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+
+    env = worker._backend_child_env()
+
+    assert env["HOME"] == "/home/runner"
+    assert env["HERMES_HOME"] == str(hermes_home)
+    assert env["PATH"] == "/usr/bin:/bin"
 
 
 def test_run_gh_bridges_real_gh_config_dir_when_home_is_isolated(monkeypatch, tmp_path):
@@ -2696,7 +2718,11 @@ def test_codex_worker_refreshes_pool_credential_missing_id_token(monkeypatch, tm
     monkeypatch.setattr(credential_pool.auth_mod, "refresh_codex_oauth_pure", fake_refresh)
 
     codex_home = tmp_path / "worker-codex-home"
-    credential_id = prepare_codex_worker_home(codex_home, allow_fallback=False)
+    credential_id = prepare_codex_worker_home(
+        codex_home,
+        source_env={"CODEX_HOME": str(tmp_path / "source-codex-home")},
+        allow_fallback=False,
+    )
 
     payload = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
     entry = credential_pool.load_pool("openai-codex").entries()[0]

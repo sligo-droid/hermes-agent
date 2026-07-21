@@ -400,7 +400,7 @@ class TestUnifiedCronjobTool:
             )
         )
         assert updated["job"]["model_tier"] is None
-        assert updated["job"]["reasoning_effort"] == "xhigh"
+        assert updated["job"]["reasoning_effort"] == "max"
 
     @staticmethod
     def _patch_named_legit(monkeypatch):

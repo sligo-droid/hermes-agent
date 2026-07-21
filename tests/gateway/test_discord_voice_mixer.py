@@ -29,6 +29,17 @@ if _DISCORD_DIR not in sys.path:
 import voice_mixer as vm  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _enable_live_voice_for_adapter_integration(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_adapter_module
+
+    monkeypatch.setattr(
+        discord_adapter_module,
+        "_discord_live_voice_enabled",
+        lambda: True,
+    )
+
+
 # =====================================================================
 # Pure mixer unit tests
 # =====================================================================

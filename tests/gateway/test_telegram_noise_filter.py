@@ -48,6 +48,14 @@ def test_discord_status_keeps_non_internal_status():
     assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) == message
 
 
+def test_telegram_drops_interrupt_sentinel():
+    """The interrupt-while-waiting sentinel is metadata, not a Telegram reply."""
+    sentinel = "Operation interrupted: waiting for model response (1.7s elapsed)."
+
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, sentinel) == ""
+    assert _sanitize_gateway_final_response("local", sentinel) == sentinel
+
+
 def test_telegram_status_sanitizes_raw_provider_security_errors():
     """Provider policy/security bodies should be replaced before chat delivery."""
     raw = (

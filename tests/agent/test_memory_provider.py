@@ -2,6 +2,9 @@
 
 import json
 import logging
+import threading
+import time
+import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -105,6 +108,19 @@ class SanitizingMemoryProvider(FakeMemoryProvider):
         clean_user = sanitize_context(user_content or "").strip()
         clean_assistant = sanitize_context(assistant_content or "").strip()
         self.synced_turns.append((clean_user, clean_assistant, session_id, messages))
+class BlockingPrefetchProvider(FakeMemoryProvider):
+    """External provider whose prefetch call blocks until released."""
+
+    def __init__(self, name="external"):
+        super().__init__(name=name)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def prefetch(self, query, *, session_id=""):
+        self.prefetch_queries.append(query)
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        return self._prefetch_result
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +262,43 @@ class TestMemoryManager:
         mgr.add_provider(p2)
 
         mgr.queue_prefetch_all("next turn")
+        assert mgr.flush_pending(timeout=1) is True
         assert p1.queued_prefetches == ["next turn"]
         assert p2.queued_prefetches == ["next turn"]
+
+    def test_multimodal_queries_are_normalized_before_prefetch(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("builtin")
+        mgr.add_provider(p)
+        query = [
+            {"type": "text", "text": "inspect this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,private"}},
+        ]
+
+        mgr.prefetch_all(query)
+        mgr.queue_prefetch_all(query)
+        assert mgr.flush_pending(timeout=1) is True
+
+        assert len(p.prefetch_queries) == 1
+        assert len(p.queued_prefetches) == 1
+        for normalized in (p.prefetch_queries[0], p.queued_prefetches[0]):
+            assert "inspect this" in normalized
+            assert "image_url=1" in normalized
+            assert "data:image/png" not in normalized
+
+    def test_media_only_queries_are_not_prefetched_or_synced(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("builtin")
+        mgr.add_provider(p)
+        query = [{"type": "audio", "data": "private"}]
+
+        assert mgr.prefetch_all(query) == ""
+        mgr.queue_prefetch_all(query)
+        mgr.sync_all(query, "noted")
+
+        assert p.prefetch_queries == []
+        assert p.queued_prefetches == []
+        assert p.synced_turns == []
 
     def test_sync_all(self):
         mgr = MemoryManager()
@@ -534,6 +585,53 @@ class TestMemoryManager:
 
         result = mgr.prefetch_all("query")
         assert "external memory" in result
+
+    def test_external_prefetch_timeout_skips_stuck_provider(self):
+        mgr = MemoryManager(external_prefetch_timeout=0.01)
+        builtin = FakeMemoryProvider("builtin")
+        builtin._prefetch_result = "builtin memory"
+        external = BlockingPrefetchProvider("hy-memory")
+        external._prefetch_result = "late external memory"
+        mgr.add_provider(builtin)
+        mgr.add_provider(external)
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query")
+        elapsed = time.monotonic() - started
+
+        assert "Memory provider: builtin" in result
+        assert "builtin memory" in result
+        assert elapsed < 0.5
+        assert external.started.wait(timeout=1.0)
+        assert external.prefetch_queries == ["query"]
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query 2")
+        elapsed = time.monotonic() - started
+
+        assert "Memory provider: builtin" in result
+        assert "builtin memory" in result
+        assert elapsed < 0.2
+        assert external.prefetch_queries == ["query"]
+
+        external.release.set()
+
+        deadline = time.monotonic() + 1.0
+        while (
+            external.name in mgr._external_prefetch_threads
+            and mgr._external_prefetch_threads[external.name].is_alive()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        result = mgr.prefetch_all("query 3")
+
+        assert "Memory provider: builtin" in result
+        assert "builtin memory" in result
+        assert "Memory provider: hy-memory" in result
+        assert "late external memory" in result
+        assert external.prefetch_queries == ["query", "query 3"]
+        assert external.name not in mgr._external_prefetch_threads
 
     def test_system_prompt_failure_doesnt_block(self):
         mgr = MemoryManager()

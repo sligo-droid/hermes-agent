@@ -25,7 +25,6 @@ import os
 import signal
 import sys
 import tempfile
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pytest
@@ -206,6 +205,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
     "HERMES_TENANT",
+    # Honcho host selection changes which nested config block wins. A local
+    # shell override leaked "myhost" into the full suite and flipped 20
+    # otherwise-unrelated config tests away from the default "hermes" host.
+    "HERMES_HONCHO_HOST",
     # Dashboard OAuth auth gate (PR #30156). When set, the bundled
     # dashboard-auth `nous` plugin auto-registers itself on plugin discovery,
     # which is triggered by any `/api/status` call. That leaks a provider
@@ -317,15 +320,29 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 })
 
 
-_HERMES_LOG_FILENAMES = {"agent.log", "errors.log", "gateway.log"}
+_HERMES_LOG_FILENAMES = {"agent.log", "errors.log", "gateway.log", "gui.log"}
 
 
 def _remove_stale_hermes_log_handlers(active_hermes_home: Path) -> None:
     """Close Hermes file handlers that target any non-current HERMES_HOME."""
     active_log_dir = (active_hermes_home / "logs").resolve()
+    hermes_logging_mod = sys.modules.get("hermes_logging")
+    if hermes_logging_mod is not None:
+        queued_handlers = getattr(hermes_logging_mod, "rotating_file_handlers", lambda: [])()
+        try:
+            has_stale_queued_handler = any(
+                Path(handler.baseFilename).resolve().parent != active_log_dir
+                for handler in queued_handlers
+                if Path(handler.baseFilename).name in _HERMES_LOG_FILENAMES
+            )
+        except (AttributeError, TypeError, ValueError):
+            has_stale_queued_handler = True
+        if has_stale_queued_handler:
+            hermes_logging_mod.shutdown_logging()
+
     root = logging.getLogger()
     for handler in list(root.handlers):
-        if not isinstance(handler, RotatingFileHandler):
+        if not hasattr(handler, "baseFilename"):
             continue
         try:
             handler_path = Path(handler.baseFilename).resolve()
@@ -338,9 +355,19 @@ def _remove_stale_hermes_log_handlers(active_hermes_home: Path) -> None:
         root.removeHandler(handler)
         handler.close()
 
-    hermes_logging_mod = sys.modules.get("hermes_logging")
     if hermes_logging_mod is not None:
         setattr(hermes_logging_mod, "_logging_initialized", False)
+
+
+def _shutdown_hermes_logging() -> None:
+    """Close async and synchronous Hermes handlers before temp-home teardown."""
+    hermes_logging_mod = sys.modules.get("hermes_logging")
+    if hermes_logging_mod is not None:
+        shutdown = getattr(hermes_logging_mod, "shutdown_logging", None)
+        if shutdown is not None:
+            shutdown()
+            return
+    _remove_stale_hermes_log_handlers(Path("/__no_active_hermes_home__"))
 
 
 @pytest.fixture(autouse=True)
@@ -359,6 +386,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
+
+    # Honcho's fallback host/config resolution legitimately reads the user's
+    # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
+    # on it), but pin the host so ordinary tests cannot inherit a developer's
+    # defaultHost and silently select the wrong nested config block. Tests of
+    # custom host resolution override/delete this explicitly.
+    monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
 
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
@@ -411,6 +445,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
+
+    yield
+
+    # The async listener is process-global while tmp_path is test-scoped.
+    # Stop it before pytest removes this test's HERMES_HOME so no background
+    # record can reopen agent.log/errors.log under a deleted directory.
+    _shutdown_hermes_logging()
 
 
 # Backward-compat alias — old tests reference this fixture name. Keep it
@@ -805,6 +846,13 @@ def _live_system_guard(request, monkeypatch):
     real_kill = _os.kill
 
     def _guarded_kill(pid, sig, *args, **kwargs):
+        # Signal 0 is a pure liveness probe — it cannot terminate anything.
+        # psutil.pid_exists() uses os.kill(pid, 0) on POSIX, and probing a
+        # just-killed grandchild that was reparented to init (zombie with a
+        # foreign parent chain) must not trip the guard. Flaked in CI on
+        # test_entire_tree_is_sigkilled_not_just_parent.
+        if int(sig) == 0:
+            return real_kill(pid, sig, *args, **kwargs)
         if _is_own_subtree(int(pid)):
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
@@ -830,6 +878,9 @@ def _live_system_guard(request, monkeypatch):
         own_pgid = _os.getpgrp()
 
         def _guarded_killpg(pgid, sig, *args, **kwargs):
+            # Signal 0 is a pure liveness probe — never destructive.
+            if int(sig) == 0:
+                return real_killpg(pgid, sig, *args, **kwargs)
             if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(

@@ -208,6 +208,7 @@ def test_compress_context_emergency_shrinks_before_churn_failure():
             )
         agent._build_system_prompt = lambda _system_message: "system"
         agent.commit_memory_session = lambda _messages: None
+        agent.compression_in_place = False
         agent.context_compressor.threshold_tokens = 190_400
 
         huge_output = "line one\n" + ("x" * 360_000)
@@ -284,6 +285,7 @@ def test_compress_context_ignores_recovered_large_zero_message_ancestor():
             )
         agent._build_system_prompt = lambda _system_message: "system"
         agent.commit_memory_session = lambda _messages: None
+        agent.compression_in_place = False
         agent.context_compressor.compress = lambda _messages, **_kwargs: [
             {"role": "user", "content": "compressed summary"}
         ]
@@ -344,6 +346,7 @@ def test_compress_context_allows_reduced_zero_message_lineage_with_three_recent_
             )
         agent._build_system_prompt = lambda _system_message: "system"
         agent.commit_memory_session = lambda _messages: None
+        agent.compression_in_place = False
         agent.context_compressor.compress = lambda _messages, **_kwargs: [
             {"role": "user", "content": "compressed summary"}
         ]
@@ -406,6 +409,7 @@ def test_compress_context_allows_meaningful_progress_lineage():
             )
         agent._build_system_prompt = lambda _system_message: "system"
         agent.commit_memory_session = lambda _messages: None
+        agent.compression_in_place = False
         agent.context_compressor.compress = lambda _messages, **_kwargs: [
             {"role": "user", "content": "compressed summary"}
         ]
@@ -538,6 +542,7 @@ def test_oversized_skill_view_emergency_shrink_avoids_churn_breaker():
             )
         agent._build_system_prompt = lambda _system_message: "system"
         agent.commit_memory_session = lambda _messages: None
+        agent.compression_in_place = False
         agent.context_compressor.threshold_tokens = 190_400
         agent.context_compressor.compress = lambda messages, **_kwargs: ContextCompressor.emergency_shrink(
             agent.context_compressor,

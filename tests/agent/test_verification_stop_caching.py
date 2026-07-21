@@ -1,15 +1,15 @@
 """Verification-loop synthetic scaffolding must never reach durable session state.
 
-verify_on_stop / pre_verify append a synthetic assistant "done" plus a synthetic
-user nudge to keep the agent going one more turn before it can claim completion.
-These messages exist only to drive the loop; persisting them poisons the resumed
-transcript and breaks prompt-prefix cache reuse on later turns (#55733).
+verify_on_stop / pre_verify inject a synthetic user nudge to keep the agent
+going one more turn before it can claim completion. The assistant candidate and
+the user nudge are both private continuation scaffolding: they remain in model
+history for role alternation and prompt-cache continuity, but neither may reach
+SQLite or JSON before verification succeeds. This test file verifies:
 
-Both persistence sinks (SQLite flush + JSON snapshot) route through the single
-``_is_ephemeral_scaffolding`` chokepoint, which is driven by
-``_EPHEMERAL_SCAFFOLDING_FLAGS``. These tests assert that the verification-loop
-flags are registered there and that both sinks drop the flagged messages while
-keeping the real conversation.
+  - The verification-loop flags remain registered in
+    ``_EPHEMERAL_SCAFFOLDING_FLAGS``.
+  - The DB flush drops both the candidate and its nudge.
+  - The JSON log drops both the candidate and its nudge.
 """
 
 import json
@@ -34,22 +34,26 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
     assert "_verification_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
     assert "_pre_verify_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
 
-    # The central classifier drives both persistence sinks.
+    # Both assistant candidates and user nudges are scaffolding when flagged.
     assert ra._is_ephemeral_scaffolding(
         {"role": "assistant", "content": "done", "_verification_stop_synthetic": True}
     )
     assert ra._is_ephemeral_scaffolding(
         {"role": "user", "content": "[System: run tests]", "_pre_verify_synthetic": True}
     )
-    # Real messages are not scaffolding.
+    assert ra._is_ephemeral_scaffolding(
+        {"role": "user", "content": "[System: run tests]", "_verification_stop_synthetic": True}
+    )
+    # Real, unflagged messages are not scaffolding.
     assert not ra._is_ephemeral_scaffolding({"role": "user", "content": "hi"})
+    assert not ra._is_ephemeral_scaffolding({"role": "assistant", "content": "premature done"})
 
 
 def _make_agent(ra, session_id, tmp_path):
     agent = ra.AIAgent(
         session_id=session_id,
         api_key="test-key",
-        base_url="http://127.0.0.1:8000/v1",
+        base_url="https://example.invalid/v1",
         provider="openai-compat",
         model="test-model",
         quiet_mode=True,
@@ -64,7 +68,7 @@ def _make_agent(ra, session_id, tmp_path):
     return agent
 
 
-def test_db_flush_drops_verification_scaffolding(tmp_path, monkeypatch):
+def test_db_flush_drops_verification_candidate_and_nudge(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     ra = _fresh_run_agent(tmp_path)
     agent = _make_agent(ra, "sess_db", tmp_path)
@@ -88,7 +92,7 @@ def test_db_flush_drops_verification_scaffolding(tmp_path, monkeypatch):
     assert "[System: run tests]" not in persisted
 
 
-def test_json_log_drops_verification_scaffolding(tmp_path, monkeypatch):
+def test_json_log_drops_verification_candidate_and_nudge(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     ra = _fresh_run_agent(tmp_path)
     agent = _make_agent(ra, "sess_json", tmp_path)

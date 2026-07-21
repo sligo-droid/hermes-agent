@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,11 @@ from hermes_cli.config import cfg_get, load_config_readonly
 from utils import atomic_json_write
 
 log = logging.getLogger(__name__)
+
+_PROJECT_MAPPING_HINT: ContextVar[tuple[str, dict[str, Any]] | None] = ContextVar(
+    "self_improvement_project_mapping_hint",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -97,7 +103,11 @@ def configured_project_discord_channel_name(project: object) -> str:
             value = str(project_cfg.get(key) or "").strip()
             if value:
                 return value
-    mapping = _project_mapping_for_key(project_key)
+    mapping_hint = _PROJECT_MAPPING_HINT.get()
+    if mapping_hint and _normalize_project_key(mapping_hint[0]) == _normalize_project_key(project_key):
+        mapping = mapping_hint[1]
+    else:
+        mapping = _project_mapping_for_key(project_key)
     return str(mapping.get("channel_name") or mapping.get("channel") or "").strip() if mapping else ""
 
 
@@ -616,12 +626,17 @@ def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
         if channel_mapping:
             mapping = {**mapping, **channel_mapping}
     explicit_context = card.get("project_context") if isinstance(card.get("project_context"), dict) else {}
+    mapping_hint_token = _PROJECT_MAPPING_HINT.set((project, mapping))
+    try:
+        project_channel_name = configured_project_discord_channel_name(project) or None
+    finally:
+        _PROJECT_MAPPING_HINT.reset(mapping_hint_token)
     context = {
         "project_name": str(mapping.get("project_name") or project),
         "project_path": mapping.get("project_path"),
         "project_github_url": mapping.get("github_url"),
         "project_channel_id": str(channel_id or mapping.get("channel_id") or ""),
-        "project_channel_name": configured_project_discord_channel_name(project),
+        "project_channel_name": project_channel_name,
         "project_mapping_source": mapping.get("source"),
         "project_mapping_resolved": bool(mapping),
         "self_improvement_project": project,

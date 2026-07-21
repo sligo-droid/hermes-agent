@@ -220,14 +220,19 @@ class TestTickWorkdirPartition:
         calls: list[tuple[str, str]] = []
         order_lock = threading.Lock()
 
-        def fake_run_job(job):
+        def fake_run_job(job, *, defer_agent_teardown=None):
             # Return a minimal tuple matching run_job's signature.
             with order_lock:
                 calls.append((job["id"], threading.current_thread().name))
             return True, "output", "response", None
 
         monkeypatch.setattr(sched, "run_job", fake_run_job)
-        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
+        monkeypatch.setattr(
+            sched,
+            "save_job_output",
+            lambda jid, _o: tmp_path / f"{jid}.md",
+        )
+        monkeypatch.setattr(sched, "update_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(
             sched, "_deliver_result", lambda *_a, **_kw: None

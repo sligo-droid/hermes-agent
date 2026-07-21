@@ -14,6 +14,8 @@ Covers:
 - Cross-platform: consistent behavior for Slack, Telegram, Discord
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from gateway.config import Platform, GatewayConfig

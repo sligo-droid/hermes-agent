@@ -774,6 +774,8 @@ def _canonical_status_from_board(
         return "blocked", "blocked"
     if counts.get("review", 0):
         return "review", "review"
+    if counts.get("running", 0):
+        return "queued", "running_unverified"
     if sum(counts.get(status, 0) for status in _WAITING_TASK_STATUSES):
         return "queued", "queued"
     active_tasks = [task for task in tasks if str(task.get("status") or "").lower() != "archived"]
@@ -1924,7 +1926,12 @@ def build_command_center_snapshot(
             and item.get("status") not in {"proposed", "rejected", "archived"}
             and kanban_db.board_exists(board)
         )
-        if not has_board_rollup:
+        linked_default_task = bool(
+            board == kanban_db.DEFAULT_BOARD
+            and _proposal_task_id(card)
+            and str(card.get("status") or "").lower() != "recovery_needed"
+        )
+        if not has_board_rollup and not linked_default_task:
             work_items.append(item)
         elif board:
             proposal_id = card.get("proposal_id")

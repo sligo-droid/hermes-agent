@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -261,7 +262,7 @@ async def test_meeting_auto_goal_directly_sets_legacy_goal_and_subgoals_for_non_
     monkeypatch.setattr(
         runner,
         "_get_goal_manager_for_event",
-        lambda event: (mgr, SimpleNamespace(session_id="sid-1")),
+        AsyncMock(return_value=(mgr, SimpleNamespace(session_id="sid-1"))),
     )
     monkeypatch.setattr(
         runner,
@@ -299,7 +300,7 @@ async def test_meeting_auto_goal_falls_back_when_discord_kanban_unavailable(monk
     monkeypatch.setattr(
         runner,
         "_get_goal_manager_for_event",
-        lambda event: (mgr, SimpleNamespace(session_id="sid-1")),
+        AsyncMock(return_value=(mgr, SimpleNamespace(session_id="sid-1"))),
     )
     monkeypatch.setattr(
         runner,
@@ -329,7 +330,7 @@ async def test_meeting_auto_goal_adds_to_existing_goal_without_overwriting(monke
     monkeypatch.setattr(
         runner,
         "_get_goal_manager_for_event",
-        lambda event: (mgr, SimpleNamespace(session_id="sid-1")),
+        AsyncMock(return_value=(mgr, SimpleNamespace(session_id="sid-1"))),
     )
     monkeypatch.setattr(runner, "_enqueue_goal_work", lambda event, prompt: None)
 

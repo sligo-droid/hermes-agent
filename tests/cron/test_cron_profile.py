@@ -410,7 +410,7 @@ class TestTickProfilePartition:
         assert os.environ["HERMES_HOME"] == str(root)
         assert sched._get_hermes_home() == root
 
-    def test_profile_jobs_run_sequentially(self, isolated_cron_profile_home, monkeypatch):
+    def test_profile_jobs_use_sequential_pool(self, isolated_cron_profile_home, monkeypatch):
         import threading
         import cron.scheduler as sched
 
@@ -423,7 +423,7 @@ class TestTickProfilePartition:
 
         calls: list[tuple[str, str]] = []
 
-        def fake_run_job(job):
+        def fake_run_job(job, **_kwargs):
             calls.append((job["id"], threading.current_thread().name))
             return True, "output", "response", None
 
@@ -435,8 +435,7 @@ class TestTickProfilePartition:
         n = sched.tick(verbose=False)
 
         assert n == 2
-        ids = [job_id for job_id, _thread_name in calls]
-        assert ids.index("a") < ids.index("b")
-        main_thread_name = threading.current_thread().name
         profile_thread_name = next(thread for job_id, thread in calls if job_id == "a")
-        assert profile_thread_name == main_thread_name
+        parallel_thread_name = next(thread for job_id, thread in calls if job_id == "b")
+        assert profile_thread_name.startswith("cron-seq")
+        assert parallel_thread_name.startswith("cron-par")

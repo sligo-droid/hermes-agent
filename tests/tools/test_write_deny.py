@@ -40,10 +40,10 @@ class TestWriteDenyExactPaths:
         path = str(get_hermes_home() / ".env")
         assert _is_write_denied(path) is True
 
-    def test_shell_profiles(self):
+    def test_shell_profiles_are_writable(self):
         home = str(Path.home())
         for name in [".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile"]:
-            assert _is_write_denied(os.path.join(home, name)) is True, f"{name} should be denied"
+            assert _is_write_denied(os.path.join(home, name)) is False, f"{name} should be writable"
 
     def test_package_manager_configs(self):
         home = str(Path.home())

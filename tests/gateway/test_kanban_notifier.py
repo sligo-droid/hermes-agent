@@ -2177,8 +2177,8 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     inline ``if adapter is None: adapter = self.adapters.get(plat)`` fallback
     makes this test FAIL (the default adapter receives the delivery).
     """
-    db_path = tmp_path / "profile-no-fallback.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     kb.init_db()
 
     conn = kb.connect()
@@ -2221,6 +2221,94 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     # The claim is rewound (adapter resolved to None → treated as disconnected),
     # so the event is still unseen and will deliver once beta's adapter connects.
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
+
+
+def test_notifier_delivers_via_secondary_profile_adapter(tmp_path, monkeypatch):
+    """A secondary-owned subscription must positively deliver via that bot.
+
+    This covers the multiplex case where the primary profile has no adapter for
+    the subscription's platform at all.  Merely preventing fallback is not
+    enough: the notifier must discover and use the connected secondary adapter.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by beta", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-beta",
+            notifier_profile="beta",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    secondary_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "beta": {Platform.TELEGRAM: secondary_adapter},
+    }
+    runner._kanban_notifier_profile = "default"
+    runner._kanban_sub_fail_counts = {}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(secondary_adapter.sent) == 1
+    assert secondary_adapter.sent[0]["chat_id"] == "chat-beta"
+    assert f"Kanban {tid} done" in secondary_adapter.sent[0]["text"]
+    assert _unseen_terminal_events_for(tid, "chat-beta") == []
+
+
+def test_notifier_default_owner_does_not_use_secondary_gateway_adapter(
+    tmp_path, monkeypatch
+):
+    """An explicit default-owned subscription cannot leak through a
+    secondary profile gateway's ``self.adapters`` registry.
+
+    ``_authorization_adapter(..., profile="default")`` normally resolves to
+    ``self.adapters``. On a standalone secondary gateway, however, that map
+    belongs to the secondary profile, so treating the default stamp as a
+    normal adapter lookup sends through the wrong bot.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by default", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-default",
+            notifier_profile="default",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    secondary_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: secondary_adapter}
+    runner._profile_adapters = {}
+    runner._kanban_notifier_profile = "beta"
+    runner._kanban_sub_fail_counts = {}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert secondary_adapter.sent == []
+    assert [
+        ev.kind for ev in _unseen_terminal_events_for(tid, "chat-default")
+    ] == ["completed"]
 
 
 def _unseen_terminal_events_for(tid, chat_id):

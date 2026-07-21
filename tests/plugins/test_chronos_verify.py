@@ -410,6 +410,39 @@ def test_http_jwks_url_is_rejected_before_network(rsa_keys, monkeypatch):
     ) is None
 
 
+def test_jwks_client_is_cached_across_calls(monkeypatch):
+    """Regression (Chronos relay 403/401 + 504 storm): the JWKS client must be
+    constructed ONCE per URL and reused across fires, NOT rebuilt per call.
+
+    A fresh PyJWKClient per fire discards its key cache and forces a synchronous
+    JWKS HTTP GET on every fire; a burst of concurrent fires then fans out into N
+    simultaneous fetches that the portal rate-limits (403 → agent 401) or that
+    block the event loop past the relay's 30s timeout (504). Reusing one cached
+    client keeps the steady state at zero fetches per fire. This test fails
+    against the pre-fix code (construct_count == N) and passes with the cache
+    (construct_count == 1).
+    """
+    from plugins.cron_providers.chronos import verify as verify_mod
+    url = "https://portal.nousresearch.com/.well-known/jwks.json"
+
+    counters = {"construct": 0}
+
+    class CountingJWKClient:
+        def __init__(self, u, **kwargs):
+            counters["construct"] += 1
+
+    monkeypatch.setattr("jwt.PyJWKClient", CountingJWKClient)
+    verify_mod._get_jwk_client.cache_clear()
+
+    for _ in range(5):
+        assert verify_mod._get_jwk_client(url) is verify_mod._get_jwk_client(url)
+
+    assert counters["construct"] == 1, (
+        f"expected 1 PyJWKClient construction, got {counters['construct']} "
+        "(a fresh client per fire is the bug this guards against)"
+    )
+
+
 def test_get_fire_verifier_returns_nas_verifier():
     from plugins.cron_providers.chronos.verify import get_fire_verifier, verify_nas_fire_token
 

@@ -92,6 +92,15 @@ def test_non_loopback_insecure_bind_still_requires_basic_auth(dashboard_app):
     assert response.headers["WWW-Authenticate"].startswith("Basic")
 
 
+def test_non_loopback_insecure_bind_accepts_session_token(dashboard_app):
+    response = dashboard_app("192.0.2.10").get(
+        "/command-center",
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    )
+
+    assert response.status_code == 200
+
+
 def test_env_flag_forces_basic_auth_on_loopback(dashboard_app, monkeypatch):
     monkeypatch.setenv("HERMES_DASHBOARD_REQUIRE_BASIC_AUTH", "1")
 

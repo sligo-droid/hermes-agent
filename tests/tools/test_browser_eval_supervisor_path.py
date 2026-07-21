@@ -248,7 +248,14 @@ def _make_supervisor_with_cdp(cdp_response):
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()
 
-    async def _fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+    async def _fake_cdp(
+        method,
+        params=None,
+        *,
+        session_id=None,
+        timeout=10.0,
+        execution_guard=None,
+    ):
         return cdp_response
 
     sup._cdp = _fake_cdp  # type: ignore[method-assign]
@@ -427,7 +434,14 @@ class TestEvaluateRuntimeDomNodeCrashRetry:
     def test_reference_chain_crash_retries_without_by_value(self):
         calls = []
 
-        async def _fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        async def _fake_cdp(
+            method,
+            params=None,
+            *,
+            session_id=None,
+            timeout=10.0,
+            execution_guard=None,
+        ):
             by_value = (params or {}).get("returnByValue")
             calls.append(by_value)
             if by_value:
@@ -462,7 +476,14 @@ class TestEvaluateRuntimeDomNodeCrashRetry:
     def test_unrelated_error_does_not_retry(self):
         calls = []
 
-        async def _fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        async def _fake_cdp(
+            method,
+            params=None,
+            *,
+            session_id=None,
+            timeout=10.0,
+            execution_guard=None,
+        ):
             calls.append((params or {}).get("returnByValue"))
             raise RuntimeError("CDP error on id=3: {'message': 'Target closed'}")
 

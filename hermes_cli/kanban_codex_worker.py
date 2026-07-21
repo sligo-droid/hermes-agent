@@ -1551,6 +1551,7 @@ def _rotate_codex_worker_credential_after_auth_failure(result: Any) -> bool:
         source_env=source_env,
         allow_fallback=False,
         use_shared_home_symlink=use_shared_home_symlink,
+        prefer_pool=True,
     )
     if not next_credential_id or next_credential_id == failed_credential_id:
         return False
@@ -1697,6 +1698,8 @@ def _scheduled_opencode_reasoning(default: str) -> str:
     from hermes_constants import normalize_reasoning_effort
 
     effort = normalize_reasoning_effort(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "")
+    if effort in {"max", "ultra"}:
+        return "xhigh"
     if effort in {"minimal", "low", "medium", "high", "xhigh"}:
         return effort
     return default
@@ -1773,6 +1776,8 @@ def _worker_reasoning_effort(role: str) -> str:
     from hermes_constants import normalize_reasoning_effort
 
     effort = normalize_reasoning_effort(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "")
+    if effort in {"max", "ultra"}:
+        effort = "xhigh"
     if effort in {"minimal", "low", "medium", "high", "xhigh"}:
         if role != ROLE_REVIEWER and effort == "xhigh":
             return "high"

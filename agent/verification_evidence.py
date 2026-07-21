@@ -324,7 +324,9 @@ def _is_narrow_verification_setup(tokens: list[str]) -> bool:
     return False
 
 
-def _verification_only_segments(command: str) -> list[list[str]] | None:
+def _verification_only_segments(
+    command: str, *, posix: bool = True,
+) -> list[list[str]] | None:
     """Parse the small accepted shell subset, failing closed on other shapes."""
 
     if _UNSAFE_VERIFY_SHELL_RE.search(command):
@@ -335,7 +337,7 @@ def _verification_only_segments(command: str) -> list[list[str]] | None:
     segments: list[list[str]] = []
     for segment in raw_segments:
         try:
-            tokens = shlex.split(segment)
+            tokens = shlex.split(segment, posix=posix)
         except ValueError:
             return None
         if not tokens:
@@ -345,25 +347,31 @@ def _verification_only_segments(command: str) -> list[list[str]] | None:
 
 
 def _find_canonical_match(command: str, canonical_commands: list[str]) -> tuple[str, list[str]] | None:
-    segments = _verification_only_segments(command)
-    if not segments:
-        return None
-    first_match: tuple[str, list[str]] | None = None
-    verification_started = False
-    for tokens in segments:
-        match = _canonical_match_for_tokens(tokens, canonical_commands)
-        if match is not None:
-            verification_started = True
-            if first_match is None:
-                first_match = match
+    # Windows paths need ``posix=False`` so backslashes survive tokenization.
+    # Keep the fork's fail-closed whole-command validation in both modes.
+    for posix in (True, False):
+        segments = _verification_only_segments(command, posix=posix)
+        if not segments:
             continue
-        if not verification_started and _is_narrow_verification_setup(tokens):
-            continue
-        # Once the command contains a non-setup, non-verification segment, the
-        # whole composite is ineligible. This rejects trailing and parallel
-        # mutation rather than crediting an earlier successful test segment.
-        return None
-    return first_match
+        first_match: tuple[str, list[str]] | None = None
+        verification_started = False
+        eligible = True
+        for tokens in segments:
+            match = _canonical_match_for_tokens(tokens, canonical_commands)
+            if match is not None:
+                verification_started = True
+                if first_match is None:
+                    first_match = match
+                continue
+            if not verification_started and _is_narrow_verification_setup(tokens):
+                continue
+            # Reject trailing/parallel mutation rather than crediting an
+            # earlier successful verification segment.
+            eligible = False
+            break
+        if eligible and first_match is not None:
+            return first_match
+    return None
 
 
 def _kind_for_command(canonical: str) -> str:
@@ -453,22 +461,27 @@ def _ad_hoc_script_args(tokens: list[str], root: str | Path | None) -> list[str]
 
 
 def _find_ad_hoc_match(command: str, root: str | Path | None) -> list[str] | None:
-    segments = _verification_only_segments(command)
-    if not segments:
-        return None
-    first_args: list[str] | None = None
-    verification_started = False
-    for tokens in segments:
-        trailing_args = _ad_hoc_script_args(tokens, root)
-        if trailing_args is not None:
-            verification_started = True
-            if first_args is None:
-                first_args = trailing_args
+    for posix in (True, False):
+        segments = _verification_only_segments(command, posix=posix)
+        if not segments:
             continue
-        if not verification_started and _is_narrow_verification_setup(tokens):
-            continue
-        return None
-    return first_args
+        first_args: list[str] | None = None
+        verification_started = False
+        eligible = True
+        for tokens in segments:
+            trailing_args = _ad_hoc_script_args(tokens, root)
+            if trailing_args is not None:
+                verification_started = True
+                if first_args is None:
+                    first_args = trailing_args
+                continue
+            if not verification_started and _is_narrow_verification_setup(tokens):
+                continue
+            eligible = False
+            break
+        if eligible and first_args is not None:
+            return first_args
+    return None
 
 
 def _summarize_output(output: str) -> str:

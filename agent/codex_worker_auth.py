@@ -545,6 +545,7 @@ def prepare_codex_worker_home(
     source_env: dict[str, str] | None = None,
     allow_fallback: bool = False,
     use_shared_home_symlink: bool = True,
+    prefer_pool: bool = False,
 ) -> Optional[str]:
     """Prepare an isolated Codex home and return inherited credential id.
 
@@ -560,7 +561,13 @@ def prepare_codex_worker_home(
     """
     path = Path(codex_home).expanduser()
 
-    api_key_provider = _parent_api_key_provider(source_env=source_env)
+    entry = None
+    if prefer_pool:
+        _, entry = select_codex_worker_credential(parent_agent)
+
+    api_key_provider = (
+        None if entry is not None else _parent_api_key_provider(source_env=source_env)
+    )
     if api_key_provider is not None:
         if path.is_symlink():
             path.unlink()
@@ -579,7 +586,8 @@ def prepare_codex_worker_home(
         )
         return None
 
-    pool, entry = select_codex_worker_credential(parent_agent)
+    if not prefer_pool:
+        _, entry = select_codex_worker_credential(parent_agent)
     credential_id = None
     copied_fallback_auth = False
     if entry is not None:
@@ -622,6 +630,7 @@ def create_codex_worker_home(
     source_env: dict[str, str] | None = None,
     allow_fallback: bool = False,
     prefix: str = "codex-worker-",
+    prefer_pool: bool = False,
 ) -> CodexWorkerHomeLease:
     """Create a temporary Codex home lease populated with worker auth."""
     root = _codex_worker_home_root()
@@ -631,17 +640,20 @@ def create_codex_worker_home(
     except OSError:
         pass
     path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
-    api_key_provider = _parent_api_key_provider(source_env=source_env)
     try:
         credential_id = prepare_codex_worker_home(
             path,
             parent_agent=parent_agent,
             source_env=source_env,
             allow_fallback=allow_fallback,
+            prefer_pool=prefer_pool,
         )
     except Exception:
         cleanup_codex_worker_home(path)
         raise
+    api_key_provider = (
+        None if credential_id is not None else _parent_api_key_provider(source_env=source_env)
+    )
     provider_env = (
         {api_key_provider.env_key: api_key_provider.env_value}
         if api_key_provider is not None and api_key_provider.env_value is not None

@@ -21,6 +21,8 @@ export const EFFORT_OPTIONS: ReadonlyArray<EffortOption> = [
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
   { value: "xhigh", label: "Extra High" },
+  { value: "max", label: "Max" },
+  { value: "ultra", label: "Ultra" },
 ];
 
 export const VALID_EFFORTS: ReadonlySet<string> = new Set(
@@ -34,6 +36,5 @@ export function normalizeEffort(raw: unknown): string {
     .trim()
     .toLowerCase();
   if (!value) return "medium";
-  if (value === "max") return "xhigh";
   return VALID_EFFORTS.has(value) ? value : "medium";
 }

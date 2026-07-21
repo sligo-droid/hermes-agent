@@ -786,7 +786,11 @@ def _write_minimal_codex_home(path: Path) -> Optional[str]:
     """Create a Codex home with auth but no Hermes MCP/tool bridge."""
     from agent.codex_worker_auth import prepare_codex_worker_home
 
-    return prepare_codex_worker_home(path, source_env=_codex_home_source_env())
+    return prepare_codex_worker_home(
+        path,
+        source_env=_codex_home_source_env(),
+        prefer_pool=True,
+    )
 
 
 def spawn_or_default(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:

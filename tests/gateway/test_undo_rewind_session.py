@@ -9,12 +9,15 @@ load_transcript returns only the active view. See issue #21910.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from gateway.config import GatewayConfig, Platform
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import SessionSource, SessionStore, build_session_key
 from hermes_state import SessionDB
-from gateway.config import GatewayConfig
-from gateway.session import SessionStore
 
 
 @pytest.fixture()
@@ -80,3 +83,69 @@ def test_rewind_clamps_negative_count_to_one(store):
     res = store.rewind_session(sid, -5)
     assert res["turns_undone"] == 1
     assert res["target_text"] == "q3"
+
+
+@pytest.mark.parametrize(
+    "handler_name",
+    [
+        "_handle_status_command",
+        "_handle_resume_command",
+        "_handle_reset_command",
+        "_handle_stop_command",
+        "_handle_undo_command",
+        "_handle_model_command",
+        "_handle_compress_command",
+        "_handle_deny_command",
+        "_handle_title_command",
+    ],
+)
+def test_gateway_runner_uses_authoritative_slash_handler(handler_name):
+    from gateway.run import GatewayRunner
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    assert getattr(GatewayRunner, handler_name) is getattr(
+        GatewaySlashCommandsMixin,
+        handler_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_gateway_undo_forwards_count_and_evicts_cached_agent():
+    from gateway.run import GatewayRunner
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="user-1",
+    )
+    event = MessageEvent(
+        text="/undo 2",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    entry = SimpleNamespace(session_id="session-1", last_prompt_tokens=987)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = Mock()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=entry),
+        rewind_session=AsyncMock(
+            return_value={
+                "turns_undone": 2,
+                "rewound_count": 4,
+                "target_text": "second prompt",
+            }
+        ),
+    )
+    runner._evict_cached_agent = Mock()
+
+    result = await runner._handle_undo_command(event)
+
+    runner.async_session_store.rewind_session.assert_awaited_once_with(
+        "session-1",
+        2,
+    )
+    runner._evict_cached_agent.assert_called_once_with(build_session_key(source))
+    assert entry.last_prompt_tokens == 0
+    assert "second prompt" in result

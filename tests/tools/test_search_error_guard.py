@@ -182,6 +182,21 @@ class TestSearchContentNewlineWarning:
         assert res.warning is None
 
 
+def test_grep_hidden_root_keeps_visible_matches_and_skips_hidden_descendants(tmp_path):
+    """A hidden ancestor must not make the grep fallback skip the whole root."""
+    root = tmp_path / ".cache" / "search-root"
+    root.mkdir(parents=True)
+    (root / "visible.txt").write_text("needle visible\n")
+    hidden = root / ".hub"
+    hidden.mkdir()
+    (hidden / "catalog.txt").write_text("needle hidden\n")
+
+    result = _search(_ops(root), "_search_with_grep", "needle", root)
+
+    assert result.error is None
+    assert [match.path for match in result.matches] == [str(root / "visible.txt")]
+
+
 class TestSplitToolDiagnostics:
     """Unit coverage for the shape-based diagnostic/payload splitter."""
 

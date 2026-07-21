@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -37,9 +38,10 @@ from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
 logger = logging.getLogger(__name__)
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
+DEFAULT_X_SEARCH_MODEL = "grok-4.5"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 180
 DEFAULT_X_SEARCH_RETRIES = 2
+X_SEARCH_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 MAX_HANDLES = 10
 
 
@@ -59,6 +61,22 @@ def _load_x_search_config() -> Dict[str, Any]:
 def _get_x_search_model() -> str:
     cfg = _load_x_search_config()
     return (str(cfg.get("model") or "").strip() or DEFAULT_X_SEARCH_MODEL)
+
+
+def _get_x_search_reasoning_effort() -> Optional[str]:
+    cfg = _load_x_search_config()
+    raw_value = cfg.get("reasoning_effort")
+    if raw_value is None or not str(raw_value).strip():
+        return None
+
+    effort = str(raw_value).strip().lower()
+    if effort not in X_SEARCH_REASONING_EFFORTS:
+        allowed = ", ".join(X_SEARCH_REASONING_EFFORTS)
+        raise ValueError(
+            f"x_search.reasoning_effort must be one of: {allowed} "
+            f"(got {raw_value!r})"
+        )
+    return effort
 
 
 def _get_x_search_timeout_seconds() -> int:
@@ -133,6 +151,40 @@ def _normalize_handles(handles: Optional[List[str]], field_name: str) -> List[st
     if len(cleaned) > MAX_HANDLES:
         raise ValueError(f"{field_name} supports at most {MAX_HANDLES} handles")
     return cleaned
+
+
+def _parse_iso_date(value: str, field_name: str) -> date:
+    """Parse a strict YYYY-MM-DD string into a date."""
+    raw = value.strip()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be YYYY-MM-DD (got {raw!r})"
+        ) from exc
+
+
+def _validate_date_range(from_date: str, to_date: str) -> None:
+    """Reject malformed, inverted, or not-yet-started X search windows."""
+    parsed_from: Optional[date] = None
+    parsed_to: Optional[date] = None
+    if from_date.strip():
+        parsed_from = _parse_iso_date(from_date, "from_date")
+    if to_date.strip():
+        parsed_to = _parse_iso_date(to_date, "to_date")
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise ValueError(
+            f"from_date ({parsed_from.isoformat()}) must be on or before "
+            f"to_date ({parsed_to.isoformat()})"
+        )
+    if parsed_from is not None:
+        today_utc = datetime.now(timezone.utc).date()
+        if parsed_from > today_utc:
+            raise ValueError(
+                f"from_date ({parsed_from.isoformat()}) is in the future; "
+                f"X Search only indexes past posts (today UTC is "
+                f"{today_utc.isoformat()})"
+            )
 
 
 def _extract_response_text(payload: Dict[str, Any]) -> str:
@@ -224,6 +276,17 @@ def x_search_tool(
         if allowed and excluded:
             return tool_error("allowed_x_handles and excluded_x_handles cannot be used together")
 
+
+        try:
+            _validate_date_range(from_date, to_date)
+        except ValueError as exc:
+            return tool_error(str(exc))
+
+        try:
+            reasoning_effort = _get_x_search_reasoning_effort()
+        except ValueError as exc:
+            return tool_error(str(exc))
+
         tool_def: Dict[str, Any] = {"type": "x_search"}
         if allowed:
             tool_def["allowed_x_handles"] = allowed
@@ -249,6 +312,8 @@ def x_search_tool(
             "tools": [tool_def],
             "store": False,
         }
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
 
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
@@ -298,6 +363,22 @@ def x_search_tool(
         citations = list(data.get("citations") or [])
         inline_citations = _extract_inline_citations(data)
 
+        active_filters: List[str] = []
+        if allowed:
+            active_filters.append("allowed_x_handles")
+        if excluded:
+            active_filters.append("excluded_x_handles")
+        if from_date.strip():
+            active_filters.append("from_date")
+        if to_date.strip():
+            active_filters.append("to_date")
+        degraded = bool(active_filters) and not citations and not inline_citations
+        degraded_reason = (
+            f"no citations returned despite filters: {', '.join(active_filters)}"
+            if degraded
+            else None
+        )
+
         return json.dumps(
             {
                 "success": True,
@@ -309,6 +390,8 @@ def x_search_tool(
                 "answer": answer,
                 "citations": citations,
                 "inline_citations": inline_citations,
+                "degraded": degraded,
+                "degraded_reason": degraded_reason,
             },
             ensure_ascii=False,
         )

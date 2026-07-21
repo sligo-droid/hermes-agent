@@ -41,9 +41,25 @@ def client(monkeypatch, isolated_profiles):
     from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
-    c = TestClient(app)
+    previous_host = getattr(app.state, "bound_host", None)
+    previous_port = getattr(app.state, "bound_port", None)
+    previous_auth_required = getattr(app.state, "auth_required", None)
+    app.state.bound_host = "127.0.0.1"
+    app.state.bound_port = 9119
+    app.state.auth_required = False
+    c = TestClient(
+        app,
+        base_url="http://127.0.0.1:9119",
+        client=("127.0.0.1", 50000),
+    )
     c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
-    return c
+    try:
+        yield c
+    finally:
+        c.close()
+        app.state.bound_host = previous_host
+        app.state.bound_port = previous_port
+        app.state.auth_required = previous_auth_required
 
 
 def _cfg(home):
@@ -160,6 +176,30 @@ class TestProfileScopedMcp:
         assert any(s["name"] == "scoped-srv" for s in listing["servers"])
         listing = client.get("/api/mcp/servers").json()
         assert not any(s["name"] == "scoped-srv" for s in listing["servers"])
+
+    def test_mcp_bearer_secret_is_profile_scoped(self, client, isolated_profiles):
+        secret = "worker-only-secret"
+        response = client.post(
+            "/api/mcp/servers",
+            params={"profile": "worker_beta"},
+            json={
+                "name": "profile-bearer",
+                "url": "https://example.com/mcp",
+                "auth": "header",
+                "bearer_token": secret,
+            },
+        )
+
+        assert response.status_code == 200
+        worker_cfg = _cfg(isolated_profiles["worker_beta"])
+        assert worker_cfg["mcp_servers"]["profile-bearer"]["headers"] == {
+            "Authorization": "Bearer ${MCP_PROFILE_BEARER_API_KEY}",
+        }
+        assert secret in (isolated_profiles["worker_beta"] / ".env").read_text()
+        assert not (isolated_profiles["default"] / ".env").exists()
+        assert "profile-bearer" not in _cfg(isolated_profiles["default"]).get(
+            "mcp_servers", {}
+        )
 
     def test_mcp_enabled_toggle_scoped(self, client, isolated_profiles):
         (isolated_profiles["worker_beta"] / "config.yaml").write_text(
@@ -294,9 +334,36 @@ class TestProfileScopedModel:
         resp = client.get("/api/model/auxiliary", params={"profile": "ghost"})
         assert resp.status_code == 404
 
-    def test_model_options_scoped_to_profile(self, client, isolated_profiles):
+    def test_model_options_scoped_to_profile(
+        self, client, isolated_profiles, monkeypatch
+    ):
         """The Models picker must read the SAME profile model/set writes —
         current model/provider in the payload come from the scoped config."""
+        from hermes_cli.config import load_config
+
+        def fake_picker_context():
+            cfg = load_config()
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            if not isinstance(model_cfg, dict):
+                return {
+                    "providers": [],
+                    "model": str(model_cfg or ""),
+                    "provider": "",
+                }
+            return {
+                "providers": [],
+                "model": str(model_cfg.get("default", "") or ""),
+                "provider": str(model_cfg.get("provider", "") or ""),
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.inventory.load_picker_context",
+            fake_picker_context,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.inventory.build_models_payload",
+            lambda context, **_kwargs: context,
+        )
         (isolated_profiles["worker_beta"] / "config.yaml").write_text(
             "model:\n  provider: openrouter\n  default: worker/current-pin\n",
             encoding="utf-8",
@@ -315,6 +382,36 @@ class TestProfileScopedModel:
     def test_model_options_unknown_profile_404(self, client, isolated_profiles):
         resp = client.get("/api/model/options", params={"profile": "ghost"})
         assert resp.status_code == 404
+
+    def test_model_options_hides_unconfigured_providers_by_default(self, client, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.inventory.load_picker_context",
+            lambda: object(),
+        )
+
+        def _fake_build_models_payload(_ctx, **kwargs):
+            calls.append(kwargs)
+            return {"providers": [], "model": "", "provider": ""}
+
+        monkeypatch.setattr(
+            "hermes_cli.inventory.build_models_payload",
+            _fake_build_models_payload,
+        )
+
+        resp = client.get("/api/model/options")
+        assert resp.status_code == 200
+        assert calls[-1]["explicit_only"] is False
+        assert calls[-1]["include_unconfigured"] is False
+
+        resp = client.get("/api/model/options", params={"explicit_only": "1"})
+        assert resp.status_code == 200
+        assert calls[-1]["explicit_only"] is True
+
+        resp = client.get("/api/model/options", params={"include_unconfigured": "1"})
+        assert resp.status_code == 200
+        assert calls[-1]["include_unconfigured"] is True
 
     def test_model_info_unknown_profile_404(self, client, isolated_profiles):
         """Regression: the broad except used to convert the 404 into a 200
@@ -428,7 +525,9 @@ class TestProfileScopedGateway:
             return None
 
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
-        monkeypatch.setattr(web_server, "get_running_pid", fake_get_running_pid)
+        # get_status probes via the TTL-cached wrapper (PR #53511 salvage);
+        # patch the cached name so the fake still intercepts the probe.
+        monkeypatch.setattr(web_server, "get_running_pid_cached", fake_get_running_pid)
         monkeypatch.setattr(
             web_server,
             "read_runtime_status",
@@ -463,7 +562,7 @@ class TestProfileScopedGateway:
             "updated_at": "2026-06-17T00:00:00+00:00",
         }
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
-        monkeypatch.setattr(web_server, "get_running_pid", lambda: None)
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: None)
         monkeypatch.setattr(web_server, "read_runtime_status", lambda: runtime)
         monkeypatch.setattr(
             web_server, "get_runtime_status_running_pid", lambda payload: 4242

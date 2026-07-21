@@ -265,6 +265,7 @@ async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adap
             "channel: #general",
             "alex: Please prepare the client kickoff notes.",
         ],
+        actionable_thread_context=False,
     )
 
 

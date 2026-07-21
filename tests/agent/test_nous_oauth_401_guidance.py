@@ -49,7 +49,7 @@ def test_nous_401_guidance_strings_present():
     assert "Nous Portal OAuth token was rejected" in source
 
     # Must give a concrete re-auth command, not a generic "hermes setup".
-    assert "hermes portal" in source
+    assert "hermes auth add nous --type oauth" in source
 
     # Must point at the portal so users can check account/credit status.
     assert "portal.nousresearch.com" in source

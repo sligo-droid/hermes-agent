@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+RUNNER_IMPLEMENTATION_CLASS = "_GatewayRunnerCore"
 
 
 def _module_tree() -> ast.Module:
@@ -50,7 +51,7 @@ def _name_is_loaded(function: ast.AsyncFunctionDef, name: str) -> bool:
 def test_run_agent_does_not_reference_message_event_outside_scope():
     """_run_agent is called with scalar event fields; it must not load `event`."""
     tree = _module_tree()
-    run_agent = _class_function(tree, "GatewayRunner", "_run_agent")
+    run_agent = _class_function(tree, RUNNER_IMPLEMENTATION_CLASS, "_run_agent")
 
     args = [arg.arg for arg in run_agent.args.args + run_agent.args.kwonlyargs]
     assert "fable_plan_metadata" in args
@@ -60,7 +61,11 @@ def test_run_agent_does_not_reference_message_event_outside_scope():
 def test_background_task_does_not_reference_message_event_outside_scope():
     """Background tasks do not carry MessageEvent; constructor kwargs must not load `event`."""
     tree = _module_tree()
-    background_task = _class_function(tree, "GatewayRunner", "_run_background_task")
+    background_task = _class_function(
+        tree,
+        RUNNER_IMPLEMENTATION_CLASS,
+        "_run_background_task",
+    )
 
     assert not _name_is_loaded(background_task, "event")
 
@@ -68,7 +73,11 @@ def test_background_task_does_not_reference_message_event_outside_scope():
 def test_handle_message_forwards_fable_metadata_to_run_agent():
     """Fable metadata is the only event-scoped value _run_agent needs for fallback suppression."""
     tree = _module_tree()
-    handle_message = _class_function(tree, "GatewayRunner", "_handle_message_with_agent")
+    handle_message = _class_function(
+        tree,
+        RUNNER_IMPLEMENTATION_CLASS,
+        "_handle_message_with_agent",
+    )
     calls = _self_method_calls(handle_message, "_run_agent")
 
     assert calls, "_handle_message_with_agent should call self._run_agent"

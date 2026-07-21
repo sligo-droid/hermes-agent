@@ -180,8 +180,7 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
         )
 
     assert result is not None
-    assert "queued voice transcript" in result
-    assert "voice message" in result.lower()
+    assert result == '"queued voice transcript"'
 
 
 @pytest.mark.asyncio

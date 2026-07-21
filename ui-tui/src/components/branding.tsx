@@ -222,6 +222,12 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   const toolEntries = Object.entries(info.tools).sort()
   const toolsTotal = flat(info.tools).length
 
+  // MCP headline counts *connected* servers, not configured-but-disabled ones,
+  // so it matches the classic CLI banner (`sum(s.connected)` in
+  // hermes_cli/banner.py) and the "connected" label on the collapse toggle.
+  const mcpServers = info.mcp_servers ?? []
+  const mcpConnected = mcpServers.filter(s => s.connected).length
+
   const toolsBody = () => {
     const shown = toolEntries.slice(0, TOOLSETS_MAX)
     const overflow = toolEntries.length - TOOLSETS_MAX
@@ -240,13 +246,9 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   }
 
   // ── Collapsible MCP section ──
-  const mcpServers = info.mcp_servers ?? []
-  const mcpConnected = mcpServers.filter(s => s.connected).length
-  const mcpSuffix = mcpServers.length === 0 ? undefined : `${mcpConnected} connected`
-
   const mcpBody = () => (
     <>
-      {mcpServers.map(s => (
+      {(info.mcp_servers ?? []).map(s => (
         <Text key={s.name} wrap="truncate">
           <Text color={t.color.muted}>{`  ${s.name} `}</Text>
           <Text color={t.color.muted}>{`[${s.transport}]`}</Text>
@@ -255,6 +257,12 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
             <Text color={t.color.text}>
               {s.tools} tool{s.tools === 1 ? '' : 's'}
             </Text>
+          ) : s.disabled || s.status === 'disabled' ? (
+            <Text color={t.color.muted}>disabled</Text>
+          ) : s.status === 'connecting' ? (
+            <Text color={t.color.warn}>connecting</Text>
+          ) : s.status === 'configured' ? (
+            <Text color={t.color.muted}>configured</Text>
           ) : (
             <Text color={t.color.error}>failed</Text>
           )}
@@ -367,10 +375,10 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         {mcpServers.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             <CollapseToggle
-              count={mcpServers.length}
+              count={mcpConnected}
               onToggle={() => setMcpOpen(v => !v)}
               open={mcpOpen}
-              suffix={mcpSuffix}
+              suffix="connected"
               t={t}
               title="MCP Servers"
             />
@@ -383,7 +391,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         <Text color={t.color.text}>
           {toolsTotal} tools{' · '}
           {skillsTotal} skills
-          {mcpServers.length ? ` · ${mcpServers.length} MCP` : ''}
+          {mcpConnected ? ` · ${mcpConnected} MCP` : ''}
           {' · '}
           <Text color={t.color.muted}>/help for commands</Text>
         </Text>
@@ -402,6 +410,12 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
               {' '}
               to update
             </Text>
+          </Text>
+        )}
+
+        {info.install_warning && (
+          <Text bold color={t.color.warn} wrap="wrap">
+            ! {info.install_warning}
           </Text>
         )}
       </Box>

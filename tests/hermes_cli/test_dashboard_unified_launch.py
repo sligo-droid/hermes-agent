@@ -201,6 +201,9 @@ class TestUnifiedDashboardRouting:
         monkeypatch.delenv("HERMES_WEB_DIST", raising=False)
         monkeypatch.setattr(main_mod, "_sync_bundled_skills_quietly", lambda: None)
         monkeypatch.setattr(main_mod, "_build_web_ui", lambda *_a, **_k: True)
+        monkeypatch.setattr(
+            main_mod, "ensure_dashboard_port_available", lambda *_a, **_k: None
+        )
         monkeypatch.setitem(sys.modules, "fastapi", types.SimpleNamespace())
         monkeypatch.setitem(sys.modules, "uvicorn", types.SimpleNamespace())
         monkeypatch.setitem(

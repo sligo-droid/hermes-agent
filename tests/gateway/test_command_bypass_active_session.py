@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 

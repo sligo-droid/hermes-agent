@@ -81,8 +81,8 @@ class TestMentionStrippedCommandDispatch:
 
 
 class TestAutoThreadingPreservesCommand:
-    async def test_command_detected_after_auto_thread(self, discord_adapter, bot_user, monkeypatch):
-        """@mention /help in channel with auto-thread → thread created AND command dispatched."""
+    async def test_simple_command_stays_inline(self, discord_adapter, bot_user, monkeypatch):
+        """Simple commands stay inline; work-starting commands own threads."""
         monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
         fake_thread = make_fake_thread(thread_id=90001, name="help")
         msg = make_discord_message(
@@ -101,7 +101,7 @@ class TestAutoThreadingPreservesCommand:
         msg.create_thread = AsyncMock(side_effect=clobber_content)
         await dispatch(discord_adapter, msg)
 
-        msg.create_thread.assert_awaited_once()
+        msg.create_thread.assert_not_awaited()
         response = get_response_text(discord_adapter)
         assert response is not None
         assert "/new" in response

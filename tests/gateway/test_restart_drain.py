@@ -292,19 +292,25 @@ async def test_windows_detached_restart_scrubs_gateway_marker(monkeypatch, tmp_p
 
 @pytest.mark.asyncio
 async def test_shutdown_notification_not_sent_to_active_sessions():
-    """Active sessions do not receive gateway lifecycle warnings."""
+    """Active sessions receive the current interruption lifecycle warning.
+
+    The historical node name is retained so merge verification can target the
+    original fork regression directly.
+    """
     runner, adapter = make_restart_runner()
     session_key = f"agent:main:telegram:dm:999"
     runner._running_agents[session_key] = MagicMock()
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == []
+    assert len(adapter.sent) == 1
+    assert "shutting down" in adapter.sent[0]
+    assert "interrupted" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
 async def test_home_shutdown_notification_says_restarting_when_restart_requested():
-    """The operator home channel still gets the restart lifecycle notice."""
+    """Distinct active and home targets both get the restart notice."""
     from gateway.config import HomeChannel, Platform
 
     runner, adapter = make_restart_runner()
@@ -319,14 +325,14 @@ async def test_home_shutdown_notification_says_restarting_when_restart_requested
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
-    assert "restarting" in adapter.sent[0]
-    assert "resume" in adapter.sent[0]
+    assert len(adapter.sent) == 2
+    assert all("restarting" in message for message in adapter.sent)
+    assert all("resume" in message for message in adapter.sent)
 
 
 @pytest.mark.asyncio
 async def test_shutdown_notification_ignores_multiple_active_sessions():
-    """Multiple active sessions still do not trigger session-scoped warnings."""
+    """Multiple active sessions sharing a target produce one warning."""
     runner, adapter = make_restart_runner()
     # Two sessions (different users) in the same chat
     runner._running_agents["agent:main:telegram:group:chat1:u1"] = MagicMock()
@@ -334,7 +340,8 @@ async def test_shutdown_notification_ignores_multiple_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == []
+    assert len(adapter.sent) == 1
+    assert "shutting down" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
@@ -435,7 +442,7 @@ async def test_shutdown_notification_home_channel_suppressed_when_flag_disabled(
 
 @pytest.mark.asyncio
 async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
-    """Persisted active-session origins no longer receive lifecycle warnings."""
+    """Persisted origins route active warnings without reparsing colon IDs."""
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock()
     source = make_restart_source(chat_id="!room123:example.org", chat_type="group")
@@ -457,4 +464,5 @@ async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    adapter.send.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[0] == "!room123:example.org"

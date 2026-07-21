@@ -28,6 +28,7 @@ from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock, patch
 
+from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import make_tool_result_message
 from run_agent import AIAgent
 
@@ -285,7 +286,8 @@ def test_final_budget_and_steer_mutations_replace_incremental_sqlite_rows(tmp_pa
     rows = db.get_messages(agent.session_id)
     assert len(rows) == 1
     assert rows[0]["content"] == (
-        "aggregate-budgeted-result\n\nUser guidance: keep the final guidance"
+        "aggregate-budgeted-result"
+        + format_steer_marker("keep the final guidance")
     )
 
 

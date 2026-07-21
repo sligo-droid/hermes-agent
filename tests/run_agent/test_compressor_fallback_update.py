@@ -69,6 +69,7 @@ def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
         base_url="https://api.openai.com/v1",
         api_key="sk-fallback",
         api_mode="codex_responses",
+        auth_mode="",
     )
 
     c = agent.context_compressor

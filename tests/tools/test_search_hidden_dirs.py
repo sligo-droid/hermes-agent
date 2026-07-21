@@ -13,9 +13,16 @@ Fix: _search_files (find) and _search_with_grep both now exclude hidden
 directories, matching ripgrep's default behavior.
 """
 
-import subprocess
+import shutil
 
 import pytest
+
+from tools.file_operations import ShellFileOperations
+from tools.environments.local import LocalEnvironment
+
+
+def _ops(root):
+    return ShellFileOperations(LocalEnvironment(cwd=str(root)), cwd=str(root))
 
 
 @pytest.fixture
@@ -44,82 +51,85 @@ def searchable_tree(tmp_path):
 class TestFindExcludesHiddenDirs:
     """_search_files uses find, which should exclude hidden directories."""
 
+    @staticmethod
+    def _search(searchable_tree, pattern):
+        ops = _ops(searchable_tree)
+        ops._command_cache.update({"rg": False, "find": True})
+        return ops._search_files(pattern, str(searchable_tree), limit=50, offset=0)
+
     def test_find_skips_hub_cache_files(self, searchable_tree):
         """find should not return files from .hub/ directory."""
-        cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.json'"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "catalog.json" not in result.stdout
-        assert ".hub" not in result.stdout
+        result = self._search(searchable_tree, "*.json")
+        assert not result.error
+        assert not result.files
 
     def test_find_skips_git_internals(self, searchable_tree):
         """find should not return files from .git/ directory."""
-        cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.idx'"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "pack-abc.idx" not in result.stdout
-        assert ".git" not in result.stdout
+        result = self._search(searchable_tree, "*.idx")
+        assert not result.error
+        assert not result.files
 
     def test_find_still_returns_visible_files(self, searchable_tree):
         """find should still return files from visible directories."""
-        cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.md'"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "SKILL.md" in result.stdout
+        result = self._search(searchable_tree, "*.md")
+        assert not result.error
+        assert [path.rsplit("/", 1)[-1] for path in result.files] == ["SKILL.md"]
 
 
 class TestGrepExcludesHiddenDirs:
     """_search_with_grep should exclude hidden directories."""
 
+    @staticmethod
+    def _search(searchable_tree, pattern):
+        return _ops(searchable_tree)._search_with_grep(
+            pattern,
+            str(searchable_tree),
+            file_glob=None,
+            limit=50,
+            offset=0,
+            output_mode="content",
+            context=0,
+        )
+
     def test_grep_skips_hub_cache(self, searchable_tree):
         """grep --exclude-dir should skip .hub/ directory."""
-        cmd = (
-            f"grep -rnH --exclude-dir='.*' 'ignore' {searchable_tree}"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        # Should NOT find the injection text in .hub/index-cache/catalog.json
-        assert ".hub" not in result.stdout
-        assert "catalog.json" not in result.stdout
+        result = self._search(searchable_tree, "ignore")
+        assert not result.error
+        assert not result.matches
 
     def test_grep_still_finds_visible_content(self, searchable_tree):
         """grep should still find content in visible directories."""
-        cmd = (
-            f"grep -rnH --exclude-dir='.*' 'real skill' {searchable_tree}"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "SKILL.md" in result.stdout
+        result = self._search(searchable_tree, "real skill")
+        assert not result.error
+        assert [match.path.rsplit("/", 1)[-1] for match in result.matches] == ["SKILL.md"]
 
 
 class TestRipgrepAlreadyExcludesHidden:
     """Verify ripgrep's default behavior is to skip hidden directories."""
 
     @pytest.mark.skipif(
-        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        shutil.which("rg") is None,
         reason="ripgrep not installed",
     )
     def test_rg_skips_hub_by_default(self, searchable_tree):
         """rg should skip .hub/ by default (no --hidden flag)."""
-        result = subprocess.run(
-            ["rg", "--no-heading", "ignore", str(searchable_tree)],
-            capture_output=True, text=True,
+        result = _ops(searchable_tree)._search_with_rg(
+            "ignore", str(searchable_tree), None, 50, 0, "content", 0,
         )
-        assert ".hub" not in result.stdout
-        assert "catalog.json" not in result.stdout
+        assert not result.error
+        assert not result.matches
 
     @pytest.mark.skipif(
-        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        shutil.which("rg") is None,
         reason="ripgrep not installed",
     )
     def test_rg_finds_visible_content(self, searchable_tree):
         """rg should find content in visible directories."""
-        result = subprocess.run(
-            ["rg", "--no-heading", "real skill", str(searchable_tree)],
-            capture_output=True, text=True,
+        result = _ops(searchable_tree)._search_with_rg(
+            "real skill", str(searchable_tree), None, 50, 0, "content", 0,
         )
-        assert "SKILL.md" in result.stdout
+        assert not result.error
+        assert [match.path.rsplit("/", 1)[-1] for match in result.matches] == ["SKILL.md"]
 
 
 class TestIgnoreFileWritten:

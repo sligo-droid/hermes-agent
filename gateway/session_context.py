@@ -69,6 +69,7 @@ _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNS
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+_SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=_UNSET)
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
@@ -107,6 +108,7 @@ _VAR_MAP = {
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
+    "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_CWD": _SESSION_CWD,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_PROJECT_KEY": _PROJECT_KEY,
@@ -187,6 +189,7 @@ def set_session_vars(
     user_name: str = "",
     session_key: str = "",
     session_id: str = "",
+    ui_session_id: str = "",
     session_cwd: str = "",
     cwd: str = "",
     profile: str = "",
@@ -226,6 +229,7 @@ def set_session_vars(
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
         _SESSION_ID.set(session_id),
+        _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_CWD.set(effective_cwd),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
@@ -272,6 +276,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_USER_NAME,
         _SESSION_KEY,
         _SESSION_ID,
+        _SESSION_UI_SESSION_ID,
         _SESSION_CWD,
         _SESSION_PROFILE,
         _PROJECT_KEY,
@@ -334,6 +339,31 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def declare_stateless_channel() -> None:
+    """Declare that this session cannot receive an async background completion.
+
+    Binds only the delivery capability, leaving every other session var unset.
+    Use this instead of ``set_session_vars(async_delivery=False)`` on a pure
+    single-process runner: ``set_session_vars`` also latches
+    ``_session_context_engaged`` (see above), which switches the subprocess
+    env bridge from "os.environ fallback" to "ContextVar-authoritative, strip on
+    _UNSET" in ``tools/environments/local.py``. A one-shot CLI that never engages
+    the session-context system must not flip that latch as a side effect of
+    declaring a capability.
+
+    Callers that already build a full session context (cron's ``run_job``) get
+    the same state by passing ``async_delivery=False`` to ``set_session_vars``.
+
+    A session that cannot take a late completion makes ``delegate_task`` fall
+    through to its existing inline/synchronous path, so subagent results are
+    returned within the turn instead of being dispatched to a channel that will
+    never deliver them.
+
+    See NousResearch/hermes-agent#53027 and #63142.
+    """
+    _SESSION_ASYNC_DELIVERY.set(False)
 
 
 def async_delivery_supported() -> bool:

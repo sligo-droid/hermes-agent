@@ -2,10 +2,12 @@
 
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs, resume_job, update_job
+from hermes_cli import cron as cron_cli
 from hermes_cli.gateway import GatewayRuntimeHealth
 from hermes_cli.cron import _print_overdue_proposal_findings, cron_command, cron_list, cron_status
 
@@ -113,6 +115,30 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
         assert jobs[0]["profile"] == "default"
+
+    def test_list_does_not_crash_when_repeat_is_null(self, tmp_cron_dir, capsys):
+        from cron.jobs import load_jobs, save_jobs
+
+        create_job(prompt="One shot", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["repeat"] = None
+        save_jobs(jobs)
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        assert "Repeat:    ∞" in capsys.readouterr().out
+
+    def test_list_does_not_crash_when_deliver_is_null(self, tmp_cron_dir, capsys):
+        from cron.jobs import load_jobs, save_jobs
+
+        create_job(prompt="No deliver", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["deliver"] = None
+        save_jobs(jobs)
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        assert "Deliver:   local" in capsys.readouterr().out
 
     def test_list_renders_terminal_auto_pause_metadata(self, tmp_cron_dir, capsys, monkeypatch):
         monkeypatch.setattr(
@@ -294,3 +320,178 @@ def test_overdue_proposal_findings_render_operator_evidence(capsys):
     assert "Last output: /tmp/output.md" in out
     assert "cron_17abff6b6061_20260613_060016" in out
     assert "agent.log: missed its scheduled time" in out
+
+
+def test_cron_create_warns_when_builtin_gateway_is_absent(tmp_cron_dir, monkeypatch, capsys):
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+
+    cron_command(
+        Namespace(
+            cron_command="create",
+            schedule="0 11 * * *",
+            prompt="Daily report",
+            name="Daily 1130",
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            profile=None,
+            script=None,
+            workdir=None,
+            no_agent=False,
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "Created job" in out
+    assert "Gateway is not running" in out
+
+
+def test_cron_list_warns_when_builtin_gateway_is_absent(monkeypatch, capsys):
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+    monkeypatch.setattr(
+        "cron.jobs.list_jobs",
+        lambda include_disabled=False: [
+            {
+                "id": "job-1",
+                "name": "Nightly docs",
+                "schedule_display": "every day",
+                "state": "scheduled",
+                "enabled": True,
+                "next_run_at": "2026-06-01T00:00:00Z",
+                "deliver": ["local"],
+            }
+        ],
+    )
+
+    cron_cli.cron_list()
+
+    out = capsys.readouterr().out
+    assert "Gateway is not running" in out
+    assert "Nightly docs" in out
+
+
+def test_cron_status_reports_external_provider_without_ticker_warning(
+    tmp_cron_dir, monkeypatch, capsys
+):
+    create_job(prompt="Ping", schedule="every 2m")
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "chronos")
+
+    cron_cli.cron_status()
+
+    out = capsys.readouterr().out
+    assert "chronos" in out
+    assert "managed scheduler" in out
+    assert "STALLED" not in out
+    assert "Gateway is not running" not in out
+    assert "1 active job(s)" in out
+
+
+def test_cron_create_is_quiet_for_external_provider_without_gateway(
+    tmp_cron_dir, monkeypatch, capsys
+):
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "chronos")
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+
+    cron_command(
+        Namespace(
+            cron_command="create",
+            schedule="every 2m",
+            prompt="Ping",
+            name="Ping",
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            profile=None,
+            script=None,
+            workdir=None,
+            no_agent=False,
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "Created job" in out
+    assert "Gateway is not running" not in out
+
+
+def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):
+    calls = []
+    monkeypatch.setattr("cron.scheduler.tick", lambda verbose=False: calls.append(verbose))
+
+    cron_cli.cron_tick()
+
+    assert calls == [True]
+
+
+def test_cron_create_success_prints_job_details(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: {
+            "success": True,
+            "job_id": "job-1",
+            "name": "Nightly docs",
+            "schedule": "every day",
+            "skills": ["docs"],
+            "next_run_at": "2026-06-01T00:00:00Z",
+            "job": {
+                "script": "scripts/build_docs.py",
+                "no_agent": True,
+                "workdir": "/tmp/repo",
+            },
+        },
+    )
+    monkeypatch.setattr(cron_cli, "_warn_if_gateway_not_running", lambda: None)
+
+    rc = cron_cli.cron_create(
+        SimpleNamespace(
+            schedule="every day",
+            prompt="refresh docs",
+            name="Nightly docs",
+            deliver=None,
+            repeat=None,
+            skill="docs",
+            skills=None,
+            script="scripts/build_docs.py",
+            workdir="/tmp/repo",
+            no_agent=True,
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Created job: job-1" in out
+    assert "Skills: docs" in out
+    assert "Script: scripts/build_docs.py" in out
+    assert "Mode: no-agent" in out
+    assert "Workdir: /tmp/repo" in out
+    assert "Next run: 2026-06-01T00:00:00Z" in out
+
+
+def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: {"success": False, "error": "boom"},
+    )
+
+    rc = cron_cli.cron_create(
+        SimpleNamespace(
+            schedule="every day",
+            prompt="refresh docs",
+            name=None,
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            script=None,
+            workdir=None,
+            no_agent=False,
+        )
+    )
+
+    assert rc == 1
+    assert "Failed to create job: boom" in capsys.readouterr().out

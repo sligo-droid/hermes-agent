@@ -3,7 +3,12 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider, resolve_api_key_provider_credentials
+from hermes_cli.auth import (
+    AuthError,
+    PROVIDER_REGISTRY,
+    resolve_api_key_provider_credentials,
+    resolve_provider,
+)
 from hermes_cli.models import _PROVIDER_MODELS, _PROVIDER_LABELS, _PROVIDER_ALIASES, normalize_provider
 from hermes_cli.model_normalize import normalize_model_for_provider, detect_vendor
 from agent.model_metadata import get_model_context_length
@@ -30,6 +35,15 @@ class TestGeminiProviderRegistry:
 
     def test_gemini_base_url(self):
         assert "generativelanguage.googleapis.com" in PROVIDER_REGISTRY["gemini"].inference_base_url
+
+    @pytest.mark.parametrize(
+        "removed_provider",
+        ("google-gemini-cli", "gemini-cli", "gemini-oauth"),
+    )
+    def test_removed_cloudcode_oauth_providers_stay_absent(self, removed_provider):
+        assert removed_provider not in PROVIDER_REGISTRY
+        with pytest.raises(AuthError, match="Unknown provider"):
+            resolve_provider(removed_provider)
 
 
 # ── Provider Aliases ──

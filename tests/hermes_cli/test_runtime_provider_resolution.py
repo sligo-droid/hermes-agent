@@ -1,10 +1,52 @@
 import base64
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli import runtime_provider as rp
+
+
+def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
+    """A saved provider must not resolve as another authenticated provider."""
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "deepseek", "default": "deepseek-v4-pro"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "provider": "deepseek",
+            "api_key": "",
+            "base_url": "https://api.deepseek.com/v1",
+            "source": "default",
+        },
+    )
+
+    with pytest.raises(rp.AuthError, match="No usable credentials.*deepseek"):
+        rp.resolve_runtime_provider()
+
+
+def test_noauth_lmstudio_still_resolves(monkeypatch):
+    """The fail-closed key guard preserves LM Studio's no-auth contract."""
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "provider": "lmstudio",
+            "api_key": "lmstudio-noauth",
+            "base_url": "http://localhost:1234/v1",
+            "source": "default",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+
+    assert resolved["provider"] == "lmstudio"
+    assert resolved["api_key"]
 
 
 def _fake_invoke_jwt(ttl_seconds=3600):
@@ -279,6 +321,11 @@ def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
     monkeypatch.setattr(
         rp,
+        "load_pool",
+        lambda _provider: SimpleNamespace(has_credentials=lambda: False),
+    )
+    monkeypatch.setattr(
+        rp,
         "resolve_qwen_runtime_credentials",
         lambda: {
             "provider": "qwen-oauth",
@@ -341,6 +388,11 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
         rp,
         "resolve_qwen_runtime_credentials",
         lambda **kw: (_ for _ in ()).throw(AuthError("stale", provider="qwen-oauth", code="qwen_auth_missing")),
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda _provider: SimpleNamespace(has_credentials=lambda: False),
     )
     monkeypatch.setattr(rp, "_get_model_config", lambda: {})
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
@@ -662,7 +714,7 @@ def test_custom_endpoint_uses_saved_config_base_url_when_env_missing(monkeypatch
     resolved = rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["base_url"] == "http://127.0.0.1:1234/v1"
-    assert resolved["api_key"] == "local-key"
+    assert resolved["api_key"] == "no-key-required"
 
 
 def test_custom_endpoint_uses_config_api_key_over_env(monkeypatch):
@@ -752,7 +804,7 @@ def test_bare_custom_uses_loopback_model_base_url_when_provider_not_custom(monke
 
     assert resolved["provider"] == "custom"
     assert resolved["base_url"] == "http://127.0.0.1:8082/v1"
-    assert resolved["api_key"] == "openai-key"
+    assert resolved["api_key"] == "no-key-required"
 
 
 def test_bare_custom_custom_base_url_env_overrides_remote_yaml(monkeypatch):
@@ -1163,7 +1215,7 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
     assert resolved["model"] == "claude-opus-4-8"
 
 
-def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
+def test_named_custom_provider_does_not_borrow_openai_api_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
@@ -1191,7 +1243,7 @@ def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="custom:local-llm")
 
     assert resolved["base_url"] == "http://localhost:1234/v1"
-    assert resolved["api_key"] == "env-openai-key"
+    assert resolved["api_key"] == "no-key-required"
     assert resolved["requested_provider"] == "custom:local-llm"
 
 
@@ -2064,7 +2116,7 @@ class TestOllamaUrlSubstringLeak:
 
     def test_ollama_key_not_leaked_to_path_injection(self, monkeypatch):
         """http://127.0.0.1:9000/ollama.com/v1 — attacker endpoint with
-        ollama.com in PATH. Must resolve to OPENAI_API_KEY, not OLLAMA_API_KEY."""
+        ollama.com in PATH. Must not borrow either unrelated global key."""
         monkeypatch.setenv("OPENAI_API_KEY", "oa-secret")
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
         monkeypatch.setenv("OLLAMA_API_KEY", "ol-SECRET-should-not-leak")
@@ -2081,7 +2133,7 @@ class TestOllamaUrlSubstringLeak:
             "OLLAMA_API_KEY must not be sent to an endpoint whose "
             "hostname is not ollama.com (GHSA-76xc-57q6-vm5m)"
         )
-        assert resolved["api_key"] == "oa-secret"
+        assert resolved["api_key"] == "no-key-required"
 
     def test_ollama_key_not_leaked_to_lookalike_host(self, monkeypatch):
         """ollama.com.attacker.test — look-alike host. OLLAMA_API_KEY
@@ -2098,7 +2150,7 @@ class TestOllamaUrlSubstringLeak:
         resolved = rp.resolve_runtime_provider(requested="custom")
 
         assert "ol-SECRET" not in resolved["api_key"]
-        assert resolved["api_key"] == "oa-secret"
+        assert resolved["api_key"] == "no-key-required"
 
     def test_ollama_key_sent_to_genuine_ollama_com(self, monkeypatch):
         """https://ollama.com/v1 — legit Ollama Cloud. OLLAMA_API_KEY

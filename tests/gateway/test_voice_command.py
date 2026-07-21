@@ -862,6 +862,9 @@ class TestVoiceChannelCommands:
         assert runner._voice_mode["discord:123"] == "all"
         assert mock_adapter._voice_sources[111]["chat_id"] == "123"
         assert mock_adapter._voice_sources[111]["chat_type"] == "group"
+        assert mock_adapter._voice_mode_getter("123") == "all"
+        runner._voice_mode["discord:123"] = "off"
+        assert mock_adapter._voice_mode_getter("123") == "off"
 
     @pytest.mark.asyncio
     async def test_join_failure(self, runner):
@@ -1226,9 +1229,9 @@ class TestDiscordVoiceChannelMethods:
         result = await adapter.play_in_voice_channel(111, "/tmp/test.ogg")
         assert result is False
 
-    def test_is_allowed_user_empty_list(self):
+    def test_is_allowed_user_empty_list_uses_trusted_development_default(self):
         adapter = self._make_adapter()
-        assert adapter._is_allowed_user("42") is False
+        assert adapter._is_allowed_user("42") is True
 
     def test_is_allowed_user_in_list(self):
         adapter = self._make_adapter()
@@ -2020,6 +2023,7 @@ class TestVoiceTimeoutCleansRunnerState:
 
         # Still connected, no disconnect callback, no "inactivity timeout" spam.
         assert 111 in adapter._voice_clients
+        assert 111 not in adapter._voice_timeout_tasks
         assert disconnect_calls == []
         mock_vc.disconnect.assert_not_called()
 

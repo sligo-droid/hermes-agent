@@ -120,3 +120,41 @@ def test_unavailable_rss_warns_and_does_not_start(caplog, monkeypatch):
     assert started is False
     assert mm.is_running() is False
     assert any("Memory monitoring unavailable" in r.getMessage() for r in caplog.records)
+
+
+def test_monitor_logging_survives_repeated_handler_rehome_and_teardown(
+    tmp_path, capsys
+):
+    """Stress the monitor against async QueueListener reconfiguration.
+
+    The full-suite cascade involved the monitor logging while per-test profile
+    handlers were being closed/re-homed. Exercise that race repeatedly in one
+    process and assert neither a monitor thread nor a closed-stream logging
+    diagnostic survives the lifecycle boundary.
+    """
+    import hermes_logging
+
+    hermes_logging.setup_logging(
+        hermes_home=tmp_path / "profile-0", mode="gateway", force=True
+    )
+    assert mm.start_memory_monitoring(interval_seconds=0.001) is True
+    try:
+        for index in range(1, 21):
+            hermes_logging.setup_logging(
+                hermes_home=tmp_path / f"profile-{index}",
+                mode="gateway",
+                force=True,
+            )
+            time.sleep(0.002)
+    finally:
+        mm.stop_memory_monitoring(timeout=1.0)
+        hermes_logging.shutdown_logging()
+
+    assert mm.is_running() is False
+    assert not any(
+        thread.name == "gateway-memory-monitor" and thread.is_alive()
+        for thread in __import__("threading").enumerate()
+    )
+    stderr = capsys.readouterr().err
+    assert "I/O operation on closed file" not in stderr
+    assert "--- Logging error ---" not in stderr

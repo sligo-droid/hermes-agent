@@ -2,7 +2,10 @@
 
 Hermes Agent uses a SQLite database (`~/.hermes/state.db`) to persist session
 metadata, full message history, and model configuration across CLI and gateway
-sessions. This replaces the earlier per-session JSONL file approach.
+sessions. SQLite is the primary store, while gateway sessions keep a legacy
+per-session JSONL compatibility transcript under `~/.hermes/sessions/`. When
+both exist, Hermes loads the longer valid transcript so a partially migrated
+or crash-recovered session does not lose older history.
 
 Source file: `hermes_state.py`
 
@@ -17,6 +20,9 @@ Source file: `hermes_state.py`
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
 ├── state_meta            — Key/value metadata table
 └── schema_version        — Single-row table tracking migration state
+
+~/.hermes/sessions/<session-id>.jsonl
+└── Gateway compatibility transcript and recovery fallback
 ```
 
 Key design decisions:
@@ -133,7 +139,7 @@ END;
 
 ## Schema Version and Migrations
 
-Current schema version: **11**
+Current schema version: **21**
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 
@@ -150,6 +156,11 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 9 | Add `codex_message_items` column to messages for Codex Responses message id/phase replay |
 | 10 | Add `messages_fts_trigram` virtual table (trigram tokenizer for CJK / substring search) and backfill existing rows |
 | 11 | Re-index `messages_fts` and `messages_fts_trigram` to cover `tool_name` + `tool_calls` and switch from external-content to inline mode; drop old triggers and backfill every message row |
+| 16 | Tag delegate subagent rows in `model_config` (`$._delegate_from`) so session pickers stay clean after parent deletes orphan them |
+| 18 | Gateway metadata consolidation — backfill `display_name` / `origin_json` / `expiry_finalized` from `sessions.json` |
+| 20 | Per-model usage attribution — seed `session_model_usage` rows from historical per-session aggregate totals |
+
+Versions not listed above were declarative column additions handled by `_reconcile_columns()` (version bump only, no data migration).
 
 Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to handle the column-already-exists case (idempotent). The version number is bumped after each successful migration block.
 

@@ -115,10 +115,10 @@ _CRON_EXFIL_COMMAND_PATTERNS = [
     (rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*(?:Bearer|token)\s+{_CRON_SECRET_VAR_RE}["\']', "exfil_curl_auth_header"),
 ]
 
-_CRON_INVISIBLE_CHARS = {
-    '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
-    '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
-}
+# Keep cron prompt screening in parity with the shared threat-pattern set.
+# U+2061-U+2064 invisible math operators and U+2066-U+2069 directional
+# isolates are real prompt-injection surfaces, not harmless formatting.
+from tools.threat_patterns import INVISIBLE_CHARS as _CRON_INVISIBLE_CHARS
 
 # U+200D Zero-Width Joiner is also a legitimate, required part of many
 # Unicode emoji sequences (for example 👨‍👩‍👧, 🏳️‍🌈, ❤️‍🩹, 🧑‍💻).
@@ -298,6 +298,29 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _local_delivery_notice(
+    job: Dict[str, Any], user_deliver: Optional[str]
+) -> Optional[str]:
+    """Explain when a local CLI/TUI cron job has no live delivery target."""
+    if (user_deliver or "").strip().lower() == "local":
+        return None
+    try:
+        from cron.scheduler import _resolve_delivery_targets
+
+        if _resolve_delivery_targets(job):
+            return None
+    except Exception:
+        if job.get("origin"):
+            return None
+    return (
+        "This is a local-only cron job: its output is saved (view it with "
+        "cronjob(action='list')) but will NOT be delivered back into this "
+        "session — CLI/TUI sessions have no live-delivery channel. To be "
+        "notified when it runs, recreate or update the job with deliver set to "
+        "a gateway-connected platform, e.g. deliver='telegram' or deliver='all'."
+    )
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
@@ -398,6 +421,83 @@ def _normalize_deliver_param(value: Any) -> Optional[str]:
     return text or None
 
 
+def _validate_cron_base_url(
+    provider: Optional[Any], base_url: Optional[Any]
+) -> Optional[str]:
+    """Reject pairing a named provider's stored credential with an off-host URL."""
+    normalized_base_url = _normalize_optional_job_value(
+        base_url, strip_trailing_slash=True
+    )
+    if not normalized_base_url:
+        return None
+
+    normalized_provider = _normalize_optional_job_value(provider)
+    if not normalized_provider:
+        return (
+            "base_url override requires an explicit provider. Set provider to a "
+            "configured custom provider to use a custom endpoint."
+        )
+
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        from hermes_cli.runtime_provider import (
+            _get_named_custom_provider,
+            has_named_custom_provider,
+            resolve_requested_provider,
+        )
+        from utils import base_url_host_matches, base_url_hostname
+    except Exception:
+        return (
+            f"Unable to validate base_url override for provider "
+            f"{normalized_provider!r}; refused."
+        )
+
+    if normalized_provider.lower() == "custom":
+        return None
+
+    if has_named_custom_provider(normalized_provider):
+        try:
+            custom_provider = _get_named_custom_provider(normalized_provider)
+        except Exception:
+            custom_provider = None
+        configured_host = (
+            base_url_hostname((custom_provider or {}).get("base_url", ""))
+            if custom_provider
+            else ""
+        )
+        if configured_host and base_url_host_matches(
+            normalized_base_url, configured_host
+        ):
+            return None
+        return (
+            f"base_url {normalized_base_url!r} is not allowed for provider "
+            f"{normalized_provider!r}. A named custom provider's stored credential "
+            f"may only be sent to its own configured endpoint "
+            f"({configured_host or 'unknown'})."
+        )
+
+    try:
+        resolved_provider = resolve_requested_provider(normalized_provider)
+    except Exception:
+        resolved_provider = normalized_provider
+    provider_config = (
+        PROVIDER_REGISTRY.get(resolved_provider)
+        if isinstance(resolved_provider, str)
+        else None
+    )
+    known_host = base_url_hostname(
+        getattr(provider_config, "inference_base_url", "") if provider_config else ""
+    )
+    if known_host and base_url_host_matches(normalized_base_url, known_host):
+        return None
+    return (
+        f"base_url {normalized_base_url!r} is not allowed for provider "
+        f"{normalized_provider!r}. A named provider's stored credential may only "
+        "be sent to its own endpoint; use a configured custom provider "
+        '(provider="custom") for a custom base_url.'
+    )
+
+
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
@@ -477,6 +577,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("profile"):
+        result["profile"] = job["profile"]
     return result
 
 
@@ -502,8 +604,18 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
-            return {"claimed": False, "success": False,
-                    "error": "Job is already being fired by the scheduler; not run again."}
+            # claim_job_for_fire returns False for paused/disabled/missing
+            # jobs too — don't mislabel those as "already being fired"
+            # (#60703): that message sends the user chasing a phantom
+            # in-flight run when the job simply isn't runnable.
+            refreshed = get_job(job_id)
+            if refreshed is None:
+                reason = "Job no longer exists; nothing to run."
+            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+                reason = "Job is paused/disabled; resume it before running."
+            else:
+                reason = "Job is already being fired by the scheduler; not run again."
+            return {"claimed": False, "success": False, "error": reason}
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -587,6 +699,10 @@ def cronjob(
                 if script_error:
                     return tool_error(script_error, success=False)
 
+            base_url_error = _validate_cron_base_url(provider, base_url)
+            if base_url_error:
+                return tool_error(base_url_error, success=False)
+
             # Validate context_from references existing jobs
             if context_from:
                 from cron.jobs import get_job as _get_job
@@ -621,6 +737,12 @@ def cronjob(
                 disable_on_terminal_success=bool(disable_on_terminal_success),
             )
             _notify_provider_jobs_changed_safe()
+            create_message = f"Cron job '{job['name']}' created."
+            local_notice = _local_delivery_notice(
+                job, _normalize_deliver_param(deliver)
+            )
+            if local_notice:
+                create_message = f"{create_message} {local_notice}"
             return json.dumps(
                 {
                     "success": True,
@@ -633,7 +755,7 @@ def cronjob(
                     "deliver": job.get("deliver", "local"),
                     "next_run_at": job["next_run_at"],
                     "job": _format_job(job),
-                    "message": f"Cron job '{job['name']}' created.",
+                    "message": create_message,
                 },
                 indent=2,
             )
@@ -712,7 +834,7 @@ def cronjob(
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
             if not exec_result.get("claimed", False):
-                result["execution_skipped"] = (
+                result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
             elif exec_result.get("error"):
@@ -744,6 +866,21 @@ def cronjob(
                 updates["reasoning_effort"] = _normalize_optional_job_value(reasoning_effort)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            effective_provider = (
+                updates["provider"]
+                if "provider" in updates
+                else job.get("provider")
+            )
+            effective_base_url = (
+                updates["base_url"]
+                if "base_url" in updates
+                else job.get("base_url")
+            )
+            base_url_error = _validate_cron_base_url(
+                effective_provider, effective_base_url
+            )
+            if base_url_error:
+                return tool_error(base_url_error, success=False)
             if script is not None:
                 # Pass empty string to clear an existing script
                 if script:
@@ -949,6 +1086,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "profile": {
+                "type": "string",
+                "description": "Optional Hermes profile ID for this job. The profile selects a context-local Hermes home, config, skills, and secrets for agent execution; subprocess environments are scoped to that profile as well. On update, pass an empty string to clear."
+            },
         },
         "required": ["action"]
     }
@@ -1005,6 +1146,7 @@ registry.register(
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
+        profile=args.get("profile"),
         no_agent=args.get("no_agent"),
         disable_on_terminal_success=args.get("disable_on_terminal_success"),
         task_id=kw.get("task_id"),

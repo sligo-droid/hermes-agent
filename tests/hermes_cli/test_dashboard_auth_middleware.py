@@ -141,6 +141,18 @@ def test_gated_static_asset_path_is_public(gated_app):
     assert r.status_code == 404
 
 
+def test_gated_dashboard_plugin_asset_path_is_public(gated_app):
+    """Plugin script/link assets must load before the OAuth session exists."""
+    r = gated_app.get(
+        "/dashboard-plugins/_definitely_not_installed_/manifest.json",
+        follow_redirects=False,
+    )
+    # The route's own 404 proves both auth middlewares let the asset request
+    # through; a missing session must not turn plugin CSS/JS loads into 401s or
+    # login redirects.
+    assert r.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # OAuth round trip
 # ---------------------------------------------------------------------------

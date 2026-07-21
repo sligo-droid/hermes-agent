@@ -1,6 +1,9 @@
 """Tests for CLI browser CDP auto-launch helpers."""
 
+from contextlib import redirect_stdout
+from io import StringIO
 import os
+from queue import Queue
 import subprocess
 from unittest.mock import patch
 
@@ -30,6 +33,7 @@ class TestChromeDebugLaunch:
 
         with patch("hermes_cli.browser_connect.shutil.which", side_effect=lambda name: r"C:\Chrome\chrome.exe" if name == "chrome.exe" else None), \
              patch("hermes_cli.browser_connect.os.path.isfile", side_effect=lambda path: path == r"C:\Chrome\chrome.exe"), \
+             patch("hermes_cli.browser_connect._wait_for_browser_debug_ready_or_exit", return_value="ready"), \
              patch("subprocess.Popen", side_effect=fake_popen):
             assert HermesCLI._try_launch_chrome_debug(9333, "Windows") is True
 
@@ -59,6 +63,7 @@ class TestChromeDebugLaunch:
 
         with patch("hermes_cli.browser_connect.shutil.which", return_value=None), \
              patch("hermes_cli.browser_connect.os.path.isfile", side_effect=lambda path: path == installed), \
+             patch("hermes_cli.browser_connect._wait_for_browser_debug_ready_or_exit", return_value="ready"), \
              patch("subprocess.Popen", side_effect=fake_popen):
             assert HermesCLI._try_launch_chrome_debug(9222, "Windows") is True
 
@@ -99,3 +104,36 @@ class TestChromeDebugLaunch:
         with patch("hermes_cli.browser_connect.shutil.which", return_value=None), \
              patch("hermes_cli.browser_connect.os.path.isfile", return_value=False):
             assert manual_chrome_debug_command(9222, "Linux") is None
+
+    def test_connect_context_note_allows_expected_browser_use(self, monkeypatch):
+        """`/browser connect` is an instruction to use the CDP browser.
+
+        The queued context note must not tell the model to wait for a second
+        permission step or imply that the attached browser is the user's main
+        everyday Chrome profile.
+        """
+        cli = HermesCLI.__new__(HermesCLI)
+        cli._pending_input = Queue()
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        # The default-local path now resolves the endpoint via
+        # discover_local_cdp_url (dual-stack probe); patch it at the
+        # mixin's import site so no real network probe or browser
+        # launch happens on the test runner.
+        with patch(
+                 "hermes_cli.cli_commands_mixin.discover_local_cdp_url",
+                 return_value="http://127.0.0.1:9222",
+             ), \
+             patch("hermes_cli.cli_commands_mixin.is_browser_debug_ready", return_value=True), \
+             patch("tools.browser_tool.cleanup_all_browsers"), \
+             patch("tools.browser_tool._ensure_cdp_supervisor"), \
+             redirect_stdout(StringIO()):
+            cli._handle_browser_command("/browser connect")
+
+        note = cli._pending_input.get_nowait()
+        assert "Chromium-family" in note
+        assert "dev/debug" in note
+        assert "using browser tools for their current browser-related request is expected" in note
+        assert "live Chrome browser" not in note
+        assert "real browser" not in note
+        assert "Please await their instruction" not in note

@@ -137,6 +137,9 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     def _fake_atomic_json_write(path, payload, **kwargs):
         calls.append((Path(path).name, payload, kwargs))
 
+    import gateway.slash_commands as gateway_slash
+
+    monkeypatch.setattr(gateway_slash, "atomic_json_write", _fake_atomic_json_write)
     monkeypatch.setattr(gateway_run, "atomic_json_write", _fake_atomic_json_write)
 
     runner, _adapter = make_restart_runner()
@@ -606,6 +609,10 @@ async def test_send_restart_notification_logs_info_on_sendresult_success(
 
 @pytest.mark.asyncio
 async def test_shutdown_notifications_do_not_use_cached_live_thread_source_when_origin_missing():
+    """Cached live routing preserves the active thread when persistence lags.
+
+    The historical node name is retained for merge-regression targeting.
+    """
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7")
     session_key = build_session_key(source)
@@ -617,4 +624,6 @@ async def test_shutdown_notifications_do_not_use_cached_live_thread_source_when_
 
     await runner._notify_active_sessions_of_shutdown()
 
-    adapter.send.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[0] == "parent-42"
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "topic-7"}

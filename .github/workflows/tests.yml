@@ -88,6 +88,11 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
+      - name: Run blocking ruff policy
+        run: |
+          source .venv/bin/activate
+          ruff check .
+
       - name: Compile core Python packages
         run: |
           source .venv/bin/activate
@@ -125,12 +130,20 @@ jobs:
 
       - name: Run frontend typechecks and desktop build
         run: |
+          npm run --workspace ui-tui build:ink
           npm run --workspace ui-tui typecheck
           npm run --workspace web typecheck
           npm run --workspace apps/bootstrap-installer typecheck
           npm run --workspace apps/desktop typecheck
           npm run --workspace apps/shared typecheck
           npm run --workspace apps/desktop build
+
+      - name: Run frontend unit and platform tests
+        run: |
+          npm run --workspace ui-tui test
+          npm run --workspace web test
+          npm run --workspace apps/desktop test:ui
+          npm run --workspace apps/desktop test:desktop:platforms
 
   site:
     name: site

@@ -8,7 +8,7 @@ silently corrupts non-ASCII content.
 
 These tests ensure:
   1. PLW1514 stays in ``[tool.ruff.lint.select]``
-  2. The CI workflow's blocking step still invokes ``ruff check .``
+  2. The fork CI workflow's blocking step still invokes ``ruff check .``
   3. pyproject.toml has ``preview = true`` (required — PLW1514 is a
      preview rule in ruff 0.15.x)
 
@@ -68,7 +68,10 @@ class TestRuffConfig:
 
 
 class TestLintWorkflow:
-    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "lint.yml"
+    # The fork keeps one bounded merge-gate workflow rather than upstream's
+    # reusable lint workflow. Assert the enforcement outcome, not the upstream
+    # workflow topology.
+    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "tests.yml"
 
     def test_workflow_exists(self):
         assert self.WORKFLOW_PATH.exists(), (
@@ -95,7 +98,7 @@ class TestLintWorkflow:
                     found_blocking = True
                     break
         assert found_blocking, (
-            "lint.yml no longer contains a blocking ``ruff check .`` step "
+            "tests.yml no longer contains a blocking ``ruff check .`` step "
             "(one without --exit-zero and not masked by || true).  "
             "Restore it — the PLW1514 rule is only useful if CI actually "
             "fails on violation."

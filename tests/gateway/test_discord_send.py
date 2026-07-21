@@ -551,19 +551,19 @@ async def test_forum_post_file_creation_failure():
 
 
 @pytest.mark.asyncio
-async def test_typing_task_removed_after_api_error():
-    """When typing API call fails, stale task must be removed so typing can restart."""
+async def test_typing_task_survives_initial_api_error():
+    """A transient first heartbeat must not tear down persistent typing."""
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     adapter._client = MagicMock()
     adapter._client.http = MagicMock()
     adapter._client.http.request = AsyncMock(side_effect=Exception("rate limited"))
     adapter._typing_tasks = {}
 
-    with pytest.raises(Exception, match="rate limited"):
-        await adapter.send_typing("12345")
+    await adapter.send_typing("12345")
 
-    assert "12345" not in adapter._typing_tasks, \
-        "Stale task should be removed after API error"
+    assert "12345" in adapter._typing_tasks
+    await adapter.stop_typing("12345")
+    assert "12345" not in adapter._typing_tasks
 
 
 @pytest.mark.asyncio
@@ -648,23 +648,23 @@ async def test_send_typing_reuses_existing_task_without_duplicate_loop():
 
 @pytest.mark.asyncio
 async def test_typing_restartable_after_error():
-    """After a typing error, send_typing should start a new task (not blocked by stale entry)."""
+    """Typing can be stopped and restarted after a non-fatal heartbeat error."""
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     adapter._client = MagicMock()
     adapter._client.http = MagicMock()
     adapter._typing_tasks = {}
 
-    # First call fails
+    # First heartbeat fails, but the persistent loop remains owned until stop.
     adapter._client.http.request = AsyncMock(side_effect=Exception("503"))
-    with pytest.raises(Exception, match="503"):
-        await adapter.send_typing("12345")
+    await adapter.send_typing("12345")
+    first_task = adapter._typing_tasks["12345"]
+    await adapter.stop_typing("12345")
 
-    # Second call should work
+    # A later turn starts a fresh loop successfully.
     adapter._client.http.request = AsyncMock()
     await adapter.send_typing("12345")
 
-    assert "12345" in adapter._typing_tasks, \
-        "Should restart typing after previous failure"
+    assert adapter._typing_tasks["12345"] is not first_task
 
     await adapter.stop_typing("12345")
 

@@ -31,15 +31,22 @@ def test_mixin_defines_kanban_methods():
 
 def test_gateway_runner_inherits_mixin():
     # Import here so a heavy gateway import only happens if the first test passed.
-    from gateway.run import GatewayRunner
+    from gateway.run import GatewayRunner, _GatewayRunnerCore
 
     if issubclass(GatewayRunner, GatewayKanbanWatchersMixin):
-        # Each kanban method resolves to the mixin's implementation via the MRO.
+        # Most kanban methods resolve to the extracted mixin. The dispatcher is
+        # deliberately rebound to the integrated fork core so Discord worker-
+        # board auto-decompose exclusion and its existing dispatch flow remain
+        # authoritative after the upstream class decomposition.
         for m in KANBAN_METHODS:
             owner = next(c for c in GatewayRunner.__mro__ if m in c.__dict__)
-            assert owner is GatewayKanbanWatchersMixin, (
-                f"{m} resolved to {owner.__name__}, expected the mixin"
-            )
+            if m == "_kanban_dispatcher_watcher":
+                assert owner is GatewayRunner
+                assert GatewayRunner.__dict__[m] is _GatewayRunnerCore.__dict__[m]
+            else:
+                assert owner is GatewayKanbanWatchersMixin, (
+                    f"{m} resolved to {owner.__name__}, expected the mixin"
+                )
         return
 
     # Some campaign bases still carry the pre-extraction methods directly on

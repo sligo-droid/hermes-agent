@@ -1,5 +1,7 @@
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from unittest.mock import AsyncMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
@@ -166,14 +168,86 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
     monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
     monkeypatch.setattr("gateway.run.GatewayRunner", _CleanExitRunner)
+    memory_start = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "gateway.memory_monitor.start_memory_monitoring", memory_start
+    )
 
     from gateway.run import start_gateway
+
+    root = logging.getLogger()
+    handlers_before = tuple(root.handlers)
 
     # verbosity=1 triggers the code path that uses RedactingFormatter.
     # Before the fix this raised NameError.
     ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=1)
 
     assert ok is True
+    # A clean startup exit never owned a live gateway runtime, so it must not
+    # leave either the periodic monitor or its pytest-capture stderr handler.
+    memory_start.assert_not_called()
+    assert tuple(root.handlers) == handlers_before
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_stops_runtime_memory_monitor_on_failure(
+    monkeypatch, tmp_path
+):
+    """Runtime failure cannot leak the memory thread into later tests."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    class _RuntimeFailureRunner:
+        def __init__(self, config):
+            self.config = config
+            self.adapters = {}
+            self._running = True
+            self._draining = False
+            self._restart_requested = False
+            self._restart_via_service = False
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = True
+            self.exit_reason = "synthetic runtime failure"
+            self.exit_code = None
+
+        async def start(self):
+            return True
+
+        async def wait_for_shutdown(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    memory_start = MagicMock(return_value=True)
+    memory_stop = MagicMock()
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("gateway.run.GatewayRunner", _RuntimeFailureRunner)
+    monkeypatch.setattr("gateway.run._start_cron_ticker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"logging": {"memory_monitor": {"interval_seconds": 0.01}}},
+    )
+    monkeypatch.setattr(
+        "gateway.memory_monitor.start_memory_monitoring", memory_start
+    )
+    monkeypatch.setattr(
+        "gateway.memory_monitor.stop_memory_monitoring", memory_stop
+    )
+
+    from gateway.run import start_gateway
+
+    ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+    assert ok is False
+    memory_start.assert_called_once_with(interval_seconds=0.01)
+    memory_stop.assert_called_once_with(timeout=2.0)
 
 
 @pytest.mark.asyncio

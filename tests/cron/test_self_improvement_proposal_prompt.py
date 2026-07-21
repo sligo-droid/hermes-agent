@@ -331,7 +331,7 @@ def test_tick_records_auth_blocked_self_improvement_cron_failure(tmp_path, monke
          patch("cron.scheduler.update_job_output"), \
          patch("cron.scheduler._deliver_result"), \
          patch("cron.scheduler.run_job", return_value=(False, output_doc, "", error)):
-        assert tick(verbose=False) == 0
+        assert tick(verbose=False) == 1
 
     runs = proposal_storage.list_runs()["runs"]
 
