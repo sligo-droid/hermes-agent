@@ -29,6 +29,7 @@ from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock, patch
 
+from agent.conversation_compression import CompressionChurnError
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import make_tool_result_message
 from run_agent import AIAgent
@@ -211,6 +212,99 @@ def test_late_final_response_steer_becomes_one_continuation():
 
     result = result_box["result"]
     assert result["pending_steer"] == "one continuation"
+    assert agent.steer("too late") is False
+
+
+def test_early_structured_return_closes_intake_and_preserves_continuation():
+    agent = _make_agent()
+    agent.compression_enabled = True
+    agent.context_compressor.threshold_tokens = 1
+    agent.context_compressor.should_compress = lambda _tokens: bool(
+        agent._steer_intake_open
+    )
+    original_open = agent._open_steer_intake
+
+    def _open_with_pending(*, supported=True):
+        original_open(supported=supported)
+        assert agent.steer("preserve this continuation") is True
+
+    agent._open_steer_intake = _open_with_pending
+    agent._compress_context = MagicMock(
+        side_effect=CompressionChurnError(
+            {"message": "deterministic compression churn"}
+        )
+    )
+
+    with (
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=100,
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("trigger early compression return")
+
+    assert result["compression_exhausted"] is True
+    assert result["pending_steer"] == "preserve this continuation"
+    assert agent.steer("accepted after return would be lost") is False
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_pre_provider_steer_never_mutates_historical_tool_result():
+    agent = _make_agent()
+    old_tool = {
+        "role": "tool",
+        "name": "web_search",
+        "tool_call_id": "old-call",
+        "content": "stable historical result",
+    }
+    history = [
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "old-call",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+        old_tool,
+    ]
+    original_open = agent._open_steer_intake
+
+    def _open_with_pending(*, supported=True):
+        original_open(supported=supported)
+        assert agent.steer("new-turn guidance") is True
+
+    agent._open_steer_intake = _open_with_pending
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="done",
+        finish_reason="stop",
+    )
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "new request",
+            conversation_history=history,
+        )
+
+    historical = next(
+        msg
+        for msg in result["messages"]
+        if msg.get("tool_call_id") == "old-call"
+    )
+    assert historical["content"] == "stable historical result"
+    assert old_tool["content"] == "stable historical result"
+    assert result["pending_steer"] == "new-turn guidance"
     assert agent.steer("too late") is False
 
 

@@ -25,6 +25,7 @@ import ssl
 import threading
 import time
 import uuid
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -99,6 +100,37 @@ logger = logging.getLogger(__name__)
 # Stable prefix used by gateway/TUI/ACP surfaces to recognize provider-wait
 # cancellation metadata without treating it as assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+
+
+def _close_steer_intake_on_exit(func):
+    """Close turn-scoped steer intake across every return and exception.
+
+    Normal turns close in ``turn_finalizer`` first, so this wrapper is a
+    no-op there. Early structured returns still receive any accepted guidance
+    as ``pending_steer`` for exactly-once continuation delivery.
+    """
+
+    @wraps(func)
+    def wrapped(agent, *args, **kwargs):
+        result = None
+        try:
+            result = func(agent, *args, **kwargs)
+            return result
+        finally:
+            close_and_take = getattr(agent, "_close_steer_intake_and_take", None)
+            leftover = close_and_take() if callable(close_and_take) else None
+            if leftover and isinstance(result, dict):
+                existing = result.get("pending_steer")
+                result["pending_steer"] = (
+                    f"{existing}\n{leftover}" if existing else leftover
+                )
+            elif leftover:
+                logger.warning(
+                    "Steer intake closed after exceptional turn exit; "
+                    "accepted guidance could not be attached to a result"
+                )
+
+    return wrapped
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -1056,6 +1088,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+@_close_steer_intake_on_exit
 def run_conversation(
     agent,
     user_message: Any,
@@ -1305,18 +1338,25 @@ def run_conversation(
         # steers sent during an API call only land after the NEXT tool batch,
         # which may never come if the model returns a final response.
         #
-        # We scan backwards for the last tool-role message in the messages
-        # list.  If found, the steer is appended there.  If not (first
-        # iteration, no tools yet), the steer stays pending for the next
-        # tool batch — injecting into a user message would break role
-        # alternation, and there's no tool output to piggyback on.
+        # Only the current turn's mutable tail is eligible. Historical tool
+        # results are part of the stable prompt-cache prefix and must never be
+        # rewritten by guidance accepted during a later user turn.
         _pre_api_target = None
         if agent._has_pending_steer():
-            for _si in range(len(messages) - 1, -1, -1):
-                _sm = messages[_si]
-                if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    _pre_api_target = _sm
-                    break
+            _steer_user_boundary = reanchor_current_turn_user_idx(
+                messages,
+                user_message,
+            )
+            if _steer_user_boundary >= 0:
+                for _si in range(
+                    len(messages) - 1,
+                    _steer_user_boundary,
+                    -1,
+                ):
+                    _sm = messages[_si]
+                    if isinstance(_sm, dict) and _sm.get("role") == "tool":
+                        _pre_api_target = _sm
+                        break
         if _pre_api_target is not None:
             _pre_api_steer = agent._take_pending_steer()
             if _pre_api_steer:
