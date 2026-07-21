@@ -3928,6 +3928,9 @@ class _GatewayRunnerCore(
         self._async_completion_seen: set[str] = set()
         self._completion_delivery_lock = threading.Lock()
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
+        self._completion_delivery_tasks: Dict[
+            object, tuple[str, asyncio.Task]
+        ] = {}
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
 
@@ -26023,6 +26026,8 @@ class _GatewayRunnerCore(
         if self._completion_suppressed_by_explicit_stop(evt):
             return None
         identity = self._completion_delivery_identity(evt)
+        delivery_token: object = identity if identity is not None else object()
+        delivery_task = asyncio.current_task()
         durable_claim_id = ""
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
@@ -26053,6 +26058,14 @@ class _GatewayRunnerCore(
                 ):
                     return None
                 self._completion_deliveries_inflight.add(identity)
+        if delivery_task is not None:
+            with self._completion_delivery_lock:
+                self.__dict__.setdefault(
+                    "_completion_delivery_tasks", {}
+                )[delivery_token] = (
+                    str(evt.get("session_key") or ""),
+                    delivery_task,
+                )
 
         accepted = False
         try:
@@ -26071,6 +26084,10 @@ class _GatewayRunnerCore(
                     injection_result = await self._inject_process_completion(
                         synth_text, evt,
                     )
+            except asyncio.CancelledError:
+                if self._completion_suppressed_by_explicit_stop(evt):
+                    return None
+                raise
             except Exception:
                 logger.warning(
                     "Completion injection failed; leaving it retryable",
@@ -26079,6 +26096,42 @@ class _GatewayRunnerCore(
                 return False
             if injection_result is not True:
                 return injection_result
+            if self._completion_suppressed_by_explicit_stop(evt):
+                return None
+
+            if durable_claim_id:
+                try:
+                    from tools.async_delegation import (
+                        complete_completion_delivery,
+                        get_durable_delegation,
+                    )
+
+                    completed = complete_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                    durable_state = get_durable_delegation(
+                        durable_delegation_id
+                    )
+                    if not completed and durable_state is not None:
+                        if self._completion_suppressed_by_explicit_stop(evt):
+                            return None
+                        if durable_state.get("delivery_state") == "delivered":
+                            return None
+                        logger.warning(
+                            "Could not acknowledge claimed async completion %s",
+                            durable_delegation_id,
+                        )
+                        return False
+                except Exception as exc:
+                    logger.warning(
+                        "Could not acknowledge durable async completion %s: %s",
+                        durable_delegation_id,
+                        exc,
+                    )
+                    return False
+
+            if self._completion_suppressed_by_explicit_stop(evt):
+                return None
             accepted = True
 
             if identity is not None:
@@ -26091,21 +26144,13 @@ class _GatewayRunnerCore(
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
 
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id,
-                        exc,
-                    )
             return True
         finally:
+            if delivery_task is not None:
+                with self._completion_delivery_lock:
+                    self.__dict__.setdefault(
+                        "_completion_delivery_tasks", {}
+                    ).pop(delivery_token, None)
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
@@ -26238,16 +26283,6 @@ class _GatewayRunnerCore(
         completion_future = synth_event.processing_completion_future
         if completion_future is not None:
             await completion_future
-        try:
-            from tools.async_delegation import mark_completion_delivered
-
-            mark_completion_delivered(synth_event.background_completion_id or "")
-        except Exception:
-            logger.debug(
-                "Could not acknowledge async completion %s",
-                synth_event.background_completion_id,
-                exc_info=True,
-            )
         return True
 
     async def _finalize_suppressed_async_completion(self, evt: dict) -> None:
@@ -27088,6 +27123,19 @@ class _GatewayRunnerCore(
         tombstones.move_to_end(session_key)
         while len(tombstones) > 512:
             tombstones.popitem(last=False)
+        delivery_lock = self.__dict__.get("_completion_delivery_lock")
+        tasks_to_cancel: List[asyncio.Task] = []
+        if delivery_lock is not None:
+            with delivery_lock:
+                for owned_session, task in self.__dict__.setdefault(
+                    "_completion_delivery_tasks", {}
+                ).values():
+                    if owned_session == session_key and not task.done():
+                        tasks_to_cancel.append(task)
+        current_task = asyncio.current_task()
+        for task in tasks_to_cancel:
+            if task is not current_task:
+                task.cancel("explicit session stop")
         self._invalidate_session_run_generation(session_key, reason=reason)
         return stopped_at
 
@@ -27436,6 +27484,8 @@ class _GatewayRunnerCore(
                 "callbacks_invoked": 0,
                 "callbacks_failed": 0,
                 "durable_cancelled": 0,
+                "durable_completions_cancelled": 0,
+                "durable_completion_ids": [],
                 "by_kind": {},
                 "failed_ids": [],
             },
@@ -27518,6 +27568,7 @@ class _GatewayRunnerCore(
                 "callbacks_invoked",
                 "callbacks_failed",
                 "durable_cancelled",
+                "durable_completions_cancelled",
             ):
                 report["async_delegations"][field] += int(
                     async_report.get(field) or 0
@@ -27528,6 +27579,11 @@ class _GatewayRunnerCore(
             for failed_id in async_report.get("failed_ids") or []:
                 if len(report["async_delegations"]["failed_ids"]) < 10:
                     report["async_delegations"]["failed_ids"].append(failed_id)
+            for delegation_id in async_report.get("durable_completion_ids") or []:
+                if len(report["async_delegations"]["durable_completion_ids"]) < 10:
+                    report["async_delegations"]["durable_completion_ids"].append(
+                        delegation_id
+                    )
 
             background_report = self._cancel_background_agents_for_session(
                 session_key,
@@ -27553,6 +27609,7 @@ class _GatewayRunnerCore(
         report["changed"] = bool(
             report["active_parent"]["matched"]
             or report["async_delegations"]["newly_cancelled"]
+            or report["async_delegations"]["durable_completions_cancelled"]
             or report["durable_attempts"]["fenced"]
             or report["durable_attempts"]["sealed"]
             or report["durable_attempts"]["dispatches_cancelled"]
@@ -27562,11 +27619,12 @@ class _GatewayRunnerCore(
             or report["discord_boards"]
         )
         logger.info(
-            "STOP scope sessions=%d parent=%d async=%d durable=%d background=%d "
+            "STOP scope sessions=%d parent=%d async=%d restored=%d durable=%d background=%d "
             "processes=%d boards=%d failures=%d",
             len(keys),
             report["active_parent"]["matched"],
             report["async_delegations"]["newly_cancelled"],
+            report["async_delegations"]["durable_completions_cancelled"],
             report["durable_attempts"]["fenced"],
             report["background_agents"]["newly_cancelled"],
             report["terminal_processes"],

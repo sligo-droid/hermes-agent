@@ -112,6 +112,35 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def test_successful_gateway_injection_acknowledges_durable_completion(
+    isolated_registry,
+):
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    event = _async_event("deleg_durable_success")
+    ad._persist_dispatch(
+        {
+            "delegation_id": event["delegation_id"],
+            "session_key": event["session_key"],
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": event["dispatched_at"],
+            "goal": event["goal"],
+        }
+    )
+    ad._persist_completion(event, {"status": "completed", "summary": "Found it"})
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", dict(event))
+    ) is True
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    ad._reset_for_tests()
+
+
 def test_explicit_stop_suppresses_async_success_queued_before_delivery(
     monkeypatch, isolated_registry,
 ):
@@ -184,6 +213,67 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
 
     assert sorted(asyncio.run(_exercise()), key=str) == [None, True]
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_linearizes_against_inflight_adapter_delivery(
+    isolated_registry,
+):
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    event = _async_event("deleg_inflight_stop")
+    ad._persist_dispatch(
+        {
+            "delegation_id": event["delegation_id"],
+            "session_key": event["session_key"],
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": event["dispatched_at"],
+            "goal": event["goal"],
+            "kind": "delegation",
+        }
+    )
+    ad._persist_completion(event, {"status": "completed", "summary": "Found it"})
+
+    entered = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def _blocked_delivery(_event):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            # Model an adapter that performs async cleanup and swallows the
+            # cancellation before returning to the gateway delivery seam.
+            cancellation_seen.set()
+            await release_cleanup.wait()
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_blocked_delivery))
+    runner = _runner(adapter)
+
+    delivery = asyncio.create_task(
+        runner._deliver_completion_notification("completion", dict(event))
+    )
+    await entered.wait()
+    runner._mark_explicit_session_stop(
+        event["session_key"], reason="test_inflight_stop"
+    )
+    outcome = ad.cancel_session(event["session_key"], reason="session_stop")
+    await cancellation_seen.wait()
+    release_cleanup.set()
+
+    assert await delivery is None
+    assert outcome["durable_completions_cancelled"] == 1
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "cancelled"
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert ("async_delegation", event["delegation_id"], "") not in (
+        runner._completion_deliveries_delivered
+    )
+    assert runner._completion_delivery_tasks == {}
+    adapter.handle_message.assert_awaited_once()
+    ad._reset_for_tests()
 
 
 def test_failed_async_injection_is_retried_and_only_success_is_acked(

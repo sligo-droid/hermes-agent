@@ -312,9 +312,19 @@ def _mark_durable_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
     with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row[0] == "delivered":
+            return True
+        if row[0] != "pending":
+            return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-               WHERE delegation_id=? AND delivery_state!='delivered'""",
+               WHERE delegation_id=? AND delivery_state='pending'""",
             (now, now, delegation_id),
         )
         return cur.rowcount == 1
@@ -337,6 +347,58 @@ def _cancel_durable_completion_delivery(
             (cancelled_at, cancelled_at, delegation_id),
         )
         return cur.rowcount == 1
+
+
+def _cancel_durable_completions_for_identity(
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    reason: str,
+    cancelled_at: float,
+) -> tuple[int, List[str]]:
+    """Persist stop tombstones for generic completions even after restart.
+
+    The generic compatibility store is the only owner available after process
+    restart, when ``_records`` is intentionally empty. Match only explicit
+    captured session identities and return producer IDs so the caller can
+    de-duplicate volatile matches before bounding public diagnostics.
+    """
+    selectors: List[str] = []
+    params: List[Any] = []
+    for column, value in (
+        ("origin_session", session_key),
+        ("origin_ui_session_id", origin_ui_session_id),
+        ("parent_session_id", parent_session_id),
+    ):
+        normalized = str(value or "").strip()
+        if normalized:
+            selectors.append(f"{column}=?")
+            params.append(normalized)
+    if not selectors:
+        return 0, []
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT delegation_id FROM async_delegations
+                WHERE delivery_state='pending' AND ({' OR '.join(selectors)})
+                ORDER BY dispatched_at, delegation_id""",
+            params,
+        ).fetchall()
+        conn.execute(
+            f"""UPDATE async_delegations
+                SET state='cancelled', completed_at=COALESCE(completed_at, ?),
+                    updated_at=?, delivery_state='cancelled', delivery_claim=NULL,
+                    delivery_claimed_at=NULL
+                WHERE delivery_state='pending' AND ({' OR '.join(selectors)})""",
+            [cancelled_at, cancelled_at, *params],
+        )
+    if rows:
+        logger.info(
+            "Durably suppressed %d undelivered async completion(s) for session stop (%s)",
+            len(rows),
+            str(reason or "session_stop")[:120],
+        )
+    return len(rows), [str(row[0]) for row in rows]
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -2074,11 +2136,29 @@ def cancel_session(
             "callbacks_invoked": 0,
             "callbacks_failed": 0,
             "durable_cancelled": 0,
+            "durable_completions_cancelled": 0,
+            "durable_completion_ids": [],
             "by_kind": {},
             "failed_ids": [],
         }
 
     cancelled_at = time.time()
+    durable_completions_cancelled = 0
+    durable_completion_ids: List[str] = []
+    if not any((normalized_kind, normalized_work_id, normalized_attempt_id, routing_scope)):
+        try:
+            (
+                durable_completions_cancelled,
+                durable_completion_ids,
+            ) = _cancel_durable_completions_for_identity(
+                session_key=normalized_session,
+                origin_ui_session_id=normalized_ui,
+                parent_session_id=normalized_parent,
+                reason=str(reason or "session_stop")[:240],
+                cancelled_at=cancelled_at,
+            )
+        except Exception:
+            logger.exception("Could not durably suppress session completion delivery")
     targets: List[Dict[str, Any]] = []
     matched = 0
     by_kind: Dict[str, int] = {}
@@ -2184,12 +2264,20 @@ def cancel_session(
                     failed_ids.append(delegation_id)
 
     bounded_by_kind = dict(sorted(by_kind.items())[:12])
+    newly_cancelled_ids = {
+        str(target.get("delegation_id") or "")
+        for target in targets
+        if str(target.get("delegation_id") or "")
+    }
+    newly_cancelled_ids.update(durable_completion_ids)
     return {
         "matched": matched,
-        "newly_cancelled": len(targets),
+        "newly_cancelled": len(newly_cancelled_ids),
         "callbacks_invoked": callbacks_invoked,
         "callbacks_failed": callbacks_failed,
         "durable_cancelled": durable_cancelled,
+        "durable_completions_cancelled": durable_completions_cancelled,
+        "durable_completion_ids": durable_completion_ids[:10],
         "by_kind": bounded_by_kind,
         "failed_ids": failed_ids[:10],
     }

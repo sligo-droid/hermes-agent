@@ -327,6 +327,61 @@ def test_advisory_delegation_uses_generic_durable_store(monkeypatch, tmp_path):
     assert ad.restore_undelivered_completions(queue.Queue()) == 0
 
 
+def test_restart_restored_completion_stop_is_durably_tombstoned(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    first_executor = _CapturingExecutor([])
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: first_executor)
+    mine = ad.dispatch_async_delegation(
+        goal="mine",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="session-mine",
+        runner=lambda: {"status": "completed", "summary": "mine done"},
+    )
+    first_executor.worker()
+
+    second_executor = _CapturingExecutor([])
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: second_executor)
+    other = ad.dispatch_async_delegation(
+        goal="other",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="session-other",
+        runner=lambda: {"status": "completed", "summary": "other done"},
+    )
+    second_executor.worker()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    # A restarted gateway has durable rows and restored events, but no
+    # process-local async record to mark cancel_requested.
+    ad._reset_for_tests()
+    restored_before_stop = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_before_stop) == 2
+
+    outcome = ad.cancel_session("session-mine", reason="session_stop")
+
+    assert outcome["matched"] == 0
+    assert outcome["newly_cancelled"] == 1
+    assert outcome["durable_completions_cancelled"] == 1
+    assert outcome["durable_completion_ids"] == [mine["delegation_id"]]
+    assert ad.get_durable_delegation(mine["delegation_id"])["delivery_state"] == "cancelled"
+    assert ad.mark_completion_delivered(mine["delegation_id"]) is False
+    assert ad.get_durable_delegation(mine["delegation_id"])["delivery_state"] == "cancelled"
+    assert ad.get_durable_delegation(other["delegation_id"])["delivery_state"] == "pending"
+
+    restored_after_stop = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_after_stop) == 1
+    assert restored_after_stop.get_nowait()["delegation_id"] == other["delegation_id"]
+
+
 def test_cancel_session_is_mixed_kind_idempotent_and_failure_isolated(monkeypatch):
     calls = []
     ledger = _FakeRequiredLedger(calls)
