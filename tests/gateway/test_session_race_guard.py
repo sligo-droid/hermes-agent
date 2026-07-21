@@ -184,7 +184,7 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
 
         # Second message should see "already running" and be queued
         result2 = await runner._handle_message(event2)
-        assert result2 is None, "Second message should return None (queued)"
+        assert "queued" in result2.lower()
 
         # The second message should have been queued in adapter pending
         adapter = runner.adapters[Platform.TELEGRAM]
@@ -265,27 +265,29 @@ def test_merge_pending_message_event_promotes_document_followups_over_text():
 
 
 @pytest.mark.asyncio
-async def test_recent_telegram_text_followup_is_queued_without_interrupt():
+async def test_recent_telegram_text_followup_steers_without_interrupt():
     runner = _make_runner()
     event = _make_event(text="follow-up")
     session_key = build_session_key(event.source)
 
     fake_agent = MagicMock()
     fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    fake_agent.steer.return_value = True
     runner._running_agents[session_key] = fake_agent
     import time as _time
     runner._running_agents_ts[session_key] = _time.time()
 
     result = await runner._handle_message(event)
 
-    assert result is None
+    assert "steered" in result.lower()
+    fake_agent.steer.assert_called_once_with("follow-up")
     fake_agent.interrupt.assert_not_called()
     adapter = runner.adapters[Platform.TELEGRAM]
-    assert adapter._pending_messages[session_key].text == "follow-up"
+    assert session_key not in adapter._pending_messages
 
 
 @pytest.mark.asyncio
-async def test_recent_telegram_followups_append_in_pending_queue():
+async def test_recent_telegram_followups_use_bounded_fifo_after_steer_rejection():
     runner = _make_runner()
     first = _make_event(text="part one")
     second = _make_event(text="part two")
@@ -293,6 +295,7 @@ async def test_recent_telegram_followups_append_in_pending_queue():
 
     fake_agent = MagicMock()
     fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    fake_agent.steer.return_value = False
     runner._running_agents[session_key] = fake_agent
     import time as _time
     runner._running_agents_ts[session_key] = _time.time()
@@ -302,7 +305,8 @@ async def test_recent_telegram_followups_append_in_pending_queue():
 
     fake_agent.interrupt.assert_not_called()
     adapter = runner.adapters[Platform.TELEGRAM]
-    assert adapter._pending_messages[session_key].text == "part one\npart two"
+    assert adapter._pending_messages[session_key].text == "part one"
+    assert [event.text for event in runner._queued_events[session_key]] == ["part two"]
 
 
 # ------------------------------------------------------------------
@@ -511,6 +515,102 @@ async def test_stop_cleans_background_processes_without_running_agent():
 
     cleanup_processes.assert_called_once_with(session_key)
     assert "stopped" in result.lower()
+
+
+def test_gateway_runner_uses_authoritative_stop_mixin():
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    assert (
+        GatewayRunner._handle_stop_command
+        is GatewaySlashCommandsMixin._handle_stop_command
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_funnel_cancels_detached_session_work_without_parent():
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    runner = _make_runner()
+    event = _make_event(text="/stop")
+    session_key = build_session_key(event.source)
+    async_interrupt = MagicMock()
+    with ad._records_lock:
+        ad._records["deleg-detached"] = {
+            "delegation_id": "deleg-detached",
+            "status": "running",
+            "session_key": session_key,
+            "kind": "delegation",
+            "interrupt_fn": async_interrupt,
+            "delivery_pending": False,
+        }
+    runner._register_background_record("bg-detached", session_key, event.source)
+    background_agent = MagicMock()
+    runner._publish_background_agent("bg-detached", background_agent)
+    background_task = MagicMock()
+    background_task.done.return_value = False
+    runner._bind_background_outer_task("bg-detached", background_task)
+    runner._fence_required_async_attempts_for_session = MagicMock(
+        return_value={
+            "matched": 0,
+            "fenced": 0,
+            "sealed": 0,
+            "dispatches_cancelled": 0,
+            "reconciled": 0,
+            "failed_ids": [],
+            "_attempts": [],
+        }
+    )
+    runner._reconcile_fenced_required_async_attempts = MagicMock()
+    runner._stop_discord_thread_boards_for_event = AsyncMock(return_value=[])
+    runner._stop_session_background_processes = MagicMock(return_value=1)
+
+    report = await runner._stop_session_owned_work(
+        event,
+        [session_key],
+        invalidation_reason="test_stop",
+    )
+
+    assert report["active_parent"]["matched"] == 0
+    assert report["async_delegations"]["newly_cancelled"] == 1
+    assert report["background_agents"]["newly_cancelled"] == 1
+    assert report["terminal_processes"] == 1
+    assert report["changed"] is True
+    async_interrupt.assert_called_once()
+    background_agent.interrupt.assert_called_once_with("Stop requested")
+    background_task.cancel.assert_called_once()
+    ad._reset_for_tests()
+
+
+def test_authorized_sibling_discovery_includes_detached_async_owner():
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="group",
+        thread_id="99",
+        user_id="caller",
+    )
+    own_key = build_session_key(source, thread_sessions_per_user=True)
+    sibling_key = own_key.rsplit(":", 1)[0] + ":sibling"
+    with ad._records_lock:
+        ad._records["deleg-sibling"] = {
+            "delegation_id": "deleg-sibling",
+            "status": "running",
+            "session_key": sibling_key,
+            "kind": "delegation",
+            "interrupt_fn": MagicMock(),
+            "delivery_pending": False,
+            "platform": "telegram",
+            "chat_id": "12345",
+            "thread_id": "99",
+        }
+
+    assert runner._sibling_thread_run_keys(source, own_key) == [sibling_key]
+    ad._reset_for_tests()
 
 
 # ------------------------------------------------------------------

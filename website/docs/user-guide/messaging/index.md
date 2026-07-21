@@ -189,7 +189,7 @@ platform network disconnect as an event-loop failure.
 | `/undo` | Remove the last exchange |
 | `/status` | Show session info |
 | `/whoami` | Show your slash command access on this scope (admin / user / unrestricted) |
-| `/stop` | Stop the running agent |
+| `/stop` | Stop all work owned by this conversation |
 | `/approve` | Approve a pending dangerous command |
 | `/deny` | Reject a pending dangerous command |
 | `/sethome` | Set this chat as the home channel |
@@ -361,7 +361,12 @@ Ordinary input while the agent is busy steers the current run by default:
 - The model receives your guidance at the next safe boundary and replans in the same turn.
 - If live steering is unsupported, still starting, or already closed, Hermes queues the original message for the immediate next turn and says so.
 - **`/queue <prompt>`** always creates a later independent turn.
-- **`/stop`** remains destructive and cancels the running session.
+- **`/stop`** remains destructive for the current conversation. It interrupts
+  the active agent and synchronous children, cancels detached coding and
+  non-coding delegations plus `/background` agents, kills tracked terminal
+  processes, and stops matching Discord worker boards. Canceled completions
+  are suppressed instead of re-entering the chat. Other sessions and profiles,
+  cron jobs, and unrelated Kanban work are not canceled.
 
 ### Queue vs interrupt vs steer (busy-input mode)
 
@@ -477,7 +482,7 @@ HERMES_BACKGROUND_NOTIFICATIONS=result
 - **File operations** — "/background Organize the photos in ~/Downloads by date into folders"
 
 :::tip
-Background tasks on messaging platforms are fire-and-forget — you don't need to wait or check on them. Results arrive in the same chat automatically when the task finishes.
+Background tasks on messaging platforms are fire-and-forget — you don't need to wait or check on them. Results arrive in the same chat automatically when the task finishes. They remain owned by that conversation: `/stop` cancels them, cooperatively interrupts a live background agent, and suppresses any result that had not yet been delivered.
 :::
 
 ## Service Management

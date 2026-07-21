@@ -4084,6 +4084,11 @@ class _GatewayRunnerCore(
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # User-visible /background agents need stronger ownership than generic
+        # infrastructure tasks: the outer asyncio task cannot stop its executor
+        # thread, so retain the live AIAgent and an explicit cancellation fence.
+        self._background_agent_lock = threading.Lock()
+        self._background_agents: Dict[str, Dict[str, Any]] = {}
         # Long-lived gateway runners need both a strong reference and explicit
         # shutdown ownership.  A bare create_task() can otherwise be collected
         # while pending, which silently kills completion recovery.
@@ -15481,19 +15486,13 @@ class _GatewayRunnerCore(
             # _interrupt_requested.  Force-clean _running_agents so the session
             # is unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
-                stopped_boards = await self._stop_discord_thread_boards_for_event(event)
-                await self._interrupt_and_clear_session(
-                    _quick_key,
-                    source,
-                    interrupt_reason=_INTERRUPT_REASON_STOP,
+                report = await self._stop_session_owned_work(
+                    event,
+                    [_quick_key],
                     invalidation_reason="stop_command",
-                    cleanup_background_processes=True,
                 )
-                logger.info(
-                    "STOP for session %s — agent interrupted, session lock released, boards_stopped=%s",
-                    _quick_key,
-                    ",".join(stopped_boards) if stopped_boards else "-",
-                )
+                if report["active_parent"]["pending"]:
+                    return EphemeralReply(t("gateway.stop.stopped_pending"))
                 return EphemeralReply(t("gateway.stop.stopped"))
 
             # /reset and /new must bypass the running-agent guard so they
@@ -22227,6 +22226,213 @@ class _GatewayRunnerCore(
             )
         return t("gateway.rollback.restore_failed", error=result["error"])
 
+    def _background_registry_parts(self) -> tuple[threading.Lock, Dict[str, Dict[str, Any]]]:
+        """Return lazily initialized /background ownership state for tests too."""
+        lock = self.__dict__.get("_background_agent_lock")
+        if lock is None:
+            lock = threading.Lock()
+            self._background_agent_lock = lock
+        records = self.__dict__.get("_background_agents")
+        if records is None:
+            records = {}
+            self._background_agents = records
+        return lock, records
+
+    @staticmethod
+    def _background_record_active(record: Dict[str, Any]) -> bool:
+        return str(record.get("state") or "") in {"starting", "running"}
+
+    def _prune_background_records_locked(
+        self, records: Dict[str, Dict[str, Any]]
+    ) -> None:
+        terminal = [
+            (task_id, record)
+            for task_id, record in records.items()
+            if not self._background_record_active(record)
+        ]
+        if len(terminal) <= 50:
+            return
+        terminal.sort(
+            key=lambda item: float(
+                item[1].get("completed_at") or item[1].get("started_at") or 0
+            )
+        )
+        for task_id, _record in terminal[: len(terminal) - 50]:
+            records.pop(task_id, None)
+
+    def _register_background_record(
+        self, task_id: str, session_key: str, source: SessionSource
+    ) -> None:
+        lock, records = self._background_registry_parts()
+        with lock:
+            records[task_id] = {
+                "task_id": task_id,
+                "session_key": str(session_key or ""),
+                "platform": getattr(source.platform, "value", str(source.platform)),
+                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                "thread_id": str(getattr(source, "thread_id", "") or ""),
+                "user_id": str(getattr(source, "user_id", "") or ""),
+                "outer_task": None,
+                "agent": None,
+                "cancel_requested": False,
+                "cancel_reason": "",
+                "cancel_requested_at": None,
+                "started_at": time.time(),
+                "completed_at": None,
+                "state": "starting",
+                "agent_finished": False,
+                "outer_done": False,
+            }
+            self._prune_background_records_locked(records)
+
+    def _bind_background_outer_task(self, task_id: str, task: asyncio.Task) -> None:
+        lock, records = self._background_registry_parts()
+        cancel_now = False
+        with lock:
+            record = records.get(task_id)
+            if record is not None:
+                record["outer_task"] = task
+                cancel_now = bool(record.get("cancel_requested"))
+        if cancel_now and not task.done():
+            task.cancel()
+
+    def _background_outer_done(self, task_id: str, task: asyncio.Task) -> None:
+        background = self.__dict__.setdefault("_background_tasks", set())
+        background.discard(task)
+        lock, records = self._background_registry_parts()
+        with lock:
+            record = records.get(task_id)
+            if record is None or record.get("outer_task") is not task:
+                return
+            record["outer_done"] = True
+            if record.get("cancel_requested"):
+                record["state"] = "cancelled"
+            elif task.cancelled():
+                record["state"] = "cancelled"
+            elif task.exception() is not None:
+                record["state"] = "error"
+            else:
+                record["state"] = "completed"
+            record["completed_at"] = time.time()
+            self._prune_background_records_locked(records)
+
+    def _publish_background_agent(self, task_id: str, agent: Any) -> bool:
+        """Publish the live executor-thread agent before starting inference."""
+        lock, records = self._background_registry_parts()
+        cancelled = True
+        with lock:
+            record = records.get(task_id)
+            if record is not None:
+                record["agent"] = agent
+                cancelled = bool(record.get("cancel_requested"))
+                record["state"] = "cancelled" if cancelled else "running"
+        if cancelled:
+            try:
+                agent.interrupt("Stop requested")
+            except Exception:
+                logger.debug(
+                    "Could not interrupt pre-cancelled background agent %s",
+                    task_id,
+                    exc_info=True,
+                )
+        return not cancelled
+
+    def _mark_background_agent_finished(self, task_id: str, agent: Any) -> None:
+        lock, records = self._background_registry_parts()
+        with lock:
+            record = records.get(task_id)
+            if record is None or record.get("agent") is not agent:
+                return
+            record["agent_finished"] = True
+            record["agent"] = None
+            if record.get("outer_done") and record.get("completed_at") is None:
+                record["completed_at"] = time.time()
+            self._prune_background_records_locked(records)
+
+    def _background_delivery_allowed(self, task_id: str) -> bool:
+        lock, records = self._background_registry_parts()
+        with lock:
+            record = records.get(task_id)
+            return bool(record is not None and not record.get("cancel_requested"))
+
+    def _cancel_background_agents_for_session(
+        self, session_key: str, *, reason: str = "Stop requested"
+    ) -> Dict[str, int]:
+        """Mark then cooperatively stop /background agents for one session."""
+        lock, records = self._background_registry_parts()
+        targets: List[tuple[str, Any, Any]] = []
+        matched = 0
+        now = time.time()
+        with lock:
+            for task_id, record in records.items():
+                if (
+                    str(record.get("session_key") or "") != str(session_key or "")
+                    or not self._background_record_active(record)
+                ):
+                    continue
+                matched += 1
+                if record.get("cancel_requested"):
+                    continue
+                record["cancel_requested"] = True
+                record["cancel_reason"] = str(reason or "Stop requested")[:240]
+                record["cancel_requested_at"] = now
+                record["state"] = "cancelled"
+                targets.append((task_id, record.get("agent"), record.get("outer_task")))
+
+        interrupted = 0
+        tasks_cancelled = 0
+        failures = 0
+        for task_id, agent, task in targets:
+            if agent is not None:
+                try:
+                    agent.interrupt("Stop requested")
+                    interrupted += 1
+                except Exception:
+                    failures += 1
+                    logger.debug(
+                        "Could not interrupt background agent %s",
+                        task_id,
+                        exc_info=True,
+                    )
+            if task is not None and not task.done():
+                try:
+                    task.cancel()
+                    tasks_cancelled += 1
+                except Exception:
+                    failures += 1
+                    logger.debug(
+                        "Could not cancel background delivery task %s",
+                        task_id,
+                        exc_info=True,
+                    )
+        return {
+            "matched": matched,
+            "newly_cancelled": len(targets),
+            "agents_interrupted": interrupted,
+            "tasks_cancelled": tasks_cancelled,
+            "failures": failures,
+        }
+
+    def _background_session_keys_for_scope(self, source: SessionSource) -> List[str]:
+        platform = getattr(source.platform, "value", str(source.platform))
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not chat_id or not thread_id:
+            return []
+        lock, records = self._background_registry_parts()
+        with lock:
+            keys = {
+                str(record.get("session_key") or "")
+                for record in records.values()
+                if self._background_record_active(record)
+                and not record.get("cancel_requested")
+                and str(record.get("platform") or "") == platform
+                and str(record.get("chat_id") or "") == chat_id
+                and str(record.get("thread_id") or "") == thread_id
+                and str(record.get("session_key") or "")
+            }
+        return sorted(keys)[:32]
+
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
 
@@ -22240,6 +22446,11 @@ class _GatewayRunnerCore(
 
         source = event.source
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = build_session_key(source)
+        self._register_background_record(task_id, session_key, source)
 
         event_message_id = self._reply_anchor_for_event(event)
 
@@ -22258,8 +22469,13 @@ class _GatewayRunnerCore(
                 media_types=media_types,
             )
         )
-        self._background_tasks.add(_task)
-        _task.add_done_callback(self._background_tasks.discard)
+        self.__dict__.setdefault("_background_tasks", set()).add(_task)
+        self._bind_background_outer_task(task_id, _task)
+        _task.add_done_callback(
+            lambda task, owned_task_id=task_id: self._background_outer_done(
+                owned_task_id, task
+            )
+        )
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
@@ -22280,16 +22496,40 @@ class _GatewayRunnerCore(
         resolve from that profile's secret scope. Mirrors the pattern in
         ``_run_agent``.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+        lock, records = self._background_registry_parts()
+        with lock:
+            needs_record = task_id not in records
+        if needs_record:
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = build_session_key(source)
+            self._register_background_record(task_id, session_key, source)
+        try:
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types,
+                )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types,
+                )
+        finally:
+            if needs_record:
+                lock, records = self._background_registry_parts()
+                with lock:
+                    record = records.get(task_id)
+                    if record is not None and record.get("outer_task") is None:
+                        record["outer_done"] = True
+                        record["state"] = (
+                            "cancelled"
+                            if record.get("cancel_requested")
+                            else "completed"
+                        )
+                        record["completed_at"] = time.time()
+                        self._prune_background_records_locked(records)
 
     async def _run_background_task_inner(
         self,
@@ -22324,11 +22564,12 @@ class _GatewayRunnerCore(
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
-                )
+                if self._background_delivery_allowed(task_id):
+                    await adapter.send(
+                        source.chat_id,
+                        f"❌ Background task {task_id} failed: no provider credentials configured.",
+                        metadata=_thread_metadata,
+                    )
                 return
 
             platform_key = _platform_config_key(source.platform)
@@ -22427,6 +22668,10 @@ class _GatewayRunnerCore(
                         "session_override" if background_model_override else ""
                     ),
                 )
+                if not self._publish_background_agent(task_id, agent):
+                    self._cleanup_agent_resources(agent)
+                    self._mark_background_agent_finished(task_id, agent)
+                    return {"cancelled": True, "final_response": ""}
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -22434,6 +22679,7 @@ class _GatewayRunnerCore(
                     )
                 finally:
                     self._cleanup_agent_resources(agent)
+                    self._mark_background_agent_finished(task_id, agent)
 
             result = await self._run_in_executor_with_context(run_sync)
 
@@ -22442,7 +22688,7 @@ class _GatewayRunnerCore(
                 response = f"Error: {result['error']}"
 
             # Extract media files from the response
-            if response:
+            if response and self._background_delivery_allowed(task_id):
                 media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -22451,13 +22697,17 @@ class _GatewayRunnerCore(
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
-                if text_content:
+                if text_content and self._background_delivery_allowed(task_id):
                     await adapter.send(
                         chat_id=source.chat_id,
                         content=header + text_content,
                         metadata=_thread_metadata,
                     )
-                elif not images and not media_files:
+                elif (
+                    not images
+                    and not media_files
+                    and self._background_delivery_allowed(task_id)
+                ):
                     await adapter.send(
                         chat_id=source.chat_id,
                         content=header + "(No response generated)",
@@ -22466,6 +22716,8 @@ class _GatewayRunnerCore(
 
                 # Send extracted images
                 for image_url, alt_text in (images or []):
+                    if not self._background_delivery_allowed(task_id):
+                        break
                     try:
                         await adapter.send_image(
                             chat_id=source.chat_id,
@@ -22485,6 +22737,8 @@ class _GatewayRunnerCore(
                 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
                 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
                 for media_path, _is_voice in (media_files or []):
+                    if not self._background_delivery_allowed(task_id):
+                        break
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
@@ -22513,7 +22767,7 @@ class _GatewayRunnerCore(
                             )
                     except Exception:
                         pass
-            else:
+            elif self._background_delivery_allowed(task_id):
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -22524,11 +22778,12 @@ class _GatewayRunnerCore(
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
+                if self._background_delivery_allowed(task_id):
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=f"❌ Background task {task_id} failed: {e}",
+                        metadata=_thread_metadata,
+                    )
             except Exception:
                 pass
 
@@ -25712,6 +25967,8 @@ class _GatewayRunnerCore(
         work-item hydration and the two message guards) while giving upstream's
         lifecycle dedupe a single adapter-acceptance seam.
         """
+        if self._completion_suppressed_by_explicit_stop(evt):
+            return None
         source = self._build_process_event_source(evt)
         if not source:
             return None
@@ -25763,6 +26020,8 @@ class _GatewayRunnerCore(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
         """Claim and deliver one completion, leaving failures retryable."""
+        if self._completion_suppressed_by_explicit_stop(evt):
+            return None
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
@@ -25797,6 +26056,8 @@ class _GatewayRunnerCore(
 
         accepted = False
         try:
+            if self._completion_suppressed_by_explicit_stop(evt):
+                return None
             try:
                 if evt.get("type") == "async_delegation":
                     injection_result = await self._inject_async_delegation_completion(
@@ -25892,6 +26153,8 @@ class _GatewayRunnerCore(
         suppress_user_output: bool = False,
     ) -> Optional[bool]:
         """Forge a fresh internal turn for one detached completion event."""
+        if self._completion_suppressed_by_explicit_stop(evt):
+            return None
         if (
             str(evt.get("origin_work_item_id") or "").strip()
             and evt.get("origin_run_generation")
@@ -26132,6 +26395,10 @@ class _GatewayRunnerCore(
                     delegation_id = str(evt.get("delegation_id") or "")
                     if delegation_id and delegation_id in seen:
                         continue
+                    if self._completion_suppressed_by_explicit_stop(evt):
+                        if delegation_id:
+                            seen.add(delegation_id)
+                        continue
                     durable_attempt = bool(
                         str(evt.get("origin_work_item_id") or "").strip()
                         and evt.get("origin_run_generation")
@@ -26207,7 +26474,17 @@ class _GatewayRunnerCore(
             while True:
                 await asyncio.sleep(interval)
                 session = process_registry.get(session_id)
-                if session is None or session.exited:
+                if (
+                    session is None
+                    or session.exited
+                    or (
+                        callable(getattr(process_registry, "is_completion_suppressed", None))
+                        and process_registry.is_completion_suppressed(
+                            session_id,
+                            getattr(session, "started_at", None) if session else None,
+                        )
+                    )
+                ):
                     break
             logger.debug("Process watcher ended (silent): %s", session_id)
             return
@@ -26218,6 +26495,14 @@ class _GatewayRunnerCore(
 
             session = process_registry.get(session_id)
             if session is None:
+                break
+            if (
+                callable(getattr(process_registry, "is_completion_suppressed", None))
+                and process_registry.is_completion_suppressed(
+                    session_id,
+                    getattr(session, "started_at", None),
+                )
+            ):
                 break
 
             current_output_len = len(session.output_buffer)
@@ -26789,6 +27074,65 @@ class _GatewayRunnerCore(
             )
         return generation
 
+    def _mark_explicit_session_stop(self, session_key: str, *, reason: str) -> float:
+        """Publish a bounded delivery tombstone before any stop signal fires."""
+        stopped_at = time.time()
+        tombstones = self.__dict__.get("_explicit_session_stops")
+        if not isinstance(tombstones, OrderedDict):
+            tombstones = OrderedDict()
+            self._explicit_session_stops = tombstones
+        tombstones[session_key] = {
+            "stopped_at": stopped_at,
+            "reason": str(reason or "session_stop")[:120],
+        }
+        tombstones.move_to_end(session_key)
+        while len(tombstones) > 512:
+            tombstones.popitem(last=False)
+        self._invalidate_session_run_generation(session_key, reason=reason)
+        return stopped_at
+
+    def _completion_suppressed_by_explicit_stop(self, evt: dict) -> bool:
+        """Fence an old producer without suppressing work started after /stop."""
+        evt_type = str(evt.get("type") or "")
+        if evt_type == "async_delegation":
+            delegation_id = str(evt.get("delegation_id") or "")
+            if delegation_id:
+                try:
+                    from tools.async_delegation import is_completion_cancelled
+
+                    if is_completion_cancelled(delegation_id):
+                        return True
+                except Exception:
+                    logger.debug(
+                        "Could not inspect async cancellation for %s",
+                        delegation_id,
+                        exc_info=True,
+                    )
+        elif evt_type == "completion":
+            try:
+                from tools.process_registry import process_registry
+
+                if process_registry.is_completion_suppressed(
+                    str(evt.get("session_id") or ""), evt.get("started_at")
+                ):
+                    return True
+            except Exception:
+                logger.debug("Could not inspect process completion suppression", exc_info=True)
+
+        session_key = str(evt.get("session_key") or "")
+        tombstones = self.__dict__.get("_explicit_session_stops") or {}
+        tombstone = tombstones.get(session_key) if session_key else None
+        if not isinstance(tombstone, dict):
+            return False
+        stopped_at = float(tombstone.get("stopped_at") or 0)
+        producer_started = evt.get("dispatched_at")
+        if producer_started is None:
+            producer_started = evt.get("started_at")
+        try:
+            return producer_started is None or float(producer_started) <= stopped_at
+        except (TypeError, ValueError):
+            return True
+
     def _is_session_run_current(self, session_key: str, generation: int) -> bool:
         """Return True when ``generation`` is still current for ``session_key``."""
         if not session_key:
@@ -26821,21 +27165,49 @@ class _GatewayRunnerCore(
         invalidation_reason: str,
         release_running_state: bool = True,
         cleanup_background_processes: bool = False,
+        manage_session_owned_async: bool = True,
+        invalidate_generation: bool = True,
     ) -> None:
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
             return
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            running_agent.interrupt(interrupt_reason)
-        self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
+            try:
+                running_agent.interrupt(interrupt_reason)
+            except Exception:
+                logger.warning(
+                    "Failed to interrupt active agent for %s",
+                    session_key,
+                    exc_info=True,
+                )
+        if invalidate_generation:
+            self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         if adapter and hasattr(adapter, "interrupt_session_activity"):
-            await adapter.interrupt_session_activity(session_key, source.chat_id)
+            try:
+                await adapter.interrupt_session_activity(session_key, source.chat_id)
+            except Exception:
+                logger.debug(
+                    "Failed to release adapter activity for %s",
+                    session_key,
+                    exc_info=True,
+                )
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            try:
+                adapter.get_pending_message(session_key)  # consume and discard
+            except Exception:
+                logger.debug(
+                    "Failed to discard adapter pending input for %s",
+                    session_key,
+                    exc_info=True,
+                )
         self._pending_messages.pop(session_key, None)
-        if interrupt_reason == _INTERRUPT_REASON_STOP:
+        self.__dict__.setdefault("_queued_events", {}).pop(session_key, None)
+        if (
+            manage_session_owned_async
+            and interrupt_reason == _INTERRUPT_REASON_STOP
+        ):
             self._stop_required_async_for_session(session_key)
         if cleanup_background_processes:
             self._stop_session_background_processes(session_key)
@@ -26860,7 +27232,10 @@ class _GatewayRunnerCore(
         try:
             from tools.process_registry import process_registry
 
-            killed = process_registry.kill_for_session(session_key)
+            killed = process_registry.kill_for_session(
+                session_key,
+                suppress_completion=True,
+            )
             if killed:
                 logger.info(
                     "Stopped %d background process(es) for session %s",
@@ -26876,16 +27251,23 @@ class _GatewayRunnerCore(
             )
             return 0
 
-    def _stop_required_async_for_session(self, session_key: str) -> int:
-        """Seal and fence all durable attempt work for explicit ``/stop``."""
-
+    def _fence_required_async_attempts_for_session(
+        self, session_key: str
+    ) -> Dict[str, Any]:
+        """Fence and seal exact durable attempts without signaling workers."""
+        report: Dict[str, Any] = {
+            "matched": 0,
+            "fenced": 0,
+            "sealed": 0,
+            "dispatches_cancelled": 0,
+            "reconciled": 0,
+            "failed_ids": [],
+            "_attempts": [],
+        }
         if not session_key:
-            return 0
+            return report
         try:
-            from tools.async_delegation import interrupt_session
-
             ledger = self._ledger()
-            stopped = 0
             for item in ledger.incomplete_items():
                 if str(item.get("session_key") or "") != session_key:
                     continue
@@ -26898,22 +27280,28 @@ class _GatewayRunnerCore(
                     or state.get("reconciled_at") is not None
                 ):
                     continue
+                report["matched"] += 1
                 identity = self._required_async_identity(state)
-                attempt_cancelled = ledger.cancel_required_async_attempt(
+                was_cancelled = state.get("attempt_cancelled") is True
+                was_sealed = state.get("sealed") is True
+                cancelled = ledger.cancel_required_async_attempt(
                     work_id,
                     **identity,
                     reason="session_stop",
                 )
-                if not isinstance(attempt_cancelled, dict):
+                if not isinstance(cancelled, dict):
+                    if len(report["failed_ids"]) < 10:
+                        report["failed_ids"].append(work_id)
                     continue
-                attempt_fenced = attempt_cancelled.get("attempt_cancelled") is True
-                sealed = ledger.seal_required_async_attempt(
-                    work_id,
-                    **identity,
-                )
+                if not was_cancelled and cancelled.get("attempt_cancelled") is True:
+                    report["fenced"] += 1
+                sealed = ledger.seal_required_async_attempt(work_id, **identity)
                 if not isinstance(sealed, dict):
+                    if len(report["failed_ids"]) < 10:
+                        report["failed_ids"].append(work_id)
                     continue
-                cancelled_ids: set[str] = set()
+                if not was_sealed and sealed.get("sealed") is True:
+                    report["sealed"] += 1
                 for delegation_id, dispatch in dict(
                     sealed.get("dispatches") or {}
                 ).items():
@@ -26922,7 +27310,7 @@ class _GatewayRunnerCore(
                         or dispatch.get("state") not in {"registered", "running"}
                     ):
                         continue
-                    cancelled = ledger.cancel_required_async_dispatch(
+                    cancelled_dispatches = ledger.cancel_required_async_dispatch(
                         work_id,
                         delegation_id=str(delegation_id),
                         **identity,
@@ -26930,86 +27318,264 @@ class _GatewayRunnerCore(
                         status="cancelled",
                     )
                     cancelled_dispatch = (
-                        cancelled.get("dispatches", {}).get(str(delegation_id))
-                        if isinstance(cancelled, dict)
+                        cancelled_dispatches.get("dispatches", {}).get(
+                            str(delegation_id)
+                        )
+                        if isinstance(cancelled_dispatches, dict)
                         else None
                     )
                     if (
                         isinstance(cancelled_dispatch, dict)
                         and cancelled_dispatch.get("state") == "cancelled"
                     ):
-                        cancelled_ids.add(str(delegation_id))
-                result = interrupt_session(
-                    session_key,
-                    kind=None,
-                    origin_work_item_id=work_id,
-                    attempt_id=str(identity.get("attempt_id") or "") or None,
-                    reason="session_stop",
-                )
-                stopped += max(
-                    int(attempt_fenced),
-                    len(cancelled_ids),
-                    int(result.get("matched") or 0),
-                )
-                refreshed = ledger.required_async_completion_state(work_id)
-                stop_failed = bool(
-                    isinstance(refreshed, dict)
-                    and (
-                        refreshed.get("failed")
-                        or (
-                            not refreshed.get("has_required")
-                            and int(refreshed.get("advisory_failed") or 0) > 0
-                        )
-                    )
-                )
-                if (
-                    isinstance(refreshed, dict)
-                    and refreshed.get("ready_to_reconcile") is True
-                    and stop_failed
-                ):
-                    reconciliation_id = self._required_async_reconciliation_id(
-                        work_id,
-                        refreshed,
-                    )
-                    finalized = ledger.finalize_required_async_failure(
-                        work_id,
-                        **self._required_async_identity(refreshed),
-                        final_response=(
-                            "Background attempt work was explicitly stopped before "
-                            "its result was reconciled and will not be resumed automatically."
-                        ),
-                        reason=(
-                            "required_async_attempt_cancelled"
-                        ),
-                        reconciliation_id=reconciliation_id,
-                    )
-                    if isinstance(finalized, dict):
-                        try:
-                            loop = asyncio.get_running_loop()
-                        except RuntimeError:
-                            loop = None
-                        if loop is not None:
-                            task = loop.create_task(
-                                self._resume_finished_discord_work_item(finalized)
-                            )
-                            background = self.__dict__.setdefault(
-                                "_background_tasks",
-                                set(),
-                            )
-                            background.add(task)
-                            task.add_done_callback(background.discard)
-            if stopped:
-                self.__dict__.setdefault(
-                    "_required_async_reconcile_event",
-                    asyncio.Event(),
-                ).set()
-            return stopped
+                        report["dispatches_cancelled"] += 1
+                report["_attempts"].append((work_id, identity))
         except Exception:
             logger.exception(
-                "Failed to stop durable attempt work for session %s",
+                "Failed to fence durable attempt work for session %s",
                 session_key,
             )
-            return 0
+        return report
+
+    def _reconcile_fenced_required_async_attempts(
+        self, report: Dict[str, Any]
+    ) -> None:
+        """Reconcile attempts after registry cancellation terminalized dispatches."""
+        attempts = list(report.get("_attempts") or [])
+        if not attempts:
+            return
+        ledger = self._ledger()
+        for work_id, _identity in attempts:
+            refreshed = ledger.required_async_completion_state(work_id)
+            stop_failed = bool(
+                isinstance(refreshed, dict)
+                and (
+                    refreshed.get("failed")
+                    or (
+                        not refreshed.get("has_required")
+                        and int(refreshed.get("advisory_failed") or 0) > 0
+                    )
+                )
+            )
+            if not (
+                isinstance(refreshed, dict)
+                and refreshed.get("ready_to_reconcile") is True
+                and stop_failed
+            ):
+                continue
+            reconciliation_id = self._required_async_reconciliation_id(
+                work_id,
+                refreshed,
+            )
+            finalized = ledger.finalize_required_async_failure(
+                work_id,
+                **self._required_async_identity(refreshed),
+                final_response=(
+                    "Background attempt work was explicitly stopped before "
+                    "its result was reconciled and will not be resumed automatically."
+                ),
+                reason="required_async_attempt_cancelled",
+                reconciliation_id=reconciliation_id,
+            )
+            if not isinstance(finalized, dict):
+                continue
+            report["reconciled"] = int(report.get("reconciled") or 0) + 1
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                task = loop.create_task(
+                    self._resume_finished_discord_work_item(finalized)
+                )
+                background = self.__dict__.setdefault("_background_tasks", set())
+                background.add(task)
+                task.add_done_callback(background.discard)
+        if any(
+            int(report.get(key) or 0)
+            for key in ("fenced", "sealed", "dispatches_cancelled", "reconciled")
+        ):
+            self.__dict__.setdefault(
+                "_required_async_reconcile_event",
+                asyncio.Event(),
+            ).set()
+
+    def _stop_required_async_for_session(self, session_key: str) -> int:
+        """Compatibility helper for non-funnel callers and focused tests."""
+        from tools.async_delegation import cancel_session
+
+        report = self._fence_required_async_attempts_for_session(session_key)
+        cancelled = cancel_session(session_key, reason="session_stop")
+        self._reconcile_fenced_required_async_attempts(report)
+        report.pop("_attempts", None)
+        return max(
+            int(report.get("fenced") or 0),
+            int(report.get("dispatches_cancelled") or 0),
+            int(cancelled.get("newly_cancelled") or 0),
+        )
+
+    async def _stop_session_owned_work(
+        self,
+        event: MessageEvent,
+        session_keys: List[str],
+        *,
+        invalidation_reason: str,
+        stop_discord_boards: bool = True,
+    ) -> Dict[str, Any]:
+        """Authoritative idempotent stop funnel for live gateway entry paths."""
+        from tools.async_delegation import cancel_session
+
+        source = event.source
+        keys = list(dict.fromkeys(str(key or "") for key in session_keys if key))[:32]
+        report: Dict[str, Any] = {
+            "session_keys": keys,
+            "active_parent": {"matched": 0, "interrupted": 0, "pending": 0},
+            "async_delegations": {
+                "matched": 0,
+                "newly_cancelled": 0,
+                "callbacks_invoked": 0,
+                "callbacks_failed": 0,
+                "durable_cancelled": 0,
+                "by_kind": {},
+                "failed_ids": [],
+            },
+            "durable_attempts": {
+                "matched": 0,
+                "fenced": 0,
+                "sealed": 0,
+                "dispatches_cancelled": 0,
+                "reconciled": 0,
+                "failed_ids": [],
+            },
+            "background_agents": {
+                "matched": 0,
+                "newly_cancelled": 0,
+                "agents_interrupted": 0,
+                "tasks_cancelled": 0,
+                "failures": 0,
+            },
+            "terminal_processes": 0,
+            "discord_boards": [],
+            "changed": False,
+        }
+        if not keys:
+            return report
+
+        # Publish every stop tombstone before the first agent/process callback.
+        for session_key in keys:
+            agent = self._running_agents.get(session_key)
+            if agent is _AGENT_PENDING_SENTINEL:
+                report["active_parent"]["matched"] += 1
+                report["active_parent"]["pending"] += 1
+            elif agent:
+                report["active_parent"]["matched"] += 1
+            self._mark_explicit_session_stop(
+                session_key,
+                reason=invalidation_reason,
+            )
+
+        attempt_reports: Dict[str, Dict[str, Any]] = {}
+        for session_key in keys:
+            attempt_report = self._fence_required_async_attempts_for_session(session_key)
+            attempt_reports[session_key] = attempt_report
+            for field in ("matched", "fenced", "sealed", "dispatches_cancelled"):
+                report["durable_attempts"][field] += int(
+                    attempt_report.get(field) or 0
+                )
+            for failed_id in attempt_report.get("failed_ids") or []:
+                if len(report["durable_attempts"]["failed_ids"]) < 10:
+                    report["durable_attempts"]["failed_ids"].append(failed_id)
+
+        if stop_discord_boards:
+            try:
+                report["discord_boards"] = list(
+                    await self._stop_discord_thread_boards_for_event(event)
+                )[:16]
+            except Exception:
+                logger.warning(
+                    "Failed to stop Discord worker boards for session scope",
+                    exc_info=True,
+                )
+
+        for session_key in keys:
+            agent = self._running_agents.get(session_key)
+            if agent and agent is not _AGENT_PENDING_SENTINEL:
+                report["active_parent"]["interrupted"] += 1
+            await self._interrupt_and_clear_session(
+                session_key,
+                source,
+                interrupt_reason=_INTERRUPT_REASON_STOP,
+                invalidation_reason=invalidation_reason,
+                cleanup_background_processes=False,
+                manage_session_owned_async=False,
+                invalidate_generation=False,
+            )
+
+            async_report = cancel_session(session_key, reason="session_stop")
+            for field in (
+                "matched",
+                "newly_cancelled",
+                "callbacks_invoked",
+                "callbacks_failed",
+                "durable_cancelled",
+            ):
+                report["async_delegations"][field] += int(
+                    async_report.get(field) or 0
+                )
+            for kind, count in dict(async_report.get("by_kind") or {}).items():
+                by_kind = report["async_delegations"]["by_kind"]
+                by_kind[kind] = by_kind.get(kind, 0) + int(count or 0)
+            for failed_id in async_report.get("failed_ids") or []:
+                if len(report["async_delegations"]["failed_ids"]) < 10:
+                    report["async_delegations"]["failed_ids"].append(failed_id)
+
+            background_report = self._cancel_background_agents_for_session(
+                session_key,
+                reason="Stop requested",
+            )
+            for field in report["background_agents"]:
+                report["background_agents"][field] += int(
+                    background_report.get(field) or 0
+                )
+            report["terminal_processes"] += self._stop_session_background_processes(
+                session_key
+            )
+            self._reconcile_fenced_required_async_attempts(
+                attempt_reports[session_key]
+            )
+            report["durable_attempts"]["reconciled"] += int(
+                attempt_reports[session_key].get("reconciled") or 0
+            )
+
+        report["async_delegations"]["by_kind"] = dict(
+            sorted(report["async_delegations"]["by_kind"].items())[:12]
+        )
+        report["changed"] = bool(
+            report["active_parent"]["matched"]
+            or report["async_delegations"]["newly_cancelled"]
+            or report["durable_attempts"]["fenced"]
+            or report["durable_attempts"]["sealed"]
+            or report["durable_attempts"]["dispatches_cancelled"]
+            or report["durable_attempts"]["reconciled"]
+            or report["background_agents"]["newly_cancelled"]
+            or report["terminal_processes"]
+            or report["discord_boards"]
+        )
+        logger.info(
+            "STOP scope sessions=%d parent=%d async=%d durable=%d background=%d "
+            "processes=%d boards=%d failures=%d",
+            len(keys),
+            report["active_parent"]["matched"],
+            report["async_delegations"]["newly_cancelled"],
+            report["durable_attempts"]["fenced"],
+            report["background_agents"]["newly_cancelled"],
+            report["terminal_processes"],
+            len(report["discord_boards"]),
+            report["async_delegations"]["callbacks_failed"]
+            + report["background_agents"]["failures"]
+            + len(report["durable_attempts"]["failed_ids"]),
+        )
+        return report
 
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc)."""
@@ -31881,7 +32447,30 @@ class _GatewayRunnerCore(
                     continue
                 if key == prefix or key.startswith(prefix + ":"):
                     matches.append(key)
-            return matches
+            try:
+                from tools.async_delegation import session_keys_for_routing_scope
+
+                matches.extend(
+                    session_keys_for_routing_scope(
+                        platform=platform,
+                        chat_id=str(chat_id),
+                        thread_id=str(thread_id),
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "Could not inspect detached async sibling ownership",
+                    exc_info=True,
+                )
+            matches.extend(self._background_session_keys_for_scope(source))
+            return sorted(
+                {
+                    key
+                    for key in matches
+                    if key != own_key
+                    and (key == prefix or key.startswith(prefix + ":"))
+                }
+            )[:32]
 
     async def _handle_suggestions_command(self, event: MessageEvent) -> str:
             """Handle /suggestions in the gateway.

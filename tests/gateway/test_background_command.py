@@ -455,6 +455,66 @@ class TestRunBackgroundTask:
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "failed" in content.lower()
 
+    def test_stop_before_agent_publication_interrupts_new_agent(self):
+        runner = _make_runner()
+        source = _make_event().source
+        runner._register_background_record("bg_pre", "mine", source)
+        task = MagicMock()
+        task.done.return_value = False
+        runner._bind_background_outer_task("bg_pre", task)
+
+        first = runner._cancel_background_agents_for_session("mine")
+        agent = MagicMock()
+        should_start = runner._publish_background_agent("bg_pre", agent)
+        second = runner._cancel_background_agents_for_session("mine")
+
+        assert first["newly_cancelled"] == 1
+        assert first["tasks_cancelled"] == 1
+        assert should_start is False
+        agent.interrupt.assert_called_once_with("Stop requested")
+        task.cancel.assert_called_once()
+        assert second["newly_cancelled"] == 0
+
+    def test_stop_after_agent_publication_interrupts_once_and_is_session_scoped(self):
+        runner = _make_runner()
+        source = _make_event().source
+        runner._register_background_record("bg_mine", "mine", source)
+        runner._register_background_record("bg_other", "other", source)
+        mine_agent = MagicMock()
+        other_agent = MagicMock()
+        assert runner._publish_background_agent("bg_mine", mine_agent)
+        assert runner._publish_background_agent("bg_other", other_agent)
+        mine_task = MagicMock()
+        mine_task.done.return_value = False
+        other_task = MagicMock()
+        other_task.done.return_value = False
+        runner._bind_background_outer_task("bg_mine", mine_task)
+        runner._bind_background_outer_task("bg_other", other_task)
+
+        first = runner._cancel_background_agents_for_session("mine")
+        second = runner._cancel_background_agents_for_session("mine")
+
+        assert first == {
+            "matched": 1,
+            "newly_cancelled": 1,
+            "agents_interrupted": 1,
+            "tasks_cancelled": 1,
+            "failures": 0,
+        }
+        assert second["newly_cancelled"] == 0
+        mine_agent.interrupt.assert_called_once_with("Stop requested")
+        mine_task.cancel.assert_called_once()
+        other_agent.interrupt.assert_not_called()
+        other_task.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_background_delivery_is_suppressed(self):
+        runner = _make_runner()
+        source = _make_event().source
+        runner._register_background_record("bg_cancelled", "mine", source)
+        runner._cancel_background_agents_for_session("mine")
+        assert runner._background_delivery_allowed("bg_cancelled") is False
+
 
 # ---------------------------------------------------------------------------
 # /background in help and known_commands

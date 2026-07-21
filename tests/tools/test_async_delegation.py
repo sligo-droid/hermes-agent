@@ -318,7 +318,6 @@ def test_advisory_delegation_uses_generic_durable_store(monkeypatch, tmp_path):
     assert durable is not None
     assert durable["state"] == "completed"
     assert durable["delivery_state"] == "pending"
-
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
     event = restored.get_nowait()
@@ -327,6 +326,97 @@ def test_advisory_delegation_uses_generic_durable_store(monkeypatch, tmp_path):
     ad.complete_event_delivery(event, claim_id)
     assert ad.restore_undelivered_completions(queue.Queue()) == 0
 
+
+def test_cancel_session_is_mixed_kind_idempotent_and_failure_isolated(monkeypatch):
+    calls = []
+    ledger = _FakeRequiredLedger(calls)
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: ledger)
+    invoked = []
+
+    def broken():
+        invoked.append("broken")
+        raise RuntimeError("cannot signal")
+
+    with ad._records_lock:
+        ad._records.update(
+            {
+                "coding": {
+                    "delegation_id": "coding",
+                    "status": "running",
+                    "session_key": "mine",
+                    "kind": "coding_worker",
+                    "interrupt_fn": lambda: invoked.append("coding"),
+                    "delivery_pending": False,
+                    "origin_work_item_id": "work-1",
+                    "origin_run_generation": 7,
+                    "origin_attempt_id": "boot:7",
+                    "origin_attempt_order": 8,
+                    "required_async_registered": True,
+                },
+                "advisory": {
+                    "delegation_id": "advisory",
+                    "status": "running",
+                    "session_key": "mine",
+                    "kind": "delegation",
+                    "interrupt_fn": broken,
+                    "delivery_pending": False,
+                },
+                "other": {
+                    "delegation_id": "other",
+                    "status": "running",
+                    "session_key": "theirs",
+                    "kind": "delegation",
+                    "interrupt_fn": lambda: invoked.append("other"),
+                    "delivery_pending": False,
+                },
+            }
+        )
+
+    first = ad.cancel_session("mine", reason="session_stop")
+    second = ad.cancel_session("mine", reason="session_stop")
+
+    assert first["matched"] == 2
+    assert first["newly_cancelled"] == 2
+    assert first["callbacks_invoked"] == 1
+    assert first["callbacks_failed"] == 1
+    assert first["by_kind"] == {"coding_worker": 1, "delegation": 1}
+    assert second["matched"] == 0 or second["newly_cancelled"] == 0
+    assert invoked == ["coding", "broken"]
+    assert ad._records["coding"]["cancel_requested"] is True
+    assert ad._records["advisory"]["delivery_pending"] is False
+    assert not ad._records["other"].get("cancel_requested")
+
+
+def test_cancelled_non_durable_late_success_is_terminal_without_delivery(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    executor = _CapturingExecutor([])
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+
+    dispatched = ad.dispatch_async_delegation(
+        goal="late advice",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="mine",
+        runner=lambda: {"status": "completed", "summary": "too late"},
+        interrupt_fn=lambda: None,
+    )
+    outcome = ad.cancel_session("mine", reason="session_stop")
+    executor.worker()
+
+    assert outcome["newly_cancelled"] == 1
+    assert process_registry.completion_queue.empty()
+    record = next(
+        item for item in ad.list_async_delegations()
+        if item["delegation_id"] == dispatched["delegation_id"]
+    )
+    assert record["status"] == "cancelled"
+    assert record["completion_success"] is False
+    assert record["delivery_pending"] is False
+    assert ad.is_completion_cancelled(dispatched["delegation_id"])
 
 def test_discord_advisory_batch_persists_under_exact_attempt(monkeypatch):
     calls = []

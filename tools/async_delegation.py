@@ -320,6 +320,25 @@ def _mark_durable_completion_delivered(delegation_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _cancel_durable_completion_delivery(
+    delegation_id: str,
+    *,
+    reason: str,
+    cancelled_at: float,
+) -> bool:
+    """Fence any not-yet-delivered compatibility event for one delegation."""
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations
+               SET state='cancelled', completed_at=COALESCE(completed_at, ?),
+                   updated_at=?, delivery_state='cancelled', delivery_claim=NULL,
+                   delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'""",
+            (cancelled_at, cancelled_at, delegation_id),
+        )
+        return cur.rowcount == 1
+
+
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
@@ -377,6 +396,26 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (now, now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
+
+
+def is_completion_cancelled(delegation_id: str) -> bool:
+    """Return whether explicit cancellation owns an undelivered completion."""
+    normalized = str(delegation_id or "")
+    if not normalized:
+        return False
+    with _records_lock:
+        record = _records.get(normalized)
+        if record is not None and record.get("cancel_requested"):
+            return True
+    try:
+        with _DB_LOCK, _connect() as conn:
+            row = conn.execute(
+                "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+                (normalized,),
+            ).fetchone()
+        return bool(row and row[0] == "cancelled")
+    except Exception:
+        return False
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
@@ -1007,6 +1046,10 @@ def dispatch_async_delegation(
         "interrupt_fn": interrupt_fn,
         "kind": str(kind or "delegation"),
         "delivery_pending": False,
+        "cancel_requested": False,
+        "cancel_reason": "",
+        "cancel_requested_at": None,
+        "interrupt_invoked": False,
         "origin_work_item_id": str(origin_work_item_id or "")[:240],
         "origin_run_generation": _normalized_generation(origin_run_generation),
         "origin_attempt_id": str(origin_attempt_id or "")[:240],
@@ -1132,6 +1175,42 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     _complete_record(delegation_id, result, status, enqueue=True)
 
 
+def _persist_cancelled_generic_record(
+    record: Dict[str, Any], result: Dict[str, Any]
+) -> None:
+    """Keep non-attempt cancellation terminal evidence without queue delivery."""
+    if _is_durable_attempt_dispatch(record):
+        return
+    cancelled_at = float(
+        record.get("cancel_requested_at")
+        or record.get("completed_at")
+        or time.time()
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": record.get("delegation_id"),
+        "session_key": record.get("session_key", ""),
+        "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+        "parent_session_id": record.get("parent_session_id"),
+        "status": "cancelled",
+        "completed_at": cancelled_at,
+        "cancel_reason": record.get("cancel_reason", "session_stop"),
+    }
+    try:
+        _persist_completion(event, result)
+        _cancel_durable_completion_delivery(
+            str(record.get("delegation_id") or ""),
+            reason=str(record.get("cancel_reason") or "session_stop"),
+            cancelled_at=cancelled_at,
+        )
+    except Exception:
+        logger.debug(
+            "Could not persist cancelled delegation %s",
+            record.get("delegation_id"),
+            exc_info=True,
+        )
+
+
 def _complete_record(
     delegation_id: str,
     result: Dict[str, Any],
@@ -1152,6 +1231,10 @@ def _complete_record(
         record["status"] = "finalizing"
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
+        cancelled = bool(record.get("cancel_requested"))
+        if cancelled:
+            status = "cancelled"
+            enqueue = False
         deterministic_result = result.get("result")
         if (
             record.get("kind") == "coding_worker"
@@ -1163,20 +1246,36 @@ def _complete_record(
             )
         else:
             record["completion_success"] = status in {"completed", "success"}
+        if cancelled:
+            record["completion_success"] = False
+            record["delivery_pending"] = False
         terminal_record = dict(record)
         terminal_record["status"] = status
 
-    durable_accepted = _persist_required_async_terminal(
-        terminal_record,
-        result,
-        status,
-        submit_failure=submit_failure,
-    )
+    if cancelled:
+        if _is_durable_attempt_dispatch(terminal_record):
+            durable_accepted = False
+        else:
+            _persist_cancelled_generic_record(terminal_record, result)
+            durable_accepted = True
+    else:
+        durable_accepted = _persist_required_async_terminal(
+            terminal_record,
+            result,
+            status,
+            submit_failure=submit_failure,
+        )
 
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None:
             return durable_accepted
+        cancelled = cancelled or bool(record.get("cancel_requested"))
+        if cancelled:
+            status = "cancelled"
+            enqueue = False
+            durable_accepted = False if _is_durable_attempt_dispatch(record) else True
+            record["completion_success"] = False
         record["required_async_terminal_accepted"] = durable_accepted
         record["delivery_pending"] = bool(
             enqueue
@@ -1190,6 +1289,10 @@ def _complete_record(
     with _records_lock:
         record = _records.get(delegation_id)
         if record is not None:
+            if record.get("cancel_requested"):
+                status = "cancelled"
+                record["completion_success"] = False
+                record["delivery_pending"] = False
             record.pop("_terminalizing", None)
             record["_terminalized"] = True
             record["status"] = status
@@ -1265,6 +1368,8 @@ def _push_completion_event(
     results remain durable; advisory delegation results would be lost, so both
     cases log loudly with the appropriate recovery semantics.
     """
+    if is_completion_cancelled(str(record.get("delegation_id") or "")):
+        return
     try:
         from tools.process_registry import process_registry
     except Exception as exc:  # pragma: no cover
@@ -1409,6 +1514,13 @@ def _push_completion_event(
         )
     if not _is_durable_attempt_dispatch(record):
         _persist_completion(evt, result)
+    if is_completion_cancelled(str(record.get("delegation_id") or "")):
+        _cancel_durable_completion_delivery(
+            str(record.get("delegation_id") or ""),
+            reason=str(record.get("cancel_reason") or "session_stop"),
+            cancelled_at=float(record.get("cancel_requested_at") or time.time()),
+        )
+        return
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1496,6 +1608,10 @@ def dispatch_async_delegation_batch(
         "is_batch": True,
         "kind": "delegation",
         "delivery_pending": False,
+        "cancel_requested": False,
+        "cancel_reason": "",
+        "cancel_requested_at": None,
+        "interrupt_invoked": False,
         "origin_work_item_id": str(origin_work_item_id or "")[:240],
         "origin_run_generation": _normalized_generation(origin_run_generation),
         "origin_attempt_id": str(origin_attempt_id or "")[:240],
@@ -1637,33 +1753,65 @@ def _finalize_batch(
         record["status"] = "finalizing"
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
-        record["completion_success"] = status in {"completed", "success"}
+        cancelled = bool(record.get("cancel_requested"))
+        if cancelled:
+            status = "cancelled"
+        record["completion_success"] = (
+            not cancelled and status in {"completed", "success"}
+        )
+        if cancelled:
+            record["delivery_pending"] = False
         terminal_record = dict(record)
         terminal_record["status"] = status
 
-    durable_accepted = _persist_required_async_terminal(
-        terminal_record,
-        combined,
-        status,
-    )
+    if cancelled:
+        if _is_durable_attempt_dispatch(terminal_record):
+            durable_accepted = False
+        else:
+            _persist_cancelled_generic_record(terminal_record, combined)
+            durable_accepted = True
+    else:
+        durable_accepted = _persist_required_async_terminal(
+            terminal_record,
+            combined,
+            status,
+        )
 
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None:
             return
+        cancelled = cancelled or bool(record.get("cancel_requested"))
+        if cancelled:
+            status = "cancelled"
+            durable_accepted = False if _is_durable_attempt_dispatch(record) else True
+            record["completion_success"] = False
         record["required_async_terminal_accepted"] = durable_accepted
         record["delivery_pending"] = bool(
-            durable_accepted and _completion_requires_delivery_ack(record)
+            not cancelled
+            and durable_accepted
+            and _completion_requires_delivery_ack(record)
         )
         event_record = dict(record)
 
-    if not durable_accepted:
+    if cancelled or not durable_accepted:
         with _records_lock:
             record = _records.get(delegation_id)
             if record is not None:
                 record.pop("_terminalizing", None)
                 record["_terminalized"] = True
                 record["status"] = status
+            _prune_completed_locked()
+        return
+
+    if is_completion_cancelled(delegation_id):
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is not None:
+                record.pop("_terminalizing", None)
+                record["_terminalized"] = True
+                record["status"] = "cancelled"
+                record["delivery_pending"] = False
             _prune_completed_locked()
         return
 
@@ -1740,6 +1888,24 @@ def _finalize_batch(
     )
     if not _is_durable_attempt_dispatch(event_record):
         _persist_completion(evt, combined)
+    if is_completion_cancelled(delegation_id):
+        _cancel_durable_completion_delivery(
+            delegation_id,
+            reason=str(event_record.get("cancel_reason") or "session_stop"),
+            cancelled_at=float(
+                event_record.get("cancel_requested_at") or time.time()
+            ),
+        )
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is not None:
+                record.pop("_terminalizing", None)
+                record["_terminalized"] = True
+                record["status"] = "cancelled"
+                record["delivery_pending"] = False
+                record["completion_success"] = False
+            _prune_completed_locked()
+        return
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1761,6 +1927,10 @@ def _finalize_batch(
         with _records_lock:
             record = _records.get(delegation_id)
             if record is not None:
+                if record.get("cancel_requested"):
+                    status = "cancelled"
+                    record["completion_success"] = False
+                    record["delivery_pending"] = False
                 record.pop("_terminalizing", None)
                 record["_terminalized"] = True
                 record["status"] = status
@@ -1829,54 +1999,146 @@ def interrupt_all(reason: str = "shutdown") -> int:
     return count
 
 
-def interrupt_session(
-    session_key: str,
+def _routing_scope_matches(
+    record: Dict[str, Any], routing_scope: Optional[Dict[str, str]]
+) -> bool:
+    if not routing_scope:
+        return False
+    for field in ("platform", "chat_id", "thread_id"):
+        expected = str(routing_scope.get(field) or "").strip()
+        if expected and str(record.get(field) or "").strip() != expected:
+            return False
+    return bool(
+        str(routing_scope.get("platform") or "").strip()
+        and str(routing_scope.get("chat_id") or "").strip()
+    )
+
+
+def session_keys_for_routing_scope(
     *,
-    kind: Optional[str] = "coding_worker",
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    limit: int = 32,
+) -> List[str]:
+    """Return bounded live/delivery-pending owners for one chat/thread scope."""
+    scope = {
+        "platform": str(platform or "").strip(),
+        "chat_id": str(chat_id or "").strip(),
+        "thread_id": str(thread_id or "").strip(),
+    }
+    if not scope["platform"] or not scope["chat_id"]:
+        return []
+    bounded = max(1, min(int(limit or 32), 64))
+    with _records_lock:
+        keys = {
+            str(record.get("session_key") or "")
+            for record in _records.values()
+            if (record.get("status") in {"running", "finalizing"}
+                or bool(record.get("delivery_pending")))
+            and not record.get("cancel_requested")
+            and _routing_scope_matches(record, scope)
+            and str(record.get("session_key") or "")
+        }
+    return sorted(keys)[:bounded]
+
+
+def cancel_session(
+    session_key: str = "",
+    *,
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    routing_scope: Optional[Dict[str, str]] = None,
+    kind: Optional[str] = None,
     origin_work_item_id: Optional[str] = None,
     attempt_id: Optional[str] = None,
     reason: str = "session_stop",
 ) -> Dict[str, Any]:
-    """Fence and signal only matching background work for one session.
+    """Idempotently cancel every matched async unit before signaling workers.
 
-    Durable Discord attempt dispatches are cancelled before their interrupt
-    callback is invoked, so late coding or advisory results cannot repaint the
-    cancellation. Pass ``kind=None`` to fence every durable kind for the
-    attempt. The returned diagnostics are deliberately bounded for gateway
-    control-command responses.
+    Selectors are additive ownership proofs: a record may match a captured
+    session identity or the bounded platform/chat/thread routing scope. Newly
+    matched records are marked under ``_records_lock`` before callbacks are
+    copied, so repeated callers cannot signal the same child twice.
     """
     normalized_session = str(session_key or "")
+    normalized_ui = str(origin_ui_session_id or "")
+    normalized_parent = str(parent_session_id or "")
     normalized_kind = str(kind or "").strip()
     normalized_work_id = str(origin_work_item_id or "").strip()
     normalized_attempt_id = str(attempt_id or "").strip()
+    if not any((normalized_session, normalized_ui, normalized_parent, routing_scope)):
+        return {
+            "matched": 0,
+            "newly_cancelled": 0,
+            "callbacks_invoked": 0,
+            "callbacks_failed": 0,
+            "durable_cancelled": 0,
+            "by_kind": {},
+            "failed_ids": [],
+        }
+
+    cancelled_at = time.time()
+    targets: List[Dict[str, Any]] = []
+    matched = 0
+    by_kind: Dict[str, int] = {}
     with _records_lock:
-        targets = [
-            dict(record)
-            for record in _records.values()
-            if record.get("status") == "running"
-            and record.get("session_key", "") == normalized_session
-            and (
-                not normalized_kind
-                or record.get("kind", "delegation") == normalized_kind
+        for record in _records.values():
+            active_or_pending = (
+                record.get("status") in {"running", "finalizing"}
+                or bool(record.get("delivery_pending"))
             )
-            and (
-                not normalized_work_id
-                or str(record.get("origin_work_item_id") or "")
-                == normalized_work_id
+            if not active_or_pending:
+                continue
+            owns = bool(
+                (normalized_session and str(record.get("session_key") or "") == normalized_session)
+                or (normalized_ui and str(record.get("origin_ui_session_id") or "") == normalized_ui)
+                or (normalized_parent and str(record.get("parent_session_id") or "") == normalized_parent)
+                or _routing_scope_matches(record, routing_scope)
             )
-            and (
-                not normalized_attempt_id
-                or str(record.get("origin_attempt_id") or "")
-                == normalized_attempt_id
-            )
-        ]
+            if not owns:
+                continue
+            if normalized_kind and record.get("kind", "delegation") != normalized_kind:
+                continue
+            if normalized_work_id and str(record.get("origin_work_item_id") or "") != normalized_work_id:
+                continue
+            if normalized_attempt_id and str(record.get("origin_attempt_id") or "") != normalized_attempt_id:
+                continue
+            matched += 1
+            kind_name = str(record.get("kind") or "delegation")[:64]
+            by_kind[kind_name] = by_kind.get(kind_name, 0) + 1
+            if record.get("cancel_requested"):
+                continue
+            record["cancel_requested"] = True
+            record["cancel_reason"] = str(reason or "session_stop")[:240]
+            record["cancel_requested_at"] = cancelled_at
+            record["delivery_pending"] = False
+            callback = record.get("interrupt_fn")
+            invoke_callback = callable(callback) and not record.get("interrupt_invoked")
+            if invoke_callback:
+                record["interrupt_invoked"] = True
+            target = dict(record)
+            target["_callback"] = callback if invoke_callback else None
+            targets.append(target)
 
     durable_cancelled = 0
-    interrupted = 0
+    callbacks_invoked = 0
+    callbacks_failed = 0
     failed_ids: List[str] = []
     for target in targets:
         delegation_id = str(target.get("delegation_id") or "")
-        durable_ok = True
+        try:
+            _cancel_durable_completion_delivery(
+                delegation_id,
+                reason=str(reason or "session_stop")[:240],
+                cancelled_at=cancelled_at,
+            )
+        except Exception:
+            logger.debug(
+                "Could not fence completion delivery for %s",
+                delegation_id,
+                exc_info=True,
+            )
         if _is_durable_attempt_dispatch(target):
             try:
                 cancelled = _required_async_ledger().cancel_required_async_dispatch(
@@ -1887,51 +2149,73 @@ def interrupt_session(
                     attempt_order=target.get("origin_attempt_order"),
                     reason=str(reason or "session_stop")[:240],
                     status="cancelled",
-                    cancelled_at=time.time(),
+                    cancelled_at=cancelled_at,
                 )
-                cancelled_dispatch = _required_dispatch_state(
-                    cancelled,
-                    delegation_id,
-                )
-                durable_ok = bool(
-                    cancelled_dispatch
-                    and cancelled_dispatch.get("state") == "cancelled"
-                )
+                cancelled_dispatch = _required_dispatch_state(cancelled, delegation_id)
+                if cancelled_dispatch and cancelled_dispatch.get("state") == "cancelled":
+                    durable_cancelled += 1
+                    with _records_lock:
+                        current = _records.get(delegation_id)
+                        if current is not None:
+                            current["required_async_state"] = "cancelled"
+                elif len(failed_ids) < 10:
+                    failed_ids.append(delegation_id)
             except Exception:
-                durable_ok = False
                 logger.exception(
                     "Could not durably cancel required async dispatch %s",
                     delegation_id,
                 )
-            if durable_ok:
-                durable_cancelled += 1
-                with _records_lock:
-                    current = _records.get(delegation_id)
-                    if current is not None:
-                        current["required_async_state"] = "cancelled"
-                        current["cancel_requested"] = True
-            elif len(failed_ids) < 10:
-                failed_ids.append(delegation_id)
+                if len(failed_ids) < 10:
+                    failed_ids.append(delegation_id)
 
-        interrupt_fn = target.get("interrupt_fn")
-        if callable(interrupt_fn):
+        callback = target.get("_callback")
+        if callable(callback):
             try:
-                interrupt_fn()
-                interrupted += 1
+                callback()
+                callbacks_invoked += 1
             except Exception:
+                callbacks_failed += 1
                 logger.debug(
-                    "interrupt_session: %s interrupt failed",
+                    "cancel_session: %s interrupt failed",
                     delegation_id,
                     exc_info=True,
                 )
                 if len(failed_ids) < 10 and delegation_id not in failed_ids:
                     failed_ids.append(delegation_id)
 
+    bounded_by_kind = dict(sorted(by_kind.items())[:12])
     return {
-        "matched": len(targets),
+        "matched": matched,
+        "newly_cancelled": len(targets),
+        "callbacks_invoked": callbacks_invoked,
+        "callbacks_failed": callbacks_failed,
         "durable_cancelled": durable_cancelled,
-        "interrupted": interrupted,
-        "failed_ids": failed_ids,
+        "by_kind": bounded_by_kind,
+        "failed_ids": failed_ids[:10],
+    }
+
+
+def interrupt_session(
+    session_key: str,
+    *,
+    kind: Optional[str] = None,
+    origin_work_item_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    reason: str = "session_stop",
+) -> Dict[str, Any]:
+    """Compatibility wrapper for the canonical session cancellation API."""
+    result = cancel_session(
+        session_key,
+        kind=kind,
+        origin_work_item_id=origin_work_item_id,
+        attempt_id=attempt_id,
+        reason=reason,
+    )
+    return {
+        "matched": result["matched"],
+        "durable_cancelled": result["durable_cancelled"],
+        "interrupted": result["callbacks_invoked"],
+        "failed_ids": result["failed_ids"],
     }
 
 
@@ -1959,34 +2243,17 @@ def interrupt_for_session(
 
     Returns how many were interrupted.
     """
-    if not session_key and not origin_ui_session_id and not parent_session_id:
-        return 0
-    count = 0
-    with _records_lock:
-        targets = [
-            r for r in _records.values()
-            if r.get("status") == "running"
-            and (
-                (origin_ui_session_id and str(r.get("origin_ui_session_id") or "") == origin_ui_session_id)
-                or (session_key and str(r.get("session_key") or "") == session_key)
-                or (parent_session_id and str(r.get("parent_session_id") or "") == parent_session_id)
-            )
-        ]
-    for r in targets:
-        fn = r.get("interrupt_fn")
-        if callable(fn):
-            try:
-                fn()
-                count += 1
-            except Exception as exc:
-                logger.debug(
-                    "interrupt_for_session: %s interrupt failed: %s",
-                    r.get("delegation_id"), exc,
-                )
-    if count:
+    result = cancel_session(
+        session_key,
+        origin_ui_session_id=origin_ui_session_id,
+        parent_session_id=parent_session_id,
+        reason=reason,
+    )
+    count = int(result.get("callbacks_invoked") or 0)
+    if result.get("newly_cancelled"):
         logger.info(
-            "Interrupted %d async delegation(s) for ending session (%s)",
-            count, reason,
+            "Cancelled %d async delegation(s) for ending session (%s)",
+            result["newly_cancelled"], reason,
         )
     return count
 
