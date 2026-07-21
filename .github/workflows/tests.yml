@@ -143,7 +143,7 @@ jobs:
           npm run --workspace ui-tui test
           npm run --workspace web test
           npm run --workspace apps/desktop test:ui
-          npm run --workspace apps/desktop test:platforms
+          npm run --workspace apps/desktop test:desktop:platforms
 
   site:
     name: site

@@ -175,7 +175,7 @@ The 885 failures that disappear in fresh processes show repeated module/class id
 The first clean required-CI run exposed two environment/build-order contracts hidden by the development host, both now corrected without runtime behavior changes:
 
 - Kanban backend-child tests now explicitly select `terminal.home_mode=profile` when asserting strict profile-local `HOME`, and separately cover the upstream 0.19 host-auto behavior that retains the real user home. The implementation was already correct and unchanged.
-- The frontend lane now builds the generated private `@hermes/ink` package before TUI typechecks and tests. From a clean `npm ci` with no ignored `dist/`, the exact sequence passes all 1,234 TUI tests and the production TUI build.
+- The frontend lane now builds the generated private `@hermes/ink` package before TUI typechecks and tests, and invokes the merged desktop package's actual `test:desktop:platforms` script. From a clean `npm ci` with no ignored `dist/`, the sequence passes all 1,234 TUI tests, the production TUI build, and 469 desktop platform tests with one expected skip.
 
 ## Residual risks and required verification
 
