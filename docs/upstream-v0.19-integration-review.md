@@ -66,6 +66,7 @@ Status: accepted for merge-commit and normal PR/CI review. Focused owner reconci
 | Expanded Hermes and humanizer prompt prose | Compact default skills plus archived full guides in `references/` | Stronger prompt-cache/token replacement for the fork's operating model; detailed information remains loadable on demand. |
 | Automatic xAI retirement startup warning/check | Automatic startup scan intentionally absent; manual `hermes migrate xai` remains | True convenience omission, not runtime inference loss. Documentation must not promise `hermes chat`/`doctor` startup warnings. |
 | Upstream generated CI/release workflow suite and duration-sliced Python runner | Fork keeps its own `.github/workflows/tests.yml`, trusted validation and `scripts/run_tests.sh`; upstream per-file duration slicer is absent | Tooling replacement/omission, not runtime feature loss. See exact inventory below. |
+| Read-only-source setuptools output redirection | `setup.py` remains identical to the fork parent | True packaging convenience omission. The fork's trusted-base supply-chain gate categorically rejects install-hook changes, matching the precedent from the previous upstream sync. Builds from a read-only source tree must provide writable build/egg-info output locations explicitly. |
 
 ## Tooling inventory deliberately not adopted
 
@@ -156,7 +157,7 @@ The isolation pass found and repaired genuine merge losses before reaching green
 - MoA request-client routing and primary-facade behavior, plus bounded steer-marker persistence.
 - Plain successful STT payloads while retaining Discord sender/intermediary provenance.
 - Provider-isolated doctor checks, local authenticated dashboard status metadata and deterministic dashboard MCP discovery tests.
-- Read-only source-tree packaging outputs, TUI-safe Honcho subprocess stdin, blocking Ruff enforcement in the fork CI topology, a 1,000-row recent-session scan and profile-aware Chromium path assertions.
+- TUI-safe Honcho subprocess stdin, blocking Ruff enforcement in the fork CI topology, a 1,000-row recent-session scan and profile-aware Chromium path assertions.
 
 The xhigh failure-gate audit classified all 918 aggregate failures as follows:
 
@@ -178,6 +179,6 @@ The 885 failures that disappear in fresh processes show repeated module/class id
 3. Review Discord deployment configuration: the preserved open default is suitable only for trusted development environments.
 4. Confirm release/CI outcome parity for omitted upstream workflow topology, especially docs generation, dependency/lockfile drift, supply-chain checks, Docker validation and package publishing.
 5. Live Discord/Telegram network E2E, Nix evaluation and PowerShell syntax checks remain unrun in this environment.
-6. Create and inspect the two-parent merge commit, verify release-tag ancestry, and check its first-parent diff for stale-branch reversions before merging the PR.
+6. The two-parent merge commit has been created and inspected, release-tag ancestry is verified, and the first-parent preservation scan is complete. The PR must be merged without squashing.
 
-No additional confirmed runtime capability absence was found beyond the explicit inventory above. The candidate-final visibility regression, optional-skill context-budget violation and every independently reproducible residual are resolved in the staged tree. The aggregate isolation disposition is accepted for this integration; merge-commit inspection, required PR CI and live messaging checks remain before release sign-off.
+No additional confirmed runtime capability absence was found beyond the explicit inventory above. The candidate-final visibility regression, optional-skill context-budget violation and every independently reproducible residual are resolved in the staged tree. The aggregate isolation disposition is accepted for this integration; required PR CI and live messaging checks remain before release sign-off.
