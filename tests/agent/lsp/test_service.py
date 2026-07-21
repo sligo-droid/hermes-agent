@@ -90,8 +90,13 @@ def test_service_returns_empty_when_disabled(tmp_path):
     svc.shutdown()
 
 
-def test_service_skips_files_outside_workspace(tmp_path):
+def test_service_skips_files_outside_workspace(tmp_path, monkeypatch):
     """Files outside any git worktree must not trigger LSP."""
+    # ``tmp_path`` may live below an ambient ``/tmp/.git`` in shared CI or
+    # developer environments.  The contract under test is the no-workspace
+    # gate, not filesystem ancestry, so make both cwd/file root probes
+    # deterministically report no worktree.
+    monkeypatch.setattr("agent.lsp.workspace.find_git_worktree", lambda _path: None)
     svc = LSPService(
         enabled=True,
         wait_mode="document",

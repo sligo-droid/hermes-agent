@@ -138,6 +138,9 @@ def adapter(monkeypatch):
     a = DiscordAdapter(config)
     a._client = SimpleNamespace(user=SimpleNamespace(id=999, bot=True))
     a._text_batch_delay_seconds = 0  # disable batching so dispatch is synchronous
+    # The fork only auto-threads action requests; these tests exercise the
+    # thread/dedup path rather than the intake classifier.
+    a._classify_discord_action_request = AsyncMock(return_value=True)
     a.handle_message = AsyncMock()
     return a
 

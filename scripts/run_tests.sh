@@ -48,13 +48,18 @@ for candidate in "${CANDIDATE_VENVS[@]}"; do
   fi
 done
 
-if [ -z "$VENV" ]; then
+if [ -n "$VENV" ]; then
+  PYTHON="$VENV/bin/python"
+elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
+    && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
+  PYTHON="$HERMES_PYTHON"
+  echo "▶ no local venv — using HERMES_PYTHON: $PYTHON"
+else
   echo "error: no virtualenv found. Checked:" >&2
   printf '  %s\n' "${CANDIDATE_VENVS[@]}" >&2
+  echo "  HERMES_PYTHON was unset or did not provide pytest" >&2
   exit 1
 fi
-
-PYTHON="$VENV/bin/python"
 
 # ── Hermetic environment ────────────────────────────────────────────────────
 # Mirror what CI does in .github/workflows/tests.yml + what conftest.py does.

@@ -91,7 +91,9 @@ class TestReasoningCommand:
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
         config_path.write_text(
-            "agent:\n  reasoning_effort: none\ndisplay:\n  show_reasoning: true\n",
+            "gateway:\n  model_tier: ''\n"
+            "agent:\n  reasoning_effort: none\n"
+            "display:\n  show_reasoning: true\n",
             encoding="utf-8",
         )
 
@@ -149,7 +151,10 @@ class TestReasoningCommand:
         assert "session only" in result
 
     @pytest.mark.asyncio
-    async def test_handle_reasoning_command_rejects_max(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("effort", ["max", "ultra"])
+    async def test_handle_reasoning_command_accepts_extended_efforts(
+        self, tmp_path, monkeypatch, effort
+    ):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text(
@@ -158,13 +163,15 @@ class TestReasoningCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        event = _make_event("/reasoning max")
+        event = _make_event(f"/reasoning {effort}")
         session_key = runner._session_key_for_source(event.source)
 
-        result = await runner._handle_reasoning_command(event)
+        await runner._handle_reasoning_command(event)
 
-        assert session_key not in runner._session_reasoning_overrides
-        assert "Unknown" in result
+        assert runner._session_reasoning_overrides[session_key] == {
+            "enabled": True,
+            "effort": effort,
+        }
 
     @pytest.mark.asyncio
     async def test_reasoning_global_clears_existing_session_override(self, tmp_path, monkeypatch):
@@ -211,7 +218,10 @@ class TestReasoningCommand:
     def test_resolve_session_reasoning_prefers_session_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: low\n", encoding="utf-8")
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n  model_tier: ''\nagent:\n  reasoning_effort: low\n",
+            encoding="utf-8",
+        )
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
@@ -225,7 +235,10 @@ class TestReasoningCommand:
     def test_run_agent_reloads_reasoning_config_per_message(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: low\n", encoding="utf-8")
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n  model_tier: ''\nagent:\n  reasoning_effort: low\n",
+            encoding="utf-8",
+        )
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
         monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")

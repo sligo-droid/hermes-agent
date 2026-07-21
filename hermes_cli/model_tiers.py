@@ -162,6 +162,7 @@ _REVIEW_TASK_SIGNALS = (
 )
 
 _REVIEW_SPILLOVER_REASONING_EFFORT = "xhigh"
+_AUTOMATIC_REASONING_EFFORT_CEILING = "xhigh"
 
 
 @dataclass(frozen=True)
@@ -315,6 +316,8 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
     model = str(raw_tier.get("model") or "").strip()
     opencode_model = str(raw_tier.get("opencode_model") or model).strip()
     reasoning_effort = normalize_reasoning_effort(raw_tier.get("reasoning_effort"))
+    if reasoning_effort in {"max", "ultra"}:
+        reasoning_effort = _AUTOMATIC_REASONING_EFFORT_CEILING
     if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
         return None
 

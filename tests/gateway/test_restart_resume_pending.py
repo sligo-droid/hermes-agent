@@ -41,6 +41,7 @@ from gateway.run import (
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _should_clear_resume_pending_after_turn,
+    build_resume_recovery_note,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
@@ -152,32 +153,9 @@ def _simulate_note_injection(
 
     if is_resume_pending:
         reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        reason_phrase = (
-            "a gateway restart"
-            if reason == "restart_timeout"
-            else "a gateway shutdown"
-            if reason == "shutdown_timeout"
-            else "a gateway interruption"
-        )
-        if message:
-            resume_guidance = (
-                "Address the user's NEW message below FIRST and focus "
-                "on what the user is asking now."
-            )
-        else:
-            resume_guidance = (
-                "Report to the user that the session was restored "
-                "successfully and ask what they would like to do next."
-            )
-        message = (
-            f"[System note: The previous turn was interrupted by "
-            f"{reason_phrase}; the gateway is now back online. "
-            f"Any restart/shutdown command in the history has already "
-            f"run — do NOT re-execute or verify it. {resume_guidance} "
-            f"Do NOT re-execute old tool calls — skip any unfinished "
-            f"work from the conversation history.]"
-            + (f"\n\n{message}" if message else "")
-        )
+        # Real production note builder — extracted to module scope in
+        # gateway/run.py so tests exercise the actual strings.
+        message = build_resume_recovery_note(reason, message)
     elif has_fresh_tool_tail:
         message = (
             "[System note: A new message has arrived. The conversation "
@@ -196,23 +174,7 @@ def _simulate_note_injection(
         and getattr(resume_entry, "resume_pending", False)
     ):
         sn_reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        sn_reason_phrase = (
-            "a gateway restart"
-            if sn_reason == "restart_timeout"
-            else "a gateway shutdown"
-            if sn_reason == "shutdown_timeout"
-            else "a gateway interruption"
-        )
-        message = (
-            f"[System note: The previous turn was interrupted by "
-            f"{sn_reason_phrase}; the gateway is now back online. "
-            f"Any restart/shutdown command in the history has already "
-            f"run — do NOT re-execute or verify it. Report to the user "
-            f"that the session was restored successfully and ask what "
-            f"they would like to do next. Do NOT re-execute old tool "
-            f"calls — skip any unfinished work from the conversation "
-            f"history.]"
-        )
+        message = build_resume_recovery_note(sn_reason, "")
     return message
 
 
@@ -521,6 +483,34 @@ class TestResumePendingSystemNote:
         )
         assert "gateway shutdown" in result
 
+    def test_empty_message_interactive_note_asks_what_next(self):
+        """Interactive platforms: the startup auto-resume turn reports the
+        restore and asks the (present) human what to do next."""
+        note = build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert "session was restored" in note
+        assert "ask what they would like to do next" in note
+        assert "skip any unfinished work" in note
+
+    def test_empty_message_noninteractive_note_continues_task(self):
+        """Non-interactive platforms (webhook, API server): nobody can answer
+        'what next?', so the resumed turn must complete the interrupted work
+        instead of acknowledging (#57056)."""
+        note = build_resume_recovery_note("restart_timeout", "", interactive=False)
+        assert "CONTINUE the interrupted task" in note
+        assert "session was restored" not in note
+        assert "ask what they would like to do next" not in note
+        # Must not tell the model to skip the unfinished work it should finish.
+        assert "skip any unfinished work" not in note
+        # But still guards against re-running already-recorded tool calls.
+        assert "already appear in the history" in note
+
+    def test_new_message_guidance_identical_regardless_of_interactivity(self):
+        """A real NEW user message always wins — same guidance either way."""
+        a = build_resume_recovery_note("restart_timeout", "do the thing", interactive=True)
+        b = build_resume_recovery_note("restart_timeout", "do the thing", interactive=False)
+        assert a == b
+        assert "NEW message" in a
+
     def test_resume_pending_fires_without_tool_tail(self):
         """Key improvement over PR #9934: the restart-resume note fires
         even when the transcript's last role is NOT ``tool``."""
@@ -617,10 +607,10 @@ class TestResumePendingSystemNote:
         """Regression: a blank auto-resume turn on a resume_pending
         session must be backfilled with a recovery note, never sent empty.
 
-        _schedule_resume_pending_sessions dispatches an empty-text internal
-        event. If the resume_pending branch did not fire, the safety net
-        must still produce non-blank text so the model does not reply with
-        confused 'the message came through blank' noise.
+        Legacy/alternate callers may still dispatch an empty-text internal
+        event. If the resume_pending branch did not fire, the safety net must
+        still produce non-blank text so the model does not reply with confused
+        'the message came through blank' noise.
         """
         entry = self._pending_entry()
         # Force the resume_pending branch to miss by making BOTH signals stale,
@@ -1431,7 +1421,7 @@ async def test_reconnect_reschedules_pending_after_late_platform_connect():
     assert isinstance(event, MessageEvent)
     assert event.internal is True
     assert event.message_type == MessageType.TEXT
-    assert event.text == ""
+    assert "Continue the turn" in event.text
     assert event.source == source
 
 
@@ -1602,14 +1592,20 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 @pytest.mark.asyncio
 async def test_restart_banner_not_sent_to_active_session():
-    """Restart lifecycle warnings are not posted into active task sessions."""
+    """Active tasks receive the current restart lifecycle warning.
+
+    The historical node name is retained so merge verification can target the
+    original fork regression directly.
+    """
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == []
+    assert len(adapter.sent) == 1
+    assert "Gateway restarting" in adapter.sent[0]
+    assert "try to resume where you left off" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
@@ -1624,7 +1620,10 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == ["⚠️ Gateway restarting"]
+    assert adapter.sent == [
+        "⚠️ Gateway restarting — Your current task will be interrupted. "
+        "Send any message after restart and I'll try to resume where you left off."
+    ]
 
 
 @pytest.mark.asyncio
@@ -1669,7 +1668,7 @@ async def test_restart_home_channel_notification_uses_top_level_channel():
 
     assert len(adapter.sent) == 1
     assert adapter.sent_calls[0][0] == "999"
-    assert adapter.sent_calls[0][2] is None
+    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
 
 
 @pytest.mark.asyncio

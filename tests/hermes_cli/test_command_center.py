@@ -24,6 +24,10 @@ def _first_card() -> dict:
     return cards[0]
 
 
+def _mark_task_worker_live(conn, task_id: str) -> None:
+    kanban_db._set_worker_pid(conn, task_id, os.getpid())
+
+
 def _hermes_audit_payload(*, cards=True, run_id="hermes-audit-run") -> dict:
     payload = _fixture_payload()
     payload["project"] = "hermes"
@@ -1092,6 +1096,7 @@ def test_snapshot_always_includes_active_runs_outside_recent_limit(tmp_path, mon
                 "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
                 (active_run_id, active_task),
             )
+        _mark_task_worker_live(conn, active_task)
         for index in range(25):
             task_id = kanban_db.create_task(conn, title=f"Completed worker {index}", board=board)
             with conn:
@@ -1334,6 +1339,7 @@ def test_snapshot_pid_filter_preserves_source_work_item_execution_relationship(t
             )
             run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+        _mark_task_worker_live(conn, task_id)
     finally:
         conn.close()
 
@@ -1407,6 +1413,7 @@ def test_snapshot_board_rollups_include_running_and_blocked_statuses(tmp_path, m
             )
             run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, running_id))
+        _mark_task_worker_live(conn, running_id)
     finally:
         conn.close()
 
@@ -1566,6 +1573,7 @@ def test_snapshot_running_task_overrides_blocked_thread_state(tmp_path, monkeypa
             )
             run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+        _mark_task_worker_live(conn, task_id)
     finally:
         conn.close()
 
@@ -1678,7 +1686,7 @@ def test_snapshot_worker_url_exposes_named_board_even_before_execution_starts(tm
     assert not any(item["id"] == f"kanban:default:{default_task_id}" for item in snapshot["work_items"])
 
 
-def test_snapshot_running_board_without_run_is_still_clickable_and_pauseable(tmp_path, monkeypatch):
+def test_snapshot_unverified_running_board_is_queued_clickable_and_pauseable(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-running-without-run"
     kanban_db.write_board_metadata(board, name="Running Without Run")
@@ -1694,7 +1702,8 @@ def test_snapshot_running_board_without_run_is_still_clickable_and_pauseable(tmp
     snapshot = command_center.build_command_center_snapshot()
     item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
 
-    assert item["status"] == "running"
+    assert item["status"] == "queued"
+    assert item["status_detail"] == "running_unverified"
     assert item["execution"]["board"] == board
     assert item["execution"]["pause_action"].endswith(f"/{board}/pause")
     assert item["execution"]["resume_action"].endswith(f"/{board}/resume")
@@ -1716,6 +1725,7 @@ def test_snapshot_valid_running_board_keeps_worker_url(tmp_path, monkeypatch):
             )
             run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+        _mark_task_worker_live(conn, task_id)
     finally:
         conn.close()
 
@@ -2281,6 +2291,7 @@ def test_self_improvement_board_rollup_preserves_proposal_naming_and_context(tmp
             )
             run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+        _mark_task_worker_live(conn, task_id)
     finally:
         conn.close()
     proposal_storage.record_approval(

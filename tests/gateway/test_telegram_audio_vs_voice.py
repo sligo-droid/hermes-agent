@@ -111,6 +111,26 @@ async def test_audio_attachment_skips_stt():
 
 
 @pytest.mark.asyncio
+async def test_pending_audio_attachment_is_not_selected_for_stt():
+    """Pending Telegram AUDIO files retain file semantics during interrupts."""
+    runner = _make_runner(stt_enabled=True)
+    event = _audio_event("/tmp/pending-song.mp3")
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=AssertionError("pending audio attachments must not enter STT"),
+    ):
+        result, transcripts = await runner._transcribe_pending_audio_event_once(
+            event,
+            event.text,
+        )
+
+    assert runner._pending_event_audio_paths(event) == []
+    assert result == ""
+    assert transcripts == []
+
+
+@pytest.mark.asyncio
 async def test_audio_attachment_context_note_format():
     """Context note for audio file attachments should include the file path and guidance."""
     runner = _make_runner(stt_enabled=True)
@@ -135,10 +155,10 @@ async def test_audio_attachment_context_note_format():
     assert "audio file attachment" in result.lower()
     # Should NOT contain the voice-message transcription wrapper text
     assert "voice message" not in result.lower()
-    # Guides the agent to transcribe/process the file itself rather than
-    # punting back to the user (same bug class as the PDF/DOCX note).
-    assert "transcri" in result.lower()
-    assert "ask the user what they'd like" not in result.lower()
+    # Gives the agent both safe choices: clarify the user's intent or process
+    # the attachment directly with the appropriate media/transcription tool.
+    assert "ask the user what they'd like" in result.lower()
+    assert "pass the path to a transcription or media tool" in result.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -45,32 +45,34 @@ class TestBrowserSecretExfil:
     def test_browser_type_redacts_returned_typed_text(self):
         from tools.browser_tool import browser_type
 
+        secret = "sk-proj-ABCD1234567890EFGH"
         with patch("tools.browser_tool._run_browser_command", return_value={"success": True}) as run_cmd:
-            result = browser_type("@e1", "super-secret-password", task_id="t1")
+            result = browser_type("@e1", secret, task_id="t1")
 
-        run_cmd.assert_called_once_with("t1", "fill", ["@e1", "super-secret-password"])
+        run_cmd.assert_called_once_with("t1", "fill", ["@e1", secret])
         parsed = json.loads(result)
         assert parsed["success"] is True
-        assert parsed["typed"] == "[REDACTED_BROWSER_INPUT]"
-        assert "super-secret-password" not in result
+        assert secret not in result
+        assert parsed["typed"].startswith("sk-pro")
 
     def test_camofox_type_redacts_returned_typed_text(self):
         from tools.browser_camofox import camofox_type
 
+        secret = "sk-proj-ABCD1234567890EFGH"
         session = {"tab_id": "tab-1", "user_id": "user-1"}
         with (
             patch("tools.browser_camofox._get_session", return_value=session),
             patch("tools.browser_camofox._post", return_value={}) as post,
         ):
-            result = camofox_type("@e1", "super-secret-password", task_id="t1")
+            result = camofox_type("@e1", secret, task_id="t1")
 
         post.assert_called_once_with(
             "/tabs/tab-1/type",
-            {"userId": "user-1", "ref": "e1", "text": "super-secret-password"},
+            {"userId": "user-1", "ref": "e1", "text": secret},
         )
         parsed = json.loads(result)
-        assert parsed["typed"] == "[REDACTED_BROWSER_INPUT]"
-        assert "super-secret-password" not in result
+        assert secret not in result
+        assert parsed["typed"].startswith("sk-pro")
 
 
 class TestWebExtractSecretExfil:

@@ -14,6 +14,7 @@ import importlib
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -60,7 +61,10 @@ def server(hermes_home):
 @pytest.fixture()
 def session(server):
     sid = "sid-test"
-    session_key = "tui-goal-session-1"
+    # Goal state is persisted in state.db. Use a per-test key so this suite
+    # remains hermetic even when hermes_state.DEFAULT_DB_PATH was resolved at
+    # worker import time before the fixture's temporary HERMES_HOME override.
+    session_key = f"tui-goal-{uuid4().hex}"
     s = {
         "session_key": session_key,
         "history": [],

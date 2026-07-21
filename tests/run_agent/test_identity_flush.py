@@ -30,6 +30,14 @@ def _contents(db, session_id=SESSION_ID):
     return [row["content"] for row in db.get_messages(session_id)]
 
 
+def _refresh_snapshot_token(agent, db, session_id=SESSION_ID):
+    session = db.get_session(session_id)
+    agent._last_flushed_db_snapshot_token = (
+        session_id,
+        int(session["transcript_revision"]),
+    )
+
+
 class TestIdentityFlush:
     def test_repair_shrunk_messages_below_history_length_still_persists_assistant(self):
         """When repair shortens messages below conversation_history, don't slice empty."""
@@ -48,6 +56,7 @@ class TestIdentityFlush:
                         role=msg["role"],
                         content=msg["content"],
                     )
+                _refresh_snapshot_token(agent, db)
 
                 # repair_message_sequence merged the six history rows into one
                 # dict before this turn appended the new user/assistant pair.
@@ -87,6 +96,7 @@ class TestIdentityFlush:
                         role=msg["role"],
                         content=msg["content"],
                     )
+                _refresh_snapshot_token(agent, db)
 
                 messages = history + [
                     {"role": "user", "content": "current question"},

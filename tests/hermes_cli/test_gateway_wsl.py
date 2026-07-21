@@ -220,12 +220,24 @@ class TestGatewayCommandWSLMessages:
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway, "is_macos", lambda: False)
         monkeypatch.setattr(gateway, "is_managed", lambda: False)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        monkeypatch.setattr(
+            gateway,
+            "prompt_yes_no",
+            lambda *args, **kwargs: pytest.fail("headless install must not prompt"),
+        )
 
-        # Mock systemd_install to capture call
+        # Mock service mutations while retaining the headless defaults.
         install_called = []
+        start_called = []
         monkeypatch.setattr(
             gateway, "systemd_install",
             lambda **kwargs: install_called.append(kwargs),
+        )
+        monkeypatch.setattr(
+            gateway,
+            "systemd_start",
+            lambda system=False: start_called.append(system),
         )
 
         args = SimpleNamespace(
@@ -238,6 +250,9 @@ class TestGatewayCommandWSLMessages:
         assert "WSL detected" in out
         assert "may not survive WSL restarts" in out
         assert len(install_called) == 1  # install still proceeded
+        assert install_called[0]["enable_on_startup"] is True
+        assert install_called[0]["non_interactive"] is True
+        assert start_called == [False]
 
     def test_status_wsl_running_manual(self, monkeypatch, capsys):
         """hermes gateway status on WSL with manual process shows WSL note."""

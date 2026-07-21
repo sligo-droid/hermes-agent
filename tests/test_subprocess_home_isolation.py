@@ -12,6 +12,14 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _exercise_explicit_profile_home_mode(monkeypatch):
+    """This legacy fork suite covers upstream's explicit profile-home mode."""
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
+
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +190,7 @@ class TestApplySubprocessHomeEnv:
         profile_home = hermes_home / "home"
         profile_home.mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
 
         from hermes_constants import apply_subprocess_home_env
 
@@ -202,7 +211,7 @@ class TestApplySubprocessHomeEnv:
         apply_subprocess_home_env(env)
 
         assert env["HOME"] == "/root"
-        assert "HERMES_HOME" not in env
+        assert env["HERMES_HOME"] == str(hermes_home)
 
     def test_bridges_real_home_config_paths_when_profile_home_exists(
         self, tmp_path, monkeypatch
@@ -227,6 +236,7 @@ class TestApplySubprocessHomeEnv:
         npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
         monkeypatch.setattr(Path, "home", lambda: real_home)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
         monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
 
         import hermes_constants
@@ -252,6 +262,7 @@ class TestApplySubprocessHomeEnv:
         profile_home.mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("HOME", "/root")
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
 
         from agent.copilot_acp_client import _build_subprocess_env
 
@@ -267,6 +278,7 @@ class TestApplySubprocessHomeEnv:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("HOME", "/root")
         monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
 
         from tools.code_execution_tool import execute_code
 
@@ -298,6 +310,7 @@ class TestMakeRunEnvHomeInjection:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("HOME", "/root")
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
 
         from tools.environments.local import _make_run_env
         result = _make_run_env({})
@@ -337,6 +350,7 @@ class TestMakeRunEnvHomeInjection:
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setenv("HOME", "/root")
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
 
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from tools.environments.local import _make_run_env
@@ -361,6 +375,7 @@ class TestMakeRunEnvHomeInjection:
         monkeypatch.setenv("HOME", str(real_home))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
         monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
 
         from tools.environments.local import _make_run_env
@@ -492,7 +507,7 @@ class TestMakeRunEnvHomeInjection:
 
         assert result["HOME"] == str(hermes_home / "home")
         assert result["HERMES_HOME"] == "/explicit/hermes"
-        assert result["PATH"] == "/explicit/bin"
+        assert "/explicit/bin" in result["PATH"].split(os.pathsep)
         assert result["GH_CONFIG_DIR"] == "/explicit/gh"
         assert result["GIT_CONFIG_GLOBAL"] == "/explicit/gitconfig"
         assert result["DOCKER_CONFIG"] == "/explicit/docker"

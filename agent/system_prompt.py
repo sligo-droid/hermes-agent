@@ -40,9 +40,14 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     TASK_COMPLETION_GUIDANCE,
+    TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
 )
+
+from agent.runtime_cwd import resolve_context_cwd
+from hermes_constants import get_hermes_home
+from utils import is_truthy_value
 
 
 def _ra():
@@ -58,6 +63,31 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> str:
+    """Apply a safe per-platform replace/append override."""
+    if not platform_key:
+        return default_hint
+    overrides = getattr(agent, "_platform_hint_overrides", None)
+    if not isinstance(overrides, dict):
+        return default_hint
+    spec = overrides.get(platform_key)
+    if isinstance(spec, str):
+        extra = spec.strip()
+        return f"{default_hint}\n\n{extra}".strip() if extra else default_hint
+    if not isinstance(spec, dict):
+        return default_hint
+    replace_text = spec.get("replace")
+    base = (
+        replace_text.strip()
+        if isinstance(replace_text, str) and replace_text.strip()
+        else default_hint
+    )
+    append_text = spec.get("append")
+    if isinstance(append_text, str) and append_text.strip():
+        return f"{base}\n\n{append_text.strip()}".strip()
+    return base
 
 
 def _resolve_skills_index_compact_categories(agent: Any) -> frozenset[str]:
@@ -90,6 +120,36 @@ def _resolve_skills_index_compact_categories(agent: Any) -> frozenset[str]:
         return frozenset()
 
 
+_TUI_EMBEDDED_PANE_CLARIFIER = (
+    " You're in its embedded terminal pane, beside the GUI chat — the user can "
+    "select your output (Option-drag on macOS, Shift-drag elsewhere) and press "
+    "Cmd/Ctrl+L to send it to the chat composer."
+)
+
+
+def _tui_embedded_pane_clarifier(hint: str) -> str:
+    """Append the desktop-embedded-terminal-pane clarifier to a tui hint.
+
+    Triggered by ``HERMES_DESKTOP_TERMINAL=1`` (set by ``main.cjs`` only on the
+    shell env of the desktop's embedded TUI PTY — never on the chat backend).
+    This is a runtime-surface qualifier, not a config override, so it lives at
+    the resolution site rather than inside ``_resolve_platform_hint`` (which
+    is purely the config-platform_hints override applier). Byte-stable for the
+    cache: called once per session build, deterministically from env state.
+
+    Idempotent and empty-safe: re-applying on an already-augmented hint is a
+    no-op, and an empty input returns empty (we never synthesize the
+    clarifier without its tui framing).
+    """
+    if not hint:
+        return hint
+    if _TUI_EMBEDDED_PANE_CLARIFIER in hint:
+        return hint
+    if not is_truthy_value(os.getenv("HERMES_DESKTOP_TERMINAL")):
+        return hint
+    return hint + _TUI_EMBEDDED_PANE_CLARIFIER
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered parts.
 
@@ -113,6 +173,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
 
+    # Resolve the model context window once so context-file caps can scale to
+    # it while remaining stable for the lifetime of this prompt/conversation.
+    _ctx_len: Optional[int] = None
+    _compressor = getattr(agent, "context_compressor", None)
+    if _compressor is not None:
+        _compressor_length = getattr(_compressor, "context_length", None)
+        if isinstance(_compressor_length, int) and _compressor_length > 0:
+            _ctx_len = _compressor_length
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -121,7 +190,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cwd project instructions disabled.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md()
+        _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -287,7 +356,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if active_profile == "default":
         stable_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
-            "under ~/.hermes/profiles/<name>/. Each profile has its own "
+            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
@@ -296,9 +365,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     else:
         stable_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes ~/.hermes/profiles/{active_profile}/. The default "
-            f"profile's data lives at ~/.hermes/skills/, ~/.hermes/plugins/, "
-            f"~/.hermes/cron/, ~/.hermes/memories/ — those belong to a "
+            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
+            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
+            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
@@ -307,17 +376,39 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         )
 
     platform_key = (agent.platform or "").lower().strip()
+    _default_hint = ""
     if platform_key in PLATFORM_HINTS:
-        stable_parts.append(PLATFORM_HINTS[platform_key])
+        _default_hint = PLATFORM_HINTS[platform_key]
     elif platform_key:
         # Check plugin registry for platform-specific LLM guidance
         try:
             from gateway.platform_registry import platform_registry
             _entry = platform_registry.get(platform_key)
             if _entry and _entry.platform_hint:
-                stable_parts.append(_entry.platform_hint)
+                _default_hint = _entry.platform_hint
         except Exception:
             pass
+
+
+    # For Telegram: append the rich-messages extension only when the user has
+    # opted in to ``platforms.telegram.extra.rich_messages: true``.  The base
+    # hint covers MarkdownV2-compatible constructs; the extension adds Bot API
+    # 10.1 guidance (tables, task lists, math, collapsible details, etc.).
+    if platform_key == "telegram" and _default_hint:
+        try:
+            from hermes_cli.config import load_config_readonly
+            _cfg = load_config_readonly()
+            _tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra") or {}
+            if _tg_extra.get("rich_messages"):
+                _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
+        except Exception:
+            pass  # Config read failure — fall back to base hint only
+
+    _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
+    if platform_key == "tui" and _effective_hint:
+        _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
+    if _effective_hint:
+        stable_parts.append(_effective_hint)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
@@ -328,20 +419,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_parts.append(system_message)
 
     if not agent.skip_context_files:
-        # Use TERMINAL_CWD for context file discovery when set (gateway
-        # mode).  The gateway process runs from the hermes-agent install
-        # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-        # other dev files — inflating token usage by ~10k for no benefit.
-        _context_cwd = None
-        try:
-            from gateway.session_context import get_session_env
 
-            _context_cwd = get_session_env("HERMES_SESSION_CWD", "") or None
-        except Exception:
-            pass
-        _context_cwd = _context_cwd or os.getenv("TERMINAL_CWD") or None
+        # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local
+        # CLI), None lets build_context_files_prompt fall back to the launch
+        # dir — the user's real cwd there, but the install dir for the gateway
+        # daemon, which is why the gateway sets TERMINAL_CWD.
+        #
+        # allow_install_tree_fallback: for cli/tui the launch dir IS the
+        # user's shell cwd, so an in-tree fallback is a deliberate choice
+        # (developing Hermes). Every other surface (desktop chat panel,
+        # gateway daemons) self-spawns into the install tree, where the
+        # fallback would inject this repo's contributor AGENTS.md (#64590).
         context_files_prompt = _r.build_context_files_prompt(
-            cwd=_context_cwd, skip_soul=_soul_loaded)
+            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+            context_length=_ctx_len,
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 

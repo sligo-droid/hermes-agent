@@ -144,6 +144,21 @@ def test_all_path_drops_workspace_requirement():
     )
 
 
+def test_aia_agent_forwarder_passes_workspace_mode_to_helper():
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._strip_think_blocks = lambda content: content
+    messages = [{"role": "user", "content": REPRO_USER}]
+
+    assert agent._looks_like_codex_intermediate_ack(
+        REPRO_USER,
+        REPRO_ACK,
+        messages,
+        require_workspace=False,
+    )
+
+
 # ── detector: guardrails that hold regardless of workspace ───────────────────
 
 

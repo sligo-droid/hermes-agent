@@ -492,12 +492,12 @@ def test_invalid_reasoning_effort_returns_tool_error(tmp_path):
     result = json.loads(
         cwt.delegate_coding_task(
             task="fix the parser",
-            reasoning_effort="ultra",
+            reasoning_effort="extreme",
             parent_agent=_parent(tmp_path),
         )
     )
 
-    assert "Unknown reasoning_effort 'ultra'" in result["error"]
+    assert "Unknown reasoning_effort 'extreme'" in result["error"]
 
 
 def test_coding_worker_schema_exposes_orchestrator_inputs():
@@ -511,6 +511,8 @@ def test_coding_worker_schema_exposes_orchestrator_inputs():
         "medium",
         "high",
         "xhigh",
+        "max",
+        "ultra",
     ]
     assert "worker_tier" not in properties
     assert {"relevant_files", "approach", "constraints", "verification", "scope_paths"} <= set(

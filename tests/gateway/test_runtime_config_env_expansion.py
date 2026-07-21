@@ -67,6 +67,7 @@ def test_load_prefill_messages_prefers_top_level_over_legacy(monkeypatch, gatewa
             "expanded prompt",
         ),
         (
+            "gateway:\n  model_tier: ''\n"
             "agent:\n  reasoning_effort: ${REASONING_LEVEL}\n",
             "REASONING_LEVEL",
             "high",

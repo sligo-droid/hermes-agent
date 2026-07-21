@@ -50,6 +50,8 @@ def _make_runner() -> GatewayRunner:
     runner._exit_cleanly = False
     runner._failed_platforms = {}
     runner.adapters = {}
+    runner.session_store = MagicMock()
+    runner.delivery_router = MagicMock()
     return runner
 
 

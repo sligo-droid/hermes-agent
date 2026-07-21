@@ -3061,7 +3061,7 @@ async def test_unmentioned_voice_action_followup_classifies_transcript(adapter, 
     ],
 )
 @pytest.mark.asyncio
-async def test_native_voice_feature_request_triages_from_transcript(
+async def test_native_voice_metadata_without_message_flag_triages_from_transcript(
     adapter,
     monkeypatch,
     transcript,
@@ -3090,7 +3090,6 @@ async def test_native_voice_feature_request_triages_from_transcript(
         channel=parent,
         guild=parent.guild,
         author=SimpleNamespace(id=42, display_name="Jezza", name="Jezza", bot=False),
-        flags=SimpleNamespace(voice=True),
         type=discord_platform.discord.MessageType.default,
     )
 

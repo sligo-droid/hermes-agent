@@ -82,6 +82,22 @@ Hermes 按会话键跟踪正在运行的 agent。
 
 本指南将引导你完成完整的设置流程——从在 Discord 开发者门户创建机器人到发送第一条消息。
 
+### Discord Gateway WebSocket 健康
+
+Discord REST 与 Gateway WebSocket 是独立传输。REST 请求成功不代表机器人仍能接收 Gateway 事件。Hermes 会组合检查 ready 状态、client/socket 关闭状态、socket 是否打开、heartbeat ACK 年龄和有限 heartbeat latency。
+
+连续异常达到阈值后，适配器只上报一次可重试失败；现有 Gateway 重连器创建新适配器，不会启动第二个无限重连循环。
+
+```yaml
+discord:
+  websocket_liveness_interval_seconds: 15
+  websocket_liveness_failure_threshold: 2
+  websocket_heartbeat_ack_max_age_seconds: 60
+  websocket_max_latency_seconds: 30
+```
+
+旧的 `liveness_interval_seconds` / `liveness_failure_threshold` 仅作为迁移别名保留，不再表示 REST probe。
+
 ## 第一步：创建 Discord 应用
 
 1. 前往 [Discord 开发者门户](https://discord.com/developers/applications) 并使用你的 Discord 账号登录。
@@ -170,7 +186,7 @@ Token 只显示一次。如果丢失，你需要重置并生成新的 token。�
 你可以使用以下格式直接构建邀请 URL：
 
 ```
-https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=274878286912
+https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=309237763136
 ```
 
 将 `YOUR_APP_ID` 替换为第一步中的 Application ID。
@@ -188,6 +204,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+application
 ### 推荐的附加权限
 
 - **Send Messages in Threads** — 在线程对话中响应
+- **Create Public Threads** - create threads
 - **Add Reactions** — 对消息添加反应以示确认
 
 ### 权限整数
@@ -195,7 +212,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+application
 | 级别 | 权限整数 | 包含内容 |
 |-------|-------------------|-----------------|
 | 最低 | `117760` | View Channels、Send Messages、Read Message History、Attach Files |
-| 推荐 | `274878286912` | 以上所有权限，加上 Embed Links、Send Messages in Threads、Add Reactions |
+| 推荐 | `309237763136` | 以上所有权限，加上 Embed Links、Send Messages in Threads、Add Reactions, Create Public Threads |
 
 ## 第六步：邀请到你的服务器
 
@@ -271,7 +288,7 @@ Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环
 | 变量 | 是否必填 | 默认值 | 描述 |
 |----------|----------|---------|-------------|
 | `DISCORD_BOT_TOKEN` | **是** | — | 来自 [Discord 开发者门户](https://discord.com/developers/applications) 的机器人 token。 |
-| `DISCORD_ALLOWED_USERS` | **是** | — | 允许与机器人交互的 Discord 用户 ID，逗号分隔。没有此项**或** `DISCORD_ALLOWED_ROLES`，网关将拒绝所有用户。 |
+| `DISCORD_ALLOWED_USERS` | 否 | — | 允许与机器人交互的 Discord 用户 ID，逗号分隔。未配置用户、角色或频道准入策略时，本 fork 为兼容现有开发环境保留开放访问；共享或可从外部访问的 bot 应始终配置允许列表。 |
 | `DISCORD_ALLOWED_ROLES` | 否 | — | Discord 角色 ID，逗号分隔。拥有其中任一角色的成员即被授权——与 `DISCORD_ALLOWED_USERS` 为 OR 语义。连接时自动启用 **Server Members Intent**。适用于管理团队频繁变动的场景：新管理员一旦被授予角色即可获得访问权限，无需推送配置。 |
 | `DISCORD_HOME_CHANNEL` | 否 | — | 机器人发送主动消息（cron 输出、提醒、通知）的频道 ID。 |
 | `DISCORD_HOME_CHANNEL_NAME` | 否 | `"Home"` | 主频道在日志和状态输出中的显示名称。 |
@@ -281,7 +298,7 @@ Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环
 | `DISCORD_VOICE_AUTO_TAG` | 否 | `false` | 为 `true` 时，服务器频道中的原生 Discord 语音消息即使没有 `@提及` 也会被视为发给该 bot。多 bot 频道中除非希望语音消息自动触发此 bot，否则保持 `false`。 |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | 否 | — | 机器人无需 `@提及` 即可响应的频道 ID，逗号分隔，即使 `DISCORD_REQUIRE_MENTION` 为 `true` 也适用。 |
 | `DISCORD_IGNORE_NO_MENTION` | 否 | `true` | 为 `true` 时，如果消息 `@提及` 了其他用户但**未**提及机器人，机器人保持沉默。防止机器人介入针对其他人的对话。仅适用于服务器频道，不适用于私信。 |
-| `DISCORD_AUTO_THREAD` | 否 | `true` | 为 `true` 时，自动为文本频道中的每次 `@提及` 创建新线程，使每个对话相互隔离（类似 Slack 行为）。已在线程或私信中的消息不受影响。 |
+| `DISCORD_AUTO_THREAD` | 否 | `true` | 为 `true` 时，将符合条件、明确发给 bot 的操作请求和直接问题路由到新线程。普通自由响应聊天、回复、配置为不建线程的频道、现有线程和私信不会自动建线程。 |
 | `DISCORD_ALLOW_BOTS` | 否 | `"none"` | 控制机器人如何处理来自其他 Discord 机器人的消息。`"none"` — 忽略所有其他机器人。`"mentions"` — 仅接受 `@提及` Hermes 的机器人消息。`"all"` — 接受所有机器人消息。 |
 | `DISCORD_REACTIONS` | 否 | `true` | 为 `true` 时，机器人在处理过程中为消息添加 emoji 反应（开始时 👀，成功时 ✅，出错时 ❌）。设置为 `false` 可完全禁用反应。 |
 | `DISCORD_IGNORED_CHANNELS` | 否 | — | 机器人**永不**响应的频道 ID，逗号分隔，即使被 `@提及` 也不响应。优先于所有其他频道设置。 |
@@ -317,6 +334,12 @@ discord:
   no_thread_channels: []          # 机器人不创建线程直接响应的频道 ID
   history_backfill: true          # 在提及时前置最近的频道滚动历史（默认：true）
   history_backfill_limit: 50      # 向后扫描的最大消息数（默认：50）
+  missed_message_backfill:        # 重新处理断线期间遗漏的消息（需主动启用）
+    enabled: false
+    channels: []                  # 留空时使用 free_response_channels
+    window_seconds: 21600         # 最多回溯 6 小时
+    limit: 100                    # 每次重连的全局扫描上限
+    max_dispatches: 10            # 每次重连的恢复分发上限
   channel_prompts: {}             # 每个频道的临时系统 prompt（提示词）
   allow_mentions:                 # 机器人允许 ping 的内容（安全默认值）
     everyone: false               # @everyone / @here ping（默认：false）
@@ -387,7 +410,7 @@ discord:
 
 **类型：** 布尔值 — **默认值：** `true`
 
-启用后，普通文本频道中的每次 `@提及` 都会自动为对话创建新线程。这保持主频道整洁，并为每个对话提供独立的会话历史。默认情况下，该线程中的后续消息仍需要 `@提及`；仅在旧的一 bot 线程需要参与后自动响应时，才将 [`thread_require_mention`](#discordthread_require_mention) 设置为 `false`。
+启用后，Hermes 会判断普通文本频道中明确发给 bot 的消息是否应路由到线程。操作请求、Discord 消息链接任务、会启动线程工作的斜杠命令，以及通过提及或语音明确提出的直接问题可以创建新线程；普通父频道聊天不会仅因 bot 能看到消息就自动建线程。默认情况下，该线程中的后续消息仍需要 `@提及`；仅在旧的一 bot 线程需要参与后自动响应时，才将 [`thread_require_mention`](#discordthread_require_mention) 设置为 `false`。
 
 在现有线程或私信中发送的消息不受此设置影响。`discord.free_response_channels` 或 `discord.no_thread_channels` 中列出的频道也会绕过自动创建线程，改为直接回复。
 
@@ -498,6 +521,24 @@ discord:
   history_backfill: true
   history_backfill_limit: 50
 ```
+
+#### `discord.missed_message_backfill`
+
+**类型：** 对象 — **默认值：** 禁用
+
+Discord 的 WebSocket 恢复窗口可能在重启或网络中断时过期。在此期间发送的消息不会作为实时网关事件交付。启用后，Hermes 会在 Discord 重连后扫描一组有界的频道与线程历史记录，并将尚未处理的消息交给与实时事件相同的授权、提及、频道、去重和分发流程。
+
+```yaml
+discord:
+  missed_message_backfill:
+    enabled: true
+    channels: ["123456789012345678"]
+    window_seconds: 3600
+    limit: 100
+    max_dispatches: 10
+```
+
+如果 `channels` 留空，Hermes 会使用 `discord.free_response_channels`。只有当机器人确实需要检查所有可访问的服务器文字频道时才设置为 `"*"`。恢复账本按配置文件存储在 `gateway/discord_message_recovery.db`，避免已成功回复的消息在后续重启时再次执行。
 
 #### `group_sessions_per_user`
 
@@ -762,7 +803,7 @@ group_sessions_per_user: true
 ## 安全
 
 :::warning
-始终设置 `DISCORD_ALLOWED_USERS`（或 `DISCORD_ALLOWED_ROLES`）以限制谁可以与机器人交互。没有任何一项，网关默认拒绝所有用户作为安全措施。只授权你信任的人——授权用户对 agent 的功能拥有完全访问权限，包括工具调用和系统访问。
+共享或可从外部访问的 bot 应始终设置 `DISCORD_ALLOWED_USERS`（或 `DISCORD_ALLOWED_ROLES`）来限制使用者。未配置准入策略时，本 fork 为兼容开发环境有意保持 Discord 开放。获准用户对 agent 的功能拥有完整访问权限，包括工具调用和系统访问，因此不要在不受信任的环境中依赖开放默认值。
 :::
 
 ### 基于角色的访问控制

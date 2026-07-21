@@ -93,6 +93,12 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`github-pr-workflow`](/docs/user-guide/skills/bundled/github/github-github-pr-workflow) | GitHub PR lifecycle: branch, commit, open, CI, merge. | `github/github-pr-workflow` |
 | [`github-repo-management`](/docs/user-guide/skills/bundled/github/github-github-repo-management) | Clone/create/fork repos; manage remotes, releases. | `github/github-repo-management` |
 
+## hermes-desktop-plugins
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`hermes-desktop-plugins`](/docs/user-guide/skills/bundled/hermes-desktop-plugins/hermes-desktop-plugins-hermes-desktop-plugins) | Write desktop app plugins that add UI panes and commands. | `hermes-desktop-plugins` |
+
 ## media
 
 | Skill | Description | Path |

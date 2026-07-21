@@ -93,11 +93,10 @@ class TestProviderMapping:
         assert PROVIDER_TO_MODELS_DEV["openai"] == "openai"
         assert PROVIDER_TO_MODELS_DEV["openai-codex"] == "openai"
 
-    def test_gemini_oauth_aliases_mapped_to_google(self):
-        assert PROVIDER_TO_MODELS_DEV["google-gemini-cli"] == "google"
-        assert PROVIDER_TO_MODELS_DEV["gemini-cli"] == "google"
-        assert PROVIDER_TO_MODELS_DEV["gemini-oauth"] == "google"
-
+    def test_removed_gemini_oauth_aliases_stay_absent(self):
+        assert "google-gemini-cli" not in PROVIDER_TO_MODELS_DEV
+        assert "gemini-cli" not in PROVIDER_TO_MODELS_DEV
+        assert "gemini-oauth" not in PROVIDER_TO_MODELS_DEV
 
 class TestExtractContext:
     def test_valid_entry(self):

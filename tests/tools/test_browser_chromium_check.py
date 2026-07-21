@@ -10,6 +10,7 @@ import os
 
 import pytest
 
+from hermes_constants import display_hermes_home
 from tools import browser_tool as bt
 
 
@@ -162,7 +163,7 @@ class TestPlaywrightChromiumPreflight:
 
         assert ok is False
         assert "Playwright Chromium preflight failed" in message
-        assert f"Hermes profile HOME: {hermes_home}" in message
+        assert f"Hermes profile HOME: {display_hermes_home()}" in message
         assert f"Browser subprocess HOME: {hermes_home / 'home'}" in message
         assert str(cache) in message
 
@@ -177,7 +178,7 @@ class TestPlaywrightChromiumPreflight:
 
         assert ok is False
         assert "Playwright Chromium preflight failed" in message
-        assert f"Hermes profile HOME: {hermes_home}" in message
+        assert f"Hermes profile HOME: {display_hermes_home()}" in message
         assert f"Browser subprocess HOME: {hermes_home / 'home'}" in message
         assert str(hermes_home / "home" / ".cache" / "ms-playwright") in message
         assert "npx playwright install --with-deps chromium" in message

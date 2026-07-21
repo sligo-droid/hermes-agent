@@ -52,14 +52,24 @@ def _fake_run_on_mcp_loop(coro_or_factory, timeout=30):
 @pytest.fixture
 def _patch_mcp_server():
     """Patch _servers and the MCP event loop so _make_tool_handler can run."""
+    old_error_count = mcp_tool._server_error_counts.pop("test-server", None)
+    old_opened_at = mcp_tool._server_breaker_opened_at.pop("test-server", None)
     fake_session = MagicMock()
     # `_rpc_lock` is acquired by _make_tool_handler's call path (mcp_tool.py
     # ~L2008) to serialize JSON-RPC against the server — build it inside the
     # fresh loop that _fake_run_on_mcp_loop spins up, not at fixture import.
     fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
-    with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
-         patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
-        yield fake_session
+    try:
+        with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
+             patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
+            yield fake_session
+    finally:
+        mcp_tool._server_error_counts.pop("test-server", None)
+        mcp_tool._server_breaker_opened_at.pop("test-server", None)
+        if old_error_count is not None:
+            mcp_tool._server_error_counts["test-server"] = old_error_count
+        if old_opened_at is not None:
+            mcp_tool._server_breaker_opened_at["test-server"] = old_opened_at
 
 
 class TestStructuredContentPreservation:

@@ -5,7 +5,7 @@ terminal_tool._get_env_config() reads ALL terminal settings from os.environ
 at startup, by THREE separate code paths:
 
   1. cli.py            -> ``env_mappings`` dict (CLI / TUI startup)
-  2. gateway/run.py    -> ``_terminal_env_map`` dict (gateway / messaging
+  2. gateway/run.py    -> ``terminal_env_map`` dict (gateway / messaging
                           platforms)
   3. hermes_cli/config.py:set_config_value
                        -> bridges via the canonical ``TERMINAL_CONFIG_ENV_MAP``
@@ -78,12 +78,12 @@ def _cli_env_map_keys() -> set[str]:
 
 
 def _gateway_env_map_keys() -> set[str]:
-    """terminal config keys bridged by gateway/run.py at module load."""
-    # gateway/run.py builds the dict at module top-level (not inside a
-    # function), so inspect the whole module source.
+    """Terminal config keys bridged by the gateway startup helper."""
+    # The map lives inside _bridge_gateway_config_to_env(). Inspecting the
+    # module keeps this static regression test independent of user config.
     import gateway.run as gr
     source = inspect.getsource(gr)
-    return _extract_dict_keys(source, "_terminal_env_map")
+    return _extract_dict_keys(source, "terminal_env_map")
 
 
 def _save_config_env_sync_keys() -> set[str]:
@@ -117,6 +117,11 @@ _CLI_ONLY_OK = frozenset({
     "sudo_password",
 })
 
+# Gateway deployment settings that are not consumed by terminal_tool or the
+# classic CLI bridge. They remain in the gateway map because gateway launchers
+# pass them to platform-specific runtimes.
+_GATEWAY_ONLY_OK = frozenset({"vercel_runtime"})
+
 
 def _terminal_tool_env_var_names() -> set[str]:
     """All TERMINAL_* env vars actually consumed by terminal_tool."""
@@ -136,7 +141,7 @@ def test_cli_and_gateway_env_maps_agree():
     mode" (or vice-versa) — the bug class that shipped twice already.
     """
     cli_keys = _cli_env_map_keys() - _CLI_ONLY_OK
-    gw_keys = _gateway_env_map_keys()
+    gw_keys = _gateway_env_map_keys() - _GATEWAY_ONLY_OK
 
     # Normalize the legacy `env_type` alias: cli.py accepts both `env_type`
     # and `backend` as source keys for TERMINAL_ENV; gateway only accepts
@@ -150,12 +155,12 @@ def test_cli_and_gateway_env_maps_agree():
 
     assert not missing_in_gateway, (
         f"Keys in cli.py env_mappings but missing from gateway/run.py "
-        f"_terminal_env_map: {sorted(missing_in_gateway)}.  Add them to "
+        f"terminal_env_map: {sorted(missing_in_gateway)}.  Add them to "
         f"both maps (same bug class as docker_run_as_host_user shipping "
         f"wired in cli but not gateway in April 2026)."
     )
     assert not missing_in_cli, (
-        f"Keys in gateway/run.py _terminal_env_map but missing from cli.py "
+        f"Keys in gateway/run.py terminal_env_map but missing from cli.py "
         f"env_mappings: {sorted(missing_in_cli)}.  Add them to both maps."
     )
 
@@ -196,7 +201,7 @@ def test_docker_run_as_host_user_is_bridged_everywhere():
 
     docker_run_as_host_user was added to terminal_tool._get_env_config and
     DockerEnvironment but NOT to cli.py's env_mappings or gateway/run.py's
-    _terminal_env_map, so ``terminal.docker_run_as_host_user: true`` in
+    terminal_env_map, so ``terminal.docker_run_as_host_user: true`` in
     config.yaml had no effect at runtime.  This guard makes the regression
     impossible to reintroduce silently.
     """
@@ -208,7 +213,7 @@ def test_docker_run_as_host_user_is_bridged_everywhere():
 
 def test_docker_mount_cwd_to_workspace_is_bridged_everywhere():
     """Same regression class — docker_mount_cwd_to_workspace was missing from
-    gateway/run.py's _terminal_env_map until the docker_run_as_host_user
+    gateway/run.py's terminal_env_map until the docker_run_as_host_user
     audit caught it.
     """
     assert "docker_mount_cwd_to_workspace" in _cli_env_map_keys()
@@ -242,7 +247,7 @@ def test_docker_extra_args_is_bridged_everywhere():
     set`` bridged it), terminal_tool._get_env_config (reads
     TERMINAL_DOCKER_EXTRA_ARGS), and DockerEnvironment (applies extra_args) --
     but it was MISSING from cli.py's env_mappings and gateway/run.py's
-    _terminal_env_map.  So a user who hand-edited config.yaml had their GPU /
+    terminal_env_map.  So a user who hand-edited config.yaml had their GPU /
     shm-size flags silently dropped on the CLI and gateway/desktop paths,
     while ``image``/``volumes`` (which were in those maps) bridged fine --
     producing the "Hermes partially reads the Docker config" symptom.  Guard

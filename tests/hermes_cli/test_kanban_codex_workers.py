@@ -2696,7 +2696,11 @@ def test_codex_worker_refreshes_pool_credential_missing_id_token(monkeypatch, tm
     monkeypatch.setattr(credential_pool.auth_mod, "refresh_codex_oauth_pure", fake_refresh)
 
     codex_home = tmp_path / "worker-codex-home"
-    credential_id = prepare_codex_worker_home(codex_home, allow_fallback=False)
+    credential_id = prepare_codex_worker_home(
+        codex_home,
+        source_env={"CODEX_HOME": str(tmp_path / "source-codex-home")},
+        allow_fallback=False,
+    )
 
     payload = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
     entry = credential_pool.load_pool("openai-codex").entries()[0]

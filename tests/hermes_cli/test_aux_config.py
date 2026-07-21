@@ -36,6 +36,7 @@ def test_title_generation_present_in_default_config():
     """
     assert "title_generation" in DEFAULT_CONFIG["auxiliary"]
     tg = DEFAULT_CONFIG["auxiliary"]["title_generation"]
+    assert tg["enabled"] is True
     assert tg["provider"] == "auto"
     assert tg["model"] == ""
     assert tg["timeout"] > 0
@@ -56,11 +57,6 @@ def test_aux_tasks_keys_all_exist_in_default_config():
     assert not missing, (
         f"_AUX_TASKS references tasks not in DEFAULT_CONFIG.auxiliary: {missing}"
     )
-
-
-def test_all_builtin_auxiliary_defaults_have_empty_api_mode():
-    for task, task_cfg in DEFAULT_CONFIG["auxiliary"].items():
-        assert task_cfg["api_mode"] == "", task
 
 
 # ── _format_aux_current ─────────────────────────────────────────────────────

@@ -2202,6 +2202,11 @@ async def test_startup_auto_resume_reuses_original_discord_work_item(tmp_path):
     runner = object.__new__(GatewayRunner)
     runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     runner._background_tasks = set()
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._persist_active_agents = MagicMock()
+    runner._update_runtime_status = MagicMock()
+    runner._is_user_authorized = lambda _source: True
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner.adapters = {Platform.DISCORD: adapter}
 
@@ -2252,6 +2257,7 @@ async def test_authoritative_closeout_clears_resume_pending_without_model_replay
     runner = object.__new__(GatewayRunner)
     runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     runner._background_tasks = set()
+    runner._running_agents = {}
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner.adapters = {Platform.DISCORD: adapter}
 

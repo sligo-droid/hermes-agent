@@ -329,6 +329,9 @@ class TestTryActivateFallback:
             base_url="https://inference-api.nousresearch.com/v1",
         )
         with patch(
+            "hermes_cli.auth.get_provider_auth_state",
+            return_value={"access_token": "nous-agent-key-abc"},
+        ), patch(
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(mock_client, "nous-hermes-3"),
         ):

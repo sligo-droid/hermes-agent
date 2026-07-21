@@ -220,7 +220,7 @@ def test_xai_text_plus_image_via_tool_surface(matrix_env):
     assert len(xai_calls) == 1
     assert xai_calls[0]["url"].endswith("/videos/generations")
     payload = xai_calls[0]["json"] or {}
-    assert payload["model"] == "grok-imagine-video-1.5-preview"
+    assert payload["model"] == "grok-imagine-video-1.5"
     assert payload["image"] == {"url": "https://example.com/img.png"}
 
 

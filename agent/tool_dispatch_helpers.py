@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
+from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
 
@@ -116,68 +117,8 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
 
 
-def _should_parallelize_tool_batch(tool_calls) -> bool:
-    """Return True when a tool-call batch is safe to run concurrently."""
-    if len(tool_calls) <= 1:
-        return False
-
-    tool_names = [tc.function.name for tc in tool_calls]
-    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
-        return False
-
-    parsed_calls: list[tuple[str, dict]] = []
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        try:
-            function_args = json.loads(tool_call.function.arguments)
-        except Exception:
-            logging.debug(
-                "Could not parse args for %s — defaulting to sequential; raw=%s",
-                tool_name,
-                tool_call.function.arguments[:200],
-            )
-            return False
-        if not isinstance(function_args, dict):
-            logging.debug(
-                "Non-dict args for %s (%s) — defaulting to sequential",
-                tool_name,
-                type(function_args).__name__,
-            )
-            return False
-        parsed_calls.append((tool_name, function_args))
-
-    coding_call_count = sum(
-        1 for tool_name, _function_args in parsed_calls
-        if tool_name == _CODING_WORKER_TOOL
-    )
-    if coding_call_count:
-        if coding_call_count != len(parsed_calls):
-            return _should_parallelize_safe_delegation_mixed(parsed_calls)
-        return _should_parallelize_coding_worker_batch(parsed_calls)
-
-    reserved_paths: list[Path] = []
-    for tool_name, function_args in parsed_calls:
-
-        if tool_name in _PATH_SCOPED_TOOLS:
-            scoped_path = _extract_parallel_scope_path(tool_name, function_args)
-            if scoped_path is None:
-                return False
-            if any(_paths_overlap(scoped_path, existing) for existing in reserved_paths):
-                return False
-            reserved_paths.append(scoped_path)
-            continue
-
-        if tool_name not in _PARALLEL_SAFE_TOOLS:
-            # Check if it's an MCP tool from a server that opted into parallel calls.
-            if not _is_mcp_tool_parallel_safe(tool_name):
-                return False
-
-    return True
-
-
 def _delegate_task_is_read_only(function_args: dict) -> bool:
     """Return whether every child in one delegate call is explicitly read-only."""
-
     tasks = function_args.get("tasks")
     if isinstance(tasks, list):
         return bool(tasks) and all(
@@ -192,48 +133,24 @@ def _delegate_task_is_read_only(function_args: dict) -> bool:
     )
 
 
-def _should_parallelize_safe_delegation_mixed(
-    parsed_calls: list[tuple[str, dict]],
-) -> bool:
-    """Compose explicitly read-only analysis with independently scoped coding."""
-
-    coding_calls: list[tuple[str, dict]] = []
-    for tool_name, function_args in parsed_calls:
-        if tool_name == _CODING_WORKER_TOOL:
-            coding_calls.append((tool_name, function_args))
-            continue
-        if tool_name != "delegate_task":
-            return False
-        if not _delegate_task_is_read_only(function_args):
-            return False
-    if not coding_calls:
-        return False
-    return _should_parallelize_coding_worker_batch(coding_calls)
-
-
 def _coding_worker_parallel_settings() -> tuple[bool, int]:
     """Resolve coding-worker parallel gates without importing config at module load."""
     try:
         from hermes_cli.config import load_config_readonly
-
         config = load_config_readonly() or {}
     except Exception:
         config = {}
-
-    coding_worker = config.get("coding_worker") or {}
-    parallel = coding_worker.get("parallel") or {}
-
+    parallel = ((config.get("coding_worker") or {}).get("parallel") or {})
     raw_enabled = parallel.get("enabled", True)
-    if isinstance(raw_enabled, str):
-        enabled = raw_enabled.strip().lower() not in {"0", "false", "no", "off"}
-    else:
-        enabled = bool(raw_enabled)
-
-    raw_max_workers = parallel.get(
-        "max_workers", _DEFAULT_CODING_WORKER_PARALLEL_MAX_WORKERS
+    enabled = (
+        raw_enabled.strip().lower() not in {"0", "false", "no", "off"}
+        if isinstance(raw_enabled, str)
+        else bool(raw_enabled)
     )
     try:
-        max_workers = int(raw_max_workers)
+        max_workers = int(parallel.get(
+            "max_workers", _DEFAULT_CODING_WORKER_PARALLEL_MAX_WORKERS
+        ))
     except (TypeError, ValueError):
         max_workers = _DEFAULT_CODING_WORKER_PARALLEL_MAX_WORKERS
     return enabled, max_workers
@@ -245,10 +162,7 @@ def _normalize_coding_worker_scope_paths(function_args: dict) -> Optional[list[P
     if not isinstance(raw_scope_paths, list):
         return None
     if not raw_scope_paths:
-        # The worker tool already enforces an explicit empty list as a
-        # no-mutation scope, so it cannot overlap a mutating worker.
         return []
-
     normalized: list[Path] = []
     rendered_paths: set[str] = set()
     for raw_path in raw_scope_paths:
@@ -260,11 +174,8 @@ def _normalize_coding_worker_scope_paths(function_args: dict) -> Optional[list[P
         if rendered in rendered_paths:
             continue
         rendered_paths.add(rendered)
-        # Anchor relative prefixes at a synthetic common root. This preserves
-        # the existing _paths_overlap prefix rule and makes "." overlap every
-        # other workdir-relative scope, matching the worker's scope semantics.
         normalized.append(Path("/").joinpath(*path.parts))
-    return normalized or None
+    return normalized
 
 
 def _should_parallelize_coding_worker_batch(
@@ -273,7 +184,6 @@ def _should_parallelize_coding_worker_batch(
     enabled, max_workers = _coding_worker_parallel_settings()
     if not enabled or len(parsed_calls) > max_workers:
         return False
-
     reserved_paths: list[Path] = []
     for _tool_name, function_args in parsed_calls:
         scope_paths = _normalize_coding_worker_scope_paths(function_args)
@@ -289,25 +199,179 @@ def _should_parallelize_coding_worker_batch(
     return True
 
 
-def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Optional[Path]:
-    """Return the normalized file target for path-scoped tools."""
+def _should_parallelize_safe_delegation_mixed(
+    parsed_calls: list[tuple[str, dict]],
+) -> bool:
+    """Compose explicitly read-only analysis with independently scoped coding."""
+    coding_calls: list[tuple[str, dict]] = []
+    for tool_name, function_args in parsed_calls:
+        if tool_name == _CODING_WORKER_TOOL:
+            coding_calls.append((tool_name, function_args))
+        elif tool_name != "delegate_task" or not _delegate_task_is_read_only(function_args):
+            return False
+    return bool(coding_calls) and _should_parallelize_coding_worker_batch(coding_calls)
+
+
+def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
+    """Split calls into ordered sequential and parallel-safe segments.
+
+    Upstream's segmented planner preserves barriers while still parallelizing
+    independent runs. The fork additionally treats disjoint coding workers as a
+    parallel run and permits explicitly read-only non-coding delegation in that
+    same run. Mutating/general delegation remains a barrier.
+    """
+    segments: list[list] = []
+    current: list = []
+    current_kind: Optional[str] = None  # "standard" or "worker"
+    reserved_paths: list[Path] = []
+    worker_scope_paths: list[Path] = []
+    worker_coding_count = 0
+    coding_enabled, coding_max_workers = _coding_worker_parallel_settings()
+
+    def _close_parallel() -> None:
+        nonlocal current, current_kind, reserved_paths
+        nonlocal worker_scope_paths, worker_coding_count
+        if current:
+            # Read-only delegate_task calls only parallelize when paired with at
+            # least one independently scoped coding worker, matching the fork's
+            # existing safe mixed-worker contract.
+            kind = "parallel"
+            if current_kind == "worker" and worker_coding_count == 0:
+                kind = "sequential"
+            segments.append([kind, current])
+        current = []
+        current_kind = None
+        reserved_paths = []
+        worker_scope_paths = []
+        worker_coding_count = 0
+
+    def _add_sequential(tool_call) -> None:
+        _close_parallel()
+        if segments and segments[-1][0] == "sequential":
+            segments[-1][1].append(tool_call)
+        else:
+            segments.append(["sequential", [tool_call]])
+
+    for tool_call in tool_calls:
+        tool_name = tool_call.function.name
+        if tool_name in _NEVER_PARALLEL_TOOLS:
+            _add_sequential(tool_call)
+            continue
+        try:
+            function_args = json.loads(tool_call.function.arguments)
+        except Exception:
+            raw = tool_call.function.arguments
+            logging.debug(
+                "Could not parse args for %s — treating as sequential barrier; raw=%s",
+                tool_name,
+                raw[:200] if isinstance(raw, str) else repr(raw)[:200],
+            )
+            _add_sequential(tool_call)
+            continue
+        if not isinstance(function_args, dict):
+            _add_sequential(tool_call)
+            continue
+
+        is_read_only_delegate = (
+            tool_name == "delegate_task" and _delegate_task_is_read_only(function_args)
+        )
+        if tool_name == _CODING_WORKER_TOOL or is_read_only_delegate:
+            if current_kind == "standard":
+                _close_parallel()
+            if tool_name == _CODING_WORKER_TOOL:
+                scope_paths = _normalize_coding_worker_scope_paths(function_args)
+                if (
+                    not coding_enabled
+                    or worker_coding_count >= coding_max_workers
+                    or scope_paths is None
+                    or any(
+                        _paths_overlap(path, existing)
+                        for path in scope_paths
+                        for existing in worker_scope_paths
+                    )
+                ):
+                    _add_sequential(tool_call)
+                    continue
+                worker_scope_paths.extend(scope_paths)
+                worker_coding_count += 1
+            current_kind = "worker"
+            current.append(tool_call)
+            continue
+        if tool_name == "delegate_task":
+            _add_sequential(tool_call)
+            continue
+
+        if current_kind == "worker":
+            _close_parallel()
+        current_kind = "standard"
+        if tool_name in _PATH_SCOPED_TOOLS:
+            scoped_path = _extract_parallel_scope_path(
+                tool_name, function_args, execution_cwd=execution_cwd
+            )
+            if scoped_path is None:
+                _add_sequential(tool_call)
+                continue
+            if any(_paths_overlap(scoped_path, existing) for existing in reserved_paths):
+                _close_parallel()
+                current_kind = "standard"
+            reserved_paths.append(scoped_path)
+            current.append(tool_call)
+            continue
+        if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
+            current.append(tool_call)
+            continue
+        _add_sequential(tool_call)
+
+    _close_parallel()
+    normalized: list[list] = []
+    for kind, calls in segments:
+        if kind == "parallel" and len(calls) < 2:
+            kind = "sequential"
+        if normalized and normalized[-1][0] == "sequential" and kind == "sequential":
+            normalized[-1][1].extend(calls)
+        else:
+            normalized.append([kind, calls])
+    return [(kind, calls) for kind, calls in normalized]
+
+
+def _should_parallelize_tool_batch(tool_calls) -> bool:
+    """Return True when the whole batch forms one safe parallel segment."""
+    if len(tool_calls) <= 1:
+        return False
+    segments = _plan_tool_batch_segments(tool_calls)
+    return len(segments) == 1 and segments[0][0] == "parallel"
+
+
+def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path:
+    """Return a symlink- and platform-aware canonical path."""
+    expanded = Path(raw_path).expanduser()
+    base = execution_cwd if execution_cwd is not None else Path.cwd()
+    candidate = expanded if expanded.is_absolute() else base / expanded
+    resolved = os.path.normcase(os.path.realpath(os.path.abspath(str(candidate))))
+    return Path(resolved)
+
+
+def _extract_parallel_scope_path(
+    tool_name: str,
+    function_args: dict,
+    execution_cwd: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the canonical file target for path-scoped tools."""
     if tool_name not in _PATH_SCOPED_TOOLS:
         return None
-
     raw_path = function_args.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
-
-    expanded = Path(raw_path).expanduser()
-    if expanded.is_absolute():
-        return Path(os.path.abspath(str(expanded)))
-
-    # Avoid resolve(); the file may not exist yet.
-    return Path(os.path.abspath(str(Path.cwd() / expanded)))
+    return _canonical_path(raw_path, execution_cwd)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
-    """Return True when two paths may refer to the same subtree."""
+    """Return True when two paths may refer to the same subtree.
+
+    Both *left* and *right* must already be canonical (as returned by
+    ``_extract_parallel_scope_path`` / ``_canonical_path``) so that
+    symlink aliases and case differences are already normalised.
+    """
     left_parts = left.parts
     right_parts = right.parts
     if not left_parts or not right_parts:
@@ -500,7 +564,13 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
-def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict:
+def make_tool_result_message(
+    name: str,
+    content: Any,
+    tool_call_id: str,
+    *,
+    effect_disposition: str | None = None,
+) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
     ``tool_name`` field (written to the session DB messages table).
@@ -521,13 +591,23 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
     callers should compare by value, not by ``is``.
     """
     wrapped = _maybe_wrap_untrusted(name, content)
-    return {
+    message = {
         "role": "tool",
         "name": name,
         "tool_name": name,
         "content": wrapped,
         "tool_call_id": tool_call_id,
     }
+    try:
+        risk_metadata = _tool_output_risk_metadata(name, content)
+    except Exception as exc:
+        logger.debug("Tool output risk scan failed for %s: %s", name, exc)
+    else:
+        if risk_metadata is not None:
+            message["_tool_output_risk"] = risk_metadata
+    if effect_disposition is not None:
+        message["effect_disposition"] = effect_disposition
+    return message
 
 
 # Tools whose results carry attacker-controllable content.  Wrapping their
@@ -559,6 +639,42 @@ def _is_untrusted_tool(name: Optional[str]) -> bool:
     if name in _UNTRUSTED_TOOL_NAMES:
         return True
     return any(name.startswith(p) for p in _UNTRUSTED_TOOL_PREFIXES)
+
+
+def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, Any]]:
+    """Classify textual attacker-controlled output without retaining a copy.
+
+    The advisory metadata is internal-only. It records deterministic finding
+    identifiers, never blocks or redacts the normal result, and deliberately
+    omits raw scanned text.
+    """
+    if not _is_untrusted_tool(name):
+        return None
+    if isinstance(content, str):
+        text_parts = [content]
+    elif isinstance(content, list):
+        text_parts = [
+            item["text"]
+            for item in content
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+        ]
+        if not text_parts:
+            return None
+    else:
+        return None
+
+    findings: List[str] = []
+    for text in text_parts:
+        for finding in scan_for_threats(text, scope="context"):
+            if finding not in findings:
+                findings.append(finding)
+    return {
+        "risk": "high" if findings else "low",
+        "findings": findings,
+        "redacted": False,
+    }
 
 
 def _neutralize_delimiters(content: str) -> str:
@@ -631,7 +747,9 @@ __all__ = [
     "_DESTRUCTIVE_PATTERNS",
     "_REDIRECT_OVERWRITE",
     "_is_destructive_command",
+    "_plan_tool_batch_segments",
     "_should_parallelize_tool_batch",
+    "_canonical_path",
     "_extract_parallel_scope_path",
     "_paths_overlap",
     "_is_multimodal_tool_result",

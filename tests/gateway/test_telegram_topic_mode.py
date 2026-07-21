@@ -263,6 +263,12 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
     )
+    # This test asserts topic-session selection, not the fork's optional
+    # runtime footer. Keep it deterministic when a prior test enables footer
+    # display in the same xdist worker.
+    monkeypatch.setattr(
+        gateway_run, "_runtime_footer_line_for_agent_result", lambda *a, **k: ""
+    )
 
     result = await runner._handle_message(_make_event("continue restored", thread_id="17585"))
 
@@ -339,6 +345,12 @@ async def test_group_new_keeps_existing_reset_semantics_when_dm_topic_mode_enabl
 
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    # /new appends a random tip from hermes_cli.tips; one tip's text contains
+    # the phrase "parallel work", which collides with the negative assertion
+    # below (observed as a 1-in-N CI flake). Pin the tip.
+    monkeypatch.setattr(
+        "hermes_cli.tips.get_random_tip", lambda: "pinned tip for test"
     )
 
     result = await runner._handle_message(_make_group_event("/new", thread_id="555"))

@@ -11,7 +11,6 @@ import argparse
 import os
 from pathlib import Path
 
-import pytest
 import subprocess
 import sys
 
@@ -31,8 +30,8 @@ def _build():
 
 def test_cron_subactions_present():
     parser = _build()
-    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "tick"):
-        ns = parser.parse_args(["cron", action] if action in ("list", "status", "tick")
+    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick"):
+        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "tick")
                                else ["cron", action, "jobid"] if action in ("pause", "resume", "run", "remove", "edit")
                                else ["cron", "create", "30m"])
         assert ns.command == "cron"
@@ -48,6 +47,10 @@ def test_cron_aliases():
     for alias in ("rm", "delete"):
         ns = parser.parse_args(["cron", alias, "jid"])
         assert ns.cron_command == alias
+    ns = parser.parse_args(["cron", "history", "jid", "--limit", "7"])
+    assert ns.cron_command == "history"
+    assert ns.job_id == "jid"
+    assert ns.limit == 7
 
 
 def test_cron_create_options():
@@ -71,11 +74,14 @@ def test_cron_create_options():
     assert ns.workdir == "/tmp/x"
 
 
-def test_cron_reasoning_effort_rejects_removed_max_level():
+def test_cron_reasoning_effort_accepts_explicit_maximum_levels():
     parser = _build()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["cron", "create", "30m", "task", "--reasoning-effort", "max"])
+    for effort in ("max", "ultra"):
+        ns = parser.parse_args(
+            ["cron", "create", "30m", "task", "--reasoning-effort", effort]
+        )
+        assert ns.reasoning_effort == effort
 
 
 def test_cron_edit_no_agent_tristate():

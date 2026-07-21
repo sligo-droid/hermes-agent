@@ -367,6 +367,7 @@ def load_coding_worker_pass_profiles(
             if explicit_reasoning is not None
             else tier.reasoning_effort if tier is not None else configured_reasoning or legacy_efforts[pass_name]
         )
+        reasoning = _normalize_reasoning_level(reasoning)
         safe_reasoning = restrict_reasoning_effort_for_task(
             reasoning,
             task,
@@ -1601,6 +1602,8 @@ def _normalize_reasoning_level(value: Any) -> str:
     from hermes_constants import normalize_reasoning_effort
 
     raw = normalize_reasoning_effort(value)
+    if raw in {"max", "ultra"}:
+        raw = "xhigh"
     return raw if raw in _VALID_REASONING_LEVELS else ""
 
 

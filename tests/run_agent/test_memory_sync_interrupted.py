@@ -31,6 +31,7 @@ def _bare_agent():
 
     agent = AIAgent.__new__(AIAgent)
     agent._memory_manager = MagicMock()
+    agent._memory_manager.read_only = False
     # session_id is now propagated into sync_all / queue_prefetch_all so
     # providers that cache per-session state can update it mid-process
     # (see #6672).
@@ -240,56 +241,60 @@ class TestSyncExternalMemoryForTurn:
         # sync_all still happened before the prefetch blew up.
         agent._memory_manager.sync_all.assert_called_once()
 
-    # --- Multimodal content flattening ----------------------------------
+    # --- Multimodal content handoff ------------------------------------
 
-    def test_multimodal_user_message_is_flattened(self):
-        """A turn with an attached image carries the user message as a
-        list of typed parts.  Providers feed the content to regexes
-        (sanitize_context), so a raw list raised ``expected string or
-        bytes-like object, got 'list'`` and the turn silently never
-        synced.  The boundary must flatten to text first."""
+    def test_multimodal_user_message_is_delegated_to_memory_manager(self):
+        """The manager owns provider-safe normalization and redaction."""
         agent = _bare_agent()
+        user_message = [
+            {"type": "text", "text": "what is in this screenshot?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
         agent._sync_external_memory_for_turn(
-            original_user_message=[
-                {"type": "text", "text": "what is in this screenshot?"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ],
+            original_user_message=user_message,
             final_response="A terminal window showing a stack trace.",
             interrupted=False,
         )
         agent._memory_manager.sync_all.assert_called_once_with(
-            "[1 image] what is in this screenshot?",
+            user_message,
             "A terminal window showing a stack trace.",
             session_id="test_session_001",
         )
         agent._memory_manager.queue_prefetch_all.assert_called_once_with(
-            "[1 image] what is in this screenshot?",
+            user_message,
             session_id="test_session_001",
         )
 
-    def test_multimodal_response_is_flattened(self):
+    def test_multimodal_response_is_delegated_to_memory_manager(self):
         agent = _bare_agent()
+        response = [{"type": "text", "text": "a cat"}]
         agent._sync_external_memory_for_turn(
             original_user_message="describe it",
-            final_response=[{"type": "text", "text": "a cat"}],
+            final_response=response,
             interrupted=False,
         )
         agent._memory_manager.sync_all.assert_called_once_with(
-            "describe it", "a cat",
+            "describe it", response,
             session_id="test_session_001",
         )
 
-    def test_multimodal_with_no_text_at_all_skips(self):
-        """Unknown-typed parts flatten to an empty string — don't sync a
-        turn with no recoverable text."""
+    def test_media_only_message_is_delegated_for_manager_side_filtering(self):
         agent = _bare_agent()
+        user_message = [{"type": "audio", "data": "..."}]
         agent._sync_external_memory_for_turn(
-            original_user_message=[{"type": "audio", "data": "..."}],
+            original_user_message=user_message,
             final_response="noted",
             interrupted=False,
         )
-        agent._memory_manager.sync_all.assert_not_called()
-        agent._memory_manager.queue_prefetch_all.assert_not_called()
+        agent._memory_manager.sync_all.assert_called_once_with(
+            user_message,
+            "noted",
+            session_id="test_session_001",
+        )
+        agent._memory_manager.queue_prefetch_all.assert_called_once_with(
+            user_message,
+            session_id="test_session_001",
+        )
 
     # --- The specific matrix the reporter asked about ------------------
 

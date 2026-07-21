@@ -73,6 +73,7 @@ export const estimatedMsgHeight = (
   {
     compact,
     details,
+    leadGap = false,
     limitHistory = false,
     thinkingVisible = details,
     toolsVisible = details,
@@ -81,6 +82,7 @@ export const estimatedMsgHeight = (
   }: {
     compact: boolean
     details: boolean
+    leadGap?: boolean
     limitHistory?: boolean
     thinkingVisible?: boolean
     toolsVisible?: boolean
@@ -136,6 +138,13 @@ export const estimatedMsgHeight = (
   if (msg.role === 'user' || msg.kind === 'diff') {
     h += 2
   } else if (msg.kind === 'slash') {
+    h++
+  }
+
+  // Group-boundary blank line owned by BlockSlot. The caller resolves the
+  // boundary against the previous row and passes it here so the estimate
+  // matches the rendered margin before Yoga remeasures.
+  if (leadGap) {
     h++
   }
 

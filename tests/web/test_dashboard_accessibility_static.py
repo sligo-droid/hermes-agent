@@ -47,7 +47,8 @@ def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes(
     assert "currentProject={selectedProject}" in source
     assert "pendingProject={projectSwitchPending ? selectedProject : null}" in source
     assert "const projectSwitchPending = Boolean(snapshot && snapshotProject !== selectedProject && !error);" in source
-    assert "{loading && snapshot && !projectSwitchPending ?" in source
+    assert "commandCenterLoadingState({ loading, snapshot, projectSwitchPending })" in source
+    assert '{loadingState === "refreshing" ?' in source
     assert "to={{ pathname, search: tabSearch(project.key) }}" in source
     assert "to={{ pathname: lane.href, search }}" in source
     assert 'href="/workers" rel="noopener noreferrer" target="_blank"' in source
@@ -131,16 +132,20 @@ def test_command_center_archive_action_is_one_click_without_removing_other_promp
 
 def test_command_center_proposal_archive_action_uses_halt_flow():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
+    approval_block = action_source.split("if (canApproveReject) {", 1)[1].split("}", 1)[0]
     handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
     run_action_source = source.split("const runActionForItem = useCallback", 1)[1].split("const handleAction = useCallback", 1)[0]
 
     assert 'type ActionKind = "approve" | "approve_worker_board" | "reject" | "pause" | "replay" | "repair" | "undo" | "archive";' in source
-    assert 'approve: { label: "Approve native"' in source
+    assert 'approve: { label: "Approve"' in source
     assert 'approve_worker_board: { label: "Worker board"' in source
     assert 'if (canApproveReject) {' in source
-    assert 'actions.push("approve");' in source
-    assert 'actions.push("approve_worker_board");' in source
-    assert 'actions.push("reject");' in source
+    assert 'actions.push("approve");' in approval_block
+    assert 'actions.push("reject");' in approval_block
+    assert 'actions.push("approve_worker_board");' not in approval_block
+    assert 'item.status === "accepted" && !item.execution' in action_source
+    assert 'actions.push("approve_worker_board");' in action_source
     assert 'const hasProposalExecution = Boolean(proposalId && item.execution);' in source
     assert '(hasProposalExecution || (item.execution?.pause_action && board))' in source
     assert 'const proposalCanArchive = Boolean(proposalId && ["proposed", "queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));' in source
@@ -148,8 +153,8 @@ def test_command_center_proposal_archive_action_uses_halt_flow():
     assert 'rejectReason' not in handle_source
     assert 'window.prompt("Reason for rejecting this proposal?"' not in run_action_source
     assert 'await api.rejectSelfImprovementProposal(proposalId);' in run_action_source
-    assert 'await api.approveSelfImprovementProposal(proposalId, "native");' in run_action_source
-    assert 'await api.approveSelfImprovementProposal(proposalId, "worker_board");' in run_action_source
+    assert 'await api.approveSelfImprovementProposal(proposalId, "native");' not in run_action_source
+    assert run_action_source.count('await api.approveSelfImprovementProposal(proposalId, "worker_board");') == 2
     assert 'const proposalHasDownstreamExecution = Boolean(item.execution?.task_id || item.execution?.board);' in run_action_source
     assert 'else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);' in run_action_source
     assert 'else if (proposalId && !proposalHasDownstreamExecution) await api.archiveSelfImprovementProposal(proposalId);' in run_action_source

@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent.codex_runtime import run_codex_app_server_turn
+from agent.iteration_budget import IterationBudget
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -51,6 +52,11 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
     agent._codex_session.run_turn.return_value = _make_turn()
+    agent.max_iterations = 1
+    agent.iteration_budget = IterationBudget(1)
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._api_call_count = 0
     agent.tool_progress_callback = None
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0

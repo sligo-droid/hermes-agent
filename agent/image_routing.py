@@ -182,8 +182,82 @@ def _supports_vision_override(
     """
     from agent.vision_capabilities import configured_model_vision_support
 
+
     support, _source = configured_model_vision_support(cfg, provider, model)
     return support
+
+def _resolve_inference_base_url(
+    cfg: Optional[Dict[str, Any]],
+    provider: str,
+) -> str:
+    """Best-effort base URL for the active inference provider."""
+    try:
+        from agent.auxiliary_client import _runtime_main_value
+
+        runtime = str(_runtime_main_value("base_url") or "").strip()
+        runtime_provider = str(_runtime_main_value("provider") or "").strip().lower()
+        requested_provider = str(provider or "").strip().lower()
+        if runtime and (not requested_provider or requested_provider == runtime_provider):
+            return runtime
+    except Exception:
+        pass
+
+    if not isinstance(cfg, dict):
+        return ""
+
+    model_cfg_raw = cfg.get("model")
+    model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
+    base_url = str(model_cfg.get("base_url") or "").strip()
+    if base_url:
+        return base_url
+
+    config_provider = str(model_cfg.get("provider") or "").strip()
+    candidate_names: set[str] = set()
+    for p in filter(None, (provider, config_provider)):
+        candidate_names.add(p)
+        if p.lower().startswith("custom:"):
+            candidate_names.add(p.split(":", 1)[1])
+        else:
+            candidate_names.add(f"custom:{p}")
+
+    providers_cfg = cfg.get("providers")
+    if isinstance(providers_cfg, dict):
+        for name in candidate_names:
+            entry = providers_cfg.get(name)
+            if isinstance(entry, dict):
+                bu = str(entry.get("base_url") or "").strip()
+                if bu:
+                    return bu
+
+    custom_providers = cfg.get("custom_providers")
+    if isinstance(custom_providers, list):
+        lowered = {n.lower() for n in candidate_names}
+        for entry_raw in custom_providers:
+            if not isinstance(entry_raw, dict):
+                continue
+            entry_name = str(entry_raw.get("name") or "").strip()
+            if entry_name not in candidate_names and entry_name.lower() not in lowered:
+                continue
+            bu = str(entry_raw.get("base_url") or "").strip()
+            if bu:
+                return bu
+
+    return ""
+
+
+def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
+    """True when the active provider likely fronts a local Ollama server."""
+    p = (provider or "").strip().lower()
+    if p == "ollama":
+        return True
+    if not base_url:
+        return False
+    try:
+        from agent.model_metadata import detect_local_server_type
+
+        return detect_local_server_type(base_url) == "ollama"
+    except Exception:
+        return False
 
 
 def _coerce_mode(raw: Any) -> str:
@@ -307,12 +381,63 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     # BMP: "BM"
     if raw.startswith(b"BM"):
         return "image/bmp"
-    # HEIC/HEIF: ftypheic / ftypheix / ftypmif1 / ftypmsf1 etc.
-    if len(raw) >= 12 and raw[4:8] == b"ftyp" and raw[8:12] in {
-        b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1", b"heim", b"heis",
-    }:
-        return "image/heic"
+    # ISO-BMFF family: HEIC/HEIF/AVIF.
+    if len(raw) >= 12 and raw[4:8] == b"ftyp":
+        brand = raw[8:12]
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+        if brand in {
+            b"heic", b"heix", b"hevc", b"hevx",
+            b"mif1", b"msf1", b"heim", b"heis",
+        }:
+            return "image/heic"
+    if raw[:4] in {b"II*\x00", b"MM\x00*"}:
+        return "image/tiff"
+    if raw[:4] == b"\x00\x00\x01\x00":
+        return "image/x-icon"
+    head = raw[:512].lstrip().lower()
+    if (head.startswith(b"<?xml") or head.startswith(b"<svg")) and b"<svg" in head:
+        return "image/svg+xml"
     return None
+
+
+_UNIVERSALLY_SUPPORTED_MIMES = frozenset({
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+})
+
+
+def _transcode_to_png(raw: bytes) -> Optional[bytes]:
+    """Decode a non-universal image format and re-encode it as PNG."""
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.info(
+            "image_routing: Pillow not installed; cannot transcode "
+            "non-standard image format to PNG"
+        )
+        return None
+    try:
+        import pillow_heif  # type: ignore
+
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+    try:
+        import pillow_avif  # type: ignore  # noqa: F401
+    except Exception:
+        pass
+    try:
+        from io import BytesIO
+
+        with Image.open(BytesIO(raw)) as image:
+            if image.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
+                image = image.convert("RGBA")
+            output = BytesIO()
+            image.save(output, format="PNG", optimize=False)
+            return output.getvalue()
+    except Exception as exc:
+        logger.info("image_routing: Pillow could not transcode image to PNG -- %s", exc)
+        return None
 
 
 def _guess_mime(path: Path, raw: Optional[bytes] = None) -> str:
@@ -350,15 +475,39 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     accept large images (OpenAI 49 MB+, Gemini 100 MB) don't pay a silent
     quality tax just because one other provider is stricter.
 
-    Returns None only if the file can't be read (missing, permission
-    denied, etc.); the caller reports those paths in ``skipped``.
+    Non-universal formats are transcoded to PNG. If decoding is unavailable
+    or fails (including SVG/vector input), the attachment is skipped so one
+    unsupported image cannot fail the entire model turn.
     """
+    try:
+        from agent.file_safety import raise_if_read_blocked
+
+        raise_if_read_blocked(str(path))
+    except ValueError as exc:
+        logger.warning("image_routing: blocked local image attachment %s -- %s", path, exc)
+        return None
+    except Exception:
+        # Keep attachment routing best-effort if the guard itself is unavailable.
+        pass
+
     try:
         raw = path.read_bytes()
     except Exception as exc:
         logger.warning("image_routing: failed to read %s — %s", path, exc)
         return None
     mime = _guess_mime(path, raw=raw)
+    if mime not in _UNIVERSALLY_SUPPORTED_MIMES:
+        transcoded = _transcode_to_png(raw)
+        if transcoded is None:
+            logger.warning(
+                "image_routing: %s is %s and could not be transcoded to PNG; "
+                "skipping this attachment",
+                path,
+                mime,
+            )
+            return None
+        raw = transcoded
+        mime = "image/png"
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 

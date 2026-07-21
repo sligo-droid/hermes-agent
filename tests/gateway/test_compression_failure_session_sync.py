@@ -115,10 +115,13 @@ def _runner(session_store):
         {"provider": "openai-codex", "api_mode": "codex_responses", "base_url": "https://chatgpt.com/backend-api/codex", "api_key": "token"},
     )
     runner._resolve_session_reasoning_config = lambda **_kwargs: None
-    runner._resolve_turn_agent_config = lambda message, model, runtime: {"model": model, "runtime": runtime}
+    runner._resolve_turn_agent_config = lambda message, model, runtime, **_kwargs: {
+        "model": model,
+        "runtime": runtime,
+    }
     runner._load_service_tier = lambda: None
     runner._agent_config_signature = lambda *_args, **_kwargs: ("sig",)
-    runner._extract_cache_busting_config = lambda _config: ()
+    runner._extract_cache_busting_config = lambda _config: {}
     runner._thread_metadata_for_source = lambda *_args, **_kwargs: None
     runner._sync_telegram_topic_binding = MagicMock()
     runner._release_running_agent_state = MagicMock()

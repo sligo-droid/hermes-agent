@@ -191,6 +191,23 @@ class GatewayKanbanWatchersMixin:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
+        def _adapter_for_owner(plat, owner_profile):
+            """Resolve a subscription without crossing profile ownership.
+
+            ``self.adapters`` belongs to the gateway process's active profile,
+            which is not necessarily ``default``. An explicit default-owned
+            subscription seen by a secondary-profile gateway must therefore be
+            skipped instead of being sent through that secondary bot. A
+            multiplexing default gateway may still route explicit secondary
+            ownership through ``_profile_adapters``.
+            """
+            owner = (owner_profile or "").strip() or notifier_profile
+            if owner == notifier_profile:
+                return (getattr(self, "adapters", None) or {}).get(plat)
+            if owner == "default":
+                return None
+            return self._authorization_adapter(plat, owner)
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -198,11 +215,8 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
-                    active_platforms = {
-                        getattr(platform, "value", str(platform)).lower()
-                        for platform in self.adapters.keys()
-                    }
-                    if not active_platforms:
+                    profile_adapters = getattr(self, "_profile_adapters", {}) or {}
+                    if not self.adapters and not any(profile_adapters.values()):
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
 
@@ -216,6 +230,66 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
                     seen_db_paths: set[str] = set()
+
+                    def _board_db_path(slug: str) -> Path:
+                        return Path(
+                            str(_kb.kanban_db_path(slug))
+                        ).expanduser().resolve()
+
+                    def _corrupt_quarantine_state(slug: str) -> dict:
+                        try:
+                            return _kb.corrupt_board_quarantine_state(slug)
+                        except Exception:
+                            return {"open_allowed": True, "skipped": False}
+
+                    def _record_corrupt_board(
+                        slug: str, exc: Exception
+                    ) -> Optional[dict]:
+                        incident = getattr(exc, "incident", None)
+                        if isinstance(incident, dict):
+                            return incident
+                        try:
+                            db_path = _board_db_path(slug)
+                            fingerprint = _kb._db_content_fingerprint(db_path)
+                        except Exception:
+                            db_path = Path(str(_kb.kanban_db_path(slug)))
+                            fingerprint = None
+                        return _kb.record_corrupt_board_incident(
+                            slug,
+                            db_path,
+                            str(getattr(exc, "reason", None) or exc),
+                            backup_path=getattr(exc, "backup_path", None),
+                            fingerprint=fingerprint,
+                            error_class=exc.__class__.__name__,
+                        )
+
+                    def _log_corrupt_board_incident(
+                        slug: str,
+                        incident: Optional[dict],
+                        exc: Exception,
+                    ) -> None:
+                        if not _kb.should_log_corrupt_board_incident(incident):
+                            return
+                        incident = incident or {}
+                        logger.error(
+                            "kanban notifier: board %s database corruption incident; "
+                            "db_path=%s quarantine_path=%s reason=%s. Notification "
+                            "polling is paused for this board while the DB fingerprint "
+                            "is unchanged. Repair guidance: restore a known-good backup "
+                            "or run `hermes kanban repair --board %s`, then retry after "
+                            "integrity checks pass.",
+                            slug,
+                            incident.get("db_path")
+                            or str(_kb.kanban_db_path(slug)),
+                            incident.get("quarantine_path")
+                            or getattr(exc, "backup_path", None)
+                            or "<unavailable>",
+                            incident.get("reason")
+                            or getattr(exc, "reason", None)
+                            or str(exc),
+                            slug,
+                        )
+
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
                         db_path = board_meta.get("db_path")
@@ -230,9 +304,28 @@ class GatewayKanbanWatchersMixin:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        state = _corrupt_quarantine_state(slug)
+                        if state.get("skipped"):
+                            logger.debug(
+                                "kanban notifier: board %s paused for unchanged DB "
+                                "corruption; skipping poll db_path=%s next_retry=%s "
+                                "reason=%s",
+                                slug,
+                                state.get("db_path"),
+                                state.get("next_retry"),
+                                state.get("reason"),
+                            )
+                            continue
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
+                            if _kb.is_corrupt_board_db_error(exc):
+                                _log_corrupt_board_incident(
+                                    slug,
+                                    _record_corrupt_board(slug, exc),
+                                    exc,
+                                )
+                                continue
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
@@ -248,24 +341,45 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            ready, incident = _kb.board_schema_ready(
+                                conn,
+                                board=slug,
+                                operation="notifier",
+                                required_tables=(
+                                    "kanban_notify_subs",
+                                    "task_events",
+                                    "tasks",
+                                ),
+                            )
+                            if not ready:
+                                _log_corrupt_board_incident(
+                                    slug,
+                                    incident,
+                                    RuntimeError(
+                                        (incident or {}).get("reason")
+                                        or "kanban board schema not ready"
+                                    ),
+                                )
+                                continue
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
                                 owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
-                                        logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                            sub.get("task_id"), owner_profile, notifier_profile,
-                                        )
-                                        continue
                                 platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
+                                try:
+                                    plat = _Platform(platform)
+                                except ValueError:
                                     logger.debug(
-                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
+                                        "kanban notifier: subscription for %s has unknown platform %s; skipping",
                                         sub.get("task_id"), platform or "<missing>",
+                                    )
+                                    continue
+                                if _adapter_for_owner(plat, owner_profile) is None:
+                                    logger.debug(
+                                        "kanban notifier: subscription for %s on %s owned by profile %s skipped; adapter not connected",
+                                        sub.get("task_id"), platform or "<missing>",
+                                        owner_profile or notifier_profile,
                                     )
                                     continue
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
@@ -310,17 +424,13 @@ class GatewayKanbanWatchersMixin:
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         continue
-                    sub_profile = sub.get("notifier_profile") or ""
-                    # Route via the SAME chokepoint the authorization path uses
-                    # (gateway/authz_mixin.py::_authorization_adapter): a stamped
-                    # profile with its own adapter-registry entry must be served
-                    # by THAT profile's same-platform adapter and must NOT silently
-                    # fall back to the default profile's adapter — otherwise a
-                    # secondary profile's task notification is delivered by the
-                    # wrong bot (the cross-profile mis-delivery this whole change
-                    # exists to fix). The helper returns None only when the profile
-                    # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    owner_profile = sub.get("notifier_profile") or None
+                    # Resolve through the ownership helper above. Explicit
+                    # secondary ownership still uses the authorization
+                    # chokepoint, while current-profile and explicit-default
+                    # ownership remain distinct so neither can borrow the
+                    # other profile's ``self.adapters`` registry.
+                    adapter = _adapter_for_owner(plat, owner_profile)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -781,6 +891,26 @@ class GatewayKanbanWatchersMixin:
         in-flight ``to_thread`` returns on its own after the current
         ``dispatch_once`` call finishes (typically <1ms on an idle board).
         """
+        # The Sligo GatewayRunner carries a fork-specific dispatcher that adds
+        # Discord worker-board pooling, dirty-marker wakeups, lifecycle
+        # announcements, corruption quarantine, and stuck-dispatch diagnostics.
+        # Keep this extracted mixin as the MRO owner while delegating the full
+        # runner to that implementation until those integrations are migrated
+        # mechanically into this module. Standalone mixin tests and downstream
+        # consumers without the fork wake helper continue through the generic
+        # upstream dispatcher below.
+        if callable(getattr(self, "_sleep_until_kanban_dispatch_due", None)):
+            try:
+                from gateway.run import _GatewayRunnerCore
+
+                fork_dispatcher = _GatewayRunnerCore.__dict__.get(
+                    "_kanban_dispatcher_watcher"
+                )
+                if fork_dispatcher is not None:
+                    return await fork_dispatcher(self)
+            except ImportError:
+                pass
+
         # Read config once at boot. If the user flips the flag later, they
         # restart the gateway; same pattern as every other background
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var

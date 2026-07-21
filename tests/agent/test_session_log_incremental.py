@@ -22,6 +22,7 @@ def _agent(tmp_path, session_id="session-log-incremental"):
     agent._session_log_written_count = -1
     agent._session_log_written_path = None
     agent._session_log_written_stat = None
+    agent._session_json_enabled = True
     return agent
 
 

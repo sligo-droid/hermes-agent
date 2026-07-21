@@ -45,6 +45,7 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 
 from __future__ import annotations
 
+
 import copy
 import inspect
 import json
@@ -56,6 +57,49 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# JSON Schema type -> Python type mapping for signature generation
+_JSON_TO_PY = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict[str, type]]:
+    """Build a Python function signature and annotations from a JSON schema.
+
+    Args:
+        schema: JSON Schema dict with "properties" and "required" keys.
+
+    Returns:
+        (signature, annotations_dict) where signature has KEYWORD_ONLY params
+        and annotations maps param names to Python types.
+    """
+    props = (schema or {}).get("properties") or {}
+    required = set((schema or {}).get("required") or [])
+    params, annots = [], {}
+
+    for pname, pspec in props.items():
+        if pname.startswith("_"):
+            continue
+        py = _JSON_TO_PY.get((pspec or {}).get("type"), Any)
+        ann, default = (
+            (py, inspect.Parameter.empty)
+            if pname in required
+            else (Optional[py], None)
+        )
+        annots[pname] = ann
+        params.append(
+            inspect.Parameter(
+                pname, inspect.Parameter.KEYWORD_ONLY, annotation=ann, default=default
+            )
+        )
+
+    return inspect.Signature(params, return_annotation=str), annots
 
 
 # Tools we expose. Each name MUST match a registered Hermes tool that
@@ -170,7 +214,11 @@ def _make_handler(
 
     def _dispatch(**kwargs: Any) -> str:
         try:
-            return dispatch(tool_name, kwargs or {})
+            # Unset optional parameters arrive as ``None`` from the synthetic
+            # FastMCP signature. Do not forward them: Hermes handlers apply
+            # their own defaults when a key is absent.
+            args = {key: value for key, value in kwargs.items() if value is not None}
+            return dispatch(tool_name, args)
         except Exception as exc:
             logger.exception("tool %s raised", tool_name)
             return json.dumps({"error": str(exc), "tool": tool_name})
@@ -255,6 +303,7 @@ def _build_server() -> Any:
             continue
 
         description = spec.get("description") or f"Hermes {name} tool"
+
         params_schema = _normalise_parameters_schema(spec.get("parameters"))
 
         try:
@@ -265,6 +314,7 @@ def _build_server() -> Any:
                 handle_function_call,
             )
             mcp.add_tool(
+
                 handler,
                 name=name,
                 description=description,
@@ -272,6 +322,7 @@ def _build_server() -> Any:
             )
             _patch_fastmcp_tool_schema(mcp, name, params_schema)
         except TypeError:
+
             # Older mcp SDK signature — fall back to decorator-style.
             handler = _make_handler(
                 name,

@@ -237,7 +237,7 @@ class WebToolsTester:
                 "https://docs.firecrawl.dev/introduction",
                 "https://www.python.org/about/"
             ]
-            print(f"  Using default URLs for testing")
+            print("  Using default URLs for testing")
         else:
             print(f"  Using {len(urls)} URLs from search results")
         
@@ -318,20 +318,79 @@ class WebToolsTester:
                 else:
                     self.log_result(
                         "Bounded extract",
-                        "failed", 
+                        "failed",
                         f"No valid content. {failed_results} errors, {len(results) - failed_results} empty"
                     )
                     if self.verbose:
-                        print(f"\n  Extraction details:")
+                        print("\n  Extraction details:")
                         for detail in extraction_details:
                             print(f"    {detail}")
-                    
+
             except Exception as e:
                 self.log_result("Bounded extract", "failed", f"Exception: {type(e).__name__}: {str(e)}")
                 if self.verbose:
                     import traceback
                     print(f"    Traceback: {traceback.format_exc()}")
-    
+
+    async def test_web_extract_with_llm(self, urls: List[str] = None):
+        """Test web extraction with LLM processing"""
+        print_section("Test 3: Web Extract (with Gemini LLM)")
+
+        if not self.test_llm:
+            self.log_result("Extract (with LLM)", "skipped", "LLM testing disabled")
+            return
+
+        # Use a URL likely to have substantial content
+        test_url = urls[0] if urls else "https://docs.firecrawl.dev/features/scrape"
+
+        try:
+            print(f"\n  Extracting and processing: {test_url}")
+
+            result = await web_extract_tool(
+                [test_url],
+                format="markdown",
+                char_limit=1000,  # small budget to force truncation in the test
+            )
+
+            data = json.loads(result)
+
+            if "error" in data:
+                self.log_result("Extract (with LLM)", "failed", data["error"])
+                return
+
+            results = data.get("results", [])
+
+            if not results:
+                self.log_result("Extract (with LLM)", "failed", "No results returned")
+                return
+
+            result = results[0]
+            content = result.get("content", "")
+
+            if content:
+                content_len = len(content)
+
+                # Check if content was actually processed (should be shorter than typical raw content)
+                if content_len > 0:
+                    self.log_result(
+                        "Extract (with LLM)",
+                        "passed",
+                        f"Content processed: {content_len} chars"
+                    )
+
+                    if self.verbose:
+                        print("\n    First 300 chars of processed content:")
+                        print(f"    {content[:300]}...")
+                else:
+                    self.log_result("Extract (with LLM)", "failed", "No content after processing")
+            else:
+                self.log_result("Extract (with LLM)", "failed", "No content field in result")
+
+        except json.JSONDecodeError as e:
+            self.log_result("Extract (with LLM)", "failed", f"Invalid JSON: {e}")
+        except Exception as e:
+            self.log_result("Extract (with LLM)", "failed", str(e))
+
     async def run_all_tests(self):
         """Run all tests"""
         self.start_time = datetime.now()

@@ -9,17 +9,21 @@ import type {
   GatewaySkin,
   SessionMostRecentResponse
 } from '../gatewayTypes.js'
+import { isTodoDone } from '../lib/liveProgress.js'
+import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
 import { writeCompletionNotification } from '../lib/terminalNotification.js'
-import { formatToolCall, stripAnsi } from '../lib/text.js'
+import { formatAbandonedClarify, formatToolCall, stripAnsi } from '../lib/text.js'
 import { fromSkin } from '../theme.js'
 import type { Msg, SubagentProgress, SubagentStatus } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
+import { flashGoodVibes, flashPet } from './petFlashStore.js'
 import { turnController } from './turnController.js'
+import { getTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
 const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
@@ -77,7 +81,7 @@ const normalizeSubagentStatus = (status: unknown, fallback: SubagentStatus): Sub
 
 export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: GatewayEvent) => void {
   const { rpc } = ctx.gateway
-  const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = ctx.session
+  const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, stdout, sys, terminalNotifyOnComplete } = ctx.system
   const { appendMessage, onAssistantComplete, panel, setHistoryItems } = ctx.transcript
   const { setInput } = ctx.composer
@@ -87,6 +91,23 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
   let startupPromptSubmitted = false
+
+  const persistedAbandonedClarify = new Set<string>()
+
+  const flushAbandonedClarify = () => {
+    const { clarify } = getOverlayState()
+
+    if (!clarify || persistedAbandonedClarify.has(clarify.requestId)) {
+      return
+    }
+
+    persistedAbandonedClarify.add(clarify.requestId)
+    appendMessage({
+      role: 'system',
+      text: formatAbandonedClarify(clarify.question, clarify.choices, 'timed out')
+    })
+    patchOverlayState({ clarify: null })
+  }
 
   // Inject the disk-save callback into turnController so recordMessageComplete
   // can fire-and-forget a persist without having to plumb a gateway ref around.
@@ -191,11 +212,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     agentsNudgedThisTurn = false
   }
 
-  // Kick off the config fetch eagerly at handler creation so the flag is
-  // resolved well before the first delegation of any real session (which
-  // only happens after gateway.ready + a user turn).
-  ensureAgentsNudgeConfig()
-
   const refreshDelegationStatus = (force = false) => {
     const now = Date.now()
 
@@ -284,6 +300,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       applySkin(skin)
     }
 
+    // Fetch only after readiness; construction occurs during React render.
+    ensureAgentsNudgeConfig()
+
     rpc<CommandsCatalogResponse>('commands.catalog', {})
       .then(r => {
         if (!r?.pairs) {
@@ -303,6 +322,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
       })
       .catch((e: unknown) => turnController.pushActivity(`command catalog unavailable: ${rpcErrorMessage(e)}`, 'info'))
+
+    const recoverSid = recoverSidRef?.current
+
+    if (recoverSidRef && recoverSid) {
+      recoverSidRef.current = null
+      resumeById(recoverSid)
+      patchUiState({ status: 'recovering session…' })
+
+      return
+    }
 
     if (STARTUP_RESUME_ID) {
       patchUiState({ status: 'resuming…' })
@@ -458,6 +487,50 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'notification.show': {
+        const p = ev.payload
+
+        if (!p?.text) {
+          return
+        }
+
+        turnController.showNotice({
+          id: p.id,
+          key: p.key,
+          kind: p.kind ?? 'sticky',
+          level: p.level ?? 'info',
+          text: p.text,
+          ttl_ms: p.ttl_ms ?? null
+        })
+
+        return
+      }
+
+      case 'notification.clear':
+        turnController.clearNotice(ev.payload?.key)
+
+        return
+
+      case 'billing.step_up.verification': {
+        const url = ev.payload.verification_url
+        const code = ev.payload.user_code
+
+        if (!url) {
+          return
+        }
+
+        sys('💳 Open this link to grant terminal billing access:')
+        sys(url)
+
+        if (code) {
+          sys(`If prompted, enter code: ${code}`)
+        }
+
+        void openExternalUrl(url)
+
+        return
+      }
+
       case 'gateway.stderr': {
         const line = String(ev.payload.line).slice(0, 120)
 
@@ -583,6 +656,19 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
 
+      case 'moa.reference':
+        turnController.recordMoaReference(
+          String(ev.payload?.label ?? 'reference'),
+          String(ev.payload?.text ?? ''),
+          typeof ev.payload?.index === 'number' ? ev.payload.index : undefined,
+          typeof ev.payload?.count === 'number' ? ev.payload.count : undefined
+        )
+
+        return
+
+      case 'moa.aggregating':
+        return
+
       case 'tool.progress':
         if (ev.payload?.preview && ev.payload.name) {
           turnController.recordToolProgress(ev.payload.name, ev.payload.preview)
@@ -597,6 +683,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
 
+      case 'reaction':
+        // Core-detected affection (ily / <3 / good bot): flash the ♥ and let the
+        // pet celebrate. Same signal drives the desktop's floating hearts.
+        flashGoodVibes()
+        flashPet('jump')
+
+        return
+
       case 'tool.start':
         turnController.recordTodos(ev.payload.todos)
         turnController.recordToolStart(
@@ -608,6 +702,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       case 'tool.complete': {
+        if (ev.payload.name === 'clarify') {
+          flushAbandonedClarify()
+        }
+
         const inlineDiffText =
           ev.payload.inline_diff && getUiState().inlineDiffs ? stripAnsi(String(ev.payload.inline_diff)).trim() : ''
 
@@ -646,8 +744,18 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       case 'approval.request': {
         const description = String(ev.payload.description ?? 'dangerous command')
+        // Only an explicit false (tirith warning) drops the permanent-allow option.
+        const allowPermanent = ev.payload.allow_permanent !== false
 
-        patchOverlayState({ approval: { command: String(ev.payload.command ?? ''), description } })
+        patchOverlayState({
+          approval: {
+            allowPermanent,
+            choices: ev.payload.choices,
+            command: String(ev.payload.command ?? ''),
+            description,
+            smartDenied: ev.payload.smart_denied === true
+          }
+        })
         setStatus('approval needed')
 
         return
@@ -664,6 +772,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           secret: { envVar: ev.payload.env_var, prompt: ev.payload.prompt, requestId: ev.payload.request_id }
         })
         setStatus('secret input needed')
+
+        return
+
+      case 'sudo.expire':
+        patchOverlayState(prev => (prev.sudo?.requestId === ev.payload.request_id ? { ...prev, sudo: null } : prev))
+
+        return
+
+      case 'secret.expire':
+        patchOverlayState(prev => (prev.secret?.requestId === ev.payload.request_id ? { ...prev, secret: null } : prev))
 
         return
 
@@ -790,6 +908,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         turnController.recordMessageDelta(ev.payload ?? {})
 
         return
+      case 'message.interim': {
+        const text = ev.payload?.text
+
+        if (typeof text === 'string' && text.trim()) {
+          turnController.recordInterimMessage(text)
+        }
+
+        return
+      }
+
       case 'message.complete': {
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
 
@@ -797,6 +925,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
           msgs.forEach(appendMessage)
           onAssistantComplete?.()
+
+          flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
 
           if (bellOnComplete && stdout?.isTTY) {
             stdout.write('\x07')
@@ -816,6 +946,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'error':
         turnController.recordError()
+        flashPet('failed')
 
         {
           const message = String(ev.payload?.message || 'unknown error')

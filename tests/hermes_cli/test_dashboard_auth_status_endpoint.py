@@ -139,7 +139,9 @@ def test_public_status_sanitizes_platform_errors_and_exit_reason(
             return [type("Platform", (), {"value": "discord"})()]
 
     monkeypatch.setattr(gateway_config, "load_gateway_config", GatewayConfig)
-    monkeypatch.setattr(web_server, "get_running_pid", lambda: 1234)
+    # Status uses the bounded PID cache so repeated public probes do not scan
+    # the process table on every request.
+    monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 1234)
     monkeypatch.setattr(
         web_server,
         "read_runtime_status",

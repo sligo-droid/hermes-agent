@@ -35,6 +35,7 @@ from utils import base_url_host_matches
 
 
 _PROVIDER_ENV_HINTS = (
+    "DEEPINFRA_API_KEY",
     "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -47,6 +48,7 @@ _PROVIDER_ENV_HINTS = (
     "KIMI_API_KEY",
     "KIMI_CN_API_KEY",
     "GMI_API_KEY",
+    "FIREWORKS_API_KEY",
     "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY",
     "KILOCODE_API_KEY",
@@ -611,16 +613,170 @@ def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
 
 
+def managed_scope_check() -> None:
+    """Report the active managed scope (resolved dir + pinned key counts).
+
+    Silent when no managed scope is present. When the managed directory was
+    resolved from the HERMES_MANAGED_DIR override (rather than the system
+    default), that is surfaced too — a redirected scope is the documented
+    foot-gun (see docs/design/managed-scope.md §7) and an operator should see it.
+    """
+    try:
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+    except Exception:  # noqa: BLE001 — diagnostics must never crash
+        return
+    if managed_dir is None:
+        return
+    n_cfg = len(managed_scope.managed_config_keys())
+    n_env = len(managed_scope.load_managed_env())
+    check_ok(
+        f"Managed scope active: {n_cfg} config key(s), {n_env} env key(s) "
+        f"pinned by {managed_dir}"
+    )
+    if os.environ.get("HERMES_MANAGED_DIR", "").strip():
+        check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
+
+
 def _section(title: str) -> None:
     """Print a doctor section banner: blank line + bold cyan ◆ title."""
     print()
     print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
 
 
+def _check_xai_model_retirement(manual_issues: list[str]) -> None:
+    """Report retired xAI model references without mutating config."""
+    _section("xAI Model Retirement (May 15, 2026)")
+
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.xai_retirement import (
+            MIGRATION_GUIDE_URL,
+            find_retired_xai_refs,
+            format_issue,
+        )
+
+        retired_refs = find_retired_xai_refs(load_config())
+        if not retired_refs:
+            check_ok("No retired xAI models in config")
+            return
+
+        for ref in retired_refs:
+            check_warn(format_issue(ref))
+        check_info(f"Migration guide: {MIGRATION_GUIDE_URL}")
+        manual_issues.append(
+            f"Update {len(retired_refs)} retired xAI model reference(s) "
+            f"in config.yaml — see {MIGRATION_GUIDE_URL}"
+        )
+    except Exception as exc:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            detail = redact_sensitive_text(str(exc), force=True)
+        except Exception:
+            detail = type(exc).__name__
+        check_warn("xAI retirement check skipped", f"({detail})")
+
+
 def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None:
     """Emit a check_fail and append the corresponding fix instruction."""
     check_fail(text, detail)
     issues.append(fix)
+
+
+# Deprecated / legacy config keys still read for back-compat. Doctor surfaces
+# them as non-failing warnings with the modern replacement — it does not
+# auto-migrate or delete (migrations live in config.py version steps).
+_DEPRECATED_CONFIG_KEYS: tuple[tuple[str, str, str], ...] = (
+    # (section, key, replacement)
+    ("display", "tool_progress_overrides", "display.platforms"),
+    ("delegation", "max_async_children", "delegation.max_concurrent_children"),
+)
+
+# compression.summary_* → auxiliary.compression (model/provider/base_url)
+_DEPRECATED_COMPRESSION_SUMMARY_KEYS: tuple[str, ...] = (
+    "summary_model",
+    "summary_provider",
+    "summary_base_url",
+)
+
+# Deprecated env vars (checked in the .env file, not process env, so config→env
+# bridges like terminal.cwd → TERMINAL_CWD do not false-positive).
+_DEPRECATED_ENV_VARS: tuple[tuple[str, str], ...] = (
+    ("HERMES_TOOL_PROGRESS", "display.tool_progress in config.yaml"),
+    ("HERMES_TOOL_PROGRESS_MODE", "display.tool_progress in config.yaml"),
+    ("TERMINAL_CWD", "terminal.cwd in config.yaml"),
+    ("MESSAGING_CWD", "terminal.cwd in config.yaml"),
+    ("QQ_HOME_CHANNEL", "QQBOT_HOME_CHANNEL"),
+    ("QQ_HOME_CHANNEL_NAME", "QQBOT_HOME_CHANNEL_NAME"),
+)
+
+
+def collect_deprecated_config_keys(raw_config: dict | None) -> list[tuple[str, str]]:
+    """Return ``(legacy_path, replacement)`` for deprecated keys present in *raw_config*.
+
+    Only keys that appear in the on-disk YAML are reported (raw file load, not
+    merged defaults). Empty containers still count — presence of the legacy
+    key is the signal that the user should migrate.
+    """
+    findings: list[tuple[str, str]] = []
+    if not isinstance(raw_config, dict):
+        return findings
+
+    for section, key, replacement in _DEPRECATED_CONFIG_KEYS:
+        section_val = raw_config.get(section)
+        if isinstance(section_val, dict) and key in section_val:
+            findings.append((f"{section}.{key}", replacement))
+
+    compression = raw_config.get("compression")
+    if isinstance(compression, dict):
+        for key in _DEPRECATED_COMPRESSION_SUMMARY_KEYS:
+            if key in compression:
+                findings.append((f"compression.{key}", "auxiliary.compression"))
+
+    return findings
+
+
+def collect_deprecated_env_vars(env_map: dict | None) -> list[tuple[str, str]]:
+    """Return ``(legacy_env, replacement)`` for deprecated vars present in *env_map*.
+
+    *env_map* should come from the on-disk ``.env`` (e.g. ``load_env()``), not
+    ``os.environ``, so bridged runtime vars do not trigger false positives.
+    """
+    findings: list[tuple[str, str]] = []
+    if not isinstance(env_map, dict):
+        return findings
+    for name, replacement in _DEPRECATED_ENV_VARS:
+        val = env_map.get(name)
+        if val is not None and str(val).strip() != "":
+            findings.append((name, replacement))
+    return findings
+
+
+def report_deprecated_config_and_env(
+    raw_config: dict | None = None,
+    env_map: dict | None = None,
+) -> list[tuple[str, str]]:
+    """Emit non-failing doctor warnings for deprecated config keys and env vars.
+
+    Returns the list of ``(legacy, replacement)`` findings that were reported
+    (empty when nothing deprecated is present). Does not mutate config/env and
+    does not append to the blocking ``issues`` list.
+    """
+    findings = collect_deprecated_config_keys(raw_config)
+    findings.extend(collect_deprecated_env_vars(env_map))
+    if not findings:
+        check_ok("No deprecated config keys or env vars")
+        return findings
+
+    for legacy, replacement in findings:
+        check_warn(
+            f"Deprecated: {legacy}",
+            f"(use {replacement} instead)",
+        )
+        check_info(f"Replace {legacy} → {replacement} (warn-only; not auto-migrated here)")
+    return findings
 
 
 def _enabled_cli_toolsets_for_doctor() -> set[str] | None:
@@ -1079,6 +1235,8 @@ def run_doctor(args):
             check_warn(name, "(optional, not installed)")
     
     _section("Configuration Files")
+    # Managed scope (administrator-pinned config/env), when present.
+    managed_scope_check()
     # Check ~/.hermes/.env (primary location for user config)
     env_path = HERMES_HOME / '.env'
     if env_path.exists():
@@ -1162,7 +1320,12 @@ def run_doctor(args):
 
             user_providers = cfg.get("providers")
             if isinstance(user_providers, dict):
-                known_providers.update(str(name).strip().lower() for name in user_providers if str(name).strip())
+                from hermes_cli.config import is_provider_enabled
+                known_providers.update(
+                    str(name).strip().lower()
+                    for name, prov_cfg in user_providers.items()
+                    if str(name).strip() and is_provider_enabled(prov_cfg)
+                )
             for entry in custom_providers:
                 if not isinstance(entry, dict):
                     continue
@@ -1219,23 +1382,40 @@ def run_doctor(args):
                         issues,
                     )
 
-            # Warn if model is set to a provider-prefixed name on a provider that doesn't use them
+            # Warn if model is set to a provider-prefixed name on a provider that doesn't use them.
+            # Vendor/model slugs are valid on aggregator-style providers and on any custom
+            # provider — bare "custom" or a named "custom:<name>" that fronts an OpenAI-compatible
+            # aggregator (e.g. custom:hpc-ai serving deepseek/deepseek-v4-flash) requires the prefix.
             provider_for_policy = runtime_provider or catalog_provider
+            provider_policy_id = str(provider_for_policy or "").strip().lower()
             providers_accepting_vendor_slugs = {
                 "openrouter",
-                "custom",
                 "auto",
                 "kilocode",
                 "opencode-zen",
                 "huggingface",
                 "lmstudio",
                 "nous",
+                "nvidia",
+                # Fireworks' native model IDs are slash-form
+                # (accounts/fireworks/models/... and .../routers/...), so a "/"
+                # is expected, not an aggregator vendor prefix.
+                "fireworks",
+                # DeepInfra is an aggregator-style gateway: its catalog
+                # is exclusively ``vendor/model`` slugs (Qwen/Qwen3.5-…,
+                # meta-llama/Llama-3-…, anthropic/claude-opus-4-7, …).
+                "deepinfra",
             }
+            provider_accepts_vendor_slug = (
+                provider_policy_id in providers_accepting_vendor_slugs
+                or provider_policy_id == "custom"
+                or provider_policy_id.startswith("custom:")
+            )
             if (
                 default_model
                 and "/" in default_model
-                and provider_for_policy
-                and provider_for_policy not in providers_accepting_vendor_slugs
+                and provider_policy_id
+                and not provider_accepts_vendor_slug
             ):
                 check_warn(
                     f"model.default '{default_model}' uses a vendor/model slug but provider is '{provider_raw}'",
@@ -1363,12 +1543,88 @@ def run_doctor(args):
                             model_section[k] = raw_config.pop(k)
                         else:
                             raw_config.pop(k)
-                    from utils import atomic_yaml_write
-                    atomic_yaml_write(config_path, raw_config)
+                    from hermes_cli.config import atomic_config_write
+                    atomic_config_write(config_path, raw_config)
                     check_ok("Migrated stale root-level keys into model section")
                     fixed_count += 1
                 else:
                     issues.append("Stale root-level provider/base_url in config.yaml — run 'hermes doctor --fix'")
+        except Exception:
+            pass
+
+        # Detect stale HERMES_MAX_ITERATIONS ghost in .env shadowing
+        # agent.max_turns in config.yaml (issue #17534). The setup wizard
+        # used to dual-write the iteration budget to both stores; users who
+        # later edit only config.yaml are left with a .env ghost. The gateway
+        # bridge normally derives HERMES_MAX_ITERATIONS from agent.max_turns
+        # at startup, but if that bridge bails (any earlier config-parse
+        # error), the stale .env value silently wins and the agent runs at the
+        # wrong budget — e.g. config says 400 but the activity line reads N/90.
+        # Read the .env FILE directly (load_env), not get_env_value/os.environ,
+        # which the startup bridge may already have overridden.
+        try:
+            import yaml
+            from hermes_cli.config import load_env, remove_env_value
+            with open(config_path, encoding="utf-8") as f:
+                raw_config = yaml.safe_load(f) or {}
+            agent_cfg = raw_config.get("agent")
+            cfg_max_turns = (
+                agent_cfg.get("max_turns")
+                if isinstance(agent_cfg, dict)
+                else None
+            )
+            # Legacy root-level key counts too.
+            if cfg_max_turns is None:
+                cfg_max_turns = raw_config.get("max_turns")
+            env_ghost = load_env().get("HERMES_MAX_ITERATIONS")
+            drift = (
+                cfg_max_turns is not None
+                and env_ghost is not None
+                and str(cfg_max_turns).strip() != str(env_ghost).strip()
+            )
+            if drift:
+                check_warn(
+                    f"HERMES_MAX_ITERATIONS={env_ghost} in .env shadows "
+                    f"agent.max_turns={cfg_max_turns} in config.yaml",
+                    "(stale ghost from an earlier `hermes setup` run)",
+                )
+                if should_fix:
+                    if remove_env_value("HERMES_MAX_ITERATIONS"):
+                        check_ok(
+                            "Removed stale HERMES_MAX_ITERATIONS from .env "
+                            f"(config.yaml agent.max_turns={cfg_max_turns} is now authoritative)"
+                        )
+                        fixed_count += 1
+                    else:
+                        check_warn("Could not remove HERMES_MAX_ITERATIONS from .env")
+                        manual_issues.append(
+                            "Manually delete the HERMES_MAX_ITERATIONS line from "
+                            f"{_DHH}/.env — config.yaml agent.max_turns is authoritative."
+                        )
+                else:
+                    issues.append(
+                        "Stale HERMES_MAX_ITERATIONS in .env shadows config.yaml — "
+                        "run 'hermes doctor --fix'"
+                    )
+        except Exception:
+            pass
+
+        # Surface deprecated/legacy config keys and env vars (warn-only).
+        # Migrations may still live in config.py version steps; doctor does
+        # not auto-delete here — only tells the user the modern replacement.
+        try:
+            import yaml as _yaml_depr
+            from hermes_cli.config import load_env as _load_env_depr
+
+            with open(config_path, encoding="utf-8") as _f_depr:
+                _raw_for_depr = _yaml_depr.safe_load(_f_depr) or {}
+            # Prefer the on-disk .env so bridged process env (e.g. TERMINAL_CWD
+            # from terminal.cwd) does not false-positive.
+            try:
+                _env_for_depr = _load_env_depr()
+            except Exception:
+                _env_for_depr = {}
+            report_deprecated_config_and_env(_raw_for_depr, _env_for_depr)
         except Exception:
             pass
 
@@ -1390,22 +1646,38 @@ def run_doctor(args):
         except Exception:
             pass
 
-    _section("Auth Providers")
-    try:
-        from hermes_cli.auth import (
-            get_nous_auth_status,
-            get_codex_auth_status,
-            get_gemini_oauth_auth_status,
-            get_minimax_oauth_auth_status,
-        )
+    if not config_path.exists():
+        # No config.yaml — still surface deprecated env vars from .env.
+        try:
+            from hermes_cli.config import load_env as _load_env_depr
 
-        nous_status = get_nous_auth_status()
+            try:
+                _env_for_depr = _load_env_depr()
+            except Exception:
+                _env_for_depr = {}
+            report_deprecated_config_and_env({}, _env_for_depr)
+        except Exception:
+            pass
+
+    _check_xai_model_retirement(manual_issues)
+
+    _section("Auth Providers")
+
+    try:
+        from hermes_cli.auth import get_nous_auth_status
+
+        nous_status = get_nous_auth_status() or {}
         if nous_status.get("logged_in"):
             check_ok("Nous Portal auth", "(logged in)")
         else:
             check_warn("Nous Portal auth", "(not logged in)")
+    except Exception as e:
+        check_warn("Nous Portal auth", f"(could not check: {e})")
 
-        codex_status = get_codex_auth_status()
+    try:
+        from hermes_cli.auth import get_codex_auth_status
+
+        codex_status = get_codex_auth_status() or {}
         if codex_status.get("logged_in"):
             check_ok("OpenAI Codex auth", "(logged in)")
         else:
@@ -1422,29 +1694,45 @@ def run_doctor(args):
                     "(optional — only required to import tokens "
                     "from an existing Codex CLI login)"
                 )
+    except Exception as e:
+        check_warn("OpenAI Codex auth", f"(could not check: {e})")
 
-        gemini_status = get_gemini_oauth_auth_status()
-        if gemini_status.get("logged_in"):
-            email = gemini_status.get("email") or ""
-            project = gemini_status.get("project_id") or ""
-            pieces = []
-            if email:
-                pieces.append(email)
-            if project:
-                pieces.append(f"project={project}")
-            suffix = f" ({', '.join(pieces)})" if pieces else ""
-            check_ok("Google Gemini OAuth", f"(logged in{suffix})")
-        else:
-            check_warn("Google Gemini OAuth", "(not logged in)")
+    # Gemini OAuth was removed upstream. Keep the fork's status row when the
+    # helper is present, but do not let its absence suppress other providers.
+    try:
+        from hermes_cli.auth import get_gemini_oauth_auth_status
+    except ImportError:
+        get_gemini_oauth_auth_status = None
 
-        minimax_status = get_minimax_oauth_auth_status()
+    if get_gemini_oauth_auth_status is not None:
+        try:
+            gemini_status = get_gemini_oauth_auth_status() or {}
+            if gemini_status.get("logged_in"):
+                email = gemini_status.get("email") or ""
+                project = gemini_status.get("project_id") or ""
+                pieces = []
+                if email:
+                    pieces.append(email)
+                if project:
+                    pieces.append(f"project={project}")
+                suffix = f" ({', '.join(pieces)})" if pieces else ""
+                check_ok("Google Gemini OAuth", f"(logged in{suffix})")
+            else:
+                check_warn("Google Gemini OAuth", "(not logged in)")
+        except Exception as e:
+            check_warn("Google Gemini OAuth", f"(could not check: {e})")
+
+    try:
+        from hermes_cli.auth import get_minimax_oauth_auth_status
+
+        minimax_status = get_minimax_oauth_auth_status() or {}
         if minimax_status.get("logged_in"):
             region = minimax_status.get("region", "global")
             check_ok("MiniMax OAuth", f"(logged in, region={region})")
         else:
             check_warn("MiniMax OAuth", "(not logged in)")
     except Exception as e:
-        check_warn("Auth provider status", f"(could not check: {e})")
+        check_warn("MiniMax OAuth", f"(could not check: {e})")
 
     # xAI OAuth — separate try/except so an import failure here cannot
     # disrupt the already-printed Nous/Codex/Gemini/MiniMax rows above.
@@ -1974,18 +2262,38 @@ def run_doctor(args):
     # npm audit for all Node.js packages
     _npm_bin = _safe_which("npm")
     if _npm_bin:
-        npm_dirs = [
-            (PROJECT_ROOT, "Browser tools (agent-browser)"),
-            (PROJECT_ROOT / "scripts" / "whatsapp-bridge", "WhatsApp bridge"),
+        # Each entry: (cwd, label, extra_audit_args)
+        # PROJECT_ROOT is audited with --workspaces=false so that the apps/*
+        # glob (which pulls in Electron, node-pty, etc.) is never resolved
+        # for a routine security check. The web and ui-tui workspaces are
+        # audited separately via --workspace flags. See #38772.
+        # The WhatsApp bridge may live under a writable HERMES_HOME mirror
+        # instead of the (possibly read-only) install tree in Docker — resolve
+        # it through the shared helper so we audit the dir that actually holds
+        # node_modules. See #49561.
+        try:
+            from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
+            _whatsapp_bridge_dir = resolve_whatsapp_bridge_dir()
+        except Exception:
+            _whatsapp_bridge_dir = PROJECT_ROOT / "scripts" / "whatsapp-bridge"
+        npm_audit_targets = [
+            (PROJECT_ROOT, "Browser tools (agent-browser)", ["--workspaces=false"]),
+            (PROJECT_ROOT, "web workspace", ["--workspace", "web"]),
+            (PROJECT_ROOT, "ui-tui workspace", ["--workspace", "ui-tui"]),
+            (_whatsapp_bridge_dir, "WhatsApp bridge", []),
         ]
-        for npm_dir, label in npm_dirs:
-            if not (npm_dir / "node_modules").exists():
+        for npm_dir, label, audit_extra in npm_audit_targets:
+            # For workspace-scoped audits run from PROJECT_ROOT the
+            # node_modules check must use the workspace root; standalone dirs
+            # (whatsapp-bridge) check their own node_modules.
+            check_dir = PROJECT_ROOT if audit_extra else npm_dir
+            if not (check_dir / "node_modules").exists():
                 continue
             try:
                 # Use resolved absolute path so Windows can execute
                 # npm.cmd (CreateProcessW can't run bare .cmd names).
                 audit_result = subprocess.run(
-                    [_npm_bin, "audit", "--json"],
+                    [_npm_bin, "audit", "--json", *audit_extra],
                     cwd=str(npm_dir),
                     capture_output=True, text=True, timeout=30,
                 )
@@ -1996,13 +2304,47 @@ def run_doctor(args):
                 high = vuln_count.get("high", 0)
                 moderate = vuln_count.get("moderate", 0)
                 total = critical + high + moderate
+                # Determine a scoped fix command for the remediation hint.
+                if audit_extra and audit_extra[0] == "--workspace":
+                    # Detection (`npm audit --workspace <name>`) is read-only and
+                    # safe, but `npm audit fix --workspace <name>` crashes on
+                    # current npm with "Cannot read properties of null (reading
+                    # 'edgesOut')" — an arborist bug with workspace-filtered
+                    # audit fix. The root-level `npm audit fix` can crash on the
+                    # same tree with "isDescendantOf", so do not hand the user a
+                    # manual fix command for these build-tool advisories.
+                    fix_cmd = None
+                elif audit_extra == ["--workspaces=false"]:
+                    fix_cmd = f"cd {npm_dir} && npm audit fix --workspaces=false"
+                else:
+                    fix_cmd = f"cd {npm_dir} && npm audit fix"
                 if total == 0:
                     check_ok(f"{label} deps", "(no known vulnerabilities)")
                 elif critical > 0 or high > 0:
+                    if fix_cmd:
+                        vuln_detail = (
+                            f"{critical} critical, {high} high, {moderate} moderate — run: {fix_cmd}"
+                        )
+                    else:
+                        vuln_detail = (
+                            f"{critical} critical, {high} high, {moderate} moderate — "
+                            "build-tool advisory; clears via lockfile bump"
+                        )
                     check_warn(
                         f"{label} deps",
-                        f"({critical} critical, {high} high, {moderate} moderate — run: cd {npm_dir} && npm audit fix)"
+                        f"({vuln_detail})"
                     )
+                    if audit_extra and audit_extra[0] == "--workspace":
+                        # The web/ui-tui workspace advisories are in build-time
+                        # tooling (esbuild/vite, etc.), not runtime code that ships
+                        # to users. Manual npm remediation may error with a known
+                        # arborist crash (edgesOut / isDescendantOf) on this monorepo
+                        # tree — in that case it is an npm bug, not a Hermes one.
+                        check_info(
+                            "  ^ build-time tooling (not runtime); if manual npm remediation "
+                            "errors with an arborist crash it's a known npm bug — clears "
+                            "via a lockfile bump"
+                        )
                     issues.append(
                         f"{label} has {total} npm "
                         f"{'vulnerability' if total == 1 else 'vulnerabilities'}"

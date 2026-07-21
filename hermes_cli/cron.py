@@ -43,6 +43,35 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+def _active_cron_provider_name() -> str:
+    """Return the resolved cron scheduler provider, defaulting to builtin."""
+    try:
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        return resolve_cron_scheduler().name or "builtin"
+    except Exception:
+        return "builtin"
+
+
+def _warn_if_gateway_not_running() -> None:
+    """Warn when the built-in ticker has no gateway process to host it."""
+    try:
+        if _active_cron_provider_name() != "builtin":
+            return
+
+        from hermes_cli.gateway import find_gateway_pids
+
+        if find_gateway_pids():
+            return
+    except Exception:
+        return
+
+    print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
+    print(color("     Start it with: hermes gateway install", Colors.DIM))
+    print(color("                    sudo hermes gateway install --system  # Linux servers", Colors.DIM))
+    print(color("     Check status:  hermes cron status", Colors.DIM))
+
+
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
@@ -67,12 +96,12 @@ def cron_list(show_all: bool = False):
         state = job.get("state", "scheduled" if job.get("enabled", True) else "paused")
         next_run = job.get("next_run_at", "?")
 
-        repeat_info = job.get("repeat", {})
+        repeat_info = job.get("repeat") or {}
         repeat_times = repeat_info.get("times")
         repeat_completed = repeat_info.get("completed", 0)
         repeat_str = f"{repeat_completed}/{repeat_times}" if repeat_times else "∞"
 
-        deliver = job.get("deliver", ["local"])
+        deliver = job.get("deliver") or ["local"]
         if isinstance(deliver, str):
             deliver = [deliver]
         deliver_str = ", ".join(deliver)
@@ -131,6 +160,13 @@ def cron_list(show_all: bool = False):
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
             print(f"    Last run:  {last_run}  {status_display}")
 
+        latest_execution = job.get("latest_execution")
+        if latest_execution:
+            print(
+                f"    Execution: {latest_execution.get('status', '?')}  "
+                f"{latest_execution.get('id', '?')}"
+            )
+
         delivery_err = job.get("last_delivery_error")
         if delivery_err:
             print(f"    {color('⚠ Delivery failed:', Colors.YELLOW)} {delivery_err}")
@@ -150,12 +186,8 @@ def cron_list(show_all: bool = False):
 
         print()
 
-    from hermes_cli.gateway import get_gateway_runtime_health
-    if not get_gateway_runtime_health().running:
-        print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
-        print(color("     Start it with: hermes gateway install", Colors.DIM))
-        print(color("                    sudo hermes gateway install --system  # Linux servers", Colors.DIM))
-        print()
+    _warn_if_gateway_not_running()
+    print()
 
 
 def _print_overdue_proposal_findings(findings):
@@ -214,6 +246,24 @@ def cron_tick():
     tick(verbose=True)
 
 
+def cron_runs(job_id: Optional[str] = None, limit: int = 20):
+    """Show indexed durable cron execution history."""
+    from cron.executions import list_executions
+
+    records = list_executions(job_id=job_id, limit=limit)
+    if not records:
+        print("No cron execution attempts recorded.")
+        return
+    for record in records:
+        print(
+            f"{record.get('id', '?')}  {record.get('status', '?'):<9}  "
+            f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  "
+            f"{record.get('claimed_at', '?')}"
+        )
+        if record.get("error"):
+            print(f"    {record['error']}")
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import (
@@ -227,6 +277,30 @@ def cron_status():
     from hermes_cli.gateway import get_gateway_runtime_health
 
     print()
+
+    provider = _active_cron_provider_name()
+    if provider != "builtin":
+        print(color(
+            f"✓ Cron provider: {provider} — jobs fire via the managed scheduler, "
+            "not the in-process ticker.",
+            Colors.GREEN,
+        ))
+        print(color(
+            "  (No ticker heartbeat is expected for an external provider; "
+            "due jobs are delivered by an authenticated webhook.)",
+            Colors.DIM,
+        ))
+        print()
+        jobs = list_jobs(include_disabled=False)
+        if jobs:
+            next_runs = [j.get("next_run_at") for j in jobs if j.get("next_run_at")]
+            print(f"  {len(jobs)} active job(s)")
+            if next_runs:
+                print(f"  Next run: {min(next_runs)}")
+        else:
+            print("  No active jobs")
+        print()
+        return
 
     health = get_gateway_runtime_health()
     if health.running:
@@ -334,6 +408,7 @@ def cron_create(args):
     if job_data.get("profile"):
         print(f"  Profile: {job_data['profile']}")
     print(f"  Next run: {result['next_run_at']}")
+    _warn_if_gateway_not_running()
     return 0
 
 
@@ -442,6 +517,10 @@ def cron_command(args):
         cron_tick()
         return 0
 
+    if subcmd in {"runs", "history"}:
+        cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
+        return 0
+
     if subcmd in {"create", "add"}:
         return cron_create(args)
 
@@ -461,5 +540,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
     sys.exit(1)

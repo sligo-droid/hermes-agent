@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,11 @@ def _fixture(tmp_path: Path):
 
 
 def _items(word: str):
-    resp = server.handle_request({"id": "1", "method": "complete.path", "params": {"word": word}})
+    resp = server.handle_request({
+        "id": "1",
+        "method": "complete.path",
+        "params": {"word": word, "cwd": os.getcwd()},
+    })
 
     return [(it["text"], it["display"], it.get("meta", "")) for it in resp["result"]["items"]]
 

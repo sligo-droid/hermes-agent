@@ -141,9 +141,11 @@ def test_compression_gpt_outage_uses_proxy_chat_fallback_and_continues(
     assert result["final_response"] == "Conversation continued after compression."
     assert agent.context_compressor.compression_count == 1
     assert gpt_auxiliary.chat.completions.create.call_count == 1
-    build_proxy_chat.assert_called_once_with(
-        api_key="test-proxy-key", base_url="http://127.0.0.1:8317/v1"
-    )
+    build_proxy_chat.assert_called_once()
+    proxy_kwargs = build_proxy_chat.call_args.kwargs
+    assert proxy_kwargs["api_key"] == "test-proxy-key"
+    assert proxy_kwargs["base_url"] == "http://127.0.0.1:8317/v1"
+    assert proxy_kwargs["max_retries"] == 0
     assert proxy_chat.chat.completions.create.call_count == 1
     proxy_kwargs = proxy_chat.chat.completions.create.call_args.kwargs
     assert proxy_kwargs["model"] == "claude-sonnet-4-6"
@@ -152,7 +154,10 @@ def test_compression_gpt_outage_uses_proxy_chat_fallback_and_continues(
     )
     assert any(
         SUMMARY_PREFIX in str(message.get("content", ""))
-        and "Continue the current conversation safely" in str(message.get("content", ""))
+        and "User asked (deterministic, from compacted turns)" in str(
+            message.get("content", "")
+        )
+        and "Historical request" in str(message.get("content", ""))
         for message in result["messages"]
     )
     main_client.chat.completions.create.assert_called_once()
@@ -277,9 +282,16 @@ def test_compression_proxy_chat_outage_uses_native_codex_fallback_and_continues(
         "Conversation continued after inverse compression fallback."
     )
     assert agent.context_compressor.compression_count == 1
-    build_proxy_chat.assert_called_once_with(
-        api_key="test-proxy-key", base_url="http://127.0.0.1:8317/v1"
-    )
+    # Startup feasibility ran before this test-scoped provider config was
+    # installed, so the actual compression call builds the proxy client once.
+    # It must preserve the explicit Chat Completions route rather than the
+    # named provider's codex_responses default.
+    assert build_proxy_chat.call_count == 1
+    for proxy_client_call in build_proxy_chat.call_args_list:
+        proxy_client_kwargs = proxy_client_call.kwargs
+        assert proxy_client_kwargs["api_key"] == "test-proxy-key"
+        assert proxy_client_kwargs["base_url"] == "http://127.0.0.1:8317/v1"
+        assert proxy_client_kwargs["max_retries"] == 0
     assert proxy_chat.chat.completions.create.call_count == 1
     proxy_kwargs = proxy_chat.chat.completions.create.call_args.kwargs
     assert proxy_kwargs["model"] == "claude-sonnet-4-6"
@@ -292,8 +304,10 @@ def test_compression_proxy_chat_outage_uses_native_codex_fallback_and_continues(
     assert native_kwargs["extra_body"]["reasoning"] == {"enabled": False}
     assert any(
         SUMMARY_PREFIX in str(message.get("content", ""))
-        and "Continue through native Codex compression fallback"
-        in str(message.get("content", ""))
+        and "User asked (deterministic, from compacted turns)" in str(
+            message.get("content", "")
+        )
+        and "Historical request" in str(message.get("content", ""))
         for message in result["messages"]
     )
     main_client.chat.completions.create.assert_called_once()

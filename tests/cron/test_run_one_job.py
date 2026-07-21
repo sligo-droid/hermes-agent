@@ -20,7 +20,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     """Patch the job pipeline primitives and record the call order."""
     calls = []
 
-    def fake_run_job(job):
+    def fake_run_job(job, *, defer_agent_teardown=None):
         calls.append(("run_job", job["id"]))
         fr = final if silent_marker_in is None else silent_marker_in
         return (success, output, fr, error)
@@ -28,6 +28,9 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     def fake_save(jid, out):
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
+
+    def fake_update(path, out):
+        calls.append(("update", path))
 
     def fake_deliver(job, content, adapters=None, loop=None):
         calls.append(("deliver", job["id"]))
@@ -38,6 +41,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
     monkeypatch.setattr(s, "save_job_output", fake_save)
+    monkeypatch.setattr(s, "update_job_output", fake_update)
     monkeypatch.setattr(s, "_deliver_result", fake_deliver)
     monkeypatch.setattr(s, "mark_job_run", fake_mark)
     return calls
@@ -52,7 +56,7 @@ def test_tick_process_job_sequence(monkeypatch):
 
     s.tick(verbose=False, sync=True)
 
-    assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
+    assert [c[0] for c in calls] == ["save", "run_job", "update", "deliver", "mark"]
     assert calls[-1] == ("mark", "j1", True)
 
 
@@ -64,7 +68,7 @@ def test_run_one_job_success_sequence(monkeypatch):
     ok = s.run_one_job({"id": "j2", "name": "t"})
 
     assert ok is True
-    assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
+    assert [c[0] for c in calls] == ["save", "run_job", "update", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
 
 
@@ -106,7 +110,7 @@ def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
         "manual_run": {"run_id": "manual-4", "state": "queued"},
     })
 
-    assert ok is False
+    assert ok is True  # processed successfully; job outcome is recorded as failure
     assert "deliver" not in [call[0] for call in calls]
     assert manual_finishes == [
         (
@@ -137,7 +141,7 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
 def test_run_one_job_exception_marks_failure(monkeypatch):
     """If run_job raises, the helper marks the run failed and returns False
     rather than propagating."""
-    def boom(job):
+    def boom(job, *, defer_agent_teardown=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(s, "run_job", boom)
@@ -311,7 +315,7 @@ def test_run_one_job_auth_blocked_records_health_without_ingesting_output(monkey
 
     ok = s.run_one_job({"id": "j-auth", "name": "t", "self_improvement_proposal": {"project": "p", "prong": "q"}})
 
-    assert ok is False
+    assert ok is True  # processed successfully; job outcome remains failed
     detail = seen_health_details[0]["self_improvement_proposal_ingestion"]
     assert detail["status"] == "auth_blocked"
     assert detail["card_count"] == 0
@@ -358,5 +362,162 @@ def test_run_one_job_non_self_improvement_auth_failure_has_no_ingestion_health(m
 
     ok = s.run_one_job({"id": "j-non-proposal", "name": "t"})
 
-    assert ok is False
+    assert ok is True  # processed successfully; job outcome remains failed
     assert seen_health_details == [None]
+
+
+def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
+    """run_one_job installs and tears down the profile secret scope."""
+    from agent import secret_scope as ss
+
+    (tmp_path / ".env").write_text(
+        "OPENROUTER_BASE_URL=https://openrouter.ai/api/v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+
+    scope_during_run = {}
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        # This is where resolve_runtime_provider() would read a secret. Prove a
+        # scope is installed and the profile's secret resolves without raising.
+        scope_during_run["scope"] = ss.current_secret_scope()
+        scope_during_run["base_url"] = ss.get_secret("OPENROUTER_BASE_URL")
+        return (True, "out", "final", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "update_job_output", lambda path, out: None)
+    monkeypatch.setattr(s, "_deliver_result", lambda *a, **k: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+
+    ss.set_multiplex_active(True)
+    try:
+        ok = s.run_one_job({"id": "j7", "name": "t"})
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert ok is True
+    # Scope was installed during run_job and the profile secret resolved.
+    assert scope_during_run["scope"] is not None
+    assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
+    # And it was torn down after run_one_job returned (no leak).
+    assert ss.current_secret_scope() is None
+
+
+def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
+    """Regression for #58720: the cron agent's async-resource teardown
+    (agent.close + cleanup_stale_async_clients) MUST run AFTER delivery, not
+    before. run_job defers teardown by appending the live agent to the holder
+    list; run_one_job tears it down only after _deliver_result has run. If the
+    order flips, delivery races a torn-down async client and dies with
+    'cannot schedule new futures after interpreter shutdown'.
+    """
+    order = []
+
+    class FakeAgent:
+        def close(self):
+            order.append("agent.close")
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        order.append("run_job")
+        # Mimic run_job's deferral contract: hand the live agent back so the
+        # caller tears it down after delivery instead of in run_job's finally.
+        assert defer_agent_teardown is not None, "run_one_job must defer teardown"
+        defer_agent_teardown.append(FakeAgent())
+        return (True, "out", "final response", None)
+
+    def fake_deliver(job, content, adapters=None, loop=None):
+        order.append("deliver")
+        return None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "update_job_output", lambda path, out: None)
+    monkeypatch.setattr(s, "_deliver_result", fake_deliver)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+    # cleanup_stale_async_clients is imported lazily inside _teardown_cron_agent;
+    # stub it so the teardown records its own marker without touching real caches.
+    import agent.auxiliary_client as aux
+    monkeypatch.setattr(aux, "cleanup_stale_async_clients",
+                        lambda: order.append("cleanup_stale"))
+
+    ok = s.run_one_job({"id": "j8", "name": "t"})
+
+    assert ok is True
+    # Delivery must strictly precede agent teardown + stale-client reap.
+    assert order == ["run_job", "deliver", "agent.close", "cleanup_stale"], order
+
+
+def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch):
+    """Even if _deliver_result raises, the deferred agent is still torn down
+    (no fd/client leak — #10200). Teardown lives in a finally around delivery.
+    """
+    order = []
+
+    class FakeAgent:
+        def close(self):
+            order.append("agent.close")
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        defer_agent_teardown.append(FakeAgent())
+        return (True, "out", "final response", None)
+
+    def boom_deliver(job, content, adapters=None, loop=None):
+        order.append("deliver-raise")
+        raise RuntimeError("send blew up")
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_deliver_result", boom_deliver)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+    import agent.auxiliary_client as aux
+    monkeypatch.setattr(aux, "cleanup_stale_async_clients",
+                        lambda: order.append("cleanup_stale"))
+
+    ok = s.run_one_job({"id": "j9", "name": "t"})
+
+    assert ok is True  # delivery error is recorded, not propagated
+    assert order == ["deliver-raise", "agent.close", "cleanup_stale"], order
+
+
+def test_run_one_job_tears_down_deferred_agent_when_update_raises(monkeypatch):
+    """If final artifact closeout raises after run_job hands the agent back,
+    the deferred agent must still be torn down before returning.
+    """
+    order = []
+
+    class FakeAgent:
+        def close(self):
+            order.append("agent.close")
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        defer_agent_teardown.append(FakeAgent())
+        return (True, "out", "final response", None)
+
+    def boom_update(path, out):
+        order.append("update-raise")
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.md")
+    monkeypatch.setattr(s, "update_job_output", boom_update)
+    monkeypatch.setattr(s, "_deliver_result",
+                        lambda *a, **k: order.append("deliver"))
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+    import agent.auxiliary_client as aux
+    monkeypatch.setattr(aux, "cleanup_stale_async_clients",
+                        lambda: order.append("cleanup_stale"))
+
+    ok = s.run_one_job({"id": "j10", "name": "t"})
+
+    # closeout update raised → outer handler marks failure and returns False, but the
+    # deferred agent was still torn down (no delivery, no leak).
+    assert ok is False
+    assert "deliver" not in order
+    assert order == [
+        "update-raise",
+        "update-raise",
+        "agent.close",
+        "cleanup_stale",
+    ], order

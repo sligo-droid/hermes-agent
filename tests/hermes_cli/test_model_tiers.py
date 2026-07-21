@@ -113,7 +113,7 @@ def test_partial_custom_tier_override_keeps_required_default_fields():
 
 def test_invalid_tier_is_rejected_without_leaking_into_runtime():
     assert resolve_model_tier(
-        {"model_tiers": {"broken": {"model": "x", "reasoning_effort": "ultra"}}},
+        {"model_tiers": {"broken": {"model": "x", "reasoning_effort": "extreme"}}},
         "broken",
     ) is None
 
@@ -128,8 +128,8 @@ def test_review_spills_high_to_xhigh_and_implementation_caps_at_high():
     assert restrict_model_tier_for_task({}, advanced, "Implement the fix").reasoning_effort == "high"
     assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").name == "advanced"
     assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").reasoning_effort == "xhigh"
-    assert restrict_reasoning_effort_for_task("max", "Apply the patch") == "high"
-    assert restrict_reasoning_effort_for_task("max", "Review the authentication flow") == "xhigh"
+    assert restrict_reasoning_effort_for_task("max", "Apply the patch") == "max"
+    assert restrict_reasoning_effort_for_task("ultra", "Review the authentication flow") == "ultra"
     assert restrict_reasoning_effort_for_task("high", "Review the authentication flow") == "xhigh"
     assert restrict_reasoning_effort_for_task("xhigh", "Diagnose the incident") == "xhigh"
 
@@ -193,11 +193,12 @@ def test_standalone_coding_worker_uses_its_named_tier():
     assert resolved["complex_build_reasoning_level"] == "high"
 
 
-def test_legacy_max_tier_effort_normalizes_to_xhigh():
-    tier = resolve_model_tier(
-        {"model_tiers": {"legacy": {"model": "custom/model", "reasoning_effort": "max"}}},
-        "legacy",
-    )
+def test_explicit_maximum_tier_efforts_cap_at_xhigh():
+    for effort in ("max", "ultra"):
+        tier = resolve_model_tier(
+            {"model_tiers": {"custom": {"model": "custom/model", "reasoning_effort": effort}}},
+            "custom",
+        )
 
-    assert tier is not None
-    assert tier.reasoning_effort == "xhigh"
+        assert tier is not None
+        assert tier.reasoning_effort == "xhigh"

@@ -22,6 +22,9 @@ def _make_minimal_agent(memory_manager, context_compressor, session_id="abc"):
     """
     from run_agent import AIAgent
 
+    if memory_manager is not None:
+        memory_manager.read_only = False
+
     obj = SimpleNamespace(
         _memory_manager=memory_manager,
         context_compressor=context_compressor,

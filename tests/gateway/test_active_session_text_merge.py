@@ -92,6 +92,9 @@ def _make_adapter() -> BasePlatformAdapter:
     adapter._active_sessions = {}
     adapter._pending_messages = {}
     adapter._session_tasks = {}
+    # ``object.__new__`` intentionally bypasses BasePlatformAdapter.__init__,
+    # so mirror the exact-delivery state that production adapters initialize.
+    adapter._deferred_processing_completions = {}
     adapter._background_tasks = set()
     adapter._post_delivery_callbacks = {}
     adapter._expected_cancelled_tasks = set()
