@@ -130,6 +130,7 @@ jobs:
 
       - name: Run frontend typechecks and desktop build
         run: |
+          npm run --workspace ui-tui build:ink
           npm run --workspace ui-tui typecheck
           npm run --workspace web typecheck
           npm run --workspace apps/bootstrap-installer typecheck
