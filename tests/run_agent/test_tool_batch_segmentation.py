@@ -235,6 +235,78 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    def test_sequential_steer_finishes_active_call_and_skips_later_calls(self, agent):
+        calls = [
+            _tc("terminal", '{"command":"one"}', call_id="t1"),
+            _tc("terminal", '{"command":"two"}', call_id="t2"),
+            _tc("terminal", '{"command":"three"}', call_id="t3"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        first_started = threading.Event()
+        release_first = threading.Event()
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            if kwargs["tool_call_id"] == "t1":
+                first_started.set()
+                assert release_first.wait(timeout=10)
+            return json.dumps({"ok": True})
+
+        agent._open_steer_intake()
+        thread = threading.Thread(
+            target=lambda: agent._execute_tool_calls(msg, messages, "task-1")
+        )
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            thread.start()
+            assert first_started.wait(timeout=10)
+            assert agent.steer("stop after this call") is True
+            release_first.set()
+            thread.join(timeout=20)
+
+        assert not thread.is_alive()
+        assert executed == ["t1"]
+        assert [m["tool_call_id"] for m in messages] == ["t1", "t2", "t3"]
+        assert "stop after this call" in messages[-1]["content"]
+
+    def test_segmented_steer_finishes_submitted_parallel_segment_only(self, agent):
+        calls = [
+            _tc("web_search", '{"query":"a"}', call_id="s1"),
+            _tc("web_search", '{"query":"b"}', call_id="s2"),
+            _tc("terminal", '{"command":"later"}', call_id="t1"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        both_started = threading.Barrier(3, timeout=10)
+        release_parallel = threading.Event()
+        executed = []
+        executed_lock = threading.Lock()
+
+        def fake_handle(name, args, task_id, **kwargs):
+            with executed_lock:
+                executed.append(kwargs["tool_call_id"])
+            if name == "web_search":
+                both_started.wait()
+                assert release_parallel.wait(timeout=10)
+            return json.dumps({"ok": True})
+
+        agent._open_steer_intake()
+        thread = threading.Thread(
+            target=lambda: agent._execute_tool_calls(msg, messages, "task-1")
+        )
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            thread.start()
+            both_started.wait()
+            assert agent.steer("do not run the terminal") is True
+            release_parallel.set()
+            thread.join(timeout=20)
+
+        assert not thread.is_alive()
+        assert set(executed) == {"s1", "s2"}
+        assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1"]
+        assert "do not run the terminal" in messages[-1]["content"]
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""
@@ -392,6 +464,7 @@ class TestSegmentedDispatchIntegration:
         def fake_handle(name, args, task_id, **kwargs):
             return json.dumps({"ok": True})
 
+        agent._open_steer_intake()
         agent.steer("focus on the tests")
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")

@@ -171,10 +171,8 @@ async def test_steer_agent_without_steer_method_falls_back():
 
 
 @pytest.mark.asyncio
-async def test_steer_rejected_payload_returns_rejection_message():
-    """If agent.steer() returns False (e.g. empty after strip — though
-    the gateway already guards this), surface a rejection message."""
-    runner, _adapter = _make_runner(_session_entry())
+async def test_steer_rejected_payload_queues_immediate_next_turn():
+    runner, adapter = _make_runner(_session_entry())
     sk = build_session_key(_make_source())
 
     running_agent = MagicMock()
@@ -184,7 +182,9 @@ async def test_steer_rejected_payload_returns_rejection_message():
     result = await runner._handle_message(_make_event("/steer hello"))
 
     assert result is not None
-    assert "rejected" in result.lower() or "empty" in result.lower()
+    assert "queued" in result.lower()
+    assert "immediate next turn" in result.lower()
+    assert adapter._pending_messages[sk].text == "hello"
 
 
 if __name__ == "__main__":  # pragma: no cover

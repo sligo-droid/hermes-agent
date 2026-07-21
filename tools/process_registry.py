@@ -105,6 +105,7 @@ class ProcessSession:
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    completion_suppressed: bool = False          # explicit session stop owns delivery
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
@@ -186,6 +187,9 @@ class ProcessRegistry:
         # Track sessions whose completion was already consumed by the agent
         # via wait/poll/log.  Drain loops skip notifications for these.
         self._completion_consumed: set = set()
+        # Producer-stable tombstones for completions explicitly suppressed by
+        # a session /stop. Values are insertion timestamps for bounded pruning.
+        self._completion_suppressed: Dict[tuple[str, float], float] = {}
         # poll() is read-only for gateway delivery, but CLI drains still need
         # to avoid reinjecting a completion already shown inline.
         self._poll_observed: set = set()
@@ -1040,7 +1044,11 @@ class ProcessRegistry:
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
+        if (
+            was_running
+            and session.notify_on_complete
+            and not session.completion_suppressed
+        ):
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
             self.completion_queue.put({
@@ -1063,6 +1071,35 @@ class ProcessRegistry:
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/poll/log."""
         return session_id in self._completion_consumed
+
+    def is_completion_suppressed(
+        self, session_id: str, started_at: Optional[float] = None
+    ) -> bool:
+        """Return whether explicit session stop fenced this process completion."""
+        normalized = str(session_id or "")
+        if not normalized:
+            return False
+        with self._lock:
+            session = self._running.get(normalized) or self._finished.get(normalized)
+            if session is not None and session.completion_suppressed:
+                if started_at is None or float(session.started_at) == float(started_at):
+                    return True
+            if started_at is not None:
+                return (normalized, float(started_at)) in self._completion_suppressed
+            return any(key[0] == normalized for key in self._completion_suppressed)
+
+    def _suppress_completion_locked(self, session: ProcessSession) -> None:
+        """Mark a producer suppressed before exposing its terminal state."""
+        session.completion_suppressed = True
+        self._completion_consumed.add(session.id)
+        key = (session.id, float(session.started_at))
+        self._completion_suppressed[key] = time.time()
+        if len(self._completion_suppressed) > 2048:
+            oldest = sorted(
+                self._completion_suppressed.items(), key=lambda item: item[1]
+            )[:1024]
+            for stale_key, _timestamp in oldest:
+                self._completion_suppressed.pop(stale_key, None)
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
@@ -1192,6 +1229,10 @@ class ProcessRegistry:
             # session owns (or legacy ownerless ordinary events). Routing must
             # happen first so a foreign session cannot drop the owner's event.
             _evt_sid = evt.get("session_id", "")
+            if evt.get("type") == "completion" and self.is_completion_suppressed(
+                _evt_sid, evt.get("started_at")
+            ):
+                continue
             if evt.get("type") == "completion" and self._drain_should_skip(
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
@@ -1449,6 +1490,7 @@ class ProcessRegistry:
         *,
         source: str = "process.kill",
         consume_output: bool = True,
+        suppress_completion: bool = False,
     ) -> dict:
         """Kill a background process and return its output snapshot.
 
@@ -1462,6 +1504,10 @@ class ProcessRegistry:
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
+        if suppress_completion:
+            with self._lock:
+                self._suppress_completion_locked(session)
+
         if session.exited:
             with session._lock:
                 result = {
@@ -1474,7 +1520,7 @@ class ProcessRegistry:
                 }
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
-            if consume_output:
+            if consume_output or suppress_completion:
                 self._completion_consumed.add(session_id)
             return result
 
@@ -1505,7 +1551,7 @@ class ProcessRegistry:
                         session.exited = True
                         session.exit_code = None
                         output = strip_ansi(session.output_buffer[-2000:])
-                    if consume_output:
+                    if consume_output or suppress_completion:
                         self._completion_consumed.add(session_id)
                     self._move_to_finished(session)
                     return {
@@ -1527,7 +1573,7 @@ class ProcessRegistry:
             # notification race without discarding the terminal transcript.
             with session._lock:
                 output = strip_ansi(session.output_buffer[-2000:])
-                if consume_output:
+                if consume_output or suppress_completion:
                     self._completion_consumed.add(session_id)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
@@ -1676,6 +1722,8 @@ class ProcessRegistry:
                 entry["watch_hit"] = s._watch_hits > 0
             if s.notify_on_complete:
                 entry["notify_on_complete"] = True
+            if s.completion_suppressed:
+                entry["completion_suppressed"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
                 entry["completion_reason"] = s.completion_reason
@@ -1736,8 +1784,15 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
-    def kill_for_session(self, session_key: str) -> int:
-        """Kill all running background processes owned by ``session_key``."""
+    def kill_for_session(
+        self, session_key: str, *, suppress_completion: bool = False
+    ) -> int:
+        """Kill background processes owned by ``session_key``.
+
+        Explicit user stop passes ``suppress_completion=True`` so both running
+        producers and already-queued completions are fenced before exit becomes
+        visible to gateway watchers.
+        """
         if not session_key:
             return 0
 
@@ -1746,6 +1801,10 @@ class ProcessRegistry:
                 s for s in self._running.values()
                 if s.session_key == session_key and not s.exited
             ]
+            if suppress_completion:
+                for session in list(self._running.values()) + list(self._finished.values()):
+                    if session.session_key == session_key:
+                        self._suppress_completion_locked(session)
 
         killed = 0
         for session in targets:
@@ -1753,6 +1812,7 @@ class ProcessRegistry:
                 session.id,
                 source="kill_for_session",
                 consume_output=False,
+                suppress_completion=suppress_completion,
             )
             if result.get("status") in {"killed", "already_exited"}:
                 killed += 1

@@ -2768,6 +2768,17 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        # A hard interrupt ends the Hermes-managed turn.  Close steer intake
+        # immediately so a racing follow-up cannot be accepted into a turn
+        # that is already being torn down.
+        _clear_steer = getattr(self, "_clear_steer_intake", None)
+        if callable(_clear_steer):
+            _clear_steer()
+        else:
+            _lock = getattr(self, "_pending_steer_lock", None)
+            if _lock is not None:
+                with _lock:
+                    self._pending_steer = None
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -2844,57 +2855,57 @@ class AIAgent:
                     _set_interrupt(False, _wtid)
                 except Exception:
                     pass
-        # A hard interrupt supersedes any pending /steer — the steer was
-        # meant for the agent's next tool-call iteration, which will no
-        # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        # ``interrupt()`` already closes and clears steer intake.  Keep this
+        # idempotent for test stubs and exceptional cleanup paths.
+        _clear_steer = getattr(self, "_clear_steer_intake", None)
+        if callable(_clear_steer):
+            _clear_steer()
+        else:
+            _lock = getattr(self, "_pending_steer_lock", None)
+            if _lock is not None:
+                with _lock:
+                    self._pending_steer = None
 
-    def steer(self, text: str) -> bool:
-        """
-        Inject a user message into the next tool result without interrupting.
-
-        Unlike interrupt(), this does NOT stop the current tool call. The
-        text is stashed and the agent loop appends it to the LAST tool
-        result's content once the current tool batch finishes. The model
-        sees the steer as part of the tool output on its next iteration.
-
-        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
-        before the drain point concatenate with newlines.
-
-        Args:
-            text: The user text to inject. Empty strings are ignored.
-
-        Returns:
-            True if the steer was accepted, False if the text was empty.
-        """
-        if not text or not text.strip():
-            return False
-        cleaned = text.strip()
+    def _open_steer_intake(self, *, supported: bool = True) -> None:
+        """Open a fresh turn's steer intake when Hermes can consume it."""
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            return True
+            supported = bool(supported) and not bool(
+                getattr(self, "_interrupt_requested", False)
+            )
+            self._pending_steer = None
+            self._steer_supported = supported
+            self._steer_intake_open = supported
+            return
         with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
-        return True
+            supported = bool(supported) and not bool(
+                getattr(self, "_interrupt_requested", False)
+            )
+            self._pending_steer = None
+            self._steer_supported = supported
+            self._steer_intake_open = supported
 
-    def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot.
+    def _clear_steer_intake(self) -> None:
+        """Close intake and discard guidance after a destructive interrupt."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._pending_steer = None
+            self._steer_intake_open = False
+            return
+        with _lock:
+            self._pending_steer = None
+            self._steer_intake_open = False
 
-        Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
-        """
+    def _has_pending_steer(self) -> bool:
+        """Return whether accepted guidance is waiting at a safe boundary."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            return bool(getattr(self, "_pending_steer", None))
+        with _lock:
+            return bool(self._pending_steer)
+
+    def _take_pending_steer(self) -> Optional[str]:
+        """Take pending FIFO guidance after an injection target is known."""
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
@@ -2903,7 +2914,65 @@ class AIAgent:
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
-        return text
+            return text
+
+    def _close_steer_intake_and_take(self) -> Optional[str]:
+        """Atomically close this turn and take every remaining steer."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_intake_open = False
+            return self._take_pending_steer()
+        with _lock:
+            self._steer_intake_open = False
+            text = self._pending_steer
+            self._pending_steer = None
+            return text
+
+    def steer(self, text: str) -> bool:
+        """
+        Accept user guidance for the next safe boundary without interrupting.
+
+        Already-started tools and submitted parallel segments finish. Later
+        unstarted work is skipped with paired synthetic results, and the model
+        sees the FIFO guidance on its next iteration.
+
+        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
+        before delivery concatenate with newlines.
+
+        Args:
+            text: The user text to inject. Empty strings are ignored.
+
+        Returns:
+            True only when the active Hermes turn can still consume it.
+        """
+        if not text or not text.strip():
+            return False
+        cleaned = text.strip()
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            if not (
+                getattr(self, "_steer_intake_open", False)
+                and getattr(self, "_steer_supported", False)
+            ):
+                return False
+            existing = getattr(self, "_pending_steer", None)
+            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            return True
+        with _lock:
+            if not (
+                getattr(self, "_steer_intake_open", False)
+                and getattr(self, "_steer_supported", False)
+            ):
+                return False
+            if self._pending_steer:
+                self._pending_steer = self._pending_steer + "\n" + cleaned
+            else:
+                self._pending_steer = cleaned
+        return True
+
+    def _drain_pending_steer(self) -> Optional[str]:
+        """Compatibility alias; new code confirms a target before taking."""
+        return self._take_pending_steer()
 
     def _record_file_mutation_result(
         self,

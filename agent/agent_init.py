@@ -662,15 +662,14 @@ def init_agent(
     agent._interrupt_thread_signal_pending = False
     agent._client_lock = threading.RLock()
 
-    # /steer mechanism — inject a user note into the next tool result
-    # without interrupting the agent. Unlike interrupt(), steer() does
-    # NOT set _interrupt_requested; it waits for the current tool batch
-    # to finish naturally, then the drain hook appends the text to the
-    # last tool result's content so the model sees it on its next
-    # iteration. Message-role alternation is preserved (we modify an
-    # existing tool message rather than inserting a new user turn).
+    # /steer lifecycle.  Intake is closed between turns and is opened only
+    # by Hermes' conversation loop.  The same lock owns the open/supported
+    # flags and the FIFO text buffer so finalization can atomically close
+    # intake and take every accepted message without a lost-steer race.
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    agent._steer_intake_open = False
+    agent._steer_supported = False
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker

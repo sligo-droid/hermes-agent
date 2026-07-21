@@ -1013,10 +1013,26 @@ class GatewaySlashCommandsMixin:
         except Exception:
             running_processes = []
 
-        background_tasks = [
-            t for t in (getattr(self, "_background_tasks", set()) or set())
-            if hasattr(t, "done") and not t.done()
-        ]
+        background_tasks: list[dict] = []
+        try:
+            lock, records = self._background_registry_parts()
+            with lock:
+                background_tasks = [
+                    {
+                        "task_id": str(record.get("task_id") or ""),
+                        "session_key": str(record.get("session_key") or ""),
+                        "state": str(record.get("state") or "starting"),
+                        "elapsed": max(
+                            0,
+                            int(now - float(record.get("started_at") or now)),
+                        ),
+                    }
+                    for record in records.values()
+                    if self._background_record_active(record)
+                ]
+        except Exception:
+            background_tasks = []
+        background_tasks.sort(key=lambda row: row["elapsed"], reverse=True)
 
         lines = [
             t("gateway.agents.header"),
@@ -1060,6 +1076,18 @@ class GatewaySlashCommandsMixin:
                 t("gateway.agents.async_jobs", count=len(background_tasks)),
             ]
         )
+        for row in background_tasks[:12]:
+            current = (
+                t("gateway.agents.this_chat")
+                if row["session_key"] == current_session_key
+                else ""
+            )
+            lines.append(
+                f"- `{row['task_id']}` · {row['state']} · "
+                f"{format_uptime_short(row['elapsed'])}{current}"
+            )
+        if len(background_tasks) > 12:
+            lines.append(t("gateway.agents.more", count=len(background_tasks) - 12))
 
         if not agent_rows and not running_processes and not background_tasks:
             lines.append("")
@@ -1078,71 +1106,42 @@ class GatewaySlashCommandsMixin:
 
         The session is preserved so the user can continue the conversation.
         """
-        from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
+        from gateway.run import _AGENT_PENDING_SENTINEL
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
-        stopped_boards = await self._stop_discord_thread_boards_for_event(event)
-
         agent = self._running_agents.get(session_key)
-        if agent is _AGENT_PENDING_SENTINEL:
-            # Force-clean the sentinel so the session is unlocked.
-            await self._interrupt_and_clear_session(
-                session_key,
-                source,
-                interrupt_reason=_INTERRUPT_REASON_STOP,
-                invalidation_reason="stop_command_pending",
-                cleanup_background_processes=True,
-            )
-            logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
-            return EphemeralReply(t("gateway.stop.stopped_pending"))
-        if agent:
-            # Force-clean the session lock so a truly hung agent doesn't
-            # keep it locked forever.
-            await self._interrupt_and_clear_session(
-                session_key,
-                source,
-                interrupt_reason=_INTERRUPT_REASON_STOP,
-                invalidation_reason="stop_command_handler",
-                cleanup_background_processes=True,
-            )
-            return EphemeralReply(t("gateway.stop.stopped"))
+        own_report = await self._stop_session_owned_work(
+            event,
+            [session_key],
+            invalidation_reason=(
+                "stop_command_pending"
+                if agent is _AGENT_PENDING_SENTINEL
+                else "stop_command_handler"
+            ),
+        )
+        own_work_changed = bool(
+            own_report["active_parent"]["matched"]
+            or own_report["async_delegations"]["newly_cancelled"]
+            or own_report["durable_attempts"]["fenced"]
+            or own_report["background_agents"]["newly_cancelled"]
+            or own_report["terminal_processes"]
+        )
 
-        # No run under the caller's own session key.  In a per-user thread
-        # (thread_sessions_per_user=True) each participant is isolated even
-        # inside one shared thread, so a run another user started lives under
-        # a different key.  Authorized users should still be able to /stop it
-        # (#bernard-thread-stop).  Fall back to interrupting any running
-        # agent(s) that share this thread, gated on authorization.
-        sibling_keys = self._sibling_thread_run_keys(source, session_key)
-        if sibling_keys and self._is_user_authorized(source):
-            for sibling_key in sibling_keys:
-                await self._interrupt_and_clear_session(
-                    sibling_key,
-                    source,
-                    interrupt_reason=_INTERRUPT_REASON_STOP,
+        sibling_report = None
+        if not own_work_changed and self._is_user_authorized(source):
+            sibling_keys = self._sibling_thread_run_keys(source, session_key)
+            if sibling_keys:
+                sibling_report = await self._stop_session_owned_work(
+                    event,
+                    sibling_keys,
                     invalidation_reason="stop_command_thread_sibling",
+                    stop_discord_boards=False,
                 )
-                self._stop_session_background_processes(sibling_key)
-            logger.info(
-                "STOP (thread sibling) by %s — interrupted %d run(s) in thread: %s",
-                session_key,
-                len(sibling_keys),
-                ", ".join(sibling_keys),
-            )
-            return EphemeralReply(t("gateway.stop.stopped"))
 
-        stopped_required = self._stop_required_async_for_session(session_key)
-        stopped_processes = self._stop_session_background_processes(session_key)
-        if stopped_boards or stopped_processes or stopped_required:
-            logger.info(
-                "STOP for session %s — Discord worker boards stopped: %s, "
-                "background_processes_stopped=%d, required_async_stopped=%d",
-                session_key,
-                ",".join(stopped_boards) if stopped_boards else "-",
-                stopped_processes,
-                stopped_required,
-            )
+        if agent is _AGENT_PENDING_SENTINEL and own_report["changed"]:
+            return EphemeralReply(t("gateway.stop.stopped_pending"))
+        if own_report["changed"] or (sibling_report and sibling_report["changed"]):
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No running agent anywhere for this scope. A platform status

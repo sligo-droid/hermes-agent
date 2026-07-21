@@ -188,6 +188,43 @@ class TestBusySessionAck:
         agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_telegram_grace_does_not_demote_steer_mode(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", "true")
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner._busy_text_mode = "steer"
+        adapter = _make_adapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="change course",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="m-steer",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+        agent = MagicMock()
+        agent.steer.return_value = True
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        agent.steer.assert_called_once_with("change course")
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+        assert result is not None and "safe boundary" in str(result)
+
+    @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
         """First message during busy session should get a status ack."""
         runner, sentinel = _make_runner()
@@ -320,6 +357,30 @@ class TestBusySessionAck:
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio
+    async def test_first_steer_ack_is_visible_after_generic_busy_ack(self, monkeypatch):
+        import gateway.run as _gr
+
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", "true")
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        event = _make_event(text="new direction")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[sk] = agent
+        runner._busy_ack_ts[sk] = time.time()
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        adapter._send_with_retry.assert_called_once()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Steered into current run" in content
+        assert "next safe boundary" in content
+
+    @pytest.mark.asyncio
     async def test_steer_mode_can_suppress_visible_ack_without_disabling_steer(self, monkeypatch):
         """busy_steer_ack_enabled=false keeps steering but drops the echo bubble."""
         import gateway.run as _gr
@@ -403,6 +464,8 @@ class TestBusySessionAck:
         agent.steer = MagicMock(return_value=True)
         runner._running_agents[sk] = agent
         runner._busy_ack_ts[sk] = time.time()
+        runner._busy_steer_ack_generation = {sk: 0}
+        runner._busy_steer_ack_ts = {sk: time.time()}
 
         result = await runner._handle_active_session_busy_message(event, sk)
 
@@ -437,7 +500,7 @@ class TestBusySessionAck:
         # Ack uses queue-mode wording (not steer, not interrupt)
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
+        assert "Queued for the immediate next turn" in content
         assert "Steered" not in content
 
     @pytest.mark.asyncio
@@ -461,7 +524,7 @@ class TestBusySessionAck:
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
+        assert "Queued for the immediate next turn" in content
 
     @pytest.mark.asyncio
     async def test_interrupt_mode_text_followups_fifo_not_merged(self):
@@ -783,6 +846,43 @@ class TestBusySessionAck:
 
         result = await runner._handle_active_session_busy_message(event, sk)
         assert result is False  # not handled, let default path try
+
+
+def test_final_gateway_runner_resolves_live_core_helper_and_command_mixin():
+    from gateway.run import (
+        GatewayRunner,
+        GatewaySlashCommandsMixin,
+        _GatewayRunnerCore,
+    )
+
+    assert GatewayRunner._try_steer_busy_event is _GatewayRunnerCore._try_steer_busy_event
+    assert GatewayRunner._handle_stop_command is GatewaySlashCommandsMixin._handle_stop_command
+
+
+def test_prepend_fifo_preserves_queued_turn_order():
+    runner, _sentinel = _make_runner()
+    adapter = _make_adapter()
+    first = _make_event("first queued")
+    second = MessageEvent(
+        text="second queued",
+        message_type=MessageType.TEXT,
+        source=first.source,
+        message_id="msg2",
+    )
+    third = MessageEvent(
+        text="third queued",
+        message_type=MessageType.TEXT,
+        source=first.source,
+        message_id="msg3",
+    )
+    sk = build_session_key(first.source)
+    adapter._pending_messages[sk] = second
+    runner._queued_events = {sk: [third]}
+
+    runner._prepend_fifo(sk, first, adapter)
+
+    assert adapter._pending_messages[sk] is first
+    assert runner._queued_events[sk] == [second, third]
 
 
 class TestBusySessionOnboardingHint:

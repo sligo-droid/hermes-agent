@@ -189,7 +189,7 @@ platform network disconnect as an event-loop failure.
 | `/undo` | Remove the last exchange |
 | `/status` | Show session info |
 | `/whoami` | Show your slash command access on this scope (admin / user / unrestricted) |
-| `/stop` | Stop the running agent |
+| `/stop` | Stop all work owned by this conversation |
 | `/approve` | Approve a pending dangerous command |
 | `/deny` | Reject a pending dangerous command |
 | `/sethome` | Set this chat as the home channel |
@@ -352,31 +352,39 @@ gateway:
 
 Use `/whoami` from any platform to see the active scope, your tier (admin / user / unrestricted), and which slash commands you can run. See the [Telegram](/user-guide/messaging/telegram#slash-command-access-control) and [Discord](/user-guide/messaging/discord#slash-command-access-control) pages for platform-specific examples.
 
-## Interrupting the Agent
+## Steering, Queueing, and Stopping
 
-Send any message while the agent is working to interrupt it. Key behaviors:
+Ordinary input while the agent is busy steers the current run by default:
 
-- **In-progress terminal commands are killed immediately** (SIGTERM, then SIGKILL after 1s)
-- **Tool calls are cancelled** — only the currently-executing one runs, the rest are skipped
-- **Multiple messages are combined** — messages sent during interruption are joined into one prompt
-- **`/stop` command** — interrupts without queuing a follow-up message
+- Already-started tools and submitted parallel segments finish naturally.
+- Later tool calls that have not started are paired with skipped results and do not run.
+- The model receives your guidance at the next safe boundary and replans in the same turn.
+- If live steering is unsupported, still starting, or already closed, Hermes queues the original message for the immediate next turn and says so.
+- **`/queue <prompt>`** always creates a later independent turn.
+- **`/stop`** remains destructive for the current conversation. It interrupts
+  the active agent and synchronous children, cancels detached coding and
+  non-coding delegations plus `/background` agents, kills tracked terminal
+  processes, and stops matching Discord worker boards. Canceled completions
+  are suppressed instead of re-entering the chat. Other sessions and profiles,
+  cron jobs, and unrelated Kanban work are not canceled.
 
 ### Queue vs interrupt vs steer (busy-input mode)
 
-By default, messaging a busy agent interrupts it. Two other modes are available:
+Three modes are available:
 
-- `queue` — follow-up messages wait and run as the next turn after the current task finishes.
-- `steer` — follow-up messages are injected into the current run via `/steer`, arriving at the agent after the next tool call. No interrupt, no new turn. Falls back to `queue` behavior if the agent hasn't started yet.
+- `steer` (default) — apply follow-up guidance at the next safe boundary without cancelling already-started work.
+- `queue` — follow-up messages wait and run as independent turns after the current task finishes.
+- `interrupt` — destructively interrupt the current run and handle the message next.
 
 ```yaml
 display:
-  busy_input_mode: steer   # or queue, or interrupt (default)
+  busy_input_mode: steer   # default; or queue / interrupt
   busy_ack_enabled: true   # set to false to suppress the ⚡/⏳/⏩ chat reply entirely
 ```
 
 The first time you message a busy agent on any platform, Hermes appends a one-line reminder to the busy-ack explaining the knob (`"💡 First-time tip — …"`). The reminder fires once per install — a flag under `onboarding.seen.busy_input_prompt` latches it. Delete that key to see the tip again.
 
-If you find the busy-ack noisy — especially with voice input or rapid-fire messages — set `display.busy_ack_enabled: false`. Your input is still queued/steered/interrupts as normal, only the chat reply is silenced.
+The first accepted steer in each run gets an immediate “next safe boundary” acknowledgement. Rapid later steers are rate-limited. Set `display.busy_steer_ack_enabled: false` to silence only steer confirmations, or `display.busy_ack_enabled: false` to silence all busy acknowledgements; routing behavior is unchanged.
 
 ## Tool Progress Notifications
 
@@ -474,7 +482,7 @@ HERMES_BACKGROUND_NOTIFICATIONS=result
 - **File operations** — "/background Organize the photos in ~/Downloads by date into folders"
 
 :::tip
-Background tasks on messaging platforms are fire-and-forget — you don't need to wait or check on them. Results arrive in the same chat automatically when the task finishes.
+Background tasks on messaging platforms are fire-and-forget — you don't need to wait or check on them. Results arrive in the same chat automatically when the task finishes. They remain owned by that conversation: `/stop` cancels them, cooperatively interrupts a live background agent, and suppresses any result that had not yet been delivered.
 :::
 
 ## Service Management

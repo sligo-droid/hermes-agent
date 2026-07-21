@@ -116,7 +116,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("list", "delete", "edit")),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
                aliases=("q",), args_hint="<prompt>"),
-    CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
+    CommandDef("steer", "Guide the current run at its next safe boundary", "Session",
                args_hint="<prompt>"),
     CommandDef("goal", "Set a standing goal Hermes works on across turns until achieved", "Session",
                args_hint="[text | pause | resume | clear | status]"),

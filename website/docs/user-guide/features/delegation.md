@@ -121,7 +121,7 @@ When an agent provides a `tasks` array, Hermes runs the subagents in parallel an
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback
 - **Result ordering:** Results are sorted by task index to match input order regardless of completion order
-- **Cancellation:** Follow-up messages do not cancel an explicitly backgrounded batch. `/stop` or closing/resetting the owning session cancels its active children. Synchronous orchestrator children still follow their parent's interrupt state
+- **Cancellation:** Follow-up messages do not cancel an explicitly backgrounded batch. `/stop` or closing/resetting the owning session cancels all of its active detached coding and advisory children. `/stop` also suppresses a canceled result that was queued but not yet delivered. Synchronous orchestrator children still follow their parent's interrupt state
 
 Synchronous single-task delegation from an orchestrator runs directly without thread pool overhead.
 
@@ -247,7 +247,7 @@ delegate_task(
 :::warning Background completion durability is not durable execution
 `delegate_task` runs synchronously unless the caller explicitly sets `background=true`. Background mode is limited to read-only delegation on sessions that support later delivery; Hermes returns a handle immediately, and the result re-enters the conversation after the child or batch finishes. Orchestrator subagents wait for their workers in the current turn because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
 
-- Normal follow-up messages do not cancel background children. `/stop` cancels running background delegations, and closing or resetting the owning session discards its active children.
+- Normal follow-up messages do not cancel background children. `/stop` cancels every running background delegation owned by the conversation, and closing or resetting the owning session discards its active children. Work owned by another session/profile, cron, or unrelated Kanban items is not affected.
 - Explicit session close/reset interrupts that session's background children. Closing a TUI viewer of a gateway-owned session does not kill the gateway's work.
 - A Hermes process restart does **not** resume a running child. Its attempt becomes `unknown` because Hermes cannot prove which side effects happened.
 - A child that completed before restart but whose result was not delivered is restored and routed back through the owning session's normal checks.

@@ -1336,15 +1336,15 @@ async def test_session_boundary_only_stop_cancels_required_work(reason, expected
     assert runner._stop_required_async_for_session.call_count == expected_calls
 
 
-def test_stop_seals_required_attempt_before_scoped_interrupt(tmp_path, monkeypatch):
+def test_stop_seals_required_attempt_before_canonical_session_cancel(tmp_path, monkeypatch):
     ledger, work_item_id, session_key = _registered_required_attempt(tmp_path)
     calls = []
 
-    def interrupt_session(session, **kwargs):
+    def cancel_session(session, **kwargs):
         calls.append((session, kwargs))
-        return {"matched": 1, "durable_cancelled": 1, "interrupted": 1}
+        return {"matched": 1, "newly_cancelled": 1}
 
-    monkeypatch.setattr("tools.async_delegation.interrupt_session", interrupt_session)
+    monkeypatch.setattr("tools.async_delegation.cancel_session", cancel_session)
     runner = object.__new__(GatewayRunner)
     runner._ledger = lambda: ledger
     runner._background_tasks = set()
@@ -1353,13 +1353,11 @@ def test_stop_seals_required_attempt_before_scoped_interrupt(tmp_path, monkeypat
 
     state = ledger.required_async_completion_state(work_item_id)
     assert state["sealed"] is True
+    assert state["dispatches"]["deleg_required"]["state"] == "cancelled"
     assert calls == [
         (
             session_key,
             {
-                "kind": None,
-                "origin_work_item_id": work_item_id,
-                "attempt_id": "boot-a:7",
                 "reason": "session_stop",
             },
         )

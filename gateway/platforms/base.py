@@ -2027,10 +2027,10 @@ class BasePlatformAdapter(ABC):
         ] = {}
         # The runner synchronizes its resolved busy-input policy onto each
         # adapter after construction. Until then, match the single-knob
-        # default and interrupt rather than silently queueing.
+        # default and steer rather than destructively interrupting.
         self._busy_text_mode: str = (
-            os.environ.get("HERMES_GATEWAY_BUSY_TEXT_MODE", "interrupt").strip().lower()
-            or "interrupt"
+            os.environ.get("HERMES_GATEWAY_BUSY_TEXT_MODE", "steer").strip().lower()
+            or "steer"
         )
         self._busy_text_debounce_seconds: float = _float_env(
             "HERMES_GATEWAY_BUSY_TEXT_DEBOUNCE_SECONDS", 0.35
@@ -3779,7 +3779,7 @@ class BasePlatformAdapter(ABC):
     def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
         """Return True for normal text eligible for queue-mode debounce."""
         result = (
-            getattr(self, "_busy_text_mode", "interrupt") == "queue"
+            getattr(self, "_busy_text_mode", "steer") == "queue"
             and event.message_type == MessageType.TEXT
             and not getattr(event, "internal", False)
             and not event.is_command()

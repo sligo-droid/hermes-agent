@@ -4298,7 +4298,7 @@ def test_config_get_busy_survives_non_dict_display(monkeypatch):
         {"id": "1", "method": "config.get", "params": {"key": "busy"}}
     )
 
-    assert resp["result"]["value"] == "interrupt"
+    assert resp["result"]["value"] == "steer"
 
 
 def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
@@ -6423,7 +6423,7 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
         server._sessions.pop("sid", None)
 
     assert "result" in resp, resp
-    assert resp["result"]["status"] == "queued"
+    assert resp["result"]["status"] == "steered"
     assert resp["result"]["text"] == "also check auth.log"
     assert calls["steer_text"] == "also check auth.log"
     assert "interrupt_called" not in calls  # must NOT interrupt

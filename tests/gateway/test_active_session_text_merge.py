@@ -419,10 +419,10 @@ async def test_single_followup_is_stored_as_is():
     assert not adapter._active_sessions[session_key].is_set()
 
 
-def test_adapter_defaults_to_interrupt_mode(monkeypatch):
+def test_adapter_defaults_to_steer_mode(monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_TEXT_MODE", raising=False)
     adapter = _make_initialized_adapter()
-    assert adapter._busy_text_mode == "interrupt"
+    assert adapter._busy_text_mode == "steer"
     assert not adapter._is_queue_text_debounce_candidate(_make_event("hello"))
 
 

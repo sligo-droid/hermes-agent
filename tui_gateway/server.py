@@ -437,7 +437,7 @@ def _load_busy_input_mode() -> str:
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    return raw if raw in {"queue", "steer", "interrupt"} else "steer"
 
 
 def _load_interim_assistant_messages() -> bool:
@@ -5677,13 +5677,13 @@ def _handle_busy_submit(
     The old rejection forced clients into a deadline-bounded busy-retry that
     silently dropped the send when turn teardown outlived the deadline (e.g. a
     slow, non-interruptible tool like ``web_search`` running when the user hits
-    stop). The message is instead queued to run as the next turn — and, for the
-    default ``interrupt`` policy, the live turn is interrupted so it winds down
-    promptly. Drained in ``run``'s tail (see ``_run_prompt_submit``).
+    stop). The message is instead steered by default or queued to run as the
+    next turn. Explicit ``interrupt`` mode also winds the live turn down.
+    Drained in ``run``'s tail (see ``_run_prompt_submit``).
 
-    Modes: ``interrupt`` (default) → interrupt + queue; ``queue`` → queue
-    without interrupting; ``steer`` → inject into the live turn if accepted,
-    else queue.
+    Modes: ``steer`` (default) → guide the live run at its next safe boundary;
+    ``queue`` → queue without interrupting; ``interrupt`` → interrupt + queue;
+    steering falls back to the immediate next turn when not accepted.
     """
     mode = _load_busy_input_mode()
     agent = session.get("agent")
@@ -9386,9 +9386,8 @@ def _(rid, params: dict) -> dict:
     """Inject a user message into the next tool result without interrupting.
 
     Mirrors AIAgent.steer(). Safe to call while a turn is running — the text
-    lands on the last tool result of the next tool batch and the model sees
-    it on its next iteration. No interrupt, no new user turn, no role
-    alternation violation.
+    lands on a safe tool boundary and the model sees it on its next iteration.
+    No interrupt, no new user turn, no role alternation violation.
     """
     text = (params.get("text") or "").strip()
     if not text:
@@ -9403,7 +9402,7 @@ def _(rid, params: dict) -> dict:
         accepted = agent.steer(text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
-    return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
+    return _ok(rid, {"status": "steered" if accepted else "rejected", "text": text})
 
 
 @method("terminal.resize")
@@ -13280,7 +13279,7 @@ def _(rid, params: dict) -> dict:
                         rid,
                         {
                             "type": "exec",
-                            "output": f"⏩ Steer queued — arrives after the next tool call: {arg[:80]}{'...' if len(arg) > 80 else ''}",
+                            "output": f"⏩ Steered into the current run — applies at the next safe boundary: {arg[:80]}{'...' if len(arg) > 80 else ''}",
                         },
                     )
             except Exception:
