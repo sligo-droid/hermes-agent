@@ -2599,11 +2599,39 @@ class GatewayWorkLedger:
             if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 return None
             existing = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+            existing_policy = (
+                existing.get("policy") if isinstance(existing.get("policy"), dict) else None
+            )
+            if isinstance(policy, dict):
+                resolved_policy = dict(policy)
+            elif policy is None:
+                resolved_policy = dict(existing_policy or {})
+            else:
+                resolved_policy = policy
+            normalized_source = str(
+                source or existing.get("source") or "direct"
+            ).strip().lower()
+            if (
+                normalized_source in {"direct", "fable"}
+                and str(canonical_path or "").strip()
+                and _repo_backed_discord_item(item)
+                and _delivery_intent_for_item(item) == "full_lifecycle"
+            ):
+                # A full Discord action lifecycle does not end at the remote
+                # merge.  Persist canonical synchronization as a required
+                # exact-SHA receipt even when an older/default config opted
+                # out; dirty or diverged checkouts then block visibly instead
+                # of being reported as completed while the base checkout lags.
+                resolved_policy = dict(resolved_policy or {})
+                post_merge = resolved_policy.get("post_merge_requirements")
+                post_merge = dict(post_merge) if isinstance(post_merge, dict) else {}
+                post_merge["canonical_sync"] = True
+                resolved_policy["post_merge_requirements"] = post_merge
             state = normalize_closeout_state(
                 {
                     **existing,
                     "id": str(existing.get("id") or closeout_id or f"{work_id}:closeout"),
-                    "source": str(source or existing.get("source") or "direct"),
+                    "source": normalized_source,
                     "mode": str(mode or existing.get("mode") or "off"),
                     "workspace": {
                         "path": str(workspace_path or ""),
@@ -2612,7 +2640,7 @@ class GatewayWorkLedger:
                         "branch": str(branch or ""),
                         "base_branch": str(base_branch or "main"),
                     },
-                    "policy": policy if policy is not None else existing.get("policy"),
+                    "policy": resolved_policy,
                 }
             )
             state["revision"] = int(existing.get("revision") or 0) + 1
@@ -3331,7 +3359,11 @@ class GatewayWorkLedger:
         *,
         expected_run_state: Any = _RUN_STATE_UNSET,
     ) -> dict[str, Any] | None:
-        """Adopt a read-only, exact merged-PR observation before delivery."""
+        """Adopt a read-only, exact merged-PR observation before delivery.
+
+        A fully observed lifecycle may be terminal immediately, or it may hand
+        the independently reported merge SHA to required post-merge collectors.
+        """
 
         from hermes_cli.trusted_closeout import (
             closeout_terminal_eligible,
@@ -3349,11 +3381,27 @@ class GatewayWorkLedger:
             return None
         current = normalize_closeout_state(item["closeout"])
         state = normalize_closeout_state(closeout_state)
+        head_sha = str(state["pr"].get("head_sha") or "").strip().lower()
+        merge_sha = str(state["pr"].get("merge_sha") or "").strip().lower()
+        pending_exact_post_merge = bool(
+            state["status"] == "post_merge_pending"
+            and state["workspace"] == current["workspace"]
+            and state["policy"] == current["policy"]
+            and state["pr"].get("state") == "MERGED"
+            and _CLOSEOUT_SHA_RE.fullmatch(head_sha)
+            and _CLOSEOUT_SHA_RE.fullmatch(merge_sha)
+            and state["post_merge"].get("target_sha") == merge_sha
+            and state["local_verification"].get("status") == "passed"
+            and state["local_verification"].get("head_sha") == head_sha
+            and state["ci"].get("status") == "passed"
+            and state["ci"].get("head_sha") == head_sha
+            and any(state["policy"]["post_merge_requirements"].values())
+        )
         if (
             current["source"] not in {"direct", "fable"}
             or state["source"] != current["source"]
             or state["mode"] != "enforce"
-            or not closeout_terminal_eligible(state)
+            or not (closeout_terminal_eligible(state) or pending_exact_post_merge)
         ):
             return None
         state["revision"] = int(current.get("revision") or 0) + 1

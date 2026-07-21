@@ -1396,7 +1396,7 @@ def test_full_lifecycle_allows_preserved_protected_checkout_when_production_is_c
     assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
 
 
-def test_closeout_policy_allows_optional_canonical_checkout_to_remain_unsynced(tmp_path):
+def test_full_lifecycle_requires_canonical_checkout_sync(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Implement the feature")
     item = ledger.accept_event(
@@ -1421,6 +1421,7 @@ def test_closeout_policy_allows_optional_canonical_checkout_to_remain_unsynced(t
         },
     )
     assert attached is not None
+    assert attached["policy"]["post_merge_requirements"]["canonical_sync"] is True
 
     ledger.mark_agent_done(
         item["id"],
@@ -1434,9 +1435,34 @@ def test_closeout_policy_allows_optional_canonical_checkout_to_remain_unsynced(t
     )
 
     stored = ledger.get(item["id"])
-    assert stored["summary_status"] == "Complete"
-    assert stored["completion_gate"]["allowed_to_complete"] is True
-    assert stored["completion_gate"]["reason"] == "no_self_declared_delivery_gap"
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["reason"] == "self_declared_delivery_incomplete"
+    assert stored["completion_gate"]["matched_markers"] == ["runtime_not_synced"]
+
+
+def test_pr_only_closeout_may_leave_canonical_sync_optional(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Open a PR only; do not merge it")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        canonical_path="/tmp/project",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={"post_merge_requirements": {"canonical_sync": False}},
+    )
+
+    assert attached is not None
+    assert attached["policy"]["post_merge_requirements"]["canonical_sync"] is False
 
 
 def test_optional_canonical_sync_does_not_hide_private_runtime_lag(tmp_path):

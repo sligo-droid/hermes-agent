@@ -170,8 +170,6 @@ def observe_merged_direct_closeout(
     if not checks_green:
         return None
 
-    state["status"] = "post_merge_complete"
-    state["next_due_at"] = None
     state["local_verification"] = {
         "status": "passed",
         "head_sha": head_sha,
@@ -198,6 +196,19 @@ def observe_merged_direct_closeout(
         "wait_state": "complete",
         "required": checks,
     }
-    state["post_merge"]["target_sha"] = merge_sha
+    from hermes_cli.post_merge_receipts import initialize_post_merge_receipts
+
+    state["post_merge"] = initialize_post_merge_receipts(
+        state,
+        target_sha=merge_sha,
+    )
+    state["canonical_sync"] = dict(state["post_merge"]["canonical_sync"])
+    required_post_merge = state["policy"]["post_merge_requirements"]
+    if any(required_post_merge.values()):
+        state["status"] = "post_merge_pending"
+        state["next_due_at"] = 0.0
+    else:
+        state["status"] = "post_merge_complete"
+        state["next_due_at"] = None
     state["telemetry"]["last_transition"] = "observed_direct_completion"
     return state

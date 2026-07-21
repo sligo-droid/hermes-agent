@@ -150,23 +150,29 @@ async def test_sentinel_cleaned_up_on_exception():
 
 
 # ------------------------------------------------------------------
-# Test 4: Second message during sentinel sees "already running"
+# Test 4: Second message during sentinel joins the claimed turn
 # ------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_second_message_during_sentinel_queued_not_duplicate():
+async def test_second_message_during_sentinel_folds_not_duplicate():
     """While the sentinel is set (agent setup in progress), a second
-    message for the same session must hit the 'already running' branch
-    and be queued — not start a second agent."""
+    text message must join that claimed turn — not start another agent or
+    become an independent queued turn."""
     runner = _make_runner()
     event1 = _make_event(text="first message")
     event2 = _make_event(text="second message")
     session_key = build_session_key(event1.source)
 
     barrier = asyncio.Event()
+    folded_message = None
 
     async def slow_inner(self_inner, ev, src, qk, generation):
+        nonlocal folded_message
         # Simulate slow setup — wait until test tells us to proceed
         await barrier.wait()
+        folded_message = runner._fold_start_user_followups(
+            ev.text or "",
+            runner._consume_start_user_followups(qk, generation),
+        )
         return "ok"
 
     with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
@@ -182,20 +188,22 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
         # Verify sentinel is set
         assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
-        # Second message should see "already running" and be queued
+        # Second message sees the startup sentinel and is accepted silently.
         result2 = await runner._handle_message(event2)
-        assert "queued" in result2.lower()
+        assert result2 is None
 
-        # The second message should have been queued in adapter pending
+        # It must not enter the next-turn adapter queue.
         adapter = runner.adapters[Platform.TELEGRAM]
-        assert session_key in adapter._pending_messages, (
-            "Second message should be queued as pending"
-        )
-        assert adapter._pending_messages[session_key] is event2
+        assert session_key not in adapter._pending_messages
 
         # Let first message complete
         barrier.set()
         await task1
+        assert folded_message == (
+            "first message\n\n"
+            "[Additional message from the same user while this turn was starting]\n"
+            "second message"
+        )
 
 
 def test_merge_pending_message_event_merges_text_and_photo_followups():
