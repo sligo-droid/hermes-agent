@@ -225,8 +225,8 @@ class TestBusySessionAck:
         assert result is not None and "safe boundary" in str(result)
 
     @pytest.mark.asyncio
-    async def test_sends_ack_when_agent_running(self):
-        """First message during busy session should get a status ack."""
+    async def test_interrupt_mode_is_silent_and_interrupts_agent(self):
+        """Interrupt follow-ups act immediately without a noise bubble."""
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -251,17 +251,7 @@ class TestBusySessionAck:
         result = await runner._handle_active_session_busy_message(event, sk)
 
         assert result is True  # handled
-        # Verify ack was sent
-        adapter._send_with_retry.assert_called_once()
-        call_kwargs = adapter._send_with_retry.call_args
-        content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        if not content and call_kwargs.args:
-            # positional args
-            content = str(call_kwargs)
-        assert "Interrupting" in content or "respond" in content
-        assert "/stop" not in content  # no need — we ARE interrupting
-
-        # Verify agent interrupt was called
+        adapter._send_with_retry.assert_not_called()
         agent.interrupt.assert_called_once_with("Are you working?")
 
     @pytest.mark.asyncio
@@ -504,8 +494,12 @@ class TestBusySessionAck:
         assert "Steered" not in content
 
     @pytest.mark.asyncio
-    async def test_steer_mode_falls_back_to_queue_when_agent_pending(self):
-        """If agent is still starting (sentinel), steer mode falls back to queue."""
+    async def test_steer_mode_folds_into_claimed_turn_when_agent_pending(
+        self,
+        monkeypatch,
+    ):
+        """Startup-time steering stays in the claimed turn exactly once."""
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", "false")
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "steer"
         adapter = _make_adapter()
@@ -516,15 +510,14 @@ class TestBusySessionAck:
 
         # Agent is still being set up — sentinel in place
         runner._running_agents[sk] = sentinel
+        runner._session_run_generation = {sk: 7}
+        runner._open_start_user_followups(sk, 7)
 
         await runner._handle_active_session_busy_message(event, sk)
 
-        # Event was queued instead of steered (FIFO path, #43066)
-        assert adapter._pending_messages.get(sk) is event
-
-        call_kwargs = adapter._send_with_retry.call_args
-        content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the immediate next turn" in content
+        assert sk not in adapter._pending_messages
+        assert runner._consume_start_user_followups(sk, 7) == ["arrived too early"]
+        adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_interrupt_mode_text_followups_fifo_not_merged(self):
@@ -576,7 +569,8 @@ class TestBusySessionAck:
     async def test_debounce_suppresses_rapid_acks(self):
         """Second message within 30s should NOT send another ack."""
         runner, sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
         adapter = _make_adapter()
 
         event1 = _make_event(text="hello?")
@@ -612,14 +606,14 @@ class TestBusySessionAck:
         assert result2 is True
         assert adapter._send_with_retry.call_count == 1  # still 1, no new ack
 
-        # But interrupt should still be called for both (since we are in interrupt mode)
-        assert agent.interrupt.call_count == 2
+        agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_ack_after_cooldown_expires(self):
         """After 30s cooldown, a new message should send a fresh ack."""
         runner, sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
         adapter = _make_adapter()
 
         event = _make_event(text="hello?")
@@ -660,7 +654,8 @@ class TestBusySessionAck:
             lambda: {"display": {"platforms": {"telegram": {"busy_ack_detail": True}}}},
         )
         runner, sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
         adapter = _make_adapter()
 
         event = _make_event(text="yo")
@@ -688,10 +683,11 @@ class TestBusySessionAck:
         assert "10 min" in content  # elapsed
 
     @pytest.mark.asyncio
-    async def test_telegram_omits_status_detail_by_default(self):
-        """Telegram busy acks stay concise unless busy_ack_detail is enabled."""
+    async def test_telegram_queue_ack_omits_status_detail_by_default(self):
+        """Telegram queue acks stay concise unless busy_ack_detail is enabled."""
         runner, sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
         adapter = _make_adapter()
 
         event = _make_event(text="yo")
@@ -713,7 +709,7 @@ class TestBusySessionAck:
         await runner._handle_active_session_busy_message(event, sk)
 
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Interrupting current task" in content
+        assert "Queued for the next turn" in content
         assert "21/60" not in content
         assert "terminal" not in content
         assert "10 min" not in content
@@ -815,8 +811,8 @@ class TestBusySessionAck:
         assert event.defer_work_completion is True
 
     @pytest.mark.asyncio
-    async def test_pending_sentinel_no_interrupt(self):
-        """When agent is PENDING_SENTINEL, don't call interrupt (it has no method)."""
+    async def test_pending_sentinel_folds_interrupt_text_without_second_turn(self):
+        """Interrupt text received during startup joins the claimed turn."""
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -826,12 +822,36 @@ class TestBusySessionAck:
 
         runner._running_agents[sk] = sentinel
         runner._running_agents_ts[sk] = time.time()
+        runner._session_run_generation = {sk: 3}
+        runner._open_start_user_followups(sk, 3)
         runner.adapters[event.source.platform] = adapter
 
         result = await runner._handle_active_session_busy_message(event, sk)
         assert result is True
-        # Should still send ack
-        adapter._send_with_retry.assert_called_once()
+        assert sk not in adapter._pending_messages
+        assert runner._consume_start_user_followups(sk, 3) == ["hey"]
+        adapter._send_with_retry.assert_not_called()
+
+    def test_start_user_followups_are_generation_scoped_and_user_role_folded(self):
+        runner, _sentinel = _make_runner()
+        event = _make_event(text="include the pull-down step")
+        sk = build_session_key(event.source)
+
+        runner._session_run_generation = {sk: 4}
+        runner._open_start_user_followups(sk, 4)
+        assert runner._stage_start_user_followup(sk, event) is True
+
+        runner._session_run_generation[sk] = 5
+        runner._open_start_user_followups(sk, 5)
+        assert runner._consume_start_user_followups(sk, 4) == [
+            "include the pull-down step"
+        ]
+        assert runner._consume_start_user_followups(sk, 5) == []
+        assert runner._fold_start_user_followups("first request", ["also do this"]) == (
+            "first request\n\n"
+            "[Additional message from the same user while this turn was starting]\n"
+            "also do this"
+        )
 
     @pytest.mark.asyncio
     async def test_no_adapter_falls_through(self):
@@ -889,7 +909,7 @@ class TestBusySessionOnboardingHint:
     """First-touch hint appended to the busy-ack the first time it fires."""
 
     @pytest.mark.asyncio
-    async def test_first_busy_ack_appends_interrupt_hint(self, tmp_path, monkeypatch):
+    async def test_first_busy_ack_appends_steer_hint(self, tmp_path, monkeypatch):
         """First busy-while-running message gets an extra hint about /busy."""
         import gateway.run as _gr
 
@@ -899,7 +919,7 @@ class TestBusySessionOnboardingHint:
         monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
 
         runner, _sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
+        runner._busy_input_mode = "steer"
         adapter = _make_adapter()
 
         event = _make_event(text="ping")
@@ -911,6 +931,7 @@ class TestBusySessionOnboardingHint:
             "current_tool": None, "last_activity_ts": time.time(),
             "last_activity_desc": "api", "seconds_since_activity": 0.1,
         }
+        agent.steer.return_value = True
         runner._running_agents[sk] = agent
         runner._running_agents_ts[sk] = time.time() - 5
         runner.adapters[event.source.platform] = adapter
@@ -921,7 +942,7 @@ class TestBusySessionOnboardingHint:
         content = call_kwargs.kwargs.get("content", "")
 
         # Normal ack body
-        assert "Interrupting" in content
+        assert "Steered" in content
         # First-touch hint appended
         assert "First-time tip" in content
         assert "/busy queue" in content
@@ -948,7 +969,7 @@ class TestBusySessionOnboardingHint:
         )
 
         runner, _sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
+        runner._busy_input_mode = "steer"
         adapter = _make_adapter()
 
         event = _make_event(text="ping again")
@@ -960,6 +981,7 @@ class TestBusySessionOnboardingHint:
             "current_tool": None, "last_activity_ts": time.time(),
             "last_activity_desc": "api", "seconds_since_activity": 0.1,
         }
+        agent.steer.return_value = True
         runner._running_agents[sk] = agent
         runner._running_agents_ts[sk] = time.time() - 5
         runner.adapters[event.source.platform] = adapter
@@ -969,7 +991,7 @@ class TestBusySessionOnboardingHint:
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
 
-        assert "Interrupting" in content
+        assert "Steered" in content
         assert "First-time tip" not in content
         assert "/busy queue" not in content
 

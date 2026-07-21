@@ -188,10 +188,10 @@ def test_format_footer_renders_one_worker():
         ],
         fields=("workers",),
     )
-    assert out == "workers: codex gpt-5.6-luna/low"
+    assert out == "workers — coding: codex gpt-5.6-luna/low"
 
 
-def test_format_footer_renders_workers_and_collapses_consecutive_duplicates():
+def test_format_footer_groups_workers_and_collapses_duplicates():
     out = format_runtime_footer(
         model="",
         context_tokens=0,
@@ -210,8 +210,8 @@ def test_format_footer_renders_workers_and_collapses_consecutive_duplicates():
         fields=("workers",),
     )
     assert out == (
-        "workers: codex gpt-5.6-luna/low x2, "
-        "opencode gpt-5.6-sol/xhigh, codex gpt-5.6-luna/low"
+        "workers — coding: codex gpt-5.6-luna/low x3, "
+        "opencode gpt-5.6-sol/xhigh"
     )
 
 
@@ -231,8 +231,8 @@ def test_format_footer_includes_general_delegate_model_and_reasoning():
     )
 
     assert out == (
-        "workers: delegate gpt-5.6-sol/high, delegate gpt-5.6-terra/xhigh, "
-        "codex gpt-5.6-luna/medium x2"
+        "workers — coding: codex gpt-5.6-luna/medium x2; "
+        "delegates: delegate gpt-5.6-sol/high, delegate gpt-5.6-terra/xhigh"
     )
 
 
@@ -245,7 +245,7 @@ def test_format_footer_worker_omits_unknown_reasoning():
         worker_runs=[{"backend": "claude_code", "model": "claude-fable-5"}],
         fields=("workers",),
     )
-    assert out == "workers: claude_code claude-fable-5"
+    assert out == "workers — coding: claude_code claude-fable-5"
 
 
 def test_format_footer_workers_respect_field_order():
@@ -259,7 +259,32 @@ def test_format_footer_workers_respect_field_order():
         ],
         fields=("workers", "model"),
     )
-    assert out == "workers: codex gpt-5.6-luna/low · gpt-5.6-sol"
+    assert out == (
+        "gpt-5.6-sol\n"
+        "workers — coding: codex gpt-5.6-luna/low"
+    )
+
+
+def test_format_footer_visually_separates_requested_worker_sample(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/droid")
+    out = format_runtime_footer(
+        model="openai/gpt-5.6-sol",
+        context_tokens=5,
+        context_length=100,
+        cwd="/home/droid/workspaces/pid-discord-action-268d767ba329",
+        reasoning_effort="medium",
+        worker_runs=[
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "medium"},
+            {"backend": "codex", "model": "gpt-5.6-luna", "reasoning": "medium"},
+            {"backend": "delegate", "model": "gpt-5.6-sol", "reasoning": "high"},
+            {"backend": "delegate", "model": "gpt-5.6-terra", "reasoning": "high"},
+        ],
+    )
+    assert out == (
+        "gpt-5.6-sol · medium · 5% · ~/workspaces/pid-discord-action-268d767ba329\n"
+        "workers — coding: codex gpt-5.6-luna/medium x2; "
+        "delegates: delegate gpt-5.6-sol/high, delegate gpt-5.6-terra/high"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +411,7 @@ def test_build_footer_returns_rendered_when_enabled(monkeypatch, tmp_path):
     assert "gpt-5.4" in out
     assert "medium" in out
     assert "25%" in out
-    assert "workers: codex gpt-5.6-luna/low" in out
+    assert "workers — coding: codex gpt-5.6-luna/low" in out
 
 
 def test_build_footer_per_platform_off_suppresses():
@@ -431,7 +456,7 @@ def test_gateway_footer_builder_passes_worker_runs_from_agent_result():
         },
     )
 
-    assert out == "workers: codex gpt-5.6-luna/low"
+    assert out == "workers — coding: codex gpt-5.6-luna/low"
 
 
 def test_build_footer_no_data_returns_empty_even_when_enabled():

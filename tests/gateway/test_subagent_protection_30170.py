@@ -271,9 +271,7 @@ class TestBusyHandlerDemotesInterruptForSubagents:
             await runner._handle_active_session_busy_message(event, sk)
 
         parent.interrupt.assert_called_once_with("please stop")
-        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Interrupting" in content
-        assert "Subagent" not in content
+        adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_queue_mode_unchanged_with_subagents(self) -> None:
@@ -334,15 +332,16 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         event = _make_event(text="follow up before start")
         sk = build_session_key(event.source)
         runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+        runner._session_run_generation = {sk: 6}
+        runner._open_start_user_followups(sk, 6)
         runner.adapters[event.source.platform] = adapter
 
         with patch("gateway.run.merge_pending_message_event"):
             handled = await runner._handle_active_session_busy_message(event, sk)
 
         assert handled is True
-        # Sentinel can't be interrupted (no .interrupt to call) — verify
-        # that the helper still returns the "interrupting" copy because
-        # demotion did NOT fire (and the sentinel branch in the real
-        # handler just skips the interrupt call silently).
-        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Subagent working" not in content
+        assert runner._consume_start_user_followups(sk, 6) == [
+            "follow up before start"
+        ]
+        assert sk not in adapter._pending_messages
+        adapter._send_with_retry.assert_not_called()

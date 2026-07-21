@@ -209,6 +209,8 @@ class TestBusyHandlerDemotesInterruptForCompression:
         event = _make_event(text="hello")
         sk = build_session_key(event.source)
         runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+        runner._session_run_generation = {sk: 8}
+        runner._open_start_user_followups(sk, 8)
         runner.adapters[event.source.platform] = adapter
         runner._session_db._db.get_compression_lock_holder.return_value = "compressing"
 
@@ -216,3 +218,5 @@ class TestBusyHandlerDemotesInterruptForCompression:
             handled = await runner._handle_active_session_busy_message(event, sk)
 
         assert handled is True
+        assert runner._consume_start_user_followups(sk, 8) == ["hello"]
+        assert sk not in adapter._pending_messages

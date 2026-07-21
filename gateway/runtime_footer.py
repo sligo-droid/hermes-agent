@@ -1,7 +1,7 @@
 """Gateway runtime-metadata footer.
 
 Renders a compact footer showing runtime state (model, context %, cwd,
-reasoning, coding workers) and appends it to the final response of each
+reasoning, workers) and appends it to the final response of each
 completed agent turn when enabled.
 Off by default to keep replies minimal.
 
@@ -78,8 +78,11 @@ def _footer_fields(fields: Iterable[Any]) -> list[str]:
 
 
 def _format_worker_runs(worker_runs: Iterable[Any] | None) -> str:
-    """Render consecutive coding-worker runs with compact duplicate counts."""
-    collapsed: list[tuple[str, int]] = []
+    """Render coding workers separately from general delegates."""
+    grouped: dict[str, list[tuple[str, int]]] = {
+        "coding": [],
+        "delegates": [],
+    }
     for raw_run in worker_runs or []:
         if not isinstance(raw_run, dict):
             continue
@@ -91,18 +94,35 @@ def _format_worker_runs(worker_runs: Iterable[Any] | None) -> str:
         label = f"{backend} {model}"
         if reasoning:
             label += f"/{reasoning}"
-        if collapsed and collapsed[-1][0] == label:
-            previous_label, count = collapsed[-1]
-            collapsed[-1] = (previous_label, count + 1)
+        group_name = "delegates" if backend.lower() == "delegate" else "coding"
+        collapsed = grouped[group_name]
+        existing_index = next(
+            (
+                index
+                for index, (existing, _count) in enumerate(collapsed)
+                if existing == label
+            ),
+            None,
+        )
+        if existing_index is not None:
+            previous_label, count = collapsed[existing_index]
+            collapsed[existing_index] = (previous_label, count + 1)
         else:
             collapsed.append((label, 1))
-    if not collapsed:
+
+    rendered_groups: list[str] = []
+    for group_name in ("coding", "delegates"):
+        collapsed = grouped[group_name]
+        if not collapsed:
+            continue
+        rendered = [
+            f"{label} x{count}" if count > 1 else label
+            for label, count in collapsed
+        ]
+        rendered_groups.append(f"{group_name}: {', '.join(rendered)}")
+    if not rendered_groups:
         return ""
-    rendered = [
-        f"{label} x{count}" if count > 1 else label
-        for label, count in collapsed
-    ]
-    return "workers: " + ", ".join(rendered)
+    return "workers — " + "; ".join(rendered_groups)
 
 
 def resolve_footer_config(
@@ -156,6 +176,7 @@ def format_runtime_footer(
     partially-populated footer is better than a line with ``?%`` or empty slots.
     """
     parts: list[str] = []
+    workers_line = ""
     for field in fields:
         if field == "model":
             m = _model_short(model)
@@ -183,12 +204,13 @@ def format_runtime_footer(
         elif field == "workers":
             workers = _format_worker_runs(worker_runs)
             if workers:
-                parts.append(workers)
+                workers_line = workers
         # Unknown field names are silently ignored.
 
-    if not parts:
-        return ""
-    return _SEP.join(parts)
+    metadata_line = _SEP.join(parts)
+    if metadata_line and workers_line:
+        return f"{metadata_line}\n{workers_line}"
+    return metadata_line or workers_line
 
 
 def build_footer_line(

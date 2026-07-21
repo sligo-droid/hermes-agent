@@ -14,7 +14,7 @@ Covers:
 - timeout fail-open: a stuck holder degrades to unserialized with a degraded
   token, never a wedged session, and the degraded token releases nothing
 - registry stays bounded; live leases are never evicted
-- GatewayRunner._release_turn_lease wiring (bare-runner safe, token-scoped)
+- GatewayRunner cleanup wiring (bare-runner safe, token-scoped, stale-safe)
 """
 
 import asyncio
@@ -301,5 +301,37 @@ def test_runner_release_turn_lease_is_token_scoped_and_bare_safe():
         assert runner._release_turn_lease("key-a", 1) is False
         # Empty key guard.
         assert runner._release_turn_lease("", 1) is False
+
+    _run(scenario())
+
+
+def test_running_state_cleanup_releases_stale_generation_turn_lease():
+    """A stale routing generation must not strand its transcript lease."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._turn_lease_tokens = {}
+    runner._session_run_generation = {"key-a": 2}
+    runner._active_session_leases = {}
+    runner._running_agents = {"key-a": object()}
+    runner._running_agents_ts = {"key-a": 1.0}
+    runner._busy_ack_ts = {}
+    runner._refresh_active_agent_runtime_status = lambda: None
+
+    async def scenario():
+        token = await runner._turn_leases.acquire(
+            "sess-r", owner_key="key-a", generation=1, timeout=5
+        )
+        runner._turn_lease_tokens[("key-a", 1)] = token
+
+        # Generation 2 still owns the routing slot, so its state is preserved.
+        # Generation 1's exact transcript lease must nevertheless be released.
+        assert runner._release_running_agent_state(
+            "key-a", run_generation=1
+        ) is False
+        assert runner._turn_leases._leases["sess-r"].holder is None
+        assert token.released is True
+        assert "key-a" in runner._running_agents
 
     _run(scenario())

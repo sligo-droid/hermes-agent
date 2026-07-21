@@ -2130,6 +2130,10 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
     "_pending_turn_sidecar_notes",
+    # Same-turn user follow-ups accepted while the run still owns only the
+    # startup sentinel. They are generation-scoped and consumed before inbound
+    # preprocessing; conversation-boundary cleanup is a final leak guard.
+    "_pending_start_user_followups",
 )
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
@@ -3784,6 +3788,7 @@ class _GatewayRunnerCore(
     _pending_one_turn_model_restores: Dict[str, Dict[str, Any]] = {}
     _session_service_tier_overrides: Dict[str, Optional[str]] = {}
     _pending_turn_sidecar_notes: Dict[str, List[str]] = {}
+    _pending_start_user_followups: Dict[str, Dict[int, List[str]]] = {}
     _session_ephemeral_pin: Dict[str, tuple] = {}
     _session_vc_last: Dict[str, str] = {}
     _startup_restore_in_progress: bool = False
@@ -3896,6 +3901,8 @@ class _GatewayRunnerCore(
         self._active_session_leases: Dict[str, Any] = {}
         self._turn_leases = SessionTurnLeaseRegistry()
         self._turn_lease_tokens: Dict[tuple, Any] = {}
+        self._pending_start_user_followups: Dict[str, Dict[int, List[str]]] = {}
+        self._pending_start_user_followups_lock = threading.Lock()
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Last successfully-resolved (non-empty) model, keyed by session. Used
         # as a fallback when a fresh config read transiently returns an empty
@@ -5762,6 +5769,119 @@ class _GatewayRunnerCore(
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    def _start_user_followup_lock(self):
+        """Return the lazy lock used by bare-runner-safe startup guidance."""
+        lock = self.__dict__.get("_pending_start_user_followups_lock")
+        if lock is None:
+            lock = threading.Lock()
+            self._pending_start_user_followups_lock = lock
+        return lock
+
+    def _open_start_user_followups(self, session_key: str, run_generation: int) -> None:
+        """Open the same-turn follow-up window for one claimed run."""
+        if not session_key:
+            return
+        with self._start_user_followup_lock():
+            pending = self.__dict__.setdefault("_pending_start_user_followups", {})
+            by_generation = pending.setdefault(session_key, {})
+            by_generation[run_generation] = []
+
+    def _stage_start_user_followup(
+        self,
+        session_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        """Stage text for the claimed turn while it still has only a sentinel.
+
+        Returning ``False`` means the same-turn window is closed or the payload
+        needs the normal media/queue pipeline. Callers must then preserve the
+        event through their existing fallback path rather than dropping it.
+        """
+        if (
+            not session_key
+            or event.message_type != MessageType.TEXT
+            or bool(getattr(event, "media_urls", None))
+        ):
+            return False
+        text = (event.text or "").strip()
+        if not text:
+            return False
+        generation = int(
+            (getattr(self, "_session_run_generation", None) or {}).get(
+                session_key,
+                0,
+            )
+        )
+        if generation <= 0:
+            return False
+        with self._start_user_followup_lock():
+            pending = self.__dict__.setdefault("_pending_start_user_followups", {})
+            by_generation = pending.get(session_key)
+            staged = by_generation.get(generation) if isinstance(by_generation, dict) else None
+            if staged is None:
+                return False
+            if len(staged) >= self._BUSY_QUEUE_MAX_PENDING:
+                return False
+            if sum(len(item) for item in staged) + len(text) > 32_000:
+                return False
+            staged.append(text)
+        logger.debug(
+            "Folded busy follow-up into starting turn for session %s generation %s",
+            session_key,
+            generation,
+        )
+        return True
+
+    def _consume_start_user_followups(
+        self,
+        session_key: str,
+        run_generation: int,
+    ) -> List[str]:
+        """Atomically close and consume startup guidance for one run."""
+        if not session_key:
+            return []
+        with self._start_user_followup_lock():
+            pending = self.__dict__.setdefault("_pending_start_user_followups", {})
+            by_generation = pending.get(session_key)
+            if not isinstance(by_generation, dict):
+                return []
+            staged = by_generation.pop(run_generation, [])
+            if not by_generation:
+                pending.pop(session_key, None)
+        return list(staged) if isinstance(staged, list) else []
+
+    def _discard_start_user_followups(
+        self,
+        session_key: str,
+        run_generation: Optional[int] = None,
+    ) -> None:
+        """Discard unconsumed startup guidance during turn teardown."""
+        if not session_key:
+            return
+        with self._start_user_followup_lock():
+            pending = self.__dict__.setdefault("_pending_start_user_followups", {})
+            if run_generation is None:
+                pending.pop(session_key, None)
+                return
+            by_generation = pending.get(session_key)
+            if not isinstance(by_generation, dict):
+                return
+            by_generation.pop(run_generation, None)
+            if not by_generation:
+                pending.pop(session_key, None)
+
+    @staticmethod
+    def _fold_start_user_followups(message: str, followups: List[str]) -> str:
+        """Keep startup follow-ups in the same user-role turn without uplift."""
+        result = str(message or "").strip()
+        for text in followups:
+            block = (
+                "[Additional message from the same user while this turn was starting]\n"
+                f"{text}"
+            )
+            result = f"{result}\n\n{block}" if result else block
+        return result
+
     def _ledger(self):
         ledger = getattr(self, "work_ledger", None)
         if ledger is None:
@@ -6196,12 +6316,12 @@ class _GatewayRunnerCore(
         if running_agent is None:
             running_agent = self._running_agents.get(session_key)
         text = (event.text or "").strip()
-        if (
-            running_agent is None
-            or running_agent is _AGENT_PENDING_SENTINEL
-            or not hasattr(running_agent, "steer")
-            or not text
-        ):
+        if running_agent is _AGENT_PENDING_SENTINEL:
+            if self._stage_start_user_followup(session_key, event):
+                return "accepted"
+            self._queue_or_replace_pending_event(session_key, event)
+            return "unsupported"
+        if running_agent is None or not hasattr(running_agent, "steer") or not text:
             self._queue_or_replace_pending_event(session_key, event)
             return "unsupported"
         try:
@@ -6389,9 +6509,9 @@ class _GatewayRunnerCore(
             return False
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
-        # queueing + interrupting.  If the agent isn't running yet
-        # (sentinel) or lacks steer(), or the payload is empty, fall back
-        # to queue semantics so nothing is lost.
+        # queueing + interrupting. While the claimed turn still owns only the
+        # startup sentinel, stage plain text for that same turn; unsupported,
+        # closed, empty, and media payloads retain the queue fallback.
         # #30170 — Subagent protection. ``AIAgent.interrupt()`` cascades
         # to every entry in the parent's ``_active_children`` list and
         # aborts in-flight ``delegate_task`` work. Demote ``interrupt``
@@ -6413,6 +6533,7 @@ class _GatewayRunnerCore(
             effective_mode = "queue"
         demoted_for_compression = (
             effective_mode == "interrupt"
+            and running_agent is not _AGENT_PENDING_SENTINEL
             and await self._session_has_compression_in_flight(session_key)
         )
         if demoted_for_compression:
@@ -6423,6 +6544,15 @@ class _GatewayRunnerCore(
             )
             effective_mode = "queue"
         steer_outcome = None
+        start_followup_accepted = False
+        if (
+            effective_mode == "interrupt"
+            and running_agent is _AGENT_PENDING_SENTINEL
+        ):
+            start_followup_accepted = self._stage_start_user_followup(
+                session_key,
+                event,
+            )
         if effective_mode == "steer":
             steer_outcome = self._try_steer_busy_event(
                 event,
@@ -6436,7 +6566,7 @@ class _GatewayRunnerCore(
         # current run finishes (or is interrupted).  Skip this for a
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
-        if steer_outcome is None:
+        if steer_outcome is None and not start_followup_accepted:
             self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
@@ -6462,7 +6592,15 @@ class _GatewayRunnerCore(
                     interrupt_text = _build_media_placeholder(event)
                 running_agent.interrupt(interrupt_text)
             except Exception:
-                pass  # don't let interrupt failure block the ack
+                pass  # don't let interrupt failure block input handling
+
+        # Interrupt-mode follow-ups either joined the startup turn or were
+        # queued above as replacement input. A separate confirmation bubble
+        # adds noise, so keep this mode silent. Queue and steer retain their
+        # configurable status acknowledgements.
+        if effective_mode == "interrupt":
+            logger.debug("Busy interrupt ack suppressed for session %s", session_key)
+            return True
 
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
@@ -15556,14 +15694,15 @@ class _GatewayRunnerCore(
                     return "Usage: /steer <prompt>"
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent is _AGENT_PENDING_SENTINEL:
-                    # Agent hasn't started yet — queue as turn-boundary fallback.
-                    queued_event = dataclasses.replace(
+                    staged_event = dataclasses.replace(
                         event,
                         text=steer_text,
                         message_type=MessageType.TEXT,
                     )
-                    self._queue_or_replace_pending_event(_quick_key, queued_event)
-                    return "Agent still starting — queued for the immediate next turn."
+                    if self._stage_start_user_followup(_quick_key, staged_event):
+                        return "⏩ Folded into the turn that is starting."
+                    self._queue_or_replace_pending_event(_quick_key, staged_event)
+                    return "Agent startup intake closed — queued for the immediate next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
                         accepted = running_agent.steer(steer_text)
@@ -15751,13 +15890,9 @@ class _GatewayRunnerCore(
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
-                if self._busy_input_mode == "steer":
-                    self._try_steer_busy_event(
-                        event,
-                        _quick_key,
-                        running_agent=running_agent,
-                    )
-                    return "⏳ Queued for the immediate next turn — the agent is still starting."
+                if self._busy_input_mode in {"steer", "interrupt"}:
+                    if self._stage_start_user_followup(_quick_key, event):
+                        return None
                 # Queue the message so it will be picked up after the agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
@@ -16436,6 +16571,7 @@ class _GatewayRunnerCore(
         self._running_agents_ts[_quick_key] = time.time()
         self._refresh_active_agent_runtime_status()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        self._open_start_user_followups(_quick_key, _run_generation)
         _work_item_id = str(getattr(event, "work_item_id", "") or "")
         if _work_item_id and getattr(source, "platform", None) == Platform.DISCORD:
             try:
@@ -16497,6 +16633,11 @@ class _GatewayRunnerCore(
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            # The transcript lease is independent from the routing-key busy
+            # guard. Always release this turn's exact token, including early
+            # failures before _run_agent installs a real agent. Normal
+            # _run_agent cleanup also releases it; the helper is idempotent.
+            self._release_turn_lease(_quick_key, _run_generation)
             if getattr(event, "fable_plan_metadata", None):
                 previous_override = getattr(event, "fable_previous_model_override", None)
                 if previous_override is None:
@@ -17883,6 +18024,19 @@ class _GatewayRunnerCore(
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
+        _starting_followups = self._consume_start_user_followups(
+            _quick_key,
+            run_generation,
+        )
+        if _starting_followups:
+            # Mutate only the text on the owned intake event. dataclasses.replace
+            # would discard transient attributes attached by Discord/Fable/
+            # background-completion paths that are not declared dataclass fields.
+            event.text = self._fold_start_user_followups(
+                event.text or "",
+                _starting_followups,
+            )
+
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event,
             source=source,
@@ -26915,6 +27069,12 @@ class _GatewayRunnerCore(
         """
         if not session_key:
             return False
+        # Release the exact old transcript token even when the routing-state
+        # generation guard below rejects stale cleanup. Otherwise a stopped or
+        # completed turn can strand later turns until the 30-minute fail-open.
+        if run_generation is not None:
+            self._release_turn_lease(session_key, run_generation)
+        self._discard_start_user_followups(session_key, run_generation)
         if run_generation is not None and not self._is_session_run_current(
             session_key, run_generation
         ):

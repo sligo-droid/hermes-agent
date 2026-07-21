@@ -5,8 +5,7 @@ interrupting. The gateway runner must:
 
   1. When an agent IS running → call ``agent.steer(text)``, do NOT set
      ``_interrupt_requested``, do NOT touch ``_pending_messages``.
-  2. When the agent is the PENDING sentinel → fall back to /queue
-     semantics (store in ``adapter._pending_messages``).
+  2. When the agent is the PENDING sentinel → fold into that claimed turn.
   3. When no agent is active → strip the slash prefix and let the normal
      prompt pipeline handle it as a regular user message.
 """
@@ -131,22 +130,22 @@ async def test_steer_without_payload_returns_usage():
 
 
 @pytest.mark.asyncio
-async def test_steer_with_pending_sentinel_falls_back_to_queue():
-    """When the agent hasn't finished booting (sentinel), /steer should
-    queue as a turn-boundary follow-up instead of crashing."""
+async def test_steer_with_pending_sentinel_folds_into_claimed_turn():
+    """Startup-time /steer guidance must not become a second turn."""
     from gateway.run import _AGENT_PENDING_SENTINEL
 
     runner, adapter = _make_runner(_session_entry())
     sk = build_session_key(_make_source())
     runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+    runner._session_run_generation = {sk: 2}
+    runner._open_start_user_followups(sk, 2)
 
     result = await runner._handle_message(_make_event("/steer wait up"))
 
     assert result is not None
-    assert "queued" in result.lower() or "starting" in result.lower()
-    # The fallback put the text into the adapter's pending queue.
-    assert sk in adapter._pending_messages
-    assert adapter._pending_messages[sk].text == "wait up"
+    assert "folded" in result.lower() or "starting" in result.lower()
+    assert sk not in adapter._pending_messages
+    assert runner._consume_start_user_followups(sk, 2) == ["wait up"]
 
 
 @pytest.mark.asyncio
