@@ -964,12 +964,27 @@ def merge_model_verbosity_request_overrides(
     api_mode: str,
     verbosity,
 ) -> dict | None:
-    """Merge the fork's Responses API text-verbosity override safely."""
+    """Merge the fork's Responses API text-verbosity override safely.
+
+    ``request_overrides`` can outlive the route that created it when the main
+    agent activates a fallback provider. Remove the Responses-only ``text``
+    field when the effective route is no longer Responses API; the OpenAI SDK
+    rejects that field before a Chat Completions request is sent.
+    """
     overrides = (
         dict(request_overrides) if isinstance(request_overrides, dict) else None
     )
     normalized = str(verbosity or "").strip().lower()
-    if api_mode != "codex_responses" or normalized not in VALID_MODEL_VERBOSITIES:
+    if api_mode != "codex_responses":
+        if overrides is None:
+            return None
+        # ``text`` is a Responses-only top-level request field.  Strip the
+        # whole object rather than only ``verbosity`` so an accompanying
+        # ``format`` value cannot trigger the same SDK TypeError.
+        overrides.pop("text", None)
+        return overrides or None
+
+    if normalized not in VALID_MODEL_VERBOSITIES:
         return overrides
 
     if overrides is None:

@@ -100,6 +100,18 @@ class TestBuildApiKwargsOpenRouter:
         assert "model" in kwargs
         assert kwargs["messages"][-1]["content"] == "hi"
 
+    def test_strips_stale_responses_verbosity_after_fallback(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.request_overrides = {
+            "service_tier": "priority",
+            "text": {"verbosity": "low"},
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["service_tier"] == "priority"
+        assert "text" not in kwargs
+
     def test_includes_reasoning_in_extra_body(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         agent.model = "anthropic/claude-sonnet-4-20250514"
