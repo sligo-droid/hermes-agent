@@ -415,6 +415,8 @@ class TestBuildSessionContextPrompt:
         assert "`/home/droid/.hermes/workspace/PID`" in prompt
         assert "not the Hermes Agent codebase" in prompt
         assert "use this project path explicitly" in prompt
+        assert "discover workflows" in prompt
+        assert "guessed display name" in prompt
         assert prompt.index("http://localhost:3000/") < prompt.index("https://dev.pid.example/")
         assert prompt.index("https://dev.pid.example/") < prompt.index("https://pid.example/")
         assert "production target only when navigation" in prompt

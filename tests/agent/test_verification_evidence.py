@@ -621,6 +621,119 @@ def test_protected_canonical_checkout_guardrail_is_not_failed_verification_evide
     assert agent._turn_runtime_stats.get("verification_evidence", []) == []
 
 
+def test_missing_workflow_lookup_is_not_negative_ci_or_deployment_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": "could not find any workflows named Deploy Local Dashboard",
+            "exit_code": 1,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 0.2, result, True)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "gh run list --repo sligo-labs/PID "
+                "--workflow 'Deploy Local Dashboard' --limit 3 "
+                "--json databaseId,headSha,status,conclusion,createdAt,url"
+            )
+        },
+        result,
+        True,
+    )
+
+    assert agent._turn_runtime_stats.get("verification_evidence", []) == []
+
+
+def test_review_transcript_does_not_turn_completed_contests_and_status_into_ci_claim():
+    text = (
+        "Review limitation: local development was reachable but required admin authentication; "
+        "external development returned Cloudflare Tunnel error 1033. "
+        "Upcoming and completed contests are separated. "
+        "Group candidates by meaningful status and report findings."
+    )
+    legacy_evidence = [
+        {
+            "surface": "ci",
+            "check_name": (
+                "gh run list --repo sligo-labs/PID "
+                "--workflow 'Deploy Local Dashboard' --limit 3"
+            ),
+            "status": "failure",
+            "order": 24,
+            "detail": "could not find any workflows named Deploy Local Dashboard",
+        }
+    ]
+
+    downgraded, constraints = downgrade_final_response_for_evidence(text, legacy_evidence)
+
+    assert constraints["allowed"] is True
+    assert downgraded == text
+
+
+def test_browser_auth_and_error_pages_are_not_successful_verification_evidence():
+    cases = [
+        (
+            "http://127.0.0.1:5173/races",
+            '<untrusted_tool_result source="browser_navigate"> '
+            '{"success":true,"url":"http://127.0.0.1:5173/races",'
+            '"title":"Sign In to Races | Agora","snapshot":"Sign In Username Password"}',
+            {"browser"},
+        ),
+        (
+            "https://pid.sligolabs.com/races",
+            '<untrusted_tool_result source="browser_navigate"> '
+            '{"success":true,"url":"https://pid.sligolabs.com/races",'
+            '"title":"Cloudflare Tunnel error | pid.sligolabs.com | Cloudflare",'
+            '"snapshot":"Error 1033"}',
+            {"browser", "production", "production_browser"},
+        ),
+    ]
+
+    for url, result, expected_surfaces in cases:
+        agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+        tool_executor._record_turn_tool_runtime(agent, "browser_navigate", 0.2, result, False)
+        tool_executor._record_turn_verification_evidence(
+            agent,
+            "browser_navigate",
+            {"url": url},
+            result,
+            False,
+        )
+
+        latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+        assert set(latest) == expected_surfaces
+        assert {item["status"] for item in latest.values()} == {"failure"}
+
+
+def test_normal_browser_navigation_remains_successful_browser_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "success": True,
+            "url": "http://127.0.0.1:3000/races",
+            "title": "Races | Agora",
+            "snapshot": "Races directory. Link: Sign In. Latest evidence available.",
+        }
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "browser_navigate", 0.2, result, False)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "browser_navigate",
+        {"url": "http://127.0.0.1:3000/races"},
+        result,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert latest["browser"]["status"] == "success"
+
+
 def test_verify_path_name_alone_is_not_verification_evidence():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     result = json.dumps(

@@ -1713,6 +1713,90 @@ def test_review_request_allows_negative_findings_about_uncommitted_manifest_path
     assert stored["completion_gate"]["delivery_intent"] == "review_only"
 
 
+def test_review_only_no_mutation_is_not_blocked_by_incidental_ci_lookup(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(
+        text=(
+            "do a review of our races tab and individual races pages. "
+            "Make the review thorough and individual."
+        )
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "Review complete. Local development required authentication; "
+            "recommendations are source-grounded and no files were changed."
+        ),
+        summary_status="Complete",
+        visual_qa_code_mutation_observed=False,
+        runtime_breakdown={
+            "mutation_generation": 0,
+            "mutation_boundary": 0,
+            "verification_evidence": [
+                {
+                    "surface": "ci",
+                    "check_name": (
+                        "gh run list --repo sligo-labs/PID "
+                        "--workflow 'Deploy Local Dashboard' --limit 3"
+                    ),
+                    "status": "failure",
+                    "order": 24,
+                    "detail": "could not find any workflows named Deploy Local Dashboard",
+                }
+            ],
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["delivery_intent"] == "review_only"
+
+
+def test_review_intent_with_observed_mutation_keeps_negative_evidence_gate(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="review only: inspect the page and report findings")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Updated the page and CI passed.",
+        summary_status="Complete",
+        visual_qa_code_mutation_observed=True,
+        runtime_breakdown={
+            "mutation_generation": 1,
+            "mutation_boundary": 2,
+            "verification_evidence": [
+                {
+                    "surface": "ci",
+                    "check_name": "scripts/run_tests.sh tests/ui",
+                    "status": "failure",
+                    "order": 3,
+                    "detail": "1 failed",
+                }
+            ],
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["reason"] == "latest_verification_evidence_negative"
+
+
 def test_uncommitted_changes_still_block_full_lifecycle_repo_work(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Implement the feature")

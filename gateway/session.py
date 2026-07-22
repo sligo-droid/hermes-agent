@@ -516,6 +516,11 @@ def build_session_context_prompt(
                 "  - Working directory: Gateway tools may start from Hermes home; "
                 "use this project path explicitly for project files and commands."
             )
+            lines.append(
+                "  - GitHub Actions rule: discover workflows from the checked-in "
+                "`.github/workflows/` files or `gh workflow list`; prefer a stable "
+                "workflow filename/path or numeric ID over a guessed display name."
+            )
             if src.project_inspection_candidates:
                 lines.append("  - Inspection targets, in required order:")
                 for candidate in src.project_inspection_candidates:
