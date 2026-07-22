@@ -552,9 +552,7 @@ def _discover_honcho_embedding_env() -> tuple[dict[str, str], str, str | None]:
             continue
         project = labels.get("com.docker.compose.project", "") if isinstance(labels, dict) else ""
         service = labels.get("com.docker.compose.service", "") if isinstance(labels, dict) else ""
-        image_path = str(image).split("@", 1)[0]
-        image_leaf = image_path.rsplit("/", 1)[-1].split(":", 1)[0].lower()
-        if service != "api" or project.lower() != "honcho" or image_leaf not in {"honcho", "honcho-api"}:
+        if service != "api" or project.lower() != "honcho":
             continue
 
         env: dict[str, str] = {}
