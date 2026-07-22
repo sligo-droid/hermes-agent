@@ -580,6 +580,29 @@ class TestModelVerbosityRequestOverrides:
             verbosity="low",
         ) is None
 
+    @pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages"])
+    def test_non_responses_modes_remove_stale_responses_verbosity(self, api_mode):
+        assert merge_model_verbosity_request_overrides(
+            {
+                "service_tier": "priority",
+                "text": {"verbosity": "low"},
+            },
+            api_mode=api_mode,
+            verbosity=None,
+        ) == {"service_tier": "priority"}
+
+    def test_non_responses_modes_remove_entire_responses_text_configuration(self):
+        assert merge_model_verbosity_request_overrides(
+            {
+                "text": {
+                    "verbosity": "low",
+                    "format": {"type": "text"},
+                },
+            },
+            api_mode="chat_completions",
+            verbosity=None,
+        ) is None
+
     @pytest.mark.parametrize("verbosity", ["", "verbose", None])
     def test_invalid_or_empty_verbosity_is_omitted(self, verbosity):
         assert merge_model_verbosity_request_overrides(

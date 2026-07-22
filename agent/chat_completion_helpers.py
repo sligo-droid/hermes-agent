@@ -1140,6 +1140,17 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
 
+    # A fallback can change ``api_mode`` in place while retaining request
+    # overrides assembled for the primary Responses API route. Normalize at
+    # the final API boundary so Responses-only fields never reach
+    # ``chat.completions.create()``.
+    from hermes_constants import merge_model_verbosity_request_overrides
+    _chat_request_overrides = merge_model_verbosity_request_overrides(
+        agent.request_overrides,
+        api_mode="chat_completions",
+        verbosity=None,
+    )
+
     # Provider detection flags
     _is_qwen = agent._is_qwen_portal()
     _is_or = agent._is_openrouter_url()
@@ -1218,7 +1229,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
-            request_overrides=agent.request_overrides,
+            request_overrides=_chat_request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
@@ -1250,7 +1261,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
-        request_overrides=agent.request_overrides,
+        request_overrides=_chat_request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
