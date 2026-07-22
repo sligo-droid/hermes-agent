@@ -52,6 +52,26 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        (None, "https://api.anthropic.com/v1/models"),
+        ("https://anthropic.example.com", "https://anthropic.example.com/v1/models"),
+        ("https://anthropic.example.com/v1/", "https://anthropic.example.com/v1/models"),
+    ],
+)
+def test_anthropic_models_url_respects_custom_base(monkeypatch, base_url, expected):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert doctor._anthropic_models_url(base_url) == expected
+
+
+def test_anthropic_models_url_uses_environment(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://tailnet-anthropic.example.com")
+    assert doctor._anthropic_models_url() == (
+        "https://tailnet-anthropic.example.com/v1/models"
+    )
+
+
 def test_doctor_gateway_memory_telemetry_reports_children(monkeypatch, capsys):
     monkeypatch.setattr(
         gateway_cli,
