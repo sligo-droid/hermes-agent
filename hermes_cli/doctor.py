@@ -990,6 +990,18 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
 _APIKEY_PROVIDERS_CACHE: list | None = None
 
 
+def _anthropic_models_url(base_url: str | None = None) -> str:
+    """Return the models probe URL for the configured Anthropic-compatible route."""
+    base = (
+        base_url
+        or os.getenv("ANTHROPIC_BASE_URL")
+        or "https://api.anthropic.com"
+    ).strip().rstrip("/")
+    if base.endswith("/v1"):
+        return base + "/models"
+    return base + "/v1/models"
+
+
 def _build_apikey_providers_list() -> list:
     """Build the API-key provider health-check list once and cache it.
 
@@ -2464,10 +2476,8 @@ def run_doctor(args):
                 headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
             else:
                 headers["x-api-key"] = key
-            r = httpx.get(
-                "https://api.anthropic.com/v1/models",
-                headers=headers, timeout=10,
-            )
+            models_url = _anthropic_models_url()
+            r = httpx.get(models_url, headers=headers, timeout=10)
             # Reactive recovery: OAuth subscriptions without 1M context reject the
             # request with 400 "long context beta is not yet available for this
             # subscription". Retry once with that beta stripped so the doctor
@@ -2482,10 +2492,7 @@ def run_doctor(args):
                     [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
                     + list(_OAUTH_ONLY_BETAS)
                 )
-                r = httpx.get(
-                    "https://api.anthropic.com/v1/models",
-                    headers=headers, timeout=10,
-                )
+                r = httpx.get(models_url, headers=headers, timeout=10)
             if r.status_code == 200:
                 return _ConnectivityResult(
                     "Anthropic API",
