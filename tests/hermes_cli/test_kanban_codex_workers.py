@@ -1330,6 +1330,10 @@ def test_worker_prompt_includes_dashboard_qa_auth_without_secret(monkeypatch, tm
 
     assert "Protected dashboard/browser QA auth contract" in prompt
     assert "hermes_qa" in prompt
+    assert "pnpm --dir dashboard qa:auth" in prompt
+    assert "PID_QA_USERNAME" in prompt
+    assert "role `user`" in prompt
+    assert "admin visual QA as blocked" in prompt
     assert "HERMES_DASHBOARD_PASSWORD" in prompt
     assert "Never print, log" in prompt
     assert "super-secret-dashboard-password" not in prompt
@@ -2359,6 +2363,33 @@ def test_worker_env_preserves_explicit_dashboard_username(monkeypatch):
 
     assert env["HERMES_DASHBOARD_USERNAME"] == "operator"
     assert env["HERMES_DASHBOARD_PASSWORD"] == "dashboard-secret"
+
+
+def test_worker_env_defaults_pid_qa_to_readonly_and_drops_admin_mode(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.setenv("PID_QA_USERNAME", "hermes_qa")
+    monkeypatch.setenv("PID_QA_PASSWORD", "pid-qa-secret")
+    monkeypatch.setenv("PID_QA_EXPECT_ADMIN", "true")
+    monkeypatch.setenv("PID_QA_EXPECT_READONLY", "false")
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+
+    env = workers._worker_env()
+
+    assert env["PID_QA_USERNAME"] == "hermes_qa"
+    assert env["PID_QA_PASSWORD"] == "pid-qa-secret"
+    assert env["PID_QA_EXPECT_READONLY"] == "true"
+    assert "PID_QA_EXPECT_ADMIN" not in env
+
+
+def test_pid_qa_credentials_are_explicitly_allowed_for_container_workers():
+    from hermes_cli import kanban_codex_workers as workers
+
+    assert workers._forward_env_to_worker_container("PID_QA_USERNAME")
+    assert workers._forward_env_to_worker_container("PID_QA_PASSWORD")
+    assert workers._forward_env_to_worker_container("PID_QA_EXPECT_READONLY")
+    assert not workers._forward_env_to_worker_container("PID_QA_EXPECT_ADMIN")
+    assert not workers._forward_env_to_worker_container("PID_SUPABASE_SERVICE_ROLE_KEY")
 
 
 def test_worker_env_loads_dashboard_password_from_config_env(monkeypatch):

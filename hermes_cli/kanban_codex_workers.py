@@ -33,7 +33,16 @@ _WORKER_CONTAINER_ENV_PREFIXES = (
     "PUBLIC_",
     "NEXT_PUBLIC_",
 )
-_WORKER_CONTAINER_ENV_KEYS = {"PYTHONPATH", "HOME"}
+_WORKER_CONTAINER_ENV_KEYS = {
+    "PYTHONPATH",
+    "HOME",
+    "PID_QA_USERNAME",
+    "PID_QA_PASSWORD",
+    "PID_QA_EXPECT_READONLY",
+    "PID_QA_BASE_URL",
+    "PID_QA_PATH",
+    "PID_QA_ENV_FILE",
+}
 _DASHBOARD_QA_USERNAME = "hermes_qa"
 
 _ROLE_DEFAULT_REASONING = {
@@ -407,12 +416,25 @@ def _configure_dashboard_qa_auth(env: dict[str, str]) -> None:
             env["HERMES_DASHBOARD_PASSWORD"] = password
 
 
+def _configure_pid_qa_auth(env: dict[str, str]) -> None:
+    """Keep PID QA workers on the read-only account contract by default.
+
+    PID's own ``qa:auth`` launcher loads the canonical read-only credential
+    file when the two credential variables are absent.  Preserve explicitly
+    forwarded credentials for that launcher, but never inherit an admin-mode
+    switch from the long-lived gateway environment.
+    """
+    env.pop("PID_QA_EXPECT_ADMIN", None)
+    env["PID_QA_EXPECT_READONLY"] = "true"
+
+
 def _worker_env() -> dict[str, str]:
     env = os.environ.copy()
     _strip_discord_credentials(env)
     _strip_inherited_codex_worker_state(env)
     _configure_discord_read_broker(env)
     _configure_dashboard_qa_auth(env)
+    _configure_pid_qa_auth(env)
     return env
 
 
