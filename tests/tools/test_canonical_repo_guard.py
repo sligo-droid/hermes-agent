@@ -131,6 +131,40 @@ def test_terminal_guard_allows_readonly_git_and_worktree_creation(tmp_path, monk
     )
 
 
+def test_terminal_guard_routes_compound_canonical_sync_to_trusted_closeout(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    repo = workspace / "PID"
+    _init_repo(repo)
+    _protect(monkeypatch, workspace)
+
+    msg = canonical_main_terminal_violation(
+        repo,
+        "git status --short --branch && git fetch origin --prune && git pull --ff-only origin main",
+    )
+
+    assert msg is not None
+    assert "Do not retry canonical synchronization through the terminal" in msg
+    assert "gateway trusted closeout owns exact-SHA canonical synchronization" in msg
+    assert "sync_canonical_checkout is manual/recovery-only" in msg
+
+
+def test_terminal_guard_routes_worktree_removal_to_mutable_cwd(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    repo = workspace / "PID"
+    _init_repo(repo)
+    _protect(monkeypatch, workspace)
+
+    msg = canonical_main_terminal_violation(
+        repo,
+        "git worktree remove /home/droid/workspaces/pid-pr-1044-verify",
+    )
+
+    assert msg is not None
+    assert "Temporary worktree cleanup" in msg
+    assert "workdir set to the mutable action worktree" in msg
+    assert "not from the protected canonical checkout" in msg
+
+
 def test_execute_code_refuses_project_mode_inside_protected_main(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     repo = workspace / "PID"
