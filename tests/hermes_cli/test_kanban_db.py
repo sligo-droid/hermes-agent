@@ -4779,6 +4779,11 @@ class TestSharedBoardPaths:
             "PATH": "/usr/bin",
             "OPENAI_API_KEY": "secret",
             "ANTHROPIC_API_KEY": "secret",
+            "PID_QA_USERNAME": "hermes_qa",
+            "PID_QA_PASSWORD": "pid-qa-secret",
+            "PID_QA_EXPECT_READONLY": "true",
+            "PID_QA_EXPECT_ADMIN": "true",
+            "PID_SUPABASE_SERVICE_ROLE_KEY": "pid-service-secret",
         }
 
         out = kb._systemd_worker_env(env)
@@ -4790,6 +4795,11 @@ class TestSharedBoardPaths:
         assert out["PATH"] == "/usr/bin"
         assert "OPENAI_API_KEY" not in out
         assert "ANTHROPIC_API_KEY" not in out
+        assert out["PID_QA_USERNAME"] == "hermes_qa"
+        assert out["PID_QA_PASSWORD"] == "pid-qa-secret"
+        assert out["PID_QA_EXPECT_READONLY"] == "true"
+        assert "PID_QA_EXPECT_ADMIN" not in out
+        assert "PID_SUPABASE_SERVICE_ROLE_KEY" not in out
 
     def test_spawn_systemd_worker_uses_transient_user_service(self, tmp_path, monkeypatch):
         calls = []
