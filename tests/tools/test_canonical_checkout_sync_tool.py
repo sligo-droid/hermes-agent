@@ -12,10 +12,15 @@ def _parent(*, depth: int = 0) -> SimpleNamespace:
 def test_is_registered_in_the_core_toolset():
     import tools.canonical_checkout_sync_tool  # noqa: F401
     from toolsets import _HERMES_CORE_TOOLS
+    from tools.canonical_checkout_sync_tool import SYNC_CANONICAL_CHECKOUT_SCHEMA
     from tools.registry import registry
 
     assert "sync_canonical_checkout" in _HERMES_CORE_TOOLS
     assert registry.get_entry("sync_canonical_checkout") is not None
+    description = SYNC_CANONICAL_CHECKOUT_SCHEMA["description"]
+    assert "Ordinary gateway Discord closeout must not call this proactively" in description
+    assert "trusted closeout owns synchronization" in description
+    assert "manual/recovery orchestration" in description
 
 
 def test_is_hidden_from_dispatcher_scoped_worker_schema(monkeypatch):

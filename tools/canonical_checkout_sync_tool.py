@@ -24,6 +24,9 @@ SYNC_CANONICAL_CHECKOUT_SCHEMA = {
     "description": (
         "Fast-forward a clean protected canonical checkout after a verified GitHub PR merge. "
         "Use only after confirming the PR is MERGED and obtaining its exact merge commit SHA. "
+        "Ordinary gateway Discord closeout must not call this proactively: trusted closeout "
+        "owns synchronization there. This tool is only for explicit manual/recovery "
+        "orchestration after trusted closeout reports a concrete blocker. "
         "This never resets, stashes, merges, or creates/pushes a PR."
     ),
     "parameters": {

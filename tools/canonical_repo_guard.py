@@ -281,6 +281,44 @@ def _is_read_only_terminal_command(command: str) -> bool:
     return True
 
 
+def _canonical_terminal_remediation(command: str) -> str | None:
+    """Return command-specific guidance for blocked canonical git operations."""
+    segments = _simple_command_segments(command)
+    if segments is None:
+        return None
+    git_commands: list[tuple[str, list[str]]] = []
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        if not tokens or tokens[0] != "git":
+            continue
+        subcommand, rest = _git_subcommand(tokens)
+        if subcommand:
+            git_commands.append((subcommand, rest))
+
+    if any(
+        subcommand == "worktree" and rest and rest[0] == "remove"
+        for subcommand, rest in git_commands
+    ):
+        return (
+            "Temporary worktree cleanup must be run with workdir set to the mutable "
+            "action worktree; rerun git worktree remove from there, not from the "
+            "protected canonical checkout."
+        )
+
+    sync_like_commands = {"pull", "checkout", "reset", "switch", "merge", "rebase"}
+    if any(subcommand in sync_like_commands for subcommand, _rest in git_commands):
+        return (
+            "Do not retry canonical synchronization through the terminal. For ordinary "
+            "Discord action turns, gateway trusted closeout owns exact-SHA canonical "
+            "synchronization after merge. sync_canonical_checkout is manual/recovery-only "
+            "after trusted closeout reports a concrete blocker."
+        )
+    return None
+
+
 def canonical_main_terminal_violation(workdir: str | Path, command: str) -> str | None:
     """Return a block message for non-read-only terminal commands on canonical main."""
     if _guard_disabled():
@@ -290,6 +328,13 @@ def canonical_main_terminal_violation(workdir: str | Path, command: str) -> str 
         return None
     if _is_read_only_terminal_command(command):
         return None
+    remediation = _canonical_terminal_remediation(command)
+    if remediation:
+        return (
+            "BLOCKED: refusing to run a non-read-only terminal command from a "
+            f"protected canonical checkout on {info.branch}: {info.repo_root}. "
+            f"Canonical project roots are inspection-only. {remediation}"
+        )
     return (
         "BLOCKED: refusing to run a non-read-only terminal command from a "
         f"protected canonical checkout on {info.branch}: {info.repo_root}. "
