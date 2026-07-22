@@ -122,13 +122,36 @@ _PROTECTED_CHECKOUT_GUARDRAIL_RE = re.compile(
     r"\bBLOCKED:\s*refusing to run a non-read-only terminal command from a protected canonical checkout\b",
     re.IGNORECASE,
 )
+_WORKFLOW_LOOKUP_ERROR_RE = re.compile(
+    r"\bcould not find any workflows? named\b|"
+    r"\bno workflows? (?:found|matched|matching)\b|"
+    r"\bworkflows?\b[^\n]{0,120}\b(?:not found|does not exist|unknown)\b|"
+    r"\b(?:not found|does not exist|unknown)\b[^\n]{0,120}\bworkflows?\b",
+    re.IGNORECASE,
+)
 _BROWSER_RE = re.compile(r"\b(browser|playwright|chromium|chrome|modal)\b", re.IGNORECASE)
+_BROWSER_AUTH_BOUNDARY_RE = re.compile(
+    r'''(?:"title"\s*:\s*"[^"\n]*\b(?:sign[ -]?in|log[ -]?in|login)\b)|'''
+    r"(?:<title>[^<\n]*\b(?:sign[ -]?in|log[ -]?in|login)\b)|"
+    r"\b(?:authentication required|authorization required|unauthorized)\b|"
+    r'''\btextbox\s+["']password["'][^\n]{0,240}\bbutton\s+["'](?:sign[ -]?in|log[ -]?in)["']''',
+    re.IGNORECASE,
+)
+_BROWSER_ERROR_PAGE_RE = re.compile(
+    r"\bcloudflare tunnel error\b|\berror\s*1033\b|"
+    r"\b(?:bad gateway|service unavailable|gateway timeout|internal server error)\b",
+    re.IGNORECASE,
+)
 _PRODUCTION_RE = re.compile(
     r"\b(production|prod|deployed?|live)\b|"
     r"https?://(?!(?:127(?:\.\d{1,3}){3}|localhost|0\.0\.0\.0|\[::1\])(?::|/|$))",
     re.IGNORECASE,
 )
 _CI_RE = re.compile(r"\b(ci|checks?|status|gh\s+pr\s+checks|test|tests|pytest|vitest)\b", re.IGNORECASE)
+_CI_CLAIM_RE = re.compile(
+    r"\b(?:ci|continuous integration|tests?|pytest|vitest|pr checks?|build checks?)\b",
+    re.IGNORECASE,
+)
 _CI_COMMAND_RE = re.compile(
     r"\b(?:ci|checks?|status|gh\s+pr\s+checks|pytest|vitest)\b|"
     r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:[^\s;&|]*[-:]?)?(?:test|tests|check|verify|verification)\b|"
@@ -194,7 +217,7 @@ def _surfaces_for(tool_name: str, check_name: str, detail: str) -> list[str]:
         surfaces.append("pr")
     if _DEPLOY_RE.search(haystack):
         surfaces.append("deployment")
-    if _BROWSER_RE.search(haystack):
+    if tool_name.startswith("browser") or _BROWSER_RE.search(haystack):
         surfaces.append("browser")
     if _PRODUCTION_RE.search(haystack):
         surfaces.append("production")
@@ -601,6 +624,13 @@ def classify_tool_verification_evidence(
     if name == "terminal":
         if not _terminal_command_looks_like_verification(check_name):
             return []
+        # A miss while resolving a workflow identity says nothing about the
+        # state of CI or a deployment. In particular, ``gh run list`` exits 1
+        # when a guessed display name does not exist. Recording that as a
+        # failed run turns a configuration/lookup mistake into false negative
+        # delivery evidence.
+        if _WORKFLOW_LOOKUP_ERROR_RE.search(result_text):
+            return []
     elif not name.startswith("browser") and name not in {"webfetch", "web_search"}:
         return []
 
@@ -613,6 +643,14 @@ def classify_tool_verification_evidence(
             status = "success"
     if status == "success" and result_text and _TIMEOUT_RE.search(result_text):
         status = "timeout"
+    if name.startswith("browser") and status == "success" and (
+        _BROWSER_AUTH_BOUNDARY_RE.search(result_text)
+        or _BROWSER_ERROR_PAGE_RE.search(result_text)
+    ):
+        # Navigation transport success is not page verification. A login wall
+        # leaves the requested authenticated surface unverified, and an
+        # infrastructure error page is direct negative browser evidence.
+        status = "failure"
 
     surfaces = _surfaces_for(name, check_name, result_text)
     return [
@@ -990,11 +1028,12 @@ def _surface_claimed(text: str, surface: str) -> bool:
     )
     if not relevant_text.strip():
         return False
-    if surface in {"browser", "production", "production_browser", "deployment"}:
+    if surface in {"browser", "production", "production_browser", "ci", "deployment", "pr"}:
         sentences = [part for part in _SENTENCE_SPLIT_RE.split(relevant_text) if part.strip()]
         relevant = [part for part in sentences if _surface_terms_present(part, surface)]
-        if relevant:
-            relevant_text = " ".join(relevant)
+        if not relevant:
+            return False
+        relevant_text = " ".join(relevant)
     claim_match = _CLAIM_WORD_RE.search(relevant_text)
     if not claim_match:
         return False
@@ -1027,6 +1066,10 @@ def _surface_terms_present(text: str, surface: str) -> bool:
         return bool(_PRODUCTION_RE.search(text))
     if surface == "deployment":
         return bool(_DEPLOY_RE.search(text))
+    if surface == "ci":
+        return bool(_CI_CLAIM_RE.search(text))
+    if surface == "pr":
+        return bool(_MERGE_RE.search(text))
     return True
 
 

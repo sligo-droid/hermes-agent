@@ -1351,6 +1351,25 @@ def _delivery_intent_for_item(item: dict[str, Any]) -> str:
     return "full_lifecycle"
 
 
+def _review_only_without_code_mutation(item: dict[str, Any], intent: str) -> bool:
+    """Return whether negative incidental checks cannot block a review delivery."""
+
+    if intent != "review_only":
+        return False
+    runtime = item.get("runtime_breakdown")
+    if isinstance(runtime, dict) and (
+        "mutation_generation" in runtime or "mutation_boundary" in runtime
+    ):
+        try:
+            return (
+                int(runtime.get("mutation_generation") or 0) == 0
+                and int(runtime.get("mutation_boundary") or 0) == 0
+            )
+        except (TypeError, ValueError):
+            return False
+    return item.get("visual_qa_code_mutation_observed") is False
+
+
 def _deferred_runtime_watch_missing_markers(text: str) -> list[str]:
     """Return missing handoff evidence for a deferred long runtime watch.
 
@@ -1409,7 +1428,7 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
 
     evidence = evidence_from_runtime_breakdown(item.get("runtime_breakdown"))
     constraints = claim_constraints_for_text(final_text, evidence)
-    if not constraints.get("allowed"):
+    if not constraints.get("allowed") and not _review_only_without_code_mutation(item, intent):
         gate.update(
             {
                 "allowed_to_complete": False,
