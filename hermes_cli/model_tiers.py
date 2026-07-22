@@ -27,9 +27,9 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "reasoning_effort": "medium",
     },
     "basic": {
-        "model": "gpt-5.6-luna",
-        "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "xhigh",
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "low",
     },
     "intermediate": {
         "model": "gpt-5.6-sol",
@@ -47,7 +47,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
     },
 }
 
