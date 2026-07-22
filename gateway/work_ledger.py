@@ -1220,6 +1220,40 @@ def _canonical_sync_explicitly_not_required(item: dict[str, Any]) -> bool:
     return requirements.get("canonical_sync") is False
 
 
+def _authoritative_canonical_sync_verified(item: dict[str, Any]) -> bool:
+    """Return whether trusted closeout proves the exact canonical merge SHA."""
+
+    closeout = item.get("closeout") if isinstance(item.get("closeout"), dict) else {}
+    policy = closeout.get("policy") if isinstance(closeout.get("policy"), dict) else {}
+    requirements = (
+        policy.get("post_merge_requirements")
+        if isinstance(policy.get("post_merge_requirements"), dict)
+        else {}
+    )
+    post_merge = (
+        closeout.get("post_merge")
+        if isinstance(closeout.get("post_merge"), dict)
+        else {}
+    )
+    receipt = (
+        post_merge.get("canonical_sync")
+        if isinstance(post_merge.get("canonical_sync"), dict)
+        else {}
+    )
+    pr = closeout.get("pr") if isinstance(closeout.get("pr"), dict) else {}
+    target_sha = str(post_merge.get("target_sha") or "").strip().lower()
+    return bool(
+        item.get("closeout_authoritative") is True
+        and closeout.get("mode") == "enforce"
+        and closeout.get("status") == "post_merge_complete"
+        and requirements.get("canonical_sync") is True
+        and _CLOSEOUT_SHA_RE.fullmatch(target_sha)
+        and str(pr.get("merge_sha") or "").strip().lower() == target_sha
+        and receipt.get("status") == "passed"
+        and str(receipt.get("observed_sha") or "").strip().lower() == target_sha
+    )
+
+
 def _is_canonical_checkout_only_gap(text: str, match: re.Match[str]) -> bool:
     """Return whether a runtime-gap match concerns only the local checkout."""
 
@@ -1248,6 +1282,13 @@ def _incomplete_final_markers(text: str, item: dict[str, Any] | None = None) -> 
             if reason == "runtime_not_synced" and _is_explicitly_healthy_runtime_match(match):
                 continue
             if reason == "runtime_not_synced" and _is_preserved_protected_checkout_gap(text, match):
+                continue
+            if (
+                reason == "runtime_not_synced"
+                and isinstance(item, dict)
+                and _authoritative_canonical_sync_verified(item)
+                and _is_canonical_checkout_only_gap(text, match)
+            ):
                 continue
             if (
                 reason == "runtime_not_synced"
@@ -1472,6 +1513,79 @@ def _record_discord_board_final_response(
         )
     except Exception:
         pass
+
+
+def _refresh_successful_closeout_completion(
+    item: dict[str, Any],
+    *,
+    now: float,
+) -> bool:
+    """Reclassify the delivery tail after authoritative closeout succeeds."""
+
+    status = str(item.get("status") or "")
+    if status not in {
+        "agent_done",
+        "response_delivered",
+        "summary_updated",
+        "blocked",
+    }:
+        return False
+    prior_gate = (
+        dict(item["completion_gate"])
+        if isinstance(item.get("completion_gate"), dict)
+        else {}
+    )
+    prior_gate_blocked = bool(
+        prior_gate and prior_gate.get("allowed_to_complete") is False
+    )
+    gate = classify_delivery_completion(item)
+    item["completion_gate"] = gate
+    item["summary_status"] = str(gate.get("summary_status") or "Complete")
+    item["updated_at"] = now
+    gate_allowed = gate.get("allowed_to_complete") is True
+    response_confirmed = bool(
+        item.get("confirmed_message_ids")
+        or str(item.get("result_message_id") or "").strip()
+        or str(item.get("delivery_outcome") or "") == "delivered"
+    )
+    stale_block_cleared = prior_gate_blocked and gate_allowed
+    next_status = status
+    if status == "summary_updated":
+        if stale_block_cleared:
+            # The summary was rendered from a stale blocked gate. Reopen only
+            # the deterministic delivery tail so the existing response is not
+            # sent twice and the summary/reaction can be corrected.
+            next_status = (
+                "response_delivered" if response_confirmed else "agent_done"
+            )
+        else:
+            next_status = (
+                "completed"
+                if gate_allowed
+                else str(gate.get("terminal_status") or "blocked")
+            )
+    elif (
+        status == "blocked"
+        and stale_block_cleared
+        and not isinstance(item.get("terminal_delivery"), dict)
+    ):
+        next_status = "response_delivered" if response_confirmed else "agent_done"
+
+    if next_status != status:
+        item["status"] = next_status
+        if next_status in {"agent_done", "response_delivered"}:
+            item.pop("summary_updated_at", None)
+            item.pop("blocked_at", None)
+            item.pop("blocked_reason", None)
+        elif next_status == "blocked":
+            item["blocked_at"] = now
+        _record_provider_progress(
+            item,
+            f"ledger_status_{next_status}",
+            status=next_status,
+        )
+    _record_discord_board_final_response(item)
+    return True
 
 
 def _item_id(
@@ -3338,18 +3452,38 @@ class GatewayWorkLedger:
                     "ledger_status_agent_done",
                     status="agent_done",
                 )
-            elif status == "summary_updated":
-                item["status"] = "completed"
-                item["updated_at"] = now
-                _record_provider_progress(
-                    item,
-                    "ledger_status_completed",
-                    status="completed",
-                )
-            else:
+            elif not _refresh_successful_closeout_completion(item, now=now):
                 item["updated_at"] = now
             self._write(data)
             return dict(item)
+
+    @_locked_ledger_mutation
+    def repair_successful_closeout_completion(
+        self,
+        work_id: str,
+    ) -> dict[str, Any] | None:
+        """Repair a persisted stale gate from already-terminal trusted closeout."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        gate = item.get("completion_gate") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or not isinstance(gate, dict)
+            or gate.get("allowed_to_complete") is not False
+            or not _authoritative_canonical_sync_verified(item)
+        ):
+            return None
+        if not _refresh_successful_closeout_completion(item, now=self._now()):
+            return None
+        refreshed_gate = item.get("completion_gate")
+        if (
+            not isinstance(refreshed_gate, dict)
+            or refreshed_gate.get("allowed_to_complete") is not True
+        ):
+            return None
+        self._write(data)
+        return dict(item)
 
     @_locked_ledger_mutation
     def adopt_observed_direct_closeout(
@@ -4327,7 +4461,23 @@ class GatewayWorkLedger:
                     or terminal_delivery.get("summary_updated_at") is None
                 )
             )
-            if item.get("status") not in INCOMPLETE_STATUSES and not blocked_delivery_pending:
+            gate = (
+                item.get("completion_gate")
+                if isinstance(item.get("completion_gate"), dict)
+                else {}
+            )
+            stale_successful_closeout = bool(
+                item.get("status") == "blocked"
+                and not terminal_delivery
+                and gate.get("allowed_to_complete") is False
+                and _authoritative_canonical_sync_verified(item)
+                and classify_delivery_completion(item).get("allowed_to_complete") is True
+            )
+            if (
+                item.get("status") not in INCOMPLETE_STATUSES
+                and not blocked_delivery_pending
+                and not stale_successful_closeout
+            ):
                 continue
             if _required_async_completion_state(item)["owns_recovery"]:
                 # Required-worker ownership replaces the volatile intake TTL.

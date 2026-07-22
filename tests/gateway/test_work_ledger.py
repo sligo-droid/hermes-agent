@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
@@ -103,6 +104,32 @@ def _activated_visual_closeout(
     )
     assert activated is not None
     return activated
+
+
+def _exact_synced_closeout(state: dict) -> dict:
+    result = deepcopy(state)
+    head_sha = "a" * 40
+    merge_sha = "b" * 40
+    result["status"] = "post_merge_complete"
+    result["local_verification"] = {"status": "passed", "head_sha": head_sha}
+    result["pr"].update(
+        {
+            "state": "MERGED",
+            "head_sha": head_sha,
+            "merge_sha": merge_sha,
+        }
+    )
+    result["ci"] = {"status": "passed", "head_sha": head_sha}
+    result["post_merge"].update(
+        {
+            "target_sha": merge_sha,
+            "canonical_sync": {
+                "status": "passed",
+                "observed_sha": merge_sha,
+            },
+        }
+    )
+    return result
 
 
 def test_ledger_deduplicates_discord_message_ids(tmp_path):
@@ -1439,6 +1466,43 @@ def test_full_lifecycle_requires_canonical_checkout_sync(tmp_path):
     assert stored["completion_gate"]["allowed_to_complete"] is False
     assert stored["completion_gate"]["reason"] == "self_declared_delivery_incomplete"
     assert stored["completion_gate"]["matched_markers"] == ["runtime_not_synced"]
+
+
+def test_exact_trusted_canonical_sync_clears_only_canonical_checkout_gap(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement and ship the feature")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        canonical_path="/tmp/project",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+    )
+    assert attached is not None
+    terminal_item = ledger.get(item["id"])
+    terminal_item["closeout"] = _exact_synced_closeout(attached)
+    terminal_item["closeout_authoritative"] = True
+
+    canonical_gate = classify_delivery_completion(
+        terminal_item,
+        "PR merged, but the canonical checkout was not synced when I finished.",
+    )
+    private_runtime_gate = classify_delivery_completion(
+        terminal_item,
+        "PR merged, but the private runtime is not synced yet.",
+    )
+
+    assert canonical_gate["allowed_to_complete"] is True
+    assert canonical_gate["reason"] == "no_self_declared_delivery_gap"
+    assert private_runtime_gate["allowed_to_complete"] is False
+    assert private_runtime_gate["matched_markers"] == ["runtime_not_synced"]
 
 
 def test_pr_only_closeout_may_leave_canonical_sync_optional(tmp_path):
@@ -3466,6 +3530,166 @@ def test_successful_closeout_finalization_is_one_atomic_cas(tmp_path):
     assert stored["final_response"] == "Trusted closeout completed."
     assert stored["closeout"]["status"] == "completed"
     assert stored["closeout"]["lease"] == {"owner": "", "until": None}
+
+
+@pytest.mark.asyncio
+async def test_exact_sync_reopens_stale_blocked_delivery_tail_without_resend(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _repo_discord_event(
+        message_id="trusted-sync-stale-gate",
+        text="Implement and ship the feature",
+    )
+    event.feature_summary = {"message_id": "summary-1"}
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        canonical_path="/canonical/project",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    assert activated is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "PR merged, but the canonical checkout was not synced when I finished."
+        ),
+    )
+    assert ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    assert ledger.mark_summary_updated(item["id"])
+    assert ledger.mark_blocked(item["id"], reason="self_declared_delivery_incomplete")
+    stale = ledger.get(item["id"])
+    assert stale["completion_gate"]["allowed_to_complete"] is False
+
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=stale["closeout"]["revision"],
+    )
+    assert leased is not None
+    completed_state = _exact_synced_closeout(leased["closeout"])
+    reopened = ledger.finalize_successful_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=completed_state,
+        final_response="Trusted closeout completed.",
+        expected_run_state=ledger.run_state_snapshot(leased),
+    )
+
+    assert reopened is not None
+    assert reopened["status"] == "response_delivered"
+    assert reopened["summary_status"] == "Complete"
+    assert reopened["completion_gate"]["allowed_to_complete"] is True
+    assert "blocked_at" not in reopened
+    assert "summary_updated_at" not in reopened
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(_send_with_retry=AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(reopened)
+
+    adapter._send_with_retry.assert_not_awaited()
+    runner._update_discord_summaries.assert_awaited_once()
+    assert runner._update_discord_summaries.await_args.kwargs["status"] == "Complete"
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "completed"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_startup_repairs_persisted_successful_closeout_gate(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _repo_discord_event(
+        message_id="persisted-trusted-sync-stale-gate",
+        text="Implement and ship the feature",
+    )
+    event.feature_summary = {"message_id": "summary-1"}
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        canonical_path="/canonical/project",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+    )
+    activated = ledger.activate_closeout(
+        item["id"],
+        attached,
+        expected_revision=attached["revision"],
+    )
+    assert activated is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "PR merged, but the canonical checkout was not synced when I finished."
+        ),
+    )
+    assert ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    assert ledger.mark_summary_updated(item["id"])
+    assert ledger.mark_blocked(item["id"], reason="self_declared_delivery_incomplete")
+    stale = ledger.get(item["id"])
+    leased = ledger.lease_closeout(
+        item["id"],
+        owner="watcher-1",
+        lease_seconds=30,
+        expected_revision=stale["closeout"]["revision"],
+    )
+    persisted = ledger.release_closeout(
+        item["id"],
+        owner="watcher-1",
+        expected_revision=leased["closeout"]["revision"],
+        expected_generation=leased["closeout"]["lease_generation"],
+        closeout_state=_exact_synced_closeout(leased["closeout"]),
+        expected_run_state=ledger.run_state_snapshot(leased),
+    )
+    assert persisted is not None
+    persisted_item = ledger.get(item["id"])
+    assert persisted_item["status"] == "blocked"
+    assert persisted_item["closeout"]["status"] == "post_merge_complete"
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._background_tasks = set()
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(),
+        handle_message=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    assert runner._schedule_incomplete_discord_work_items() == 1
+    tasks = list(runner._background_tasks)
+    assert tasks
+    await asyncio.gather(*tasks)
+
+    adapter._send_with_retry.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+    runner._update_discord_summaries.assert_awaited_once()
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "completed"
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
 
 
 def test_blocked_closeout_run_state_cas_preserves_new_live_run_and_closeout(tmp_path):

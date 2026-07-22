@@ -8002,6 +8002,20 @@ class _GatewayRunnerCore(
             if not work_id:
                 continue
             status = str(item.get("status") or "")
+            gate = item.get("completion_gate")
+            if isinstance(gate, dict) and gate.get("allowed_to_complete") is False:
+                try:
+                    repaired = ledger.repair_successful_closeout_completion(work_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to repair successful Discord closeout gate for %s",
+                        work_id,
+                        exc_info=True,
+                    )
+                else:
+                    if isinstance(repaired, dict):
+                        item = repaired
+                        status = str(item.get("status") or "")
             required_state = ledger.required_async_completion_state(work_id)
             if (
                 isinstance(required_state, dict)
