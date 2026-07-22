@@ -56,17 +56,17 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "medium",
-        "basic": "xhigh",
+        "basic": "low",
         "intermediate": "medium",
         "advanced": "high",
-        "discord_action": "medium",
+        "discord_action": "low",
     }
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).model
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "gpt-5.6-luna",
-        "basic": "gpt-5.6-luna",
+        "basic": "gpt-5.6-sol",
         "intermediate": "gpt-5.6-sol",
         "advanced": "gpt-5.6-sol",
         "discord_action": "gpt-5.6-sol",
@@ -108,9 +108,9 @@ def test_reserved_builtin_tier_override_is_ignored():
     )
 
     assert tier is not None
-    assert tier.model == "gpt-5.6-luna"
-    assert tier.opencode_model == "hermes-codex/gpt-5.6-luna"
-    assert tier.reasoning_effort == "xhigh"
+    assert tier.model == "gpt-5.6-sol"
+    assert tier.opencode_model == "hermes-codex/gpt-5.6-sol"
+    assert tier.reasoning_effort == "low"
 
 
 def test_custom_non_reserved_tier_resolves_atomically():

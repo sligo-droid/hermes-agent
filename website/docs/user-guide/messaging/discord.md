@@ -338,7 +338,7 @@ discord:
   voice_auto_tag: false           # Native Discord voice messages still need @mention
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
-  action_request_model_tier: discord_action          # All accepted action requests: Sol/medium
+  action_request_model_tier: discord_action          # All accepted action requests: Sol/low
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
