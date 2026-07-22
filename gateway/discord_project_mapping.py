@@ -98,6 +98,7 @@ def resolve_discord_project_context(
         if db is not None:
             row = db.get_discord_project_mapping(guild_id=guild_id, channel_id=channel_id)
             if row:
+                row = _reconcile_existing_mapping_origin(db, row)
                 return _with_inspection_candidates(_context_from_row(row), cfg)
 
         configured = _context_from_configured_channel_cwd(
@@ -171,6 +172,71 @@ def _context_from_row(row: dict[str, Any]) -> DiscordProjectContext:
         mapping_source=row.get("source") or "manual",
         resolved=True,
     )
+
+
+def _reconcile_existing_mapping_origin(
+    db: SessionDB,
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    """Refresh a stored mapping when its checkout origin has changed.
+
+    Mapping rows predate repository moves and can retain an old GitHub URL
+    even though their project checkout has a newer, authoritative ``origin``.
+    Keep the mapping's channel/project identity intact, but refresh the URL so
+    downstream project inspection and closeout use the same repository.
+    """
+    project_path = str(row.get("project_path") or "").strip()
+    if not project_path:
+        return row
+
+    actual_url = _git_remote_url(Path(project_path))
+    if not actual_url:
+        return row
+
+    try:
+        from hermes_cli.github_remote import github_repo_from_value
+
+        configured_repo = github_repo_from_value(row.get("github_url"))
+        actual_repo = github_repo_from_value(actual_url)
+    except Exception:
+        return row
+
+    # Only reconcile GitHub origins. A local or non-GitHub origin is not a
+    # valid replacement for the mapping's GitHub identity.
+    if not actual_repo or (
+        configured_repo
+        and configured_repo.lower() == actual_repo.lower()
+    ):
+        return row
+
+    try:
+        refreshed = db.upsert_discord_project_mapping(
+            guild_id=str(row.get("guild_id") or ""),
+            channel_id=str(row.get("channel_id") or ""),
+            parent_channel_id=row.get("parent_channel_id"),
+            channel_name=row.get("channel_name"),
+            guild_name=row.get("guild_name"),
+            project_key=str(row.get("project_key") or ""),
+            project_name=row.get("project_name"),
+            project_path=project_path,
+            github_url=actual_url,
+            source=str(row.get("source") or "manual"),
+        )
+    except Exception:
+        logger.debug(
+            "Discord project mapping origin reconciliation failed for %s",
+            project_path,
+            exc_info=True,
+        )
+        return row
+
+    logger.info(
+        "Reconciled Discord project mapping origin: %s -> %s (workspace=%s)",
+        configured_repo or "<missing>",
+        actual_repo,
+        project_path,
+    )
+    return refreshed
 
 
 def _with_inspection_candidates(

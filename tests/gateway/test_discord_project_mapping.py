@@ -1,3 +1,4 @@
+import subprocess
 from types import SimpleNamespace
 
 from gateway.discord_project_mapping import resolve_discord_project_context
@@ -16,6 +17,16 @@ class FakeChannel:
 
 def _guild():
     return SimpleNamespace(id="guild-1", name="Sligo Labs")
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
 
 def test_existing_db_mapping_wins_over_workspace_scan(tmp_path):
@@ -88,6 +99,41 @@ def test_existing_mapping_is_dynamically_enriched_without_schema_change(tmp_path
     assert ctx.to_dict()["project_key"] == "example"
     persisted = db.get_discord_project_mapping(guild_id="guild-1", channel_id="chan-1")
     assert "inspection_candidates" not in persisted
+    db.close()
+
+
+def test_existing_mapping_reconciles_stale_github_origin(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = tmp_path / "PID"
+    project.mkdir()
+    _git(project, "init")
+    _git(project, "remote", "add", "origin", "git@github.com:sligo-labs/PID.git")
+    db.upsert_discord_project_mapping(
+        guild_id="guild-1",
+        channel_id="chan-1",
+        channel_name="pid",
+        guild_name="Sligo Labs",
+        project_key="PID",
+        project_name="Pid",
+        project_path=str(project),
+        github_url="https://github.com/sligo-droid/PID",
+        source="deterministic_directory_bootstrap",
+    )
+
+    ctx = resolve_discord_project_context(
+        FakeChannel(channel_id="chan-1", name="pid", guild=_guild()),
+        session_db=db,
+    )
+
+    assert ctx is not None
+    assert ctx.github_url == "https://github.com/sligo-labs/PID"
+    persisted = db.get_discord_project_mapping(
+        guild_id="guild-1",
+        channel_id="chan-1",
+    )
+    assert persisted is not None
+    assert persisted["github_url"] == "https://github.com/sligo-labs/PID"
+    assert persisted["source"] == "deterministic_directory_bootstrap"
     db.close()
 
 
