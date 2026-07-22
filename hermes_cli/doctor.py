@@ -2901,6 +2901,15 @@ def run_doctor(args):
                 def _report_honcho_embeddings_repair(repaired: bool, repair_facts: list[str]) -> None:
                     if not repair_facts:
                         return
+                    if not repaired and any(
+                        "Honcho consumer embeddings route is healthy" in fact
+                        for fact in repair_facts
+                    ):
+                        check_ok("Honcho embeddings route", "healthy")
+                        for fact in repair_facts:
+                            if "Honcho consumer embeddings route is healthy" not in fact:
+                                check_info(fact)
+                        return
                     if repaired:
                         check_ok("Honcho embeddings auto-repair", "docker start hermes-honcho-embeddings")
                     else:

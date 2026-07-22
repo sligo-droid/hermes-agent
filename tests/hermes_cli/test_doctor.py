@@ -863,6 +863,9 @@ class TestDoctorMemoryProviderSection:
         out = buf.getvalue()
 
         assert "Honcho embeddings auto-repair failed" not in out
+        if repair_facts[0].startswith("Honcho consumer embeddings route is healthy"):
+            assert "Honcho embeddings route" in out
+            assert "Honcho embeddings auto-repair not completed" not in out
         assert "Honcho connected" in out
 
     @pytest.mark.parametrize(

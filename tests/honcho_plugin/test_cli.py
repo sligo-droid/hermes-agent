@@ -600,6 +600,36 @@ class TestEmbeddingsCommand:
         assert all(call[-1] == "validated-id" for call in docker_calls[1:])
         assert all(call[1] != "exec" for call in docker_calls)
 
+    def test_embedding_env_discovery_accepts_custom_honcho_api_image(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        for key in honcho_cli._EMBEDDING_RUNTIME_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[1] == "ps":
+                return FakeCompletedProcess(stdout="validated-id\n")
+            if cmd[1:4] == ["inspect", "--format", "{{json .Config.Labels}}\t{{json .Config.Image}}"]:
+                return FakeCompletedProcess(
+                    stdout='{"com.docker.compose.project":"honcho","com.docker.compose.service":"api"}\t"honcho-local-sligo:latest"\n'
+                )
+            if cmd[1] == "inspect":
+                key = next((key for key in honcho_cli._EMBEDDING_RUNTIME_ENV_KEYS if key in cmd[3]), None)
+                value = "http://hermes-honcho-embeddings:8080/v1" if key == "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL" else ""
+                return FakeCompletedProcess(stdout=json.dumps(f"{key}={value}") + "\n" if value else "")
+            raise AssertionError(cmd)
+
+        monkeypatch.setattr(honcho_cli.shutil, "which", lambda name: "/usr/bin/docker")
+        monkeypatch.setattr(honcho_cli.subprocess, "run", fake_run)
+
+        env, source, container_id = honcho_cli._discover_honcho_embedding_env()
+
+        assert env["EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL"] == (
+            "http://hermes-honcho-embeddings:8080/v1"
+        )
+        assert "Docker Compose project honcho api" in source
+        assert container_id == "validated-id"
+
     def test_embedding_env_discovery_ignores_unrelated_name_match(self, monkeypatch):
         import plugins.memory.honcho.cli as honcho_cli
 
@@ -990,7 +1020,13 @@ class TestHonchoEmbeddingsAutoRepair:
 
         from unittest.mock import patch
 
-        with patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (False, ["Route: FAILED (connection refused at 127.0.0.1:8080)"])), \
+        config = {
+            "port": 8080, "dimensions": 1024, "model": honcho_cli.LOCAL_EMBEDDING_MODEL,
+            "dimensions_mode": "", "base_url": "http://127.0.0.1:8080/v1",
+            "consumer_container_id": None,
+        }
+        with patch.object(honcho_cli, "_embedding_status_config", lambda args: config), \
+             patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (False, ["Route: FAILED (connection refused at 127.0.0.1:8080)"])), \
              patch.object(honcho_cli, "auto_repair_honcho_embeddings_container", fake_repair):
             ok, facts = honcho_cli.repair_honcho_embeddings_for_local_base_url(
                 "http://127.0.0.1:8000",
@@ -1039,7 +1075,13 @@ class TestHonchoEmbeddingsAutoRepair:
         import plugins.memory.honcho.cli as honcho_cli
         from unittest.mock import patch
 
-        with patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (False, ["Route: BLOCKED (port ownership/collision)"])), \
+        config = {
+            "port": 8080, "dimensions": 1024, "model": honcho_cli.LOCAL_EMBEDDING_MODEL,
+            "dimensions_mode": "", "base_url": "http://127.0.0.1:8080/v1",
+            "consumer_container_id": None,
+        }
+        with patch.object(honcho_cli, "_embedding_status_config", lambda args: config), \
+             patch.object(honcho_cli, "_embedding_endpoint_report", lambda **kwargs: (False, ["Route: BLOCKED (port ownership/collision)"])), \
              patch.object(honcho_cli, "auto_repair_honcho_embeddings_container") as repair:
             ok, facts = honcho_cli.repair_honcho_embeddings_for_local_base_url("http://127.0.0.1:8000")
 
