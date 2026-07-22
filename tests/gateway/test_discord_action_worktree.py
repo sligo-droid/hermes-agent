@@ -2334,7 +2334,7 @@ async def test_successful_promotion_stays_out_of_current_turn_until_target_inbou
     )
     tier = gateway_run._discord_action_request_model_tier({}, next_event.feature_summary)
     assert tier.name == "discord_action"
-    assert tier.reasoning_effort == "low"
+    assert tier.reasoning_effort == "medium"
 
 
 @pytest.mark.asyncio
