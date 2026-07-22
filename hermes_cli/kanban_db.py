@@ -9913,6 +9913,12 @@ _SYSTEMD_WORKER_ENV_EXACT = frozenset({
     "GH_CONFIG_DIR",
     "HERMES_DASHBOARD_PASSWORD",
     "HERMES_DASHBOARD_USERNAME",
+    "PID_QA_USERNAME",
+    "PID_QA_PASSWORD",
+    "PID_QA_EXPECT_READONLY",
+    "PID_QA_BASE_URL",
+    "PID_QA_PATH",
+    "PID_QA_ENV_FILE",
     "HOME",
     "HERMES_CODING_WORKER_BACKEND",
     "HERMES_HOME",
@@ -9940,7 +9946,7 @@ def _systemd_worker_env(env: dict[str, str]) -> dict[str, str]:
 
     Do not shovel the gateway's full process environment into systemd unit
     metadata. Keep this to runtime routing keys, basic shell/Python path state,
-    and explicit worker-contract secrets such as the dashboard QA password.
+    and explicit worker-contract secrets such as dashboard/PID QA passwords.
     """
     out: dict[str, str] = {}
     for key, value in env.items():

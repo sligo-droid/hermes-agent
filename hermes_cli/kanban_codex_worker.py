@@ -113,6 +113,7 @@ _WORKER_PROJECT_STATE_JUSTIFICATION = (
     "no current project-state ledger change required."
 )
 _DASHBOARD_QA_USERNAME = "hermes_qa"
+_PID_QA_USERNAME = "hermes_qa"
 _REQUIRED_PR_CI_CHECKS = (
     ("Basic Tests", "basic"),
     ("PR Body Format", "pr body"),
@@ -627,9 +628,14 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
 def _dashboard_qa_auth_prompt() -> str:
     return (
         "Protected dashboard/browser QA auth contract:\n"
+        "- For PID customer-surface browser QA, use the repository's native `pnpm --dir dashboard qa:auth` flow. It uses the read-only PID QA account "
+        f"`{_PID_QA_USERNAME}` through `PID_QA_USERNAME`/`PID_QA_PASSWORD`; when those are absent, let PID's native launcher load its configured QA env file. Do not parse or source that file in an ad-hoc script.\n"
+        "- Treat that PID account as role `user`: it can verify customer-facing routes and expected admin-denial states, but it is not admin QA.\n"
+        "- Do not seek, request, or substitute admin credentials for ordinary QA. If the requested rendered target is admin-only, report admin visual QA as blocked unless separate explicit admin credentials are already supplied; do not claim that read-only denial proves admin rendering.\n"
+        "- PID QA credentials are separate from Hermes dashboard Basic Auth; do not use `HERMES_DASHBOARD_*` credentials for PID.\n"
         f"- For protected Hermes dashboard or frontend smoke checks, use dashboard Basic Auth username `{_DASHBOARD_QA_USERNAME}`.\n"
         "- Read the password from `HERMES_DASHBOARD_PASSWORD` in the worker environment; do not ask for it if that env var is absent.\n"
-        "- Never print, log, copy into prompts, or include the password value in final output, test output, screenshots, URLs, or handoff metadata.\n\n"
+        "- Never print, log, copy into prompts, or include any PID or Hermes password value in final output, test output, screenshots, URLs, or handoff metadata.\n\n"
     )
 
 
