@@ -492,7 +492,9 @@ _DELEGATION_OBSERVATION_TOOLS = frozenset({
     "web_search",
 })
 
-_DISCORD_INTAKE_OBSERVATION_TOOLS = _DELEGATION_OBSERVATION_TOOLS | frozenset({
+_DISCORD_INTAKE_OBSERVATION_TOOLS = (
+    _DELEGATION_OBSERVATION_TOOLS - {"delegate_task"}
+) | frozenset({
     "clarify",
     "escalate_to_action",
     "discord_get_channel",
@@ -551,17 +553,14 @@ def _discord_intake_mutation_block(
     args = function_args or {}
     if function_name == "process":
         allowed = str(args.get("action") or "") in {"list", "poll", "log", "wait"}
-    elif function_name == "delegate_task":
-        from agent.tool_dispatch_helpers import _delegate_task_is_read_only
-
-        allowed = _delegate_task_is_read_only(args)
     else:
         allowed = function_name in _DISCORD_INTAKE_OBSERVATION_TOOLS
     if allowed:
         return None
     return (
         f"Blocked {function_name}: this Discord turn is in safe question/intake "
-        "mode. Use read-only observation tools to answer a question, or call "
+        "mode. Delegation and task-level execution are unavailable here. Use "
+        "lightweight observation tools to answer a question, or call "
         "escalate_to_action before performing work."
     )
 

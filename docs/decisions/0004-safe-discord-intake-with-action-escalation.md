@@ -18,15 +18,24 @@ it or performing work in the wrong runtime.
 
 Discord intake uses asymmetric routing:
 
-1. Structural routes and narrow high-confidence heuristics continue to send
-   explicit work requests directly to action mode.
+1. Structural routes and high-confidence heuristics send explicit work
+   requests directly to action mode. Work includes task-shaped read-only asks
+   such as reviews, audits, inspection, investigation, verification, research,
+   planning, and producing recommendations; action routing is not limited to
+   mutation or implementation. Polite question syntax does not make an
+   explicit observational task ambiguous (for example, "could you review the
+   release?"). Less-specific question-shaped mutation asks (for example, "can
+   you get the tests passing?") remain intake-first and can escalate
+   transactionally once the requested execution is clear.
 2. Every ambiguous message defaults to the safe question/intake runtime; no
    auxiliary LLM classifier runs.
 3. Question/intake turns expose `escalate_to_action`. A successful call is a
    control-plane signal only and immediately ends the intake agent loop.
-   Tool execution is fail-closed to explicit observation tools until that
-   handoff; file writes, shell execution, coding delegation, and unknown tools
-   cannot run in the intake runtime.
+   Tool execution is fail-closed to lightweight observation tools until that
+   handoff; file writes, shell execution, all delegation, browser navigation,
+   and unknown tools cannot run in the intake runtime. This is a deterministic
+   latency boundary: a misclassified intake turn cannot launch task-level
+   delegation before escalating.
 4. Intake persistence is deferred until the turn outcome is known. Ordinary
    answers are persisted normally; an escalation's provisional tool turn is
    discarded.
@@ -43,7 +52,9 @@ Discord intake uses asymmetric routing:
 
 - Ambiguous questions stay cheap and safe while the full agent can recover an
   action request without another user message.
-- Clear imperatives retain the one-pass fast path.
+- Clear mutation and observational-task requests retain the one-pass fast path.
+- Genuine explanation, status, advice, and short factual questions stay in the
+  safe intake runtime and may use lightweight reads when needed.
 - The handoff pays for a second model turn, but only after the first model has
   established that ambiguous language actually requests work.
 - The action turn receives the normal model tier, worktree, summary, ledger,

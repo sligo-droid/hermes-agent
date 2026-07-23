@@ -30,6 +30,11 @@ def adapter():
         ("new feature for saved searches", True),
         ("fix the login bug", True),
         ("run the entire pipeline again", True),
+        ("review the authentication changes", True),
+        ("conduct a security audit of the API", True),
+        ("plan the database migration", True),
+        ("produce a list of recommendations", True),
+        ("can you investigate the flaky tests?", True),
     ],
 )
 def test_heuristic_keeps_only_precise_verdicts(adapter, message, expected):
@@ -83,6 +88,46 @@ def test_heuristic_keeps_pipeline_action_phrases_precise(adapter, message):
     assert adapter._heuristic_action_request_intent(message) is True
 
 
+def test_narrative_prefixed_observational_task_routes_directly_to_action(adapter):
+    message = (
+        "we tried to implement some stuff yesterday via discord but it was a bit "
+        "of a disaster. look through the site the way a human would and try to "
+        "identify things you may have broken. also look through the commits for "
+        "areas you changed and focus on those. produce a list of recommendations"
+    )
+
+    assert adapter._heuristic_action_request_intent(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "audit the permissions model and report the findings",
+        "please review this pull request",
+        "could you verify the release against the acceptance criteria?",
+        "research the available migration approaches",
+        "write a plan for improving the caching layer",
+        "provide recommendations for the next iteration",
+    ],
+)
+def test_read_only_task_requests_route_directly_to_action(adapter, message):
+    assert adapter._heuristic_action_request_intent(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "why did the scraper fail?",
+        "can you explain how the cache works?",
+        "what is the status of the security audit?",
+        "what do you recommend?",
+        "did the review finish?",
+    ],
+)
+def test_explanation_status_and_short_factual_questions_remain_intake(adapter, message):
+    assert adapter._heuristic_action_request_intent(message) is not True
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -130,6 +175,10 @@ def test_feature_triage_timeout_defaults_to_five_seconds(adapter, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_question_shaped_action_ask_starts_in_safe_intake(adapter):
+    # Polite mutable asks remain intentionally conservative: unlike explicit
+    # observational task verbs, "get ... passing" can describe either advice
+    # or execution. Intake can answer or transactionally escalate without
+    # provisioning mutable action state from the heuristic alone.
     result = await adapter._classify_discord_action_request(
         "can you get the tests passing?"
     )
