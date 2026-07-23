@@ -492,6 +492,19 @@ _DELEGATION_OBSERVATION_TOOLS = frozenset({
     "web_search",
 })
 
+_DISCORD_INTAKE_OBSERVATION_TOOLS = _DELEGATION_OBSERVATION_TOOLS | frozenset({
+    "clarify",
+    "escalate_to_action",
+    "discord_get_channel",
+    "discord_get_message",
+    "discord_get_reactions",
+    "discord_get_thread",
+    "discord_list_channels",
+    "discord_list_guilds",
+    "discord_list_recent",
+    "discord_search_messages",
+})
+
 
 
 def _delegation_mutation_block(
@@ -524,6 +537,32 @@ def _delegation_mutation_block(
         f"Blocked {function_name}: this delegated agent is in {policy} mode. "
         "Only explicit observation tools are allowed; terminal execution and "
         "unknown plugin/MCP tools fail closed."
+    )
+
+
+def _discord_intake_mutation_block(
+    agent: Any,
+    function_name: str,
+    function_args: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Fail closed on side effects while a Discord turn is still intake-only."""
+    if not getattr(agent, "_discord_intake_read_only", False):
+        return None
+    args = function_args or {}
+    if function_name == "process":
+        allowed = str(args.get("action") or "") in {"list", "poll", "log", "wait"}
+    elif function_name == "delegate_task":
+        from agent.tool_dispatch_helpers import _delegate_task_is_read_only
+
+        allowed = _delegate_task_is_read_only(args)
+    else:
+        allowed = function_name in _DISCORD_INTAKE_OBSERVATION_TOOLS
+    if allowed:
+        return None
+    return (
+        f"Blocked {function_name}: this Discord turn is in safe question/intake "
+        "mode. Use read-only observation tools to answer a question, or call "
+        "escalate_to_action before performing work."
     )
 
 
@@ -1198,6 +1237,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
         elif block_result is None:
             block_message = _delegation_mutation_block(agent, function_name, function_args)
+            if block_message is None:
+                block_message = _discord_intake_mutation_block(
+                    agent, function_name, function_args
+                )
             if block_message is None:
                 block_message = _coding_worker_mutation_block(agent, function_name, function_args)
             if block_message is None:
@@ -1946,6 +1989,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _block_msg = _ts_scope_block
         else:
             _block_msg = _delegation_mutation_block(agent, function_name, function_args)
+            if _block_msg is None:
+                _block_msg = _discord_intake_mutation_block(
+                    agent, function_name, function_args
+                )
             if _block_msg is None:
                 _block_msg = _coding_worker_mutation_block(agent, function_name, function_args)
             if _block_msg is None:

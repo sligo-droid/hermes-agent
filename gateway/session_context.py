@@ -91,6 +91,9 @@ _KANBAN_NOTIFY_PROFILE: ContextVar = ContextVar("HERMES_KANBAN_NOTIFY_PROFILE", 
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+_DISCORD_ACTION_ESCALATION_ALLOWED: ContextVar = ContextVar(
+    "HERMES_DISCORD_ACTION_ESCALATION_ALLOWED", default=_UNSET
+)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -123,6 +126,7 @@ _VAR_MAP = {
     "HERMES_KANBAN_DEFAULT_INTAKE_ASSIGNEE": _KANBAN_DEFAULT_INTAKE_ASSIGNEE,
     "HERMES_KANBAN_NOTIFY_PROFILE": _KANBAN_NOTIFY_PROFILE,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
+    "HERMES_DISCORD_ACTION_ESCALATION_ALLOWED": _DISCORD_ACTION_ESCALATION_ALLOWED,
     "HERMES_CRON_SESSION": _CRON_EXECUTION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
@@ -206,6 +210,7 @@ def set_session_vars(
     kanban_default_intake_assignee: str = "",
     kanban_notify_profile: str = "",
     message_id: str = "",
+    discord_action_escalation_allowed: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -245,6 +250,7 @@ def set_session_vars(
         _KANBAN_DEFAULT_INTAKE_ASSIGNEE.set(kanban_default_intake_assignee),
         _KANBAN_NOTIFY_PROFILE.set(kanban_notify_profile),
         _SESSION_MESSAGE_ID.set(message_id),
+        _DISCORD_ACTION_ESCALATION_ALLOWED.set(discord_action_escalation_allowed),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -291,6 +297,7 @@ def clear_session_vars(tokens: list) -> None:
         _KANBAN_DEFAULT_INTAKE_ASSIGNEE,
         _KANBAN_NOTIFY_PROFILE,
         _SESSION_MESSAGE_ID,
+        _DISCORD_ACTION_ESCALATION_ALLOWED,
     ):
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)

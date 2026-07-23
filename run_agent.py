@@ -6153,6 +6153,45 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # Action escalation is a control-plane boundary, not an ordinary tool
+        # that may share a batch with reads or mutations. Execute only the first
+        # escalation call and pair every sibling with a synthetic skip so the
+        # assistant/tool sequence stays provider-valid. This guarantees that a
+        # question-mode agent cannot start work in the wrong runtime while also
+        # asking the gateway to transfer the request.
+        escalation_calls = [
+            call
+            for call in tool_calls
+            if getattr(getattr(call, "function", None), "name", "")
+            == "escalate_to_action"
+        ]
+        if escalation_calls:
+            original_calls = tool_calls
+            assistant_message.tool_calls = [escalation_calls[0]]
+            self._executing_tools = True
+            try:
+                self._execute_tool_calls_sequential(
+                    assistant_message, messages, effective_task_id, api_call_count
+                )
+                for call in original_calls:
+                    if call is escalation_calls[0]:
+                        continue
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "name": getattr(getattr(call, "function", None), "name", ""),
+                            "tool_call_id": getattr(call, "id", ""),
+                            "content": (
+                                "[Tool execution skipped — action escalation transfers "
+                                "the request before any other tool may run]"
+                            ),
+                        }
+                    )
+                return
+            finally:
+                assistant_message.tool_calls = original_calls
+                self._executing_tools = False
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:

@@ -481,6 +481,8 @@ class TestDisabledToolsetsPlatformBundle:
         names_telegram = {t["function"]["name"] for t in tools_telegram}
         names_no_yuanbao = {t["function"]["name"] for t in tools_telegram_no_yuanbao}
 
+        assert "escalate_to_action" not in names_telegram
+
         # Disabling a *different* platform bundle must not remove any tools
         assert names_telegram == names_no_yuanbao, (
             f"Tools lost after disabling hermes-yuanbao: "
