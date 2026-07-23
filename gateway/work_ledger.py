@@ -418,6 +418,19 @@ def _durable_runtime_breakdown(
         )
     except Exception:
         durable["closeout_receipt"] = None
+    try:
+        from agent.preview_readiness import summarize_preview_events
+
+        preview = (
+            runtime_breakdown.get("preview_readiness")
+            if isinstance(runtime_breakdown, dict)
+            else None
+        )
+        durable["preview_readiness"] = summarize_preview_events(
+            preview.get("events") if isinstance(preview, dict) else None
+        )
+    except Exception:
+        durable["preview_readiness"] = None
     return durable
 
 

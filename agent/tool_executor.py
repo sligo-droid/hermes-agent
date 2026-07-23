@@ -37,6 +37,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.preview_readiness import preview_block_result, record_preview_event
 from agent.verification_evidence import (
     classify_tool_verification_evidence,
     classify_tool_visual_receipt,
@@ -329,6 +330,62 @@ def _current_session_cwd(agent: Any = None) -> str:
     except Exception:
         pass
     return os.getenv("TERMINAL_CWD", os.getcwd())
+
+
+def _visual_qa_required(agent: Any) -> bool:
+    try:
+        from agent.visual_qa import normalize_visual_requirement
+
+        return normalize_visual_requirement(
+            getattr(agent, "visual_qa_requirement", None)
+        )["level"] in {"surface", "artifact"}
+    except Exception:
+        return False
+
+
+def _preview_readiness_before_call(
+    agent: Any,
+    function_name: str,
+    function_args: dict[str, Any],
+) -> Any:
+    controller = getattr(agent, "_preview_readiness", None)
+    if controller is None:
+        return None
+    try:
+        return controller.before_call(
+            function_name,
+            function_args,
+            session_cwd=_current_session_cwd(agent),
+            visual_required=_visual_qa_required(agent),
+        )
+    except Exception:
+        logger.debug("preview readiness preflight failed", exc_info=True)
+        return None
+
+
+def _apply_preview_readiness_result(
+    agent: Any,
+    function_name: str,
+    function_args: dict[str, Any],
+    function_result: Any,
+) -> Any:
+    controller = getattr(agent, "_preview_readiness", None)
+    if controller is None:
+        return function_result
+    try:
+        function_result, event = controller.after_call(
+            function_name,
+            function_args,
+            function_result,
+            session_cwd=_current_session_cwd(agent),
+            visual_required=_visual_qa_required(agent),
+        )
+        if event is not None:
+            record_preview_event(getattr(agent, "_turn_runtime_stats", None), event)
+        return function_result
+    except Exception:
+        logger.debug("preview readiness result classification failed", exc_info=True)
+        return function_result
 
 
 def _parallel_coding_base_cwd(agent: Any) -> str:
@@ -2010,8 +2067,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 except Exception:
                     pass
 
-        _guardrail_block_decision: ToolGuardrailDecision | None = None
+        _preview_block_decision = None
         if _block_msg is None:
+            _preview_block_decision = _preview_readiness_before_call(
+                agent, function_name, function_args
+            )
+
+        _guardrail_block_decision: ToolGuardrailDecision | None = None
+        if _block_msg is None and _preview_block_decision is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
@@ -2019,6 +2082,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_blocked = (
             _preflight_block_result is not None
             or _block_msg is not None
+            or _preview_block_decision is not None
             or _guardrail_block_decision is not None
         )
 
@@ -2131,6 +2195,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type=("tool_scope_block" if _ts_scope_block is not None else "plugin_block"),
                 error_message=_block_msg,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _preview_block_decision is not None:
+            function_result = preview_block_result(_preview_block_decision)
+            record_preview_event(
+                getattr(agent, "_turn_runtime_stats", None),
+                _preview_block_decision.evidence,
+            )
+            tool_duration = 0.0
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="preview_readiness_block",
+                error_message=_preview_block_decision.message,
                 middleware_trace=list(middleware_trace),
             )
         elif _guardrail_block_decision is not None:
@@ -2439,6 +2522,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result,
             )
             closeout_boundary_hit = closeout_boundary_hit or _closeout_accepted_now
+
+        if not _execution_blocked:
+            function_result = _apply_preview_readiness_result(
+                agent,
+                function_name,
+                function_args,
+                function_result,
+            )
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

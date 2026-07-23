@@ -218,6 +218,7 @@ def _new_turn_runtime_stats(started_at: float) -> dict[str, Any]:
         "visual_qa_level": "none",
         "visual_qa_followup_count": 0,
         "visual_qa_check_duration_s": 0.0,
+        "preview_readiness_events": [],
     }
 
 

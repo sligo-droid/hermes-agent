@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from agent.runtime_spans import sanitize_runtime_spans, summarize_span_intervals
+from agent.preview_readiness import summarize_preview_events
 from agent.visual_qa import sanitize_visual_receipt
 from agent.terminal_outcomes import sanitize_closeout_receipt
 
@@ -169,6 +170,7 @@ def build_turn_runtime_breakdown(
             visual_receipts.append(latest)
     visual_qa = _visual_qa_summary(stats, visual_receipts)
     closeout_receipt = sanitize_closeout_receipt(stats.get("closeout_receipt"))
+    preview_readiness = summarize_preview_events(stats.get("preview_readiness_events"))
 
     return {
         "schema_version": 2,
@@ -205,6 +207,7 @@ def build_turn_runtime_breakdown(
         "visual_qa_receipts": visual_receipts,
         "visual_qa": visual_qa,
         "closeout_receipt": closeout_receipt,
+        "preview_readiness": preview_readiness,
         "active_exceeds_wall": bool(wall and summed_active > wall + 0.25),
     }
 
@@ -245,6 +248,7 @@ def merge_runtime_breakdowns(
             "check_duration_s": 0.0,
         },
         "closeout_receipt": None,
+        "preview_readiness": summarize_preview_events([]),
         "phases": [],
         "active_exceeds_wall": False,
     }
@@ -313,6 +317,15 @@ def merge_runtime_breakdowns(
             + _count(visual.get("followup_count")),
         )
         merged["visual_qa"]["check_duration_s"] += _seconds(visual.get("check_duration_s"))
+        preview = item.get("preview_readiness")
+        if isinstance(preview, dict) and isinstance(preview.get("events"), list):
+            combined_preview_events = list(
+                merged["preview_readiness"].get("events") or []
+            )
+            combined_preview_events.extend(preview["events"])
+            merged["preview_readiness"] = summarize_preview_events(
+                combined_preview_events
+            )
     merged["top_tools"] = sorted(tools.values(), key=lambda item: item["duration_s"], reverse=True)[:5]
     merged["phases"] = sorted(phases.values(), key=lambda item: item["duration_s"], reverse=True)[:6]
     merged["verification_evidence"] = merged["verification_evidence"][-20:]
