@@ -3527,6 +3527,52 @@ class DiscordAdapter(BasePlatformAdapter):
             dict.fromkeys(candidate for candidate in (cleaned, leading_ack) if candidate)
         )
 
+        # Observational work is still work. Route explicit reviews, audits,
+        # investigations, verification, research, and planning through the
+        # normal action runtime even when the request is phrased politely or
+        # follows narrative context. Keep the pattern anchored to request-like
+        # clause starts so status prose such as "support is investigating" and
+        # short advice questions such as "what do you recommend?" stay intake.
+        observational_task_verb = (
+            r"(?:review|audit|inspect|investigate|research|analy[sz]e|assess|"
+            r"evaluate|test|verify|validate|diagnose|trace|reproduce|survey|"
+            r"inventory|compare|plan|look\s+(?:through|into|over)|check)"
+        )
+        observational_deliverable = (
+            r"(?:review|audit|inspection|investigation|analysis|assessment|"
+            r"research|test|verification|report|plan|findings|recommendations|"
+            r"list\s+of\s+recommendations)"
+        )
+        task_clause_patterns = (
+            re.compile(rf"^(?:please\s+)?{observational_task_verb}\b"),
+            re.compile(
+                rf"^(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+                rf"{observational_task_verb}\b"
+            ),
+            re.compile(
+                rf"^(?:i|we)\s+(?:need|want|would\s+like)\s+"
+                rf"(?:you\s+to\s+)?{observational_task_verb}\b"
+            ),
+            re.compile(
+                rf"^(?:please\s+)?(?:perform|conduct|do)\s+(?:an?\s+)?"
+                rf"(?:[a-z][\w-]*\s+){{0,2}}"
+                rf"{observational_deliverable}\b"
+            ),
+            re.compile(
+                rf"^(?:please\s+)?(?:produce|prepare|write|draft|create|"
+                rf"provide|return)\s+(?:an?\s+|the\s+|a\s+list\s+of\s+)?"
+                rf"{observational_deliverable}\b"
+            ),
+        )
+        for candidate in intent_candidates:
+            clauses = re.split(r"(?:^|[.!?;]\s+)", candidate)
+            for clause in clauses:
+                request_clause = re.sub(
+                    r"^(?:(?:and|also|then)\s+)+", "", clause.strip()
+                )
+                if any(pattern.match(request_clause) for pattern in task_clause_patterns):
+                    return True
+
         # An explicit request not to build is a direct-question signal even
         # though the sentence contains an implementation verb. This pins the
         # production wording from Discord message 1527747538797465641.

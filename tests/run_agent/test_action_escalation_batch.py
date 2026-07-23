@@ -38,7 +38,7 @@ def test_action_escalation_skips_every_sibling_tool_call():
     assert "skipped" in messages[1]["content"]
 
 
-def test_discord_intake_blocks_mutation_but_allows_escalation_and_reads():
+def test_discord_intake_blocks_task_execution_but_allows_escalation_and_light_reads():
     agent = SimpleNamespace(_discord_intake_read_only=True)
 
     assert _discord_intake_mutation_block(
@@ -47,5 +47,14 @@ def test_discord_intake_blocks_mutation_but_allows_escalation_and_reads():
     assert _discord_intake_mutation_block(
         agent, "terminal", {"command": "git status"}
     )
+    assert _discord_intake_mutation_block(
+        agent,
+        "delegate_task",
+        {"goal": "investigate the repository", "read_only": True},
+    )
+    assert _discord_intake_mutation_block(
+        agent, "browser_navigate", {"url": "https://example.com"}
+    )
     assert _discord_intake_mutation_block(agent, "read_file", {}) is None
+    assert _discord_intake_mutation_block(agent, "web_search", {}) is None
     assert _discord_intake_mutation_block(agent, "escalate_to_action", {}) is None

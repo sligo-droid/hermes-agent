@@ -311,6 +311,35 @@ async def test_ack_prefixed_run_pipeline_request_gets_feature_summary(adapter, m
 
 
 @pytest.mark.asyncio
+async def test_narrative_prefixed_review_request_enters_action_thread_directly(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    request = (
+        "we tried to implement some stuff yesterday via discord but it was a bit "
+        "of a disaster. look through the site the way a human would and try to "
+        "identify things you may have broken. also look through the commits for "
+        "areas you changed and focus on those. produce a list of recommendations"
+    )
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content=request)
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.discord_action_request_intent is True
+    assert event.channel_prompt is None
+    assert event.feature_summary is not None
+    assert event.feature_summary["thread_id"] == "200"
+    assert event.feature_summary["initial_request"] == request
+
+
+@pytest.mark.asyncio
 async def test_non_goal_feature_summary_does_not_start_kanban_pipeline(adapter, monkeypatch):
     from hermes_cli import discord_worker_boards as dwb
 
