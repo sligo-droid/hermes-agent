@@ -172,12 +172,7 @@ _DISCORD_DIRECT_QUESTION_PROMPT = (
     "This Discord trigger was classified as a direct question, not an "
     "action request. Answer in place. Do not start a branch, PR, deployment, "
     "feature summary, or long-lived client-project coding workflow unless the "
-    "user explicitly asks for implementation work. If the inline exchange turns "
-    "out to be a genuine work request, call the Discord tool's "
-    "promote_to_action_thread action. The tool returns the target thread link. "
-    "After it succeeds, STOP current-turn implementation, include that link in "
-    "your response, and ask the user to continue by sending a new message in the "
-    "promoted thread. Do not implement the work until that new inbound message."
+    "user explicitly asks for implementation work."
 )
 
 try:
@@ -3047,52 +3042,6 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] Failed to persist Discord feature summary handle", self.name, exc_info=True)
         return handle
-
-    async def initialize_promoted_action_thread(
-        self,
-        *,
-        channel_id: str,
-        message_id: str,
-        thread_id: str,
-        initial_request: str,
-    ) -> bool:
-        """Initialize or reuse the standard summary for a tool-promoted thread."""
-        parent_channel = await self._resolve_channel_by_id(channel_id)
-        if parent_channel is None:
-            return False
-
-        source_message = None
-        fetch_message = getattr(parent_channel, "fetch_message", None)
-        if callable(fetch_message):
-            try:
-                source_message = await fetch_message(int(message_id))
-            except Exception as exc:
-                logger.debug("[%s] Promoted Discord source message fetch failed: %s", self.name, exc)
-
-        thread_channel = getattr(source_message, "thread", None)
-        if thread_channel is None or str(getattr(thread_channel, "id", "") or "") != str(thread_id):
-            thread_channel = await self._resolve_channel_by_id(thread_id)
-        if thread_channel is None:
-            return False
-
-        project_context = self._resolve_project_context_for_channel(parent_channel)
-        feature_summary = self._load_feature_summary_handle_for_thread(
-            thread_channel,
-            project_context=project_context,
-        )
-        if feature_summary is None:
-            feature_summary = await self.initialize_feature_summary(
-                thread_channel,
-                parent_channel=parent_channel,
-                initial_request=initial_request,
-                project_context=project_context,
-                source_message_id=str(message_id),
-            )
-        if feature_summary is None:
-            return False
-
-        self._threads.mark(str(thread_id))
-        return True
 
     async def initialize_goal_feature_summary_for_source(
         self,
