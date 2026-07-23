@@ -56,7 +56,8 @@ def test_feature_summary_triage_is_pinned_to_luna_without_reasoning():
     assert triage["provider"] == "auto"
     assert triage["model"] == "gpt-5.6-luna"
     assert triage["reasoning_effort"] == "none"
-    assert triage["timeout"] == 4
+    assert triage["timeout"] == 5
+    assert DEFAULT_CONFIG["discord"]["feature_summary_triage_timeout"] == 5
 
 
 def test_aux_tasks_keys_all_exist_in_default_config():

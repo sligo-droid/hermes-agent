@@ -157,6 +157,12 @@ async def test_llm_prompt_includes_few_shot_examples_and_context(
     assert kwargs["timeout"] == adapter._feature_triage_timeout_seconds()
 
 
+def test_feature_triage_timeout_defaults_to_five_seconds(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT", raising=False)
+
+    assert adapter._feature_triage_timeout_seconds() == 5.0
+
+
 @pytest.mark.parametrize(
     ("verdict", "expected"),
     [

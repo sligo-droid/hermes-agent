@@ -84,7 +84,7 @@ FORK_DEFAULT_ADDITIONS = {
             "base_url": "",
             "api_key": "",
             "api_mode": "",
-            "timeout": 4,
+            "timeout": 5,
             "reasoning_effort": "none",
             "extra_body": {},
         },
@@ -365,7 +365,7 @@ FORK_DEFAULT_ADDITIONS = {
         "project_mapping_ignored_category_names": "",
         "voice_auto_tag": False,
         "history_backfill_feature_channels": False,
-        "feature_summary_triage_timeout": 4,
+        "feature_summary_triage_timeout": 5,
     },
     "cron": {
         "model_tier": "trivial",
@@ -519,7 +519,7 @@ FORK_DEFAULT_OVERRIDES: dict[str, Any] = {
         "feature_summary_triage": {
             "model": "gpt-5.6-luna",
             "reasoning_effort": "none",
-            "timeout": 4,
+            "timeout": 5,
         },
     },
     # The fork's Discord action flow expects edit-based response streaming.
