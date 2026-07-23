@@ -26730,11 +26730,23 @@ class _GatewayRunnerCore(
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/log.
                 # poll() remains read-only and does not suppress delivery.
-                from tools.process_registry import (
-                    format_process_notification,
-                    process_registry as _pr_check,
-                )
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                if agent_notify:
+                    from tools.process_registry import (
+                        format_process_notification,
+                        process_registry as _pr_check,
+                    )
+                    if _pr_check.is_completion_consumed(session_id):
+                        # ``notify_on_complete`` is an agent-continuation
+                        # contract, not a request for a second chat message.
+                        # The agent already received this result through an
+                        # explicit wait/log/kill, so falling through to the
+                        # direct-notice path below would post a stale duplicate
+                        # after its turn has finished.
+                        logger.debug(
+                            "Process completion already consumed; skipping notification: %s",
+                            session_id,
+                        )
+                        break
                     from agent.redact import redact_terminal_output
                     from tools.ansi_strip import strip_ansi
                     _command = getattr(session, "command", "") or ""

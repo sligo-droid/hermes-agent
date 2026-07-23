@@ -24,8 +24,9 @@ from gateway.run import GatewayRunner, _parse_session_key
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
 
-    def __init__(self, sessions):
+    def __init__(self, sessions, *, consumed=()):
         self._sessions = list(sessions)
+        self._consumed = set(consumed)
 
     def get(self, session_id):
         if self._sessions:
@@ -33,7 +34,7 @@ class _FakeRegistry:
         return None
 
     def is_completion_consumed(self, session_id):
-        return False
+        return session_id in self._consumed
 
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
@@ -236,6 +237,43 @@ async def test_completion_notice_suppresses_process_output(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_consumed_agent_completion_does_not_post_a_second_notice(
+    monkeypatch, tmp_path,
+):
+    """A result already returned through ``process wait/log`` needs no chat echo."""
+    import tools.process_registry as pr_module
+
+    session_id = "proc_already_consumed"
+    sessions = [
+        SimpleNamespace(
+            output_buffer="health check passed\n",
+            exited=True,
+            exit_code=0,
+            command="check-health",
+        )
+    ]
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry(sessions, consumed={session_id}),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = _watcher_dict(session_id)
+    watcher["notify_on_complete"] = True
+
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
     """thread_id from watcher dict is forwarded as metadata to adapter.send()."""
     import tools.process_registry as pr_module
@@ -345,6 +383,7 @@ async def test_agent_notification_carries_message_id_reply_anchor(monkeypatch, t
     await runner._run_process_watcher(watcher)
 
     adapter.handle_message.assert_awaited_once()
+    adapter.send.assert_not_awaited()
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.internal is True
     assert synth_event.message_id == "555"
