@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter
 
 
 def _ensure_discord_mock():
@@ -43,6 +44,30 @@ _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 import plugins.platforms.discord.adapter as discord_adapter_module  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_unknown_channel_send_is_typed_and_not_plain_text_replayed():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: None,
+        fetch_channel=AsyncMock(
+            side_effect=RuntimeError(
+                "404 Not Found (error code: 10003): Unknown Channel"
+            )
+        ),
+    )
+
+    result = await BasePlatformAdapter._send_with_retry(
+        adapter,
+        "parent-1",
+        "blocked closeout",
+        metadata={"thread_id": "1528874646290698260"},
+    )
+
+    assert result.success is False
+    assert result.error_kind == "not_found"
+    assert adapter._client.fetch_channel.await_count == 1
 
 
 @pytest.mark.asyncio

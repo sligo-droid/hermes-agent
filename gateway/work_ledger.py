@@ -4405,6 +4405,52 @@ class GatewayWorkLedger:
             self._write(data)
             return True
 
+    def mark_terminal_delivery_unreachable(
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        reason: str = "target_not_found",
+    ) -> bool:
+        """CAS-close terminal delivery when its exact destination is gone.
+
+        Unlike an ambiguous timeout, Discord ``Unknown Channel`` proves that
+        this send produced no side effect and that retrying the same thread is
+        futile.  The blocked work item remains durable for operator diagnosis;
+        only its response/summary delivery obligation is retired.
+        """
+
+        with _ledger_file_lock(self.path):
+            data = self._read()
+            item = data["items"].get(work_id)
+            delivery = item.get("terminal_delivery") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(delivery, dict)
+                or str(delivery.get("status") or "") != "sending"
+                or str(delivery.get("owner") or "") != str(owner or "")
+            ):
+                return False
+            now = self._now()
+            next_delivery = dict(delivery)
+            next_delivery.update(
+                {
+                    "status": "completed",
+                    "revision": _positive_int(delivery.get("revision")) + 1,
+                    "owner": "",
+                    "lease_until": None,
+                    "summary_updated_at": now,
+                    "unreachable_at": now,
+                    "unreachable_reason": str(reason or "target_not_found")[:120],
+                }
+            )
+            item["terminal_delivery"] = next_delivery
+            item["delivery_outcome"] = "unreachable"
+            item["summary_updated_at"] = now
+            item["updated_at"] = now
+            self._write(data)
+            return True
+
     def release_terminal_delivery(self, work_id: str, *, owner: str) -> bool:
         with _ledger_file_lock(self.path):
             data = self._read()
