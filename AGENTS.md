@@ -21,6 +21,7 @@ Keep durable project state in the narrowest repo-owned source: code/tests/config
   source .venv/bin/activate   # or: source venv/bin/activate
   ```
 - When developing Hermes itself, work in a git worktree based on `main`; keep the main checkout clean. Merge changes back to `main` when done unless the user asks to pause.
+- A normal Hermes PR lifecycle ends after the PR is merged and the clean canonical checkout is fast-forwarded to the verified merge SHA. Do not restart the gateway merely because Hermes code was merged. Restart only for an explicit user request, runtime-critical configuration that cannot reload safely, or a demonstrated operational necessity; active development workers make noncritical restarts wait/defer, and Discord commentary must continue to state what is happening while work is in flight or recovering.
 - For routine PR/worktree decisions, run `python -m hermes_cli.pr_workflow_preflight --base <base> --head <head>` and use its bounded summary. Do not put raw `git worktree list --porcelain` or an unbounded `git worktree list` inventory into conversational terminal results; reserve raw inventories for explicit repair/audit work outside the active model context.
 - Prefer config changes over code changes when the desired behavior is already configurable.
 - Inspect structure/status first, preserve unrelated local edits, and verify with the project test wrapper before reporting completion.

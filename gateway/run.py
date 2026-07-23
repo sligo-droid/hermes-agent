@@ -5188,7 +5188,7 @@ class _GatewayRunnerCore(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
-                active_agents=self._running_agent_count(),
+                active_agents=self._active_work_count(),
             )
         except Exception:
             pass
@@ -6767,28 +6767,37 @@ class _GatewayRunnerCore(
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_coding_worker_count = self._active_coding_worker_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count, last_coding_worker_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            coding_worker_count = self._active_coding_worker_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or coding_worker_count != last_coding_worker_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_coding_worker_count = coding_worker_count
                 last_status_at = now
 
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_coding_worker_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -6802,6 +6811,7 @@ class _GatewayRunnerCore(
                 self._running_agents
                 or self._active_cron_job_count()
                 or self._active_api_run_count()
+                or self._active_coding_worker_count()
             )
             and asyncio.get_running_loop().time() < deadline
         ):
@@ -6811,6 +6821,7 @@ class _GatewayRunnerCore(
             bool(self._running_agents)
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_coding_worker_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -6840,7 +6851,8 @@ class _GatewayRunnerCore(
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
             "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+            "Hermes will automatically resume it after restart. If automatic "
+            "recovery does not proceed, send a message to continue."
             if self._restart_requested
             else "Your current task will be interrupted."
         )
@@ -9124,23 +9136,36 @@ class _GatewayRunnerCore(
                 _clear_planned_restart_notification()
 
         # Establish durable async/closeout ownership before considering any
-        # original-intake or session replay.  Required coding work from a prior
-        # process is fenced as outcome-unknown and reconciled from the ledger;
-        # it must never be restarted as an arbitrary tool-capable model turn.
+        # original-intake or session replay. Required coding Worker Runs are
+        # enumerated as a set, then reattached/resumed/relaunched from their
+        # stable dispatch records. Unsafe ambiguity is surfaced by the ledger;
+        # it must never become an arbitrary tool-capable parent replay.
         try:
             recovered_required = await asyncio.to_thread(
-                self._ledger().mark_orphaned_required_async_dispatches_unknown,
-                current_process_epoch=self._process_epoch,
-                current_owner_pid=os.getpid(),
+                self._recover_durable_coding_workers,
             )
         except Exception:
-            recovered_required = []
-            logger.exception("Required async startup recovery failed")
-        if recovered_required:
+            recovered_required = {"failed": 1}
+            logger.exception("Durable coding-worker startup recovery failed")
+        if any(int(recovered_required.get(key) or 0) for key in (
+            "launched", "waiting_alive", "manual_fallback", "failed"
+        )):
             logger.warning(
-                "Recovered %d orphaned required coding dispatch(es) as outcome-unknown",
-                len(recovered_required),
+                "Durable coding-worker startup recovery: launched=%d waiting=%d "
+                "manual_fallback=%d failed=%d",
+                int(recovered_required.get("launched") or 0),
+                int(recovered_required.get("waiting_alive") or 0),
+                int(recovered_required.get("manual_fallback") or 0),
+                int(recovered_required.get("failed") or 0),
             )
+        await self._send_durable_coding_worker_recovery_notices(
+            recovered_required.get("notices") or []
+        )
+        self._start_owned_runner(
+            "durable-coding-worker-recovery",
+            self._durable_coding_worker_reconciler,
+            restart_on_exit=True,
+        )
         self._start_owned_runner(
             "required-async-reconciler",
             self._required_async_reconciler,
@@ -10657,6 +10682,108 @@ class _GatewayRunnerCore(
             ):
                 scheduled += 1
         return scheduled
+
+    def _recover_durable_coding_workers(self) -> dict[str, Any]:
+        """Recover all registered Discord coding children for this process."""
+
+        from tools.coding_worker_tool import recover_durable_coding_workers
+
+        report = recover_durable_coding_workers(
+            ledger=self._ledger(),
+            process_epoch=str(self._process_epoch),
+            owner_pid=os.getpid(),
+        )
+        if report.get("work_item_ids"):
+            event = self.__dict__.setdefault(
+                "_required_async_reconcile_event",
+                asyncio.Event(),
+            )
+            event.set()
+        return report
+
+    async def _send_durable_coding_worker_recovery_notices(
+        self,
+        notices: Any,
+    ) -> int:
+        """Keep Discord parents informed when automatic recovery must wait/fail."""
+
+        sent = 0
+        seen: set[tuple[str, str]] = set()
+        delivered = self.__dict__.setdefault(
+            "_durable_coding_worker_notice_keys",
+            set(),
+        )
+        for raw in list(notices or [])[:32]:
+            if not isinstance(raw, dict):
+                continue
+            delegation_id = str(raw.get("delegation_id") or "")
+            kind = str(raw.get("kind") or "waiting")
+            dedupe_key = (delegation_id, kind)
+            if not delegation_id or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            source_data = raw.get("source")
+            if not isinstance(source_data, dict):
+                continue
+            try:
+                source = SessionSource.from_dict(source_data)
+            except Exception:
+                continue
+            if source.platform != Platform.DISCORD:
+                continue
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                continue
+            detail = str(raw.get("message") or "").strip()
+            persistent_key = (delegation_id, kind, detail)
+            if persistent_key in delivered:
+                continue
+            if kind == "manual_fallback":
+                content = (
+                    "⚠️ Coding-worker recovery needs attention — Hermes could not "
+                    "safely resume this worker and will block the parent request "
+                    "without replaying it. " + detail
+                )
+            else:
+                content = (
+                    "🔄 Recovering coding work after restart — " + detail
+                )
+            metadata = {"thread_id": source.thread_id} if source.thread_id else None
+            try:
+                result = await adapter.send(
+                    chat_id=str(source.chat_id),
+                    content=content,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.debug(
+                    "Durable coding-worker recovery notice failed for %s",
+                    delegation_id,
+                    exc_info=True,
+                )
+                continue
+            if getattr(result, "success", False):
+                sent += 1
+                delivered.add(persistent_key)
+                if len(delivered) > 256:
+                    delivered.clear()
+                    delivered.add(persistent_key)
+        return sent
+
+    async def _durable_coding_worker_reconciler(self, interval: float = 2.0) -> None:
+        """Retry deferred alive/capacity recovery without replaying the parent."""
+
+        while self._running:
+            try:
+                report = await asyncio.to_thread(self._recover_durable_coding_workers)
+                await self._send_durable_coding_worker_recovery_notices(
+                    report.get("notices") or []
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Durable coding-worker reconciliation failed")
+            await asyncio.sleep(max(0.25, interval))
 
     async def _required_async_reconciler(
         self,
@@ -26554,6 +26681,8 @@ class _GatewayRunnerCore(
                 generation=evt.get("origin_run_generation"),
                 attempt_id=evt.get("origin_attempt_id"),
                 attempt_order=evt.get("origin_attempt_order"),
+                owner_pid=evt.get("origin_owner_pid"),
+                process_epoch=evt.get("origin_process_epoch"),
                 status=str(evt.get("status") or ""),
                 completed_at=evt.get("completed_at"),
                 closeout_id=str(evt.get("closeout_id") or ""),
@@ -31602,7 +31731,43 @@ class _GatewayRunnerCore(
                 self._running_agent_count()
                 + self._active_cron_job_count()
                 + self._active_api_run_count()
+                + self._active_coding_worker_count()
             )
+
+    def _active_coding_worker_count(self) -> int:
+            """Count detached coding Worker Runs that a noncritical restart drains."""
+
+            try:
+                from tools.async_delegation import list_async_delegations
+
+                active_ids = {
+                    str(row.get("delegation_id") or "")
+                    for row in list_async_delegations()
+                    if row.get("kind") == "coding_worker"
+                    and row.get("status") in {"running", "finalizing"}
+                    and str(row.get("delegation_id") or "")
+                }
+                if active_ids:
+                    return len(active_ids)
+                ledger = self._ledger()
+                for item in ledger.incomplete_items():
+                    state = ledger.required_async_completion_state(
+                        str(item.get("id") or "")
+                    )
+                    if not isinstance(state, dict) or not state.get("owns_recovery"):
+                        continue
+                    for delegation_id, dispatch in dict(
+                        state.get("dispatches") or {}
+                    ).items():
+                        if (
+                            dispatch.get("kind") == "coding_worker"
+                            and dispatch.get("required") is True
+                            and dispatch.get("state") in {"registered", "running"}
+                        ):
+                            active_ids.add(str(delegation_id))
+                return len(active_ids)
+            except Exception:
+                return 0
 
     def _active_cron_job_count(self) -> int:
             """Count of cron jobs currently executing, from the cron scheduler's
