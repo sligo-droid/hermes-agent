@@ -203,6 +203,36 @@ def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     agent.context_compressor.compress.assert_not_called()
 
 
+def test_read_only_compression_fails_closed_without_session_mutation(tmp_path: Path) -> None:
+    """Overflow recovery cannot lock, rotate, or compact a read-only session."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "READ_ONLY_COMPRESSION"
+    db.create_session(parent_sid, source="discord")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    agent._runtime_mode = "read_only"
+    agent._persist_disabled = True
+    agent._build_system_prompt = MagicMock(return_value="read-only prompt")
+    agent.commit_memory_session = MagicMock(
+        side_effect=AssertionError("read-only compression must not extract memory")
+    )
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    compressed, prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    assert compressed is messages
+    assert prompt == "read-only prompt"
+    assert agent.session_id == parent_sid
+    assert _count_children(db, parent_sid) == 0
+    assert db.get_compression_lock_holder(parent_sid) is None
+    agent.context_compressor.compress.assert_not_called()
+    agent.commit_memory_session.assert_not_called()
+
+
 def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path: Path) -> None:
     """Provider chat templates need at least one user message after compaction.
 

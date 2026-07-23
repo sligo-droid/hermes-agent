@@ -2334,4 +2334,10 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if str(args.get("action") or "") in {"list", "poll", "log", "wait"}
+        else "only list, poll, log, and wait are read-only"
+    ),
 )

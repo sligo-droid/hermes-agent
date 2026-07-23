@@ -518,6 +518,8 @@ class PluginContext:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
+        effect: str = "unknown",
+        read_only_check: Callable[[dict], bool | str | None] | None = None,
         override: bool = False,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
@@ -553,6 +555,8 @@ class PluginContext:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            effect=effect,
+            read_only_check=read_only_check,
             override=override,
         )
         registered_entry = registry.get_entry(name)

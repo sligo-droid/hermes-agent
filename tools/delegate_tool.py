@@ -1688,6 +1688,7 @@ def _build_child_agent(
         skip_context_files=True,
         skip_memory=True,
         session_role="worker",
+        runtime_mode=("read_only" if read_only else "action"),
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
@@ -1717,6 +1718,10 @@ def _build_child_agent(
     )
     set_runtime_audit_context(child, **audit_context)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Read-only delegation may query the parent's session store through the
+    # bounded session_search handler, but the child itself must never create a
+    # session, append messages, persist token accounting, or compact history.
+    child._persist_disabled = bool(read_only)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
@@ -4652,6 +4657,27 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if (
+            args.get("allow_nested_coding") is not True
+            and (
+                (
+                    isinstance(args.get("tasks"), list)
+                    and bool(args.get("tasks"))
+                    and all(
+                        isinstance(task, dict)
+                        and task.get("read_only") is True
+                        and task.get("allow_nested_coding") is not True
+                        for task in args.get("tasks")
+                    )
+                )
+                or (not args.get("tasks") and args.get("read_only") is True)
+            )
+        )
+        else "every delegated task must explicitly set read_only=true and disable nested coding"
+    ),
 )
 
 registry.register(

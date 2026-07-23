@@ -179,7 +179,8 @@ async def test_debounce_later_action_upgrades_question_intent_and_prompt():
 
     aggregate = _debounced_event(adapter, session_key)
     assert aggregate.text == "What should we build?\nOkay, let's build this"
-    assert aggregate.discord_action_request_intent is True
+    assert aggregate.discord_runtime_mode == "action"
+    assert aggregate.discord_action_request_intent is None
     assert aggregate.channel_prompt == "Project instructions"
     assert "Direct question overlay" not in aggregate.channel_prompt
 
@@ -211,7 +212,8 @@ async def test_debounce_later_question_overrides_action_intent_and_prompt():
 
     aggregate = _debounced_event(adapter, session_key)
     assert aggregate.text == "Okay, let's build this\nActually, stop. What would this change?"
-    assert aggregate.discord_action_request_intent is False
+    assert aggregate.discord_runtime_mode == "read_only"
+    assert aggregate.discord_action_request_intent is None
     assert aggregate.channel_prompt == "Project instructions\n\nDirect question overlay"
     assert aggregate.discord_action_request_base_channel_prompt == "Project instructions"
 

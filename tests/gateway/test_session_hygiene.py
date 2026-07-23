@@ -52,8 +52,8 @@ def _make_large_history_tokens(target_tokens: int) -> list:
 
 
 class HygieneCaptureAdapter(BasePlatformAdapter):
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
+    def __init__(self, platform: Platform = Platform.TELEGRAM):
+        super().__init__(PlatformConfig(enabled=True, token="fake-token"), platform)
         self.sent = []
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -393,6 +393,90 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     assert FakeCompressAgent.last_instance is not None
     FakeCompressAgent.last_instance.shutdown_memory_provider.assert_called_once()
     FakeCompressAgent.last_instance.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_read_only_discord_skips_durable_session_hygiene(monkeypatch, tmp_path):
+    """A bounded read-only replay must not first rewrite the durable transcript."""
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class ForbiddenCompressAgent:
+        def __init__(self, **_kwargs):
+            raise AssertionError("read-only Discord hygiene must not construct a compressor")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = ForbiddenCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    adapter = HygieneCaptureAdapter(Platform.DISCORD)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:discord:channel:123",
+        session_id="sess-read-only",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.DISCORD,
+        chat_type="channel",
+    )
+    original_history = _make_history(6, content_size=400)
+    runner.session_store.load_transcript.return_value = original_history
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "observed",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "agent_persisted": False,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+
+    event = MessageEvent(
+        text="audit the current state and recommend next fixes",
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            chat_type="channel",
+            user_id="456",
+        ),
+        message_id="789",
+        discord_runtime_mode="read_only",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "observed"
+    runner.session_store.rewrite_transcript.assert_not_called()
+    assert runner.session_store.load_transcript.return_value == original_history
+    assert runner._run_agent.await_args.kwargs["discord_runtime_mode"] == "read_only"
 
 
 @pytest.mark.asyncio

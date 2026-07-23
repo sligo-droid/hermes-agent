@@ -138,7 +138,8 @@ class TestDiscordTextBatching:
 
         pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
         assert pending.text == "What should we build?\nOkay, let's build this"
-        assert pending.discord_action_request_intent is True
+        assert pending.discord_runtime_mode == "action"
+        assert pending.discord_action_request_intent is None
         assert pending.channel_prompt == "Project instructions"
         assert "Direct question overlay" not in pending.channel_prompt
         assert pending.message_id == "first-message"
@@ -165,7 +166,8 @@ class TestDiscordTextBatching:
         adapter._enqueue_text_event(second)
 
         pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
-        assert pending.discord_action_request_intent is False
+        assert pending.discord_runtime_mode == "read_only"
+        assert pending.discord_action_request_intent is None
         assert pending.channel_prompt == "Project instructions\n\nDirect question overlay"
         assert pending.discord_action_request_base_channel_prompt == "Project instructions"
 
@@ -192,7 +194,8 @@ class TestDiscordTextBatching:
         adapter._enqueue_text_event(second)
 
         pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
-        assert pending.discord_action_request_intent is False
+        assert pending.discord_runtime_mode == "read_only"
+        assert pending.discord_action_request_intent is None
         assert pending.channel_prompt.endswith("Direct question overlay")
         assert pending.message_id == "first-question"
         assert pending.source is first.source

@@ -470,6 +470,7 @@ class AIAgent:
         pass_session_id: bool = False,
         verify_on_stop: bool | str | None = None,
         session_role: str = "operator",
+        runtime_mode: str = "action",
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -549,6 +550,7 @@ class AIAgent:
             pass_session_id=pass_session_id,
             verify_on_stop=verify_on_stop,
             session_role=session_role,
+            runtime_mode=runtime_mode,
         )
         self._session_log_written_count: int = -1
         self._session_log_written_path: Optional[Path] = None
@@ -562,10 +564,13 @@ class AIAgent:
         opening the default state DB instead of making the advertised
         ``session_search`` tool unusable.
         """
-        if getattr(self, "_persist_disabled", False):
-            return None
         if self._session_db is not None:
             return self._session_db
+        if getattr(self, "_persist_disabled", False):
+            # Deferred/read-only turns may inspect the gateway-provided store,
+            # but must never create a new writable store as an implicit side
+            # effect when the entrypoint omitted one.
+            return None
         try:
             from hermes_state import SessionDB
 
@@ -6231,6 +6236,8 @@ class AIAgent:
         """
         from tools.delegate_tool import delegate_task as _delegate_task
         read_only = bool(function_args.get("read_only", False))
+        if str(getattr(self, "_runtime_mode", "") or "") == "read_only":
+            read_only = True
         if getattr(self, "_coding_worker_required_this_turn", False):
             # General analysis delegation remains available on every routed
             # coding turn, but repository mutation stays on the trusted coding

@@ -123,6 +123,7 @@ async def _run_discord_agent(
         session_key="agent:main:discord:thread:thread-1",
         channel_prompt=channel_prompt,
         feature_summary=feature_summary,
+        discord_runtime_mode="read_only" if intent is False else "action",
         discord_action_request_intent=intent,
     )
 
@@ -316,6 +317,8 @@ async def test_existing_action_thread_direct_question_uses_ordinary_runtime(monk
     assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert "tool_delay" not in init
     assert "verify_on_stop" not in init
+    assert init["runtime_mode"] == "read_only"
+    assert init["memory_read_only"] is True
     assert "Discord action-request thread guidance" not in init["ephemeral_system_prompt"]
     assert "Answer this current direct question in place." in init["ephemeral_system_prompt"]
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
@@ -394,6 +397,7 @@ async def test_persisted_auto_thread_summary_reaches_action_request_route(monkey
         session_id="session-1",
         session_key="agent:main:discord:thread:thread-1",
         feature_summary=event.feature_summary,
+        discord_runtime_mode="action",
     )
 
     assert result["final_response"] == "ok"
@@ -434,6 +438,7 @@ async def test_zero_background_workers_finalize_summary_and_reaction():
             "message_id": "300",
             "kanban_board": None,
         },
+        discord_runtime_mode="action",
     )
 
     runner._install_background_worker_reaction_gate(adapter)
@@ -608,6 +613,7 @@ async def test_discord_action_request_cache_signature_records_fast_path(monkeypa
     )
 
     assert captured_cache_keys
+    assert captured_cache_keys[0]["gateway.runtime_mode"] == "action"
     assert captured_cache_keys[0]["gateway.discord_action_request_fast_path"] is True
     assert captured_cache_keys[0]["gateway.discord_feature_request_fast_path"] is True
     assert captured_cache_keys[0]["gateway.tool_delay"] == 0.0

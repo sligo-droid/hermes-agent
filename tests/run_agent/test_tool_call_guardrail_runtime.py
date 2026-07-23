@@ -36,7 +36,12 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
+def _make_agent(
+    *tool_names: str,
+    max_iterations: int = 10,
+    config: dict | None = None,
+    runtime_mode: str = "action",
+) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -50,6 +55,7 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            runtime_mode=runtime_mode,
         )
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
@@ -218,6 +224,87 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert started_events == [("tool.started", "web_search", allowed_args, {})]
     assert len(completed_events) == 1
     assert completed_events[0][1] == "web_search"
+
+
+def test_read_only_sequential_execution_blocks_mutation_and_runs_reads():
+    agent = _make_agent("write_file", "read_file", runtime_mode="read_only")
+    calls = [
+        _mock_tool_call("write_file", '{"path":"app.py","content":"x"}', "c-write"),
+        _mock_tool_call("read_file", '{"path":"README.md"}', "c-read"),
+    ]
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value='{"ok":true}') as dispatch:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls),
+            messages,
+            "task-1",
+        )
+
+    dispatch.assert_called_once()
+    assert dispatch.call_args.args[:2] == ("read_file", {"path": "README.md"})
+    assert [message["tool_call_id"] for message in messages] == ["c-write", "c-read"]
+    assert "changes durable state" in messages[0]["content"]
+
+
+def test_read_only_concurrent_execution_blocks_unknown_and_mutating_tools():
+    agent = _make_agent(
+        "read_file",
+        "browser_click",
+        "unknown_plugin_tool",
+        runtime_mode="read_only",
+    )
+    calls = [
+        _mock_tool_call("read_file", '{"path":"README.md"}', "c-read"),
+        _mock_tool_call("browser_click", '{"ref":"@e1"}', "c-click"),
+        _mock_tool_call("unknown_plugin_tool", "{}", "c-unknown"),
+    ]
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value='{"ok":true}') as dispatch:
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=calls),
+            messages,
+            "task-1",
+        )
+
+    dispatch.assert_called_once()
+    assert dispatch.call_args.args[:2] == ("read_file", {"path": "README.md"})
+    by_id = {message["tool_call_id"]: message["content"] for message in messages}
+    assert "changes durable state" in by_id["c-click"]
+    assert "no registered read-only capability metadata" in by_id["c-unknown"]
+
+
+def test_read_only_execution_rechecks_middleware_rewritten_conditional_args(monkeypatch):
+    from model_tools import handle_function_call
+    from tools.registry import registry
+
+    entry = registry.get_entry("terminal")
+    original_handler = entry.handler
+    handler = MagicMock(return_value='{"ok":true}')
+    entry.handler = handler
+
+    def execution_middleware(**kwargs):
+        return kwargs["next_call"]({"command": "touch forbidden"})
+
+    manager = SimpleNamespace(
+        _middleware={"tool_request": [], "tool_execution": [execution_middleware]}
+    )
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+    try:
+        result = json.loads(
+            handle_function_call(
+                "terminal",
+                {"command": "ps"},
+                runtime_mode="read_only",
+            )
+        )
+    finally:
+        entry.handler = original_handler
+
+    handler.assert_not_called()
+    assert "terminal is limited" in result["error"]
 
 
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():

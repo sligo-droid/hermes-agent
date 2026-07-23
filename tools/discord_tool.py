@@ -1946,4 +1946,19 @@ for _tool_name, _schema, _action, _required, _handler_fn in _FIRST_CLASS_DISCORD
         handler=_make_first_class_handler(_tool_name, _action, _required, _handler_fn),
         check_fn=_make_action_check(_action),
         requires_env=["DISCORD_BOT_TOKEN"],
+        effect=(
+            "read_only"
+            if _action
+            in {
+                "list_guilds",
+                "list_channels",
+                "get_channel",
+                "get_message",
+                "list_recent",
+                "get_thread",
+                "search_messages",
+                "get_reactions",
+            }
+            else "mutating"
+        ),
     )

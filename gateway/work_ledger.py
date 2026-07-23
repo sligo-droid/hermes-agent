@@ -2004,14 +2004,14 @@ class GatewayWorkLedger:
         message_type = getattr(getattr(event, "message_type", None), "value", None)
         normalized_visual_config = normalize_visual_qa_config(visual_qa_config)
         visual_requirement = _visual_qa_requirement_for_event(event)
-        action_intent = getattr(event, "discord_action_request_intent", None)
         channel_prompt = getattr(event, "channel_prompt", None)
-        if isinstance(action_intent, bool):
-            channel_prompt = getattr(
-                event,
-                "discord_action_request_base_channel_prompt",
-                None,
-            )
+        base_channel_prompt = getattr(
+            event,
+            "discord_action_request_base_channel_prompt",
+            None,
+        )
+        if base_channel_prompt is not None:
+            channel_prompt = base_channel_prompt
         item = {
             "id": work_id,
             "status": status,
@@ -5312,6 +5312,8 @@ class GatewayWorkLedger:
             project_summary=item.get("project_summary"),
             channel_context=item.get("channel_context"),
             goal_thread_context=item.get("goal_thread_context"),
+            discord_runtime_mode="action",
+            participates_in_work_lifecycle=True,
         )
         event.work_item_id = item.get("id")
         event.work_replay = True

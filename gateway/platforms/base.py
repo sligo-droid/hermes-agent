@@ -1451,11 +1451,14 @@ class MessageEvent:
     feature_summary: Optional[Dict[str, Any]] = None
     project_summary: Optional[Dict[str, Any]] = None
 
-    # Discord adapter intent verdict for the current user turn. True selects
-    # action runtime behavior, False selects ordinary question behavior while
-    # retaining action-thread identity, and None preserves legacy/synthetic
-    # routing based on structural thread metadata.
+    # Deprecated Discord intake verdict retained only for synthetic/plugin
+    # compatibility. New code must set ``discord_runtime_mode`` instead.
     discord_action_request_intent: Optional[bool] = None
+
+    # Explicit Discord turn capability. New adapter/gateway code uses this
+    # single representation; ``discord_action_request_intent`` is retained
+    # only as a narrow compatibility input for older synthetic callers.
+    discord_runtime_mode: Optional[str] = None
 
     # Discord channel prompt before any per-turn direct-question overlay.
     # This is transient intake metadata used when coalescing inbound messages.
@@ -1755,9 +1758,16 @@ def merge_discord_action_request_metadata(
     verdict wins, while a legacy/synthetic ``None`` verdict never replaces an
     earlier explicit one. The matching prompt metadata moves with that verdict.
     """
+    from agent.runtime_capabilities import normalize_runtime_mode
+
+    incoming_mode = getattr(event, "discord_runtime_mode", None)
     incoming_intent = getattr(event, "discord_action_request_intent", None)
-    if incoming_intent is None:
+    if incoming_mode is None and incoming_intent is None:
         return
+    incoming_mode = normalize_runtime_mode(
+        incoming_mode,
+        legacy_action_intent=incoming_intent,
+    ).value
 
     base_prompt_attr = "discord_action_request_base_channel_prompt"
     legacy_base_prompt_attr = "_discord_action_request_base_channel_prompt"
@@ -1769,9 +1779,10 @@ def merge_discord_action_request_metadata(
     if incoming_base_prompt is None:
         incoming_base_prompt = getattr(existing, legacy_base_prompt_attr, None)
 
-    existing.discord_action_request_intent = incoming_intent
+    existing.discord_runtime_mode = incoming_mode
+    existing.discord_action_request_intent = None
     existing.discord_action_request_base_channel_prompt = incoming_base_prompt
-    if incoming_intent is True:
+    if incoming_mode == "action":
         existing.channel_prompt = incoming_base_prompt
     else:
         existing.channel_prompt = getattr(event, "channel_prompt", None)

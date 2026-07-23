@@ -32,6 +32,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.provider = "openrouter"
     agent.platform = "cli"
     agent._session_db = session_db
+    agent._persist_disabled = False
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -138,6 +139,16 @@ class TestLegitimateFreshBuild:
         _restore_or_build_system_prompt(agent, None, [])
         agent._build_system_prompt.assert_called_once()
         assert agent._cached_system_prompt == "BUILT_PROMPT"
+
+    def test_persist_disabled_turn_builds_prompt_without_db_write(self):
+        db = MagicMock()
+        agent = _make_agent(session_db=db)
+        agent._persist_disabled = True
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -65,6 +65,18 @@ def test_run_conversation_persists_tokens_for_cron_sessions():
     assert session_db.update_token_counts.call_args.args[0] == "cron-session"
 
 
+def test_persist_disabled_read_only_turn_does_not_write_token_accounting():
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="discord")
+    agent._runtime_mode = "read_only"
+    agent._persist_disabled = True
+
+    result = agent.run_conversation("inspect the current state")
+
+    assert result["final_response"] == "done"
+    session_db.update_token_counts.assert_not_called()
+
+
 def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):
     sentinel_db = object()
     captured = {}

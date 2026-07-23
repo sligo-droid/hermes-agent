@@ -39,6 +39,7 @@ from hermes_cli.discord_thread_context import (
 )
 from hermes_cli.discord_plan_artifacts import persist_discord_plan_artifact
 from agent.runtime_breakdown import render_runtime_breakdown_text
+from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
@@ -169,17 +170,19 @@ _OBSIDIAN_PROJECT_ACCESS_HEADINGS = {
     "credentials",
     "demo credentials",
 }
-_DISCORD_DIRECT_QUESTION_PROMPT = (
-    "This Discord trigger was classified as a direct question, not an action "
-    "request, and entered the safe question/intake runtime. Answer in place "
-    "when the user wants explanation, status, advice, or a short answer. "
-    "Read-only inspection is allowed when it is needed to answer. Do not edit "
-    "files, run mutating commands, start a branch or PR, deploy, or begin any "
-    "other implementation workflow in this runtime. If the "
-    "user is actually asking Hermes to implement, change, fix, deploy, run, or "
-    "otherwise perform work, call `escalate_to_action` immediately and call it "
-    "alone. Do not do preliminary investigation first. The gateway will replay "
-    "the original request in the correctly isolated action runtime."
+_DISCORD_READ_ONLY_PROMPT = (
+    "This Discord turn is running in Hermes' default READ-ONLY runtime. Answer "
+    "directly when existing context is enough; otherwise actively inspect with "
+    "the available read-only file/search, history/log, browser navigation and "
+    "snapshot, API, process-inspection, disposable verification, vision, or "
+    "read-only delegation tools. Durable changes are structurally blocked: do "
+    "not edit source/config, install packages, commit/push/open or merge PRs, "
+    "deploy, send external messages, or mutate databases/services. If and only "
+    "if the user's original request requires durable state to change, call "
+    "`escalate_to_action` alone. The gateway will end this turn and replay the "
+    "original text, media, and context into a fresh ACTION runtime. Explicit "
+    "constraints such as 'do not implement', 'plan only', and 'recommend only' "
+    "must remain read-only and must never escalate."
 )
 
 try:
@@ -3204,10 +3207,10 @@ class DiscordAdapter(BasePlatformAdapter):
             ),
             feature_summary=feature_summary,
             project_summary=project_summary,
-            discord_action_request_intent=True,
-            channel_context=None,
-            goal_thread_context=None,
-            internal=True,
+            discord_runtime_mode=RuntimeMode.ACTION.value,
+            discord_action_request_intent=None,
+            participates_in_work_lifecycle=True,
+            internal=False,
             suppress_user_output=False,
         )
         self._threads.mark(thread_id)
@@ -3573,12 +3576,42 @@ class DiscordAdapter(BasePlatformAdapter):
             dict.fromkeys(candidate for candidate in (cleaned, leading_ack) if candidate)
         )
 
-        # Observational work is still work. Route explicit reviews, audits,
-        # investigations, verification, research, and planning through the
-        # normal action runtime even when the request is phrased politely or
-        # follows narrative context. Keep the pattern anchored to request-like
-        # clause starts so status prose such as "support is investigating" and
-        # short advice questions such as "what do you recommend?" stay intake.
+        explicit_read_only_constraints = (
+            r"\b(?:do\s+not|don't|dont|without)\s+(?:yet\s+)?(?:implement|change|"
+            r"modify|edit|fix|build|create|add|deploy|ship|write|commit|push|merge)\b",
+            r"\b(?:for\s+now\s+)?(?:just|only)\s+(?:plan|review|audit|research|"
+            r"investigate|verify|recommend|advise|analy[sz]e|assess)\b",
+            r"\b(?:plan|recommendations?|advice|analysis|assessment|findings)\s+only\b",
+            r"\btell\s+me\s+(?:what|how)\s+you\s+would\s+(?:do|implement|change|"
+            r"fix|build|approach)\b",
+            r"\bwhat\s+would\s+you\s+(?:do|change|fix|build|recommend)\b",
+            r"\bno\s+(?:implementation|changes?|edits?|deployment|commits?|push|merge)\b",
+        )
+        if any(
+            re.search(pattern, candidate)
+            for candidate in intent_candidates
+            for pattern in explicit_read_only_constraints
+        ):
+            return False
+
+        # Mixed requests with a concrete operational tail are actionable even
+        # when an earlier clause asks for explanation or diagnosis. Explicit
+        # read-only constraints above still win.
+        if any(
+            re.search(
+                r"(?:[.;,:]\s*|\b(?:and|then)\s+)(?:please\s+)?"
+                r"(?:rerun|re-run|restart|deploy|ship|execute|commit|push|merge|"
+                r"apply|run\s+(?:the\s+)?(?:pipeline|workflow|job|command))\b",
+                candidate,
+            )
+            for candidate in intent_candidates
+        ):
+            return True
+
+        # Observational work belongs directly in the default read-only runtime.
+        # Keep these request-shaped patterns explicit so audits, verification,
+        # research, planning, and recommendations never take a question→action
+        # double hop merely because they need tools.
         observational_task_verb = (
             r"(?:review|audit|inspect|investigate|research|analy[sz]e|assess|"
             r"evaluate|test|verify|validate|diagnose|trace|reproduce|survey|"
@@ -3617,7 +3650,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     r"^(?:(?:and|also|then)\s+)+", "", clause.strip()
                 )
                 if any(pattern.match(request_clause) for pattern in task_clause_patterns):
-                    return True
+                    return False
 
         # An explicit request not to build is a direct-question signal even
         # though the sentence contains an implementation verb. This pins the
@@ -3791,6 +3824,31 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return False
 
+    async def _classify_discord_runtime_mode(
+        self,
+        text: str,
+        context_lines: list[str] | None = None,
+        *,
+        actionable_thread_context: bool = False,
+        force_action: bool = False,
+    ) -> RuntimeMode:
+        if not str(text or "").strip():
+            return RuntimeMode.READ_ONLY
+        heuristic = self._heuristic_action_request_intent(
+            text,
+            actionable_thread_context=actionable_thread_context,
+        )
+        # Explicit read-only constraints beat structural action context,
+        # including an established action thread or configured action channel.
+        if heuristic is False:
+            return RuntimeMode.READ_ONLY
+        if heuristic is True or force_action:
+            return RuntimeMode.ACTION
+        # Ambiguity is intentionally read-only by default. The ordinary agent
+        # gets the full context and can request a transactional gateway replay
+        # only when durable state actually needs to change.
+        return RuntimeMode.READ_ONLY
+
     async def _classify_discord_action_request(
         self,
         text: str,
@@ -3798,18 +3856,15 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         actionable_thread_context: bool = False,
     ) -> bool:
-        if not str(text or "").strip():
-            return False
-        heuristic = self._heuristic_action_request_intent(
-            text,
-            actionable_thread_context=actionable_thread_context,
-        )
-        if heuristic is not None:
-            return heuristic
-        # Ambiguity is intentionally safe by default. The ordinary agent gets
-        # the full conversational context and can request a transactional
-        # gateway escalation if the user's intent is actually to perform work.
-        return False
+        """Compatibility bool wrapper for older tests and plugin callers."""
+
+        return (
+            await self._classify_discord_runtime_mode(
+                text,
+                context_lines=context_lines,
+                actionable_thread_context=actionable_thread_context,
+            )
+        ) is RuntimeMode.ACTION
 
     async def _classify_discord_feature_request(self, text: str) -> bool:
         return await self._classify_discord_action_request(text)
@@ -3849,8 +3904,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _append_direct_question_prompt(self, prompt: Optional[str]) -> str:
         if prompt and prompt.strip():
-            return f"{prompt.strip()}\n\n{_DISCORD_DIRECT_QUESTION_PROMPT}"
-        return _DISCORD_DIRECT_QUESTION_PROMPT
+            return f"{prompt.strip()}\n\n{_DISCORD_READ_ONLY_PROMPT}"
+        return _DISCORD_READ_ONLY_PROMPT
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Notify the gateway when Discord's top-level runtime task exits."""
@@ -6677,9 +6732,14 @@ class DiscordAdapter(BasePlatformAdapter):
     @staticmethod
     def _action_lifecycle_enabled(event: MessageEvent) -> bool:
         """Return whether this turn may mutate action summary/reaction state."""
-        return (
-            getattr(event, "discord_action_request_intent", None) is not False
-            and getattr(event, "participates_in_work_lifecycle", True)
+        mode = normalize_runtime_mode(
+            getattr(event, "discord_runtime_mode", None),
+            legacy_action_intent=getattr(
+                event, "discord_action_request_intent", None
+            ),
+        )
+        return mode is RuntimeMode.ACTION and getattr(
+            event, "participates_in_work_lifecycle", True
         )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
@@ -13383,7 +13443,8 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
         direct_question_prompt = False
-        action_request_intent: Optional[bool] = None
+        discord_runtime_mode: Optional[RuntimeMode] = None
+        empty_action_attachment_followup = False
         voice_action_transcript = ""
         voice_triage_preprocessed = False
         triage_context_lines: list[str] = []
@@ -13417,6 +13478,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
         auto_threaded_direct_question = False
+        should_consider_auto_thread = False
         if is_parent_channel_message and is_meeting_command_message and meeting_audio_attachments:
             thread = await self._create_meeting_thread(message)
             if thread:
@@ -13470,17 +13532,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     voice_triage_preprocessed = True
                     triage_text = voice_triage_text
                     voice_action_transcript = voice_triage_text
-                action_request_intent = (
-                    True
-                    if has_discord_message_link or slash_command_starts_threaded_work or is_action_request_channel
-                    else await self._classify_discord_action_request(
-                        triage_text,
-                        context_lines=triage_context_lines,
-                        actionable_thread_context=existing_actionable_thread_context,
-                    )
+                discord_runtime_mode = await self._classify_discord_runtime_mode(
+                    triage_text,
+                    context_lines=triage_context_lines,
+                    actionable_thread_context=existing_actionable_thread_context,
+                    force_action=(
+                        slash_command_starts_threaded_work
+                        or is_action_request_channel
+                    ),
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-                direct_question_prompt = not action_request_intent
+                direct_question_prompt = discord_runtime_mode is RuntimeMode.READ_ONLY
 
             should_auto_thread_direct_question = bool(
                 direct_question_prompt
@@ -13490,7 +13552,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             )
             if should_consider_auto_thread and (
-                action_request_intent or should_auto_thread_direct_question
+                discord_runtime_mode is RuntimeMode.ACTION
+                or should_auto_thread_direct_question
             ):
                 _stage_started = time.perf_counter()
                 thread = await self._auto_create_thread(message)
@@ -13539,7 +13602,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     return False
 
         if (
-            action_request_intent is None
+            discord_runtime_mode is None
             and not is_meeting_command_message
             and not grill_me_trigger
             and not is_slash_command_message
@@ -13564,24 +13627,21 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if not empty_action_attachment or triage_text.strip():
                 _stage_started = time.perf_counter()
-                action_request_intent = (
-                    True
-                    if is_action_request_channel
-                    else await self._classify_discord_action_request(
-                        triage_text,
-                        context_lines=triage_context_lines,
-                        actionable_thread_context=existing_actionable_thread_context,
-                    )
+                discord_runtime_mode = await self._classify_discord_runtime_mode(
+                    triage_text,
+                    context_lines=triage_context_lines,
+                    actionable_thread_context=existing_actionable_thread_context,
+                    force_action=is_action_request_channel,
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-                direct_question_prompt = not action_request_intent
+                direct_question_prompt = discord_runtime_mode is RuntimeMode.READ_ONLY
 
         # Accepted unmentioned turns in a participated/free-response action
         # thread bypass the earlier mention/reply classifier. Classify them
         # here once structural action identity is known so direct questions
         # use ordinary runtime while terse approvals stay action turns.
         if (
-            action_request_intent is None
+            discord_runtime_mode is None
             and is_thread
             and existing_actionable_thread_context
             and not is_meeting_command_message
@@ -13606,13 +13666,32 @@ class DiscordAdapter(BasePlatformAdapter):
             # native voice remains classifiable when transcription produced text.
             if late_triage_text.strip():
                 _stage_started = time.perf_counter()
-                action_request_intent = await self._classify_discord_action_request(
+                discord_runtime_mode = await self._classify_discord_runtime_mode(
                     late_triage_text,
                     context_lines=triage_context_lines,
                     actionable_thread_context=True,
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-                direct_question_prompt = not action_request_intent
+                direct_question_prompt = discord_runtime_mode is RuntimeMode.READ_ONLY
+
+        empty_action_attachment_followup = bool(
+            existing_actionable_thread_context
+            and all_attachments
+            and not (normalized_content or voice_action_transcript).strip()
+        )
+        if discord_runtime_mode is None:
+            discord_runtime_mode = (
+                RuntimeMode.ACTION
+                if (
+                    slash_command_starts_threaded_work
+                    or is_meeting_command_message
+                    or (
+                        existing_actionable_thread_context
+                        and not (normalized_content or voice_action_transcript).strip()
+                    )
+                )
+                else RuntimeMode.READ_ONLY
+            )
 
         def _feature_summary_initial_request(candidate: Any) -> str:
             candidate_text = str(candidate or "")
@@ -13629,7 +13708,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if (
             is_parent_channel_message
             and mention_prefix
-            and direct_question_prompt is False
+            and discord_runtime_mode is RuntimeMode.ACTION
             and not grill_me_trigger
         ):
             project_summary_handle = await self.initialize_project_summary(
@@ -13677,7 +13756,8 @@ class DiscordAdapter(BasePlatformAdapter):
         elif (
             is_thread
             and not slash_goal_uses_attachment_body
-            and action_request_intent is True
+            and discord_runtime_mode is RuntimeMode.ACTION
+            and not empty_action_attachment_followup
         ):
             feature_summary_handle = self._load_feature_summary_handle_for_request(
                 message.channel,
@@ -14016,7 +14096,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
         _base_channel_prompt = _channel_prompt
-        if direct_question_prompt:
+        if discord_runtime_mode is RuntimeMode.READ_ONLY:
             _channel_prompt = self._append_direct_question_prompt(_channel_prompt)
 
         reply_to_id, reply_to_text = await self._resolve_reply_context(message)
@@ -14036,16 +14116,20 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             feature_summary=feature_summary_handle,
             project_summary=project_summary_handle,
-            discord_action_request_intent=action_request_intent,
+            discord_runtime_mode=discord_runtime_mode.value,
+            discord_action_request_intent=None,
             discord_action_request_base_channel_prompt=_base_channel_prompt,
             channel_context=_channel_context,
             goal_thread_context=_goal_thread_context,
             text_document_inlined=text_document_inlined,
             inlined_text_document_names=inlined_text_document_names,
             participates_in_work_lifecycle=(
-                not is_slash_command_message
-                or slash_command_starts_threaded_work
-                or is_meeting_command_message
+                discord_runtime_mode is RuntimeMode.ACTION
+                and (
+                    not is_slash_command_message
+                    or slash_command_starts_threaded_work
+                    or is_meeting_command_message
+                )
             ),
         )
 

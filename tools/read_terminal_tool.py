@@ -91,4 +91,5 @@ registry.register(
     ),
     check_fn=check_read_terminal_requirements,
     emoji="🖥️",
+    effect="read_only",
 )

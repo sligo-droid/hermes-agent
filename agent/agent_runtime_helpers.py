@@ -2144,7 +2144,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # model switch. Bare test agents may not have a state DB.
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
-    if session_db is not None and session_id:
+    if (
+        session_db is not None
+        and session_id
+        and not getattr(agent, "_persist_disabled", False)
+    ):
         try:
             session_db.update_session_billing_route(
                 session_id,
@@ -2197,13 +2201,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     # policy even when upstream middleware rewrites a request. Check the final
     # payload so middleware cannot accidentally bypass the worker boundary.
     if not pre_tool_block_checked:
-        from agent.tool_executor import _delegation_mutation_block
+        from agent.tool_executor import (
+            _delegation_mutation_block,
+            _read_only_runtime_block,
+        )
 
         delegation_block = _delegation_mutation_block(
             agent, function_name, function_args
         )
         if delegation_block is not None:
             return json.dumps({"error": delegation_block}, ensure_ascii=False)
+        read_only_block = _read_only_runtime_block(
+            agent, function_name, function_args
+        )
+        if read_only_block is not None:
+            return json.dumps({"error": read_only_block}, ensure_ascii=False)
 
     # Check plugin hooks for a block or approval directive before executing.
     block_message: Optional[str] = None
@@ -2408,14 +2420,29 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                runtime_mode=getattr(agent, "_runtime_mode", None),
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
+    def _execute_with_final_policy(next_args: dict) -> Any:
+        effective_args = next_args if isinstance(next_args, dict) else function_args
+        from agent.tool_executor import _read_only_runtime_block
+
+        read_only_block = _read_only_runtime_block(
+            agent, function_name, effective_args
+        )
+        if read_only_block is not None:
+            return _finish_agent_tool(
+                json.dumps({"error": read_only_block}, ensure_ascii=False),
+                effective_args,
+            )
+        return _execute(effective_args)
+
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _execute_with_final_policy,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",

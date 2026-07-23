@@ -47,6 +47,31 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("echo", {"msg": "hi"}))
         assert result == {"msg": "hi"}
 
+    def test_conditional_read_only_policy_requires_explicit_true(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="conditional",
+            toolset="core",
+            schema=_make_schema("conditional"),
+            handler=_dummy_handler,
+            effect="conditional",
+            read_only_check=lambda _args: None,
+        )
+
+        assert "not read-only" in reg.read_only_block("conditional", {})
+
+    def test_conditional_tool_without_policy_is_not_exposed_read_only(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="conditional",
+            toolset="core",
+            schema=_make_schema("conditional"),
+            handler=_dummy_handler,
+            effect="conditional",
+        )
+
+        assert reg.is_exposable_in_read_only("conditional") is False
+
     def test_dispatch_preserves_supported_multimodal_result(self):
         reg = ToolRegistry()
         multimodal = {

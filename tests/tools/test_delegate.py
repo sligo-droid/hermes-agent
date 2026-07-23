@@ -1525,6 +1525,8 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         self.assertEqual(kwargs["model"], parent.model)
         self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
         self.assertEqual(kwargs["provider"], parent.provider)
+        self.assertEqual(kwargs["runtime_mode"], "read_only")
+        self.assertIs(MockAgent.return_value._persist_disabled, True)
 
     @patch("tools.delegate_tool._run_single_child")
     def test_explicit_tier_reaches_aiagent_without_keyword_rewrite(self, mock_run):

@@ -65,6 +65,7 @@ from agent.replay_cleanup import (
     strip_interrupted_tool_tails as _strip_interrupted_tool_tails,
     strip_stale_dangerous_confirmations as _strip_stale_dangerous_confirmations,
 )
+from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
@@ -199,6 +200,35 @@ _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
 )
 _DISCORD_ACTION_WORKTREE_ROOT = Path("/home/droid/workspaces")
 _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT
+_DISCORD_READ_ONLY_HISTORY_MAX_MESSAGES = 48
+_DISCORD_READ_ONLY_HISTORY_MAX_CHARS = 80_000
+
+
+def _discord_runtime_mode_for(
+    value_or_event: Any = None,
+    legacy_action_intent: Optional[bool] = None,
+    *,
+    default: RuntimeMode = RuntimeMode.READ_ONLY,
+) -> RuntimeMode:
+    """Normalize explicit Discord authority with a narrow legacy boundary."""
+
+    value = value_or_event
+    if hasattr(value_or_event, "discord_runtime_mode"):
+        value = getattr(value_or_event, "discord_runtime_mode", None)
+        if legacy_action_intent is None:
+            legacy_action_intent = getattr(
+                value_or_event,
+                "discord_action_request_intent",
+                None,
+            )
+    elif isinstance(value_or_event, bool):
+        legacy_action_intent = value_or_event
+        value = None
+    return normalize_runtime_mode(
+        value,
+        legacy_action_intent=legacy_action_intent,
+        default=default,
+    )
 
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
     """Return whether a board should count toward dispatcher stuck health.
@@ -265,11 +295,16 @@ def _is_standard_discord_feature_request(
 def _discord_feature_summary_for_turn(
     source: Any,
     feature_summary: Optional[Dict[str, Any]],
-    discord_action_request_intent: Optional[bool],
+    discord_runtime_mode: Any,
+    legacy_action_intent: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Suppress action-summary mutation for an explicit direct-question turn."""
+    """Suppress action-summary mutation outside the ACTION runtime."""
     if (
-        discord_action_request_intent is False
+        _discord_runtime_mode_for(
+            discord_runtime_mode,
+            legacy_action_intent,
+        )
+        is RuntimeMode.READ_ONLY
         and _is_standard_discord_action_request(source, feature_summary)
     ):
         return None
@@ -1221,11 +1256,110 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
+def _gateway_history_message_chars(message: Dict[str, Any]) -> int:
+    """Return a deterministic rough character weight for one replay message."""
+
+    total = 0
+    for key in ("content", "api_content", "reasoning", "reasoning_content"):
+        value = message.get(key)
+        if isinstance(value, str):
+            total += len(value)
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        try:
+            total += len(json.dumps(tool_calls, ensure_ascii=False, sort_keys=True))
+        except (TypeError, ValueError):
+            total += len(str(tool_calls))
+    return total
+
+
+def _gateway_history_turn_groups(
+    messages: List[Dict[str, Any]],
+) -> List[List[Dict[str, Any]]]:
+    """Group replay rows without splitting assistant/tool-call sequences."""
+
+    groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "user" and current:
+            groups.append(current)
+            current = []
+        current.append(message)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _truncate_read_only_tool_outputs(
+    messages: List[Dict[str, Any]],
+    *,
+    max_chars: int,
+) -> List[Dict[str, Any]]:
+    """Trim only API-copy tool output while preserving call/result structure."""
+
+    bounded = [dict(message) for message in messages]
+    overflow = sum(_gateway_history_message_chars(message) for message in bounded) - max_chars
+    if overflow <= 0:
+        return bounded
+    marker = "\n...[older read-only tool output truncated from API replay]...\n"
+    for message in bounded:
+        if overflow <= 0:
+            break
+        if message.get("role") not in {"tool", "function"}:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or len(content) <= len(marker) + 256:
+            continue
+        minimum = len(marker) + 256
+        reduction = min(overflow, len(content) - minimum)
+        kept = len(content) - reduction - len(marker)
+        prefix = kept // 2
+        suffix = kept - prefix
+        message["content"] = (
+            content[:prefix]
+            + marker
+            + (content[-suffix:] if suffix else "")
+        )
+        overflow -= reduction
+    return bounded
+
+
+def _bound_read_only_gateway_history(
+    messages: List[Dict[str, Any]],
+    *,
+    max_messages: int = _DISCORD_READ_ONLY_HISTORY_MAX_MESSAGES,
+    max_chars: int = _DISCORD_READ_ONLY_HISTORY_MAX_CHARS,
+) -> List[Dict[str, Any]]:
+    """Return a bounded API-only tail without mutating durable history."""
+
+    groups = _gateway_history_turn_groups(messages)
+    if not groups:
+        return []
+    selected: List[List[Dict[str, Any]]] = []
+    selected_messages = 0
+    selected_chars = 0
+    for group in reversed(groups):
+        group_messages = len(group)
+        group_chars = sum(_gateway_history_message_chars(message) for message in group)
+        if selected and (
+            selected_messages + group_messages > max_messages
+            or selected_chars + group_chars > max_chars
+        ):
+            break
+        selected.append(group)
+        selected_messages += group_messages
+        selected_chars += group_chars
+    selected.reverse()
+    flattened = [message for group in selected for message in group]
+    return _truncate_read_only_tool_outputs(flattened, max_chars=max_chars)
+
+
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]],
     *,
     channel_prompt: Optional[str] = None,
     inject_timestamps: bool = False,
+    runtime_mode: Any = RuntimeMode.ACTION,
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
@@ -1298,6 +1432,11 @@ def _build_gateway_agent_history(
     agent_history = _strip_stale_dangerous_confirmations(
         agent_history, now=time.time()
     )
+    if _discord_runtime_mode_for(
+        runtime_mode,
+        default=RuntimeMode.ACTION,
+    ) is RuntimeMode.READ_ONLY:
+        agent_history = _bound_read_only_gateway_history(agent_history)
 
     observed_context = "\n".join(observed_group_context).strip() or None
     return agent_history, observed_context
@@ -2407,10 +2546,14 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
 def _dequeue_pending_event_for_turn(
     adapter,
     session_key: str,
-    discord_action_request_intent: Optional[bool],
+    discord_runtime_mode: Any,
+    legacy_action_intent: Optional[bool] = None,
 ) -> MessageEvent | None:
-    """Leave queued input for a fresh adapter turn after a direct question."""
-    if discord_action_request_intent is False:
+    """Leave queued input for fresh adapter classification after read-only work."""
+    if _discord_runtime_mode_for(
+        discord_runtime_mode,
+        legacy_action_intent,
+    ) is RuntimeMode.READ_ONLY:
         return None
     return _dequeue_pending_event(adapter, session_key)
 
@@ -3087,13 +3230,17 @@ def _discord_action_worktree_cwd(
     feature_summary: Optional[Dict[str, Any]],
     session_key: str,
     config: Optional[dict] = None,
+    *,
+    provision: bool = True,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Resolve/create the mutable worktree for a normal Discord action thread.
+    """Resolve, and optionally create, a Discord action-thread worktree.
 
     Only protected canonical project mappings are redirected. Existing mutable
     mappings and every non-action gateway route keep their established CWD
     behavior. The branch/path identity is stable per Discord thread, so later
     turns reuse the same worktree while unrelated threads cannot collide.
+    Read-only turns may observe an already-existing action worktree but never
+    create directories, branches, worktrees, dependency links, or warmup state.
     """
     if not _is_standard_discord_action_request(source, feature_summary):
         return None, None
@@ -3124,12 +3271,13 @@ def _discord_action_worktree_cwd(
         )
 
     workspace_root = _DISCORD_ACTION_WORKTREE_ROOT.expanduser().resolve(strict=False)
-    try:
-        workspace_root.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        return None, (
-            f"could not prepare the mutable action-worktree root {workspace_root}: {exc}"
-        )
+    if provision:
+        try:
+            workspace_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return None, (
+                f"could not prepare the mutable action-worktree root {workspace_root}: {exc}"
+            )
 
     import subprocess
 
@@ -3213,6 +3361,9 @@ def _discord_action_worktree_cwd(
         if path_record is not None or target_path.exists():
             continue
 
+        if not provision:
+            continue
+
         try:
             branch_exists = _git(
                 ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
@@ -3281,6 +3432,8 @@ def _discord_action_worktree_cwd(
             + (f": {detail}" if detail else ".")
         )
 
+    if not provision:
+        return None, None
     return None, (
         "could not allocate a collision-free Discord action worktree under "
         f"{workspace_root} after 32 attempts"
@@ -3292,15 +3445,28 @@ def _resolve_gateway_turn_cwd(
     feature_summary: Optional[Dict[str, Any]],
     config: Optional[dict],
     session_key: str,
+    runtime_mode: Any = RuntimeMode.ACTION,
 ) -> tuple[str, Optional[str], Optional[str]]:
-    """Resolve one turn's CWD, provisioning action worktrees when required."""
+    """Resolve a turn CWD, provisioning only for explicit ACTION authority."""
     fallback = _resolve_gateway_session_cwd(source, config)
+    mode = _discord_runtime_mode_for(
+        runtime_mode,
+        default=RuntimeMode.ACTION,
+    )
     worktree_cwd, error = _discord_action_worktree_cwd(
         source,
         feature_summary,
         session_key,
         config,
+        provision=mode is RuntimeMode.ACTION,
     )
+    if mode is RuntimeMode.READ_ONLY and error:
+        logger.debug(
+            "Read-only Discord turn could not reuse an existing action worktree; "
+            "falling back to the mapped session cwd: %s",
+            error,
+        )
+        return fallback, None, None
     return worktree_cwd or fallback, error, worktree_cwd
 
 
@@ -6273,6 +6439,10 @@ class _GatewayRunnerCore(
             return None
         if getattr(event.source, "platform", None) != Platform.DISCORD:
             return None
+        if _discord_runtime_mode_for(event) is not RuntimeMode.ACTION:
+            return None
+        if not getattr(event, "participates_in_work_lifecycle", True):
+            return None
         ledger = self._ledger()
         gateway_config = _load_gateway_config()
         repository = _gateway_repository_for_source(getattr(event, "source", None))
@@ -7645,6 +7815,12 @@ class _GatewayRunnerCore(
         if work_id:
             event.work_item_id = work_id
             event.work_replay = True
+        if (
+            getattr(event, "discord_runtime_mode", None) is None
+            and getattr(event, "discord_action_request_intent", None) is None
+        ):
+            event.discord_runtime_mode = RuntimeMode.ACTION.value
+            event.participates_in_work_lifecycle = True
         session_id = str(item.get("session_id") or "").strip()
         if session_id:
             event.session_id = session_id
@@ -7732,7 +7908,7 @@ class _GatewayRunnerCore(
         """Queue a clean action-runtime replay for a successful intake handoff."""
         if (
             source.platform != Platform.DISCORD
-            or getattr(event, "discord_action_request_intent", None) is not False
+            or _discord_runtime_mode_for(event) is not RuntimeMode.READ_ONLY
             or not isinstance(agent_result.get("action_escalation_requested"), dict)
         ):
             return None
@@ -7778,6 +7954,19 @@ class _GatewayRunnerCore(
         session_key: str,
     ) -> Optional[str]:
         if not getattr(event, "participates_in_work_lifecycle", True):
+            return None
+        if (
+            getattr(getattr(event, "source", None), "platform", None) == Platform.DISCORD
+            and _discord_runtime_mode_for(
+                event,
+                default=(
+                    RuntimeMode.ACTION
+                    if getattr(event, "internal", False)
+                    else RuntimeMode.READ_ONLY
+                ),
+            )
+            is not RuntimeMode.ACTION
+        ):
             return None
         work_item_id = getattr(event, "work_item_id", None)
         if work_item_id or getattr(event.source, "platform", None) != Platform.DISCORD:
@@ -17533,6 +17722,13 @@ class _GatewayRunnerCore(
             and str(_fable_turn_metadata.get("fable_mode") or "").strip().lower()
             == "implementation"
         )
+        discord_runtime_mode = (
+            RuntimeMode.ACTION
+            if _fable_implementation_turn
+            else _discord_runtime_mode_for(event)
+            if source.platform == Platform.DISCORD
+            else RuntimeMode.ACTION
+        )
         if _fable_turn_metadata and not _fable_implementation_turn:
             session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
             session_cwd_error = None
@@ -17544,6 +17740,7 @@ class _GatewayRunnerCore(
                 getattr(event, "feature_summary", None),
                 _pcfg,
                 session_key,
+                discord_runtime_mode,
             )
         if session_cwd_error:
             logger.error(
@@ -17557,35 +17754,36 @@ class _GatewayRunnerCore(
                 "was not used as the agent working directory."
             )
         if action_worktree_cwd:
-            repository = _gateway_repository_for_source(
-                source,
-                workspace_path=action_worktree_cwd,
-            )
-            if not repository:
-                try:
-                    from hermes_cli.github_remote import github_origin_repo
+            if discord_runtime_mode is RuntimeMode.ACTION:
+                repository = _gateway_repository_for_source(
+                    source,
+                    workspace_path=action_worktree_cwd,
+                )
+                if not repository:
+                    try:
+                        from hermes_cli.github_remote import github_origin_repo
 
-                    repository = str(github_origin_repo(action_worktree_cwd) or "")
-                except Exception:
-                    repository = ""
-            visual_requirement = getattr(event, "visual_qa_requirement", None)
-            direct_mode, direct_policy = _gateway_action_closeout_contract(
-                _pcfg,
-                repository=repository,
-                request=_gateway_action_request_text(event),
-                source="fable" if _fable_implementation_turn else "direct",
-                visual_requirement=visual_requirement,
-                visual_config=getattr(event, "visual_qa_config", None),
-            )
-            self._persist_action_closeout_workspace(
-                event,
-                mutable_path=action_worktree_cwd,
-                canonical_path=str(source.project_path or ""),
-                config=_pcfg,
-                source="fable" if _fable_implementation_turn else "direct",
-                mode=direct_mode,
-                policy=direct_policy,
-            )
+                        repository = str(github_origin_repo(action_worktree_cwd) or "")
+                    except Exception:
+                        repository = ""
+                visual_requirement = getattr(event, "visual_qa_requirement", None)
+                direct_mode, direct_policy = _gateway_action_closeout_contract(
+                    _pcfg,
+                    repository=repository,
+                    request=_gateway_action_request_text(event),
+                    source="fable" if _fable_implementation_turn else "direct",
+                    visual_requirement=visual_requirement,
+                    visual_config=getattr(event, "visual_qa_config", None),
+                )
+                self._persist_action_closeout_workspace(
+                    event,
+                    mutable_path=action_worktree_cwd,
+                    canonical_path=str(source.project_path or ""),
+                    config=_pcfg,
+                    source="fable" if _fable_implementation_turn else "direct",
+                    mode=direct_mode,
+                    policy=direct_policy,
+                )
             # The Discord mapping remains canonical in its DB/adapter state,
             # but this turn's injected project context must name the worktree.
             # Otherwise the system prompt explicitly tells lower-tier models to
@@ -17610,7 +17808,7 @@ class _GatewayRunnerCore(
             if "discord_action_escalation_allowed" in _set_env_sig.parameters:
                 _set_env_kwargs["discord_action_escalation_allowed"] = bool(
                     source.platform == Platform.DISCORD
-                    and getattr(event, "discord_action_request_intent", None) is False
+                    and discord_runtime_mode is RuntimeMode.READ_ONLY
                 )
             # Some focused tests replace _set_session_env with a minimal
             # one-arg stub; only pass kwargs its signature accepts.
@@ -17776,7 +17974,16 @@ class _GatewayRunnerCore(
         #    by 30-50% on code/JSON-heavy sessions, but that just
         #    means hygiene fires a bit early — safe and harmless.
         # -----------------------------------------------------------------
-        if history and len(history) >= 4:
+        # Read-only Discord turns use a bounded API-only replay below. Running
+        # durable session hygiene first would defeat that latency/cost bound and
+        # could rewrite or rotate the stored transcript before an observational
+        # turn. Action turns and every non-Discord surface retain the existing
+        # hygiene behavior.
+        _skip_hygiene_for_read_only_discord = bool(
+            source.platform == Platform.DISCORD
+            and discord_runtime_mode is RuntimeMode.READ_ONLY
+        )
+        if history and len(history) >= 4 and not _skip_hygiene_for_read_only_discord:
             from agent.model_metadata import (
                 estimate_messages_tokens_rough,
                 get_model_context_length,
@@ -18391,6 +18598,7 @@ class _GatewayRunnerCore(
                     channel_prompt=event.channel_prompt,
                     feature_summary=getattr(event, "feature_summary", None),
                     project_summary=getattr(event, "project_summary", None),
+                    discord_runtime_mode=discord_runtime_mode.value,
                     discord_action_request_intent=getattr(
                         event,
                         "discord_action_request_intent",
@@ -18411,7 +18619,7 @@ class _GatewayRunnerCore(
                     ),
                     defer_persistence=bool(
                         source.platform == Platform.DISCORD
-                        and getattr(event, "discord_action_request_intent", None) is False
+                        and discord_runtime_mode is RuntimeMode.READ_ONLY
                     ),
                 )
             finally:
@@ -19059,7 +19267,13 @@ class _GatewayRunnerCore(
                 turn_feature_summary = _discord_feature_summary_for_turn(
                     source,
                     getattr(event, "feature_summary", None),
+                    getattr(event, "discord_runtime_mode", None),
                     getattr(event, "discord_action_request_intent", None),
+                )
+                turn_project_summary = (
+                    getattr(event, "project_summary", None)
+                    if _discord_runtime_mode_for(event) is RuntimeMode.ACTION
+                    else None
                 )
                 summary_status = (
                     "Running"
@@ -19069,15 +19283,17 @@ class _GatewayRunnerCore(
                         self._discord_summary_status(agent_result),
                     )
                 )
-                summary_ok = await self._update_discord_summaries(
-                    source=source,
-                    feature_summary=turn_feature_summary,
-                    project_summary=getattr(event, "project_summary", None),
-                    final_response=response,
-                    status=summary_status,
-                    session_id=session_entry.session_id,
-                    runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
-                )
+                summary_ok = False
+                if turn_feature_summary or turn_project_summary or work_item_id:
+                    summary_ok = await self._update_discord_summaries(
+                        source=source,
+                        feature_summary=turn_feature_summary,
+                        project_summary=turn_project_summary,
+                        final_response=response,
+                        status=summary_status,
+                        session_id=session_entry.session_id,
+                        runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
+                    )
                 if (
                     work_item_id
                     and source.platform == Platform.DISCORD
@@ -19086,7 +19302,7 @@ class _GatewayRunnerCore(
                 ):
                     try:
                         expected_run_state = getattr(event, "work_item_run_state", None)
-                        if turn_feature_summary or getattr(event, "project_summary", None):
+                        if turn_feature_summary or turn_project_summary:
                             if self._ledger().mark_summary_updated(str(work_item_id)) and isinstance(
                                 expected_run_state,
                                 dict,
@@ -21827,9 +22043,14 @@ class _GatewayRunnerCore(
         feature_summary = _discord_feature_summary_for_turn(
             source,
             getattr(event, "feature_summary", None),
+            getattr(event, "discord_runtime_mode", None),
             getattr(event, "discord_action_request_intent", None),
         )
-        project_summary = getattr(event, "project_summary", None)
+        project_summary = (
+            getattr(event, "project_summary", None)
+            if _discord_runtime_mode_for(event) is RuntimeMode.ACTION
+            else None
+        )
         if not feature_summary and not project_summary and not work_item_id:
             return
         if not pending_background:
@@ -26680,8 +26901,12 @@ class _GatewayRunnerCore(
         synth_event.participates_in_work_lifecycle = bool(
             kind == "coding_worker" and origin_work_item_id
         )
-        if not synth_event.participates_in_work_lifecycle:
-            synth_event.discord_action_request_intent = False
+        if synth_event.participates_in_work_lifecycle:
+            synth_event.discord_runtime_mode = RuntimeMode.ACTION.value
+            synth_event.discord_action_request_intent = None
+        else:
+            synth_event.discord_runtime_mode = RuntimeMode.READ_ONLY.value
+            synth_event.discord_action_request_intent = None
         synth_event.work_item_id = (
             origin_work_item_id
             if synth_event.participates_in_work_lifecycle and origin_work_item_id
@@ -28645,6 +28870,7 @@ class _GatewayRunnerCore(
         channel_prompt: Optional[str] = None,
         feature_summary: Optional[Dict[str, Any]] = None,
         project_summary: Optional[Dict[str, Any]] = None,
+        discord_runtime_mode: Optional[str] = None,
         discord_action_request_intent: Optional[bool] = None,
         fable_plan_metadata: Optional[Dict[str, Any]] = None,
         fable_toolsets: Optional[List[str]] = None,
@@ -28671,8 +28897,28 @@ class _GatewayRunnerCore(
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        turn_runtime_mode = (
+            _discord_runtime_mode_for(
+                discord_runtime_mode,
+                discord_action_request_intent,
+            )
+            if source.platform == _GATEWAY_PLATFORM.DISCORD
+            else RuntimeMode.ACTION
+        )
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if turn_runtime_mode is RuntimeMode.READ_ONLY:
+                return {
+                    "final_response": (
+                        "⚠️ The configured remote gateway proxy cannot prove read-only "
+                        "tool enforcement, so this Discord turn was blocked safely."
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "history_offset": len(history),
+                    "agent_persisted": False,
+                }
             proxy_requirement, proxy_config = _normalize_gateway_visual_qa_contract(
                 visual_qa_requirement,
                 visual_qa_config if visual_qa_config is not None else _load_gateway_config(),
@@ -28727,7 +28973,7 @@ class _GatewayRunnerCore(
         )
         discord_action_runtime = (
             standard_discord_action_thread
-            and discord_action_request_intent is not False
+            and turn_runtime_mode is RuntimeMode.ACTION
         )
         fable_mode = str(
             (fable_plan_metadata or {}).get("fable_mode", "")
@@ -28749,7 +28995,7 @@ class _GatewayRunnerCore(
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         if (
             source.platform == _GATEWAY_PLATFORM.DISCORD
-            and discord_action_request_intent is False
+            and turn_runtime_mode is RuntimeMode.READ_ONLY
             and "discord-action-escalation" not in enabled_toolsets
         ):
             enabled_toolsets = sorted(
@@ -29795,6 +30041,7 @@ class _GatewayRunnerCore(
                 cache_keys={
                     **self._extract_cache_busting_config(user_config),
                     "gateway.session_cwd": session_cwd,
+                    "gateway.runtime_mode": turn_runtime_mode.value,
                     "gateway.discord_action_request_fast_path": discord_action_runtime,
                     "gateway.discord_feature_request_fast_path": discord_action_runtime,
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
@@ -29862,6 +30109,8 @@ class _GatewayRunnerCore(
                     "gateway_session_key": session_key,
                     "session_db": self._session_db,
                     "fallback_model": None if fable_plan_metadata else self._fallback_model,
+                    "runtime_mode": turn_runtime_mode.value,
+                    "memory_read_only": turn_runtime_mode is RuntimeMode.READ_ONLY,
                 }
                 if fable_plan_metadata:
                     agent_kwargs["providers_allowed"] = ["anthropic"]
@@ -29935,7 +30184,9 @@ class _GatewayRunnerCore(
             agent._visual_qa_last_edit_order = 0
             agent._visual_qa_stop_callback = None
             agent._persist_disabled = bool(defer_persistence)
-            agent._discord_intake_read_only = bool(defer_persistence)
+            agent._runtime_mode = turn_runtime_mode.value
+            agent.memory_read_only = turn_runtime_mode is RuntimeMode.READ_ONLY
+            agent._discord_intake_read_only = turn_runtime_mode is RuntimeMode.READ_ONLY
             agent._action_escalation_requested = None
             if (
                 origin_work_item_id
@@ -30155,6 +30406,7 @@ class _GatewayRunnerCore(
             agent_history, observed_group_context = _build_gateway_agent_history(
                 history,
                 channel_prompt=channel_prompt,
+                runtime_mode=turn_runtime_mode,
             )
 
             # Collect MEDIA paths already in history so we can exclude them
@@ -30694,6 +30946,7 @@ class _GatewayRunnerCore(
                     if (
                         source.platform == Platform.DISCORD
                         and getattr(source, "auto_thread_created", False)
+                        and turn_runtime_mode is RuntimeMode.ACTION
                     ):
                         title_callbacks.append(
                             lambda title: self._schedule_discord_semantic_thread_rename(
@@ -30705,16 +30958,22 @@ class _GatewayRunnerCore(
                     title_feature_summary = _discord_feature_summary_for_turn(
                         source,
                         feature_summary,
+                        turn_runtime_mode,
                         discord_action_request_intent,
                     )
-                    if source.platform == Platform.DISCORD and (title_feature_summary or project_summary):
+                    title_project_summary = (
+                        project_summary
+                        if turn_runtime_mode is RuntimeMode.ACTION
+                        else None
+                    )
+                    if source.platform == Platform.DISCORD and (title_feature_summary or title_project_summary):
                         def _update_discord_title(title: str) -> None:
                             try:
                                 asyncio.run_coroutine_threadsafe(
                                     self._update_discord_summaries(
                                         source=source,
                                         feature_summary=title_feature_summary,
-                                        project_summary=project_summary,
+                                        project_summary=title_project_summary,
                                         final_response=final_response,
                                         status="Complete",
                                         session_id=effective_session_id,
@@ -31249,9 +31508,9 @@ class _GatewayRunnerCore(
                 pending_event = _dequeue_pending_event_for_turn(
                     adapter,
                     session_key,
-                    discord_action_request_intent,
+                    turn_runtime_mode,
                 )
-                if discord_action_request_intent is not False:
+                if turn_runtime_mode is RuntimeMode.ACTION:
                     # /queue overflow: after consuming the adapter's "next-up"
                     # slot, promote the next queued event into it so the
                     # recursive run's drain will see it.  This keeps the slot
@@ -31480,8 +31739,20 @@ class _GatewayRunnerCore(
                 next_project_summary = project_summary
                 next_origin_work_item_id = str(origin_work_item_id or "")
                 next_session_key = session_key
+                next_runtime_mode = turn_runtime_mode
+                next_legacy_action_intent = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_runtime_mode = (
+                        _discord_runtime_mode_for(pending_event)
+                        if getattr(next_source, "platform", None) == Platform.DISCORD
+                        else RuntimeMode.ACTION
+                    )
+                    next_legacy_action_intent = getattr(
+                        pending_event,
+                        "discord_action_request_intent",
+                        None,
+                    )
                     self._hydrate_discord_continuation_event_from_work_item(
                         pending_event,
                         session_key,
@@ -31543,12 +31814,18 @@ class _GatewayRunnerCore(
                     channel_prompt=next_channel_prompt,
                     feature_summary=next_feature_summary,
                     project_summary=next_project_summary,
+                    discord_runtime_mode=next_runtime_mode.value,
+                    discord_action_request_intent=next_legacy_action_intent,
                     fable_reasoning_config=fable_reasoning_config,
                     session_cwd_override=session_cwd,
                     origin_work_item_id=next_origin_work_item_id,
                     suppress_user_output=bool(
                         getattr(pending_event, "suppress_user_output", False)
                     ) if pending_event is not None else False,
+                    defer_persistence=(
+                        getattr(next_source, "platform", None) == Platform.DISCORD
+                        and next_runtime_mode is RuntimeMode.READ_ONLY
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

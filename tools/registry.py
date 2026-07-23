@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from agent.runtime_capabilities import ToolEffect, normalize_tool_effect
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,12 +92,14 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "effect",
+        "read_only_check",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 effect=ToolEffect.UNKNOWN, read_only_check=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -114,6 +118,8 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.effect = normalize_tool_effect(effect)
+        self.read_only_check = read_only_check
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +381,8 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        effect: ToolEffect | str = ToolEffect.UNKNOWN,
+        read_only_check: Callable[[dict], bool | str | None] = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -445,6 +453,8 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                effect=effect,
+                read_only_check=read_only_check,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -455,6 +465,52 @@ class ToolRegistry:
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
+
+    def read_only_block(self, name: str, args: Optional[dict] = None) -> Optional[str]:
+        """Return a fail-closed reason when *name* is unsafe in read-only mode."""
+
+        entry = self.get_entry(name)
+        if entry is None:
+            return (
+                f"Blocked {name}: the tool has no registered read-only capability metadata."
+            )
+        if entry.effect is ToolEffect.READ_ONLY:
+            return None
+        if entry.effect is ToolEffect.CONDITIONAL:
+            check = entry.read_only_check
+            if not callable(check):
+                return f"Blocked {name}: its conditional read-only policy is unavailable."
+            try:
+                decision = check(dict(args or {}))
+            except Exception as exc:
+                logger.warning("read_only_check for %s failed closed: %s", name, exc)
+                return f"Blocked {name}: its read-only policy could not be verified."
+            if decision is True:
+                return None
+            if isinstance(decision, str) and decision.strip():
+                return f"Blocked {name}: {decision.strip()}"
+            return f"Blocked {name}: the requested operation is not read-only."
+        if entry.effect is ToolEffect.MUTATING:
+            return f"Blocked {name}: this tool changes durable state."
+        return (
+            f"Blocked {name}: the tool has not been proven read-only; unknown plugin, "
+            "MCP, and broad tools fail closed."
+        )
+
+    def is_exposable_in_read_only(self, name: str) -> bool:
+        """Whether a schema is useful in a read-only runtime."""
+
+        entry = self.get_entry(name)
+        return bool(
+            entry
+            and (
+                entry.effect is ToolEffect.READ_ONLY
+                or (
+                    entry.effect is ToolEffect.CONDITIONAL
+                    and callable(entry.read_only_check)
+                )
+            )
+        )
 
     def deregister(self, name: str) -> None:
         """Remove a tool from the registry.
@@ -623,6 +679,15 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
+
+        if normalize_runtime_mode(
+            kwargs.get("runtime_mode"),
+            default=RuntimeMode.ACTION,
+        ) is RuntimeMode.READ_ONLY:
+            block = self.read_only_block(name, args)
+            if block is not None:
+                return json.dumps({"error": block}, ensure_ascii=False)
         try:
             if entry.is_async:
                 from model_tools import _run_async
