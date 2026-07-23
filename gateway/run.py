@@ -1257,20 +1257,24 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
 
 
 def _gateway_history_message_chars(message: Dict[str, Any]) -> int:
-    """Return a deterministic rough character weight for one replay message."""
+    """Return deterministic provider-payload weight, including structured content."""
 
-    total = 0
-    for key in ("content", "api_content", "reasoning", "reasoning_content"):
-        value = message.get(key)
-        if isinstance(value, str):
-            total += len(value)
-    tool_calls = message.get("tool_calls")
-    if tool_calls:
-        try:
-            total += len(json.dumps(tool_calls, ensure_ascii=False, sort_keys=True))
-        except (TypeError, ValueError):
-            total += len(str(tool_calls))
-    return total
+    provider_payload = {
+        key: value
+        for key, value in message.items()
+        if key not in {"timestamp", "observed", "mirror", "mirror_source"}
+    }
+    try:
+        return len(
+            json.dumps(
+                provider_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    except (TypeError, ValueError):
+        return len(str(provider_payload))
 
 
 def _gateway_history_turn_groups(
@@ -1311,7 +1315,10 @@ def _truncate_read_only_tool_outputs(
         if not isinstance(content, str) or len(content) <= len(marker) + 256:
             continue
         minimum = len(marker) + 256
-        reduction = min(overflow, len(content) - minimum)
+        # JSON encoding expands the marker's newlines/backslashes slightly;
+        # reserve a small margin so a second generic truncation pass does not
+        # replace this more useful tool-output marker.
+        reduction = min(overflow + 64, len(content) - minimum)
         kept = len(content) - reduction - len(marker)
         prefix = kept // 2
         suffix = kept - prefix
@@ -1321,6 +1328,130 @@ def _truncate_read_only_tool_outputs(
             + (content[-suffix:] if suffix else "")
         )
         overflow -= reduction
+    return bounded
+
+
+_READ_ONLY_HISTORY_RESET_GUIDANCE = (
+    "Earlier read-only context exceeded the safe replay ceiling and was omitted. "
+    "Answer from the current request and available inspection tools; ask the user to "
+    "run /reset if exact prior context is required."
+)
+
+
+def _read_only_history_guidance() -> List[Dict[str, Any]]:
+    return [{"role": "assistant", "content": _READ_ONLY_HISTORY_RESET_GUIDANCE}]
+
+
+def _gateway_history_action_chunks(
+    group: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+    """Split one user turn into an optional user prefix and indivisible action chunks."""
+
+    prefix: List[Dict[str, Any]] = []
+    index = 0
+    if group and group[0].get("role") == "user":
+        prefix = [group[0]]
+        index = 1
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for message in group[index:]:
+        role = message.get("role")
+        if role == "assistant" and current:
+            chunks.append(current)
+            current = []
+        current.append(message)
+    if current:
+        chunks.append(current)
+    return prefix, chunks
+
+
+def _shrink_read_only_group_messages(
+    group: List[Dict[str, Any]],
+    *,
+    max_messages: int,
+) -> List[Dict[str, Any]]:
+    """Drop only complete older assistant/tool chunks from an oversized turn."""
+
+    if len(group) <= max_messages:
+        return [dict(message) for message in group]
+    if max_messages <= 0:
+        return []
+    prefix, chunks = _gateway_history_action_chunks(group)
+    selected: List[List[Dict[str, Any]]] = []
+    used = len(prefix)
+    for chunk in reversed(chunks):
+        if used + len(chunk) > max_messages:
+            if not selected:
+                return _read_only_history_guidance()
+            break
+        selected.append(chunk)
+        used += len(chunk)
+    selected.reverse()
+    result = [dict(message) for message in prefix]
+    result.extend(dict(message) for chunk in selected for message in chunk)
+    return result or _read_only_history_guidance()
+
+
+def _truncate_replay_string(value: str, target: int, marker: str) -> str:
+    if len(value) <= target:
+        return value
+    if target <= len(marker) + 16:
+        return marker[:target]
+    kept = target - len(marker)
+    prefix = kept // 2
+    suffix = kept - prefix
+    return value[:prefix] + marker + (value[-suffix:] if suffix else "")
+
+
+def _shrink_read_only_group_chars(
+    group: List[Dict[str, Any]],
+    *,
+    max_chars: int,
+) -> List[Dict[str, Any]]:
+    """Bound one newest group without corrupting tool calls/results."""
+
+    bounded = _truncate_read_only_tool_outputs(group, max_chars=max_chars)
+    overflow = sum(_gateway_history_message_chars(message) for message in bounded) - max_chars
+    if overflow <= 0:
+        return bounded
+
+    # api_content is an optional cache sidecar; dropping it never changes the
+    # replayed semantic content and often removes a full duplicate payload.
+    for message in bounded:
+        if overflow <= 0:
+            break
+        if "api_content" in message:
+            before = _gateway_history_message_chars(message)
+            message.pop("api_content", None)
+            overflow -= max(0, before - _gateway_history_message_chars(message))
+
+    marker = "\n...[older read-only history truncated]...\n"
+    for message in bounded:
+        if overflow <= 0:
+            break
+        content = message.get("content")
+        if isinstance(content, str) and len(content) > len(marker) + 64:
+            before = _gateway_history_message_chars(message)
+            target = max(len(marker) + 64, len(content) - overflow - 32)
+            message["content"] = _truncate_replay_string(content, target, marker)
+            overflow -= max(0, before - _gateway_history_message_chars(message))
+        elif content is not None and not isinstance(content, str):
+            before = _gateway_history_message_chars(message)
+            message["content"] = "[structured historical content omitted at read-only replay limit]"
+            overflow -= max(0, before - _gateway_history_message_chars(message))
+
+        for key in ("reasoning", "reasoning_content"):
+            if overflow <= 0:
+                break
+            value = message.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            before = _gateway_history_message_chars(message)
+            message.pop(key, None)
+            overflow -= max(0, before - _gateway_history_message_chars(message))
+
+    if sum(_gateway_history_message_chars(message) for message in bounded) > max_chars:
+        return _read_only_history_guidance()
     return bounded
 
 
@@ -1335,23 +1466,34 @@ def _bound_read_only_gateway_history(
     groups = _gateway_history_turn_groups(messages)
     if not groups:
         return []
-    selected: List[List[Dict[str, Any]]] = []
-    selected_messages = 0
-    selected_chars = 0
-    for group in reversed(groups):
+    newest = _shrink_read_only_group_messages(
+        groups[-1],
+        max_messages=max_messages,
+    )
+    newest = _shrink_read_only_group_chars(newest, max_chars=max_chars)
+    selected: List[List[Dict[str, Any]]] = [newest]
+    selected_messages = len(newest)
+    selected_chars = sum(_gateway_history_message_chars(message) for message in newest)
+    for group in reversed(groups[:-1]):
         group_messages = len(group)
         group_chars = sum(_gateway_history_message_chars(message) for message in group)
-        if selected and (
+        if (
             selected_messages + group_messages > max_messages
             or selected_chars + group_chars > max_chars
         ):
             break
-        selected.append(group)
+        selected.append([dict(message) for message in group])
         selected_messages += group_messages
         selected_chars += group_chars
     selected.reverse()
     flattened = [message for group in selected for message in group]
-    return _truncate_read_only_tool_outputs(flattened, max_chars=max_chars)
+    bounded = _truncate_read_only_tool_outputs(flattened, max_chars=max_chars)
+    if (
+        len(bounded) > max_messages
+        or sum(_gateway_history_message_chars(message) for message in bounded) > max_chars
+    ):
+        return _read_only_history_guidance()
+    return bounded
 
 
 def _build_gateway_agent_history(
@@ -7903,13 +8045,16 @@ class _GatewayRunnerCore(
         event: MessageEvent,
         source: SessionSource,
         session_key: str,
+        run_generation: int,
         agent_result: Dict[str, Any],
     ) -> Optional[str]:
         """Queue a clean action-runtime replay for a successful intake handoff."""
         if (
             source.platform != Platform.DISCORD
             or _discord_runtime_mode_for(event) is not RuntimeMode.READ_ONLY
+            or getattr(event, "discord_action_escalation_allowed", None) is not True
             or not isinstance(agent_result.get("action_escalation_requested"), dict)
+            or not self._is_session_run_current(session_key, run_generation)
         ):
             return None
         payload = agent_result["action_escalation_requested"]
@@ -7927,19 +8072,62 @@ class _GatewayRunnerCore(
         promoted_event, thread_url = await promote(
             event,
             initial_request=str(getattr(event, "text", "") or "").strip(),
+            generation_is_current=lambda: self._is_session_run_current(
+                session_key,
+                run_generation,
+            ),
         )
         if promoted_event is None:
             logger.error("Discord action escalation failed to initialize action state")
             return None
 
+        if not self._is_session_run_current(session_key, run_generation):
+            rollback = getattr(adapter, "rollback_promoted_action_request", None)
+            if callable(rollback):
+                try:
+                    result = rollback(promoted_event)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug("Discord stale action-promotion rollback failed", exc_info=True)
+            return None
+
         promoted_source = getattr(promoted_event, "source", None) or source
         promoted_session_key = self._session_key_for_source(promoted_source)
+        promoted_event._discord_promotion_origin_session_key = session_key
+        promoted_event._discord_promotion_origin_generation = int(run_generation)
         if promoted_session_key == session_key:
             # The current adapter task still owns this session. Put the action
             # replay at the head so a racing user follow-up remains ordered
             # after the original request instead of merging into it.
+            if not self._is_session_run_current(session_key, run_generation):
+                rollback = getattr(adapter, "rollback_promoted_action_request", None)
+                if callable(rollback):
+                    try:
+                        result = rollback(promoted_event)
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        logger.debug(
+                            "Discord stale action-promotion rollback failed",
+                            exc_info=True,
+                        )
+                return None
             self._prepend_fifo(session_key, promoted_event, adapter)
         else:
+            if not self._is_session_run_current(session_key, run_generation):
+                rollback = getattr(adapter, "rollback_promoted_action_request", None)
+                if callable(rollback):
+                    try:
+                        result = rollback(promoted_event)
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        logger.debug(
+                            "Discord stale action-promotion rollback failed",
+                            exc_info=True,
+                        )
+                return None
             await adapter.handle_message(promoted_event)
 
         # The intake agent contains an intentionally unpersisted tool turn.
@@ -7947,6 +8135,52 @@ class _GatewayRunnerCore(
         # change accidentally makes the two runtimes compare equal.
         self._evict_cached_agent(session_key)
         return str(thread_url or "")
+
+    def _promoted_replay_is_current(self, event: MessageEvent) -> bool:
+        origin_key = str(
+            getattr(event, "_discord_promotion_origin_session_key", "") or ""
+        )
+        origin_generation = getattr(
+            event,
+            "_discord_promotion_origin_generation",
+            None,
+        )
+        if not origin_key and origin_generation is None:
+            return True
+        try:
+            return bool(
+                origin_key
+                and int(origin_generation) > 0
+                and self._is_session_run_current(origin_key, int(origin_generation))
+            )
+        except (TypeError, ValueError):
+            return False
+
+    async def _consume_promoted_replay_fence(
+        self,
+        event: MessageEvent,
+        *,
+        consume: bool = True,
+    ) -> bool:
+        """Validate one promoted replay immediately before gateway dispatch."""
+        if not hasattr(event, "_discord_promotion_origin_generation"):
+            return True
+        if not self._promoted_replay_is_current(event):
+            adapter = self._adapter_for_source(getattr(event, "source", None))
+            rollback = getattr(adapter, "rollback_promoted_action_request", None)
+            if callable(rollback):
+                try:
+                    result = rollback(event)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug("Discord stale promoted replay rollback failed", exc_info=True)
+            logger.info("Discarding stale promoted Discord action replay before dispatch")
+            return False
+        if consume:
+            delattr(event, "_discord_promotion_origin_session_key")
+            delattr(event, "_discord_promotion_origin_generation")
+        return True
 
     def _discord_work_item_id_for_event(
         self,
@@ -15641,6 +15875,8 @@ class _GatewayRunnerCore(
         7. Return response
         """
         source = event.source
+        if not await self._consume_promoted_replay_fence(event):
+            return None
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -17809,6 +18045,7 @@ class _GatewayRunnerCore(
                 _set_env_kwargs["discord_action_escalation_allowed"] = bool(
                     source.platform == Platform.DISCORD
                     and discord_runtime_mode is RuntimeMode.READ_ONLY
+                    and getattr(event, "discord_action_escalation_allowed", None) is True
                 )
             # Some focused tests replace _set_session_env with a minimal
             # one-arg stub; only pass kwargs its signature accepts.
@@ -18604,6 +18841,9 @@ class _GatewayRunnerCore(
                         "discord_action_request_intent",
                         None,
                     ),
+                    discord_action_escalation_allowed=bool(
+                        getattr(event, "discord_action_escalation_allowed", False)
+                    ),
                     fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
                     fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
                     fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
@@ -18690,10 +18930,20 @@ class _GatewayRunnerCore(
                 agent_result.get("action_escalation_requested"), dict
             )
             if escalation_requested:
+                if getattr(event, "discord_action_escalation_allowed", None) is not True:
+                    logger.warning(
+                        "Ignoring model-emitted Discord action escalation denied by event authority: %s",
+                        getattr(event, "discord_runtime_reason", None) or "unspecified",
+                    )
+                    return (
+                        "I kept this turn read-only because the current request does not "
+                        "authorize action-mode work. No durable changes were made."
+                    )
                 promoted_thread_url = await self._promote_discord_action_escalation(
                     event=event,
                     source=source,
                     session_key=session_key,
+                    run_generation=run_generation,
                     agent_result=agent_result,
                 )
                 if promoted_thread_url is None:
@@ -28872,6 +29122,7 @@ class _GatewayRunnerCore(
         project_summary: Optional[Dict[str, Any]] = None,
         discord_runtime_mode: Optional[str] = None,
         discord_action_request_intent: Optional[bool] = None,
+        discord_action_escalation_allowed: bool = False,
         fable_plan_metadata: Optional[Dict[str, Any]] = None,
         fable_toolsets: Optional[List[str]] = None,
         fable_reasoning_config: Optional[Dict[str, Any]] = None,
@@ -28996,11 +29247,16 @@ class _GatewayRunnerCore(
         if (
             source.platform == _GATEWAY_PLATFORM.DISCORD
             and turn_runtime_mode is RuntimeMode.READ_ONLY
+            and discord_action_escalation_allowed is True
             and "discord-action-escalation" not in enabled_toolsets
         ):
             enabled_toolsets = sorted(
                 [*enabled_toolsets, "discord-action-escalation"]
             )
+        elif not discord_action_escalation_allowed:
+            enabled_toolsets = [
+                name for name in enabled_toolsets if name != "discord-action-escalation"
+            ]
         if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
             enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
         if fable_plan_only:
@@ -30187,6 +30443,10 @@ class _GatewayRunnerCore(
             agent._runtime_mode = turn_runtime_mode.value
             agent.memory_read_only = turn_runtime_mode is RuntimeMode.READ_ONLY
             agent._discord_intake_read_only = turn_runtime_mode is RuntimeMode.READ_ONLY
+            agent._discord_action_escalation_allowed = bool(
+                turn_runtime_mode is RuntimeMode.READ_ONLY
+                and discord_action_escalation_allowed
+            )
             agent._action_escalation_requested = None
             if (
                 origin_work_item_id
@@ -31518,6 +31778,14 @@ class _GatewayRunnerCore(
                     # order, and (b) causes any mid-chain /queue to correctly
                     # route to overflow rather than jumping the queue.
                     pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                    if (
+                        pending_event is not None
+                        and not await self._consume_promoted_replay_fence(
+                            pending_event,
+                            consume=False,
+                        )
+                    ):
+                        pending_event = None
                     if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                         interrupt_message = result.get("interrupt_message")
                         if _is_control_interrupt_message(interrupt_message):
@@ -31741,6 +32009,7 @@ class _GatewayRunnerCore(
                 next_session_key = session_key
                 next_runtime_mode = turn_runtime_mode
                 next_legacy_action_intent = None
+                next_action_escalation_allowed = False
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     next_runtime_mode = (
@@ -31752,6 +32021,13 @@ class _GatewayRunnerCore(
                         pending_event,
                         "discord_action_request_intent",
                         None,
+                    )
+                    next_action_escalation_allowed = bool(
+                        getattr(
+                            pending_event,
+                            "discord_action_escalation_allowed",
+                            False,
+                        )
                     )
                     self._hydrate_discord_continuation_event_from_work_item(
                         pending_event,
@@ -31816,6 +32092,7 @@ class _GatewayRunnerCore(
                     project_summary=next_project_summary,
                     discord_runtime_mode=next_runtime_mode.value,
                     discord_action_request_intent=next_legacy_action_intent,
+                    discord_action_escalation_allowed=next_action_escalation_allowed,
                     fable_reasoning_config=fable_reasoning_config,
                     session_cwd_override=session_cwd,
                     origin_work_item_id=next_origin_work_item_id,
@@ -36810,6 +37087,14 @@ class _GatewayRunnerCore(
                     # order, and (b) causes any mid-chain /queue to correctly
                     # route to overflow rather than jumping the queue.
                     pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                    if (
+                        pending_event is not None
+                        and not await self._consume_promoted_replay_fence(
+                            pending_event,
+                            consume=False,
+                        )
+                    ):
+                        pending_event = None
                     if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                         interrupt_message = result.get("interrupt_message")
                         if _is_control_interrupt_message(interrupt_message):

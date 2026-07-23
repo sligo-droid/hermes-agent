@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import resource
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,33 +20,25 @@ from gateway.session_context import get_session_env
 from tools.registry import registry, tool_error
 
 
-_SHELL_CONTROL_CHARS = frozenset("\n\r;|&<>`")
+_SHELL_CONTROL_CHARS = frozenset("\n\r;|&<>`$*?[]{}")
 _SAFE_SCRIPT_NAMES = re.compile(
     r"^(?:test|tests|lint|type[-_]?check|check|verify|verification|build)(?::[\w.-]+)?$",
     re.IGNORECASE,
 )
-_SAFE_MAKE_TARGET = re.compile(
-    r"^(?:test|tests|lint|type[-_]?check|check|verify|verification|build)(?:[-_:][\w.-]+)?$",
-    re.IGNORECASE,
-)
 _OUTPUT_LIMIT = 100_000
-_SENSITIVE_ENV_NAME = re.compile(
-    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|"
-    r"CREDENTIALS?|AUTH(?:ORIZATION)?|COOKIE|PAT|DSN)(?:_|$)"
-)
-_SENSITIVE_ENV_SUFFIXES = (
-    "_KEY",
-    "_URL",
-    "_URI",
-    "_DSN",
-    "_CONNECTION_STRING",
-)
-_SENSITIVE_ENV_EXACT = frozenset(
+_CAPTURE_LIMIT = 1_000_000
+_VERIFICATION_ENV_ALLOWLIST = frozenset(
     {
-        "DATABASE_URL",
-        "DOCKER_AUTH_CONFIG",
-        "KUBECONFIG",
-        "NETRC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "PYTHONHASHSEED",
+        "HERMES_TEST_WORKERS",
     }
 )
 
@@ -91,27 +85,15 @@ def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None
         allowed = True
     elif base in {"python", "python3"}:
         allowed = len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]
-    elif base in {"npm", "pnpm", "yarn", "bun"}:
+    elif base in {"npm", "pnpm"}:
         tail = argv[1:]
         if tail and tail[0] == "run":
             tail = tail[1:]
         allowed = bool(tail and _SAFE_SCRIPT_NAMES.fullmatch(tail[0]))
-    elif base == "make":
-        targets = [arg for arg in argv[1:] if not arg.startswith("-")]
-        allowed = bool(targets) and all(_SAFE_MAKE_TARGET.fullmatch(arg) for arg in targets)
-    elif base == "go":
-        allowed = len(argv) >= 2 and argv[1] == "test"
-    elif base == "cargo":
-        allowed = len(argv) >= 2 and argv[1] in {"test", "check", "clippy"}
-    elif base == "dotnet":
-        allowed = len(argv) >= 2 and argv[1] == "test"
-    elif base in {"mvn", "mvnw"}:
-        goals = [arg for arg in argv[1:] if not arg.startswith("-")]
-        allowed = bool(goals) and all(arg in {"test", "verify"} for arg in goals)
     if not allowed:
         return None, (
-            "only recognized test, lint, type-check, verification, and build entrypoints "
-            "are allowed"
+            "only repository test wrappers, pytest, and npm/pnpm test, lint, "
+            "type-check, verification, or build scripts are allowed"
         )
     return argv, None
 
@@ -176,6 +158,29 @@ def _copy_working_tree_overlay(source_root: Path, snapshot_root: Path) -> None:
                     target.unlink()
 
 
+def _neutralize_escaping_symlinks(snapshot_root: Path) -> list[str]:
+    """Replace source symlinks that could leave the disposable repository."""
+
+    neutralized: list[str] = []
+    for path in snapshot_root.rglob("*"):
+        if not path.is_symlink():
+            continue
+        try:
+            target = Path(os.readlink(path))
+            resolved = target if target.is_absolute() else path.parent / target
+            resolved = resolved.resolve(strict=False)
+            resolved.relative_to(snapshot_root)
+        except (OSError, ValueError):
+            relative = path.relative_to(snapshot_root).as_posix()
+            path.unlink(missing_ok=True)
+            path.write_text(
+                "Hermes read-only verification neutralized a symlink outside the source root.\n",
+                encoding="utf-8",
+            )
+            neutralized.append(relative)
+    return neutralized
+
+
 def _bounded_output(value: bytes) -> str:
     text = value.decode("utf-8", errors="replace")
     if len(text) <= _OUTPUT_LIMIT:
@@ -184,30 +189,248 @@ def _bounded_output(value: bytes) -> str:
     return text[:half] + "\n...[verification output truncated]...\n" + text[-half:]
 
 
-def _environment_name_is_sensitive(name: str) -> bool:
-    upper = str(name or "").strip().upper()
-    return bool(
-        upper in _SENSITIVE_ENV_EXACT
-        or upper.endswith(_SENSITIVE_ENV_SUFFIXES)
-        or _SENSITIVE_ENV_NAME.search(upper)
-    )
-
-
-def _resolved_verification_argv(argv: list[str]) -> list[str]:
+def _resolved_verification_argv(
+    argv: list[str],
+    *,
+    has_venv: bool,
+    has_pnpm_runtime: bool,
+) -> list[str]:
     """Resolve trusted executables without accepting user-supplied absolute paths."""
 
     resolved = list(argv)
     base = Path(resolved[0]).name.lower()
     if base in {"pytest", "py.test"}:
-        return [sys.executable, "-m", "pytest", *resolved[1:]]
+        executable = "/tmp/workspace/.venv/bin/python" if has_venv else "/usr/bin/python3"
+        return [executable, "-m", "pytest", *resolved[1:]]
     if base in {"python", "python3"}:
-        resolved[0] = sys.executable
+        resolved[0] = "/tmp/workspace/.venv/bin/python" if has_venv else "/usr/bin/python3"
         return resolved
+    if base == "pnpm":
+        if not has_pnpm_runtime:
+            raise RuntimeError("a prepared offline pnpm runtime is unavailable")
+        return ["/usr/bin/node", "/opt/hermes-pnpm/bin/pnpm.cjs", *resolved[1:]]
     if "/" not in resolved[0]:
         executable = shutil.which(resolved[0])
         if executable:
-            resolved[0] = executable
+            resolved[0] = f"/usr/bin/{Path(executable).name}"
     return resolved
+
+
+def _prepared_pnpm_runtime() -> Path | None:
+    """Find a complete Corepack-cached pnpm distribution for offline use."""
+
+    cache_candidates: list[Path] = []
+    configured = os.environ.get("COREPACK_HOME")
+    if configured:
+        cache_candidates.append(Path(configured).expanduser())
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        cache_candidates.append(Path(xdg_cache).expanduser() / "node" / "corepack")
+    cache_candidates.append(Path.home() / ".cache" / "node" / "corepack")
+
+    pnpm_shim = shutil.which("pnpm")
+    if pnpm_shim:
+        shim_path = Path(pnpm_shim).expanduser().absolute()
+        if len(shim_path.parents) >= 3 and shim_path.parent.name == "bin":
+            cache_candidates.append(
+                shim_path.parents[2] / ".cache" / "node" / "corepack"
+            )
+
+    def version_key(path: Path) -> tuple[int, ...]:
+        match = re.fullmatch(r"(\d+(?:\.\d+)*)", path.name)
+        return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+    for cache_root in dict.fromkeys(path.resolve(strict=False) for path in cache_candidates):
+        pnpm_root = cache_root / "pnpm"
+        if not pnpm_root.is_dir():
+            continue
+        versions = sorted(
+            (path for path in pnpm_root.iterdir() if version_key(path)),
+            key=version_key,
+            reverse=True,
+        )
+        for candidate in versions:
+            if (
+                (candidate / ".corepack").is_file()
+                and (candidate / "bin" / "pnpm.cjs").is_file()
+                and (candidate / "dist" / "pnpm.cjs").is_file()
+            ):
+                return candidate.resolve()
+    return None
+
+
+def _prepared_dependency_roots(source_root: Path) -> dict[str, Path]:
+    """Locate trusted prepared dependencies for a linked worktree snapshot."""
+
+    roots: dict[str, Path] = {}
+    common = _git(
+        source_root,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        timeout=10,
+    )
+    primary_root = source_root
+    if common.returncode == 0:
+        common_dir = Path(common.stdout.decode(errors="replace").strip()).resolve()
+        if common_dir.name == ".git":
+            primary_root = common_dir.parent
+
+    repository_roots = tuple(dict.fromkeys((primary_root, source_root)))
+    venv_candidates = [
+        *(root / relative for root in repository_roots for relative in (".venv", "venv")),
+        Path(sys.prefix),
+    ]
+    for candidate in venv_candidates:
+        if (candidate / "bin" / "python").is_file():
+            roots["venv"] = candidate.resolve()
+            python_binary = (candidate / "bin" / "python").resolve()
+            try:
+                python_binary.relative_to(candidate.resolve())
+            except ValueError:
+                python_link = candidate / "bin" / "python"
+                try:
+                    raw_target = Path(os.readlink(python_link))
+                except OSError:
+                    raw_target = python_binary
+                if raw_target.is_absolute() and len(raw_target.parents) >= 3:
+                    roots["python_runtime"] = raw_target.parent.parent.parent
+                else:
+                    roots["python_runtime"] = python_binary.parent.parent
+            break
+
+    hermes_source = Path(__file__).resolve().parents[1]
+    hermes_common = _git(
+        hermes_source,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        timeout=10,
+    )
+    hermes_primary = hermes_source
+    if hermes_common.returncode == 0:
+        common_dir = Path(hermes_common.stdout.decode(errors="replace").strip()).resolve()
+        if common_dir.name == ".git":
+            hermes_primary = common_dir.parent
+
+    for relative, key in ((Path("node_modules"), "node_modules"), (Path("ui-tui/node_modules"), "ui_node_modules")):
+        for root in dict.fromkeys(
+            (*repository_roots, hermes_primary, hermes_source)
+        ):
+            candidate = root / relative
+            if candidate.is_dir():
+                roots[key] = candidate.resolve()
+                break
+    pnpm_runtime = _prepared_pnpm_runtime()
+    if pnpm_runtime is not None:
+        roots["pnpm_runtime"] = pnpm_runtime
+    return roots
+
+
+def _verification_environment() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _VERIFICATION_ENV_ALLOWLIST and isinstance(value, str)
+    }
+    env.update(
+        {
+            "PATH": (
+                "/tmp/workspace/.venv/bin:/tmp/workspace/node_modules/.bin:"
+                "/tmp/workspace/ui-tui/node_modules/.bin:/usr/local/bin:/usr/bin:/bin"
+            ),
+            "HOME": "/tmp/home",
+            "TMPDIR": "/tmp",
+            "XDG_CACHE_HOME": "/tmp/cache",
+            "XDG_CONFIG_HOME": "/tmp/config",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "CI": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LANG": env.get("LANG", "C.UTF-8"),
+            "LC_ALL": env.get("LC_ALL", "C.UTF-8"),
+            "TZ": env.get("TZ", "UTC"),
+        }
+    )
+    return env
+
+
+def _sandbox_system_mounts() -> list[str]:
+    args = ["--ro-bind", "/usr", "/usr"]
+    for path in (Path("/bin"), Path("/lib"), Path("/lib64"), Path("/sbin")):
+        if path.is_symlink():
+            args.extend(["--symlink", os.readlink(path), str(path)])
+        elif path.exists():
+            args.extend(["--ro-bind", str(path), str(path)])
+    args.extend(["--dir", "/etc"])
+    for path in (
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/ssl/certs",
+    ):
+        if Path(path).exists():
+            args.extend(["--ro-bind", path, path])
+    return args
+
+
+def _sandbox_parent_dirs(path: Path) -> list[str]:
+    parents = []
+    current = path.parent
+    while str(current) not in {"", "/"}:
+        parents.append(str(current))
+        current = current.parent
+    args: list[str] = []
+    for parent in reversed(parents):
+        args.extend(["--dir", parent])
+    return args
+
+
+def _resource_limits(timeout_value: int):
+    def apply() -> None:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (_CAPTURE_LIMIT, _CAPTURE_LIMIT))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+        cpu = max(2, min(timeout_value + 5, 605))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+
+    return apply
+
+
+def _run_bounded(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    timeout_value: int,
+) -> tuple[int, bytes, bytes, bool]:
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            argv,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            env=env,
+            start_new_session=True,
+            preexec_fn=_resource_limits(timeout_value),
+        )
+        try:
+            return_code = process.wait(timeout=timeout_value)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
+            raise
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(_CAPTURE_LIMIT + 1)
+        stderr = stderr_file.read(_CAPTURE_LIMIT + 1)
+        truncated = len(stdout) > _OUTPUT_LIMIT or len(stderr) > _OUTPUT_LIMIT
+        return return_code, stdout, stderr, truncated
 
 
 def read_only_verify(
@@ -224,8 +447,6 @@ def read_only_verify(
     argv, error = parse_read_only_verification_command(command)
     if error or argv is None:
         return tool_error(f"Unsafe verification command: {error}")
-    argv = _resolved_verification_argv(argv)
-
     raw_cwd = str(workdir or get_session_env("HERMES_SESSION_CWD", "") or os.getcwd())
     source_cwd = Path(raw_cwd).expanduser().resolve(strict=False)
     root_result = _git(source_cwd, "rev-parse", "--show-toplevel", timeout=10)
@@ -283,27 +504,24 @@ def read_only_verify(
                     + _bounded_output(read_tree.stderr or read_tree.stdout)
                 )
             _copy_working_tree_overlay(source_root, snapshot_root)
+            neutralized_symlinks = _neutralize_escaping_symlinks(snapshot_root)
             snapshot_cwd = snapshot_root / relative_cwd
             if not snapshot_cwd.is_dir():
                 return tool_error("verification workdir is unavailable in the disposable snapshot")
 
-            env = os.environ.copy()
-            for key in list(env):
-                if _environment_name_is_sensitive(key):
-                    env.pop(key, None)
-            env.update(
-                {
-                    "HOME": "/tmp/home",
-                    "TMPDIR": "/tmp",
-                    "XDG_CACHE_HOME": "/tmp/cache",
-                    "XDG_CONFIG_HOME": "/tmp/config",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "CI": "1",
-                    "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_CONFIG_GLOBAL": "/dev/null",
-                    "GIT_TERMINAL_PROMPT": "0",
-                }
+            dependencies = _prepared_dependency_roots(source_root)
+            if "venv" in dependencies:
+                (snapshot_root / ".venv").mkdir(exist_ok=True)
+            if "node_modules" in dependencies:
+                (snapshot_root / "node_modules").mkdir(exist_ok=True)
+            if "ui_node_modules" in dependencies:
+                (snapshot_root / "ui-tui" / "node_modules").mkdir(parents=True, exist_ok=True)
+            argv = _resolved_verification_argv(
+                argv,
+                has_venv="venv" in dependencies,
+                has_pnpm_runtime="pnpm_runtime" in dependencies,
             )
+            env = _verification_environment()
             sandbox_argv = [
                 shutil.which("bwrap") or "bwrap",
                 "--die-with-parent",
@@ -311,12 +529,9 @@ def read_only_verify(
                 "--unshare-pid",
                 "--unshare-ipc",
                 "--unshare-uts",
-                "--ro-bind",
-                "/",
-                "/",
+                *_sandbox_system_mounts(),
                 # Hide host service/display sockets and give tests ordinary
-                # disposable temp space. The repository itself is mounted at
-                # a stable sandbox-only path below.
+                # disposable temp space. No host home/workspace tree is mounted.
                 "--tmpfs",
                 "/run",
                 "--tmpfs",
@@ -338,28 +553,68 @@ def read_only_verify(
                 "/dev",
                 "--proc",
                 "/proc",
+            ]
+            if "venv" in dependencies:
+                sandbox_argv += [
+                    "--ro-bind",
+                    str(dependencies["venv"]),
+                    "/tmp/workspace/.venv",
+                ]
+            if "python_runtime" in dependencies:
+                runtime_root = dependencies["python_runtime"]
+                sandbox_argv += [
+                    *_sandbox_parent_dirs(runtime_root),
+                    "--dir",
+                    str(runtime_root),
+                    "--ro-bind",
+                    str(runtime_root),
+                    str(runtime_root),
+                ]
+            if "node_modules" in dependencies:
+                sandbox_argv += [
+                    "--ro-bind",
+                    str(dependencies["node_modules"]),
+                    "/tmp/workspace/node_modules",
+                ]
+            if "ui_node_modules" in dependencies:
+                sandbox_argv += [
+                    "--ro-bind",
+                    str(dependencies["ui_node_modules"]),
+                    "/tmp/workspace/ui-tui/node_modules",
+                ]
+            if "pnpm_runtime" in dependencies:
+                sandbox_argv += [
+                    "--dir",
+                    "/opt",
+                    "--ro-bind",
+                    str(dependencies["pnpm_runtime"]),
+                    "/opt/hermes-pnpm",
+                ]
+            sandbox_argv += [
                 "--chdir",
                 str(PurePosixPath("/tmp/workspace") / PurePosixPath(relative_cwd.as_posix())),
                 "--",
                 *argv,
             ]
-            completed = subprocess.run(
+            return_code, stdout, stderr, output_truncated = _run_bounded(
                 sandbox_argv,
-                capture_output=True,
-                timeout=timeout_value,
-                check=False,
                 env=env,
+                timeout_value=timeout_value,
             )
             return json.dumps(
                 {
-                    "success": completed.returncode == 0,
+                    "success": return_code == 0,
                     "command": argv,
-                    "exit_code": completed.returncode,
-                    "output": _bounded_output(completed.stdout),
-                    "error": _bounded_output(completed.stderr) or None,
+                    "exit_code": return_code,
+                    "output": _bounded_output(stdout),
+                    "error": _bounded_output(stderr) or None,
+                    "output_truncated": output_truncated,
+                    "neutralized_symlinks": neutralized_symlinks[:100],
+                    "dependencies": sorted(dependencies),
                     "sandbox": (
-                        "temporary snapshot; host filesystem read-only; network, PID, IPC, "
-                        "and host runtime sockets isolated"
+                        "temporary snapshot; only system runtime and prepared dependencies "
+                        "mounted read-only; host home/workspaces and network, PID, IPC, and "
+                        "runtime sockets isolated"
                     ),
                     "artifacts_cleaned": True,
                 },
@@ -375,8 +630,9 @@ READ_ONLY_VERIFY_SCHEMA = {
     "name": "read_only_verify",
     "description": (
         "Run a recognized test, lint, type-check, verification, or build command in a "
-        "temporary Git snapshot. The host filesystem is mounted read-only, network access "
-        "is disabled, credentials are removed, and all temporary artifacts are deleted."
+        "temporary Git snapshot. Only prepared dependencies and system runtimes are mounted "
+        "read-only; network access is disabled, credentials are removed, and temporary "
+        "artifacts are deleted."
     ),
     "parameters": {
         "type": "object",

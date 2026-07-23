@@ -4930,4 +4930,5 @@ registry.register(
     ),
     check_fn=check_coding_worker_requirements,
     emoji="code",
+    effect="mutating",
 )

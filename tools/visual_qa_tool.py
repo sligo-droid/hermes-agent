@@ -114,6 +114,7 @@ registry.register(
     is_async=True,
     emoji="🔎",
     max_result_size_chars=6000,
+    effect="read_only",
 )
 
 

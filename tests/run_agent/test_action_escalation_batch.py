@@ -62,7 +62,7 @@ def test_read_only_runtime_allows_observation_and_blocks_mutation():
     )
     assert _discord_intake_mutation_block(
         agent, "delegate_task", {"goal": "inspect it"}
-    )
+    ) is None
     assert _discord_intake_mutation_block(agent, "unknown_plugin_tool", {})
     assert _discord_intake_mutation_block(agent, "read_file", {}) is None
     assert _discord_intake_mutation_block(agent, "web_search", {}) is None

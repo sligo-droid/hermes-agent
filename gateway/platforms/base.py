@@ -1460,6 +1460,16 @@ class MessageEvent:
     # only as a narrow compatibility input for older synthetic callers.
     discord_runtime_mode: Optional[str] = None
 
+    # Per-event authority for the READ_ONLY -> ACTION control-plane handoff.
+    # ``False`` is a structural denial (for example "plan only"), while
+    # ``True`` means an otherwise ambiguous read-only turn may request a clean
+    # replay.  ``None`` is fail-closed for escalation.
+    discord_action_escalation_allowed: Optional[bool] = None
+
+    # Stable classifier rationale retained with the event for audit/debugging.
+    # This is transient routing metadata, not model-authored conversation text.
+    discord_runtime_reason: Optional[str] = None
+
     # Discord channel prompt before any per-turn direct-question overlay.
     # This is transient intake metadata used when coalescing inbound messages.
     discord_action_request_base_channel_prompt: Optional[str] = None
@@ -1781,6 +1791,10 @@ def merge_discord_action_request_metadata(
 
     existing.discord_runtime_mode = incoming_mode
     existing.discord_action_request_intent = None
+    existing.discord_action_escalation_allowed = bool(
+        getattr(event, "discord_action_escalation_allowed", False)
+    )
+    existing.discord_runtime_reason = getattr(event, "discord_runtime_reason", None)
     existing.discord_action_request_base_channel_prompt = incoming_base_prompt
     if incoming_mode == "action":
         existing.channel_prompt = incoming_base_prompt

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+from agent.runtime_capabilities import ToolEffect
 
 
 def _dummy_handler(args, **kwargs):
@@ -135,6 +136,54 @@ class TestRegisterAndDispatch:
         assert result["error_type"] == "tool_result_contract"
         assert result["tool"] == name
         assert result["result_type"] == "NoneType"
+
+    def test_obvious_core_mutators_and_observers_declare_effect_metadata(self):
+        import model_tools  # noqa: F401 - imports and registers the built-in tool surface
+        from tools.registry import registry
+
+        expected_mutating = {
+            "close_terminal",
+            "computer_use",
+            "delegate_coding_task",
+            "execute_code",
+            "memory",
+            "project_create",
+            "project_switch",
+            "request_coding_task",
+            "skill_manage",
+            "sync_canonical_checkout",
+            "todo",
+        }
+        expected_read_only = {
+            "discord_get_message",
+            "git_inspect",
+            "kanban_attachments",
+            "kanban_list",
+            "kanban_show",
+            "project_list",
+            "read_only_verify",
+            "visual_qa",
+        }
+
+        assert {
+            name: registry.get_entry(name).effect for name in expected_mutating
+        } == {name: ToolEffect.MUTATING for name in expected_mutating}
+        assert {
+            name: registry.get_entry(name).effect for name in expected_read_only
+        } == {name: ToolEffect.READ_ONLY for name in expected_read_only}
+
+        assert registry.read_only_block(
+            "discord", {"action": "fetch_messages", "channel_id": "1"}
+        ) is None
+        assert registry.read_only_block(
+            "discord_admin", {"action": "server_info", "guild_id": "1"}
+        ) is None
+        assert registry.read_only_block(
+            "discord", {"action": "send_message", "channel_id": "1"}
+        )
+        assert registry.read_only_block(
+            "discord_admin", {"action": "delete_message", "channel_id": "1"}
+        )
 
 
 class TestGetDefinitions:

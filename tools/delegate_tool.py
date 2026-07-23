@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 from hermes_constants import VALID_REASONING_EFFORTS
 from toolsets import TOOLSETS
+from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -3116,7 +3117,14 @@ def delegate_task(
 
     # Read-only is monotonic down the delegation tree. A child cannot turn off
     # a restriction imposed by its parent.
-    inherited_read_only = bool(getattr(parent_agent, "_delegation_read_only", False))
+    inherited_read_only = bool(
+        getattr(parent_agent, "_delegation_read_only", False)
+        or normalize_runtime_mode(
+            getattr(parent_agent, "_runtime_mode", None),
+            default=RuntimeMode.ACTION,
+        )
+        is RuntimeMode.READ_ONLY
+    )
     top_read_only = inherited_read_only or is_truthy_value(read_only, default=False)
     background_requested = is_truthy_value(background, default=False)
     background = background_requested
@@ -4191,12 +4199,13 @@ def _build_top_level_description() -> str:
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
         "delegate_task, clarify, memory, send_message, execute_code.\n"
-        "- read_only=false is the default. Use it when a worker may need bounded "
+        "- read_only=false is the default in ACTION runtime. Use it when a worker may need bounded "
         "workspace exploration, setup, or in-scope mutation; terminal and file "
         "tools remain available.\n"
-        "- read_only=true is opt-in, enforced at dispatch time, and propagates to nested "
-        "delegate_task calls. It blocks file writes, all terminal execution, "
-        "execute_code, and coding-worker mutation.\n"
+        "- read_only=true is inherited automatically from a READ_ONLY parent (you may omit "
+        "the argument there), enforced at dispatch time, and propagates to nested "
+        "delegate_task calls. It blocks file writes, mutable terminal/process actions, "
+        "execute_code, and coding-worker mutation while retaining bounded observation.\n"
         "- background=true requires read_only=true for every task. Detached "
         "repository mutation belongs on delegate_coding_task.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
@@ -4368,8 +4377,10 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "read_only": {
                             "type": "boolean",
-                            "default": False,
-                            "description": "Enforce read-only execution for this task and all descendants.",
+                            "description": (
+                                "Enforce read-only execution for this task and descendants. "
+                                "Inherited automatically when the parent runtime is read-only."
+                            ),
                         },
                         "allow_nested_coding": {
                             "type": "boolean",
@@ -4402,9 +4413,9 @@ DELEGATE_TASK_SCHEMA = {
             },
             "read_only": {
                 "type": "boolean",
-                "default": False,
                 "description": (
-                    "Opt-in runtime-enforced repository read-only mode. Default false: "
+                    "Runtime-enforced repository read-only mode. In a READ_ONLY parent this "
+                    "is inherited automatically and may be omitted. In ACTION runtime, false: "
                     "workers may use terminal/file tools for bounded exploration, setup, "
                     "and in-scope mutation. True propagates to descendants."
                 ),
@@ -4668,15 +4679,14 @@ registry.register(
                     and bool(args.get("tasks"))
                     and all(
                         isinstance(task, dict)
-                        and task.get("read_only") is True
                         and task.get("allow_nested_coding") is not True
                         for task in args.get("tasks")
                     )
                 )
-                or (not args.get("tasks") and args.get("read_only") is True)
+                or not args.get("tasks")
             )
         )
-        else "every delegated task must explicitly set read_only=true and disable nested coding"
+        else "read-only delegation requires valid tasks and nested coding disabled"
     ),
 )
 
@@ -4699,4 +4709,5 @@ registry.register(
     ),
     check_fn=check_delegate_requirements,
     emoji="code",
+    effect="mutating",
 )

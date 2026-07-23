@@ -2348,6 +2348,7 @@ async def test_successful_intake_escalation_queues_clean_action_turn_without_rep
         source=source,
         message_id="message-1",
         discord_runtime_mode="read_only",
+        discord_action_escalation_allowed=True,
     )
     async def _promote_then_stop(**_kwargs):
         return {
@@ -2399,6 +2400,76 @@ async def test_successful_intake_escalation_queues_clean_action_turn_without_rep
         "agent:main:discord:thread:thread-123"
     ] is promoted_event
     assert runner._run_agent.await_args.kwargs["defer_persistence"] is True
+    runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_explicit_no_action_turn_rejects_model_escalation_and_writes_no_transcript(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: _config(canonical))
+
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    adapter = SimpleNamespace(
+        _active_sessions={},
+        _pending_messages={},
+        promote_event_to_action_request=AsyncMock(),
+        register_post_delivery_callback=lambda *args, **kwargs: None,
+        send=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_has_pending_background_workers = lambda *args, **kwargs: False
+
+    def _set_session_env(
+        context,
+        *,
+        session_cwd="",
+        discord_action_escalation_allowed=False,
+    ):
+        captured["escalation_allowed"] = discord_action_escalation_allowed
+        return []
+
+    runner._set_session_env = _set_session_env
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": ".NO_REPLY",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "agent_persisted": False,
+            "action_escalation_requested": {
+                "success": True,
+                "action_escalation_requested": True,
+            },
+        }
+    )
+    source = _source(canonical)
+    event = MessageEvent(
+        text="Do not implement; plan only.",
+        source=source,
+        message_id="message-1",
+        discord_runtime_mode="read_only",
+        discord_action_escalation_allowed=False,
+        discord_runtime_reason="explicit_no_implementation",
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:discord:thread:thread-123",
+        1,
+    )
+
+    assert captured["escalation_allowed"] is False
+    assert "kept this turn read-only" in response
+    adapter.promote_event_to_action_request.assert_not_awaited()
     runner.session_store.append_to_transcript.assert_not_called()
 
 

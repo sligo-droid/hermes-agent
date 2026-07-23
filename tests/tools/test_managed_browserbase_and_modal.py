@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent.runtime_capabilities import ToolEffect, normalize_tool_effect
 from hermes_cli.nous_account import NousPortalAccountInfo
 
 
@@ -98,6 +99,10 @@ def _install_fake_tools_package():
     agent_package = types.ModuleType("agent")
     agent_package.__path__ = []  # type: ignore[attr-defined]
     sys.modules["agent"] = agent_package
+    sys.modules["agent.runtime_capabilities"] = types.SimpleNamespace(
+        ToolEffect=ToolEffect,
+        normalize_tool_effect=normalize_tool_effect,
+    )
     sys.modules["agent.auxiliary_client"] = types.SimpleNamespace(
         call_llm=lambda *args, **kwargs: "",
     )

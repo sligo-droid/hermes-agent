@@ -1153,4 +1153,10 @@ registry.register(
     ))(),
     check_fn=check_cronjob_requirements,
     emoji="⏰",
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if str(args.get("action") or "").strip().lower() == "list"
+        else "only cronjob action='list' is observational"
+    ),
 )

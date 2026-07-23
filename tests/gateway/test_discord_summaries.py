@@ -336,8 +336,55 @@ async def test_narrative_prefixed_review_request_runs_read_only_directly(
     assert "default READ-ONLY runtime" in event.channel_prompt
     assert event.feature_summary is None
     assert event.participates_in_work_lifecycle is False
+    assert event.discord_action_escalation_allowed is False
+    assert event.discord_runtime_reason == "classified_read_only"
     assert event.source.chat_id == "200"
     adapter._auto_create_thread.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_message_link_routes_direct_action_without_mutation_verb(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=parent,
+            content="https://discord.com/channels/1/2/3",
+        )
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.discord_runtime_mode == "action"
+    assert event.feature_summary is not None
+    assert event.participates_in_work_lifecycle is True
+
+
+@pytest.mark.asyncio
+async def test_discord_message_link_explicit_plan_only_stays_read_only(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=parent,
+            content=(
+                "Plan only; do not implement changes for "
+                "https://discord.com/channels/1/2/3"
+            ),
+        )
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.discord_runtime_mode == "read_only"
+    assert event.discord_action_escalation_allowed is False
+    assert event.feature_summary is None
 
 
 @pytest.mark.asyncio
@@ -410,12 +457,67 @@ async def test_discord_runtime_mode_distinguishes_mutation_ambiguity_and_thread_
         "Do not implement; for now just plan the fix.",
         "Recommend only, no changes.",
         "Tell me what you would do to fix it.",
+        "Do not take any action; analyze it only.",
+        "Read-only review: don't actually make changes.",
     ):
         assert await adapter._classify_discord_runtime_mode(
             request,
             actionable_thread_context=True,
             force_action=True,
         ) is gateway_run.RuntimeMode.READ_ONLY
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Please fix the parser.",
+        "Could you please build the deployment dashboard.",
+        "Please implement the approved change.",
+        "Please deploy the current branch.",
+        "Please update the retry policy.",
+        "Please implement read-only parser mode.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_polite_mutation_requests_route_directly_to_action(adapter, request_text):
+    assert await adapter._classify_discord_runtime_mode(request_text) is gateway_run.RuntimeMode.ACTION
+
+
+@pytest.mark.asyncio
+async def test_discord_message_links_keep_action_fast_path_but_no_action_wins(adapter):
+    link = "https://discord.com/channels/1/2/3"
+    assert await adapter._classify_discord_runtime_mode(
+        f"Investigate and fix {link}",
+        force_action=True,
+    ) is gateway_run.RuntimeMode.ACTION
+    assert await adapter._classify_discord_runtime_mode(
+        f"Plan only; do not implement changes for {link}",
+        force_action=True,
+    ) is gateway_run.RuntimeMode.READ_ONLY
+
+
+def test_classifier_authority_disables_only_classified_no_action_and_allows_ambiguity(adapter):
+    reason, allowed = adapter._discord_runtime_authority(
+        "Tell me what you would do to fix it.",
+        gateway_run.RuntimeMode.READ_ONLY,
+        force_action=True,
+    )
+    assert reason == "hypothetical_action_only"
+    assert allowed is False
+
+    reason, allowed = adapter._discord_runtime_authority(
+        "Could this be improved?",
+        gateway_run.RuntimeMode.READ_ONLY,
+    )
+    assert reason == "ambiguous_read_only"
+    assert allowed is True
+
+    later_reason, later_allowed = adapter._discord_runtime_authority(
+        "Please implement the parser fix.",
+        gateway_run.RuntimeMode.ACTION,
+    )
+    assert later_reason == "explicit_action_request"
+    assert later_allowed is False
 
 
 @pytest.mark.asyncio
@@ -446,6 +548,7 @@ async def test_promote_existing_question_thread_initializes_action_event(adapter
         goal_thread_context="[Goal thread context]\nprior goal context",
         discord_action_request_base_channel_prompt="base prompt",
         discord_runtime_mode="read_only",
+        discord_action_escalation_allowed=True,
     )
     adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
     adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
@@ -470,6 +573,8 @@ async def test_promote_existing_question_thread_initializes_action_event(adapter
     assert promoted.source.chat_id == "200"
     assert promoted.discord_runtime_mode == "action"
     assert promoted.discord_action_request_intent is None
+    assert promoted.discord_action_escalation_allowed is False
+    assert promoted.discord_runtime_reason == "promoted_action_replay"
     assert promoted.channel_prompt == "base prompt"
     assert promoted.feature_summary is feature_summary
     assert promoted.internal is False
@@ -503,6 +608,7 @@ async def test_promote_action_replay_reuses_summary_for_same_source_message(adap
         raw_message=raw,
         message_id="123",
         discord_action_request_intent=False,
+        discord_action_escalation_allowed=True,
     )
     feature_summary = {
         "thread_id": "200",
@@ -550,6 +656,7 @@ async def test_promote_inline_parent_intake_creates_action_thread(adapter):
         raw_message=raw,
         message_id="123",
         discord_action_request_intent=False,
+        discord_action_escalation_allowed=True,
     )
     adapter._auto_create_thread = AsyncMock(return_value=thread)
     adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
@@ -570,12 +677,58 @@ async def test_promote_inline_parent_intake_creates_action_thread(adapter):
         initial_request=event.text,
     )
 
-    adapter._auto_create_thread.assert_awaited_once_with(raw)
+    adapter._auto_create_thread.assert_awaited_once_with(
+        raw,
+        generation_is_current=None,
+    )
     assert promoted is not None
     assert promoted.source.chat_id == "200"
     assert promoted.source.parent_chat_id == "100"
     assert promoted.source.auto_thread_created is True
     assert promoted.feature_summary is feature_summary
+
+
+@pytest.mark.asyncio
+async def test_action_promotion_generation_barrier_rolls_back_new_thread(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    thread.delete = AsyncMock()
+    raw = _make_message(adapter, channel=parent, content="Could you make this work?")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="100",
+        chat_type="group",
+        guild_id="5",
+        message_id="123",
+    )
+    event = MessageEvent(
+        text="Could you make this work?",
+        source=source,
+        raw_message=raw,
+        message_id="123",
+        discord_runtime_mode="read_only",
+        discord_action_escalation_allowed=True,
+    )
+    current = {"value": True}
+
+    async def create_thread(_raw, *, generation_is_current=None):
+        assert generation_is_current is not None
+        current["value"] = False
+        return thread
+
+    adapter._auto_create_thread = AsyncMock(side_effect=create_thread)
+    adapter.initialize_feature_summary = AsyncMock()
+
+    promoted, url = await adapter.promote_event_to_action_request(
+        event,
+        initial_request=event.text,
+        generation_is_current=lambda: current["value"],
+    )
+
+    assert promoted is None
+    assert url == ""
+    thread.delete.assert_awaited_once()
+    adapter.initialize_feature_summary.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2867,7 +3020,9 @@ async def test_mentioned_attachment_only_existing_action_thread_keeps_none_inten
         "kanban_board": None,
     }
     adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
-    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._classify_discord_runtime_mode = AsyncMock(
+        return_value=gateway_run.RuntimeMode.READ_ONLY
+    )
     adapter._cache_discord_image = AsyncMock(return_value="/tmp/screenshot.png")
     attachment = FakeAttachment(
         filename="screenshot.png",
@@ -2884,7 +3039,7 @@ async def test_mentioned_attachment_only_existing_action_thread_keeps_none_inten
         )
     )
 
-    adapter._classify_discord_action_request.assert_not_awaited()
+    adapter._classify_discord_runtime_mode.assert_not_awaited()
     event = adapter.handle_message.await_args.args[0]
     assert event.feature_summary is feature_summary
     assert event.discord_runtime_mode == "action"
@@ -2909,7 +3064,9 @@ async def test_reply_attachment_only_existing_action_thread_keeps_none_intent(
         "kanban_board": None,
     }
     adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
-    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._classify_discord_runtime_mode = AsyncMock(
+        return_value=gateway_run.RuntimeMode.READ_ONLY
+    )
     adapter._cache_discord_document = AsyncMock(return_value=b"pdf")
     attachment = FakeAttachment(
         filename="requirements.pdf",
@@ -2930,7 +3087,7 @@ async def test_reply_attachment_only_existing_action_thread_keeps_none_intent(
     ):
         await adapter._handle_message(message)
 
-    adapter._classify_discord_action_request.assert_not_awaited()
+    adapter._classify_discord_runtime_mode.assert_not_awaited()
     event = adapter.handle_message.await_args.args[0]
     assert event.feature_summary is feature_summary
     assert event.discord_runtime_mode == "action"
@@ -3233,7 +3390,9 @@ async def test_unmentioned_attachment_only_action_followup_skips_late_intent_cla
         "kanban_board": None,
     }
     adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
-    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._classify_discord_runtime_mode = AsyncMock(
+        return_value=gateway_run.RuntimeMode.READ_ONLY
+    )
     adapter._cache_discord_image = AsyncMock(return_value=cached_path)
     adapter._cache_discord_document = AsyncMock(return_value=attachment._data)
     message = _make_message(
@@ -3250,7 +3409,7 @@ async def test_unmentioned_attachment_only_action_followup_skips_late_intent_cla
     ):
         await adapter._handle_message(message)
 
-    adapter._classify_discord_action_request.assert_not_awaited()
+    adapter._classify_discord_runtime_mode.assert_not_awaited()
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.feature_summary is feature_summary

@@ -34,14 +34,23 @@ class TestToolResolution:
     """Verify get_tool_definitions returns all expected tools for eval."""
 
     def test_terminal_and_file_toolsets_resolve_all_tools(self):
-        """enabled_toolsets=['terminal', 'file'] should produce 6 tools."""
+        """Terminal + file resolution includes bounded observers and file tools."""
         from model_tools import get_tool_definitions
         tools = get_tool_definitions(
             enabled_toolsets=["terminal", "file"],
             quiet_mode=True,
         )
         names = {t["function"]["name"] for t in tools}
-        expected = {"terminal", "process", "read_file", "write_file", "search_files", "patch"}
+        expected = {
+            "terminal",
+            "process",
+            "read_only_verify",
+            "git_inspect",
+            "read_file",
+            "write_file",
+            "search_files",
+            "patch",
+        }
         assert expected == names, f"Expected {expected}, got {names}"
 
     def test_terminal_tool_present(self):

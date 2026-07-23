@@ -1578,6 +1578,20 @@ _STATIC_ADMIN_SCHEMA = _build_schema(
     list(_ADMIN_ACTIONS.keys()), caps={"detected": False}, tool_name="discord_admin",
 )
 
+_READ_ONLY_DISCORD_ACTIONS = frozenset(
+    {
+        "list_guilds",
+        "server_info",
+        "list_channels",
+        "channel_info",
+        "list_roles",
+        "member_info",
+        "search_members",
+        "fetch_messages",
+        "list_pins",
+    }
+)
+
 
 def _single_schema(
     name: str,
@@ -1927,6 +1941,13 @@ registry.register(
     handler=_make_handler(discord_core),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if str(args.get("action") or "").strip().lower()
+        in _READ_ONLY_DISCORD_ACTIONS
+        else "the requested Discord action is not observational"
+    ),
 )
 
 registry.register(
@@ -1936,6 +1957,13 @@ registry.register(
     handler=_make_handler(discord_admin_handler),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if str(args.get("action") or "").strip().lower()
+        in _READ_ONLY_DISCORD_ACTIONS
+        else "the requested Discord admin action is not observational"
+    ),
 )
 
 for _tool_name, _schema, _action, _required, _handler_fn in _FIRST_CLASS_DISCORD_TOOLS:
@@ -1948,17 +1976,7 @@ for _tool_name, _schema, _action, _required, _handler_fn in _FIRST_CLASS_DISCORD
         requires_env=["DISCORD_BOT_TOKEN"],
         effect=(
             "read_only"
-            if _action
-            in {
-                "list_guilds",
-                "list_channels",
-                "get_channel",
-                "get_message",
-                "list_recent",
-                "get_thread",
-                "search_messages",
-                "get_reactions",
-            }
+            if _action in _READ_ONLY_DISCORD_ACTIONS
             else "mutating"
         ),
     )

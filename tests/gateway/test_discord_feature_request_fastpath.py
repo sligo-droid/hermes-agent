@@ -113,6 +113,7 @@ async def _run_discord_agent(
     intent=None,
     message="Build a deploy dashboard",
     channel_prompt=None,
+    escalation_allowed=False,
 ):
     return await runner._run_agent(
         message=message,
@@ -125,6 +126,7 @@ async def _run_discord_agent(
         feature_summary=feature_summary,
         discord_runtime_mode="read_only" if intent is False else "action",
         discord_action_request_intent=intent,
+        discord_action_escalation_allowed=escalation_allowed,
     )
 
 
@@ -326,6 +328,41 @@ async def test_existing_action_thread_direct_question_uses_ordinary_runtime(monk
     assert audit["model_tier_source"] == "model_override"
     assert audit["runtime_route"] == "gateway"
     assert feature_summary["initial_request"] == "Build bounded Federal Register evidence ingestion"
+
+
+@pytest.mark.asyncio
+async def test_explicit_no_action_read_only_turn_omits_escalation_schema(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+
+    result = await _run_discord_agent(
+        runner,
+        None,
+        intent=False,
+        message="Do not implement; plan only.",
+        escalation_allowed=False,
+    )
+
+    assert result["final_response"] == "ok"
+    assert "discord-action-escalation" not in _CapturingAgent.last_init["enabled_toolsets"]
+    cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
+    assert cached_agent._discord_action_escalation_allowed is False
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_read_only_turn_exposes_escalation_schema(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+
+    await _run_discord_agent(
+        runner,
+        None,
+        intent=False,
+        message="Could this parser be improved?",
+        escalation_allowed=True,
+    )
+
+    assert "discord-action-escalation" in _CapturingAgent.last_init["enabled_toolsets"]
 
 
 @pytest.mark.asyncio
