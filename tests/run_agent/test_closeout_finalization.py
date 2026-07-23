@@ -75,7 +75,6 @@ def _receipt_result(sha: str = "a" * 40) -> str:
             "summary": "Command completed without a recognized semantic failure.",
         },
         "closeout_receipt": {
-            "schema_version": 1,
             "status": "passed",
             "head_sha": sha,
             "script": "scripts/closeout.sh",
@@ -99,7 +98,6 @@ def test_receipt_forces_one_bounded_no_tool_finalization_and_resets_next_turn():
         patch(
             "agent.terminal_outcomes.inspect_repo_closeout_receipt",
             return_value={
-                "schema_version": 1,
                 "status": "passed",
                 "head_sha": "a" * 40,
                 "script": "scripts/closeout.sh",
@@ -109,16 +107,20 @@ def test_receipt_forces_one_bounded_no_tool_finalization_and_resets_next_turn():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("finish the implementation")
+        result = agent.run_conversation("hello")
 
     assert execute.call_count == 1
     assert result["final_response"] == "Implemented and verified."
     assert result["api_calls"] == 2
     assert result["closeout_receipt"]["head_sha"] == "a" * 40
     assert result["runtime_breakdown"]["closeout_receipt"] == result["closeout_receipt"]
+    initial_kwargs = agent.client.chat.completions.create.call_args_list[0].kwargs
     finalizer_kwargs = agent.client.chat.completions.create.call_args_list[1].kwargs
     assert finalizer_kwargs["tool_choice"] == "none"
-    assert "tools" not in finalizer_kwargs
+    assert finalizer_kwargs["tools"] == initial_kwargs["tools"]
+    assert finalizer_kwargs.get("parallel_tool_calls") == initial_kwargs.get(
+        "parallel_tool_calls"
+    )
     assert finalizer_kwargs["max_tokens"] <= 768
 
     agent.client.chat.completions.create.reset_mock()
@@ -156,7 +158,6 @@ def test_ignored_tool_choice_is_blocked_and_retried_at_most_once():
         patch(
             "agent.terminal_outcomes.inspect_repo_closeout_receipt",
             return_value={
-                "schema_version": 1,
                 "status": "passed",
                 "head_sha": "a" * 40,
                 "script": "scripts/closeout.sh",
@@ -166,7 +167,7 @@ def test_ignored_tool_choice_is_blocked_and_retried_at_most_once():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("finish")
+        result = agent.run_conversation("hello")
 
     assert execute.call_count == 1
     assert result["final_response"] == "Finalized without more tools."
@@ -175,7 +176,8 @@ def test_ignored_tool_choice_is_blocked_and_retried_at_most_once():
     finalization_calls = agent.client.chat.completions.create.call_args_list[1:]
     assert len(finalization_calls) == 2
     assert all(call.kwargs["tool_choice"] == "none" for call in finalization_calls)
-    assert all("tools" not in call.kwargs for call in finalization_calls)
+    initial_tools = agent.client.chat.completions.create.call_args_list[0].kwargs["tools"]
+    assert all(call.kwargs["tools"] == initial_tools for call in finalization_calls)
     skipped = [
         message for message in result["messages"]
         if message.get("role") == "tool" and "authoritative closeout receipt" in str(message.get("content"))
@@ -201,7 +203,6 @@ def test_receipt_stops_later_tools_in_same_model_batch():
         patch(
             "agent.terminal_outcomes.inspect_repo_closeout_receipt",
             return_value={
-                "schema_version": 1,
                 "status": "passed",
                 "head_sha": "a" * 40,
                 "script": "scripts/closeout.sh",
@@ -211,7 +212,7 @@ def test_receipt_stops_later_tools_in_same_model_batch():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("finish")
+        result = agent.run_conversation("hello")
 
     assert execute.call_count == 1
     assert execute.call_args.args[0] == "terminal"

@@ -443,7 +443,6 @@ def test_work_ledger_persists_only_allowlisted_closeout_receipt_fields(tmp_path)
 
     stored = ledger.get(item["id"])
     assert stored["runtime_breakdown"]["closeout_receipt"] == {
-        "schema_version": 1,
         "status": "passed",
         "head_sha": "d" * 40,
         "script": "closeout",

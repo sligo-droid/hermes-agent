@@ -247,8 +247,6 @@ def _closeout_finalize_api_kwargs(agent: Any, api_kwargs: Any) -> Any:
     if not _closeout_finalization_active(agent) or not isinstance(api_kwargs, dict):
         return api_kwargs
     bounded = dict(api_kwargs)
-    bounded.pop("tools", None)
-    bounded.pop("parallel_tool_calls", None)
     bounded["tool_choice"] = "none"
     limit = 768
     for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):

@@ -13,7 +13,17 @@ from typing import Any, Iterable
 TERMINAL_FAILURE_KINDS = frozenset(
     {"source_parse", "dependency_missing", "command_context", "test_failure", "unknown"}
 )
-_SUCCESS_CLOSEOUT_STATUSES = frozenset({"passed", "complete", "completed", "success", "succeeded"})
+_SUCCESS_CLOSEOUT_STATUSES = frozenset(
+    {
+        "deployed",
+        "verified",
+        "complete",
+        "completed",
+        "passed",
+        "success",
+        "succeeded",
+    }
+)
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_SCAN_CHARS = 24_000
 _MAX_RELATIVE_PATH_CHARS = 240
@@ -84,6 +94,8 @@ def classify_terminal_outcome(
     command_context = any(
         marker in text
         for marker in (
+            "err_pnpm_no_pkg_manifest",
+            "err_pnpm_aborted_remove_modules_dir_no_tty",
             "command not found",
             "no such file or directory",
             "not recognized as an internal or external command",
@@ -266,7 +278,6 @@ def exact_lock_pnpm_install_block(command: Any, cwd: Any) -> dict[str, Any] | No
             continue
         try:
             from hermes_cli.worktree_runtime import (
-                _same_lock,
                 git_worktree_records,
                 repo_root_for_path,
             )
@@ -289,9 +300,7 @@ def exact_lock_pnpm_install_block(command: Any, cwd: Any) -> dict[str, Any] | No
                 continue
             if modules.resolve(strict=False) != primary_modules.resolve(strict=False):
                 continue
-            if not primary_modules.is_dir() or not _same_lock(
-                package_root, primary_package, "pnpm-lock.yaml"
-            ):
+            if not primary_modules.is_dir():
                 continue
         except Exception:
             continue
@@ -314,7 +323,11 @@ def sanitize_closeout_receipt(value: Any) -> dict[str, Any] | None:
     raw = value if isinstance(value, dict) else {}
     status = str(raw.get("status") or "").strip().lower()
     head_sha = str(
-        raw.get("head_sha") or raw.get("commit_sha") or raw.get("sha") or ""
+        raw.get("active_sha")
+        or raw.get("head_sha")
+        or raw.get("commit_sha")
+        or raw.get("sha")
+        or ""
     ).strip().lower()
     script = str(raw.get("script") or "").strip().replace("\\", "/")
     if status not in _SUCCESS_CLOSEOUT_STATUSES or not _SHA_RE.fullmatch(head_sha):
@@ -322,8 +335,7 @@ def sanitize_closeout_receipt(value: Any) -> dict[str, Any] | None:
     if not script or len(script) > _MAX_RELATIVE_PATH_CHARS or script.startswith("/") or ".." in Path(script).parts:
         return None
     return {
-        "schema_version": 1,
-        "status": "passed",
+        "status": status,
         "head_sha": head_sha,
         "script": script,
     }
@@ -359,12 +371,19 @@ def inspect_repo_closeout_receipt(
     if not tokens or any(token == "--dry-run" or token.startswith("--dry-run=") for token in tokens):
         return None
     executable = Path(tokens[0])
-    if executable.name not in {"closeout", "closeout.sh"}:
+    if executable.name in {"sh", "bash"}:
+        if len(tokens) < 2:
+            return None
+        script_token = tokens[1]
+    else:
+        script_token = tokens[0]
+    script_executable = Path(script_token)
+    if script_executable.name not in {"closeout", "closeout.sh"}:
         return None
-    if not executable.is_absolute() and "/" not in tokens[0]:
+    if not script_executable.is_absolute() and "/" not in script_token:
         return None
     command_cwd = Path(str(cwd or ".")).expanduser().resolve(strict=False)
-    script_path = executable.expanduser()
+    script_path = script_executable.expanduser()
     if not script_path.is_absolute():
         script_path = command_cwd / script_path
     script_path = script_path.resolve(strict=False)

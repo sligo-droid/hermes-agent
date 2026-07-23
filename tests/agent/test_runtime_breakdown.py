@@ -175,8 +175,7 @@ def test_runtime_breakdown_carries_only_sanitized_closeout_receipt():
     })
 
     assert breakdown["closeout_receipt"] == {
-        "schema_version": 1,
-        "status": "passed",
+        "status": "completed",
         "head_sha": "c" * 40,
         "script": "scripts/closeout.sh",
     }

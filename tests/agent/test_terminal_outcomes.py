@@ -4,10 +4,13 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agent.terminal_outcomes import (
     classify_terminal_outcome,
     exact_lock_pnpm_install_block,
     inspect_repo_closeout_receipt,
+    sanitize_closeout_receipt,
 )
 from hermes_cli.worktree_runtime import WorktreeRecord
 
@@ -48,6 +51,38 @@ def test_terminal_classifier_distinguishes_common_failure_classes():
     assert classify_terminal_outcome(
         command="false", output="", exit_code=1
     )["kind"] == "unknown"
+
+
+def test_pnpm_operational_failures_are_command_context_not_install_advice():
+    signatures = (
+        "ERR_PNPM_NO_PKG_MANIFEST No package.json found in /workspace/project",
+        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY",
+    )
+    for output in signatures:
+        result = classify_terminal_outcome(
+            command="pnpm install",
+            output=output,
+            exit_code=1,
+        )
+        assert result["kind"] == "command_context"
+        assert result["dependency_installation_indicated"] is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["deployed", "verified", "complete", "completed", "passed", "success", "succeeded"],
+)
+def test_closeout_status_allowlist_preserves_status(status):
+    assert sanitize_closeout_receipt({
+        "status": status,
+        "active_sha": "f" * 40,
+        "script": "scripts/local_lifecycle/closeout.sh",
+        "secret": "drop",
+    }) == {
+        "status": status,
+        "head_sha": "f" * 40,
+        "script": "scripts/local_lifecycle/closeout.sh",
+    }
 
 
 def _exact_lock_tree(tmp_path: Path):
@@ -110,6 +145,28 @@ def test_exact_lock_allows_non_install_pnpm_commands(monkeypatch, tmp_path):
         assert exact_lock_pnpm_install_block(command, worktree / "ui" / "src") is None
 
 
+def test_exact_lock_still_blocks_after_worktree_lock_changes(monkeypatch, tmp_path):
+    primary, worktree = _exact_lock_tree(tmp_path)
+    (worktree / "ui" / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\nchanged: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worktree_runtime.repo_root_for_path",
+        lambda path: worktree,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worktree_runtime.git_worktree_records",
+        lambda root: [WorktreeRecord(str(primary)), WorktreeRecord(str(worktree))],
+    )
+
+    block = exact_lock_pnpm_install_block("pnpm install", worktree / "ui")
+
+    assert block is not None
+    assert block["code"] == "exact_lock_install_blocked"
+    assert block["shared_target"] == str(primary / "ui" / "node_modules")
+
+
 def _git(repo: Path, *args: str) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=repo, capture_output=True, text=True, check=True
@@ -144,7 +201,6 @@ def test_closeout_receipt_accepts_only_clean_tracked_final_script(tmp_path):
     )
 
     assert receipt == {
-        "schema_version": 1,
         "status": "passed",
         "head_sha": head,
         "script": "scripts/closeout.sh",
@@ -156,6 +212,60 @@ def test_closeout_receipt_accepts_only_clean_tracked_final_script(tmp_path):
         classification=classification,
         output=json.dumps({"status": "passed", "head_sha": head}),
     ) is None
+
+
+def test_pid_interpreter_closeout_accepts_deployed_active_sha(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Hermes Test")
+    _git(repo, "config", "user.email", "hermes-test@example.invalid")
+    script = repo / "scripts" / "local_lifecycle" / "closeout.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    _git(repo, "add", "scripts/local_lifecycle/closeout.sh")
+    _git(repo, "commit", "-m", "add PID closeout")
+    head = _git(repo, "rev-parse", "HEAD")
+    command = 'bash scripts/local_lifecycle/closeout.sh --source "$PWD"'
+
+    receipt = inspect_repo_closeout_receipt(
+        command=command,
+        cwd=repo,
+        exit_code=0,
+        classification=classify_terminal_outcome(
+            command=command,
+            output="",
+            exit_code=0,
+        ),
+        output=json.dumps(
+            {
+                "status": "deployed",
+                "active_sha": head,
+                "deployment_url": "must-not-persist",
+            }
+        ),
+    )
+
+    assert receipt == {
+        "status": "deployed",
+        "head_sha": head,
+        "script": "scripts/local_lifecycle/closeout.sh",
+    }
+    for rejected_command in (
+        'env bash scripts/local_lifecycle/closeout.sh --source "$PWD"',
+        'bash scripts/local_lifecycle/closeout.sh --source "$PWD"; true',
+    ):
+        assert inspect_repo_closeout_receipt(
+            command=rejected_command,
+            cwd=repo,
+            exit_code=0,
+            classification=classify_terminal_outcome(
+                command=rejected_command,
+                output="",
+                exit_code=0,
+            ),
+            output=json.dumps({"status": "deployed", "active_sha": head}),
+        ) is None
 
 
 def test_closeout_receipt_rejects_dirty_or_mismatched_head(tmp_path):

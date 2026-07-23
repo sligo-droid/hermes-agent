@@ -75,7 +75,6 @@ def test_closeout_receipt_records_only_sanitized_turn_state(monkeypatch):
     monkeypatch.setattr(
         "agent.terminal_outcomes.inspect_repo_closeout_receipt",
         lambda **kwargs: {
-            "schema_version": 1,
             "status": "passed",
             "head_sha": "a" * 40,
             "script": "scripts/closeout.sh",
@@ -99,7 +98,6 @@ def test_closeout_receipt_records_only_sanitized_turn_state(monkeypatch):
     assert accepted is True
     payload = json.loads(result)
     assert payload["closeout_receipt"] == {
-        "schema_version": 1,
         "status": "passed",
         "head_sha": "a" * 40,
         "script": "scripts/closeout.sh",
@@ -121,7 +119,6 @@ def test_closeout_receipt_rejects_unmet_visual_gate(monkeypatch):
     monkeypatch.setattr(
         "agent.terminal_outcomes.inspect_repo_closeout_receipt",
         lambda **kwargs: {
-            "schema_version": 1,
             "status": "passed",
             "head_sha": "b" * 40,
             "script": "closeout",
@@ -154,7 +151,6 @@ def test_closeout_receipt_rejects_pending_required_async_gate(monkeypatch):
     monkeypatch.setattr(
         "agent.terminal_outcomes.inspect_repo_closeout_receipt",
         lambda **kwargs: {
-            "schema_version": 1,
             "status": "passed",
             "head_sha": "e" * 40,
             "script": "closeout",
