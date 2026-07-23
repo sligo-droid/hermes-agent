@@ -2249,7 +2249,7 @@ async def test_direct_agent_result_cas_does_not_overwrite_replacement_run(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_successful_promotion_stays_out_of_current_turn_until_target_inbound(
+async def test_successful_intake_escalation_queues_clean_action_turn_without_reprompt(
     tmp_path,
     monkeypatch,
 ):
@@ -2267,12 +2267,21 @@ async def test_successful_promotion_stays_out_of_current_turn_until_target_inbou
         "initial_request": "Build the parser",
         "kanban_board": None,
     }
-    promoted_summaries: dict[str, dict] = {}
-    callbacks = []
+    promoted_event = MessageEvent(
+        text="Build the parser",
+        source=_source(canonical),
+        message_id="message-1",
+        feature_summary=feature_summary,
+        discord_action_request_intent=True,
+        internal=True,
+    )
     adapter = SimpleNamespace(
         _active_sessions={},
-        _load_feature_summary_handle_by_thread_id=lambda thread_id: promoted_summaries.get(thread_id),
-        register_post_delivery_callback=lambda *args, **kwargs: callbacks.append((args, kwargs)),
+        _pending_messages={},
+        promote_event_to_action_request=AsyncMock(
+            return_value=(promoted_event, "https://discord.com/channels/guild-1/thread-123")
+        ),
+        register_post_delivery_callback=lambda *args, **kwargs: None,
         send=AsyncMock(),
     )
     runner.adapters = {Platform.DISCORD: adapter}
@@ -2281,6 +2290,9 @@ async def test_successful_promotion_stays_out_of_current_turn_until_target_inbou
     runner._register_discord_summary_post_delivery = (
         gateway_run.GatewayRunner._register_discord_summary_post_delivery.__get__(runner)
     )
+    runner._session_key_for_source = (
+        lambda _source: "agent:main:discord:thread:thread-123"
+    )
     source = _source(canonical)
     event = MessageEvent(
         text="Can you explain this first?",
@@ -2288,22 +2300,37 @@ async def test_successful_promotion_stays_out_of_current_turn_until_target_inbou
         message_id="message-1",
         discord_action_request_intent=False,
     )
-    promotion_link = "https://discord.com/channels/guild-1/thread-123"
-
     async def _promote_then_stop(**_kwargs):
-        promoted_summaries["thread-123"] = feature_summary
         return {
-            "final_response": (
-                f"I created the action thread: {promotion_link}. "
-                "Please continue by sending a new message there."
-            ),
+            "final_response": ".NO_REPLY",
             "messages": [
                 {"role": "user", "content": event.text},
-                {"role": "assistant", "content": promotion_link},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "escalate-1",
+                            "function": {
+                                "name": "escalate_to_action",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "escalate-1",
+                    "content": '{"success": true, "action_escalation_requested": true}',
+                },
             ],
             "tools": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
+            "agent_persisted": False,
+            "action_escalation_requested": {
+                "success": True,
+                "action_escalation_requested": True,
+            },
         }
 
     runner._run_agent = AsyncMock(side_effect=_promote_then_stop)
@@ -2315,26 +2342,15 @@ async def test_successful_promotion_stays_out_of_current_turn_until_target_inbou
         1,
     )
 
-    assert promotion_link in response
-    assert "sending a new message" in response
+    assert "starting the work" in response
+    assert "https://discord.com/channels/guild-1/thread-123" in response
     assert event.source is source
     assert event.feature_summary is None
-    assert callbacks == []
-
-    next_event = MessageEvent(
-        text="Build it now.",
-        source=source,
-        message_id="message-2",
-    )
-    assert runner._hydrate_discord_feature_summary_from_adapter(next_event) == feature_summary
-    assert next_event.feature_summary == feature_summary
-    assert gateway_run._is_standard_discord_action_request(
-        next_event.source,
-        next_event.feature_summary,
-    )
-    tier = gateway_run._discord_action_request_model_tier({}, next_event.feature_summary)
-    assert tier.name == "basic"
-    assert tier.reasoning_effort == "low"
+    assert adapter._pending_messages[
+        "agent:main:discord:thread:thread-123"
+    ] is promoted_event
+    assert runner._run_agent.await_args.kwargs["defer_persistence"] is True
+    runner.session_store.append_to_transcript.assert_not_called()
 
 
 @pytest.mark.asyncio

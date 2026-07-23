@@ -1005,6 +1005,8 @@ class TestToolsetInclusion:
         assert "discord_search_messages" in TOOLSETS["hermes-discord"]["tools"]
         assert "discord_add_reaction" in TOOLSETS["hermes-discord"]["tools"]
         assert "discord_send_message" in TOOLSETS["hermes-discord"]["tools"]
+        assert "escalate_to_action" not in TOOLSETS["hermes-discord"]["tools"]
+        assert "escalate_to_action" in TOOLSETS["discord-action-escalation"]["tools"]
 
     def test_first_class_discord_tools_in_discord_toolset(self):
         from toolsets import TOOLSETS

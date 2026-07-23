@@ -334,6 +334,120 @@ async def test_non_goal_feature_summary_does_not_start_kanban_pipeline(adapter, 
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_intake_defaults_to_question_without_auxiliary_llm(adapter, monkeypatch):
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        MagicMock(side_effect=AssertionError("intake must not call auxiliary LLM")),
+    )
+
+    assert await adapter._classify_discord_action_request(
+        "The deploy failed; explain why and rerun it",
+        context_lines=["Alex: this may need investigation"],
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_promote_existing_question_thread_initializes_action_event(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    raw = _make_message(adapter, channel=thread, content="Could you make this work?")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="200",
+        chat_type="thread",
+        thread_id="200",
+        parent_chat_id="100",
+        guild_id="5",
+        message_id="123",
+    )
+    event = MessageEvent(
+        text="Could you make this work?",
+        source=source,
+        raw_message=raw,
+        message_id="123",
+        media_urls=["/tmp/reference.png"],
+        media_types=["image/png"],
+        channel_prompt="question overlay",
+        discord_action_request_base_channel_prompt="base prompt",
+        discord_action_request_intent=False,
+    )
+    adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
+    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=None)
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": event.text,
+        "kanban_board": None,
+    }
+    adapter.initialize_feature_summary = AsyncMock(return_value=feature_summary)
+    adapter.initialize_project_summary = AsyncMock(return_value=None)
+    adapter._threads.mark = MagicMock()
+    adapter._mark_discord_thread_participation = MagicMock()
+
+    promoted, url = await adapter.promote_event_to_action_request(
+        event,
+        initial_request=event.text,
+    )
+
+    assert promoted is not None
+    assert promoted.source.chat_id == "200"
+    assert promoted.discord_action_request_intent is True
+    assert promoted.channel_prompt == "base prompt"
+    assert promoted.feature_summary is feature_summary
+    assert promoted.internal is True
+    assert promoted.media_urls == ["/tmp/reference.png"]
+    assert promoted.media_types == ["image/png"]
+    assert url == "https://discord.com/channels/5/200"
+
+
+@pytest.mark.asyncio
+async def test_promote_inline_parent_intake_creates_action_thread(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    raw = _make_message(adapter, channel=parent, content="Should we rerun the deploy?")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="100",
+        chat_type="group",
+        guild_id="5",
+        message_id="123",
+    )
+    event = MessageEvent(
+        text="Should we rerun the deploy?",
+        source=source,
+        raw_message=raw,
+        message_id="123",
+        discord_action_request_intent=False,
+    )
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
+    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=None)
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "initial_request": event.text,
+        "kanban_board": None,
+    }
+    adapter.initialize_feature_summary = AsyncMock(return_value=feature_summary)
+    adapter.initialize_project_summary = AsyncMock(return_value=None)
+    adapter._threads.mark = MagicMock()
+    adapter._mark_discord_thread_participation = MagicMock()
+
+    promoted, _url = await adapter.promote_event_to_action_request(
+        event,
+        initial_request=event.text,
+    )
+
+    adapter._auto_create_thread.assert_awaited_once_with(raw)
+    assert promoted is not None
+    assert promoted.source.chat_id == "200"
+    assert promoted.source.parent_chat_id == "100"
+    assert promoted.source.auto_thread_created is True
+    assert promoted.feature_summary is feature_summary
+
+
+@pytest.mark.asyncio
 async def test_non_goal_feature_summary_can_render_explicit_pr_url(adapter):
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     thread = FakeThread(channel_id=200, parent=parent)
