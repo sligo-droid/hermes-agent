@@ -1606,6 +1606,51 @@ class DiscordAdapter(BasePlatformAdapter):
         handle["_thread_obj"] = thread_channel
         return handle
 
+    def _load_feature_summary_handle_for_request(
+        self,
+        thread_channel: Any,
+        *,
+        source_message_id: Optional[str],
+        project_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Load only the summary owned by one actionable source message."""
+        thread_id = str(getattr(thread_channel, "id", "") or "").strip()
+        request_id = str(source_message_id or "").strip()
+        if not thread_id or not request_id:
+            return None
+        handle = self._load_feature_summary_handle_by_thread_id(
+            thread_id,
+            source_message_id=request_id,
+        )
+        if not isinstance(handle, dict):
+            return None
+        if discord_message_exceeds_age_limit(request_id):
+            return None
+        identity = self._feature_summary_channel_identity(thread_channel)
+        for field in ("guild_id", "parent_channel_id"):
+            value = str(identity.get(field) or "").strip()
+            stored_value = str(handle.get(field) or "").strip()
+            if value and stored_value and value != stored_value:
+                logger.warning(
+                    "[%s] Ignoring Discord request summary with mismatched %s: %s != %s",
+                    self.name,
+                    field,
+                    stored_value,
+                    value,
+                )
+                return None
+            if value and not stored_value:
+                handle[field] = value
+        if self._should_repair_feature_summary_project_context(
+            handle.get("project_context"),
+            project_context,
+        ):
+            handle["project_context"] = project_context
+            self._persist_feature_summary_handle_by_scope(handle)
+        handle.setdefault("project_context", project_context)
+        handle["_thread_obj"] = thread_channel
+        return handle
+
     def _load_feature_summary_handle_by_thread_id(
         self,
         thread_id: str,
@@ -3106,8 +3151,14 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_channel = self._thread_parent_channel(thread_channel)
 
         project_context = self._resolve_project_context_for_channel(parent_channel)
-        feature_summary = self._load_feature_summary_handle_for_thread(
+        request_id = str(
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or ""
+        ).strip()
+        feature_summary = self._load_feature_summary_handle_for_request(
             thread_channel,
+            source_message_id=request_id or None,
             project_context=project_context,
         )
         if feature_summary is None:
@@ -3119,12 +3170,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_channel=parent_channel,
                 initial_request=request_text,
                 project_context=project_context,
-                source_message_id=str(
-                    getattr(event, "message_id", None)
-                    or getattr(source, "message_id", None)
-                    or ""
-                )
-                or None,
+                source_message_id=request_id or None,
                 reply_to_message=reply_target,
             )
         if feature_summary is None:
@@ -13628,24 +13674,30 @@ class DiscordAdapter(BasePlatformAdapter):
                     reply_to_message=message,
                 )
                 self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
-        elif is_thread and isinstance(existing_feature_summary_handle, dict):
-            feature_summary_handle = existing_feature_summary_handle
         elif (
             is_thread
             and not slash_goal_uses_attachment_body
             and action_request_intent is True
         ):
-            _stage_started = time.perf_counter()
-            feature_summary_handle = await self.initialize_feature_summary(
+            feature_summary_handle = self._load_feature_summary_handle_for_request(
                 message.channel,
-                parent_channel=self._thread_parent_channel(message.channel),
-                initial_request=_feature_summary_initial_request(normalized_content),
-                project_context=project_context,
-                transcript_quote=voice_action_transcript if message_is_voice else None,
                 source_message_id=str(message.id),
-                reply_to_message=message,
+                project_context=project_context,
             )
-            self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
+            if feature_summary_handle is None:
+                _stage_started = time.perf_counter()
+                feature_summary_handle = await self.initialize_feature_summary(
+                    message.channel,
+                    parent_channel=self._thread_parent_channel(message.channel),
+                    initial_request=_feature_summary_initial_request(normalized_content),
+                    project_context=project_context,
+                    transcript_quote=voice_action_transcript if message_is_voice else None,
+                    source_message_id=str(message.id),
+                    reply_to_message=message,
+                )
+                self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
+        elif is_thread and isinstance(existing_feature_summary_handle, dict):
+            feature_summary_handle = existing_feature_summary_handle
         elif is_thread:
             feature_summary_handle = existing_feature_summary_handle
 

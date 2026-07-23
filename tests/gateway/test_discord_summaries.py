@@ -402,7 +402,7 @@ async def test_promote_existing_question_thread_initializes_action_event(adapter
     )
     adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
     adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
-    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=None)
+    adapter._load_feature_summary_handle_for_request = MagicMock(return_value=None)
     feature_summary = {
         "thread_id": "200",
         "message_id": "300",
@@ -431,6 +431,55 @@ async def test_promote_existing_question_thread_initializes_action_event(adapter
 
 
 @pytest.mark.asyncio
+async def test_promote_action_replay_reuses_summary_for_same_source_message(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    raw = _make_message(adapter, channel=thread, content="Could you make this work?", message_id=123)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="200",
+        chat_type="thread",
+        thread_id="200",
+        parent_chat_id="100",
+        guild_id="5",
+        message_id="123",
+    )
+    event = MessageEvent(
+        text="Could you make this work?",
+        source=source,
+        raw_message=raw,
+        message_id="123",
+        discord_action_request_intent=False,
+    )
+    feature_summary = {
+        "thread_id": "200",
+        "message_id": "300",
+        "source_message_id": "123",
+        "initial_request": event.text,
+        "kanban_board": None,
+    }
+    adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
+    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
+    adapter._load_feature_summary_handle_for_request = MagicMock(return_value=feature_summary)
+    adapter.initialize_feature_summary = AsyncMock()
+    adapter.initialize_project_summary = AsyncMock(return_value=None)
+
+    promoted, _url = await adapter.promote_event_to_action_request(
+        event,
+        initial_request=event.text,
+    )
+
+    assert promoted is not None
+    assert promoted.feature_summary is feature_summary
+    adapter._load_feature_summary_handle_for_request.assert_called_once_with(
+        thread,
+        source_message_id="123",
+        project_context=None,
+    )
+    adapter.initialize_feature_summary.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_promote_inline_parent_intake_creates_action_thread(adapter):
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=200, parent=parent)
@@ -451,7 +500,7 @@ async def test_promote_inline_parent_intake_creates_action_thread(adapter):
     )
     adapter._auto_create_thread = AsyncMock(return_value=thread)
     adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
-    adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=None)
+    adapter._load_feature_summary_handle_for_request = MagicMock(return_value=None)
     feature_summary = {
         "thread_id": "200",
         "message_id": "300",
@@ -583,7 +632,7 @@ async def test_goal_feature_summary_for_source_uses_standard_goal_embed(adapter,
 
 
 @pytest.mark.asyncio
-async def test_tagged_thread_followup_reuses_persisted_feature_summary(adapter, monkeypatch):
+async def test_tagged_thread_action_followup_creates_request_scoped_feature_summary(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     thread = FakeThread(channel_id=200, parent=parent)
@@ -593,17 +642,24 @@ async def test_tagged_thread_followup_reuses_persisted_feature_summary(adapter, 
         initial_request="Build a deploy dashboard",
     )
     assert handle is not None
+    adapter._classify_discord_action_request = AsyncMock(return_value=True)
     adapter.handle_message.reset_mock()
 
-    await adapter._handle_message(
-        _make_message(adapter, channel=thread, content="<@999> Also add export")
+    followup = _make_message(
+        adapter,
+        channel=thread,
+        content="<@999> Also add export",
+        message_id=501,
     )
+    await adapter._handle_message(followup)
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "thread"
     assert event.feature_summary["thread_id"] == "200"
-    assert event.feature_summary["message_id"] == "300"
+    assert event.feature_summary["message_id"] == "301"
+    assert event.feature_summary["source_message_id"] == "501"
+    assert thread.sent[1][0]["reference"] is followup
     assert event.feature_summary["_thread_obj"] is thread
 
 
@@ -2868,7 +2924,9 @@ async def test_reply_native_voice_existing_action_thread_classifies_transcript(
     adapter._classify_discord_action_request.assert_awaited_once()
     assert adapter._classify_discord_action_request.await_args.args[0] == "Build the approved parser"
     event = adapter.handle_message.await_args.args[0]
-    assert event.feature_summary is feature_summary
+    assert event.feature_summary is not feature_summary
+    assert event.feature_summary["source_message_id"] == str(message.id)
+    assert event.feature_summary["initial_request"] == "Build the approved parser"
     assert event.discord_action_request_intent is True
     assert event.message_type == MessageType.VOICE
     assert event.media_urls == ["/tmp/voice.ogg"]
@@ -2979,7 +3037,7 @@ async def test_untriggered_existing_thread_native_voice_is_not_transcribed(adapt
 
 
 @pytest.mark.asyncio
-async def test_existing_action_thread_exact_approval_stays_action_without_promotion_prompt(
+async def test_existing_action_thread_exact_approval_gets_own_summary_without_promotion_prompt(
     adapter,
     monkeypatch,
 ):
@@ -2993,7 +3051,15 @@ async def test_existing_action_thread_exact_approval_stays_action_without_promot
         "kanban_board": None,
     }
     adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
-    adapter.initialize_feature_summary = AsyncMock()
+    new_feature_summary = {
+        "thread_id": "200",
+        "message_id": "301",
+        "source_message_id": "1527750909164261467",
+        "initial_request": "Okay, let's build this.",
+        "kanban_board": None,
+    }
+    adapter._load_feature_summary_handle_for_request = MagicMock(return_value=None)
+    adapter.initialize_feature_summary = AsyncMock(return_value=new_feature_summary)
 
     await adapter._handle_message(
         _make_message(
@@ -3004,11 +3070,11 @@ async def test_existing_action_thread_exact_approval_stays_action_without_promot
         )
     )
 
-    adapter.initialize_feature_summary.assert_not_awaited()
+    adapter.initialize_feature_summary.assert_awaited_once()
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.message_id == "1527750909164261467"
-    assert event.feature_summary is feature_summary
+    assert event.feature_summary is new_feature_summary
     assert event.discord_action_request_intent is True
     assert "promote_to_action_thread" not in str(event.channel_prompt or "")
     assert "classified as a direct question" not in str(event.channel_prompt or "")
@@ -3043,12 +3109,27 @@ async def test_unmentioned_existing_action_thread_gets_late_intent_classificatio
     adapter._load_feature_summary_handle_for_thread = MagicMock(return_value=feature_summary)
     message = _make_message(adapter, channel=thread, content=content)
     message.mentions = []
+    if expected_intent:
+        adapter._load_feature_summary_handle_for_request = MagicMock(return_value=None)
+        adapter.initialize_feature_summary = AsyncMock(
+            return_value={
+                "thread_id": "200",
+                "message_id": "301",
+                "source_message_id": str(message.id),
+                "initial_request": content,
+                "kanban_board": None,
+            }
+        )
 
     await adapter._handle_message(message)
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.feature_summary is feature_summary
+    if expected_intent:
+        assert event.feature_summary["message_id"] == "301"
+        assert event.feature_summary["source_message_id"] == str(message.id)
+    else:
+        assert event.feature_summary is feature_summary
     assert event.discord_action_request_intent is expected_intent
     assert (
         "classified as a direct question" in str(event.channel_prompt or "")
@@ -3155,7 +3236,9 @@ async def test_unmentioned_voice_action_followup_classifies_transcript(adapter, 
     adapter._classify_discord_action_request.assert_awaited_once()
     assert adapter._classify_discord_action_request.await_args.args[0] == "Build the approved parser"
     event = adapter.handle_message.await_args.args[0]
-    assert event.feature_summary is feature_summary
+    assert event.feature_summary is not feature_summary
+    assert event.feature_summary["source_message_id"] == str(message.id)
+    assert event.feature_summary["initial_request"] == "Build the approved parser"
     assert event.discord_action_request_intent is True
     assert event.media_urls == ["/tmp/voice.ogg"]
     assert "classified as a direct question" not in str(event.channel_prompt or "")
