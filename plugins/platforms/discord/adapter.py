@@ -175,9 +175,9 @@ _DISCORD_DIRECT_QUESTION_PROMPT = (
     "user explicitly asks for implementation work. If the inline exchange turns "
     "out to be a genuine work request, call the Discord tool's "
     "promote_to_action_thread action. The tool returns the target thread link. "
-    "After it succeeds, STOP current-turn implementation, include that link in "
-    "your response, and ask the user to continue by sending a new message in the "
-    "promoted thread. Do not implement the work until that new inbound message."
+    "After it succeeds, do not implement in this direct-question session. The "
+    "gateway immediately starts the original request in the promoted action "
+    "thread; briefly report that work has started there and include that link."
 )
 
 try:

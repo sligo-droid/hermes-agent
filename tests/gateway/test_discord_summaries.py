@@ -2435,10 +2435,10 @@ async def test_tagged_question_answers_in_thread_without_feature_summary(adapter
     assert event.source.parent_chat_id == "100"
     assert "classified as a direct question, not an action request" in event.channel_prompt
     assert "promote_to_action_thread" in event.channel_prompt
-    assert "STOP current-turn implementation" in event.channel_prompt
+    assert "gateway immediately starts the original request" in event.channel_prompt
     assert "include that link" in event.channel_prompt
-    assert "sending a new message in the promoted thread" in event.channel_prompt
-    assert "continue the work in the new thread" not in event.channel_prompt
+    assert "sending a new message in the promoted thread" not in event.channel_prompt
+    assert "work has started there" in event.channel_prompt
 
 
 @pytest.mark.asyncio
