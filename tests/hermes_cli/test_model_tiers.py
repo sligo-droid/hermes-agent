@@ -32,7 +32,7 @@ def test_default_routes_reference_resolvable_tiers():
     assert route_names == {
         "gateway": "basic",
         "cron": "trivial",
-        "discord_action_request": "discord_action",
+        "discord_action_request": "basic",
         "coding_worker_simple_build": "intermediate",
         "coding_worker_complex_plan": "advanced",
         "coding_worker_complex_build": "intermediate",
@@ -59,7 +59,7 @@ def test_default_routes_reference_resolvable_tiers():
         "basic": "low",
         "intermediate": "medium",
         "advanced": "high",
-        "discord_action": "medium",
+        "discord_action": "low",
     }
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).model

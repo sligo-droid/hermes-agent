@@ -275,9 +275,9 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
     assert tier is not None
     assert (tier.name, tier.model, tier.reasoning_effort) == (
-        "discord_action",
+        "basic",
         "gpt-5.6-sol",
-        "medium",
+        "low",
     )
     assert event.text == "Build a deploy dashboard"
     assert event.message_type == MessageType.TEXT
@@ -2799,9 +2799,9 @@ async def test_existing_thread_native_voice_promotes_action_from_transcript(
     tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
     assert tier is not None
     assert (tier.name, tier.model, tier.reasoning_effort) == (
-        "discord_action",
+        "basic",
         "gpt-5.6-sol",
-        "medium",
+        "low",
     )
     assert any(
         payload.get("content") == f"> {transcript}"
@@ -3078,9 +3078,9 @@ async def test_native_voice_metadata_without_message_flag_triages_from_transcrip
     tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
     assert tier is not None
     assert (tier.name, tier.model, tier.reasoning_effort) == (
-        "discord_action",
+        "basic",
         "gpt-5.6-sol",
-        "medium",
+        "low",
     )
     assert event.media_urls == ["/tmp/voice_from_read.ogg"]
     assert event.media_types == ["audio/ogg"]

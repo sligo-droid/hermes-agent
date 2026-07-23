@@ -1217,9 +1217,9 @@ choose a model and reasoning effort.
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
-| `basic` | GPT-5.6 Sol | `low` | Ordinary gateway sessions |
+| `basic` | GPT-5.6 Sol | `low` | Ordinary gateway sessions and accepted Discord action requests |
 | `intermediate` | GPT-5.6 Sol | `medium` | Coding-worker build passes and Kanban `dev` |
-| `discord_action` | GPT-5.6 Sol | `medium` | Accepted Discord action requests |
+| `discord_action` | GPT-5.6 Sol | `low` | Legacy alias for the basic Discord action tier |
 | `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 
 These code-owned built-ins follow the supported model/effort frontier: trivial
@@ -1249,7 +1249,7 @@ cron:
   model_tier: trivial
 
 discord:
-  action_request_model_tier: discord_action
+  action_request_model_tier: basic
 
 coding_worker:
   backend: codex

@@ -338,7 +338,7 @@ discord:
   voice_auto_tag: false           # Native Discord voice messages still need @mention
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
-  action_request_model_tier: discord_action          # All accepted action requests: Sol/medium
+  action_request_model_tier: basic                   # All accepted action requests: Sol/low
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
@@ -363,8 +363,8 @@ group_sessions_per_user: true     # Isolate sessions per user in shared channels
 
 Discord intake still distinguishes questions from action requests. Every
 accepted action thread uses the tier configured by
-`discord.action_request_model_tier` (`discord_action`, or `gpt-5.6-sol` with
-`medium` reasoning, by default). Request wording or inferred complexity does
+`discord.action_request_model_tier` (`basic`, or `gpt-5.6-sol` with `low`
+reasoning, by default). Request wording or inferred complexity does
 not select a different tier.
 
 #### `discord.require_mention`
