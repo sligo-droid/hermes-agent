@@ -10,14 +10,15 @@ from pathlib import Path
 
 AUTOREVIEW_RELATIVE_HELPER = Path(".agents/skills/autoreview/scripts/autoreview")
 AUTOREVIEW_RELATIVE_SKILL = Path(".agents/skills/autoreview/SKILL.md")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 _HELPER_TEXT = """#!/usr/bin/env python3
 \"\"\"Lightweight local autoreview closeout helper materialized by Hermes.
 
 This helper is deterministic and advisory. It does not run a model review or
-claim OpenClaw approval; it gives workers a stable closeout command that records
-local repository evidence and reminds them how to handle findings.
+claim approval; it gives workers a stable closeout command that records local
+repository evidence and reminds them how to handle findings.
 \"\"\"
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ description: Run deterministic local closeout review checks.
 
 # Autoreview
 
-Use this worker-local skill after non-trivial code edits and focused checks.
+Use this repo-local skill after non-trivial code edits and focused checks.
 
 ## How to Run
 
@@ -124,14 +125,30 @@ def materialize_autoreview_helper(workspace: str | os.PathLike[str]) -> Path:
     skill_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not helper_path.exists():
-        helper_path.write_text(_HELPER_TEXT, encoding="utf-8")
+        helper_path.write_text(
+            _repo_template_text(AUTOREVIEW_RELATIVE_HELPER, _HELPER_TEXT),
+            encoding="utf-8",
+        )
     if not skill_path.exists():
-        skill_path.write_text(_SKILL_TEXT, encoding="utf-8")
+        skill_path.write_text(
+            _repo_template_text(AUTOREVIEW_RELATIVE_SKILL, _SKILL_TEXT),
+            encoding="utf-8",
+        )
     _exclude_materialized_autoreview(root)
 
     mode = helper_path.stat().st_mode
     helper_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return helper_path
+
+
+def _repo_template_text(relative_path: Path, fallback: str) -> str:
+    """Read the tracked Hermes template, with a packaged-install fallback."""
+
+    source = _REPO_ROOT / relative_path
+    try:
+        return source.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
 
 
 def _exclude_materialized_autoreview(root: Path) -> None:
