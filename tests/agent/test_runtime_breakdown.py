@@ -162,3 +162,22 @@ def test_runtime_breakdown_preserves_uncertain_visual_status():
     )
 
     assert breakdown["visual_qa"]["receipt_status"] == "uncertain"
+
+
+def test_runtime_breakdown_carries_only_sanitized_closeout_receipt():
+    breakdown = build_turn_runtime_breakdown({
+        "closeout_receipt": {
+            "status": "completed",
+            "head_sha": "c" * 40,
+            "script": "scripts/closeout.sh",
+            "raw_output": "do-not-store",
+        },
+    })
+
+    assert breakdown["closeout_receipt"] == {
+        "schema_version": 1,
+        "status": "completed",
+        "head_sha": "c" * 40,
+        "script": "scripts/closeout.sh",
+    }
+    assert "do-not-store" not in repr(breakdown)

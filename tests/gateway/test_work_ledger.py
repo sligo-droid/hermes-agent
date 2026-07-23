@@ -416,6 +416,111 @@ def test_enforced_visual_qa_blocks_unverifiable_mutation_and_strips_unsafe_recei
     assert stored["completion_gate"]["visual_qa"]["status"] == "missing"
 
 
+def test_work_ledger_persists_only_allowlisted_closeout_receipt_fields(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(message_id="closeout-receipt")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Done.",
+        runtime_breakdown={
+            "wall_s": 1,
+            "closeout_receipt": {
+                "status": "passed",
+                "head_sha": "d" * 40,
+                "script": "closeout",
+                "raw_output": "do-not-store",
+                "token": "also-do-not-store",
+            },
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["runtime_breakdown"]["closeout_receipt"] == {
+        "schema_version": 1,
+        "status": "passed",
+        "head_sha": "d" * 40,
+        "script": "closeout",
+    }
+    assert stored["closeout_receipt"] == stored["runtime_breakdown"]["closeout_receipt"]
+    assert "do-not-store" not in repr(stored["runtime_breakdown"])
+
+
+def test_mark_agent_done_adopts_repo_native_closeout_receipt(tmp_path):
+    now = 123.0
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
+    event = _repo_discord_event(message_id="repo-native-closeout")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    pending = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        canonical_path="/protected/canonical",
+        repository="acme/example",
+        branch="feature/repo-native",
+        source="direct",
+        mode="enforce",
+        policy={"require_local_verification": True},
+    )
+    assert pending is not None
+    assert pending["status"] == "pending"
+    assert ledger.get(item["id"])["closeout_authoritative"] is False
+
+    head_sha = "e" * 40
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Implemented and verified.",
+        runtime_breakdown={
+            "closeout_receipt": {
+                "schema_version": 1,
+                "status": "deployed",
+                "head_sha": head_sha,
+                "script": "scripts/local_lifecycle/closeout.sh",
+                "raw_output": "do-not-store",
+                "token": "also-do-not-store",
+            },
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    evidence = {
+        "schema_version": 1,
+        "status": "deployed",
+        "head_sha": head_sha,
+        "script": "scripts/local_lifecycle/closeout.sh",
+    }
+    assert stored["closeout_authoritative"] is True
+    assert stored["closeout_activated_at"] == now
+    assert stored["closeout_receipt"] == evidence
+    assert stored["runtime_breakdown"]["closeout_receipt"] == evidence
+    assert stored["closeout"]["status"] == "completed"
+    assert stored["closeout"]["source"] == "repo_native"
+    assert stored["closeout"]["mode"] == "enforce"
+    assert stored["closeout"]["revision"] == pending["revision"] + 1
+    assert stored["closeout"]["lease"] == {"owner": "", "until": None}
+    assert stored["closeout"]["next_due_at"] is None
+    assert stored["closeout"]["local_verification"] == {
+        "status": "passed",
+        "head_sha": head_sha,
+    }
+    assert stored["closeout"]["pr"]["number"] == ""
+    assert stored["closeout"]["pr"]["merge_sha"] == ""
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert ledger.pending_closeouts(due_at=now) == []
+    assert "do-not-store" not in repr(stored)
+    assert "also-do-not-store" not in repr(stored)
+
+
 def test_mark_agent_running_clears_stale_terminal_fields(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(message_id="m1")

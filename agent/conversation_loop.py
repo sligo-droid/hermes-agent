@@ -220,6 +220,48 @@ def _new_turn_runtime_stats(started_at: float) -> dict[str, Any]:
         "visual_qa_check_duration_s": 0.0,
     }
 
+
+def _reset_closeout_turn_state(agent: Any) -> None:
+    agent._accepted_closeout_receipt = None
+    agent._closeout_finalization_attempts = 0
+    agent._closeout_tool_choice_retries = 0
+
+
+def _closeout_finalization_active(agent: Any) -> bool:
+    return isinstance(getattr(agent, "_accepted_closeout_receipt", None), dict)
+
+
+def _closeout_finalization_fallback(agent: Any) -> str:
+    receipt = getattr(agent, "_accepted_closeout_receipt", None) or {}
+    sha = str(receipt.get("head_sha") or "")[:12]
+    script = str(receipt.get("script") or "closeout")
+    return (
+        f"Closeout completed successfully at `{sha}` using `{script}`."
+        if sha
+        else "Closeout completed successfully."
+    )
+
+
+def _closeout_finalize_api_kwargs(agent: Any, api_kwargs: Any) -> Any:
+    """Return a bounded no-tool request without mutating registered schemas."""
+    if not _closeout_finalization_active(agent) or not isinstance(api_kwargs, dict):
+        return api_kwargs
+    bounded = dict(api_kwargs)
+    bounded["tool_choice"] = "none"
+    limit = 768
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        if key in bounded:
+            try:
+                bounded[key] = min(limit, max(1, int(bounded[key])))
+            except (TypeError, ValueError):
+                bounded[key] = limit
+            return bounded
+    if str(getattr(agent, "api_mode", "")) == "codex_responses":
+        bounded["max_output_tokens"] = limit
+    else:
+        bounded.update(agent._max_tokens_param(limit))
+    return bounded
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1184,6 +1226,7 @@ def run_conversation(
     agent._turn_mutation_boundary = 0
     agent._visual_qa_last_edit_order = 0
     agent._visual_qa_followup_turns = 0
+    _reset_closeout_turn_state(agent)
     try:
         from agent.visual_qa import normalize_visual_requirement, set_active_visual_requirement
 
@@ -1285,6 +1328,10 @@ def run_conversation(
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
+        if _closeout_finalization_active(agent):
+            agent._closeout_finalization_attempts = int(
+                getattr(agent, "_closeout_finalization_attempts", 0) or 0
+            ) + 1
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -1802,7 +1849,7 @@ def run_conversation(
         
         api_start_time = time.time()
         retry_count = 0
-        max_retries = agent._api_max_retries
+        max_retries = 1 if _closeout_finalization_active(agent) else agent._api_max_retries
         _retry = TurnRetryState()
         primary_recovery_attempted = False
         codex_auth_retry_attempted=False
@@ -1926,6 +1973,8 @@ def run_conversation(
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
+                api_kwargs = _closeout_finalize_api_kwargs(agent, api_kwargs)
+
                 try:
                     from hermes_cli.plugins import (
                         has_hook,
@@ -2041,6 +2090,10 @@ def run_conversation(
                     },
                 )
                 def _perform_api_call(next_api_kwargs):
+                    next_api_kwargs = _closeout_finalize_api_kwargs(
+                        agent,
+                        next_api_kwargs,
+                    )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -4956,6 +5009,43 @@ def run_conversation(
             except Exception:
                 pass
 
+            if _closeout_finalization_active(agent):
+                finalizer_tool_calls = list(
+                    getattr(assistant_message, "tool_calls", None) or []
+                )
+                if finalizer_tool_calls:
+                    finalizer_msg = agent._build_assistant_message(
+                        assistant_message,
+                        "tool_calls",
+                    )
+                    messages.append(finalizer_msg)
+                    from agent.tool_executor import _append_closeout_skipped_tool_results
+
+                    _append_closeout_skipped_tool_results(
+                        agent,
+                        messages,
+                        finalizer_tool_calls,
+                    )
+                    retries = int(
+                        getattr(agent, "_closeout_tool_choice_retries", 0) or 0
+                    )
+                    if retries < 1:
+                        agent._closeout_tool_choice_retries = retries + 1
+                        agent._budget_grace_call = True
+                        agent._emit_status(
+                            "⚠️ Finalization model ignored tool_choice=none; retrying once without tools"
+                        )
+                        continue
+                    final_response = _closeout_finalization_fallback(agent)
+                    messages.append({"role": "assistant", "content": final_response})
+                    _turn_exit_reason = "closeout_finalization_tool_choice_rejected"
+                    break
+                if not agent._has_content_after_think_block(
+                    assistant_message.content or ""
+                ):
+                    assistant_message.content = _closeout_finalization_fallback(agent)
+                finish_reason = "stop"
+
             # Handle assistant response
             if assistant_message.content and agent._has_content_after_think_block(assistant_message.content):
                 try:
@@ -5970,7 +6060,8 @@ def run_conversation(
 
                 _ack_mode = intent_ack_continuation_mode(agent)
                 if (
-                    _ack_mode != "off"
+                    not _closeout_finalization_active(agent)
+                    and _ack_mode != "off"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
                     and agent._looks_like_codex_intermediate_ack(
@@ -6079,6 +6170,8 @@ def run_conversation(
                 except Exception:
                     logger.debug("verification stop-loop check failed", exc_info=True)
                     _verify_nudge = None
+                if _closeout_finalization_active(agent):
+                    _verify_nudge = None
 
                 if _verify_nudge:
                     agent._verification_stop_nudges = (
@@ -6148,6 +6241,8 @@ def run_conversation(
                         )
                 except Exception:
                     logger.debug("pre_verify hook check failed", exc_info=True)
+                    _verify_nudge2 = None
+                if _closeout_finalization_active(agent):
                     _verify_nudge2 = None
 
                 if _verify_nudge2:

@@ -62,6 +62,131 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _closeout_receipt_gate_reason(agent: Any) -> str:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return "kanban_terminal_required"
+    work_id = str(getattr(agent, "_origin_work_item_id", "") or "").strip()
+    if work_id:
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            state = GatewayWorkLedger().required_async_completion_state(work_id)
+        except Exception:
+            return "required_async_state_unavailable"
+        if isinstance(state, dict) and state.get("has_required"):
+            if state.get("failed"):
+                return "required_async_failed"
+            if int(state.get("required_pending_count") or 0) > 0 or not state.get("sealed"):
+                return "required_async_pending"
+    try:
+        from agent.visual_qa import (
+            normalize_visual_qa_config,
+            normalize_visual_requirement,
+            visual_receipt_completion,
+        )
+
+        config = normalize_visual_qa_config(getattr(agent, "visual_qa_config", None))
+        requirement = normalize_visual_requirement(
+            getattr(agent, "visual_qa_requirement", None)
+        )
+        if config["mode"] == "enforce_explicit" and requirement["level"] != "none":
+            stats = getattr(agent, "_turn_runtime_stats", None)
+            receipts = stats.get("visual_qa_receipts", []) if isinstance(stats, dict) else []
+            completion = visual_receipt_completion(
+                requirement,
+                receipts,
+                min_order=int(getattr(agent, "_visual_qa_last_edit_order", 0) or 0) + 1,
+            )
+            if completion.get("status") != "passed":
+                return "visual_qa_pending"
+    except Exception:
+        return "visual_qa_state_unavailable"
+    return ""
+
+
+def _process_closeout_receipt(
+    agent: Any,
+    function_name: str,
+    function_args: dict[str, Any] | None,
+    result: Any,
+) -> tuple[Any, bool]:
+    """Accept one sanitized terminal closeout receipt into per-turn state."""
+
+    if function_name != "terminal" or not isinstance(result, str):
+        return result, False
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return result, False
+    if not isinstance(payload, dict):
+        return result, False
+    had_candidate = "closeout_receipt" in payload
+    payload.pop("closeout_receipt", None)
+    from agent.terminal_outcomes import (
+        inspect_repo_closeout_receipt,
+        sanitize_closeout_receipt,
+    )
+
+    args = function_args if isinstance(function_args, dict) else {}
+    receipt = sanitize_closeout_receipt(
+        inspect_repo_closeout_receipt(
+            command=args.get("command"),
+            cwd=args.get("workdir") or _current_session_cwd(agent),
+            exit_code=payload.get("exit_code"),
+            classification=payload.get("classification"),
+            output=payload.get("output"),
+        )
+    )
+    if receipt is None:
+        if had_candidate:
+            payload["closeout_receipt_rejected"] = {"reason": "invalid_receipt"}
+            return json.dumps(payload, ensure_ascii=False), False
+        return result, False
+    reason = _closeout_receipt_gate_reason(agent)
+    if reason:
+        payload["closeout_receipt_rejected"] = {"reason": reason}
+        return json.dumps(payload, ensure_ascii=False), False
+
+    payload["closeout_receipt"] = receipt
+    payload["finalization_required"] = (
+        "Closeout receipt accepted. All tools are now disabled for this turn; "
+        "return one concise final response from the recorded evidence."
+    )
+    agent._accepted_closeout_receipt = receipt
+    agent._closeout_finalization_attempts = 0
+    agent._closeout_tool_choice_retries = 0
+    agent._budget_grace_call = True
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if isinstance(stats, dict):
+        stats["closeout_receipt"] = receipt
+    return json.dumps(payload, ensure_ascii=False), True
+
+
+def _append_closeout_skipped_tool_results(
+    agent: Any,
+    messages: list,
+    tool_calls: list,
+) -> None:
+    for tool_call in list(tool_calls or []):
+        name = tool_call.function.name
+        messages.append(
+            make_tool_result_message(
+                name,
+                (
+                    f"[Tool execution skipped — {name} was not started because an "
+                    "authoritative closeout receipt already ended tool execution for this turn.]"
+                ),
+                tool_call.id,
+                effect_disposition="none",
+            )
+        )
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"closeout-skipped tool result {name}",
+        )
+
+
 def _agent_has_pending_steer(agent) -> bool:
     checker = getattr(agent, "_has_pending_steer", None)
     if callable(checker):
@@ -1750,7 +1875,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
     steer_boundary_hit = False
+    closeout_boundary_hit = False
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
+        if getattr(agent, "_accepted_closeout_receipt", None):
+            _append_closeout_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i - 1 :],
+            )
+            return True
         # Linearization point for this sequential call. Guidance accepted
         # before the check skips this and all later calls; guidance accepted
         # after it lets this one active call finish, then stops the batch.
@@ -2298,6 +2431,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
 
+        _closeout_accepted_now = False
+        if not _execution_blocked:
+            function_result, _closeout_accepted_now = _process_closeout_receipt(
+                agent,
+                function_name,
+                function_args,
+                function_result,
+            )
+            closeout_boundary_hit = closeout_boundary_hit or _closeout_accepted_now
+
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -2443,6 +2586,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         )
 
+        if _closeout_accepted_now and i < len(assistant_message.tool_calls):
+            _append_closeout_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i:],
+            )
+            steer_boundary_hit = True
+            break
+
         if not agent.quiet_mode:
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -2498,7 +2650,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         rewrite_messages = getattr(agent, "_rewrite_messages_to_session_db", None)
         if callable(rewrite_messages):
             rewrite_messages(messages)
-    return steer_boundary_hit
+    return steer_boundary_hit or closeout_boundary_hit
 
 
 
@@ -2541,12 +2693,15 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 for _later_kind, later_segment in segments[segment_index:]
                 for tc in later_segment
             ]
-            append_steer_skipped_tool_results(
-                agent,
-                messages,
-                later_calls,
-                stage="segmented steer-skipped tool result",
-            )
+            if getattr(agent, "_accepted_closeout_receipt", None):
+                _append_closeout_skipped_tool_results(agent, messages, later_calls)
+            else:
+                append_steer_skipped_tool_results(
+                    agent,
+                    messages,
+                    later_calls,
+                    stage="segmented steer-skipped tool result",
+                )
             stop_after_segment = True
             break
         segment_message = SimpleNamespace(tool_calls=list(calls))

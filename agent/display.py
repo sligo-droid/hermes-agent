@@ -1282,6 +1282,13 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     # Terminal: non-zero exit code is the canonical failure signal.
     if tool_name == "terminal":
         if isinstance(data, dict):
+            classification = data.get("classification")
+            if (
+                isinstance(classification, dict)
+                and classification.get("semantic_failure") is True
+            ):
+                kind = str(classification.get("kind") or "unknown")
+                return True, f" [{_trim_error(kind.replace('_', ' '))}]"
             exit_code = data.get("exit_code")
             if exit_code is not None and exit_code != 0:
                 err_msg = data.get("error")
@@ -1513,4 +1520,3 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-

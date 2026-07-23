@@ -408,7 +408,54 @@ def _durable_runtime_breakdown(
         requirement,
         limit=receipt_limit,
     )
+    try:
+        from agent.terminal_outcomes import sanitize_closeout_receipt
+
+        durable["closeout_receipt"] = sanitize_closeout_receipt(
+            runtime_breakdown.get("closeout_receipt")
+            if isinstance(runtime_breakdown, dict)
+            else None
+        )
+    except Exception:
+        durable["closeout_receipt"] = None
     return durable
+
+
+def _adopt_repo_native_closeout_receipt(
+    item: dict[str, Any],
+    receipt: Any,
+    *,
+    now: float,
+) -> None:
+    """Adopt one sanitized exact-head receipt into an existing closeout contract."""
+
+    if not isinstance(receipt, dict):
+        return
+    item["closeout_receipt"] = dict(receipt)
+    if not isinstance(item.get("closeout"), dict):
+        return
+
+    from hermes_cli.trusted_closeout import normalize_closeout_state
+
+    current = normalize_closeout_state(item["closeout"])
+    state = normalize_closeout_state(
+        {
+            **current,
+            "source": "repo_native",
+            "mode": "enforce",
+            "status": "completed",
+            "local_verification": {
+                "status": "passed",
+                "head_sha": receipt["head_sha"],
+            },
+            "lease": {"owner": "", "until": None},
+            "next_due_at": None,
+        }
+    )
+    state["revision"] = int(current.get("revision") or 0) + 1
+    item["closeout"] = state
+    item["closeout_authoritative"] = True
+    item["closeout_activated_at"] = now
 
 
 def _positive_int(value: Any) -> int:
@@ -4671,6 +4718,13 @@ class GatewayWorkLedger:
                 visual_requirement,
                 receipt_limit=visual_config["max_receipts_per_turn"],
             )
+            durable_runtime = item.get("runtime_breakdown")
+            if isinstance(durable_runtime, dict):
+                _adopt_repo_native_closeout_receipt(
+                    item,
+                    durable_runtime.get("closeout_receipt"),
+                    now=now,
+                )
         if provider_no_progress is not None:
             item["provider_no_progress"] = _durable_metadata(provider_no_progress)
         if visual_qa_receipts is not None:
