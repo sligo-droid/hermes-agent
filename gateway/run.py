@@ -7674,9 +7674,8 @@ class _GatewayRunnerCore(
         """Restore a persisted Discord thread summary onto an event.
 
         Normal adapter intake attaches the handle directly. This fallback also
-        covers a summary created after intake (for example by the Discord
-        ``promote_to_action_thread`` tool during a misclassified turn), so the
-        turn-end callback can still finalize the embed and its reaction.
+        covers synthetic or recovered events that have only a thread identity,
+        so the turn-end callback can still finalize the embed and its reaction.
         """
         existing = getattr(event, "feature_summary", None)
         if isinstance(existing, dict):

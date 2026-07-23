@@ -4,7 +4,7 @@ import json
 import urllib.error
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -19,6 +19,7 @@ from tools.discord_tool import (
     _discord_request,
     _enrich_403,
     _get_bot_token,
+    _format_message,
     _load_allowed_actions_config,
     _reset_capability_cache,
     check_discord_tool_requirements,
