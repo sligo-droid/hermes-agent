@@ -466,6 +466,58 @@ NODE"""
     )["allowed"] is False
 
 
+def test_compound_command_detects_verification_after_bounded_display_name():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    failed_command = "git merge --no-edit deadbeef && pnpm exec vitest run src/component.test.ts"
+    failed_result = json.dumps(
+        {
+            "output": "src/component.svelte needs formatting",
+            "exit_code": 1,
+            "error": None,
+        }
+    )
+    prefix = "prettier --write " + "src/component.svelte " * 12
+    command = (
+        f"{prefix} && git add src/component.svelte && git commit --amend --no-edit "
+        "&& pnpm exec vitest run src/component.test.ts && pnpm check "
+        "&& bash scripts/local_lifecycle/closeout.sh --source \"$PWD\""
+    )
+    result = json.dumps(
+        {
+            "output": "Tests 9 passed\nsvelte-check found 0 errors and 0 warnings",
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, failed_result, True)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": failed_command},
+        failed_result,
+        True,
+    )
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, False)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": command},
+        result,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+
+    assert latest["ci"]["status"] == "success"
+    assert len(latest["ci"]["check_name"]) <= 160
+    assert "vitest" not in latest["ci"]["check_name"]
+    assert claim_constraints_for_text(
+        "CI passed after the final closeout verification.",
+        agent._turn_runtime_stats["verification_evidence"],
+    )["allowed"] is True
+
+
 def test_persisted_playwright_evidence_misclassified_as_ci_is_not_used_as_ci():
     evidence = [
         {
