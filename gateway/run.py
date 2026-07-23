@@ -276,80 +276,6 @@ def _discord_feature_summary_for_turn(
     return feature_summary
 
 
-def _promoted_discord_action_thread_from_agent_result(
-    agent_result: Any,
-) -> Optional[Dict[str, str]]:
-    """Return a successful current-turn ``promote_to_action_thread`` result.
-
-    A direct-question turn may discover that the request is implementation work
-    only after it has begun.  The Discord tool creates the summarized action
-    thread synchronously; this helper identifies that completed tool call so
-    the gateway can enqueue the original request in its new thread without
-    waiting for another user message.
-    """
-    if not isinstance(agent_result, dict) or agent_result.get("failed"):
-        return None
-    messages = agent_result.get("messages")
-    if not isinstance(messages, list):
-        return None
-    try:
-        history_offset = max(0, int(agent_result.get("history_offset") or 0))
-    except (TypeError, ValueError):
-        history_offset = 0
-    current_messages = messages[history_offset:] if history_offset <= len(messages) else messages
-
-    promotion_call_ids: set[str] = set()
-    promotion_args_by_call_id: Dict[str, Dict[str, Any]] = {}
-    for message in current_messages:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict):
-                continue
-            function = call.get("function")
-            function = function if isinstance(function, dict) else {}
-            if str(function.get("name") or call.get("name") or "") != "discord":
-                continue
-            raw_args = function.get("arguments", call.get("arguments", {}))
-            if isinstance(raw_args, str):
-                try:
-                    raw_args = json.loads(raw_args)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-            if not isinstance(raw_args, dict) or raw_args.get("action") != "promote_to_action_thread":
-                continue
-            call_id = str(call.get("id") or call.get("call_id") or "").strip()
-            if call_id:
-                promotion_call_ids.add(call_id)
-                promotion_args_by_call_id[call_id] = raw_args
-
-    if not promotion_call_ids:
-        return None
-    for message in current_messages:
-        if not isinstance(message, dict) or message.get("role") not in {"tool", "function"}:
-            continue
-        call_id = str(message.get("tool_call_id") or message.get("call_id") or "").strip()
-        if call_id not in promotion_call_ids:
-            continue
-        try:
-            result = json.loads(str(message.get("content") or ""))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(result, dict):
-            continue
-        thread_id = str(result.get("thread_id") or "").strip()
-        if not (result.get("success") and result.get("feature_summary_initialized") and thread_id):
-            continue
-        args = promotion_args_by_call_id[call_id]
-        return {
-            "thread_id": thread_id,
-            "thread_url": str(result.get("thread_url") or "").strip(),
-            "parent_channel_id": str(args.get("channel_id") or "").strip(),
-            "message_id": str(args.get("message_id") or "").strip(),
-        }
-    return None
-
-
 def _normalize_gateway_visual_qa_contract(
     requirement: Any,
     config: Any,
@@ -7748,9 +7674,8 @@ class _GatewayRunnerCore(
         """Restore a persisted Discord thread summary onto an event.
 
         Normal adapter intake attaches the handle directly. This fallback also
-        covers a summary created after intake (for example by the Discord
-        ``promote_to_action_thread`` tool during a misclassified turn), so the
-        turn-end callback can still finalize the embed and its reaction.
+        covers synthetic or recovered events that have only a thread identity,
+        so the turn-end callback can still finalize the embed and its reaction.
         """
         existing = getattr(event, "feature_summary", None)
         if isinstance(existing, dict):
@@ -7782,79 +7707,6 @@ class _GatewayRunnerCore(
             return None
         event.feature_summary = feature_summary
         return feature_summary
-
-    async def _start_promoted_discord_action_thread(
-        self,
-        *,
-        source: SessionSource,
-        agent_result: Dict[str, Any],
-    ) -> Optional[str]:
-        """Start a newly promoted Discord action thread without another input.
-
-        ``promote_to_action_thread`` has already created the thread and posted
-        its feature-summary embed by the time its tool result reaches here. We
-        deliberately re-enter normal adapter intake instead of continuing the
-        direct-question agent: that gives the new thread its own session, action
-        model route, mutable worktree, and summary lifecycle.
-        """
-        if getattr(source, "platform", None) != Platform.DISCORD:
-            return None
-        promotion = _promoted_discord_action_thread_from_agent_result(agent_result)
-        if promotion is None:
-            return None
-        thread_id = promotion["thread_id"]
-        parent_channel_id = promotion["parent_channel_id"] or str(
-            getattr(source, "parent_chat_id", "") or getattr(source, "chat_id", "") or ""
-        ).strip()
-        if not parent_channel_id:
-            return None
-
-        promoted_source = dataclasses.replace(
-            source,
-            chat_id=thread_id,
-            chat_type="thread",
-            thread_id=thread_id,
-            parent_chat_id=parent_channel_id,
-            # The promoted message is also the thread starter, so preserve its
-            # real snowflake for durable work-item identity and reply routing.
-            message_id=promotion["message_id"] or None,
-            auto_thread_created=False,
-            auto_thread_initial_name=None,
-        )
-        promoted_event = MessageEvent(
-            text="",
-            source=promoted_source,
-            message_id=promotion["message_id"] or None,
-            discord_action_request_intent=True,
-        )
-        feature_summary = self._hydrate_discord_feature_summary_from_adapter(promoted_event)
-        if not _is_standard_discord_action_request(promoted_source, feature_summary):
-            logger.warning(
-                "Not starting promoted Discord action thread %s: no usable feature summary",
-                thread_id,
-            )
-            return None
-        promoted_event.text = str(feature_summary.get("initial_request") or "").strip()
-        if not promoted_event.text:
-            return None
-
-        adapter = self._adapter_for_source(promoted_source)
-        handle_message = getattr(adapter, "handle_message", None)
-        if not callable(handle_message):
-            logger.warning(
-                "Not starting promoted Discord action thread %s: adapter intake unavailable",
-                thread_id,
-            )
-            return None
-        try:
-            await handle_message(promoted_event)
-        except Exception:
-            logger.exception(
-                "Failed to start promoted Discord action thread %s",
-                thread_id,
-            )
-            return None
-        return promotion["thread_url"]
 
     def _discord_work_item_id_for_event(
         self,
@@ -18477,14 +18329,6 @@ class _GatewayRunnerCore(
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
-            promoted_action_thread_url = await self._start_promoted_discord_action_thread(
-                source=source,
-                agent_result=agent_result,
-            )
-            if promoted_action_thread_url is not None:
-                response = "I created the action thread and started the work there."
-                if promoted_action_thread_url:
-                    response = f"{response}\n\n{promoted_action_thread_url}"
             transcript_user_message = str(
                 getattr(event, "fable_transcript_user_message", "") or ""
             ).strip()

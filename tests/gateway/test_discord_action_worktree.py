@@ -2249,7 +2249,7 @@ async def test_direct_agent_result_cas_does_not_overwrite_replacement_run(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_successful_promotion_starts_target_action_thread_immediately(
+async def test_successful_promotion_stays_out_of_current_turn_until_target_inbound(
     tmp_path,
     monkeypatch,
 ):
@@ -2273,7 +2273,6 @@ async def test_successful_promotion_starts_target_action_thread_immediately(
         _active_sessions={},
         _load_feature_summary_handle_by_thread_id=lambda thread_id: promoted_summaries.get(thread_id),
         register_post_delivery_callback=lambda *args, **kwargs: callbacks.append((args, kwargs)),
-        handle_message=AsyncMock(),
         send=AsyncMock(),
     )
     runner.adapters = {Platform.DISCORD: adapter}
@@ -2300,32 +2299,7 @@ async def test_successful_promotion_starts_target_action_thread_immediately(
             ),
             "messages": [
                 {"role": "user", "content": event.text},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": "call-promote",
-                            "function": {
-                                "name": "discord",
-                                "arguments": (
-                                    '{"action":"promote_to_action_thread",'
-                                    '"channel_id":"project-channel-1",'
-                                    '"message_id":"message-1"}'
-                                ),
-                            },
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "name": "discord",
-                    "tool_call_id": "call-promote",
-                    "content": (
-                        '{"success":true,"thread_id":"thread-123",'
-                        f'"thread_url":"{promotion_link}",'
-                        '"feature_summary_initialized":true}'
-                    ),
-                },
+                {"role": "assistant", "content": promotion_link},
             ],
             "tools": [],
             "history_offset": 0,
@@ -2342,24 +2316,23 @@ async def test_successful_promotion_starts_target_action_thread_immediately(
     )
 
     assert promotion_link in response
-    assert "started the work" in response
+    assert "sending a new message" in response
     assert event.source is source
     assert event.feature_summary is None
     assert callbacks == []
-    adapter.handle_message.assert_awaited_once()
-    started_event = adapter.handle_message.await_args.args[0]
-    assert started_event.text == "Build the parser"
-    assert started_event.feature_summary == feature_summary
-    assert started_event.discord_action_request_intent is True
-    assert started_event.message_id == "message-1"
-    assert started_event.source.chat_id == "thread-123"
-    assert started_event.source.thread_id == "thread-123"
-    assert started_event.source.parent_chat_id == "project-channel-1"
-    assert gateway_run._is_standard_discord_action_request(
-        started_event.source,
-        started_event.feature_summary,
+
+    next_event = MessageEvent(
+        text="Build it now.",
+        source=source,
+        message_id="message-2",
     )
-    tier = gateway_run._discord_action_request_model_tier({}, started_event.feature_summary)
+    assert runner._hydrate_discord_feature_summary_from_adapter(next_event) == feature_summary
+    assert next_event.feature_summary == feature_summary
+    assert gateway_run._is_standard_discord_action_request(
+        next_event.source,
+        next_event.feature_summary,
+    )
+    tier = gateway_run._discord_action_request_model_tier({}, next_event.feature_summary)
     assert tier.name == "discord_action"
     assert tier.reasoning_effort == "medium"
 

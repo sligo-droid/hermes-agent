@@ -334,37 +334,6 @@ async def test_non_goal_feature_summary_does_not_start_kanban_pipeline(adapter, 
 
 
 @pytest.mark.asyncio
-async def test_promoted_action_thread_initializes_summary_once(adapter):
-    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
-    thread = FakeThread(channel_id=200, parent=parent)
-    source_message_id = _discord_snowflake_at(time.time())
-    parent.fetch_message = AsyncMock(
-        return_value=SimpleNamespace(id=int(source_message_id), thread=thread)
-    )
-    adapter._resolve_channel_by_id = AsyncMock(
-        side_effect=lambda channel_id: parent if str(channel_id) == "100" else thread
-    )
-    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
-    adapter._threads.mark = MagicMock()
-
-    assert await adapter.initialize_promoted_action_thread(
-        channel_id="100",
-        message_id=source_message_id,
-        thread_id="200",
-        initial_request="Build a deploy dashboard",
-    ) is True
-    assert await adapter.initialize_promoted_action_thread(
-        channel_id="100",
-        message_id=source_message_id,
-        thread_id="200",
-        initial_request="Build a deploy dashboard",
-    ) is True
-
-    assert len(thread.sent) == 1
-    adapter._threads.mark.assert_called_with("200")
-
-
-@pytest.mark.asyncio
 async def test_non_goal_feature_summary_can_render_explicit_pr_url(adapter):
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     thread = FakeThread(channel_id=200, parent=parent)
@@ -2434,11 +2403,7 @@ async def test_tagged_question_answers_in_thread_without_feature_summary(adapter
     assert event.source.thread_id == "200"
     assert event.source.parent_chat_id == "100"
     assert "classified as a direct question, not an action request" in event.channel_prompt
-    assert "promote_to_action_thread" in event.channel_prompt
-    assert "gateway immediately starts the original request" in event.channel_prompt
-    assert "include that link" in event.channel_prompt
-    assert "sending a new message in the promoted thread" not in event.channel_prompt
-    assert "work has started there" in event.channel_prompt
+    assert "promote_to_action_thread" not in event.channel_prompt
 
 
 @pytest.mark.asyncio
@@ -3435,107 +3400,6 @@ async def test_direct_question_processing_start_and_end_leave_action_lifecycle_u
     adapter._processing_reaction_messages.assert_not_awaited()
     adapter._set_message_reaction_state.assert_not_awaited()
     assert feature_summary == before
-
-
-@pytest.mark.asyncio
-async def test_successful_promotion_waits_for_next_target_thread_message(adapter):
-    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
-    thread = FakeThread(channel_id=200, parent=parent)
-    source_message_id = _discord_snowflake_at(time.time())
-    parent.fetch_message = AsyncMock(
-        return_value=SimpleNamespace(id=int(source_message_id), thread=thread)
-    )
-    adapter._resolve_channel_by_id = AsyncMock(
-        side_effect=lambda channel_id: parent if str(channel_id) == "100" else thread
-    )
-    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
-    adapter._threads.mark = MagicMock()
-
-    assert await adapter.initialize_promoted_action_thread(
-        channel_id="100",
-        message_id=source_message_id,
-        thread_id="200",
-        initial_request="Build the parser",
-    ) is True
-    feature_summary = adapter._load_feature_summary_handle_by_thread_id("200")
-    assert feature_summary is not None
-
-    runner = object.__new__(gateway_run.GatewayRunner)
-    runner._session_db = None
-    runner.adapters = {Platform.DISCORD: adapter}
-    runner._adapter_for_source = lambda _source: adapter
-    runner._session_has_pending_background_workers = lambda *args, **kwargs: False
-    runner._discord_work_item_id_for_event = lambda *args, **kwargs: None
-    runner._discord_ledger_summary_status = lambda _work_id, status: status
-    runner._summarize_discord_feature_outcome = lambda response: response
-    callbacks = []
-    adapter.register_post_delivery_callback = (
-        lambda session_key, callback, generation=None: callbacks.append(callback)
-    )
-    adapter._reactions_enabled = MagicMock(return_value=True)
-    adapter._processing_reaction_messages = AsyncMock(return_value=[])
-    adapter.update_feature_summary = AsyncMock(return_value=True)
-    source = SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="200",
-        chat_type="thread",
-        thread_id="200",
-    )
-    promoted_turn = MessageEvent(
-        text="Can you explain this first?",
-        source=source,
-        discord_action_request_intent=False,
-    )
-    promotion_link = "https://discord.com/channels/5/200"
-    promotion_response = (
-        f"I created the action thread: {promotion_link}. "
-        "Please continue by sending a new message there."
-    )
-    await adapter.on_processing_start(promoted_turn)
-    runner._register_discord_summary_post_delivery(
-        event=promoted_turn,
-        source=source,
-        session_key="discord:200",
-        run_generation=1,
-        session_id="session-1",
-        final_response=promotion_response,
-        agent_result={"completed": True},
-    )
-    assert promoted_turn.source is source
-    assert promoted_turn.feature_summary is None
-    assert promotion_link in promotion_response
-    assert "sending a new message" in promotion_response
-    adapter.update_feature_summary.assert_not_awaited()
-    adapter._processing_reaction_messages.assert_not_awaited()
-    assert callbacks == []
-
-    next_turn = MessageEvent(
-        text="Build it now.",
-        source=source,
-    )
-    assert runner._hydrate_discord_feature_summary_from_adapter(next_turn) is not None
-    assert next_turn.feature_summary == feature_summary
-    assert gateway_run._is_standard_discord_action_request(
-        next_turn.source,
-        next_turn.feature_summary,
-    )
-    await adapter.on_processing_start(next_turn)
-    runner._register_discord_summary_post_delivery(
-        event=next_turn,
-        source=source,
-        session_key="discord:200",
-        run_generation=2,
-        session_id="session-1",
-        final_response="Implemented the parser.",
-        agent_result={"completed": True},
-    )
-
-    assert len(callbacks) == 1
-    assert await callbacks[0]() is True
-    assert [call.kwargs["status"] for call in adapter.update_feature_summary.await_args_list] == [
-        "Running",
-        "Complete",
-    ]
 
 
 @pytest.mark.asyncio

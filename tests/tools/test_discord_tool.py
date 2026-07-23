@@ -20,7 +20,6 @@ from tools.discord_tool import (
     _enrich_403,
     _get_bot_token,
     _format_message,
-    _initialize_promoted_thread_feature_summary,
     _load_allowed_actions_config,
     _reset_capability_cache,
     check_discord_tool_requirements,
@@ -287,13 +286,6 @@ class TestDiscordServerValidation:
         result = json.loads(discord_core(action="fetch_messages"))
         assert "error" in result
         assert "channel_id" in result["error"]
-
-    def test_promote_requires_channel_and_message_ids(self, monkeypatch):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        result = json.loads(discord_core(action="promote_to_action_thread"))
-        assert "error" in result
-        assert "channel_id" in result["error"]
-        assert "message_id" in result["error"]
 
     def test_missing_required_message_id_for_delete(self, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
@@ -831,183 +823,6 @@ class TestCreateThread:
 
 
 # ---------------------------------------------------------------------------
-# Action: promote_to_action_thread
-# ---------------------------------------------------------------------------
-
-class TestPromoteToActionThread:
-    def test_summary_initialization_uses_matching_live_adapter(self, monkeypatch):
-        from gateway.config import Platform
-
-        initialize = MagicMock(return_value=object())
-        adapter = SimpleNamespace(
-            config=SimpleNamespace(token="test-token"),
-            initialize_promoted_action_thread=initialize,
-        )
-        loop = MagicMock()
-        loop.is_closed.return_value = False
-        loop.is_running.return_value = True
-        runner = SimpleNamespace(
-            adapters={Platform.DISCORD: adapter},
-            _profile_adapters={},
-            _gateway_loop=loop,
-        )
-        future = MagicMock()
-        future.result.return_value = True
-        schedule = MagicMock(return_value=future)
-        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
-        monkeypatch.setattr("gateway.session_context.get_session_env", lambda *_args: "")
-        monkeypatch.setattr(
-            "tools.discord_tool.asyncio.run_coroutine_threadsafe",
-            schedule,
-        )
-
-        initialized, error = _initialize_promoted_thread_feature_summary(
-            "test-token",
-            channel_id="11",
-            message_id="1001",
-            thread_id="801",
-            initial_request="Build a deploy dashboard",
-        )
-
-        assert initialized is True
-        assert error is None
-        initialize.assert_called_once_with(
-            channel_id="11",
-            message_id="1001",
-            thread_id="801",
-            initial_request="Build a deploy dashboard",
-        )
-        schedule.assert_called_once_with(initialize.return_value, loop)
-        future.result.assert_called_once_with(timeout=30)
-
-    @patch(
-        "tools.discord_tool._initialize_promoted_thread_feature_summary",
-        return_value=(True, None),
-    )
-    @patch("tools.discord_tool._discord_request")
-    def test_promotes_message_and_initializes_summary(
-        self,
-        mock_req,
-        mock_initialize,
-        monkeypatch,
-    ):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setattr(
-            "gateway.session_context.get_session_env",
-            lambda name, default="": "discord" if name == "HERMES_SESSION_PLATFORM" else default,
-        )
-        mock_req.side_effect = [
-            {
-                "id": "1001",
-                "guild_id": "111",
-                "content": "<@999> Build a deploy dashboard for the release team",
-            },
-            {"id": "801", "name": "Build a deploy dashboard for the release team"},
-        ]
-
-        result = json.loads(discord_core(
-            action="promote_to_action_thread",
-            channel_id="11",
-            message_id="1001",
-        ))
-
-        assert result == {
-            "success": True,
-            "thread_id": "801",
-            "thread_url": "https://discord.com/channels/111/801",
-            "already_existed": False,
-            "feature_summary_initialized": True,
-        }
-        assert mock_req.call_args_list == [
-            call(
-                "GET",
-                "/channels/11/messages/1001",
-                "test-token",
-            ),
-            call(
-                "POST",
-                "/channels/11/messages/1001/threads",
-                "test-token",
-                body={
-                    "name": "Build a deploy dashboard for the release team",
-                    "auto_archive_duration": 1440,
-                },
-            ),
-        ]
-        mock_initialize.assert_called_once_with(
-            "test-token",
-            channel_id="11",
-            message_id="1001",
-            thread_id="801",
-            initial_request="<@999> Build a deploy dashboard for the release team",
-        )
-
-    @patch(
-        "tools.discord_tool._initialize_promoted_thread_feature_summary",
-        return_value=(True, None),
-    )
-    @patch("tools.discord_tool._discord_request")
-    def test_existing_message_thread_is_idempotent(
-        self,
-        mock_req,
-        mock_initialize,
-        monkeypatch,
-    ):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setattr(
-            "gateway.session_context.get_session_env",
-            lambda name, default="": "discord" if name == "HERMES_SESSION_PLATFORM" else default,
-        )
-        mock_req.return_value = {
-            "id": "1001",
-            "guild_id": "111",
-            "content": "Fix the release pipeline",
-            "thread": {"id": "1001", "name": "Existing thread", "guild_id": "111"},
-        }
-
-        result = json.loads(discord_core(
-            action="promote_to_action_thread",
-            channel_id="11",
-            message_id="1001",
-            name="Ignored because the thread already exists",
-        ))
-
-        assert result["thread_id"] == "1001"
-        assert result["already_existed"] is True
-        assert result["feature_summary_initialized"] is True
-        mock_req.assert_called_once_with(
-            "GET",
-            "/channels/11/messages/1001",
-            "test-token",
-        )
-        mock_initialize.assert_called_once()
-
-    @patch("tools.discord_tool._initialize_promoted_thread_feature_summary")
-    @patch("tools.discord_tool._discord_request")
-    def test_non_discord_session_is_rejected(
-        self,
-        mock_req,
-        mock_initialize,
-        monkeypatch,
-    ):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setattr(
-            "gateway.session_context.get_session_env",
-            lambda name, default="": "telegram" if name == "HERMES_SESSION_PLATFORM" else default,
-        )
-
-        result = json.loads(discord_core(
-            action="promote_to_action_thread",
-            channel_id="11",
-            message_id="1001",
-        ))
-
-        assert "only in Discord sessions" in result["error"]
-        mock_req.assert_not_called()
-        mock_initialize.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
 # Actions: add_role / remove_role
 # ---------------------------------------------------------------------------
 
@@ -1118,7 +933,7 @@ class TestRegistration:
         entry = registry._tools["discord"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
         assert actions == {
-            "fetch_messages", "search_members", "create_thread", "promote_to_action_thread",
+            "fetch_messages", "search_members", "create_thread",
             "add_reaction", "remove_reaction", "send_message", "edit_message",
         }
 
@@ -1151,7 +966,6 @@ class TestRegistration:
         assert "fetch_messages(channel_id)" in desc
         assert "search_members(guild_id, query)" in desc
         assert "create_thread(channel_id, name)" in desc
-        assert "promote_to_action_thread(channel_id, message_id; optional name)" in desc
         assert "add_reaction(channel_id, message_id, emoji)" in desc
         assert "send_message(channel_id, content)" in desc
         # Admin actions should NOT be in core description
