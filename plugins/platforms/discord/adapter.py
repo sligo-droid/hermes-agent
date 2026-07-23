@@ -10314,11 +10314,11 @@ class DiscordAdapter(BasePlatformAdapter):
     def _feature_triage_timeout_seconds(self) -> float:
         raw = self.config.extra.get("feature_summary_triage_timeout")
         if raw is None:
-            raw = os.getenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT", "4")
+            raw = os.getenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT", "5")
         try:
             return max(0.5, float(raw))
         except (TypeError, ValueError):
-            return 4.0
+            return 5.0
 
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
