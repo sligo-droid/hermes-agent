@@ -75,6 +75,7 @@ def _receipt_result(sha: str = "a" * 40) -> str:
             "summary": "Command completed without a recognized semantic failure.",
         },
         "closeout_receipt": {
+            "schema_version": 1,
             "status": "passed",
             "head_sha": sha,
             "script": "scripts/closeout.sh",
@@ -114,6 +115,7 @@ def test_receipt_forces_one_bounded_no_tool_finalization_and_resets_next_turn():
     assert result["api_calls"] == 2
     assert result["closeout_receipt"]["head_sha"] == "a" * 40
     assert result["runtime_breakdown"]["closeout_receipt"] == result["closeout_receipt"]
+    assert result["terminal_success"] is True
     initial_kwargs = agent.client.chat.completions.create.call_args_list[0].kwargs
     finalizer_kwargs = agent.client.chat.completions.create.call_args_list[1].kwargs
     assert finalizer_kwargs["tool_choice"] == "none"
@@ -134,6 +136,7 @@ def test_receipt_forces_one_bounded_no_tool_finalization_and_resets_next_turn():
         next_result = agent.run_conversation("new request")
 
     assert "closeout_receipt" not in next_result
+    assert "terminal_success" not in next_result
     normal_kwargs = agent.client.chat.completions.create.call_args.kwargs
     assert normal_kwargs.get("tool_choice") != "none"
     assert "tools" in normal_kwargs

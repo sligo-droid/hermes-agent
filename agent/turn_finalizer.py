@@ -602,6 +602,7 @@ def finalize_turn(
         )
         if _closeout_receipt is not None:
             result["closeout_receipt"] = _closeout_receipt
+            result["terminal_success"] = True
     except Exception:
         logger.debug("closeout receipt final-result sanitization failed", exc_info=True)
     if _verification_constraints:

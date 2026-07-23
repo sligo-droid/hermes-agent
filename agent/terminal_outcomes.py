@@ -335,6 +335,7 @@ def sanitize_closeout_receipt(value: Any) -> dict[str, Any] | None:
     if not script or len(script) > _MAX_RELATIVE_PATH_CHARS or script.startswith("/") or ".." in Path(script).parts:
         return None
     return {
+        "schema_version": 1,
         "status": status,
         "head_sha": head_sha,
         "script": script,

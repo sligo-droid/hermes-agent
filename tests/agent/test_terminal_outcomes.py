@@ -79,6 +79,7 @@ def test_closeout_status_allowlist_preserves_status(status):
         "script": "scripts/local_lifecycle/closeout.sh",
         "secret": "drop",
     }) == {
+        "schema_version": 1,
         "status": status,
         "head_sha": "f" * 40,
         "script": "scripts/local_lifecycle/closeout.sh",
@@ -201,6 +202,7 @@ def test_closeout_receipt_accepts_only_clean_tracked_final_script(tmp_path):
     )
 
     assert receipt == {
+        "schema_version": 1,
         "status": "passed",
         "head_sha": head,
         "script": "scripts/closeout.sh",
@@ -247,6 +249,7 @@ def test_pid_interpreter_closeout_accepts_deployed_active_sha(tmp_path):
     )
 
     assert receipt == {
+        "schema_version": 1,
         "status": "deployed",
         "head_sha": head,
         "script": "scripts/local_lifecycle/closeout.sh",

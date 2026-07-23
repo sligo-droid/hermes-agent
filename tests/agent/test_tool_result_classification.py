@@ -98,6 +98,7 @@ def test_closeout_receipt_records_only_sanitized_turn_state(monkeypatch):
     assert accepted is True
     payload = json.loads(result)
     assert payload["closeout_receipt"] == {
+        "schema_version": 1,
         "status": "passed",
         "head_sha": "a" * 40,
         "script": "scripts/closeout.sh",
