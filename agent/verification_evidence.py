@@ -616,13 +616,17 @@ def classify_tool_verification_evidence(
     args = tool_args if isinstance(tool_args, dict) else {}
     data = _json_object(result)
     result_text = _text(data.get("output") or data.get("error") or result)
-    check_name = _text(args.get("command") or args.get("url") or args.get("route") or name, limit=160)
+    raw_check_name = str(args.get("command") or args.get("url") or args.get("route") or name)
+    check_name = _text(raw_check_name, limit=160)
 
     if name == "terminal" and _PROTECTED_CHECKOUT_GUARDRAIL_RE.search(result_text):
         return []
 
     if name == "terminal":
-        if not _terminal_command_looks_like_verification(check_name):
+        # Inspect the complete command. Compound closeout commands often put
+        # formatting, staging, or synchronization before the actual tests, so
+        # the verification segment may begin after the bounded display label.
+        if not _terminal_command_looks_like_verification(raw_check_name):
             return []
         # A miss while resolving a workflow identity says nothing about the
         # state of CI or a deployment. In particular, ``gh run list`` exits 1
@@ -634,7 +638,7 @@ def classify_tool_verification_evidence(
     elif not name.startswith("browser") and name not in {"webfetch", "web_search"}:
         return []
 
-    timed_out = bool(_TIMEOUT_RE.search(f"{check_name}\n{result_text}"))
+    timed_out = bool(_TIMEOUT_RE.search(f"{raw_check_name}\n{result_text}"))
     status = "timeout" if timed_out else ("failure" if is_error else "success")
     if not is_error and name != "terminal" and data:
         if data.get("success") is False or data.get("ok") is False:
@@ -652,7 +656,7 @@ def classify_tool_verification_evidence(
         # infrastructure error page is direct negative browser evidence.
         status = "failure"
 
-    surfaces = _surfaces_for(name, check_name, result_text)
+    surfaces = _surfaces_for(name, raw_check_name, result_text)
     return [
         {
             "schema_version": 1,
