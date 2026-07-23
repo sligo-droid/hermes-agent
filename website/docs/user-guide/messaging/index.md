@@ -659,7 +659,7 @@ Set `typing_indicator: false` on any platform where the indicator is unwanted. S
 
 ### Session resume across gateway restarts
 
-When the gateway shuts down with an in-flight tool call or generation, the affected sessions are flagged as `restart_interrupted`. On the next startup, the gateway schedules an auto-resume for each one — the user gets a short heads-up in the chat ("Send any message after restart and I'll try to resume where you left off.") and the session picks up from the last committed turn when they reply.
+When the gateway shuts down with an in-flight tool call or generation, the affected sessions are flagged as `restart_interrupted`. On the next startup, the gateway automatically resumes each one from the last committed turn. The user gets a short heads-up in chat; sending another message is only a fallback if automatic recovery does not proceed.
 
 This behaviour is on by default and is logged at gateway start:
 

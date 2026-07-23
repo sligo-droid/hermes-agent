@@ -243,6 +243,142 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
+def _loaded_gateway_process_epoch() -> str:
+    """Return the current gateway epoch without importing its large module."""
+
+    import sys
+
+    gateway_module = sys.modules.get("gateway.run")
+    return str(getattr(gateway_module, "_GATEWAY_PROCESS_EPOCH", "") or "")
+
+
+def _current_process_start_time() -> int:
+    try:
+        from gateway.status import get_process_start_time
+
+        return int(get_process_start_time(os.getpid()) or 0)
+    except Exception:
+        return 0
+
+
+def recover_abandoned_advisory_dispatches(
+    *,
+    ledger: Any = None,
+    current_process_epoch: Optional[str] = None,
+    current_owner_pid: Optional[int] = None,
+    process_alive: Optional[Callable[[int, Optional[int]], Optional[bool]]] = None,
+) -> int:
+    """Terminalize durable advisory children whose producer is gone.
+
+    Durable Discord-attempt advisories intentionally bypass the generic
+    SQLite persistence below because the work ledger owns their delivery.
+    Coding-worker recovery also intentionally ignores them. This startup scan
+    closes that gap without turning advisory loss into required-work failure.
+    """
+
+    if process_alive is None:
+        try:
+            from gateway.status import _pid_exists, get_process_start_time
+        except Exception:
+            return 0
+
+        def process_alive(pid: int, started_at: Optional[int]) -> Optional[bool]:
+            try:
+                if not _pid_exists(pid):
+                    return False
+                if not started_at:
+                    return True
+                actual_start = int(get_process_start_time(pid) or 0)
+                if not actual_start:
+                    return None
+                return actual_start == int(started_at)
+            except Exception:
+                return None
+    if ledger is None:
+        try:
+            ledger = _required_async_ledger()
+        except Exception:
+            logger.exception("Could not open the work ledger for advisory recovery")
+            return 0
+
+    current_pid = int(current_owner_pid or os.getpid())
+    current_epoch = str(
+        current_process_epoch
+        if current_process_epoch is not None
+        else _loaded_gateway_process_epoch()
+    ).strip()
+    try:
+        items = list(ledger.incomplete_items())
+    except Exception:
+        logger.exception("Could not enumerate durable advisory dispatches")
+        return 0
+
+    recovered = 0
+    for item in items:
+        if item.get("platform") != "discord":
+            continue
+        work_id = str(item.get("id") or "")
+        state = ledger.required_async_completion_state(work_id)
+        if not isinstance(state, dict) or not state.get("owns_recovery"):
+            continue
+        for delegation_id, dispatch in dict(state.get("dispatches") or {}).items():
+            if (
+                dispatch.get("kind") != "advisory"
+                or dispatch.get("required") is True
+                or dispatch.get("state") not in {"registered", "running"}
+            ):
+                continue
+            owner_pid = int(dispatch.get("owner_pid") or 0)
+            owner_epoch = str(dispatch.get("process_epoch") or "")
+            recovery = dict(dispatch.get("recovery") or {})
+            owner_started_at = int(recovery.get("owner_started_at") or 0) or None
+            if owner_pid == current_pid:
+                # Same-process records are live unless a gateway epoch proves
+                # this PID was reused after a prior process died.
+                if not current_epoch or not owner_epoch or owner_epoch == current_epoch:
+                    continue
+            elif owner_pid:
+                try:
+                    alive = process_alive(owner_pid, owner_started_at)
+                    if alive is not False:
+                        continue
+                except Exception:
+                    logger.debug(
+                        "Could not establish advisory owner liveness for %s",
+                        delegation_id,
+                        exc_info=True,
+                    )
+                    continue
+            try:
+                terminal = ledger.mark_orphaned_advisory_async_dispatch_terminal(
+                    work_id,
+                    delegation_id=str(delegation_id),
+                    generation=state.get("generation"),
+                    attempt_id=state.get("attempt_id"),
+                    attempt_order=state.get("attempt_order"),
+                    expected_owner_pid=owner_pid,
+                    expected_process_epoch=owner_epoch,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not terminalize orphaned advisory dispatch %s",
+                    delegation_id,
+                )
+                continue
+            terminal_dispatch = (
+                dict(terminal.get("dispatches") or {}).get(str(delegation_id))
+                if isinstance(terminal, dict)
+                else None
+            )
+            if (
+                isinstance(terminal_dispatch, dict)
+                and terminal_dispatch.get("state") == "terminal"
+                and terminal_dispatch.get("status") == "producer_process_lost"
+            ):
+                recovered += 1
+    return recovered
+
+
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
@@ -288,6 +424,15 @@ def recover_abandoned_delegations() -> int:
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
+    recovered += recover_abandoned_advisory_dispatches(
+        process_alive=lambda pid, started_at: bool(
+            _pid_exists(pid)
+            and (
+                not started_at
+                or get_process_start_time(pid) == int(started_at)
+            )
+        ),
+    )
     return recovered
 
 
@@ -658,6 +803,12 @@ def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
 
+def reserve_async_delegation_id() -> str:
+    """Reserve a stable id before a background worker thread can checkpoint."""
+
+    return _new_delegation_id()
+
+
 def _capture_session_routing() -> Dict[str, str]:
     """Snapshot gateway routing metadata on the dispatching parent thread."""
     try:
@@ -752,6 +903,7 @@ def _register_required_async_dispatch(record: Dict[str, Any]) -> Optional[str]:
             ),
             required=record.get("kind") == "coding_worker",
             evidence=record.get("registration_evidence"),
+            recovery=record.get("recovery"),
         )
         registered_dispatch = _required_dispatch_state(
             registered,
@@ -968,6 +1120,8 @@ def _persist_required_async_terminal(
         "generation": record.get("origin_run_generation"),
         "attempt_id": record.get("origin_attempt_id"),
         "attempt_order": record.get("origin_attempt_order"),
+        "owner_pid": record.get("origin_owner_pid"),
+        "process_epoch": record.get("origin_process_epoch"),
         "status": status,
         "completed_at": record.get("completed_at"),
         "closeout_id": terminal["closeout_id"],
@@ -1065,6 +1219,8 @@ def dispatch_async_delegation(
     origin_process_epoch: str = "",
     origin_scope_paths: Optional[List[str]] = None,
     closeout_id: str = "",
+    recovery: Optional[Dict[str, Any]] = None,
+    delegation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -1100,7 +1256,9 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
-    delegation_id = _new_delegation_id()
+    delegation_id = str(delegation_id or _new_delegation_id()).strip()
+    if not delegation_id:
+        return {"status": "rejected", "error": "missing async delegation id"}
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
@@ -1130,6 +1288,7 @@ def dispatch_async_delegation(
         "origin_process_epoch": str(origin_process_epoch or "")[:240],
         "origin_scope_paths": list(origin_scope_paths or []),
         "closeout_id": str(closeout_id or "")[:240],
+        "recovery": dict(recovery or {}),
     }
     record.update(_capture_session_routing())
     # Capacity check and record insert under ONE lock hold — checking
@@ -1240,6 +1399,140 @@ def dispatch_async_delegation(
         delegation_id, session_key or "<cli>", (goal or "")[:80],
     )
     return {"status": "dispatched", "delegation_id": delegation_id}
+
+
+def recover_async_coding_delegation(
+    *,
+    delegation_id: str,
+    goal: str,
+    context: Optional[str],
+    session_key: str,
+    runner: Callable[[], Dict[str, Any]],
+    interrupt_fn: Optional[Callable[[], None]],
+    max_async_children: int,
+    origin_work_item_id: str,
+    origin_run_generation: int,
+    origin_attempt_id: str,
+    origin_attempt_order: int,
+    origin_owner_pid: int,
+    origin_process_epoch: str,
+    origin_scope_paths: Optional[List[str]] = None,
+    recovery: Optional[Dict[str, Any]] = None,
+    routing: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Recreate one atomically claimed durable coding child in this process.
+
+    The work ledger claim happens before this function is called. Reusing the
+    stable delegation id means retries cannot create a second logical Worker
+    Run, and the in-memory guard makes repeated startup scans idempotent.
+    """
+
+    normalized_id = str(delegation_id or "").strip()
+    if not normalized_id:
+        return {"status": "rejected", "error": "missing durable delegation id"}
+    dispatched_at = time.time()
+    record: Dict[str, Any] = {
+        "delegation_id": normalized_id,
+        "goal": str(goal or ""),
+        "context": context,
+        "toolsets": ["coding_worker"],
+        "role": "coding_worker",
+        "model": str((recovery or {}).get("model_tier") or ""),
+        "session_key": str(session_key or ""),
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "status": "running",
+        "dispatched_at": dispatched_at,
+        "completed_at": None,
+        "interrupt_fn": interrupt_fn,
+        "kind": "coding_worker",
+        "delivery_pending": False,
+        "cancel_requested": False,
+        "cancel_reason": "",
+        "cancel_requested_at": None,
+        "interrupt_invoked": False,
+        "origin_work_item_id": str(origin_work_item_id or "")[:240],
+        "origin_run_generation": _normalized_generation(origin_run_generation),
+        "origin_attempt_id": str(origin_attempt_id or "")[:240],
+        "origin_attempt_order": _normalized_generation(origin_attempt_order),
+        "origin_owner_pid": int(origin_owner_pid or os.getpid()),
+        "origin_process_epoch": str(origin_process_epoch or "")[:240],
+        "origin_scope_paths": list(origin_scope_paths or []),
+        "closeout_id": "",
+        "required_async_registered": True,
+        "required_async_state": "registered",
+        "recovery": dict(recovery or {}),
+    }
+    record.update(dict(routing or {}))
+    with _records_lock:
+        existing = _records.get(normalized_id)
+        if existing is not None:
+            if existing.get("status") in {"running", "finalizing"}:
+                return {"status": "already_running", "delegation_id": normalized_id}
+            return {
+                "status": "rejected",
+                "error": "durable delegation id already terminal in this process",
+            }
+        running = sum(
+            1
+            for item in _records.values()
+            if item.get("status") in {"running", "finalizing"}
+        )
+        if running >= max_async_children:
+            return {
+                "status": "deferred",
+                "error": f"Async delegation capacity reached ({max_async_children} running).",
+            }
+        _records[normalized_id] = record
+
+    try:
+        executor = _get_executor(max_async_children)
+    except Exception as exc:
+        with _records_lock:
+            _records.pop(normalized_id, None)
+        return {"status": "rejected", "error": f"Failed to initialize executor: {exc}"}
+
+    def _worker() -> None:
+        result: Dict[str, Any] = {}
+        status = "error"
+        try:
+            result = runner() or {}
+            status = result.get("status") or "completed"
+        except Exception as exc:  # noqa: BLE001 - detached recovery must terminalize
+            logger.exception("Recovered async delegation %s crashed", normalized_id)
+            result = {
+                "status": "error",
+                "summary": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_seconds": round(time.time() - dispatched_at, 2),
+            }
+            status = "error"
+        finally:
+            _finalize(normalized_id, result, status)
+
+    try:
+        executor.submit(propagate_context_to_thread(_worker))
+    except Exception as exc:
+        failed_result = {
+            "status": "submit_failed",
+            "summary": "",
+            "error": f"Failed to schedule recovered async delegation: {exc}",
+            "result": {
+                "success": False,
+                "status": "submit_failed",
+                "summary": "",
+                "error": f"Failed to schedule recovered async delegation: {exc}",
+            },
+        }
+        _complete_record(
+            normalized_id,
+            failed_result,
+            "submit_failed",
+            enqueue=False,
+            submit_failure=True,
+        )
+        return {"status": "rejected", "error": failed_result["error"]}
+    return {"status": "dispatched", "delegation_id": normalized_id}
 
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
@@ -1509,6 +1802,8 @@ def _push_completion_event(
         "origin_run_generation": record.get("origin_run_generation"),
         "origin_attempt_id": record.get("origin_attempt_id", ""),
         "origin_attempt_order": record.get("origin_attempt_order"),
+        "origin_owner_pid": record.get("origin_owner_pid"),
+        "origin_process_epoch": record.get("origin_process_epoch", ""),
         "closeout_id": (
             (
                 deterministic_result.get("fable_git_result", {}).get("closeout_id")
@@ -1693,6 +1988,7 @@ def dispatch_async_delegation_batch(
         "origin_scope_paths": [],
         "read_only": bool(read_only),
         "task_specs": [dict(item) for item in (task_specs or [])],
+        "recovery": {"owner_started_at": _current_process_start_time()},
         "registration_evidence": {
             "advisory_results": [
                 {

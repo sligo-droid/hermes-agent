@@ -58,8 +58,8 @@ _RUN_STATE_LEASE_LIMIT = 1_000_000_000_000_000.0
 _MAX_CONFIRMED_MESSAGE_IDS = 128
 _MAX_DELIVERY_MESSAGE_ID_LENGTH = 160
 _MAX_REQUIRED_ASYNC_COMPLETIONS = 64
-_REQUIRED_ASYNC_SCHEMA_VERSION = 5
-_SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
+_REQUIRED_ASYNC_SCHEMA_VERSION = 6
+_SUPPORTED_REQUIRED_ASYNC_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5, 6})
 _REQUIRED_ASYNC_DISPATCH_STATES = frozenset(
     {"registered", "running", "terminal", "cancelled", "outcome_unknown"}
 )
@@ -69,6 +69,23 @@ _MAX_REQUIRED_ASYNC_SCOPE_PATHS = 32
 _MAX_REQUIRED_ASYNC_TEST_REFS = 16
 _MAX_ASYNC_ADVISORY_RESULTS = 16
 _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT = 1000
+_REQUIRED_ASYNC_RECOVERY_TEXT_LIMIT = 20_000
+_REQUIRED_ASYNC_RECOVERY_CONTEXT_LIMIT = 40_000
+_MAX_REQUIRED_ASYNC_RECOVERY_FILES = 32
+_REQUIRED_ASYNC_RECOVERY_STATUSES = frozenset(
+    {
+        "registered",
+        "running",
+        "waiting_for_owner",
+        "waiting_for_worker",
+        "claimed",
+        "resuming_thread",
+        "relaunching",
+        "recovered",
+        "manual_fallback",
+        "failed",
+    }
+)
 _CLOSEOUT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CLOSEOUT_VISUAL_STATUSES = frozenset(
     {"passed", "failed", "blocked", "uncertain", "missing"}
@@ -650,6 +667,159 @@ def _bounded_required_async_checkpoint(
     return checkpoint, False
 
 
+def _bounded_required_async_recovery(value: Any) -> tuple[dict[str, Any], bool]:
+    """Normalize the durable Worker Run data needed after a gateway restart."""
+
+    if value is None:
+        return {}, False
+    if not isinstance(value, Mapping):
+        return {}, True
+    raw = value
+    malformed = False
+    recovery: dict[str, Any] = {}
+
+    def text_field(key: str, *, limit: int = _REQUIRED_ASYNC_RECOVERY_TEXT_LIMIT) -> None:
+        text = _bounded_run_state_text(raw.get(key), limit=limit)
+        if text:
+            recovery[key] = text
+
+    for key, limit in (
+        ("task", _REQUIRED_ASYNC_RECOVERY_CONTEXT_LIMIT),
+        ("context", _REQUIRED_ASYNC_RECOVERY_CONTEXT_LIMIT),
+        ("approach", _REQUIRED_ASYNC_RECOVERY_TEXT_LIMIT),
+        ("constraints", _REQUIRED_ASYNC_RECOVERY_TEXT_LIMIT),
+        ("verification", _REQUIRED_ASYNC_RECOVERY_TEXT_LIMIT),
+        ("plan_text", _REQUIRED_ASYNC_RECOVERY_CONTEXT_LIMIT),
+        ("worktree", _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT),
+        ("repository_root", _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT),
+        ("requested_cwd", _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT),
+        ("backend", _RUN_STATE_TEXT_LIMIT),
+        ("model_tier", _RUN_STATE_TEXT_LIMIT),
+        ("reasoning_effort", _RUN_STATE_TEXT_LIMIT),
+        ("phase", _RUN_STATE_TEXT_LIMIT),
+        ("thread_id", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("turn_id", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("worker_scope_unit", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("worker_run_id", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("launch_id", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("last_event", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("last_error", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("base_sha", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+        ("git_top_level", _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT),
+        ("git_common_dir", _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT),
+    ):
+        text_field(key, limit=limit)
+
+    status = str(raw.get("status") or "").strip().lower()
+    if status:
+        if status not in _REQUIRED_ASYNC_RECOVERY_STATUSES:
+            status = "failed"
+            malformed = True
+        recovery["status"] = status
+    policy = str(raw.get("policy") or "").strip().lower()
+    if policy:
+        if policy not in {"resume_or_relaunch", "manual"}:
+            policy = "manual"
+            malformed = True
+        recovery["policy"] = policy
+    side_effect_mode = str(raw.get("side_effect_mode") or "").strip().lower()
+    if side_effect_mode:
+        if side_effect_mode not in {"workspace_only", "external"}:
+            side_effect_mode = "external"
+            malformed = True
+        recovery["side_effect_mode"] = side_effect_mode
+
+    for key in (
+        "allow_git_pr_lifecycle",
+        "trusted_allow_git_pr_lifecycle",
+        "thread_resume_supported",
+    ):
+        if key in raw and not isinstance(raw.get(key), bool):
+            malformed = True
+        elif isinstance(raw.get(key), bool):
+            recovery[key] = raw[key]
+    external_authority = bool(
+        recovery.get("side_effect_mode") == "external"
+        or recovery.get("allow_git_pr_lifecycle") is True
+        or recovery.get("trusted_allow_git_pr_lifecycle") is True
+    )
+    if external_authority:
+        if recovery.get("policy") not in {None, "manual"}:
+            malformed = True
+        recovery["policy"] = "manual"
+        recovery["side_effect_mode"] = "external"
+    for key in (
+        "launch_generation",
+        "owner_started_at",
+        "worker_pid",
+        "worker_started_at",
+    ):
+        number = _bounded_run_state_int(raw.get(key))
+        if number:
+            recovery[key] = number
+    for key in ("heartbeat_at", "claimed_at"):
+        stamp = _bounded_run_state_lease(raw.get(key))
+        if stamp is not None:
+            recovery[key] = stamp
+    timeout = _bounded_run_state_lease(raw.get("turn_timeout_seconds"))
+    if timeout is not None and timeout >= 0:
+        recovery["turn_timeout_seconds"] = timeout
+
+    for key in ("scope_paths", "analysis_handoff_ids", "initial_dirty_paths"):
+        values = _bounded_required_async_strings(
+            raw.get(key),
+            limit=_MAX_REQUIRED_ASYNC_SCOPE_PATHS,
+        )
+        if values:
+            recovery[key] = values
+
+    relevant_files: list[dict[str, str]] = []
+    raw_files = raw.get("relevant_files")
+    if raw_files is not None and not isinstance(raw_files, list):
+        malformed = True
+    if isinstance(raw_files, list):
+        for raw_file in raw_files[:_MAX_REQUIRED_ASYNC_RECOVERY_FILES]:
+            if not isinstance(raw_file, Mapping):
+                malformed = True
+                continue
+            entry: dict[str, str] = {}
+            for key, limit in (
+                ("path", _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT),
+                ("note", _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT),
+            ):
+                text = _bounded_run_state_text(raw_file.get(key), limit=limit)
+                if text:
+                    entry[key] = text
+            if entry:
+                relevant_files.append(entry)
+    if relevant_files:
+        recovery["relevant_files"] = relevant_files
+
+    raw_parallel = raw.get("parallel_group")
+    if raw_parallel is not None and not isinstance(raw_parallel, Mapping):
+        malformed = True
+    if isinstance(raw_parallel, Mapping):
+        parallel: dict[str, Any] = {}
+        for key in ("group_id", "base_cwd", "base_sha"):
+            limit = (
+                _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT
+                if key == "base_cwd"
+                else _REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT
+            )
+            text = _bounded_run_state_text(raw_parallel.get(key), limit=limit)
+            if text:
+                parallel[key] = text
+        dirty = _bounded_required_async_strings(
+            raw_parallel.get("initial_dirty_paths"),
+            limit=_MAX_REQUIRED_ASYNC_SCOPE_PATHS,
+        )
+        if dirty:
+            parallel["initial_dirty_paths"] = dirty
+        if parallel:
+            recovery["parallel_group"] = parallel
+    return recovery, malformed
+
+
 def _normalized_required_async_dispatch(
     raw_dispatch: Any,
     *,
@@ -674,6 +844,10 @@ def _normalized_required_async_dispatch(
     required = raw.get("required") is not False
     if kind == "advisory":
         required = False
+    recovery, recovery_malformed = _bounded_required_async_recovery(
+        raw.get("recovery")
+    )
+    malformed = malformed or recovery_malformed
     dispatch = {
         "kind": kind,
         "required": required,
@@ -692,6 +866,7 @@ def _normalized_required_async_dispatch(
         "summary": _bounded_required_async_text(raw.get("summary")),
         "error": _bounded_required_async_text(raw.get("error")),
         "evidence": _bounded_required_async_evidence(raw.get("evidence")),
+        "recovery": recovery,
     }
     if raw.get("registration_missing") is True:
         dispatch["registration_missing"] = True
@@ -1917,6 +2092,7 @@ class GatewayWorkLedger:
         kind: str = "coding_worker",
         required: bool = True,
         evidence: Mapping[str, Any] | None = None,
+        recovery: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Register one actual executor dispatch before submission begins.
 
@@ -1963,6 +2139,11 @@ class GatewayWorkLedger:
         bounded_evidence = _bounded_required_async_evidence(
             {**dict(evidence or {}), "scope_paths": scope_paths}
         )
+        bounded_recovery, recovery_malformed = _bounded_required_async_recovery(
+            recovery
+        )
+        if recovery_malformed:
+            return None
         if isinstance(existing, dict):
             if (
                 existing.get("state") == "registered"
@@ -1973,6 +2154,7 @@ class GatewayWorkLedger:
                 and str(existing.get("closeout_id") or "") == closeout
                 and existing.get("evidence", {}).get("scope_paths", [])
                 == bounded_evidence.get("scope_paths", [])
+                and existing.get("recovery", {}) == bounded_recovery
             ):
                 return state
             return None
@@ -1995,6 +2177,7 @@ class GatewayWorkLedger:
             "summary": "",
             "error": "",
             "evidence": bounded_evidence,
+            "recovery": bounded_recovery,
         }
         state["dispatches"] = dispatches
         return self._persist_required_async_state(
@@ -2045,6 +2228,17 @@ class GatewayWorkLedger:
         if existing.get("state") != "registered":
             return None
         dispatch = dict(existing)
+        recovery = dict(dispatch.get("recovery") or {})
+        if recovery:
+            recovery.update(
+                {
+                    "status": "running",
+                    "heartbeat_at": _bounded_run_state_lease(
+                        started_at if started_at is not None else self._now()
+                    ),
+                }
+            )
+            recovery, _ = _bounded_required_async_recovery(recovery)
         dispatch.update(
             {
                 "state": "running",
@@ -2052,11 +2246,261 @@ class GatewayWorkLedger:
                 "started_at": _bounded_run_state_lease(
                     started_at if started_at is not None else self._now()
                 ),
+                "recovery": recovery,
             }
         )
         dispatches[completion_id] = dispatch
         state["dispatches"] = dispatches
         return self._persist_required_async_state(data, item, state)
+
+    @_locked_ledger_mutation
+    def update_required_async_dispatch_recovery(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        owner_pid: int | None = None,
+        process_epoch: str | None = None,
+        updates: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """CAS-update one pending child checkpoint without changing its identity."""
+
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        completion_id = _bounded_run_state_text(delegation_id)
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        if (
+            not isinstance(existing, dict)
+            or existing.get("state") not in _REQUIRED_ASYNC_PENDING_STATES
+        ):
+            return None
+        expected_pid = _bounded_run_state_int(owner_pid)
+        expected_epoch = _bounded_run_state_text(
+            process_epoch,
+            limit=_RUN_STATE_EPOCH_LIMIT,
+        )
+        if owner_pid is not None and int(existing.get("owner_pid") or 0) != expected_pid:
+            return None
+        if process_epoch is not None and str(existing.get("process_epoch") or "") != expected_epoch:
+            return None
+        merged = dict(existing.get("recovery") or {})
+        merged.update(dict(updates or {}))
+        recovery, malformed = _bounded_required_async_recovery(merged)
+        if malformed:
+            return None
+        dispatch = dict(existing)
+        dispatch["recovery"] = recovery
+        dispatches[completion_id] = dispatch
+        state["dispatches"] = dispatches
+        return self._persist_required_async_state(data, item, state)
+
+    @_locked_ledger_mutation
+    def claim_required_async_dispatch_recovery(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        expected_owner_pid: int | None = None,
+        expected_process_epoch: str | None = None,
+        owner_pid: int,
+        process_epoch: str,
+        launch_id: str,
+        claimed_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically fence a dead producer and assign one recovery launch."""
+
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        completion_id = _bounded_run_state_text(delegation_id)
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        if (
+            not isinstance(existing, dict)
+            or existing.get("state") not in _REQUIRED_ASYNC_PENDING_STATES
+        ):
+            return None
+        expected_pid = _bounded_run_state_int(expected_owner_pid)
+        expected_epoch = _bounded_run_state_text(
+            expected_process_epoch,
+            limit=_RUN_STATE_EPOCH_LIMIT,
+        )
+        if expected_owner_pid is not None and int(existing.get("owner_pid") or 0) != expected_pid:
+            return None
+        if expected_process_epoch is not None and str(existing.get("process_epoch") or "") != expected_epoch:
+            return None
+        new_pid = _bounded_run_state_int(owner_pid)
+        new_epoch = _bounded_run_state_text(process_epoch, limit=_RUN_STATE_EPOCH_LIMIT)
+        new_launch_id = _bounded_run_state_text(
+            launch_id,
+            limit=_REQUIRED_ASYNC_EVIDENCE_TEXT_LIMIT,
+        )
+        if not new_pid or not new_epoch or not new_launch_id:
+            return None
+        recovery = dict(existing.get("recovery") or {})
+        if (
+            int(existing.get("owner_pid") or 0) == new_pid
+            and str(existing.get("process_epoch") or "") == new_epoch
+            and str(recovery.get("launch_id") or "") == new_launch_id
+        ):
+            return state
+        now = _bounded_run_state_lease(
+            claimed_at if claimed_at is not None else self._now()
+        )
+        try:
+            from gateway.status import get_process_start_time
+
+            owner_started_at = int(get_process_start_time(new_pid) or 0)
+        except Exception:
+            owner_started_at = 0
+        recovery.update(
+            {
+                "status": "claimed",
+                "claimed_at": now,
+                "heartbeat_at": now,
+                "launch_id": new_launch_id,
+                "launch_generation": _positive_int(
+                    recovery.get("launch_generation")
+                )
+                + 1,
+                "owner_started_at": owner_started_at,
+                "last_error": "",
+                "worker_pid": 0,
+                "worker_started_at": 0,
+                "worker_scope_unit": "",
+                "turn_id": "",
+            }
+        )
+        normalized_recovery, malformed = _bounded_required_async_recovery(recovery)
+        if malformed:
+            return None
+        dispatch = dict(existing)
+        dispatch.update(
+            {
+                "state": "registered",
+                "status": "recovery_claimed",
+                "started_at": None,
+                "owner_pid": new_pid,
+                "process_epoch": new_epoch,
+                "recovery": normalized_recovery,
+            }
+        )
+        dispatches[completion_id] = dispatch
+        state["dispatches"] = dispatches
+        return self._persist_required_async_state(data, item, state)
+
+    @_locked_ledger_mutation
+    def mark_required_async_dispatch_outcome_unknown(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        expected_owner_pid: int | None = None,
+        expected_process_epoch: str | None = None,
+        reason: str,
+        recovery_status: str = "manual_fallback",
+        completed_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Fail one unsafe/unsupported child closed with visible recovery detail."""
+
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        completion_id = _bounded_run_state_text(delegation_id)
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        if (
+            not isinstance(existing, dict)
+            or existing.get("state") not in _REQUIRED_ASYNC_PENDING_STATES
+        ):
+            return None
+        expected_pid = _bounded_run_state_int(expected_owner_pid)
+        expected_epoch = _bounded_run_state_text(
+            expected_process_epoch,
+            limit=_RUN_STATE_EPOCH_LIMIT,
+        )
+        if expected_owner_pid is not None and int(existing.get("owner_pid") or 0) != expected_pid:
+            return None
+        if expected_process_epoch is not None and str(existing.get("process_epoch") or "") != expected_epoch:
+            return None
+        now = _bounded_run_state_lease(
+            completed_at if completed_at is not None else self._now()
+        )
+        recovery = dict(existing.get("recovery") or {})
+        recovery.update(
+            {
+                "status": recovery_status,
+                "heartbeat_at": now,
+                "last_error": reason,
+            }
+        )
+        normalized_recovery, _ = _bounded_required_async_recovery(recovery)
+        dispatch = dict(existing)
+        dispatch.update(
+            {
+                "state": "outcome_unknown",
+                "success": False,
+                "status": "recovery_manual_fallback",
+                "completed_at": now,
+                "error": _bounded_required_async_text(reason),
+                "recovery": normalized_recovery,
+            }
+        )
+        dispatches[completion_id] = dispatch
+        state.update(
+            {
+                "dispatches": dispatches,
+                "sticky_failure": True,
+                "failure_reason": "required_async_outcome_unknown",
+            }
+        )
+        if not any(
+            row.get("state") in _REQUIRED_ASYNC_PENDING_STATES
+            for row in dispatches.values()
+        ):
+            state["sealed"] = True
+            state["sealed_at"] = state.get("sealed_at") or now
+        return self._persist_required_async_state(
+            data,
+            item,
+            state,
+            refresh_gate=True,
+        )
 
     def _record_required_async_terminal_locked(
         self,
@@ -2067,6 +2511,8 @@ class GatewayWorkLedger:
         generation: int | None,
         attempt_id: str | None,
         attempt_order: int | None,
+        owner_pid: int | None,
+        process_epoch: str | None,
         status: str | None,
         completed_at: float | None,
         closeout_id: str | None,
@@ -2108,8 +2554,19 @@ class GatewayWorkLedger:
                 "summary": "",
                 "error": "",
                 "evidence": {},
+                "recovery": {},
                 "registration_missing": True,
             }
+        elif (
+            owner_pid is not None
+            and int(existing.get("owner_pid") or 0)
+            != _bounded_run_state_int(owner_pid)
+        ) or (
+            process_epoch is not None
+            and str(existing.get("process_epoch") or "")
+            != _bounded_run_state_text(process_epoch, limit=_RUN_STATE_EPOCH_LIMIT)
+        ):
+            return None
         incoming_status = _bounded_run_state_text(status)
         incoming_success = bool(success)
         if existing.get("state") in {"cancelled", "outcome_unknown"}:
@@ -2139,6 +2596,18 @@ class GatewayWorkLedger:
             dispatch = dict(existing)
             combined_evidence = dict(dispatch.get("evidence") or {})
             combined_evidence.update(_bounded_required_async_evidence(evidence))
+            recovery = dict(dispatch.get("recovery") or {})
+            if recovery:
+                recovery.update(
+                    {
+                        "status": "recovered" if incoming_success else "failed",
+                        "heartbeat_at": _bounded_run_state_lease(
+                            completed_at if completed_at is not None else self._now()
+                        ),
+                        "last_error": error or "",
+                    }
+                )
+                recovery, _ = _bounded_required_async_recovery(recovery)
             closeout = _bounded_run_state_text(closeout_id) or str(
                 dispatch.get("closeout_id") or ""
             )
@@ -2154,6 +2623,7 @@ class GatewayWorkLedger:
                     "summary": _bounded_required_async_text(summary),
                     "error": _bounded_required_async_text(error),
                     "evidence": combined_evidence,
+                    "recovery": recovery,
                 }
             )
             dispatches[completion_id] = dispatch
@@ -2174,6 +2644,8 @@ class GatewayWorkLedger:
         generation: int | None = None,
         attempt_id: str | None = None,
         attempt_order: int | None = None,
+        owner_pid: int | None = None,
+        process_epoch: str | None = None,
         error: str | None = None,
         status: str | None = "submit_failed",
         completed_at: float | None = None,
@@ -2191,6 +2663,8 @@ class GatewayWorkLedger:
             generation=generation,
             attempt_id=attempt_id,
             attempt_order=attempt_order,
+            owner_pid=owner_pid,
+            process_epoch=process_epoch,
             status=status,
             completed_at=completed_at,
             closeout_id=closeout_id,
@@ -2214,6 +2688,8 @@ class GatewayWorkLedger:
         generation: int | None = None,
         attempt_id: str | None = None,
         attempt_order: int | None = None,
+        owner_pid: int | None = None,
+        process_epoch: str | None = None,
         status: str | None = None,
         completed_at: float | None = None,
         closeout_id: str | None = None,
@@ -2233,6 +2709,8 @@ class GatewayWorkLedger:
             generation=generation,
             attempt_id=attempt_id,
             attempt_order=attempt_order,
+            owner_pid=owner_pid,
+            process_epoch=process_epoch,
             status=status,
             completed_at=completed_at,
             closeout_id=closeout_id,
@@ -2571,6 +3049,122 @@ class GatewayWorkLedger:
         if changed_work_ids:
             self._write(data)
         return changed_work_ids
+
+    @_locked_ledger_mutation
+    def mark_orphaned_advisory_async_dispatch_terminal(
+        self,
+        work_id: str,
+        *,
+        delegation_id: str,
+        generation: int | None = None,
+        attempt_id: str | None = None,
+        attempt_order: int | None = None,
+        expected_owner_pid: int | None = None,
+        expected_process_epoch: str | None = None,
+        reason: str = (
+            "advisory producer exited before recording a durable terminal outcome"
+        ),
+        completed_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Terminalize one orphaned advisory without failing required work.
+
+        The caller must first prove that the owning process is gone. Exact
+        attempt and producer identity fencing prevents a stale startup scan
+        from overwriting a live or replacement dispatch.
+        """
+
+        data = self._read()
+        context = self._required_async_write_context(
+            data,
+            work_id,
+            generation=generation,
+            attempt_id=attempt_id,
+            attempt_order=attempt_order,
+        )
+        if context is None:
+            return None
+        item, state = context
+        completion_id = _bounded_run_state_text(delegation_id)
+        dispatches = dict(state["dispatches"])
+        existing = dispatches.get(completion_id)
+        if not isinstance(existing, dict):
+            return None
+        if (
+            existing.get("kind") != "advisory"
+            or existing.get("required") is True
+        ):
+            return None
+        if (
+            existing.get("state") == "terminal"
+            and existing.get("status") == "producer_process_lost"
+        ):
+            return state
+        if existing.get("state") not in _REQUIRED_ASYNC_PENDING_STATES:
+            return None
+        if (
+            expected_owner_pid is not None
+            and int(existing.get("owner_pid") or 0)
+            != _bounded_run_state_int(expected_owner_pid)
+        ):
+            return None
+        if (
+            expected_process_epoch is not None
+            and str(existing.get("process_epoch") or "")
+            != _bounded_run_state_text(
+                expected_process_epoch,
+                limit=_RUN_STATE_EPOCH_LIMIT,
+            )
+        ):
+            return None
+
+        now = _bounded_run_state_lease(
+            completed_at if completed_at is not None else self._now()
+        )
+        error = _bounded_required_async_text(reason)
+        evidence = dict(existing.get("evidence") or {})
+        prior_results = evidence.get("advisory_results")
+        advisory_results: list[dict[str, str]] = []
+        if isinstance(prior_results, list):
+            for raw_result in prior_results[:_MAX_ASYNC_ADVISORY_RESULTS]:
+                if not isinstance(raw_result, Mapping):
+                    continue
+                result: dict[str, str] = {}
+                goal = _bounded_required_async_text(raw_result.get("goal"))
+                if goal:
+                    result["goal"] = goal
+                result["status"] = "error"
+                result["error"] = error
+                advisory_results.append(result)
+        if not advisory_results:
+            advisory_results.append({"status": "error", "error": error})
+        evidence["advisory_results"] = advisory_results
+
+        dispatch = dict(existing)
+        dispatch.update(
+            {
+                "state": "terminal",
+                "success": False,
+                "status": "producer_process_lost",
+                "completed_at": now,
+                "summary": "",
+                "error": error,
+                "evidence": _bounded_required_async_evidence(evidence),
+            }
+        )
+        dispatches[completion_id] = dispatch
+        state["dispatches"] = dispatches
+        # The parent producer is gone, so registration for this attempt is
+        # complete even when required coding children still need recovery.
+        # Sealing now lets the normal reconciler finish once those children
+        # become terminal, without replaying the parent model turn.
+        state["sealed"] = True
+        state["sealed_at"] = state.get("sealed_at") or now
+        return self._persist_required_async_state(
+            data,
+            item,
+            state,
+            refresh_gate=True,
+        )
 
     @_locked_ledger_mutation
     def finalize_required_async_failure(

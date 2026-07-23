@@ -1605,7 +1605,8 @@ async def test_restart_banner_not_sent_to_active_session():
 
     assert len(adapter.sent) == 1
     assert "Gateway restarting" in adapter.sent[0]
-    assert "try to resume where you left off" in adapter.sent[0]
+    assert "Hermes will automatically resume it after restart" in adapter.sent[0]
+    assert "If automatic recovery does not proceed, send a message" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
@@ -1622,7 +1623,8 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     assert adapter.sent == [
         "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "Hermes will automatically resume it after restart. If automatic "
+        "recovery does not proceed, send a message to continue."
     ]
 
 

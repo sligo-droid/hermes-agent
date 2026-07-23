@@ -56,6 +56,7 @@ Stable repo map lives in `AGENTS.md`; this section is the product-level map.
 
 - Command Center should use one Work Item / Source / Worker Run model. Self-improvement, Discord, and cron are sources/intake channels, not separate peer ledgers.
 - Worker boards are execution children. They should not become the source of truth for product/work status.
+- Concurrent async coding children launched directly by a Discord parent are durable Worker Runs on that parent's Work Item; their restart recovery does not route through Kanban or require a worker board.
 - Hermes `#dev` and PID are current Command Center project tabs. Adding projects should extend the same project metadata model, not hard-code a new screen.
 - `AGENTS.md` is worker instruction; it is not a status ledger.
 - `docs/project-state.md` is a tiny routing cursor, not authoritative current state.

@@ -18,6 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
@@ -280,13 +281,32 @@ class _BackgroundCodingStartup:
     preflight_result: Optional[str] = None
     worker_cwd: str = ""
     model_tier: str = "default"
+    recovery_model_tier: str = ""
     scope_paths: list[str] = field(default_factory=list)
     backend: str = ""
     worker_run: Optional[dict[str, Any]] = None
+    delegation_id: str = ""
+    origin_work_item_id: str = ""
+    origin_run_generation: Optional[int] = None
+    origin_attempt_id: str = ""
+    origin_attempt_order: Optional[int] = None
+    origin_owner_pid: Optional[int] = None
+    origin_process_epoch: str = ""
+    recovery_phase: str = ""
+    recovery_thread_id: str = ""
+    recovery_plan_text: str = ""
+    recovery_backend: str = ""
+    recovery_launch: bool = False
+    base_sha: str = ""
+    initial_dirty_paths: list[str] = field(default_factory=list)
+    git_top_level: str = ""
+    git_common_dir: str = ""
     cancel_reason: str = ""
     interrupt_requested: threading.Event = field(default_factory=threading.Event)
     _interrupt_lock: threading.Lock = field(default_factory=threading.Lock)
     _interrupt_callback: Optional[Callable[[], None]] = None
+    _recovery_lock: threading.Lock = field(default_factory=threading.Lock)
+    _last_recovery_persisted_at: float = 0.0
 
     def mark_ready(
         self,
@@ -301,9 +321,50 @@ class _BackgroundCodingStartup:
         if not self.ready.is_set():
             self.worker_cwd = str(worker_cwd or "")
             self.model_tier = str(model_tier or "default")
+            if model_tier is not None:
+                self.recovery_model_tier = str(model_tier or "")
             self.scope_paths = list(scope_paths or [])
             self.backend = str(backend or "")
             self.worker_run = worker_run
+            actual_top_level, actual_common_dir, actual_head = _git_workspace_identity(
+                self.worker_cwd
+            )
+            if self.recovery_launch and (
+                not self.git_top_level
+                or not self.git_common_dir
+                or actual_top_level != self.git_top_level
+                or actual_common_dir != self.git_common_dir
+                or actual_head != self.base_sha
+            ):
+                self.cancel_reason = (
+                    "Recovered coding-worker Git identity no longer matches its "
+                    "durable worktree and baseline."
+                )
+                self.preflight_result = tool_error(self.cancel_reason)
+            else:
+                self.git_top_level = actual_top_level
+                self.git_common_dir = actual_common_dir
+            try:
+                repository_root = _reservation_root(self.worker_cwd)
+            except Exception:
+                repository_root = self.worker_cwd
+            if self.origin_work_item_id and not self.persist_recovery(
+                force=True,
+                status="registered",
+                backend=self.backend,
+                worktree=self.worker_cwd,
+                repository_root=repository_root,
+                model_tier=self.recovery_model_tier,
+                scope_paths=self.scope_paths,
+                base_sha=self.base_sha,
+                initial_dirty_paths=self.initial_dirty_paths,
+                git_top_level=self.git_top_level,
+                git_common_dir=self.git_common_dir,
+            ):
+                self.cancel_reason = (
+                    "Could not durably checkpoint coding-worker startup metadata."
+                )
+                self.preflight_result = tool_error(self.cancel_reason)
             if self.parallel_group and self.worker_cwd:
                 registry_key = str(Path(self.worker_cwd).expanduser().resolve())
                 with _BACKGROUND_PARALLEL_WORKERS_GUARD:
@@ -311,6 +372,28 @@ class _BackgroundCodingStartup:
                     _BACKGROUND_PARALLEL_WORKERS.add(registry_key)
             self.ready.set()
         self.release.wait()
+        if self.recovery_launch:
+            actual_top_level, actual_common_dir, actual_head = _git_workspace_identity(
+                self.worker_cwd
+            )
+            base_identity_matches = True
+            if self.parallel_group:
+                _base_top, _base_common, base_head = _git_workspace_identity(
+                    str(self.parallel_group.get("base_cwd") or "")
+                )
+                base_identity_matches = bool(
+                    base_head
+                    and base_head == str(self.parallel_group.get("base_sha") or "")
+                )
+            if (
+                actual_top_level != self.git_top_level
+                or actual_common_dir != self.git_common_dir
+                or actual_head != self.base_sha
+                or not base_identity_matches
+            ):
+                self.cancel_reason = (
+                    "Recovered coding-worker Git identity changed before release."
+                )
         return not bool(self.cancel_reason)
 
     def request_interrupt(self) -> None:
@@ -331,6 +414,76 @@ class _BackgroundCodingStartup:
         with self._interrupt_lock:
             if self._interrupt_callback == callback:
                 self._interrupt_callback = None
+
+    def persist_recovery(self, *, force: bool = False, **updates: Any) -> bool:
+        """Checkpoint this stable Worker Run without depending on parent replay."""
+
+        if not (
+            self.delegation_id
+            and self.origin_work_item_id
+            and self.origin_run_generation
+            and self.origin_attempt_id
+            and self.origin_attempt_order
+        ):
+            return False
+        now = time.time()
+        with self._recovery_lock:
+            if not force and now - self._last_recovery_persisted_at < 2.0:
+                return True
+            try:
+                payload = _redact_recovery_updates(
+                    {"heartbeat_at": now, **updates}
+                )
+            except Exception:
+                logger.debug(
+                    "Could not redact coding-worker recovery checkpoint for %s",
+                    self.delegation_id,
+                    exc_info=True,
+                )
+                return False
+            try:
+                from tools.async_delegation import _required_async_ledger
+
+                state = _required_async_ledger().update_required_async_dispatch_recovery(
+                    self.origin_work_item_id,
+                    delegation_id=self.delegation_id,
+                    generation=self.origin_run_generation,
+                    attempt_id=self.origin_attempt_id,
+                    attempt_order=self.origin_attempt_order,
+                    owner_pid=self.origin_owner_pid,
+                    process_epoch=self.origin_process_epoch,
+                    updates=payload,
+                )
+            except Exception:
+                logger.debug(
+                    "Could not checkpoint coding-worker recovery state for %s",
+                    self.delegation_id,
+                    exc_info=True,
+                )
+                return False
+            if not isinstance(state, dict):
+                return False
+            self._last_recovery_persisted_at = now
+            return True
+
+
+def _redact_recovery_updates(value: Any) -> Any:
+    """Force-redact every string before it enters durable recovery state."""
+
+    from agent.redact import redact_sensitive_text
+
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, list):
+        return [_redact_recovery_updates(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_recovery_updates(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_recovery_updates(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _codex_reasoning_args(reasoning_level: str) -> list[str]:
@@ -1851,6 +2004,10 @@ def _delegate_coding_task_impl(
     _parallel_context: Optional[_ParallelWorkerContext] = None
     cwd_fallback_metadata: dict[str, str] | None = None
     if not Path(workdir).exists():
+        if _background_startup is not None and _background_startup.recovery_launch:
+            return tool_error(
+                f"recovered coding-worker cwd no longer exists: {workdir}"
+            )
         fallback_workdir, cwd_fallback_metadata = _workspace_fallback_for_missing_cwd(workdir)
         if not fallback_workdir:
             return tool_error(f"cwd does not exist: {workdir}")
@@ -1876,11 +2033,53 @@ def _delegate_coding_task_impl(
 
     if _parallel_request is not None:
         try:
-            _parallel_context = _provision_parallel_worker(
-                str(_parallel_request["base_cwd"]),
-                str(_parallel_request["group_id"]),
-                requested_cwd=workdir,
-            )
+            reuse_worker_cwd = str(
+                _parallel_request.get("reuse_worker_cwd") or ""
+            ).strip()
+            if reuse_worker_cwd:
+                worker_top, worker_common, worker_head = _git_workspace_identity(
+                    reuse_worker_cwd
+                )
+                base_top, base_common, base_head = _git_workspace_identity(
+                    str(_parallel_request["base_cwd"])
+                )
+                if (
+                    not worker_top
+                    or not base_top
+                    or worker_common != base_common
+                    or worker_top == base_top
+                    or worker_head != str(_parallel_request.get("base_sha") or "")
+                    or base_head != str(_parallel_request.get("base_sha") or "")
+                ):
+                    raise RuntimeError(
+                        "recovered parallel worktree is not an isolated checkout "
+                        "of the recorded base repository"
+                    )
+                branch = subprocess.run(
+                    ["git", "symbolic-ref", "--short", "HEAD"],
+                    cwd=worker_top,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+                if branch.returncode != 0 or not str(branch.stdout or "").strip():
+                    raise RuntimeError("recovered parallel worktree has no branch")
+                _parallel_context = _ParallelWorkerContext(
+                    group_id=str(_parallel_request["group_id"]),
+                    base_cwd=str(_parallel_request["base_cwd"]),
+                    base_root=base_top,
+                    worker_cwd=reuse_worker_cwd,
+                    worker_root=worker_top,
+                    branch=str(branch.stdout or "").strip(),
+                )
+            else:
+                _parallel_context = _provision_parallel_worker(
+                    str(_parallel_request["base_cwd"]),
+                    str(_parallel_request["group_id"]),
+                    requested_cwd=workdir,
+                )
         except Exception as exc:
             _parallel_request["provision_error"] = str(exc)
             return tool_error(f"parallel worker provisioning failed: {exc}")
@@ -1902,6 +2101,14 @@ def _delegate_coding_task_impl(
         BACKEND_CODEX = "codex"
         BACKEND_OPENCODE = "opencode"
         backend = "codex"
+    if _background_startup is not None and _background_startup.recovery_launch:
+        recorded_backend = str(_background_startup.recovery_backend or "").strip()
+        if recorded_backend:
+            if recorded_backend not in {BACKEND_CODEX, BACKEND_OPENCODE}:
+                return tool_error(
+                    f"Recorded coding-worker backend is unavailable: {recorded_backend}"
+                )
+            backend = recorded_backend
 
     try:
         from hermes_cli.ui_work_routing import resolve_ui_work_route
@@ -2197,6 +2404,11 @@ def _delegate_coding_task_impl(
                 touch_activity = getattr(parent_agent, "_touch_activity", None)
                 if callable(touch_activity):
                     touch_activity(f"OpenCode coding worker event: {event_type}{suffix}")
+                if _background_startup is not None:
+                    _background_startup.persist_recovery(
+                        last_event=f"{event_type}{suffix}",
+                        phase="build",
+                    )
             except Exception:
                 pass
 
@@ -2390,11 +2602,49 @@ def _delegate_coding_task_impl(
             item_type = item.get("type") or ""
             suffix = f": {item_type}" if item_type else ""
             parent_agent._touch_activity(f"Coding worker event: {method}{suffix}")
+            if _background_startup is not None:
+                _background_startup.persist_recovery(
+                    last_event=f"{method}{suffix}",
+                )
         except Exception:
             pass
 
+    def _publish_codex_identity(identity: dict[str, Any]) -> None:
+        if _background_startup is None or not _background_startup.origin_work_item_id:
+            return
+        recovery_mode = str(identity.get("recovery_mode") or "")
+        if not _background_startup.persist_recovery(
+            force=True,
+            thread_id=str(identity.get("thread_id") or ""),
+            worker_pid=identity.get("worker_pid"),
+            worker_started_at=identity.get("worker_started_at"),
+            worker_scope_unit=str(identity.get("worker_scope_unit") or ""),
+            status=(
+                "resuming_thread"
+                if recovery_mode == "thread_resume"
+                else "relaunching"
+                if recovery_mode == "fresh_relaunch"
+                else "running"
+            ),
+            thread_resume_supported=recovery_mode == "thread_resume",
+        ):
+            raise RuntimeError(
+                "Could not durably checkpoint the Codex backend identity."
+            )
+
     started = time.monotonic()
     needs_plan = looks_complex_or_risky(task_text, classification_context)
+    recovered_phase = (
+        str(_background_startup.recovery_phase or "")
+        if _background_startup is not None
+        else ""
+    )
+    recovered_thread_id = (
+        str(_background_startup.recovery_thread_id or "")
+        if _background_startup is not None
+        else ""
+    )
+    skip_recovered_plan = recovered_phase == "build"
     agents: list[str] = []
     plan_text = ""
     turns = []
@@ -2469,8 +2719,24 @@ def _delegate_coding_task_impl(
                     or "background coding worker was cancelled before startup"
                 )
 
-            if needs_plan:
+            if needs_plan and not skip_recovered_plan:
                 agents.append("plan")
+                if (
+                    _background_startup is not None
+                    and _background_startup.origin_work_item_id
+                    and not _background_startup.persist_recovery(
+                        force=True,
+                        phase="plan",
+                        status=(
+                            "resuming_thread"
+                            if recovered_phase == "plan" and recovered_thread_id
+                            else "running"
+                        ),
+                    )
+                ):
+                    return tool_error(
+                        "Could not durably checkpoint the coding-worker plan phase."
+                    )
                 with CodexAppServerSession(
                     cwd=workdir,
                     codex_home=str(codex_home) if codex_home is not None else None,
@@ -2481,6 +2747,10 @@ def _delegate_coding_task_impl(
                     ),
                     approval_callback=approval_callback,
                     on_event=_touch_codex_activity,
+                    resume_thread_id=(
+                        recovered_thread_id if recovered_phase == "plan" else None
+                    ),
+                    on_identity=_publish_codex_identity,
                     env=worker_env,
                     replace_env=False,
                     scope_kind="coding-worker",
@@ -2490,8 +2760,16 @@ def _delegate_coding_task_impl(
                     if _background_startup is not None and callable(interrupt_callback):
                         _background_startup.set_interrupt_callback(interrupt_callback)
                     try:
+                        plan_input = _plan_prompt(worker_prompt)
+                        if recovered_phase == "plan":
+                            plan_input = (
+                                "Hermes restarted while this planning Worker Run was in "
+                                "progress. Continue the existing task from the durable "
+                                "thread/worktree state. Do not repeat completed external "
+                                "side effects.\n\n" + plan_input
+                            )
                         plan_turn = session.run_turn(
-                            user_input=_plan_prompt(worker_prompt),
+                            user_input=plan_input,
                             turn_timeout=timeout,
                         )
                     finally:
@@ -2539,14 +2817,42 @@ def _delegate_coding_task_impl(
                     )
                     return json.dumps(payload, ensure_ascii=False)
                 plan_text = plan_turn.final_text.strip()
+                if (
+                    _background_startup is not None
+                    and _background_startup.origin_work_item_id
+                    and not _background_startup.persist_recovery(
+                        force=True,
+                        phase="build",
+                        plan_text=plan_text,
+                        thread_id="",
+                        turn_id="",
+                        worker_pid=0,
+                        worker_started_at=0,
+                        worker_scope_unit="",
+                        status="running",
+                    )
+                ):
+                    return tool_error(
+                        "Could not durably checkpoint the coding-worker plan result."
+                    )
 
             agents.append("build")
             build_prompt = worker_prompt
+            if recovered_phase == "build" and _background_startup is not None:
+                plan_text = str(_background_startup.recovery_plan_text or "").strip()
             if plan_text:
                 build_prompt = (
                     f"{worker_prompt.rstrip()}\n\n"
                     "Codex plan to follow:\n"
                     f"{plan_text}\n"
+                )
+            if recovered_phase == "build":
+                build_prompt = (
+                    "Hermes restarted while this coding Worker Run was in progress. "
+                    "Continue from the existing durable thread and worktree. Inspect "
+                    "the current repository state before acting, preserve completed "
+                    "edits, and never repeat an already-completed external side effect.\n\n"
+                    + build_prompt
                 )
             reasoning_level = (
                 pass_cfg["complex_build_reasoning_level"]
@@ -2559,6 +2865,22 @@ def _delegate_coding_task_impl(
                 model=_attempt_model(build_pass),
                 reasoning=reasoning_level,
             )
+            if (
+                _background_startup is not None
+                and _background_startup.origin_work_item_id
+                and not _background_startup.persist_recovery(
+                    force=True,
+                    phase="build",
+                    status=(
+                        "resuming_thread"
+                        if recovered_phase == "build" and recovered_thread_id
+                        else "running"
+                    ),
+                )
+            ):
+                return tool_error(
+                    "Could not durably checkpoint the coding-worker build phase."
+                )
             with CodexAppServerSession(
                 cwd=workdir,
                 codex_home=str(codex_home) if codex_home is not None else None,
@@ -2568,6 +2890,10 @@ def _delegate_coding_task_impl(
                 ) + _codex_reasoning_args(reasoning_level),
                 approval_callback=approval_callback,
                 on_event=_touch_codex_activity,
+                resume_thread_id=(
+                    recovered_thread_id if recovered_phase == "build" else None
+                ),
+                on_identity=_publish_codex_identity,
                 env=worker_env,
                 replace_env=False,
                 scope_kind="coding-worker",
@@ -2739,6 +3065,74 @@ def _background_context_pack(
     }
 
 
+def _durable_worker_recovery_spec(
+    *,
+    task: str,
+    context_pack: dict[str, Any],
+    call_kwargs: dict[str, Any],
+    parallel_group: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return the bounded restart input for one background coding Worker Run."""
+
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception as exc:
+        raise RuntimeError(
+            "durable coding-worker registration requires secret redaction"
+        ) from exc
+
+    def safe_text(value: Any, limit: int = 40_000) -> str:
+        return redact_sensitive_text(str(value or ""), force=True)[:limit]
+
+    relevant_files: list[dict[str, str]] = []
+    for raw in list(context_pack.get("relevant_files") or [])[:32]:
+        if not isinstance(raw, dict):
+            continue
+        relevant_files.append(
+            {
+                "path": safe_text(raw.get("path"), 1000),
+                "note": safe_text(raw.get("note"), 1000),
+            }
+        )
+    allow_git = bool(call_kwargs.get("allow_git_pr_lifecycle"))
+    trusted_git = bool(call_kwargs.get("trusted_allow_git_pr_lifecycle"))
+    try:
+        requested_cwd = _resolve_cwd(call_kwargs.get("cwd"), call_kwargs.get("parent_agent"))
+    except Exception:
+        requested_cwd = str(call_kwargs.get("cwd") or "")
+    try:
+        from gateway.status import get_process_start_time
+
+        owner_started_at = int(get_process_start_time(os.getpid()) or 0)
+    except Exception:
+        owner_started_at = 0
+    spec: dict[str, Any] = {
+        "status": "registered",
+        "policy": "manual" if allow_git or trusted_git else "resume_or_relaunch",
+        "side_effect_mode": "external" if allow_git or trusted_git else "workspace_only",
+        "task": safe_text(task),
+        "context": safe_text(context_pack.get("context")),
+        "relevant_files": relevant_files,
+        "approach": safe_text(context_pack.get("approach"), 20_000),
+        "constraints": safe_text(context_pack.get("constraints"), 20_000),
+        "verification": safe_text(context_pack.get("verification"), 20_000),
+        "analysis_handoff_ids": list(context_pack.get("analysis_handoff_ids") or [])[:32],
+        "requested_cwd": safe_text(requested_cwd, 1000),
+        "model_tier": safe_text(call_kwargs.get("model_tier"), 240),
+        "reasoning_effort": safe_text(call_kwargs.get("reasoning_effort"), 240),
+        "scope_paths": list(call_kwargs.get("scope_paths") or [])[:32],
+        "turn_timeout_seconds": call_kwargs.get("turn_timeout_seconds"),
+        "allow_git_pr_lifecycle": allow_git,
+        "trusted_allow_git_pr_lifecycle": trusted_git,
+        "owner_started_at": owner_started_at,
+        "launch_generation": 1,
+        "heartbeat_at": time.time(),
+    }
+    if isinstance(parallel_group, dict):
+        spec["parallel_group"] = dict(parallel_group)
+    return spec
+
+
 def _background_result_status(payload: dict[str, Any]) -> str:
     if payload.get("success") is True:
         parallel_merge = payload.get("parallel_merge")
@@ -2827,6 +3221,57 @@ def _git_workspace_baseline(cwd: str) -> tuple[str, list[str]]:
     return sha, dirty_paths
 
 
+def _git_workspace_identity(cwd: str) -> tuple[str, str, str]:
+    """Return exact worktree root, shared Git dir, and HEAD for fencing."""
+
+    if not cwd:
+        return "", "", ""
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        common = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return "", "", ""
+    if any(result.returncode != 0 for result in (top, common, head)):
+        return "", "", ""
+    try:
+        top_path = str(Path(str(top.stdout or "").strip()).expanduser().resolve())
+        common_path = Path(str(common.stdout or "").strip()).expanduser()
+        if not common_path.is_absolute():
+            common_path = Path(cwd).expanduser().resolve() / common_path
+        common_text = str(common_path.resolve())
+    except Exception:
+        return "", "", ""
+    head_sha = str(head.stdout or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        return "", "", ""
+    return top_path, common_text, head_sha
+
+
 def _complete_background_parallel_result(
     payload: dict[str, Any],
     startup: _BackgroundCodingStartup,
@@ -2873,6 +3318,42 @@ def _complete_background_parallel_result(
                     )
         finally:
             _release_parallel_worker_reservation(resolved_worker_cwd)
+
+
+def _preserve_failed_background_parallel_result(
+    payload: dict[str, Any],
+    startup: _BackgroundCodingStartup,
+) -> None:
+    """Release runtime ownership without merging or deleting unsafe work."""
+
+    group = startup.parallel_group
+    if not group or not startup.worker_cwd:
+        return
+    resolved_worker_cwd = str(Path(startup.worker_cwd).expanduser().resolve())
+    result = {
+        "success": False,
+        "recovery_required": True,
+        "group_id": str(group.get("group_id") or ""),
+        "worker_cwd": resolved_worker_cwd,
+        "merged": False,
+        "merge_conflicts": [],
+        "worktree_kept": True,
+        "error": (
+            startup.cancel_reason
+            or "parallel coding-worker preflight failed before safe release"
+        ),
+        "next_action": (
+            "Inspect and recover the preserved isolated worktree manually; "
+            "Hermes did not merge or clean it up."
+        ),
+    }
+    payload["parallel_merge"] = result
+    with _BACKGROUND_PARALLEL_WORKERS_GUARD:
+        _BACKGROUND_PARALLEL_RESULTS[resolved_worker_cwd] = dict(result)
+        _BACKGROUND_PARALLEL_WORKERS.discard(resolved_worker_cwd)
+        while len(_BACKGROUND_PARALLEL_RESULTS) > 100:
+            _BACKGROUND_PARALLEL_RESULTS.pop(next(iter(_BACKGROUND_PARALLEL_RESULTS)))
+    _release_parallel_worker_reservation(resolved_worker_cwd)
 
 
 def _dispatch_background_coding_task(
@@ -2936,6 +3417,8 @@ def _dispatch_background_coding_task(
                 else _resolve_cwd(call_kwargs.get("cwd"), parent_agent)
             )
             base_sha, initial_dirty_paths = _git_workspace_baseline(baseline_cwd)
+        startup.base_sha = base_sha
+        startup.initial_dirty_paths = list(initial_dirty_paths)
         try:
             raw_result = delegate_coding_task(
                 **call_kwargs,
@@ -2961,7 +3444,10 @@ def _dispatch_background_coding_task(
                 "summary": "",
                 "error": str(raw_result),
             }
-        _complete_background_parallel_result(payload, startup)
+        if startup.cancel_reason:
+            _preserve_failed_background_parallel_result(payload, startup)
+        else:
+            _complete_background_parallel_result(payload, startup)
         if origin_work_item_id:
             if base_sha:
                 payload["base_sha"] = base_sha
@@ -3001,6 +3487,7 @@ def _dispatch_background_coding_task(
         discard_async_delegation,
         dispatch_async_delegation,
         mark_async_delegation_running,
+        reserve_async_delegation_id,
         terminalize_async_delegation,
     )
 
@@ -3036,6 +3523,23 @@ def _dispatch_background_coding_task(
     ).strip()
     if not origin_process_epoch and ":" in origin_attempt_id:
         origin_process_epoch = origin_attempt_id.rsplit(":", 1)[0]
+    try:
+        recovery_spec = _durable_worker_recovery_spec(
+            task=task_text,
+            context_pack=startup.context_pack,
+            call_kwargs=call_kwargs,
+            parallel_group=parallel_group,
+        )
+    except Exception as exc:
+        return tool_error(f"Could not prepare durable coding-worker recovery: {exc}")
+    delegation_id = reserve_async_delegation_id()
+    startup.delegation_id = delegation_id
+    startup.origin_work_item_id = origin_work_item_id
+    startup.origin_run_generation = origin_run_generation
+    startup.origin_attempt_id = origin_attempt_id
+    startup.origin_attempt_order = origin_attempt_order
+    startup.origin_owner_pid = origin_owner_pid
+    startup.origin_process_epoch = origin_process_epoch
     dispatch = dispatch_async_delegation(
         goal=task_text,
         context=context_text,
@@ -3058,6 +3562,8 @@ def _dispatch_background_coding_task(
             if isinstance(call_kwargs.get("scope_paths"), list)
             else []
         ),
+        recovery=recovery_spec,
+        delegation_id=delegation_id,
     )
     if dispatch.get("status") != "dispatched":
         error = str(
@@ -3078,6 +3584,27 @@ def _dispatch_background_coding_task(
 
     delegation_id = str(dispatch["delegation_id"])
     startup.ready.wait()
+    if isinstance(startup.worker_run, dict):
+        startup.worker_run["worker_run_id"] = delegation_id
+    if origin_work_item_id and startup.preflight_result is None:
+        try:
+            repository_root = _reservation_root(startup.worker_cwd)
+        except Exception:
+            repository_root = startup.worker_cwd
+        checkpointed = startup.persist_recovery(
+            force=True,
+            status="registered",
+            backend=startup.backend,
+            worktree=startup.worker_cwd,
+            repository_root=repository_root,
+            model_tier=startup.recovery_model_tier,
+            scope_paths=startup.scope_paths,
+            worker_run_id=delegation_id,
+        )
+        if not checkpointed:
+            startup.preflight_result = tool_error(
+                "Could not confirm durable coding-worker startup metadata."
+            )
     if startup.preflight_result is not None:
         if origin_work_item_id:
             try:
@@ -3164,6 +3691,794 @@ def _dispatch_background_coding_task(
         }
     startup.release.set()
     return json.dumps(handle, ensure_ascii=False)
+
+
+def _durable_process_alive(pid: Any, started_at: Any = None) -> Optional[bool]:
+    """Return process liveness, or ``None`` when it cannot be proven safely."""
+
+    try:
+        normalized_pid = int(pid or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if normalized_pid <= 0:
+        return False
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+
+        if not _pid_exists(normalized_pid):
+            return False
+        expected_start = int(started_at or 0)
+        if not expected_start:
+            return True
+        actual_start = int(get_process_start_time(normalized_pid) or 0)
+        if not actual_start:
+            return None
+        return actual_start == expected_start
+    except Exception:
+        return None
+
+
+def _durable_scope_alive(unit: Any) -> Optional[bool]:
+    """Return systemd scope liveness, or ``None`` when it is uncertain."""
+
+    normalized = str(unit or "").strip()
+    if not normalized:
+        return False
+    if not re.fullmatch(r"hermes-gateway-child-[A-Za-z0-9_.-]+(?:\.scope)?", normalized):
+        return None
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", normalized],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode in {3, 4}:
+        return False
+    return None
+
+
+def _recovery_parent_agent(
+    *,
+    item: dict[str, Any],
+    state: dict[str, Any],
+    owner_pid: int,
+    process_epoch: str,
+    cwd: str,
+) -> Any:
+    """Build the minimum non-model parent context for a recovered Worker Run."""
+
+    return SimpleNamespace(
+        api_mode="",
+        platform="discord",
+        session_id=str(item.get("session_id") or ""),
+        session_key=str(item.get("session_key") or ""),
+        gateway_session_key=str(item.get("session_key") or ""),
+        session_cwd=cwd,
+        turn_worker_runs=[],
+        _origin_work_item_id=str(item.get("id") or ""),
+        _origin_work_item_generation=state.get("generation"),
+        _origin_work_item_attempt_id=str(state.get("attempt_id") or ""),
+        _origin_work_item_attempt_order=state.get("attempt_order"),
+        _origin_work_item_owner_pid=owner_pid,
+        _origin_work_item_process_epoch=process_epoch,
+        _touch_activity=lambda _message: None,
+    )
+
+
+def _launch_recovered_coding_worker(
+    *,
+    ledger: Any,
+    item: dict[str, Any],
+    state: dict[str, Any],
+    delegation_id: str,
+    dispatch: dict[str, Any],
+    owner_pid: int,
+    process_epoch: str,
+    max_async_children: int,
+) -> dict[str, Any]:
+    recovery = dict(dispatch.get("recovery") or {})
+    worktree = str(recovery.get("worktree") or recovery.get("requested_cwd") or "")
+    parent_agent = _recovery_parent_agent(
+        item=item,
+        state=state,
+        owner_pid=owner_pid,
+        process_epoch=process_epoch,
+        cwd=worktree,
+    )
+    startup = _BackgroundCodingStartup(
+        task=str(recovery.get("task") or ""),
+        context_pack={
+            "context": str(recovery.get("context") or ""),
+            "relevant_files": list(recovery.get("relevant_files") or []),
+            "approach": str(recovery.get("approach") or ""),
+            "constraints": str(recovery.get("constraints") or ""),
+            "verification": str(recovery.get("verification") or ""),
+            "analysis_handoff_ids": list(recovery.get("analysis_handoff_ids") or []),
+        },
+        parallel_group=(
+            dict(recovery.get("parallel_group"))
+            if isinstance(recovery.get("parallel_group"), dict)
+            else None
+        ),
+        delegation_id=delegation_id,
+        origin_work_item_id=str(item.get("id") or ""),
+        origin_run_generation=state.get("generation"),
+        origin_attempt_id=str(state.get("attempt_id") or ""),
+        origin_attempt_order=state.get("attempt_order"),
+        origin_owner_pid=owner_pid,
+        origin_process_epoch=process_epoch,
+        recovery_phase=str(recovery.get("phase") or "plan"),
+        recovery_thread_id=str(recovery.get("thread_id") or ""),
+        recovery_plan_text=str(recovery.get("plan_text") or ""),
+        recovery_backend=str(recovery.get("backend") or ""),
+        recovery_model_tier=str(recovery.get("model_tier") or ""),
+        recovery_launch=True,
+        base_sha=str(recovery.get("base_sha") or ""),
+        initial_dirty_paths=list(recovery.get("initial_dirty_paths") or []),
+        git_top_level=str(recovery.get("git_top_level") or ""),
+        git_common_dir=str(recovery.get("git_common_dir") or ""),
+    )
+
+    call_kwargs = {
+        "task": startup.task,
+        "context": startup.context_pack["context"],
+        "cwd": worktree,
+        "turn_timeout_seconds": recovery.get("turn_timeout_seconds"),
+        "model_tier": str(recovery.get("model_tier") or "") or None,
+        "reasoning_effort": str(recovery.get("reasoning_effort") or "") or None,
+        "relevant_files": startup.context_pack["relevant_files"],
+        "approach": startup.context_pack["approach"],
+        "constraints": startup.context_pack["constraints"],
+        "verification": startup.context_pack["verification"],
+        "scope_paths": list(recovery.get("scope_paths") or []),
+        "analysis_handoff_ids": None,
+        "background": False,
+        "allow_git_pr_lifecycle": bool(recovery.get("allow_git_pr_lifecycle")),
+        "trusted_allow_git_pr_lifecycle": bool(
+            recovery.get("trusted_allow_git_pr_lifecycle")
+        ),
+        "parent_agent": parent_agent,
+        "parent_messages": None,
+        "_background_startup": startup,
+    }
+    if startup.parallel_group:
+        call_kwargs["_parallel_group"] = {
+            **startup.parallel_group,
+            "reuse_worker_cwd": worktree,
+        }
+
+    def _runner() -> dict[str, Any]:
+        parallel = startup.parallel_group or {}
+        base_sha = str(recovery.get("base_sha") or parallel.get("base_sha") or "")
+        initial_dirty_paths = list(
+            recovery.get("initial_dirty_paths")
+            or parallel.get("initial_dirty_paths")
+            or []
+        )
+        try:
+            raw_result = delegate_coding_task(**call_kwargs)
+        except Exception as exc:
+            raw_result = tool_error(f"recovered background coding worker failed: {exc}")
+        if not startup.ready.is_set():
+            startup.preflight_result = raw_result
+            startup.ready.set()
+            startup.release.wait()
+            return {
+                "status": "preflight_failed",
+                "summary": "",
+                "error": str(raw_result),
+                "result": json.loads(raw_result),
+            }
+        try:
+            payload = json.loads(raw_result)
+        except (TypeError, ValueError):
+            payload = {
+                "success": False,
+                "status": "partial",
+                "summary": "",
+                "error": str(raw_result),
+            }
+        if startup.cancel_reason:
+            _preserve_failed_background_parallel_result(payload, startup)
+        else:
+            _complete_background_parallel_result(payload, startup)
+        if base_sha:
+            payload["base_sha"] = base_sha
+        if initial_dirty_paths:
+            payload["initial_dirty_paths"] = initial_dirty_paths
+        evidence_cwd = startup.worker_cwd or worktree
+        parallel_merge = payload.get("parallel_merge")
+        if (
+            startup.parallel_group
+            and isinstance(parallel_merge, dict)
+            and parallel_merge.get("merged") is True
+        ):
+            evidence_cwd = str(startup.parallel_group.get("base_cwd") or "")
+        head_sha = _clean_git_head_sha(evidence_cwd)
+        if head_sha:
+            payload["head_sha"] = head_sha
+        worker_run = dict(startup.worker_run or {})
+        worker_run["worker_run_id"] = delegation_id
+        return {
+            "status": _background_result_status(payload),
+            "summary": payload.get("summary"),
+            "error": payload.get("error"),
+            "duration_seconds": payload.get("duration_seconds", 0),
+            "model": worker_run.get("model") or "",
+            "result": payload,
+            "_async_coding_worker": {
+                "task": startup.task,
+                "context_pack": startup.context_pack,
+                "worker_cwd": startup.worker_cwd or worktree,
+                "model_tier": startup.model_tier,
+                "scope_paths": startup.scope_paths or list(recovery.get("scope_paths") or []),
+                "worker_run": worker_run,
+                "parallel_group": startup.parallel_group,
+            },
+        }
+
+    from tools.async_delegation import (
+        mark_async_delegation_running,
+        recover_async_coding_delegation,
+        terminalize_async_delegation,
+    )
+
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    routing = {
+        key: str(value)
+        for key, value in {
+            "platform": "discord",
+            "chat_id": source.get("chat_id"),
+            "thread_id": source.get("thread_id"),
+            "user_id": source.get("user_id"),
+            "message_id": item.get("message_id"),
+        }.items()
+        if value
+    }
+    launched = recover_async_coding_delegation(
+        delegation_id=delegation_id,
+        goal=startup.task,
+        context=startup.context_pack["context"],
+        session_key=str(item.get("session_key") or ""),
+        runner=_runner,
+        interrupt_fn=startup.request_interrupt,
+        max_async_children=max_async_children,
+        origin_work_item_id=str(item.get("id") or ""),
+        origin_run_generation=int(state.get("generation") or 0),
+        origin_attempt_id=str(state.get("attempt_id") or ""),
+        origin_attempt_order=int(state.get("attempt_order") or 0),
+        origin_owner_pid=owner_pid,
+        origin_process_epoch=process_epoch,
+        origin_scope_paths=list(recovery.get("scope_paths") or []),
+        recovery=recovery,
+        routing=routing,
+    )
+    if launched.get("status") not in {"dispatched", "already_running"}:
+        return launched
+    if launched.get("status") == "already_running":
+        return launched
+    startup.ready.wait()
+    if startup.preflight_result is not None:
+        try:
+            preflight = json.loads(startup.preflight_result)
+        except (TypeError, ValueError):
+            preflight = {
+                "success": False,
+                "status": "preflight_failed",
+                "summary": "",
+                "error": str(startup.preflight_result),
+            }
+        terminalize_async_delegation(
+            delegation_id,
+            {
+                "status": "preflight_failed",
+                "summary": preflight.get("summary"),
+                "error": preflight.get("error"),
+                "result": preflight,
+                "_async_coding_worker": {
+                    "task": startup.task,
+                    "context_pack": startup.context_pack,
+                    "worker_cwd": worktree,
+                    "model_tier": recovery.get("model_tier") or "default",
+                    "scope_paths": list(recovery.get("scope_paths") or []),
+                    "worker_run": {},
+                    "parallel_group": startup.parallel_group,
+                },
+            },
+            "preflight_failed",
+            enqueue=False,
+        )
+        startup.release.set()
+        return {"status": "preflight_failed", "delegation_id": delegation_id}
+    startup.worker_run = startup.worker_run or {}
+    startup.worker_run["worker_run_id"] = delegation_id
+    if not startup.persist_recovery(
+        force=True,
+        backend=startup.backend,
+        worktree=startup.worker_cwd or worktree,
+        repository_root=_reservation_root(startup.worker_cwd or worktree),
+        model_tier=startup.recovery_model_tier,
+        scope_paths=startup.scope_paths,
+        worker_run_id=delegation_id,
+    ):
+        reason = "Could not confirm recovered coding-worker startup metadata."
+        startup.cancel_reason = reason
+        terminalize_async_delegation(
+            delegation_id,
+            {
+                "status": "start_failed",
+                "summary": "",
+                "error": reason,
+                "result": {
+                    "success": False,
+                    "status": "start_failed",
+                    "summary": "",
+                    "error": reason,
+                },
+            },
+            "start_failed",
+            enqueue=False,
+        )
+        startup.release.set()
+        return {"status": "start_failed", "delegation_id": delegation_id}
+    if not mark_async_delegation_running(delegation_id):
+        reason = "Recovered coding Worker Run lost its durable start claim."
+        startup.cancel_reason = reason
+        terminalize_async_delegation(
+            delegation_id,
+            {
+                "status": "start_failed",
+                "summary": "",
+                "error": reason,
+                "result": {
+                    "success": False,
+                    "status": "start_failed",
+                    "summary": "",
+                    "error": reason,
+                },
+            },
+            "start_failed",
+            enqueue=False,
+        )
+        startup.release.set()
+        return {"status": "start_failed", "delegation_id": delegation_id}
+    startup.release.set()
+    return {"status": "dispatched", "delegation_id": delegation_id}
+
+
+def recover_durable_coding_workers(
+    *,
+    ledger: Any,
+    process_epoch: str,
+    owner_pid: Optional[int] = None,
+    max_async_children: Optional[int] = None,
+    process_alive: Callable[[Any, Any], Optional[bool]] = _durable_process_alive,
+    scope_alive: Callable[[Any], Optional[bool]] = _durable_scope_alive,
+    launch_worker: Callable[..., dict[str, Any]] = _launch_recovered_coding_worker,
+) -> dict[str, Any]:
+    """Reconcile every durable Discord coding child before parent replay."""
+
+    current_pid = int(owner_pid or os.getpid())
+    limit = int(max_async_children or get_coding_worker_background_max_concurrent())
+    report: dict[str, Any] = {
+        "enumerated": 0,
+        "already_owned": 0,
+        "waiting_alive": 0,
+        "claimed": 0,
+        "launched": 0,
+        "completed": 0,
+        "manual_fallback": 0,
+        "failed": 0,
+        "work_item_ids": [],
+        "notices": [],
+    }
+    try:
+        items = list(ledger.incomplete_items())
+    except Exception:
+        logger.exception("Could not enumerate durable coding Worker Runs")
+        report["failed"] += 1
+        return report
+
+    for item in items:
+        if item.get("platform") != "discord":
+            continue
+        work_id = str(item.get("id") or "")
+        state = ledger.required_async_completion_state(work_id)
+        if not isinstance(state, dict) or not state.get("owns_recovery"):
+            continue
+        if work_id and work_id not in report["work_item_ids"]:
+            report["work_item_ids"].append(work_id)
+        for delegation_id, dispatch in dict(state.get("dispatches") or {}).items():
+            if dispatch.get("kind") != "coding_worker" or dispatch.get("required") is not True:
+                continue
+            if dispatch.get("state") not in {"registered", "running"}:
+                if dispatch.get("state") == "terminal":
+                    report["completed"] += 1
+                continue
+            report["enumerated"] += 1
+            recovery = dict(dispatch.get("recovery") or {})
+            dispatch_pid = int(dispatch.get("owner_pid") or 0)
+            dispatch_epoch = str(dispatch.get("process_epoch") or "")
+            if dispatch_pid == current_pid and dispatch_epoch == process_epoch:
+                from tools.async_delegation import list_async_delegations
+
+                live_ids = {
+                    str(row.get("delegation_id") or "")
+                    for row in list_async_delegations()
+                    if row.get("status") in {"running", "finalizing"}
+                }
+                if delegation_id in live_ids:
+                    report["already_owned"] += 1
+                    continue
+            if dispatch_pid == current_pid and dispatch_epoch != process_epoch:
+                owner_alive = False
+            else:
+                owner_alive = process_alive(
+                    dispatch_pid,
+                    recovery.get("owner_started_at"),
+                )
+            worker_alive = process_alive(
+                recovery.get("worker_pid"),
+                recovery.get("worker_started_at"),
+            )
+            if recovery.get("worker_scope_unit") and worker_alive is not True:
+                recorded_scope_alive = scope_alive(recovery.get("worker_scope_unit"))
+                if recorded_scope_alive is True:
+                    worker_alive = True
+                elif recorded_scope_alive is None:
+                    worker_alive = None
+            if dispatch_epoch != process_epoch and owner_alive is None:
+                ledger.update_required_async_dispatch_recovery(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=state.get("generation"),
+                    attempt_id=state.get("attempt_id"),
+                    attempt_order=state.get("attempt_order"),
+                    owner_pid=dispatch_pid,
+                    process_epoch=dispatch_epoch,
+                    updates={
+                        "status": "waiting_for_owner",
+                        "last_error": (
+                            "previous gateway owner liveness is unknown; "
+                            "recovery deferred"
+                        ),
+                        "heartbeat_at": time.time(),
+                    },
+                )
+                report["waiting_alive"] += 1
+                if len(report["notices"]) < 32:
+                    report["notices"].append(
+                        {
+                            "kind": "waiting",
+                            "work_item_id": work_id,
+                            "delegation_id": delegation_id,
+                            "session_key": str(item.get("session_key") or ""),
+                            "source": dict(item.get("source") or {}),
+                            "message": (
+                                "Hermes could not prove the previous gateway owner is "
+                                "dead, so it is waiting instead of risking a duplicate "
+                                "coding attempt."
+                            ),
+                        }
+                    )
+                continue
+            if dispatch_epoch != process_epoch and owner_alive:
+                ledger.update_required_async_dispatch_recovery(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=state.get("generation"),
+                    attempt_id=state.get("attempt_id"),
+                    attempt_order=state.get("attempt_order"),
+                    owner_pid=dispatch_pid,
+                    process_epoch=dispatch_epoch,
+                    updates={
+                        "status": "waiting_for_owner",
+                        "last_error": "previous gateway owner is still alive; recovery deferred",
+                        "heartbeat_at": time.time(),
+                    },
+                )
+                report["waiting_alive"] += 1
+                if len(report["notices"]) < 32:
+                    report["notices"].append(
+                        {
+                            "kind": "waiting",
+                            "work_item_id": work_id,
+                            "delegation_id": delegation_id,
+                            "session_key": str(item.get("session_key") or ""),
+                            "source": dict(item.get("source") or {}),
+                            "message": (
+                                "The previous gateway owner is still alive. Hermes is "
+                                "waiting instead of starting a duplicate coding attempt."
+                            ),
+                        }
+                    )
+                continue
+            if dispatch_epoch != process_epoch and worker_alive:
+                ledger.update_required_async_dispatch_recovery(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=state.get("generation"),
+                    attempt_id=state.get("attempt_id"),
+                    attempt_order=state.get("attempt_order"),
+                    owner_pid=dispatch_pid,
+                    process_epoch=dispatch_epoch,
+                    updates={
+                        "status": "waiting_for_worker",
+                        "last_error": (
+                            "coding backend is still alive but its stdio owner is gone; "
+                            "waiting before resume/relaunch to avoid duplicate side effects"
+                        ),
+                        "heartbeat_at": time.time(),
+                    },
+                )
+                report["waiting_alive"] += 1
+                if len(report["notices"]) < 32:
+                    report["notices"].append(
+                        {
+                            "kind": "waiting",
+                            "work_item_id": work_id,
+                            "delegation_id": delegation_id,
+                            "session_key": str(item.get("session_key") or ""),
+                            "source": dict(item.get("source") or {}),
+                            "message": (
+                                "The coding backend is still alive without a reconnectable "
+                                "stdio owner. Hermes is waiting to avoid duplicate side effects."
+                            ),
+                        }
+                    )
+                continue
+            if dispatch_epoch != process_epoch and worker_alive is None:
+                ledger.update_required_async_dispatch_recovery(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=state.get("generation"),
+                    attempt_id=state.get("attempt_id"),
+                    attempt_order=state.get("attempt_order"),
+                    owner_pid=dispatch_pid,
+                    process_epoch=dispatch_epoch,
+                    updates={
+                        "status": "waiting_for_worker",
+                        "last_error": (
+                            "coding backend liveness is unknown; recovery deferred "
+                            "to avoid duplicate side effects"
+                        ),
+                        "heartbeat_at": time.time(),
+                    },
+                )
+                report["waiting_alive"] += 1
+                if len(report["notices"]) < 32:
+                    report["notices"].append(
+                        {
+                            "kind": "waiting",
+                            "work_item_id": work_id,
+                            "delegation_id": delegation_id,
+                            "session_key": str(item.get("session_key") or ""),
+                            "source": dict(item.get("source") or {}),
+                            "message": (
+                                "Hermes could not prove the prior coding backend is dead, "
+                                "so it is waiting to avoid duplicate side effects."
+                            ),
+                        }
+                    )
+                continue
+            exact_worktree = str(recovery.get("worktree") or "")
+            worktree = str(exact_worktree or recovery.get("requested_cwd") or "")
+            unsafe_reason = ""
+            external_authority = bool(
+                recovery.get("side_effect_mode") == "external"
+                or recovery.get("allow_git_pr_lifecycle") is True
+                or recovery.get("trusted_allow_git_pr_lifecycle") is True
+            )
+            if recovery.get("policy") != "resume_or_relaunch" or external_authority:
+                unsafe_reason = (
+                    "The interrupted coding Worker Run was authorized for external git/PR "
+                    "side effects, so Hermes will not relaunch it automatically. Inspect "
+                    f"the durable worktree and Worker Run {delegation_id}, then explicitly resume."
+                )
+            elif recovery.get("backend") != "codex":
+                unsafe_reason = (
+                    "The interrupted coding Worker Run has no reconnectable Codex "
+                    "backend identity. OpenCode or missing backend records require "
+                    "manual recovery to avoid duplicate execution."
+                )
+            elif recovery.get("parallel_group") and not exact_worktree:
+                unsafe_reason = (
+                    "The interrupted parallel coding Worker Run has no exact durable "
+                    "isolated worktree. Hermes will not fall back to the base checkout."
+                )
+            elif not recovery.get("task") or not recovery.get("scope_paths"):
+                unsafe_reason = (
+                    "Durable coding-worker task or mutation scope is missing; automatic "
+                    "relaunch cannot prove ownership safely."
+                )
+            elif not worktree or not Path(worktree).is_dir():
+                unsafe_reason = (
+                    f"Durable coding-worker worktree is unavailable: {worktree or '(missing)'}. "
+                    "Restore it and explicitly resume the Worker Run."
+                )
+            elif not re.fullmatch(r"[0-9a-f]{40}", str(recovery.get("base_sha") or "")):
+                unsafe_reason = (
+                    "The interrupted coding Worker Run has no trustworthy original Git "
+                    "baseline, so deterministic closeout cannot be recovered safely."
+                )
+            else:
+                actual_top, actual_common, actual_head = _git_workspace_identity(
+                    worktree
+                )
+                if (
+                    not actual_top
+                    or actual_top != str(recovery.get("git_top_level") or "")
+                    or actual_common != str(recovery.get("git_common_dir") or "")
+                    or actual_head != str(recovery.get("base_sha") or "")
+                ):
+                    unsafe_reason = (
+                        "The interrupted coding Worker Run no longer matches its exact "
+                        "durable Git worktree, repository identity, and baseline."
+                    )
+            if not unsafe_reason and recovery.get("analysis_handoff_ids"):
+                unsafe_reason = (
+                    "The interrupted coding Worker Run depends on structured analysis "
+                    "handoffs that cannot be revalidated after restart."
+                )
+            if unsafe_reason:
+                result = ledger.mark_required_async_dispatch_outcome_unknown(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=state.get("generation"),
+                    attempt_id=state.get("attempt_id"),
+                    attempt_order=state.get("attempt_order"),
+                    expected_owner_pid=dispatch_pid,
+                    expected_process_epoch=dispatch_epoch,
+                    reason=unsafe_reason,
+                )
+                report["manual_fallback"] += bool(result)
+                report["failed"] += not bool(result)
+                if len(report["notices"]) < 32:
+                    report["notices"].append(
+                        {
+                            "kind": "manual_fallback",
+                            "work_item_id": work_id,
+                            "delegation_id": delegation_id,
+                            "session_key": str(item.get("session_key") or ""),
+                            "source": dict(item.get("source") or {}),
+                            "message": unsafe_reason,
+                        }
+                    )
+                continue
+            launch_generation = int(recovery.get("launch_generation") or 0) + 1
+            launch_id = f"{process_epoch}:{delegation_id}:{launch_generation}"
+            if dispatch_pid == current_pid and dispatch_epoch == process_epoch:
+                claimed = state
+            else:
+                claimed = ledger.claim_required_async_dispatch_recovery(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=state.get("generation"),
+                    attempt_id=state.get("attempt_id"),
+                    attempt_order=state.get("attempt_order"),
+                    expected_owner_pid=dispatch_pid,
+                    expected_process_epoch=dispatch_epoch,
+                    owner_pid=current_pid,
+                    process_epoch=process_epoch,
+                    launch_id=launch_id,
+                )
+            if not isinstance(claimed, dict):
+                continue
+            report["claimed"] += 1
+            claimed_dispatch = dict(claimed.get("dispatches") or {}).get(delegation_id)
+            if not isinstance(claimed_dispatch, dict):
+                report["failed"] += 1
+                continue
+            try:
+                result = launch_worker(
+                    ledger=ledger,
+                    item=item,
+                    state=claimed,
+                    delegation_id=delegation_id,
+                    dispatch=claimed_dispatch,
+                    owner_pid=current_pid,
+                    process_epoch=process_epoch,
+                    max_async_children=limit,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Durable coding Worker Run %s launch failed",
+                    delegation_id,
+                )
+                ledger.update_required_async_dispatch_recovery(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=claimed.get("generation"),
+                    attempt_id=claimed.get("attempt_id"),
+                    attempt_order=claimed.get("attempt_order"),
+                    owner_pid=current_pid,
+                    process_epoch=process_epoch,
+                    updates={
+                        "status": "failed",
+                        "last_error": f"recovery launch failed: {exc}",
+                    },
+                )
+                report["failed"] += 1
+                continue
+            if result.get("status") in {"dispatched", "already_running"}:
+                report["launched"] += 1
+                if result.get("status") == "dispatched" and len(report["notices"]) < 32:
+                    report["notices"].append(
+                        {
+                            "kind": "resumed",
+                            "work_item_id": work_id,
+                            "delegation_id": delegation_id,
+                            "session_key": str(item.get("session_key") or ""),
+                            "source": dict(item.get("source") or {}),
+                            "message": (
+                                "Hermes automatically resumed the interrupted coding "
+                                "Worker Run in its durable worktree."
+                            ),
+                        }
+                    )
+            elif result.get("status") == "deferred":
+                logger.info("Durable coding Worker Run %s deferred for capacity", delegation_id)
+            elif (
+                dispatch_pid == current_pid
+                and dispatch_epoch == process_epoch
+                and result.get("status") == "rejected"
+                and "already terminal in this process"
+                in str(result.get("error") or "")
+            ):
+                reason = (
+                    "The in-process coding Worker Run is already terminal, but its "
+                    "durable terminal result could not be reconciled. Hermes will not "
+                    "relaunch it automatically because the outcome may already include "
+                    "workspace mutations."
+                )
+                reconciled = ledger.mark_required_async_dispatch_outcome_unknown(
+                    work_id,
+                    delegation_id=delegation_id,
+                    generation=claimed.get("generation"),
+                    attempt_id=claimed.get("attempt_id"),
+                    attempt_order=claimed.get("attempt_order"),
+                    expected_owner_pid=current_pid,
+                    expected_process_epoch=process_epoch,
+                    reason=reason,
+                )
+                report["manual_fallback"] += bool(reconciled)
+                report["failed"] += not bool(reconciled)
+                if reconciled and len(report["notices"]) < 32:
+                    report["notices"].append(
+                        {
+                            "kind": "manual_fallback",
+                            "work_item_id": work_id,
+                            "delegation_id": delegation_id,
+                            "session_key": str(item.get("session_key") or ""),
+                            "source": dict(item.get("source") or {}),
+                            "message": reason,
+                        }
+                    )
+            else:
+                report["failed"] += 1
+
+        refreshed = ledger.required_async_completion_state(work_id)
+        if (
+            isinstance(refreshed, dict)
+            and refreshed.get("owns_recovery")
+            and not refreshed.get("sealed")
+            and refreshed.get("pending_count") == 0
+            and refreshed.get("dispatches")
+        ):
+            ledger.seal_required_async_attempt(
+                work_id,
+                generation=refreshed.get("generation"),
+                attempt_id=refreshed.get("attempt_id"),
+                attempt_order=refreshed.get("attempt_order"),
+            )
+    report["work_item_ids"] = report["work_item_ids"][:64]
+    return report
 
 
 def _delegate_coding_task_dispatch(
@@ -3259,6 +4574,10 @@ def _delegate_coding_task_dispatch(
         "group_id": group_id,
         "base_cwd": base_cwd,
     }
+    if group.get("base_sha"):
+        parallel_request["base_sha"] = str(group["base_sha"])
+    if group.get("reuse_worker_cwd"):
+        parallel_request["reuse_worker_cwd"] = str(group["reuse_worker_cwd"])
     call_kwargs["cwd"] = _resolve_cwd(cwd, parent_agent) if cwd else base_cwd
     call_kwargs["_parallel_request"] = parallel_request
     try:

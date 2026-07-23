@@ -4313,10 +4313,10 @@ def test_required_async_v2_checkpoint_mutation_upgrades_schema(tmp_path):
     )
 
     assert state is not None
-    assert state["schema_version"] == 5
+    assert state["schema_version"] == 6
     assert state["checkpoint"]["tree_sha"] == "b" * 40
     stored = ledger.get(work_id)["required_async_completions"]
-    assert stored["schema_version"] == 5
+    assert stored["schema_version"] == 6
     assert stored["checkpoint"]["parent_sha"] == "a" * 40
 
 

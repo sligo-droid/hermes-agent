@@ -184,6 +184,66 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_recovery_resumes_existing_thread_and_reports_identity(self):
+        client = FakeClient()
+        identities = []
+
+        def handler(method, params):
+            if method == "thread/resume":
+                assert params == {"threadId": "thread-old", "cwd": "/tmp"}
+                return {"thread": {"id": "thread-old"}}
+            raise AssertionError(method)
+
+        client._request_handler = handler
+        s = make_session(
+            client,
+            resume_thread_id="thread-old",
+            on_identity=identities.append,
+        )
+
+        assert s.ensure_started() == "thread-old"
+        assert [method for method, _params in client.requests] == ["thread/resume"]
+        assert identities[0]["recovery_mode"] == "thread_resume"
+
+    def test_recovery_falls_back_to_fresh_thread_when_resume_is_unsupported(self):
+        client = FakeClient()
+        identities = []
+
+        def handler(method, params):
+            if method == "thread/resume":
+                raise session_mod.CodexAppServerError(
+                    code=-32601,
+                    message="method not found",
+                )
+            if method == "thread/start":
+                return {"thread": {"id": "thread-new"}}
+            raise AssertionError(method)
+
+        client._request_handler = handler
+        s = make_session(
+            client,
+            resume_thread_id="thread-old",
+            on_identity=identities.append,
+        )
+
+        assert s.ensure_started() == "thread-new"
+        assert [method for method, _params in client.requests] == [
+            "thread/resume",
+            "thread/start",
+        ]
+        assert identities[0]["recovery_mode"] == "fresh_relaunch"
+
+    def test_identity_checkpoint_failure_aborts_thread_start(self):
+        client = FakeClient()
+
+        def reject_identity(_identity):
+            raise RuntimeError("checkpoint failed")
+
+        s = make_session(client, on_identity=reject_identity)
+
+        with pytest.raises(RuntimeError, match="checkpoint failed"):
+            s.ensure_started()
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)

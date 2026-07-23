@@ -280,6 +280,8 @@ class CodexAppServerSession:
         replace_env: bool = False,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        resume_thread_id: Optional[str] = None,
+        on_identity: Optional[Callable[[dict[str, Any]], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         scope_kind: str = "codex-app-server",
@@ -299,6 +301,8 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._resume_thread_id = str(resume_thread_id or "").strip()
+        self._on_identity = on_identity
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
         self._scope_kind = scope_kind
@@ -355,7 +359,26 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        recovery_mode = "fresh"
+        if self._resume_thread_id:
+            try:
+                result = self._client.request(
+                    "thread/resume",
+                    {"threadId": self._resume_thread_id, "cwd": self._cwd},
+                    timeout=15,
+                )
+                recovery_mode = "thread_resume"
+            except (CodexAppServerError, TimeoutError) as exc:
+                logger.warning(
+                    "codex thread resume unavailable for %s; starting a fresh "
+                    "thread in the existing worktree: %s",
+                    self._resume_thread_id[:12],
+                    exc,
+                )
+                result = self._client.request("thread/start", params, timeout=15)
+                recovery_mode = "fresh_relaunch"
+        else:
+            result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -376,6 +399,22 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        if self._on_identity is not None:
+            self._on_identity(
+                {
+                    "thread_id": self._thread_id,
+                    "worker_pid": getattr(self._client, "process_id", 0),
+                    "worker_started_at": getattr(
+                        self._client,
+                        "process_started_at",
+                        0,
+                    ),
+                    "worker_scope_unit": str(
+                        getattr(self._client, "child_scope_unit", "") or ""
+                    ),
+                    "recovery_mode": recovery_mode,
+                }
+            )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s",
             self._thread_id[:8],

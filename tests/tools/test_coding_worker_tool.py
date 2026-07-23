@@ -546,6 +546,10 @@ def test_required_background_worker_marks_running_before_model_start(
             calls.append(("running", work_id, kwargs))
             return {"dispatches": {kwargs["delegation_id"]: {"state": "running"}}}
 
+        def update_required_async_dispatch_recovery(self, work_id, **kwargs):
+            calls.append(("checkpoint", work_id, kwargs))
+            return {"dispatches": {kwargs["delegation_id"]: {"state": "registered"}}}
+
         def record_required_async_completion(self, work_id, **kwargs):
             calls.append(("complete", work_id, kwargs))
             return {
@@ -596,6 +600,15 @@ def test_required_background_worker_marks_running_before_model_start(
     assert registration["owner_pid"] == os.getpid()
     assert registration["process_epoch"] == "gateway-epoch"
     assert registration["scope_paths"] == ["src"]
+    assert registration["recovery"]["task"] == "update the parser"
+    assert registration["recovery"]["policy"] == "resume_or_relaunch"
+    assert registration["recovery"]["scope_paths"] == ["src"]
+    checkpoint = next(call for call in calls if call[0] == "checkpoint")[2]["updates"]
+    assert checkpoint["worktree"] == str(repo)
+    assert len(checkpoint["base_sha"]) == 40
+    assert checkpoint["model_tier"] == "trivial"
+    assert checkpoint["git_top_level"] == str(repo)
+    assert checkpoint["git_common_dir"].endswith("/.git")
     assert event["delegation_id"] == handle["delegation_id"]
     completion = next(call for call in calls if call[0] == "complete")[2]
     head_sha = completion["evidence"]["head_sha"]
@@ -603,6 +616,102 @@ def test_required_background_worker_marks_running_before_model_start(
     assert set(head_sha) <= set("0123456789abcdef")
     assert event["result"]["head_sha"] == head_sha
     _reset_background_state()
+
+
+def test_runtime_recovery_checkpoint_redacts_nested_strings(monkeypatch):
+    captured = {}
+
+    class Ledger:
+        def update_required_async_dispatch_recovery(self, _work_id, **kwargs):
+            captured.update(kwargs["updates"])
+            return {"dispatches": {kwargs["delegation_id"]: {"state": "running"}}}
+
+    monkeypatch.setattr(ad, "_required_async_ledger", lambda: Ledger())
+    monkeypatch.setattr(
+        "agent.redact.redact_sensitive_text",
+        lambda value, force=False: str(value).replace("SECRET", "[REDACTED]"),
+    )
+    startup = cwt._BackgroundCodingStartup(
+        task="task",
+        context_pack={},
+        delegation_id="deleg-redact",
+        origin_work_item_id="work-redact",
+        origin_run_generation=1,
+        origin_attempt_id="epoch:1",
+        origin_attempt_order=1,
+        origin_owner_pid=123,
+        origin_process_epoch="epoch",
+    )
+
+    assert startup.persist_recovery(
+        force=True,
+        plan_text="use SECRET",
+        relevant_files=[{"note": "SECRET nested"}],
+    )
+    assert captured["plan_text"] == "use [REDACTED]"
+    assert captured["relevant_files"] == [{"note": "[REDACTED] nested"}]
+
+
+def test_recovered_startup_rechecks_git_identity_after_release(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_worktree(repo)
+    top, common, head = cwt._git_workspace_identity(str(repo))
+    startup = cwt._BackgroundCodingStartup(
+        task="task",
+        context_pack={},
+        recovery_launch=True,
+        base_sha=head,
+        git_top_level=top,
+        git_common_dir=common,
+    )
+    result = {}
+
+    def ready_worker():
+        result["accepted"] = startup.mark_ready(
+            worker_cwd=str(repo),
+            model_tier=None,
+            scope_paths=["src"],
+            backend="codex",
+            worker_run={},
+        )
+
+    thread = threading.Thread(target=ready_worker)
+    thread.start()
+    assert startup.ready.wait(5)
+    (repo / "changed.txt").write_text("changed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "change head"], check=True)
+    startup.release.set()
+    thread.join(5)
+
+    assert result["accepted"] is False
+    assert "changed before release" in startup.cancel_reason
+    assert startup.model_tier == "default"
+    assert startup.recovery_model_tier == ""
+
+
+def test_failed_parallel_preflight_preserves_isolated_worktree(tmp_path):
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    startup = cwt._BackgroundCodingStartup(
+        task="task",
+        context_pack={},
+        parallel_group={"group_id": "group-1", "base_cwd": str(tmp_path)},
+        worker_cwd=str(worker),
+        cancel_reason="identity changed",
+    )
+    payload = {"success": False, "error": startup.cancel_reason}
+    resolved = str(worker.resolve())
+    with cwt._BACKGROUND_PARALLEL_WORKERS_GUARD:
+        cwt._BACKGROUND_PARALLEL_WORKERS.add(resolved)
+
+    cwt._preserve_failed_background_parallel_result(payload, startup)
+
+    assert worker.exists()
+    assert payload["parallel_merge"]["merged"] is False
+    assert payload["parallel_merge"]["worktree_kept"] is True
+    assert resolved not in cwt._BACKGROUND_PARALLEL_WORKERS
 
 
 def test_required_background_preflight_failure_is_durably_terminalized(

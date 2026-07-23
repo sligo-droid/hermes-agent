@@ -213,6 +213,19 @@ class CodexAppServerClient:
 
     # ---------- lifecycle ----------
 
+    @property
+    def process_id(self) -> int:
+        return int(getattr(self._proc, "pid", 0) or 0)
+
+    @property
+    def process_started_at(self) -> int:
+        try:
+            from gateway.status import get_process_start_time
+
+            return int(get_process_start_time(self.process_id) or 0)
+        except Exception:
+            return 0
+
     def initialize(
         self,
         client_name: str = "hermes",
