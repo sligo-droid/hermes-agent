@@ -59,6 +59,26 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+def _synchronous_session_db(session_db):
+    """Return the raw sync store expected by the synchronous agent runtime.
+
+    Gateway loop code uses ``AsyncSessionDB`` so SQLite work is offloaded, but
+    ``AIAgent.run_conversation()`` itself runs in an executor thread and calls
+    its session store synchronously.  Letting the async facade cross this
+    boundary turns every database result into an un-awaited coroutine.
+    """
+    if session_db is None:
+        return None
+    try:
+        from hermes_state import AsyncSessionDB
+
+        if isinstance(session_db, AsyncSessionDB):
+            return session_db._db
+    except (ImportError, AttributeError):
+        pass
+    return session_db
+
+
 def _refresh_visible_tool_names(agent) -> None:
     agent.valid_tool_names = {
         tool.get("function", {}).get("name")
@@ -1315,7 +1335,7 @@ def init_agent(
     )
     
     # SQLite session store (optional -- provided by CLI or gateway)
-    agent._session_db = session_db
+    agent._session_db = _synchronous_session_db(session_db)
     agent._parent_session_id = parent_session_id
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
