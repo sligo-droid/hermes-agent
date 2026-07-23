@@ -304,6 +304,24 @@ class TestSendWithRetryExhausted:
 
 class TestSendWithRetryFallback:
     @pytest.mark.asyncio
+    async def test_missing_destination_does_not_try_plain_text_fallback(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="404 Not Found (error code: 10003): Unknown Channel",
+                error_kind="not_found",
+            ),
+            SendResult(success=True, message_id="unexpected-fallback"),
+        ]
+
+        result = await adapter._send_with_retry("thread-1", "hello")
+
+        assert result.success is False
+        assert result.error_kind == "not_found"
+        assert len(adapter._send_calls) == 1
+
+    @pytest.mark.asyncio
     async def test_non_network_error_falls_back_immediately(self):
         adapter = _StubAdapter()
         adapter._send_results = [

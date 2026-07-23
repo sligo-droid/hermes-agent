@@ -31,6 +31,7 @@ class _FakeBadRequest(Exception):
         ("Bad Request: not enough rights to send text messages", "forbidden"),
         ("Bad Request: chat not found", "not_found"),
         ("Bad Request: message to edit not found", "not_found"),
+        ("404 Not Found (error code: 10003): Unknown Channel", "not_found"),
         ("Too Many Requests: retry after 12", "rate_limited"),
         ("Flood control exceeded", "rate_limited"),
         ("ConnectError: connection refused", "transient"),

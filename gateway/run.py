@@ -2076,6 +2076,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     get_confirmed_message_ids,
     is_logical_send_retry_safe,
+    classify_send_error,
     merge_pending_message_event,
     utf16_len,
 )
@@ -8394,6 +8395,27 @@ class _GatewayRunnerCore(
                 else:
                     if not getattr(result, "success", False):
                         error_text = str(getattr(result, "error", "") or "")
+                        error_kind = str(getattr(result, "error_kind", "") or "")
+                        if not error_kind:
+                            error_kind = classify_send_error(None, error_text=error_text)
+                        if (
+                            event.source.platform == Platform.DISCORD
+                            and getattr(event.source, "thread_id", None)
+                            and error_kind == "not_found"
+                            and "unknown channel" in error_text.lower()
+                        ):
+                            retired = await asyncio.to_thread(
+                                ledger.mark_terminal_delivery_unreachable,
+                                work_id,
+                                owner=delivery_owner,
+                                reason="discord_unknown_channel",
+                            )
+                            if retired:
+                                logger.info(
+                                    "Retired unreachable Discord terminal delivery for %s",
+                                    work_id,
+                                )
+                            return
                         timeout_check = getattr(adapter, "_is_timeout_error", None)
                         timed_out = bool(
                             callable(timeout_check) and timeout_check(error_text)

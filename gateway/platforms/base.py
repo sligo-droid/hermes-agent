@@ -511,6 +511,7 @@ _SUBCHAT_NOT_FOUND_SUBSTRINGS = (
     "message to edit not found",
     "message to reply not found",
     "thread not found",
+    "unknown channel",
     "topic_deleted",
     "message_id_invalid",
 )
@@ -3685,6 +3686,12 @@ class BasePlatformAdapter(ABC):
                 "whole-message replay is disabled",
                 self.name,
             )
+            return result
+
+        # A missing destination cannot be repaired by stripping formatting.
+        # Return the typed failure so the owning delivery ledger can retire or
+        # reroute that exact obligation without issuing a duplicate REST call.
+        if result.error_kind == "not_found":
             return result
 
         # Timeout errors are not safe to retry (message may have been

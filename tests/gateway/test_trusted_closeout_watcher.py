@@ -1237,6 +1237,55 @@ async def test_blocked_terminal_delivery_retries_in_same_process(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_startup_terminal_delivery_retires_deleted_discord_thread(
+    monkeypatch,
+    tmp_path,
+):
+    """Match the live startup trace without suppressing transient retries."""
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=time.time)
+    blocked = _blocked_item(
+        ledger,
+        message_id="1528874646290698260",
+        freshness_seconds=1,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._background_tasks = set()
+    runner._terminal_delivery_retry_tasks = {}
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                error="404 Not Found (error code: 10003): Unknown Channel",
+                error_kind="not_found",
+                confirmed_message_ids=(),
+                retry_safe=True,
+            )
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(blocked)
+
+    adapter._send_with_retry.assert_awaited_once()
+    runner._update_discord_summaries.assert_not_awaited()
+    stored = ledger.get(blocked["id"])
+    assert stored["status"] == "blocked"
+    assert stored["delivery_outcome"] == "unreachable"
+    assert stored["terminal_delivery"]["status"] == "completed"
+    assert stored["terminal_delivery"]["unreachable_reason"] == "discord_unknown_channel"
+    assert stored["terminal_delivery"]["retry_count"] == 0
+    assert ledger.incomplete_items() == []
+    assert runner._schedule_incomplete_discord_work_items() == 0
+    assert runner._terminal_delivery_retry_tasks == {}
+
+
+@pytest.mark.asyncio
 async def test_terminal_delivery_retry_is_deduplicated_and_stops_on_shutdown(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr("gateway.run._TERMINAL_DELIVERY_RETRY_BASE_SECONDS", 60.0)
