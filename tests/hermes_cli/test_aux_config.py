@@ -49,13 +49,13 @@ def test_session_search_no_longer_appears_in_auxiliary_model_config():
     assert "session_search" not in {key for key, _name, _desc in _AUX_TASKS}
 
 
-def test_feature_summary_triage_is_pinned_to_luna_low():
+def test_feature_summary_triage_is_pinned_to_luna_without_reasoning():
     """Discord intent classification must stay on the fast, shallow route."""
     triage = DEFAULT_CONFIG["auxiliary"]["feature_summary_triage"]
 
     assert triage["provider"] == "auto"
     assert triage["model"] == "gpt-5.6-luna"
-    assert triage["reasoning_effort"] == "low"
+    assert triage["reasoning_effort"] == "none"
     assert triage["timeout"] == 4
 
 
