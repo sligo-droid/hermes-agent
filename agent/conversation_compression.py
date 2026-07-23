@@ -710,6 +710,18 @@ def _compression_churn_details(
     except Exception:
         logger.debug("compression churn lineage query failed", exc_info=True)
         return None
+    if inspect.isawaitable(lineage):
+        # The agent runtime is synchronous.  A leaked AsyncSessionDB facade
+        # returns a coroutine here; never let optional churn diagnostics turn a
+        # recoverable context overflow into a second fatal exception.
+        close = getattr(lineage, "close", None)
+        if callable(close):
+            close()
+        logger.warning(
+            "compression churn lineage query returned an awaitable; "
+            "skipping churn diagnostics"
+        )
+        return None
     if not lineage:
         return None
 

@@ -2,6 +2,7 @@ import os
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -46,6 +47,55 @@ def test_recent_compression_lineage_excludes_out_of_window_rows():
         lineage = db.get_recent_compression_lineage("current", window_seconds=60)
 
     assert [row["id"] for row in lineage] == ["current"]
+
+
+def test_agent_init_unwraps_async_session_db_for_sync_runtime():
+    from agent.agent_init import _synchronous_session_db
+    from hermes_state import AsyncSessionDB, SessionDB
+    from run_agent import AIAgent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = SessionDB(db_path=Path(tmpdir) / "state.db")
+        facade = AsyncSessionDB(db)
+
+        assert _synchronous_session_db(facade) is db
+        assert _synchronous_session_db(db) is db
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=facade,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent._session_db is db
+
+
+def test_compression_churn_details_skips_leaked_async_session_db(caplog):
+    from agent.conversation_compression import _compression_churn_details
+    from hermes_state import AsyncSessionDB
+
+    class _LineageDB:
+        def get_recent_compression_lineage(self, *_args, **_kwargs):
+            return [{"id": "current", "parent_session_id": None}]
+
+    agent = SimpleNamespace(
+        _session_db=AsyncSessionDB(_LineageDB()),
+        session_id="current",
+    )
+
+    details = _compression_churn_details(
+        agent,
+        [],
+        original_tokens=200_000,
+        compressed_tokens=100_000,
+    )
+
+    assert details is None
+    assert "returned an awaitable" in caplog.text
 
 
 def test_compress_context_trips_churn_breaker_before_session_rotation():
