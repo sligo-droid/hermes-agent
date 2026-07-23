@@ -7,6 +7,7 @@ from typing import Any
 
 from agent.runtime_spans import sanitize_runtime_spans, summarize_span_intervals
 from agent.visual_qa import sanitize_visual_receipt
+from agent.terminal_outcomes import sanitize_closeout_receipt
 
 
 def _seconds(value: Any) -> float:
@@ -167,6 +168,7 @@ def build_turn_runtime_breakdown(
         if latest is not None:
             visual_receipts.append(latest)
     visual_qa = _visual_qa_summary(stats, visual_receipts)
+    closeout_receipt = sanitize_closeout_receipt(stats.get("closeout_receipt"))
 
     return {
         "schema_version": 2,
@@ -202,6 +204,7 @@ def build_turn_runtime_breakdown(
         "mutation_boundary": _count(stats.get("mutation_boundary")),
         "visual_qa_receipts": visual_receipts,
         "visual_qa": visual_qa,
+        "closeout_receipt": closeout_receipt,
         "active_exceeds_wall": bool(wall and summed_active > wall + 0.25),
     }
 
@@ -241,6 +244,7 @@ def merge_runtime_breakdowns(
             "followup_count": 0,
             "check_duration_s": 0.0,
         },
+        "closeout_receipt": None,
         "phases": [],
         "active_exceeds_wall": False,
     }
@@ -270,6 +274,9 @@ def merge_runtime_breakdowns(
                 for evidence in item["verification_evidence"]
                 if isinstance(evidence, dict)
             )
+        receipt = sanitize_closeout_receipt(item.get("closeout_receipt"))
+        if receipt is not None:
+            merged["closeout_receipt"] = receipt
         merged["mutation_generation"] = _count(item.get("mutation_generation"))
         merged["mutation_boundary"] = _count(item.get("mutation_boundary"))
         merged["active_exceeds_wall"] = bool(merged["active_exceeds_wall"] or item.get("active_exceeds_wall"))

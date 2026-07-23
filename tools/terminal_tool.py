@@ -2488,6 +2488,32 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        resolved_command_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=session_key,
+        )
+        try:
+            from agent.terminal_outcomes import exact_lock_pnpm_install_block
+
+            install_block = exact_lock_pnpm_install_block(
+                command,
+                resolved_command_cwd,
+            )
+        except Exception:
+            logger.debug("exact-lock pnpm install guard failed open", exc_info=True)
+            install_block = None
+        if install_block:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": 126,
+                    "error": install_block["remediation"],
+                    "status": "blocked",
+                    "install_guard": install_block,
+                },
+                ensure_ascii=False,
+            )
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2495,11 +2521,7 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            effective_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-            )
+            effective_cwd = resolved_command_cwd
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2756,11 +2778,7 @@ def terminal_tool(
 
             while retry_count <= max_retries:
                 try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                    )
+                    command_cwd = resolved_command_cwd
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
@@ -2890,6 +2908,30 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            try:
+                from agent.terminal_outcomes import (
+                    classify_terminal_outcome,
+                    inspect_repo_closeout_receipt,
+                )
+
+                classification = classify_terminal_outcome(
+                    command=command,
+                    output=output,
+                    exit_code=returncode,
+                    error=None,
+                )
+                result_dict["classification"] = classification
+                receipt = inspect_repo_closeout_receipt(
+                    command=command,
+                    cwd=command_cwd,
+                    exit_code=returncode,
+                    classification=classification,
+                    output=output,
+                )
+                if receipt is not None:
+                    result_dict["closeout_receipt"] = receipt
+            except Exception:
+                logger.debug("terminal outcome metadata failed", exc_info=True)
             try:
                 from agent.verification_evidence import record_terminal_result
 
@@ -3155,7 +3197,7 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
-    return terminal_tool(
+    result = terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
         timeout=args.get("timeout"),
@@ -3166,6 +3208,21 @@ def _handle_terminal(args, **kw):
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
     )
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict) and "classification" not in data:
+            from agent.terminal_outcomes import classify_terminal_outcome
+
+            data["classification"] = classify_terminal_outcome(
+                command=args.get("command"),
+                output=data.get("output"),
+                exit_code=data.get("exit_code"),
+                error=data.get("error"),
+            )
+            result = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        logger.debug("terminal handler metadata augmentation failed", exc_info=True)
+    return result
 
 
 registry.register(

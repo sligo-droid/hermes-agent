@@ -416,6 +416,41 @@ def test_enforced_visual_qa_blocks_unverifiable_mutation_and_strips_unsafe_recei
     assert stored["completion_gate"]["visual_qa"]["status"] == "missing"
 
 
+def test_work_ledger_persists_only_allowlisted_closeout_receipt_fields(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(message_id="closeout-receipt")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Done.",
+        runtime_breakdown={
+            "wall_s": 1,
+            "closeout_receipt": {
+                "status": "passed",
+                "head_sha": "d" * 40,
+                "script": "closeout",
+                "raw_output": "do-not-store",
+                "token": "also-do-not-store",
+            },
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["runtime_breakdown"]["closeout_receipt"] == {
+        "schema_version": 1,
+        "status": "passed",
+        "head_sha": "d" * 40,
+        "script": "closeout",
+    }
+    assert "do-not-store" not in repr(stored["runtime_breakdown"])
+
+
 def test_mark_agent_running_clears_stale_terminal_fields(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(message_id="m1")

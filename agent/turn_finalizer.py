@@ -594,6 +594,16 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    try:
+        from agent.terminal_outcomes import sanitize_closeout_receipt
+
+        _closeout_receipt = sanitize_closeout_receipt(
+            getattr(agent, "_accepted_closeout_receipt", None)
+        )
+        if _closeout_receipt is not None:
+            result["closeout_receipt"] = _closeout_receipt
+    except Exception:
+        logger.debug("closeout receipt final-result sanitization failed", exc_info=True)
     if _verification_constraints:
         result["verification_constraints"] = _verification_constraints
     _attach_runtime_breakdown(

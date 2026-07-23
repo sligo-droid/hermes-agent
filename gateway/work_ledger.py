@@ -408,6 +408,16 @@ def _durable_runtime_breakdown(
         requirement,
         limit=receipt_limit,
     )
+    try:
+        from agent.terminal_outcomes import sanitize_closeout_receipt
+
+        durable["closeout_receipt"] = sanitize_closeout_receipt(
+            runtime_breakdown.get("closeout_receipt")
+            if isinstance(runtime_breakdown, dict)
+            else None
+        )
+    except Exception:
+        durable["closeout_receipt"] = None
     return durable
 
 
