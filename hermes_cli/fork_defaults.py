@@ -85,7 +85,7 @@ FORK_DEFAULT_ADDITIONS = {
             "api_key": "",
             "api_mode": "",
             "timeout": 4,
-            "reasoning_effort": "low",
+            "reasoning_effort": "none",
             "extra_body": {},
         },
         "foreman_manual_escalation": {
@@ -513,12 +513,12 @@ FORK_DEFAULT_OVERRIDES: dict[str, Any] = {
     # Multi-bot project threads must continue requiring an inline mention.
     "discord": {"thread_require_mention": True},
     # Discord intent triage is latency-sensitive and returns one short label;
-    # keep it on the fast model at low reasoning even if upstream later adds
+    # keep it on the fast model with reasoning disabled even if upstream adds
     # its own defaults for the same auxiliary task.
     "auxiliary": {
         "feature_summary_triage": {
             "model": "gpt-5.6-luna",
-            "reasoning_effort": "low",
+            "reasoning_effort": "none",
             "timeout": 4,
         },
     },
