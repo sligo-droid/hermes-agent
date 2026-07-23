@@ -3928,6 +3928,31 @@ class TestAuxiliaryTaskExtraBody:
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "low"}
 
+    def test_feature_summary_triage_defaults_use_luna_low(self):
+        """The Discord classifier's shipped route reaches the wire unchanged."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        client = MagicMock()
+        client.base_url = "https://api.example.com/v1"
+        client.chat.completions.create.return_value = MagicMock()
+
+        with patch("hermes_cli.config.load_config", return_value=DEFAULT_CONFIG), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "gpt-5.6-luna"),
+        ):
+            call_llm(
+                task="feature_summary_triage",
+                messages=[{"role": "user", "content": "classify"}],
+            )
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.6-luna"
+        assert kwargs["timeout"] == 4
+        assert kwargs["extra_body"]["reasoning"] == {
+            "enabled": True,
+            "effort": "low",
+        }
+
     def test_reasoning_effort_none_disables(self):
         client = MagicMock()
         client.base_url = "https://api.example.com/v1"

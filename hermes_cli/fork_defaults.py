@@ -80,11 +80,12 @@ FORK_DEFAULT_ADDITIONS = {
         },
         "feature_summary_triage": {
             "provider": "auto",
-            "model": "",
+            "model": "gpt-5.6-luna",
             "base_url": "",
             "api_key": "",
             "api_mode": "",
             "timeout": 4,
+            "reasoning_effort": "low",
             "extra_body": {},
         },
         "foreman_manual_escalation": {
@@ -511,6 +512,16 @@ FORK_DEFAULT_OVERRIDES: dict[str, Any] = {
     "compression": {"threshold": 0.70},
     # Multi-bot project threads must continue requiring an inline mention.
     "discord": {"thread_require_mention": True},
+    # Discord intent triage is latency-sensitive and returns one short label;
+    # keep it on the fast model at low reasoning even if upstream later adds
+    # its own defaults for the same auxiliary task.
+    "auxiliary": {
+        "feature_summary_triage": {
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "low",
+            "timeout": 4,
+        },
+    },
     # The fork's Discord action flow expects edit-based response streaming.
     "streaming": {"enabled": True},
     # Keep worker-board pickup responsive for the development workflow.
