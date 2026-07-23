@@ -5542,6 +5542,43 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                escalation_call_ids = {
+                    str(getattr(tc, "id", "") or "")
+                    for tc in assistant_message.tool_calls
+                    if getattr(getattr(tc, "function", None), "name", "")
+                    == "escalate_to_action"
+                }
+                if escalation_call_ids:
+                    escalation_payload = None
+                    for candidate in reversed(messages):
+                        if not isinstance(candidate, dict) or candidate.get("role") != "tool":
+                            continue
+                        if str(candidate.get("tool_call_id") or "") not in escalation_call_ids:
+                            continue
+                        try:
+                            parsed = json.loads(str(candidate.get("content") or ""))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            parsed = None
+                        if (
+                            isinstance(parsed, dict)
+                            and parsed.get("success") is True
+                            and parsed.get("action_escalation_requested") is True
+                        ):
+                            escalation_payload = parsed
+                        break
+                    if escalation_payload is not None:
+                        agent._action_escalation_requested = escalation_payload
+                        _turn_exit_reason = "action_escalation"
+                        # The gateway consumes this turn before delivery or
+                        # persistence and replays the original user request in
+                        # the action runtime. Keep the internal sequence closed
+                        # without streaming a misleading QA-mode acknowledgement.
+                        final_response = ".NO_REPLY"
+                        messages.append(
+                            {"role": "assistant", "content": final_response}
+                        )
+                        break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

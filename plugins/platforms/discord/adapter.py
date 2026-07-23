@@ -26,6 +26,7 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import suppress
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple, cast
 from urllib.parse import quote, urlparse
@@ -169,10 +170,16 @@ _OBSIDIAN_PROJECT_ACCESS_HEADINGS = {
     "demo credentials",
 }
 _DISCORD_DIRECT_QUESTION_PROMPT = (
-    "This Discord trigger was classified as a direct question, not an "
-    "action request. Answer in place. Do not start a branch, PR, deployment, "
-    "feature summary, or long-lived client-project coding workflow unless the "
-    "user explicitly asks for implementation work."
+    "This Discord trigger was classified as a direct question, not an action "
+    "request, and entered the safe question/intake runtime. Answer in place "
+    "when the user wants explanation, status, advice, or a short answer. "
+    "Read-only inspection is allowed when it is needed to answer. Do not edit "
+    "files, run mutating commands, start a branch or PR, deploy, or begin any "
+    "other implementation workflow in this runtime. If the "
+    "user is actually asking Hermes to implement, change, fix, deploy, run, or "
+    "otherwise perform work, call `escalate_to_action` immediately and call it "
+    "alone. Do not do preliminary investigation first. The gateway will replay "
+    "the original request in the correctly isolated action runtime."
 )
 
 try:
@@ -3043,6 +3050,139 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to persist Discord feature summary handle", self.name, exc_info=True)
         return handle
 
+    async def promote_event_to_action_request(
+        self,
+        event: MessageEvent,
+        *,
+        initial_request: str,
+    ) -> Tuple[Optional[MessageEvent], str]:
+        """Promote a safe-intake event into a normal Discord action event.
+
+        This method owns Discord topology and summary initialization only. The
+        gateway owns dispatch ordering and replays the original request in a
+        fresh action-runtime turn, so the intake agent never mutates in place.
+        """
+        source = getattr(event, "source", None)
+        request_text = str(initial_request or getattr(event, "text", "") or "").strip()
+        if source is None or not request_text:
+            return None, ""
+
+        raw_message = getattr(event, "raw_message", None)
+        thread_id = str(
+            getattr(source, "thread_id", "")
+            or (
+                getattr(source, "chat_id", "")
+                if str(getattr(source, "chat_type", "") or "").lower() == "thread"
+                else ""
+            )
+            or ""
+        ).strip()
+        thread_channel = None
+        parent_channel = None
+
+        if thread_id:
+            thread_channel = await self._resolve_channel_by_id(thread_id)
+            if thread_channel is None:
+                candidate_channel = getattr(raw_message, "channel", None)
+                if str(getattr(candidate_channel, "id", "") or "") == thread_id:
+                    thread_channel = candidate_channel
+            parent_channel = self._thread_parent_channel(thread_channel)
+        else:
+            parent_channel = getattr(raw_message, "channel", None)
+            if parent_channel is None:
+                parent_channel = await self._resolve_channel_by_id(
+                    str(getattr(source, "chat_id", "") or "")
+                )
+            thread_channel = getattr(raw_message, "thread", None)
+            if thread_channel is None and raw_message is not None:
+                thread_channel = await self._auto_create_thread(raw_message)
+            thread_id = str(getattr(thread_channel, "id", "") or "").strip()
+
+        if thread_channel is None or not thread_id:
+            logger.warning("[%s] Could not create or resolve action escalation thread", self.name)
+            return None, ""
+        if parent_channel is None:
+            parent_channel = self._thread_parent_channel(thread_channel)
+
+        project_context = self._resolve_project_context_for_channel(parent_channel)
+        feature_summary = self._load_feature_summary_handle_for_thread(
+            thread_channel,
+            project_context=project_context,
+        )
+        if feature_summary is None:
+            reply_target = None
+            if getattr(raw_message, "channel", None) is thread_channel:
+                reply_target = raw_message
+            feature_summary = await self.initialize_feature_summary(
+                thread_channel,
+                parent_channel=parent_channel,
+                initial_request=request_text,
+                project_context=project_context,
+                source_message_id=str(
+                    getattr(event, "message_id", None)
+                    or getattr(source, "message_id", None)
+                    or ""
+                )
+                or None,
+                reply_to_message=reply_target,
+            )
+        if feature_summary is None:
+            return None, ""
+
+        project_summary = getattr(event, "project_summary", None)
+        if project_summary is None:
+            project_summary = await self.initialize_project_summary(
+                parent_channel,
+                project_context=project_context,
+            )
+
+        parent_id = str(getattr(parent_channel, "id", "") or "").strip() or None
+        promoted_source = replace(
+            source,
+            chat_id=thread_id,
+            chat_type="thread",
+            thread_id=thread_id,
+            parent_chat_id=parent_id,
+            auto_thread_created=(
+                bool(getattr(source, "auto_thread_created", False))
+                or not bool(getattr(source, "thread_id", None))
+            ),
+        )
+        promoted_event = replace(
+            event,
+            text=request_text,
+            source=promoted_source,
+            channel_prompt=(
+                getattr(event, "discord_action_request_base_channel_prompt", None)
+            ),
+            feature_summary=feature_summary,
+            project_summary=project_summary,
+            discord_action_request_intent=True,
+            channel_context=None,
+            goal_thread_context=None,
+            internal=True,
+            suppress_user_output=False,
+        )
+        self._threads.mark(thread_id)
+        self._mark_discord_thread_participation(
+            thread_id,
+            message_id=getattr(event, "message_id", ""),
+            channel_id=parent_id or thread_id,
+            auto_created=bool(getattr(promoted_source, "auto_thread_created", False)),
+        )
+
+        guild_id = str(
+            getattr(source, "guild_id", "")
+            or getattr(getattr(thread_channel, "guild", None), "id", "")
+            or ""
+        ).strip()
+        thread_url = (
+            f"https://discord.com/channels/{guild_id}/{thread_id}"
+            if guild_id
+            else ""
+        )
+        return promoted_event, thread_url
+
     async def initialize_goal_feature_summary_for_source(
         self,
         source: Any,
@@ -3573,64 +3713,9 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if heuristic is not None:
             return heuristic
-
-        context = []
-        for line in (context_lines or [])[:3]:
-            cleaned_line = re.sub(r"\s+", " ", str(line or "")).strip()
-            if cleaned_line:
-                context.append(cleaned_line[:200])
-        context_block = "\n".join(f"- {line}" for line in context) or "(none)"
-        prompt = (
-            "Classify this Discord message for a software-development assistant.\n"
-            "Return exactly one word: action, question, or unsure.\n\n"
-            "action = a clear request for Hermes to implement, change, fix, deploy, run, "
-            "or otherwise do work that should get an action thread.\n"
-            "question = a request for an explanation, status, advice, or short inline answer; "
-            "standalone status reports also use question.\n"
-            "unsure = mixed intent, missing conversational context, or no clear request.\n\n"
-            "Few-shot examples:\n"
-            "Message: update: the deploy finished\nVerdict: question\n"
-            "Message: can you get the tests passing?\nVerdict: action\n"
-            "Message: should we retry the deploy?\nVerdict: unsure\n"
-            "Message: run the pipeline again\nVerdict: action\n"
-            "Message: how do I run the pipeline?\nVerdict: question\n"
-            "Message: yes do that\nVerdict: unsure\n"
-            "Context: alex: Please rerun the failed deploy.\n"
-            "Message: yes do that\nVerdict: action\n"
-            "Message: hello\nVerdict: question\n"
-            "Message: feature request: add dark mode\nVerdict: action\n"
-            "Message: the deploy failed; explain why and rerun it\nVerdict: unsure\n\n"
-            f"Available context:\n{context_block}\n\n"
-            f"Message:\n{text[:2000]}"
-        )
-        try:
-            from agent.auxiliary_client import call_llm
-
-            response = await asyncio.to_thread(
-                call_llm,
-                task="feature_summary_triage",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a strict intent classifier. Return only action, question, "
-                            "or unsure."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=12,
-                temperature=0,
-                timeout=self._feature_triage_timeout_seconds(),
-            )
-            verdict = (response.choices[0].message.content or "").strip().lower()
-            if verdict == "action":
-                return True
-            if verdict in {"question", "unsure"}:
-                return False
-        except Exception as exc:
-            logger.debug("[%s] Discord action-request triage failed: %s", self.name, exc)
-
+        # Ambiguity is intentionally safe by default. The ordinary agent gets
+        # the full conversational context and can request a transactional
+        # gateway escalation if the user's intent is actually to perform work.
         return False
 
     async def _classify_discord_feature_request(self, text: str) -> bool:

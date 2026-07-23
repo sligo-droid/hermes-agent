@@ -7720,6 +7720,57 @@ class _GatewayRunnerCore(
         event.feature_summary = feature_summary
         return feature_summary
 
+    async def _promote_discord_action_escalation(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+        agent_result: Dict[str, Any],
+    ) -> Optional[str]:
+        """Queue a clean action-runtime replay for a successful intake handoff."""
+        if (
+            source.platform != Platform.DISCORD
+            or getattr(event, "discord_action_request_intent", None) is not False
+            or not isinstance(agent_result.get("action_escalation_requested"), dict)
+        ):
+            return None
+        payload = agent_result["action_escalation_requested"]
+        if not (
+            payload.get("success") is True
+            and payload.get("action_escalation_requested") is True
+        ):
+            return None
+
+        adapter = self._adapter_for_source(source)
+        promote = getattr(adapter, "promote_event_to_action_request", None)
+        if not callable(promote):
+            logger.error("Discord action escalation unavailable: adapter lacks promotion support")
+            return None
+        promoted_event, thread_url = await promote(
+            event,
+            initial_request=str(getattr(event, "text", "") or "").strip(),
+        )
+        if promoted_event is None:
+            logger.error("Discord action escalation failed to initialize action state")
+            return None
+
+        promoted_source = getattr(promoted_event, "source", None) or source
+        promoted_session_key = self._session_key_for_source(promoted_source)
+        if promoted_session_key == session_key:
+            # The current adapter task still owns this session. Put the action
+            # replay at the head so a racing user follow-up remains ordered
+            # after the original request instead of merging into it.
+            self._prepend_fifo(session_key, promoted_event, adapter)
+        else:
+            await adapter.handle_message(promoted_event)
+
+        # The intake agent contains an intentionally unpersisted tool turn.
+        # Never reuse it after the route changes, even if a future signature
+        # change accidentally makes the two runtimes compare equal.
+        self._evict_cached_agent(session_key)
+        return str(thread_url or "")
+
     def _discord_work_item_id_for_event(
         self,
         event: MessageEvent,
@@ -17531,12 +17582,17 @@ class _GatewayRunnerCore(
         _set_env = self._set_session_env
         try:
             _set_env_sig = inspect.signature(_set_env)
+            _set_env_kwargs = {}
             if "session_cwd" in _set_env_sig.parameters:
-                _session_env_tokens = _set_env(context, session_cwd=session_cwd)
-            else:
-                # Some focused tests replace _set_session_env with a minimal
-                # one-arg stub; keep those harnesses working.
-                _session_env_tokens = _set_env(context)
+                _set_env_kwargs["session_cwd"] = session_cwd
+            if "discord_action_escalation_allowed" in _set_env_sig.parameters:
+                _set_env_kwargs["discord_action_escalation_allowed"] = bool(
+                    source.platform == Platform.DISCORD
+                    and getattr(event, "discord_action_request_intent", None) is False
+                )
+            # Some focused tests replace _set_session_env with a minimal
+            # one-arg stub; only pass kwargs its signature accepts.
+            _session_env_tokens = _set_env(context, **_set_env_kwargs)
         except (TypeError, ValueError):
             _session_env_tokens = _set_env(context, session_cwd=session_cwd)
 
@@ -18331,6 +18387,10 @@ class _GatewayRunnerCore(
                     suppress_user_output=bool(
                         getattr(event, "suppress_user_output", False)
                     ),
+                    defer_persistence=bool(
+                        source.platform == Platform.DISCORD
+                        and getattr(event, "discord_action_request_intent", None) is False
+                    ),
                 )
             finally:
                 if work_item_id and source.platform == Platform.DISCORD:
@@ -18395,6 +18455,29 @@ class _GatewayRunnerCore(
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
+
+            escalation_requested = isinstance(
+                agent_result.get("action_escalation_requested"), dict
+            )
+            if escalation_requested:
+                promoted_thread_url = await self._promote_discord_action_escalation(
+                    event=event,
+                    source=source,
+                    session_key=session_key,
+                    agent_result=agent_result,
+                )
+                if promoted_thread_url is None:
+                    return (
+                        "⚠️ I recognized this as an action request, but I could not "
+                        "initialize its isolated Discord action runtime. Nothing was "
+                        "implemented. Please retry or use an action-request channel."
+                    )
+                if promoted_thread_url:
+                    return (
+                        "Switching this request into action mode and starting the work "
+                        f"there:\n\n{promoted_thread_url}"
+                    )
+                return "Switching this request into action mode and starting the work here."
 
             response = agent_result.get("final_response") or ""
             # Hidden-reasoning-only retry exhaustion has no user-visible model
@@ -25815,7 +25898,13 @@ class _GatewayRunnerCore(
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext, *, session_cwd: str = "") -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        session_cwd: str = "",
+        discord_action_escalation_allowed: bool = False,
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -25852,6 +25941,9 @@ class _GatewayRunnerCore(
                 getattr(context.source, "kanban_notifier_profile", "") or ""
             ),
             message_id=str(context.source.message_id) if context.source.message_id else "",
+            discord_action_escalation_allowed=(
+                "1" if discord_action_escalation_allowed else ""
+            ),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -28543,6 +28635,7 @@ class _GatewayRunnerCore(
         detached_delegation_accounting: Any = None,
         origin_work_item_id: Optional[str] = None,
         suppress_user_output: bool = False,
+        defer_persistence: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28632,6 +28725,14 @@ class _GatewayRunnerCore(
             getattr(source, "default_kanban_intake", False)
         )
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        if (
+            source.platform == _GATEWAY_PLATFORM.DISCORD
+            and discord_action_request_intent is False
+            and "discord-action-escalation" not in enabled_toolsets
+        ):
+            enabled_toolsets = sorted(
+                [*enabled_toolsets, "discord-action-escalation"]
+            )
         if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
             enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
         if fable_plan_only:
@@ -29811,6 +29912,9 @@ class _GatewayRunnerCore(
             agent.visual_qa_config = visual_qa_config
             agent._visual_qa_last_edit_order = 0
             agent._visual_qa_stop_callback = None
+            agent._persist_disabled = bool(defer_persistence)
+            agent._discord_intake_read_only = bool(defer_persistence)
+            agent._action_escalation_requested = None
             if (
                 origin_work_item_id
                 and discord_action_runtime
@@ -30449,6 +30553,10 @@ class _GatewayRunnerCore(
                         result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
                         visual_qa_requirement,
                     ),
+                    "agent_persisted": not defer_persistence,
+                    "action_escalation_requested": getattr(
+                        _agent, "_action_escalation_requested", None
+                    ),
                 }
 
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -30514,7 +30622,11 @@ class _GatewayRunnerCore(
                     final_response = final_response + "\n" + "\n".join(unique_tags)
 
             # Auto-generate session title after first exchange (non-blocking)
-            if final_response and self._session_db:
+            if (
+                final_response
+                and self._session_db
+                and not getattr(agent, "_action_escalation_requested", None)
+            ):
                 try:
                     from agent.title_generator import maybe_auto_title
                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []
@@ -30644,6 +30756,10 @@ class _GatewayRunnerCore(
                     agent,
                     result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
                     visual_qa_requirement,
+                ),
+                "agent_persisted": not defer_persistence,
+                "action_escalation_requested": getattr(
+                    agent, "_action_escalation_requested", None
                 ),
             }
 

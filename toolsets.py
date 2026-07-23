@@ -114,6 +114,8 @@ _DISCORD_WRITE_TOOLS = [
 
 _DISCORD_ADMIN_TOOLS = ["discord_admin"]
 
+_DISCORD_CONTROL_TOOLS = ["escalate_to_action"]
+
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
@@ -490,8 +492,22 @@ TOOLSETS = {
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
-        "tools": _HERMES_CORE_TOOLS + _DISCORD_READ_TOOLS + _DISCORD_WRITE_TOOLS + _DISCORD_ADMIN_TOOLS,
+        "tools": (
+            _HERMES_CORE_TOOLS
+            + _DISCORD_READ_TOOLS
+            + _DISCORD_WRITE_TOOLS
+            + _DISCORD_ADMIN_TOOLS
+        ),
         "includes": []
+    },
+
+    # Internal, per-turn toolset injected only for Discord question/intake
+    # turns. Keeping it separate makes the control schema absent from action
+    # runtimes and every non-Discord surface.
+    "discord-action-escalation": {
+        "description": "Internal Discord question-to-action handoff control",
+        "tools": _DISCORD_CONTROL_TOOLS,
+        "includes": [],
     },
     
     "hermes-whatsapp": {
