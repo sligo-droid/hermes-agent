@@ -43,7 +43,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     },
     # Route-specific tier for ordinary Discord action orchestration. It is
     # intentionally outside MODEL_TIER_LADDER so worker/delegation stepping
-    # continues to treat ``advanced`` as the shared Sol/high ceiling.
+    # continues to treat ``advanced`` as the shared Sol/medium ceiling.
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
