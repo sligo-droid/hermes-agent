@@ -1508,6 +1508,46 @@ class TestCodingWorkerTierMigration:
 
 
 class TestReservedModelTierMigration:
+    def test_v36_renames_visual_collision_and_preserves_it_through_load_save(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        custom_tier = {
+            "model": "custom/vision",
+            "opencode_model": "custom/vision-worker",
+            "reasoning_effort": "high",
+        }
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 35,
+                    "model_tiers": {
+                        "visual_sweep": custom_tier,
+                        "legacy_visual_sweep": {
+                            "model": "custom/existing",
+                            "opencode_model": "custom/existing-worker",
+                            "reasoning_effort": "medium",
+                        },
+                    },
+                    "coding_worker": {"model_tier": "visual_sweep"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            loaded = load_config()
+            save_config(loaded)
+            saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert migrated["_config_version"] == 36
+        assert migrated["model_tiers"]["legacy_visual_sweep_2"] == custom_tier
+        assert "visual_sweep" not in migrated["model_tiers"]
+        assert migrated["coding_worker"]["model_tier"] == "legacy_visual_sweep_2"
+        assert loaded["model_tiers"]["legacy_visual_sweep_2"] == custom_tier
+        assert saved["model_tiers"]["legacy_visual_sweep_2"] == custom_tier
+        assert any("visual_sweep→model_tiers.legacy_visual_sweep_2" in warning for warning in results["warnings"])
+
     def test_migration_strips_reserved_tiers_and_obsolete_routing_only(self, tmp_path):
         config_path = tmp_path / "config.yaml"
         config_path.write_text(

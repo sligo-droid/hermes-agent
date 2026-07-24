@@ -75,6 +75,62 @@ def test_default_routes_reference_resolvable_tiers():
         assert "reasoning" not in DEFAULT_CONFIG["kanban"]["discord_worker"]["roles"][role]
 
 
+def test_visual_tiers_resolve_with_intended_models_and_efforts():
+    tiers = DEFAULT_CONFIG["model_tiers"]
+    resolved = {
+        name: resolve_model_tier({"model_tiers": tiers}, name)
+        for name in ("visual_sweep", "visual_inspector", "visual_critique")
+    }
+    assert all(tier is not None for tier in resolved.values())
+
+    assert {name: tier.model for name, tier in resolved.items()} == {
+        "visual_sweep": "gpt-5.6-luna",
+        "visual_inspector": "claude-sonnet-5",
+        "visual_critique": "claude-opus-5",
+    }
+    assert {name: tier.reasoning_effort for name, tier in resolved.items()} == {
+        "visual_sweep": "xhigh",
+        "visual_inspector": "medium",
+        "visual_critique": "medium",
+    }
+    assert {name: tier.provider for name, tier in resolved.items()} == {
+        "visual_sweep": "openai-codex",
+        "visual_inspector": "anthropic",
+        "visual_critique": "anthropic",
+    }
+    assert {name: tier.opencode_model for name, tier in resolved.items()} == {
+        "visual_sweep": "hermes-codex/gpt-5.6-luna",
+        "visual_inspector": "anthropic/claude-sonnet-5",
+        "visual_critique": "anthropic/claude-opus-5",
+    }
+
+
+def test_visual_tiers_are_outside_the_steppable_ladder():
+    for name in ("visual_sweep", "visual_inspector", "visual_critique"):
+        assert name not in MODEL_TIER_LADDER
+        assert resolve_adjacent_model_tier({}, name, 1) is None
+        assert resolve_adjacent_model_tier({}, name, -1) is None
+
+
+def test_visual_tier_names_are_reserved_against_user_override():
+    tier = resolve_model_tier(
+        {
+            "model_tiers": {
+                "visual_inspector": {
+                    "model": "gpt-5.6-sol",
+                    "opencode_model": "hermes-codex/gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                }
+            }
+        },
+        "visual_inspector",
+    )
+
+    assert tier is not None
+    assert tier.model == "claude-sonnet-5"
+    assert tier.reasoning_effort == "medium"
+
+
 def test_builtin_tier_ladder_steps_in_order_and_rejects_custom_or_edge_tiers():
     assert MODEL_TIER_LADDER == ("trivial", "basic", "intermediate", "advanced")
 

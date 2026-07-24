@@ -73,6 +73,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("model_tier", props)
         self.assertIn("model_tier", props["tasks"]["items"]["properties"])
+        self.assertEqual(
+            props["purpose"]["enum"],
+            ["visual_sweep", "visual_inspector", "visual_critique"],
+        )
+        self.assertIn("purpose", props["tasks"]["items"]["properties"])
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
         self.assertIn("toolsets", props["tasks"]["items"]["properties"])
@@ -1533,6 +1538,65 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         self.assertIn("unknown model_tier 'missing'", result["error"])
         MockAgent.assert_not_called()
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_visual_purpose_selects_provider_model_and_effort(
+        self, mock_run, mock_resolve
+    ):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+
+        def resolve_provider(*, requested, target_model):
+            return {
+                "provider": requested,
+                "model": target_model,
+                "base_url": (
+                    "https://chatgpt.com/backend-api/codex"
+                    if requested == "openai-codex"
+                    else "https://api.anthropic.com"
+                ),
+                "api_key": "tier-key",
+                "api_mode": (
+                    "codex_responses"
+                    if requested == "openai-codex"
+                    else "anthropic_messages"
+                ),
+            }
+
+        mock_resolve.side_effect = resolve_provider
+        expected = {
+            "visual_sweep": ("openai-codex", "gpt-5.6-luna", "xhigh"),
+            "visual_inspector": ("anthropic", "claude-sonnet-5", "medium"),
+            # ``medium`` is stable under the review spillover, so the explicit
+            # review purpose passes it through rather than promoting it.
+            "visual_critique": ("anthropic", "claude-opus-5", "medium"),
+        }
+
+        for purpose, (provider, model, effort) in expected.items():
+            with self.subTest(purpose=purpose), patch(
+                "tools.delegate_tool._load_config", return_value=self._tier_config()
+            ), patch("run_agent.AIAgent") as MockAgent:
+                MockAgent.return_value = MagicMock()
+                delegate_task(
+                    goal="Process the prepared evidence",
+                    purpose=purpose,
+                    parent_agent=_make_mock_parent(),
+                )
+
+                kwargs = MockAgent.call_args.kwargs
+                self.assertEqual(kwargs["provider"], provider)
+                self.assertEqual(kwargs["model"], model)
+                self.assertEqual(kwargs["reasoning_config"]["effort"], effort)
+                self.assertEqual(
+                    MockAgent.return_value._runtime_audit_context["model_tier"],
+                    purpose,
+                )
 
     def test_exhausted_parent_worker_budget_fails_before_launch(self):
         parent = _make_mock_parent()
