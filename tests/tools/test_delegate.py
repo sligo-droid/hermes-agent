@@ -1593,6 +1593,33 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         self.assertEqual(MockAgent.call_args.kwargs["runtime_mode"], "read_only")
         self.assertIs(MockAgent.return_value._persist_disabled, True)
 
+    def test_read_only_parent_can_choose_luna_exploration_tier(self):
+        parent = _make_mock_parent()
+        parent._runtime_mode = "read_only"
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+            MockAgent.return_value = MagicMock()
+            delegate_task(
+                goal="Explore the bounded evidence sources independently",
+                model_tier="trivial",
+                parent_agent=parent,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["model"], "gpt-5.6-luna")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
+        self.assertEqual(kwargs["runtime_mode"], "read_only")
+        self.assertIs(MockAgent.return_value._persist_disabled, True)
+
     def test_read_only_parent_implicitly_propagates_to_observational_batch(self):
         parent = _make_mock_parent()
         parent._runtime_mode = "read_only"

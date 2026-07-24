@@ -75,6 +75,14 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
     operational observability and delivery metadata, not user or project
     mutation. Read-only children still cannot write project files, persist
     conversation memory, or request service changes through their transport.
+11. Discord read-only turns use the configured `discord_action` model tier and
+    reasoning profile for consistent observation quality and latency. This is a
+    model-route choice only: `discord_action_runtime` remains the separate
+    authority for mutable worktrees, action prompts, zero tool delay,
+    verification-on-stop, and action lifecycle behavior. Read-only delegation
+    may explicitly select a bounded exploratory tier such as `trivial`
+    (Luna/medium) or `basic` (Luna/xhigh); omitted tiers inherit the route-tier
+    parent (Sol/low by default) while preserving read-only enforcement.
 
 ## Consequences
 
