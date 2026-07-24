@@ -2102,6 +2102,51 @@ See also:
 - [Personality & SOUL.md](/user-guide/features/personality)
 - [Context Files](/user-guide/features/context-files)
 
+## Project Observations
+
+`project_observe` lets an agent run named, operator-approved status commands
+without granting the model arbitrary shell or repository-script execution. Each
+entry has a fixed absolute working directory and fixed argument vector. The
+model can only choose the configured name and any explicitly declared boolean
+options; it cannot override the command, working directory, environment, or
+shell text.
+
+```yaml
+project_observations:
+  pid-runtime-status:
+    description: Authoritative PID lifecycle and health status
+    cwd: /home/droid/.hermes/workspace/PID
+    argv:
+      - python3
+      - scripts/local_lifecycle/runtime_status.py
+      - --repo
+      - /home/droid/.hermes/workspace/PID
+    timeout_seconds: 20
+```
+
+Configuration values support the normal `${VAR_NAME}` expansion. `cwd` must
+resolve to an existing absolute directory, and the executable must be absolute,
+a bare command on Hermes' sanitized system `PATH`, or a relative executable
+inside that directory. Execution never uses a shell, strips credentials and
+most inherited environment variables, caps runtime and output, and terminates
+remaining child processes when the observation finishes.
+
+An observation may expose a small boolean option whose argument suffix remains
+operator-owned:
+
+```yaml
+project_observations:
+  service-status:
+    cwd: /srv/example
+    argv: [python3, scripts/status.py]
+    options:
+      human:
+        type: boolean
+        default: false
+        description: Render human-readable output instead of JSON
+        true_argv: [--human]
+```
+
 ## Working Directory
 
 | Context | Default |

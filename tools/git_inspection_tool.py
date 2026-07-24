@@ -12,8 +12,8 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from agent.runtime_capabilities import RuntimeMode, ToolEffect, normalize_runtime_mode
-from gateway.session_context import get_session_env
+from agent.runtime_capabilities import ToolEffect
+from tools.observation_workspace import resolve_observation_workdir
 from tools.registry import registry, tool_error
 
 
@@ -110,13 +110,14 @@ def git_inspect(
     limit: int = 20,
     staged: bool = False,
     workdir: str = "",
+    task_id: str = "default",
     runtime_mode: Any = None,
 ) -> str:
-    if normalize_runtime_mode(runtime_mode) is not RuntimeMode.READ_ONLY:
-        return tool_error("git_inspect is available only in a read-only runtime")
-    root, error = _git_root(
-        str(workdir or get_session_env("HERMES_SESSION_CWD", "") or os.getcwd())
-    )
+    del runtime_mode  # Observational tools are safe in both runtime modes.
+    source_cwd, error = resolve_observation_workdir(workdir, task_id=task_id)
+    if source_cwd is None:
+        return tool_error(error or "Git inspection workdir is unavailable")
+    root, error = _git_root(str(source_cwd))
     if root is None:
         return tool_error(error or "Git working tree unavailable")
 
@@ -225,7 +226,8 @@ GIT_INSPECT_SCHEMA = {
     "name": "git_inspect",
     "description": (
         "Inspect repository status, bounded diffs, recent log entries, one revision, or "
-        "branch refs without exposing arbitrary Git execution. Available only in read-only runtime."
+        "branch refs without exposing arbitrary Git execution. The repository must be "
+        "inside the active workspace boundary."
     ),
     "parameters": {
         "type": "object",
@@ -246,6 +248,13 @@ GIT_INSPECT_SCHEMA = {
             },
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
             "staged": {"type": "boolean", "default": False},
+            "workdir": {
+                "type": "string",
+                "description": (
+                    "Optional repository directory, absolute or relative to the active "
+                    "workspace. It must remain inside the active workspace boundary."
+                ),
+            },
         },
         "required": ["operation"],
     },
@@ -262,6 +271,8 @@ registry.register(
         paths=args.get("paths"),
         limit=args.get("limit", 20),
         staged=bool(args.get("staged", False)),
+        workdir=args.get("workdir", ""),
+        task_id=kw.get("task_id") or "default",
         runtime_mode=kw.get("runtime_mode"),
     ),
     effect=ToolEffect.READ_ONLY,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import resource
 import shlex
@@ -15,7 +16,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from agent.runtime_capabilities import RuntimeMode, ToolEffect, normalize_runtime_mode
+from agent.runtime_capabilities import ToolEffect
 from gateway.session_context import get_session_env
 from tools.registry import registry, tool_error
 
@@ -32,6 +33,28 @@ _MEMORY_SWAP_LIMIT_BYTES = 512 * 1024 * 1024
 _TASK_LIMIT = 256
 _CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
 _cgroup_limiter_probe: bool | None = None
+_PACKAGE_JSON_LIMIT = 1_000_000
+_PNPM_PACKAGE_MANAGER_RE = re.compile(
+    r"^pnpm@(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+\S+)?$"
+)
+_JAVASCRIPT_LOCK_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock")
+_WRITABLE_NODE_CACHE_DIRS = (".vite", ".vite-temp")
+_SANDBOX_RESERVED_MOUNT_PREFIXES = tuple(
+    Path(value)
+    for value in (
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/sbin",
+        "/etc",
+        "/proc",
+        "/dev",
+        "/run",
+        "/opt",
+        "/var",
+    )
+)
 _VERIFICATION_ENV_ALLOWLIST = frozenset(
     {
         "LANG",
@@ -311,7 +334,16 @@ def _resolved_verification_argv(
     if base == "pnpm":
         if not has_pnpm_runtime:
             raise RuntimeError("a prepared offline pnpm runtime is unavailable")
-        return ["/usr/bin/node", "/opt/hermes-pnpm/bin/pnpm.cjs", *resolved[1:]]
+        tail = resolved[1:]
+        script_index = 1 if tail[:1] == ["run"] else 0
+        separator_index = script_index + 1
+        if (
+            len(tail) > separator_index + 1
+            and tail[separator_index] == "--"
+            and all(not value.startswith("-") for value in tail[separator_index + 1 :])
+        ):
+            tail = tail[:separator_index] + tail[separator_index + 1 :]
+        return ["/usr/bin/node", "/opt/hermes-pnpm/bin/pnpm.cjs", *tail]
     if "/" not in resolved[0]:
         executable = shutil.which(resolved[0])
         if executable:
@@ -319,9 +351,7 @@ def _resolved_verification_argv(
     return resolved
 
 
-def _prepared_pnpm_runtime() -> Path | None:
-    """Find a complete Corepack-cached pnpm distribution for offline use."""
-
+def _pnpm_cache_roots() -> tuple[Path, ...]:
     cache_candidates: list[Path] = []
     configured = os.environ.get("COREPACK_HOME")
     if configured:
@@ -339,30 +369,71 @@ def _prepared_pnpm_runtime() -> Path | None:
                 shim_path.parents[2] / ".cache" / "node" / "corepack"
             )
 
-    def version_key(path: Path) -> tuple[int, ...]:
-        match = re.fullmatch(r"(\d+(?:\.\d+)*)", path.name)
-        return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+    return tuple(
+        dict.fromkeys(path.resolve(strict=False) for path in cache_candidates)
+    )
 
-    for cache_root in dict.fromkeys(path.resolve(strict=False) for path in cache_candidates):
+
+def _prepared_pnpm_runtime(version: str) -> Path | None:
+    """Find the exact complete Corepack-cached pnpm distribution requested."""
+
+    if not _PNPM_PACKAGE_MANAGER_RE.fullmatch(f"pnpm@{version}"):
+        return None
+    for cache_root in _pnpm_cache_roots():
         pnpm_root = cache_root / "pnpm"
-        if not pnpm_root.is_dir():
-            continue
-        versions = sorted(
-            (path for path in pnpm_root.iterdir() if version_key(path)),
-            key=version_key,
-            reverse=True,
-        )
-        for candidate in versions:
-            if (
-                (candidate / ".corepack").is_file()
-                and (candidate / "bin" / "pnpm.cjs").is_file()
-                and (candidate / "dist" / "pnpm.cjs").is_file()
-            ):
-                return candidate.resolve()
+        candidate = pnpm_root / version
+        if (
+            (candidate / ".corepack").is_file()
+            and (candidate / "bin" / "pnpm.cjs").is_file()
+            and (candidate / "dist" / "pnpm.cjs").is_file()
+        ):
+            return candidate.resolve()
     return None
 
 
-def _prepared_dependency_roots(source_root: Path) -> dict[str, Path]:
+def _pnpm_package_manager_pin(
+    source_cwd: Path,
+    source_root: Path,
+) -> tuple[str | None, Path | None, str | None]:
+    """Resolve the nearest repository packageManager field for a pnpm command."""
+
+    current = source_cwd
+    while True:
+        manifest = current / "package.json"
+        if manifest.is_file():
+            try:
+                if manifest.stat().st_size > _PACKAGE_JSON_LIMIT:
+                    return None, manifest, "package.json is too large to inspect safely"
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                return None, manifest, f"could not parse package.json: {type(exc).__name__}"
+            if isinstance(data, dict) and "packageManager" in data:
+                package_manager = str(data.get("packageManager") or "").strip()
+                match = _PNPM_PACKAGE_MANAGER_RE.fullmatch(package_manager)
+                if match is None:
+                    return None, manifest, (
+                        "packageManager must pin an exact pnpm runtime such as "
+                        "pnpm@10.25.0"
+                    )
+                return match.group("version"), manifest, None
+        if current == source_root:
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None, None, (
+        "pnpm verification requires an exact packageManager pin in the relevant "
+        "repository package.json"
+    )
+
+
+def _prepared_dependency_roots(
+    source_root: Path,
+    *,
+    source_cwd: Path | None = None,
+    pnpm_runtime: Path | None = None,
+) -> dict[str, Path]:
     """Locate trusted prepared dependencies for a linked worktree snapshot."""
 
     roots: dict[str, Path] = {}
@@ -402,32 +473,86 @@ def _prepared_dependency_roots(source_root: Path) -> dict[str, Path]:
                     roots["python_runtime"] = python_binary.parent.parent
             break
 
-    hermes_source = Path(__file__).resolve().parents[1]
-    hermes_common = _git(
-        hermes_source,
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-        timeout=10,
+    node_modules = _prepared_node_modules(
+        source_root,
+        source_cwd or source_root,
+        primary_root,
     )
-    hermes_primary = hermes_source
-    if hermes_common.returncode == 0:
-        common_dir = Path(hermes_common.stdout.decode(errors="replace").strip()).resolve()
-        if common_dir.name == ".git":
-            hermes_primary = common_dir.parent
-
-    for relative, key in ((Path("node_modules"), "node_modules"), (Path("ui-tui/node_modules"), "ui_node_modules")):
-        for root in dict.fromkeys(
-            (*repository_roots, hermes_primary, hermes_source)
-        ):
-            candidate = root / relative
-            if candidate.is_dir():
-                roots[key] = candidate.resolve()
-                break
-    pnpm_runtime = _prepared_pnpm_runtime()
+    if node_modules is not None:
+        modules_path, modules_relative = node_modules
+        roots["node_modules"] = modules_path
+        roots["node_modules_relative"] = modules_relative
     if pnpm_runtime is not None:
-        roots["pnpm_runtime"] = pnpm_runtime
+        roots["pnpm_runtime"] = pnpm_runtime.resolve()
     return roots
+
+
+def _nearest_ancestor_with_file(
+    start: Path,
+    stop: Path,
+    names: tuple[str, ...],
+) -> tuple[Path | None, str | None]:
+    current = start
+    while True:
+        for name in names:
+            if (current / name).is_file():
+                return current, name
+        if current == stop or current.parent == current:
+            return None, None
+        current = current.parent
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.read_bytes() == right.read_bytes()
+    except OSError:
+        return False
+
+
+def _prepared_node_modules(
+    source_root: Path,
+    source_cwd: Path,
+    primary_root: Path,
+) -> tuple[Path, Path] | None:
+    """Find dependencies for the actual verification package/lock context."""
+
+    package_root, _ = _nearest_ancestor_with_file(
+        source_cwd,
+        source_root,
+        ("package.json",),
+    )
+    if package_root is None:
+        return None
+    lock_root, lock_name = _nearest_ancestor_with_file(
+        package_root,
+        source_root,
+        _JAVASCRIPT_LOCK_NAMES,
+    )
+
+    context_roots = [package_root]
+    if lock_root is not None and lock_root != package_root:
+        context_roots.append(lock_root)
+
+    candidates: list[tuple[Path, Path]] = []
+    for context_root in context_roots:
+        relative = context_root.relative_to(source_root)
+        candidates.append((context_root, relative))
+        if primary_root != source_root:
+            primary_context = primary_root / relative
+            if lock_root is not None and lock_name is not None:
+                primary_lock_root = primary_root / lock_root.relative_to(source_root)
+                if not _same_file(
+                    lock_root / lock_name,
+                    primary_lock_root / lock_name,
+                ):
+                    continue
+            candidates.append((primary_context, relative))
+
+    for context_root, relative in candidates:
+        modules = context_root / "node_modules"
+        if modules.is_dir():
+            return modules.resolve(), relative / "node_modules"
+    return None
 
 
 def _verification_environment() -> dict[str, str]:
@@ -493,6 +618,124 @@ def _sandbox_parent_dirs(path: Path) -> list[str]:
     return args
 
 
+def _iter_pnpm_package_links(node_modules: Path):
+    """Yield bounded top-level/scoped package symlinks without entering .pnpm."""
+
+    yielded = 0
+    try:
+        entries = tuple(node_modules.iterdir())
+    except OSError:
+        return
+    for entry in entries[:4096]:
+        if entry.is_symlink():
+            yield entry
+            yielded += 1
+        elif entry.name.startswith("@") and entry.is_dir():
+            try:
+                scoped = tuple(entry.iterdir())
+            except OSError:
+                continue
+            for package in scoped[:4096 - yielded]:
+                if package.is_symlink():
+                    yield package
+                    yielded += 1
+        if yielded >= 4096:
+            return
+
+
+def _pnpm_store_aliases(
+    node_modules: Path,
+    sandbox_node_modules: Path,
+) -> tuple[Path, ...]:
+    """Find sandbox aliases needed by relocated pnpm package symlinks."""
+
+    store = (node_modules / ".pnpm").resolve(strict=False)
+    if not store.is_dir():
+        return ()
+    aliases: list[Path] = []
+    for link in _iter_pnpm_package_links(node_modules):
+        try:
+            suffix = link.resolve(strict=False).relative_to(store)
+            raw_target = Path(os.readlink(link))
+        except (OSError, ValueError):
+            continue
+        sandbox_link = sandbox_node_modules / link.relative_to(node_modules)
+        if raw_target.is_absolute():
+            sandbox_target = raw_target
+        else:
+            sandbox_target = Path(
+                posixpath.normpath(str(sandbox_link.parent / raw_target))
+            )
+        alias = sandbox_target
+        for _part in suffix.parts:
+            alias = alias.parent
+        if not alias.is_absolute() or alias == Path("/"):
+            continue
+        try:
+            alias.relative_to(sandbox_node_modules)
+        except ValueError:
+            pass
+        else:
+            continue
+        if any(
+            alias == path or path in alias.parents
+            for path in _SANDBOX_RESERVED_MOUNT_PREFIXES
+        ):
+            continue
+        if alias not in aliases:
+            aliases.append(alias)
+        if len(aliases) >= 16:
+            break
+    return tuple(aliases)
+
+
+def _node_modules_sandbox_args(
+    node_modules: Path,
+    relative: Path,
+    temp_root: Path,
+) -> list[str]:
+    """Mount dependencies read-only with only standard Vite caches writable."""
+
+    destination = Path("/tmp/workspace") / relative
+    overlay_root = temp_root / "node-modules-overlay"
+    skeleton = overlay_root / "skeleton"
+    caches = overlay_root / "caches"
+    skeleton.mkdir(parents=True, exist_ok=True)
+    caches.mkdir(parents=True, exist_ok=True)
+    for name in _WRITABLE_NODE_CACHE_DIRS:
+        (skeleton / name).mkdir()
+        (caches / name).mkdir()
+
+    args = [
+        "--dir",
+        str(destination),
+        "--overlay-src",
+        str(node_modules),
+        "--overlay-src",
+        str(skeleton),
+        "--ro-overlay",
+        str(destination),
+    ]
+    store = (node_modules / ".pnpm").resolve(strict=False)
+    if store.is_dir():
+        for alias in _pnpm_store_aliases(node_modules, destination):
+            args += [
+                *_sandbox_parent_dirs(alias),
+                "--dir",
+                str(alias),
+                "--ro-bind",
+                str(store),
+                str(alias),
+            ]
+    for name in _WRITABLE_NODE_CACHE_DIRS:
+        args += [
+            "--bind",
+            str(caches / name),
+            str(destination / name),
+        ]
+    return args
+
+
 def _resource_limits(timeout_value: int):
     def apply() -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -546,13 +789,7 @@ def read_only_verify(
 ) -> str:
     """Run a recognized verification command in a disposable read-only sandbox."""
 
-    if normalize_runtime_mode(runtime_mode) is not RuntimeMode.READ_ONLY:
-        return tool_error("read_only_verify is available only in a read-only runtime")
-    if not _cgroup_v2_limiter_available():
-        return tool_error(
-            "Read-only verification failed closed: cgroup v2 memory and task "
-            "limiters are unavailable"
-        )
+    del runtime_mode  # The sandbox contract is observational in either mode.
     argv, error = parse_read_only_verification_command(command)
     if error or argv is None:
         return tool_error(f"Unsafe verification command: {error}")
@@ -566,6 +803,28 @@ def read_only_verify(
         relative_cwd = source_cwd.relative_to(source_root)
     except ValueError:
         return tool_error("verification workdir is outside its Git root")
+
+    pnpm_runtime: Path | None = None
+    if Path(argv[0]).name.lower() == "pnpm":
+        pnpm_version, manifest, pin_error = _pnpm_package_manager_pin(
+            source_cwd,
+            source_root,
+        )
+        if pin_error or pnpm_version is None:
+            location = f" ({manifest})" if manifest is not None else ""
+            return tool_error(f"Unsafe pnpm verification{location}: {pin_error}")
+        pnpm_runtime = _prepared_pnpm_runtime(pnpm_version)
+        if pnpm_runtime is None:
+            return tool_error(
+                f"Exact Corepack pnpm runtime {pnpm_version} required by {manifest} "
+                "is not cached; refusing offline verification"
+            )
+
+    if not _cgroup_v2_limiter_available():
+        return tool_error(
+            "Read-only verification failed closed: cgroup v2 memory and task "
+            "limiters are unavailable"
+        )
 
     try:
         timeout_value = max(1, min(int(timeout), 600))
@@ -618,13 +877,13 @@ def read_only_verify(
             if not snapshot_cwd.is_dir():
                 return tool_error("verification workdir is unavailable in the disposable snapshot")
 
-            dependencies = _prepared_dependency_roots(source_root)
+            dependencies = _prepared_dependency_roots(
+                source_root,
+                source_cwd=source_cwd,
+                pnpm_runtime=pnpm_runtime,
+            )
             if "venv" in dependencies:
                 (snapshot_root / ".venv").mkdir(exist_ok=True)
-            if "node_modules" in dependencies:
-                (snapshot_root / "node_modules").mkdir(exist_ok=True)
-            if "ui_node_modules" in dependencies:
-                (snapshot_root / "ui-tui" / "node_modules").mkdir(parents=True, exist_ok=True)
             argv = _resolved_verification_argv(
                 argv,
                 has_venv="venv" in dependencies,
@@ -680,17 +939,11 @@ def read_only_verify(
                     str(runtime_root),
                 ]
             if "node_modules" in dependencies:
-                sandbox_argv += [
-                    "--ro-bind",
-                    str(dependencies["node_modules"]),
-                    "/tmp/workspace/node_modules",
-                ]
-            if "ui_node_modules" in dependencies:
-                sandbox_argv += [
-                    "--ro-bind",
-                    str(dependencies["ui_node_modules"]),
-                    "/tmp/workspace/ui-tui/node_modules",
-                ]
+                sandbox_argv += _node_modules_sandbox_args(
+                    dependencies["node_modules"],
+                    dependencies["node_modules_relative"],
+                    temp_root,
+                )
             if "pnpm_runtime" in dependencies:
                 sandbox_argv += [
                     "--dir",
@@ -710,6 +963,16 @@ def read_only_verify(
                 env=env,
                 timeout_value=timeout_value,
             )
+            dependency_labels = [
+                key
+                for key in dependencies
+                if key not in {"node_modules", "node_modules_relative"}
+            ]
+            if "node_modules" in dependencies:
+                dependency_labels.append(
+                    "node_modules:"
+                    + dependencies["node_modules_relative"].as_posix()
+                )
             return json.dumps(
                 {
                     "success": return_code == 0,
@@ -719,10 +982,12 @@ def read_only_verify(
                     "error": _bounded_output(stderr) or None,
                     "output_truncated": output_truncated,
                     "neutralized_symlinks": neutralized_symlinks[:100],
-                    "dependencies": sorted(dependencies),
+                    "dependencies": sorted(dependency_labels),
                     "sandbox": (
                         "temporary snapshot; only system runtime and prepared dependencies "
-                        "mounted read-only; host home/workspaces and network, PID, IPC, and "
+                        "mounted read-only, with disposable writable node_modules/.vite and "
+                        ".vite-temp caches when JavaScript dependencies are present; host "
+                        "home and non-dependency workspace paths plus network, PID, IPC, and "
                         "runtime sockets isolated; cgroup v2 aggregate limits: "
                         f"memory={_MEMORY_LIMIT_BYTES} bytes, swap={_MEMORY_SWAP_LIMIT_BYTES} "
                         f"bytes, tasks={_TASK_LIMIT}"

@@ -67,6 +67,7 @@ class TestHandleFunctionCall:
             "terminal",
             "process",
             "read_only_verify",
+            "project_observe",
             "browser_navigate",
             "browser_snapshot",
             "browser_vision",
