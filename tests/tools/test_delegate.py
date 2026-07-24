@@ -137,6 +137,27 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
 
+    def test_read_only_registry_policy_allows_omitted_redundant_flags(self):
+        from tools.registry import registry
+
+        self.assertIsNone(
+            registry.read_only_block(
+                "delegate_task",
+                {"goal": "Inspect the repository and report findings"},
+            )
+        )
+        self.assertIsNone(
+            registry.read_only_block(
+                "delegate_task",
+                {
+                    "tasks": [
+                        {"goal": "Inspect auth"},
+                        {"goal": "Inspect caching"},
+                    ]
+                },
+            )
+        )
+
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
@@ -742,19 +763,40 @@ class TestToolNamePreservation(unittest.TestCase):
         self.assertEqual(captured["acp_command"], "copilot")
 
     def test_schema_never_exposes_acp_transport_fields(self):
-        """delegate_task must never make ACP transport model-facing."""
-        from tools.delegate_tool import _build_dynamic_schema_overrides
+        """READ_ONLY model schemas hide operator-owned ACP transport fields."""
+        import model_tools
 
-        with patch("shutil.which", return_value="/usr/local/bin/copilot"):
-            overrides = _build_dynamic_schema_overrides()
-
-        props = overrides["parameters"]["properties"]
-        self.assertIn("acp_command", props)
-        self.assertIn("acp_args", props)
-
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=["delegation"],
+            quiet_mode=True,
+            runtime_mode="read_only",
+        )
+        schema = next(
+            item["function"]
+            for item in definitions
+            if item["function"]["name"] == "delegate_task"
+        )
+        props = schema["parameters"]["properties"]
+        self.assertNotIn("acp_command", props)
+        self.assertNotIn("acp_args", props)
         task_item_props = props["tasks"]["items"]["properties"]
-        self.assertIn("acp_command", task_item_props)
-        self.assertIn("acp_args", task_item_props)
+        self.assertNotIn("acp_command", task_item_props)
+        self.assertNotIn("acp_args", task_item_props)
+
+    def test_read_only_dispatch_rejects_stale_model_acp_override(self):
+        parent = _make_mock_parent(depth=0)
+        parent._runtime_mode = "read_only"
+
+        payload = json.loads(
+            delegate_task(
+                goal="inspect safely",
+                acp_command="copilot",
+                acp_args=["--acp"],
+                parent_agent=parent,
+            )
+        )
+
+        self.assertIn("does not accept model-supplied ACP", payload["error"])
 
     def test_saved_tool_names_set_on_child_before_run(self):
         """_run_single_child must set _delegate_saved_tool_names on the child
@@ -1525,6 +1567,61 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         self.assertEqual(kwargs["model"], parent.model)
         self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
         self.assertEqual(kwargs["provider"], parent.provider)
+        self.assertEqual(kwargs["runtime_mode"], "read_only")
+        self.assertIs(MockAgent.return_value._persist_disabled, True)
+
+    def test_read_only_parent_implicitly_propagates_to_observational_child(self):
+        parent = _make_mock_parent()
+        parent._runtime_mode = "read_only"
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+            MockAgent.return_value = MagicMock()
+            delegate_task(
+                goal="Inspect the implementation and report findings",
+                parent_agent=parent,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["runtime_mode"], "read_only")
+        self.assertIs(MockAgent.return_value._persist_disabled, True)
+
+    def test_read_only_parent_implicitly_propagates_to_observational_batch(self):
+        parent = _make_mock_parent()
+        parent._runtime_mode = "read_only"
+        children = [MagicMock(), MagicMock()]
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_run.side_effect = lambda child, task_index, *_args, **_kwargs: {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+            MockAgent.side_effect = children
+            delegate_task(
+                tasks=[
+                    {"goal": "Inspect authentication"},
+                    {"goal": "Inspect caching"},
+                ],
+                parent_agent=parent,
+            )
+
+        self.assertEqual(MockAgent.call_count, 2)
+        for call in MockAgent.call_args_list:
+            self.assertEqual(call.kwargs["runtime_mode"], "read_only")
+        for child in children:
+            self.assertIs(child._persist_disabled, True)
 
     @patch("tools.delegate_tool._run_single_child")
     def test_explicit_tier_reaches_aiagent_without_keyword_rewrite(self, mock_run):
@@ -2949,7 +3046,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
 
-    def test_model_acp_args_preserve_public_compatibility(self):
+    def test_read_only_model_acp_args_are_rejected(self):
         import run_agent
 
         captured = {}
@@ -2959,8 +3056,9 @@ class TestDispatchDelegateTask(unittest.TestCase):
             return "{}"
 
         parent = _make_mock_parent(depth=0)
+        parent._runtime_mode = "read_only"
         with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
-            run_agent.AIAgent._dispatch_delegate_task(
+            result = run_agent.AIAgent._dispatch_delegate_task(
                 parent,
                 {
                     "goal": "test",
@@ -2977,12 +3075,8 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(captured["acp_command"], "claude")
-        self.assertEqual(captured["acp_args"], ["--acp", "--stdio"])
-        self.assertEqual(captured["goal"], "test")
-        self.assertEqual(captured["model_tier"], "trivial")
-        self.assertEqual(captured["tasks"][0]["acp_command"], "codex")
-        self.assertEqual(captured["tasks"][0]["acp_args"], ["--acp"])
+        self.assertIn("rejects model-supplied ACP", json.loads(result)["error"])
+        self.assertEqual(captured, {})
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

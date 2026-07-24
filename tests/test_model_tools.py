@@ -9,6 +9,7 @@ from unittest.mock import ANY, call, patch
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
+    get_tool_definitions,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
@@ -40,6 +41,46 @@ class TestHandleFunctionCall:
         assert "error" in parsed
         assert len(parsed["error"]) > 0
         assert "error" in parsed["error"].lower() or "failed" in parsed["error"].lower()
+
+
+    def test_read_only_tool_definitions_expose_observation_and_hide_mutation(self):
+        with patch("tools.registry._check_fn_cached", return_value=True):
+            definitions = get_tool_definitions(
+                enabled_toolsets=[
+                    "file",
+                    "terminal",
+                    "browser",
+                    "delegation",
+                    "discord-action-escalation",
+                ],
+                quiet_mode=False,
+                runtime_mode="read_only",
+            )
+
+        names = {
+            definition["function"]["name"]
+            for definition in definitions
+        }
+        assert {
+            "read_file",
+            "search_files",
+            "terminal",
+            "process",
+            "read_only_verify",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_vision",
+            "delegate_task",
+            "escalate_to_action",
+        } <= names
+        assert {
+            "write_file",
+            "patch",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "delegate_coding_task",
+        }.isdisjoint(names)
 
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (

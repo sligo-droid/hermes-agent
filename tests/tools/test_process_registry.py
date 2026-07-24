@@ -2304,3 +2304,39 @@ class TestHandleProcessRedaction:
             "session_id": session.id,
         }))
         assert "zzzopaque1234567890abcdef" in result["output"]
+
+    @pytest.mark.parametrize("action", ["list", "poll", "log", "wait"])
+    def test_read_only_forces_redaction_when_global_setting_is_disabled(
+        self, monkeypatch, action
+    ):
+        import agent.redact as redact_module
+        from tools import process_registry as process_registry_module
+
+        monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+        reg = ProcessRegistry()
+        secret = "zzzopaque1234567890abcdef"
+        session = _make_session(
+            sid="proc_prior_action",
+            command=f"printenv SERVICE_TOKEN={secret}",
+            output=f"SERVICE_TOKEN={secret}\n",
+            exited=True,
+            exit_code=0,
+        )
+        reg._finished[session.id] = session
+        monkeypatch.setattr(process_registry_module, "process_registry", reg)
+        args = {"action": action}
+        if action != "list":
+            args["session_id"] = session.id
+        if action == "wait":
+            args["timeout"] = 1
+
+        result = json.loads(
+            process_registry_module._handle_process(
+                args,
+                runtime_mode="read_only",
+            )
+        )
+        rendered = json.dumps(result)
+        assert secret not in rendered
+        assert "SERVICE_TOKEN" in rendered
+        assert "***" in rendered or "..." in rendered

@@ -39,6 +39,7 @@ from hermes_cli.discord_thread_context import (
 )
 from hermes_cli.discord_plan_artifacts import persist_discord_plan_artifact
 from agent.runtime_breakdown import render_runtime_breakdown_text
+from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
@@ -169,17 +170,70 @@ _OBSIDIAN_PROJECT_ACCESS_HEADINGS = {
     "credentials",
     "demo credentials",
 }
-_DISCORD_DIRECT_QUESTION_PROMPT = (
-    "This Discord trigger was classified as a direct question, not an action "
-    "request, and entered the safe question/intake runtime. Answer in place "
-    "when the user wants explanation, status, advice, or a short answer. "
-    "Read-only inspection is allowed when it is needed to answer. Do not edit "
-    "files, run mutating commands, start a branch or PR, deploy, or begin any "
-    "other implementation workflow in this runtime. If the "
-    "user is actually asking Hermes to implement, change, fix, deploy, run, or "
-    "otherwise perform work, call `escalate_to_action` immediately and call it "
-    "alone. Do not do preliminary investigation first. The gateway will replay "
-    "the original request in the correctly isolated action runtime."
+_DISCORD_READ_ONLY_PROMPT = (
+    "This Discord turn is running in Hermes' default READ-ONLY runtime. Answer "
+    "directly when existing context is enough; otherwise actively inspect with "
+    "the available read-only file/search, history/log, browser navigation and "
+    "snapshot, API, process-inspection, disposable verification, vision, or "
+    "read-only delegation tools. Durable changes are structurally blocked: do "
+    "not edit source/config, install packages, commit/push/open or merge PRs, "
+    "deploy, send external messages, or mutate databases/services. If and only "
+    "if the user's original request requires durable state to change, call "
+    "`escalate_to_action` alone. The gateway will end this turn and replay the "
+    "original text, media, and context into a fresh ACTION runtime. Explicit "
+    "constraints such as 'do not implement', 'plan only', and 'recommend only' "
+    "must remain read-only and must never escalate."
+)
+
+_DISCORD_EXPLICIT_NO_ACTION_PATTERNS = (
+    (
+        "explicit_no_implementation",
+        re.compile(
+            r"\b(?:do\s+not|don't|dont|without)\s+(?:(?:yet|actually)\s+)?(?:implement|change|"
+            r"modify|edit|fix|build|create|add|deploy|ship|write|commit|push|merge)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "explicit_no_action",
+        re.compile(
+            r"\b(?:do\s+not|don't|dont)\s+(?:(?:actually|yet)\s+)?(?:take|perform)\s+"
+            r"(?:any\s+)?action\b|\b(?:do\s+not|don't|dont)\s+(?:(?:actually|yet)\s+)?"
+            r"(?:make|apply)\s+(?:any\s+)?(?:changes?|edits?)\b|\bno\s+action\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "explicit_observation_only",
+        re.compile(
+            r"\b(?:for\s+now\s+)?(?:just|only)\s+(?:plan|review|audit|research|"
+            r"investigate|verify|recommend|advise|analy[sz]e|assess)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "explicit_deliverable_only",
+        re.compile(
+            r"\b(?:plan|planning|recommendations?|advice|analysis|assessment|findings)\s+only\b|"
+            r"\b(?:analysis|planning)[- ]only\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "hypothetical_action_only",
+        re.compile(
+            r"\btell\s+me\s+(?:what|how)\s+you\s+would\s+(?:do|implement|change|"
+            r"fix|build|approach)\b|\bwhat\s+would\s+you\s+(?:do|change|fix|build|recommend)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "explicit_no_changes",
+        re.compile(
+            r"\bno\s+(?:implementation|changes?|edits?|deployment|commits?|push|merge)\b",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 try:
@@ -2385,7 +2439,10 @@ class DiscordAdapter(BasePlatformAdapter):
         channel: Any,
         *,
         project_context: Optional[Dict[str, Any]] = None,
+        generation_is_current: Optional[Callable[[], bool]] = None,
     ) -> Optional[Dict[str, Any]]:
+        if not self._promotion_is_current(generation_is_current):
+            return None
         if channel is None or isinstance(channel, discord.DMChannel):
             return None
         channel_id = str(getattr(channel, "id", "") or "")
@@ -2394,6 +2451,8 @@ class DiscordAdapter(BasePlatformAdapter):
         key = self._project_summary_state_key(channel)
         state = self._read_project_summary_state()
         existing = state.get(key)
+        previous_state = dict(existing) if isinstance(existing, dict) else None
+        previous_topic = str(getattr(channel, "topic", "") or "")
         if isinstance(existing, dict) and existing.get("success"):
             topic = str(getattr(channel, "topic", "") or "").lower()
             if not existing.get("pending_github_url") and "pending" not in topic:
@@ -2405,7 +2464,21 @@ class DiscordAdapter(BasePlatformAdapter):
         if isinstance(existing, dict) and existing.get("success"):
             if not self._project_topic_needs_repo_refresh(channel, metadata, existing):
                 return None
+        if not self._promotion_is_current(generation_is_current):
+            return None
         ok = await self._edit_project_summary_topic(channel, metadata)
+        if not self._promotion_is_current(generation_is_current):
+            edit = getattr(channel, "edit", None)
+            if ok and callable(edit):
+                try:
+                    await edit(
+                        topic=previous_topic,
+                        reason="Roll back stale Hermes action promotion",
+                    )
+                    channel.topic = previous_topic
+                except Exception:
+                    logger.debug("[%s] Failed to roll back stale project topic", self.name, exc_info=True)
+            return None
         state[key] = {
             "channel_id": channel_id,
             "guild_id": str(getattr(getattr(channel, "guild", None), "id", "") or ""),
@@ -2427,6 +2500,8 @@ class DiscordAdapter(BasePlatformAdapter):
             "metadata": metadata,
             "project_context": context_with_channel,
             "_channel_obj": channel,
+            "_previous_topic": previous_topic,
+            "_previous_state": previous_state,
         }
 
     async def update_project_summary(self, handle: Optional[Dict[str, Any]]) -> bool:
@@ -3009,7 +3084,10 @@ class DiscordAdapter(BasePlatformAdapter):
         transcript_quote: Optional[str] = None,
         source_message_id: Optional[str] = None,
         reply_to_message: Any = None,
+        generation_is_current: Optional[Callable[[], bool]] = None,
     ) -> Optional[Dict[str, Any]]:
+        if not self._promotion_is_current(generation_is_current):
+            return None
         if thread_channel is None or not hasattr(thread_channel, "send"):
             return None
         board_handle: Optional[Dict[str, Any]] = None
@@ -3039,6 +3117,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 }
             except Exception as exc:
                 logger.debug("[%s] Failed to initialize Discord worker board: %s", self.name, exc)
+        if not self._promotion_is_current(generation_is_current):
+            return None
         try:
             embed = self._build_feature_summary_embed(
                 initial_request=initial_request,
@@ -3060,12 +3140,20 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Failed to send Discord feature summary: %s", self.name, exc)
             return None
+        if not self._promotion_is_current(generation_is_current):
+            await self._delete_discord_object(msg, "stale Hermes action promotion")
+            return None
         quote = self._format_feature_summary_transcript_quote(transcript_quote)
+        quote_msg = None
         if quote:
             try:
-                await thread_channel.send(content=quote)
+                quote_msg = await thread_channel.send(content=quote)
             except Exception as exc:
                 logger.warning("[%s] Failed to send Discord voice transcript quote: %s", self.name, exc)
+        if not self._promotion_is_current(generation_is_current):
+            await self._delete_discord_object(quote_msg, "stale Hermes action promotion")
+            await self._delete_discord_object(msg, "stale Hermes action promotion")
+            return None
         handle = {
             "thread_id": str(getattr(thread_channel, "id", "") or ""),
             "message_id": str(getattr(msg, "id", "") or ""),
@@ -3077,9 +3165,16 @@ class DiscordAdapter(BasePlatformAdapter):
             "kanban_board": board_handle,
             "_thread_obj": thread_channel,
             "_message_obj": msg,
+            "_transcript_message_obj": quote_msg,
         }
         await self._sync_feature_summary_message_reaction(handle, msg, status="In progress")
+        if not self._promotion_is_current(generation_is_current):
+            await self._rollback_feature_summary_handle(handle)
+            return None
         try:
+            if not self._promotion_is_current(generation_is_current):
+                await self._rollback_feature_summary_handle(handle)
+                return None
             self._persist_feature_summary_handle(thread_channel, handle)
             if board_handle and board_handle.get("slug"):
                 try:
@@ -3094,13 +3189,136 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("[%s] Failed to attach feature summary ids to board", self.name, exc_info=True)
         except Exception:
             logger.debug("[%s] Failed to persist Discord feature summary handle", self.name, exc_info=True)
+        if not self._promotion_is_current(generation_is_current):
+            await self._rollback_feature_summary_handle(handle)
+            return None
         return handle
+
+    @staticmethod
+    def _promotion_is_current(callback: Optional[Callable[[], bool]]) -> bool:
+        if callback is None:
+            return True
+        try:
+            return callback() is True
+        except Exception:
+            return False
+
+    async def _delete_discord_object(self, value: Any, reason: str) -> None:
+        delete = getattr(value, "delete", None)
+        if not callable(delete):
+            return
+        try:
+            result = delete(reason=reason)
+        except TypeError:
+            try:
+                result = delete()
+            except Exception:
+                logger.debug(
+                    "[%s] Discord promotion rollback delete failed",
+                    self.name,
+                    exc_info=True,
+                )
+                return
+        except Exception:
+            logger.debug(
+                "[%s] Discord promotion rollback delete failed",
+                self.name,
+                exc_info=True,
+            )
+            return
+        try:
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("[%s] Discord promotion rollback delete failed", self.name, exc_info=True)
+
+    async def _rollback_created_discord_thread(self, thread: Any, reason: str) -> None:
+        """Best-effort cleanup for a thread and any fallback seed message."""
+
+        await self._delete_discord_object(thread, reason)
+        await self._delete_discord_object(
+            getattr(thread, "_hermes_auto_thread_seed_message", None),
+            reason,
+        )
+
+    def _remove_persisted_feature_summary_handle(self, handle: Dict[str, Any]) -> None:
+        thread_id = str(handle.get("thread_id") or "")
+        message_id = str(handle.get("message_id") or "")
+        if not thread_id or not message_id:
+            return
+        state = self._read_project_summary_state()
+        bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
+        if not isinstance(bucket, dict):
+            return
+        kept = {
+            key: value
+            for key, value in bucket.items()
+            if not (
+                isinstance(value, dict)
+                and str(value.get("thread_id") or "") == thread_id
+                and str(value.get("message_id") or "") == message_id
+            )
+        }
+        if len(kept) == len(bucket):
+            return
+        state[_DISCORD_FEATURE_SUMMARY_STATE_BUCKET] = kept
+        self._write_project_summary_state(state)
+
+    async def _rollback_feature_summary_handle(self, handle: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(handle, dict):
+            return
+        try:
+            self._remove_persisted_feature_summary_handle(handle)
+        except Exception:
+            logger.debug("[%s] Failed to remove stale feature-summary state", self.name, exc_info=True)
+        await self._delete_discord_object(
+            handle.get("_transcript_message_obj"),
+            "stale Hermes action promotion",
+        )
+        await self._delete_discord_object(
+            handle.get("_message_obj"),
+            "stale Hermes action promotion",
+        )
+
+    async def rollback_promoted_action_request(self, event: MessageEvent) -> None:
+        """Best-effort rollback for a promoted replay invalidated before dispatch."""
+        if getattr(event, "_discord_promotion_created_feature_summary", False):
+            await self._rollback_feature_summary_handle(getattr(event, "feature_summary", None))
+        project = getattr(event, "project_summary", None)
+        if getattr(event, "_discord_promotion_mutated_project_summary", False) and isinstance(project, dict):
+            channel = project.get("_channel_obj")
+            edit = getattr(channel, "edit", None)
+            previous_topic = str(project.get("_previous_topic") or "")
+            if callable(edit):
+                try:
+                    await edit(topic=previous_topic, reason="Roll back stale Hermes action promotion")
+                    channel.topic = previous_topic
+                except Exception:
+                    logger.debug("[%s] Failed to restore stale project topic", self.name, exc_info=True)
+            try:
+                state = self._read_project_summary_state()
+                key = str(project.get("state_key") or "")
+                previous_state = project.get("_previous_state")
+                if key:
+                    if isinstance(previous_state, dict):
+                        state[key] = previous_state
+                    else:
+                        state.pop(key, None)
+                    self._write_project_summary_state(state)
+            except Exception:
+                logger.debug("[%s] Failed to restore stale project-summary state", self.name, exc_info=True)
+        if getattr(event, "_discord_promotion_created_thread", False):
+            await self._rollback_created_discord_thread(
+                getattr(event, "_discord_promotion_thread_obj", None),
+                "stale Hermes action promotion",
+            )
 
     async def promote_event_to_action_request(
         self,
         event: MessageEvent,
         *,
         initial_request: str,
+        generation_is_current: Optional[Callable[[], bool]] = None,
     ) -> Tuple[Optional[MessageEvent], str]:
         """Promote a safe-intake event into a normal Discord action event.
 
@@ -3110,7 +3328,12 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         source = getattr(event, "source", None)
         request_text = str(initial_request or getattr(event, "text", "") or "").strip()
-        if source is None or not request_text:
+        if (
+            source is None
+            or not request_text
+            or getattr(event, "discord_action_escalation_allowed", None) is not True
+            or not self._promotion_is_current(generation_is_current)
+        ):
             return None, ""
 
         raw_message = getattr(event, "raw_message", None)
@@ -3125,9 +3348,12 @@ class DiscordAdapter(BasePlatformAdapter):
         ).strip()
         thread_channel = None
         parent_channel = None
+        created_thread = False
 
         if thread_id:
             thread_channel = await self._resolve_channel_by_id(thread_id)
+            if not self._promotion_is_current(generation_is_current):
+                return None, ""
             if thread_channel is None:
                 candidate_channel = getattr(raw_message, "channel", None)
                 if str(getattr(candidate_channel, "id", "") or "") == thread_id:
@@ -3139,9 +3365,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_channel = await self._resolve_channel_by_id(
                     str(getattr(source, "chat_id", "") or "")
                 )
+                if not self._promotion_is_current(generation_is_current):
+                    return None, ""
             thread_channel = getattr(raw_message, "thread", None)
             if thread_channel is None and raw_message is not None:
-                thread_channel = await self._auto_create_thread(raw_message)
+                if not self._promotion_is_current(generation_is_current):
+                    return None, ""
+                thread_channel = await self._auto_create_thread(
+                    raw_message,
+                    generation_is_current=generation_is_current,
+                )
+                created_thread = thread_channel is not None
+                self._preseed_discord_thread_dedup(thread_channel)
             thread_id = str(getattr(thread_channel, "id", "") or "").strip()
 
         if thread_channel is None or not thread_id:
@@ -3149,6 +3384,13 @@ class DiscordAdapter(BasePlatformAdapter):
             return None, ""
         if parent_channel is None:
             parent_channel = self._thread_parent_channel(thread_channel)
+        if not self._promotion_is_current(generation_is_current):
+            if created_thread:
+                await self._rollback_created_discord_thread(
+                    thread_channel,
+                    "stale Hermes action promotion",
+                )
+            return None, ""
 
         project_context = self._resolve_project_context_for_channel(parent_channel)
         request_id = str(
@@ -3172,16 +3414,41 @@ class DiscordAdapter(BasePlatformAdapter):
                 project_context=project_context,
                 source_message_id=request_id or None,
                 reply_to_message=reply_target,
+                generation_is_current=generation_is_current,
             )
+            created_feature_summary = feature_summary is not None
+        else:
+            created_feature_summary = False
         if feature_summary is None:
+            if created_thread:
+                await self._rollback_created_discord_thread(
+                    thread_channel,
+                    "failed Hermes action promotion",
+                )
             return None, ""
 
         project_summary = getattr(event, "project_summary", None)
+        mutated_project_summary = False
         if project_summary is None:
             project_summary = await self.initialize_project_summary(
                 parent_channel,
                 project_context=project_context,
+                generation_is_current=generation_is_current,
             )
+            mutated_project_summary = project_summary is not None
+
+        if not self._promotion_is_current(generation_is_current):
+            rollback_event = replace(
+                event,
+                feature_summary=feature_summary,
+                project_summary=project_summary,
+            )
+            rollback_event._discord_promotion_created_feature_summary = created_feature_summary
+            rollback_event._discord_promotion_mutated_project_summary = mutated_project_summary
+            rollback_event._discord_promotion_created_thread = created_thread
+            rollback_event._discord_promotion_thread_obj = thread_channel
+            await self.rollback_promoted_action_request(rollback_event)
+            return None, ""
 
         parent_id = str(getattr(parent_channel, "id", "") or "").strip() or None
         promoted_source = replace(
@@ -3204,12 +3471,22 @@ class DiscordAdapter(BasePlatformAdapter):
             ),
             feature_summary=feature_summary,
             project_summary=project_summary,
-            discord_action_request_intent=True,
-            channel_context=None,
-            goal_thread_context=None,
-            internal=True,
+            discord_runtime_mode=RuntimeMode.ACTION.value,
+            discord_action_request_intent=None,
+            discord_action_escalation_allowed=False,
+            discord_runtime_reason="promoted_action_replay",
+            discord_explicit_no_action_denial=False,
+            participates_in_work_lifecycle=True,
+            internal=False,
             suppress_user_output=False,
         )
+        promoted_event._discord_promotion_created_feature_summary = created_feature_summary
+        promoted_event._discord_promotion_mutated_project_summary = mutated_project_summary
+        promoted_event._discord_promotion_created_thread = created_thread
+        promoted_event._discord_promotion_thread_obj = thread_channel
+        if not self._promotion_is_current(generation_is_current):
+            await self.rollback_promoted_action_request(promoted_event)
+            return None, ""
         self._threads.mark(thread_id)
         self._mark_discord_thread_participation(
             thread_id,
@@ -3569,16 +3846,40 @@ class DiscordAdapter(BasePlatformAdapter):
             "",
             cleaned,
         ).strip()
+        polite_request = re.sub(
+            r"^(?:(?:please)|(?:(?:can|could|would|will)\s+you)(?:\s+please)?)\s+",
+            "",
+            leading_ack or cleaned,
+        ).strip()
         intent_candidates = tuple(
-            dict.fromkeys(candidate for candidate in (cleaned, leading_ack) if candidate)
+            dict.fromkeys(
+                candidate
+                for candidate in (cleaned, leading_ack, polite_request)
+                if candidate
+            )
         )
 
-        # Observational work is still work. Route explicit reviews, audits,
-        # investigations, verification, research, and planning through the
-        # normal action runtime even when the request is phrased politely or
-        # follows narrative context. Keep the pattern anchored to request-like
-        # clause starts so status prose such as "support is investigating" and
-        # short advice questions such as "what do you recommend?" stay intake.
+        if self._explicit_no_action_constraint_reason(cleaned):
+            return False
+
+        # Mixed requests with a concrete operational tail are actionable even
+        # when an earlier clause asks for explanation or diagnosis. Explicit
+        # read-only constraints above still win.
+        if any(
+            re.search(
+                r"(?:[.;,:]\s*|\b(?:and|then)\s+)(?:please\s+)?"
+                r"(?:rerun|re-run|restart|deploy|ship|execute|commit|push|merge|"
+                r"apply|run\s+(?:the\s+)?(?:pipeline|workflow|job|command))\b",
+                candidate,
+            )
+            for candidate in intent_candidates
+        ):
+            return True
+
+        # Observational work belongs directly in the default read-only runtime.
+        # Keep these request-shaped patterns explicit so audits, verification,
+        # research, planning, and recommendations never take a question→action
+        # double hop merely because they need tools.
         observational_task_verb = (
             r"(?:review|audit|inspect|investigate|research|analy[sz]e|assess|"
             r"evaluate|test|verify|validate|diagnose|trace|reproduce|survey|"
@@ -3617,7 +3918,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     r"^(?:(?:and|also|then)\s+)+", "", clause.strip()
                 )
                 if any(pattern.match(request_clause) for pattern in task_clause_patterns):
-                    return True
+                    return False
 
         # An explicit request not to build is a direct-question signal even
         # though the sentence contains an implementation verb. This pins the
@@ -3722,6 +4023,37 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return None
 
+    def _explicit_no_action_constraint_reason(self, text: str) -> Optional[str]:
+        cleaned = re.sub(r"<@[!&]?\d+>|<#\d+>", " ", str(text or ""))
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            return None
+        for reason, pattern in _DISCORD_EXPLICIT_NO_ACTION_PATTERNS:
+            if pattern.search(cleaned):
+                return reason
+        return None
+
+    def _discord_runtime_authority(
+        self,
+        text: str,
+        mode: RuntimeMode,
+        *,
+        actionable_thread_context: bool = False,
+        force_action: bool = False,
+    ) -> tuple[str, bool]:
+        no_action_reason = self._explicit_no_action_constraint_reason(text)
+        if no_action_reason:
+            return no_action_reason, False
+        if mode is RuntimeMode.ACTION:
+            return ("structural_action_context" if force_action else "explicit_action_request"), False
+        heuristic = self._heuristic_action_request_intent(
+            text,
+            actionable_thread_context=actionable_thread_context,
+        )
+        if heuristic is False:
+            return "classified_read_only", False
+        return "ambiguous_read_only", True
+
     def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:
         return self._heuristic_action_request_intent(text)
 
@@ -3791,6 +4123,40 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return False
 
+    async def _classify_discord_runtime_mode(
+        self,
+        text: str,
+        context_lines: list[str] | None = None,
+        *,
+        actionable_thread_context: bool = False,
+        force_action: bool = False,
+    ) -> RuntimeMode:
+        if not str(text or "").strip():
+            return RuntimeMode.READ_ONLY
+        # A direct Discord message link retains the established ACTION fast
+        # path. Only explicit user authority constraints may override that
+        # structural route; broad observational phrasing such as
+        # "investigate" must not silently downgrade a linked mutation request.
+        if self._explicit_no_action_constraint_reason(text):
+            return RuntimeMode.READ_ONLY
+        link_fast_path = force_action and self._contains_discord_message_link(text)
+        if link_fast_path:
+            return RuntimeMode.ACTION
+        heuristic = self._heuristic_action_request_intent(
+            text,
+            actionable_thread_context=actionable_thread_context,
+        )
+        # Explicit read-only constraints beat structural action context,
+        # including an established action thread or configured action channel.
+        if heuristic is False:
+            return RuntimeMode.READ_ONLY
+        if heuristic is True or force_action:
+            return RuntimeMode.ACTION
+        # Ambiguity is intentionally read-only by default. The ordinary agent
+        # gets the full context and can request a transactional gateway replay
+        # only when durable state actually needs to change.
+        return RuntimeMode.READ_ONLY
+
     async def _classify_discord_action_request(
         self,
         text: str,
@@ -3798,18 +4164,15 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         actionable_thread_context: bool = False,
     ) -> bool:
-        if not str(text or "").strip():
-            return False
-        heuristic = self._heuristic_action_request_intent(
-            text,
-            actionable_thread_context=actionable_thread_context,
-        )
-        if heuristic is not None:
-            return heuristic
-        # Ambiguity is intentionally safe by default. The ordinary agent gets
-        # the full conversational context and can request a transactional
-        # gateway escalation if the user's intent is actually to perform work.
-        return False
+        """Compatibility bool wrapper for older tests and plugin callers."""
+
+        return (
+            await self._classify_discord_runtime_mode(
+                text,
+                context_lines=context_lines,
+                actionable_thread_context=actionable_thread_context,
+            )
+        ) is RuntimeMode.ACTION
 
     async def _classify_discord_feature_request(self, text: str) -> bool:
         return await self._classify_discord_action_request(text)
@@ -3849,8 +4212,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _append_direct_question_prompt(self, prompt: Optional[str]) -> str:
         if prompt and prompt.strip():
-            return f"{prompt.strip()}\n\n{_DISCORD_DIRECT_QUESTION_PROMPT}"
-        return _DISCORD_DIRECT_QUESTION_PROMPT
+            return f"{prompt.strip()}\n\n{_DISCORD_READ_ONLY_PROMPT}"
+        return _DISCORD_READ_ONLY_PROMPT
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Notify the gateway when Discord's top-level runtime task exits."""
@@ -6677,9 +7040,14 @@ class DiscordAdapter(BasePlatformAdapter):
     @staticmethod
     def _action_lifecycle_enabled(event: MessageEvent) -> bool:
         """Return whether this turn may mutate action summary/reaction state."""
-        return (
-            getattr(event, "discord_action_request_intent", None) is not False
-            and getattr(event, "participates_in_work_lifecycle", True)
+        mode = normalize_runtime_mode(
+            getattr(event, "discord_runtime_mode", None),
+            legacy_action_intent=getattr(
+                event, "discord_action_request_intent", None
+            ),
+        )
+        return mode is RuntimeMode.ACTION and getattr(
+            event, "participates_in_work_lifecycle", True
         )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
@@ -9070,6 +9438,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("Discord /%s DM notice failed: %s", command, exc)
             return False
 
+        event.discord_runtime_mode = RuntimeMode.ACTION.value
+        event.discord_action_request_intent = None
+        event.discord_action_escalation_allowed = False
+        event.discord_runtime_reason = "action_thread_slash_command"
+        event.discord_explicit_no_action_denial = False
+        event.participates_in_work_lifecycle = True
+
         thread_channel = getattr(interaction, "channel", None)
         if getattr(source, "thread_id", None):
             parent_channel = self._thread_parent_channel(thread_channel)
@@ -9962,6 +10337,12 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_text=getattr(message, "content", None) or None,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
             auto_skill=self._resolve_channel_skills(channel_id, parent_id or None),
+            discord_runtime_mode=RuntimeMode.ACTION.value,
+            discord_action_request_intent=None,
+            discord_action_escalation_allowed=False,
+            discord_runtime_reason="ship_it_reaction",
+            discord_explicit_no_action_denial=False,
+            participates_in_work_lifecycle=True,
         )
 
     async def _handle_raw_reaction_add(self, payload: Any) -> None:
@@ -12041,6 +12422,22 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
         return thread_name
 
+    def _preseed_discord_thread_dedup(self, thread: Any) -> None:
+        """Mark a newly-created thread starter id before Discord replays it."""
+
+        thread_id = str(getattr(thread, "id", "") or "").strip()
+        if not thread_id:
+            return
+        try:
+            self._dedup.is_duplicate(thread_id)
+        except Exception:
+            logger.debug(
+                "[%s] Failed to pre-seed Discord thread starter dedup for %s",
+                self.name,
+                thread_id,
+                exc_info=True,
+            )
+
     def _meeting_thread_name(self, message: Any) -> str:
         created_at = getattr(message, "created_at", None)
         date_part = ""
@@ -12082,7 +12479,12 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] Meeting thread creation failed: %s", self.name, exc)
             return None
 
-    async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
+    async def _auto_create_thread(
+        self,
+        message: 'DiscordMessage',
+        *,
+        generation_is_current: Optional[Callable[[], bool]] = None,
+    ) -> Optional[Any]:
         """Create an auto-thread attached to the triggering user message.
 
         Returns the created thread object, or ``None`` on failure.  Auto-threading
@@ -12098,12 +12500,17 @@ class DiscordAdapter(BasePlatformAdapter):
         last_fallback_error: Exception | None = None
 
         for attempt in range(2):
+            if not self._promotion_is_current(generation_is_current):
+                return None
             try:
                 thread = await message.create_thread(
                     name=thread_name,
                     auto_archive_duration=1440,
                     reason=reason,
                 )
+                if not self._promotion_is_current(generation_is_current):
+                    await self._delete_discord_object(thread, "stale Hermes action promotion")
+                    return None
                 try:
                     setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
                 except Exception:
@@ -12111,27 +12518,55 @@ class DiscordAdapter(BasePlatformAdapter):
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
+                seed_msg = None
                 try:
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
                     )
+                    if not self._promotion_is_current(generation_is_current):
+                        await self._delete_discord_object(seed_msg, "stale Hermes action promotion")
+                        return None
                     thread = await seed_msg.create_thread(
                         name=thread_name,
                         auto_archive_duration=1440,
                         reason=reason,
                     )
+                    if not self._promotion_is_current(generation_is_current):
+                        seed_attached = False
+                        try:
+                            setattr(thread, "_hermes_auto_thread_seed_message", seed_msg)
+                            seed_attached = True
+                        except Exception:
+                            pass
+                        await self._rollback_created_discord_thread(
+                            thread,
+                            "stale Hermes action promotion",
+                        )
+                        if not seed_attached:
+                            await self._delete_discord_object(
+                                seed_msg,
+                                "stale Hermes action promotion",
+                            )
+                        return None
                     try:
                         setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
+                        setattr(thread, "_hermes_auto_thread_seed_message", seed_msg)
                     except Exception:
                         pass
                     return thread
                 except Exception as fallback_error:
                     last_fallback_error = fallback_error
+                    await self._delete_discord_object(
+                        seed_msg,
+                        "failed Hermes action-promotion thread creation",
+                    )
                     if attempt == 0:
                         # Brief backoff before the second attempt — most failures
                         # in this path are transient connect errors that recover
                         # within a second or two.
                         await asyncio.sleep(0.75)
+                        if not self._promotion_is_current(generation_is_current):
+                            return None
                         continue
 
         logger.warning(
@@ -13383,7 +13818,10 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
         direct_question_prompt = False
-        action_request_intent: Optional[bool] = None
+        discord_runtime_mode: Optional[RuntimeMode] = None
+        discord_runtime_reason: Optional[str] = None
+        discord_action_escalation_allowed = False
+        empty_action_attachment_followup = False
         voice_action_transcript = ""
         voice_triage_preprocessed = False
         triage_context_lines: list[str] = []
@@ -13417,9 +13855,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
         auto_threaded_direct_question = False
+        should_consider_auto_thread = False
         if is_parent_channel_message and is_meeting_command_message and meeting_audio_attachments:
             thread = await self._create_meeting_thread(message)
             if thread:
+                self._preseed_discord_thread_dedup(thread)
                 parent_channel_id = str(message.channel.id)
                 is_thread = True
                 thread_id = str(thread.id)
@@ -13432,6 +13872,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._mark_discord_stage(_intake_timing, "thread_create", _stage_started)
             direct_question_prompt = True
             if thread:
+                self._preseed_discord_thread_dedup(thread)
                 parent_channel_id = str(message.channel.id)
                 is_thread = True
                 thread_id = str(thread.id)
@@ -13470,17 +13911,28 @@ class DiscordAdapter(BasePlatformAdapter):
                     voice_triage_preprocessed = True
                     triage_text = voice_triage_text
                     voice_action_transcript = voice_triage_text
-                action_request_intent = (
-                    True
-                    if has_discord_message_link or slash_command_starts_threaded_work or is_action_request_channel
-                    else await self._classify_discord_action_request(
-                        triage_text,
-                        context_lines=triage_context_lines,
-                        actionable_thread_context=existing_actionable_thread_context,
-                    )
+                triage_force_action = bool(
+                    slash_command_starts_threaded_work
+                    or is_action_request_channel
+                    or has_discord_message_link
+                )
+                discord_runtime_mode = await self._classify_discord_runtime_mode(
+                    triage_text,
+                    context_lines=triage_context_lines,
+                    actionable_thread_context=existing_actionable_thread_context,
+                    force_action=triage_force_action,
+                )
+                (
+                    discord_runtime_reason,
+                    discord_action_escalation_allowed,
+                ) = self._discord_runtime_authority(
+                    triage_text,
+                    discord_runtime_mode,
+                    actionable_thread_context=existing_actionable_thread_context,
+                    force_action=triage_force_action,
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-                direct_question_prompt = not action_request_intent
+                direct_question_prompt = discord_runtime_mode is RuntimeMode.READ_ONLY
 
             should_auto_thread_direct_question = bool(
                 direct_question_prompt
@@ -13490,12 +13942,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             )
             if should_consider_auto_thread and (
-                action_request_intent or should_auto_thread_direct_question
+                discord_runtime_mode is RuntimeMode.ACTION
+                or should_auto_thread_direct_question
             ):
                 _stage_started = time.perf_counter()
                 thread = await self._auto_create_thread(message)
                 self._mark_discord_stage(_intake_timing, "thread_create", _stage_started)
                 if thread:
+                    self._preseed_discord_thread_dedup(thread)
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
                     thread_id = str(thread.id)
@@ -13507,16 +13961,6 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel_id=parent_channel_id,
                         auto_created=True,
                     )
-                    # Pre-seed dedup: when _auto_create_thread creates a thread
-                    # via message.create_thread(), Discord fires a second
-                    # MESSAGE_CREATE event for the "thread starter message".
-                    # That starter message carries id == thread.id and may
-                    # arrive with type=default (not type=21/thread_starter_message),
-                    # so the type filter above does not catch it.  Marking the
-                    # thread id in the dedup cache now ensures that duplicate
-                    # event is dropped before it can trigger a second agent run.
-                    # Fixes #51057.
-                    self._dedup.is_duplicate(str(thread.id))
                 else:
                     # Auto-threading is the configured routing target for this
                     # message; if it fails we must NOT silently fall back to an
@@ -13539,7 +13983,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     return False
 
         if (
-            action_request_intent is None
+            discord_runtime_mode is None
             and not is_meeting_command_message
             and not grill_me_trigger
             and not is_slash_command_message
@@ -13564,24 +14008,34 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if not empty_action_attachment or triage_text.strip():
                 _stage_started = time.perf_counter()
-                action_request_intent = (
-                    True
-                    if is_action_request_channel
-                    else await self._classify_discord_action_request(
-                        triage_text,
-                        context_lines=triage_context_lines,
-                        actionable_thread_context=existing_actionable_thread_context,
-                    )
+                triage_force_action = bool(
+                    is_action_request_channel
+                    or self._contains_discord_message_link(triage_text)
+                )
+                discord_runtime_mode = await self._classify_discord_runtime_mode(
+                    triage_text,
+                    context_lines=triage_context_lines,
+                    actionable_thread_context=existing_actionable_thread_context,
+                    force_action=triage_force_action,
+                )
+                (
+                    discord_runtime_reason,
+                    discord_action_escalation_allowed,
+                ) = self._discord_runtime_authority(
+                    triage_text,
+                    discord_runtime_mode,
+                    actionable_thread_context=existing_actionable_thread_context,
+                    force_action=triage_force_action,
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-                direct_question_prompt = not action_request_intent
+                direct_question_prompt = discord_runtime_mode is RuntimeMode.READ_ONLY
 
         # Accepted unmentioned turns in a participated/free-response action
         # thread bypass the earlier mention/reply classifier. Classify them
         # here once structural action identity is known so direct questions
         # use ordinary runtime while terse approvals stay action turns.
         if (
-            action_request_intent is None
+            discord_runtime_mode is None
             and is_thread
             and existing_actionable_thread_context
             and not is_meeting_command_message
@@ -13606,13 +14060,54 @@ class DiscordAdapter(BasePlatformAdapter):
             # native voice remains classifiable when transcription produced text.
             if late_triage_text.strip():
                 _stage_started = time.perf_counter()
-                action_request_intent = await self._classify_discord_action_request(
+                triage_force_action = self._contains_discord_message_link(late_triage_text)
+                discord_runtime_mode = await self._classify_discord_runtime_mode(
                     late_triage_text,
                     context_lines=triage_context_lines,
                     actionable_thread_context=True,
+                    force_action=triage_force_action,
+                )
+                (
+                    discord_runtime_reason,
+                    discord_action_escalation_allowed,
+                ) = self._discord_runtime_authority(
+                    late_triage_text,
+                    discord_runtime_mode,
+                    actionable_thread_context=True,
+                    force_action=triage_force_action,
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-                direct_question_prompt = not action_request_intent
+                direct_question_prompt = discord_runtime_mode is RuntimeMode.READ_ONLY
+
+        empty_action_attachment_followup = bool(
+            existing_actionable_thread_context
+            and all_attachments
+            and not (normalized_content or voice_action_transcript).strip()
+        )
+        if discord_runtime_mode is None:
+            discord_runtime_mode = (
+                RuntimeMode.ACTION
+                if (
+                    slash_command_starts_threaded_work
+                    or is_meeting_command_message
+                    or (
+                        existing_actionable_thread_context
+                        and not (normalized_content or voice_action_transcript).strip()
+                    )
+                )
+                else RuntimeMode.READ_ONLY
+            )
+            authority_text = normalized_content or voice_action_transcript
+            structural_action = discord_runtime_mode is RuntimeMode.ACTION
+            (
+                discord_runtime_reason,
+                discord_action_escalation_allowed,
+            ) = self._discord_runtime_authority(
+                authority_text,
+                discord_runtime_mode,
+                actionable_thread_context=existing_actionable_thread_context,
+                force_action=structural_action,
+            )
 
         def _feature_summary_initial_request(candidate: Any) -> str:
             candidate_text = str(candidate or "")
@@ -13629,7 +14124,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if (
             is_parent_channel_message
             and mention_prefix
-            and direct_question_prompt is False
+            and discord_runtime_mode is RuntimeMode.ACTION
             and not grill_me_trigger
         ):
             project_summary_handle = await self.initialize_project_summary(
@@ -13677,7 +14172,8 @@ class DiscordAdapter(BasePlatformAdapter):
         elif (
             is_thread
             and not slash_goal_uses_attachment_body
-            and action_request_intent is True
+            and discord_runtime_mode is RuntimeMode.ACTION
+            and not empty_action_attachment_followup
         ):
             feature_summary_handle = self._load_feature_summary_handle_for_request(
                 message.channel,
@@ -14016,7 +14512,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
         _base_channel_prompt = _channel_prompt
-        if direct_question_prompt:
+        if discord_runtime_mode is RuntimeMode.READ_ONLY:
             _channel_prompt = self._append_direct_question_prompt(_channel_prompt)
 
         reply_to_id, reply_to_text = await self._resolve_reply_context(message)
@@ -14036,16 +14532,27 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             feature_summary=feature_summary_handle,
             project_summary=project_summary_handle,
-            discord_action_request_intent=action_request_intent,
+            discord_runtime_mode=discord_runtime_mode.value,
+            discord_action_request_intent=None,
+            discord_action_escalation_allowed=discord_action_escalation_allowed,
+            discord_runtime_reason=discord_runtime_reason,
+            discord_explicit_no_action_denial=bool(
+                self._explicit_no_action_constraint_reason(
+                    normalized_content or voice_action_transcript
+                )
+            ),
             discord_action_request_base_channel_prompt=_base_channel_prompt,
             channel_context=_channel_context,
             goal_thread_context=_goal_thread_context,
             text_document_inlined=text_document_inlined,
             inlined_text_document_names=inlined_text_document_names,
             participates_in_work_lifecycle=(
-                not is_slash_command_message
-                or slash_command_starts_threaded_work
-                or is_meeting_command_message
+                discord_runtime_mode is RuntimeMode.ACTION
+                and (
+                    not is_slash_command_message
+                    or slash_command_starts_threaded_work
+                    or is_meeting_command_message
+                )
             ),
         )
 

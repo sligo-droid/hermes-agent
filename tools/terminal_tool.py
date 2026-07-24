@@ -3233,4 +3233,10 @@ registry.register(
     check_fn=check_terminal_requirements,
     emoji="💻",
     max_result_size_chars=100_000,
+    effect="conditional",
+    read_only_check=(
+        lambda args: __import__(
+            "tools.read_only_command_policy", fromlist=["read_only_terminal_check"]
+        ).read_only_terminal_check(args)
+    ),
 )

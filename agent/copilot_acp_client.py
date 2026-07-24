@@ -28,6 +28,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
 from agent.redact import redact_sensitive_text
+from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -405,6 +406,7 @@ class CopilotACPClient:
         acp_command: str | None = None,
         acp_args: list[str] | None = None,
         acp_cwd: str | None = None,
+        runtime_mode: str | RuntimeMode | None = None,
         command: str | None = None,
         args: list[str] | None = None,
         **_: Any,
@@ -415,6 +417,7 @@ class CopilotACPClient:
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._runtime_mode = normalize_runtime_mode(runtime_mode)
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -620,7 +623,7 @@ class CopilotACPClient:
                     "clientCapabilities": {
                         "fs": {
                             "readTextFile": True,
-                            "writeTextFile": True,
+                            "writeTextFile": self._runtime_mode is RuntimeMode.ACTION,
                         }
                     },
                     "clientInfo": {
@@ -726,6 +729,10 @@ class CopilotACPClient:
                 response = _jsonrpc_error(message_id, -32602, str(exc))
         elif method == "fs/write_text_file":
             try:
+                if self._runtime_mode is RuntimeMode.READ_ONLY:
+                    raise PermissionError(
+                        "ACP filesystem writes are blocked in read-only runtime."
+                    )
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
                 denied = get_write_denied_error(str(path))
                 if denied:

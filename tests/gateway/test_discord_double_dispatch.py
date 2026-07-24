@@ -23,6 +23,7 @@ import sys
 
 import pytest
 
+from agent.runtime_capabilities import RuntimeMode
 from gateway.config import PlatformConfig
 
 
@@ -140,7 +141,7 @@ def adapter(monkeypatch):
     a._text_batch_delay_seconds = 0  # disable batching so dispatch is synchronous
     # The fork only auto-threads action requests; these tests exercise the
     # thread/dedup path rather than the intake classifier.
-    a._classify_discord_action_request = AsyncMock(return_value=True)
+    a._classify_discord_runtime_mode = AsyncMock(return_value=RuntimeMode.ACTION)
     a.handle_message = AsyncMock()
     return a
 

@@ -6,6 +6,7 @@ import sys
 
 import pytest
 
+from agent.runtime_capabilities import RuntimeMode
 from gateway.config import PlatformConfig
 
 
@@ -1034,6 +1035,9 @@ async def test_fable_implementation_slash_uses_normal_non_kanban_action_thread(a
     assert captured_events[0].text == "/fable build the work"
     assert captured_events[0].source.chat_type == "thread"
     assert captured_events[0].feature_summary["kanban_board"] is None
+    assert captured_events[0].discord_runtime_mode == "action"
+    assert captured_events[0].discord_runtime_reason == "action_thread_slash_command"
+    assert captured_events[0].participates_in_work_lifecycle is True
 
 
 @pytest.mark.asyncio
@@ -1316,7 +1320,7 @@ async def test_auto_thread_creates_thread_and_redirects(adapter, monkeypatch):
 
     thread = SimpleNamespace(id=999, name="Hello")
     adapter._auto_create_thread = AsyncMock(return_value=thread)
-    adapter._classify_discord_action_request = AsyncMock(return_value=True)
+    adapter._classify_discord_runtime_mode = AsyncMock(return_value=RuntimeMode.ACTION)
 
     captured_events = []
 
@@ -1349,7 +1353,7 @@ async def test_auto_thread_source_carries_initial_name_for_semantic_rename(adapt
         _hermes_auto_thread_initial_name="raw user prompt",
     )
     adapter._auto_create_thread = AsyncMock(return_value=thread)
-    adapter._classify_discord_action_request = AsyncMock(return_value=True)
+    adapter._classify_discord_runtime_mode = AsyncMock(return_value=RuntimeMode.ACTION)
 
     captured_events = []
 

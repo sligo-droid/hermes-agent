@@ -1915,6 +1915,7 @@ registry.register(
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
+    effect="read_only",
 )
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
@@ -1928,7 +1929,11 @@ def _skill_view_with_bump(args, **kw):
     )
     try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("success")
+            and str(kw.get("runtime_mode") or "") != "read_only"
+        ):
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
@@ -1951,4 +1956,5 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+    effect="read_only",
 )

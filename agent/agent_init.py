@@ -437,6 +437,7 @@ def init_agent(
     pass_session_id: bool = False,
     verify_on_stop: bool | str | None = None,
     session_role: str = "operator",
+    runtime_mode: str = "action",
 ):
     """
     Initialize the AI Agent.
@@ -520,6 +521,9 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.session_role = str(session_role or "operator")
+    from agent.runtime_capabilities import normalize_runtime_mode
+
+    agent._runtime_mode = normalize_runtime_mode(runtime_mode).value
     agent.memory_read_only = bool(memory_read_only)
     agent.pass_session_id = pass_session_id
     agent.verify_on_stop = verify_on_stop
@@ -1230,6 +1234,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        runtime_mode=agent._runtime_mode,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -1540,8 +1545,13 @@ def init_agent(
         agent.valid_tool_names.discard("memory")
 
     agent._late_extension_tool_names: set[str] = set()
-    if agent._memory_manager and agent.tools is not None and (
+    if (
+        agent._runtime_mode != "read_only"
+        and agent._memory_manager
+        and agent.tools is not None
+        and (
         agent.enabled_toolsets is None or "memory" in agent.enabled_toolsets
+        )
     ):
         if agent.memory_read_only:
             _blocked_memory_tool_names = {"memory"}
@@ -2005,6 +2015,8 @@ def init_agent(
     # same local-model latency penalty.
     agent._context_engine_tool_names: set = set()
     if (
+        agent._runtime_mode != "read_only"
+        and
         hasattr(agent, "context_compressor")
         and agent.context_compressor
         and agent.tools is not None

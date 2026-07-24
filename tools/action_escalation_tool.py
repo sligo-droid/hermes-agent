@@ -67,4 +67,5 @@ registry.register(
     schema=ACTION_ESCALATION_SCHEMA,
     handler=lambda args, **_kw: escalate_to_action(reason=args.get("reason", "")),
     emoji="↗️",
+    effect="read_only",
 )

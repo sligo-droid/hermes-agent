@@ -276,6 +276,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    runtime_mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -327,6 +328,7 @@ def get_tool_definitions(
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             _default_kanban_intake,
             bool(skip_tool_search_assembly),
+            str(runtime_mode or ""),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -338,8 +340,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        runtime_mode=runtime_mode,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -364,6 +371,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    runtime_mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -449,6 +457,45 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
+
+    if normalize_runtime_mode(runtime_mode) is RuntimeMode.READ_ONLY:
+        filtered_tools = [
+            tool
+            for tool in filtered_tools
+            if registry.is_exposable_in_read_only(
+                str(tool.get("function", {}).get("name") or "")
+            )
+        ]
+        # ACP command/argument overrides are operator transport configuration,
+        # not model authority. Keep action-runtime compatibility for trusted
+        # callers, but remove both top-level and per-task fields from the
+        # model-visible READ_ONLY schema. Deep-copy the one schema before
+        # editing so registry/dynamic-schema caches remain immutable.
+        for index, tool in enumerate(filtered_tools):
+            function = tool.get("function", {})
+            if function.get("name") != "delegate_task":
+                continue
+            import copy
+
+            safe_tool = copy.deepcopy(tool)
+            properties = (
+                safe_tool.get("function", {})
+                .get("parameters", {})
+                .get("properties", {})
+            )
+            properties.pop("acp_command", None)
+            properties.pop("acp_args", None)
+            task_properties = (
+                properties.get("tasks", {})
+                .get("items", {})
+                .get("properties", {})
+            )
+            task_properties.pop("acp_command", None)
+            task_properties.pop("acp_args", None)
+            filtered_tools[index] = safe_tool
+            break
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -1044,6 +1091,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    runtime_mode: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1102,6 +1150,7 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
+                runtime_mode=runtime_mode,
             ) or []
         except Exception:
             current_defs = []
@@ -1147,6 +1196,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(tool_request_middleware_trace or []),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                runtime_mode=runtime_mode,
             )
 
     try:
@@ -1273,12 +1323,14 @@ def handle_function_call(
                     task_id=task_id,
                     session_id=session_id,
                     enabled_tools=sandbox_enabled,
+                    runtime_mode=runtime_mode,
                 )
             return registry.dispatch(
                 function_name, effective_args,
                 task_id=task_id,
                 session_id=session_id,
                 user_task=user_task,
+                runtime_mode=runtime_mode,
             )
 
         try:

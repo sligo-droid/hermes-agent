@@ -2761,7 +2761,12 @@ def _redact_browser_output(value: Any) -> Any:
 # Browser Tool Functions
 # ============================================================================
 
-def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+def browser_navigate(
+    url: str,
+    task_id: Optional[str] = None,
+    *,
+    read_only: bool = False,
+) -> str:
     """
     Navigate to a URL in the browser.
 
@@ -2808,6 +2813,19 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         return json.dumps({
             "success": False,
             "error": "Blocked: URL targets a cloud metadata endpoint",
+        })
+
+    # A read-only runtime does not inherit the ordinary local-browser trust
+    # shortcut. Localhost, RFC1918/link-local targets, internal DNS names, and
+    # control-plane endpoints stay blocked unless the operator explicitly
+    # enabled private URLs in Hermes security/browser config.
+    if read_only and (
+        _is_always_blocked_url(url)
+        or (not _allow_private_urls() and not _is_safe_url(url))
+    ):
+        return json.dumps({
+            "success": False,
+            "error": "Blocked: read-only browser navigation targets a private, internal, or control-plane address",
         })
 
     if (
@@ -2890,6 +2908,16 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             return json.dumps({
                 "success": False,
                 "error": "Blocked: redirect landed on a cloud metadata endpoint",
+            })
+
+        if read_only and final_url and (
+            _is_always_blocked_url(final_url)
+            or (not _allow_private_urls() and not _is_safe_url(final_url))
+        ):
+            _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
+            return json.dumps({
+                "success": False,
+                "error": "Blocked: read-only browser redirect landed on a private, internal, or control-plane address",
             })
 
         if (
@@ -3379,6 +3407,8 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
     can reach internal networks the terminal can't), and is skipped for local
     sidecar sessions and when ``allow_private_urls`` is set.
     """
+    if str(effective_task_id or "").endswith("::read-only"):
+        return True
     return (
         not _is_local_backend()
         and not _is_local_sidecar_key(effective_task_id)
@@ -3429,8 +3459,13 @@ def _current_page_private_url(effective_task_id: str) -> Optional[str]:
                 url_result.get("data", {}).get("result", "")
                 .strip().strip('"').strip("'")
             )
+            read_only = str(effective_task_id or "").endswith("::read-only")
             if current_url and (
-                _is_always_blocked_url(current_url) or not _is_safe_url(current_url)
+                _is_always_blocked_url(current_url)
+                or (
+                    not _is_safe_url(current_url)
+                    and not (read_only and _allow_private_urls())
+                )
             ):
                 return current_url
     except Exception as exc:
@@ -4834,22 +4869,68 @@ from tools.registry import registry, tool_error
 
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
+def _read_only_browser_navigate_check(args: dict) -> bool | str:
+    from urllib.parse import urlsplit
+
+    url = str(args.get("url") or "").strip()
+    if urlsplit(url).scheme.lower() not in {"http", "https"}:
+        return "only explicit http:// or https:// navigation is available"
+    if _is_always_blocked_url(url) or (
+        not _allow_private_urls() and not _is_safe_url(url)
+    ):
+        return "private, internal, localhost, and control-plane targets require operator approval"
+    return True
+
+
+def _read_only_browser_task_id(task_id: Optional[str], runtime_mode: Any) -> Optional[str]:
+    mode = str(getattr(runtime_mode, "value", runtime_mode) or "").strip().lower()
+    if mode.replace("-", "_") != "read_only":
+        return task_id
+    return f"{task_id or 'default'}::read-only"
+
+
 registry.register(
     name="browser_navigate",
     toolset="browser",
-    schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
-    handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
+    schema={
+        **_BROWSER_SCHEMA_MAP["browser_navigate"],
+        "description": (
+            _BROWSER_SCHEMA_MAP["browser_navigate"]["description"]
+            + " In READ_ONLY runtime Hermes uses a separate task namespace and blocks "
+            "localhost, private/internal, metadata, and control-plane targets and redirects "
+            "unless operator URL policy explicitly approves them. This namespace may share "
+            "the browser process/profile, so it is not a cookie-isolation boundary or a "
+            "network sandbox for subresource requests; the hard guarantee is on requested "
+            "top-level targets and observed redirects."
+        ),
+    },
+    handler=lambda args, **kw: browser_navigate(
+        url=args.get("url", ""),
+        task_id=_read_only_browser_task_id(kw.get("task_id"), kw.get("runtime_mode")),
+        read_only=(
+            str(getattr(kw.get("runtime_mode"), "value", kw.get("runtime_mode")) or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            == "read_only"
+        ),
+    ),
     check_fn=check_browser_requirements,
     emoji="🌐",
+    effect="conditional",
+    read_only_check=_read_only_browser_navigate_check,
 )
 registry.register(
     name="browser_snapshot",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_snapshot"],
     handler=lambda args, **kw: browser_snapshot(
-        full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
+        full=args.get("full", False),
+        task_id=_read_only_browser_task_id(kw.get("task_id"), kw.get("runtime_mode")),
+        user_task=kw.get("user_task")),
     check_fn=check_browser_requirements,
     emoji="📸",
+    effect="read_only",
 )
 registry.register(
     name="browser_click",
@@ -4858,6 +4939,7 @@ registry.register(
     handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="👆",
+    effect="mutating",
 )
 registry.register(
     name="browser_type",
@@ -4866,22 +4948,30 @@ registry.register(
     handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
+    effect="mutating",
 )
 registry.register(
     name="browser_scroll",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_scroll"],
-    handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_scroll(
+        direction=args.get("direction", "down"),
+        task_id=_read_only_browser_task_id(kw.get("task_id"), kw.get("runtime_mode")),
+    ),
     check_fn=check_browser_requirements,
     emoji="📜",
+    effect="read_only",
 )
 registry.register(
     name="browser_back",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_back"],
-    handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_back(
+        task_id=_read_only_browser_task_id(kw.get("task_id"), kw.get("runtime_mode"))
+    ),
     check_fn=check_browser_requirements,
     emoji="◀️",
+    effect="read_only",
 )
 registry.register(
     name="browser_press",
@@ -4890,29 +4980,48 @@ registry.register(
     handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
+    effect="mutating",
 )
 
 registry.register(
     name="browser_get_images",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_get_images"],
-    handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_get_images(
+        task_id=_read_only_browser_task_id(kw.get("task_id"), kw.get("runtime_mode"))
+    ),
     check_fn=check_browser_requirements,
     emoji="🖼️",
+    effect="read_only",
 )
 registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
-    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_vision(
+        question=args.get("question", ""),
+        annotate=args.get("annotate", False),
+        task_id=_read_only_browser_task_id(kw.get("task_id"), kw.get("runtime_mode")),
+    ),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
+    effect="read_only",
 )
 registry.register(
     name="browser_console",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
-    handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_console(
+        clear=args.get("clear", False),
+        expression=args.get("expression"),
+        task_id=_read_only_browser_task_id(kw.get("task_id"), kw.get("runtime_mode")),
+    ),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if args.get("expression") in {None, ""} and not args.get("clear")
+        else "JavaScript evaluation and clearing browser buffers are unavailable"
+    ),
 )

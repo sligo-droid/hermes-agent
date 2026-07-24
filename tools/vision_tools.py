@@ -1479,6 +1479,7 @@ registry.register(
     check_fn=check_vision_requirements,
     is_async=True,
     emoji="👁️",
+    effect="read_only",
 )
 
 

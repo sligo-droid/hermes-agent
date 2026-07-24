@@ -8,6 +8,7 @@ import pytest
 
 from tools.mcp_tool import MCPServerTask, _register_server_tools
 from tools.registry import ToolRegistry
+from agent.runtime_capabilities import ToolEffect
 
 
 def _make_mcp_tool(name: str, desc: str = ""):
@@ -34,6 +35,29 @@ class TestRegisterServerTools:
             assert "mcp__my_srv__my_tool" in mock_registry.get_all_tool_names()
             assert validate_toolset("my_srv") is True
             assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
+
+    def test_arbitrary_mcp_tools_fail_closed_without_operator_read_only_allowlist(
+        self,
+        mock_registry,
+    ):
+        server = MCPServerTask("my_srv")
+        server._tools = [_make_mcp_tool("inspect"), _make_mcp_tool("mutate")]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools(
+                "my_srv",
+                server,
+                {"read_only_tools": ["inspect"]},
+            )
+
+        assert mock_registry.get_entry("mcp__my_srv__inspect").effect is ToolEffect.READ_ONLY
+        assert mock_registry.get_entry("mcp__my_srv__mutate").effect is ToolEffect.UNKNOWN
+        assert mock_registry.read_only_block("mcp__my_srv__inspect", {}) is None
+        assert "not been proven read-only" in mock_registry.read_only_block(
+            "mcp__my_srv__mutate",
+            {},
+        )
 
 
 class TestRefreshTools:

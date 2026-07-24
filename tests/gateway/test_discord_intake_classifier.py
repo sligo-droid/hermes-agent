@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent.runtime_capabilities import RuntimeMode
 from gateway.config import PlatformConfig
 from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -30,11 +31,11 @@ def adapter():
         ("new feature for saved searches", True),
         ("fix the login bug", True),
         ("run the entire pipeline again", True),
-        ("review the authentication changes", True),
-        ("conduct a security audit of the API", True),
-        ("plan the database migration", True),
-        ("produce a list of recommendations", True),
-        ("can you investigate the flaky tests?", True),
+        ("review the authentication changes", False),
+        ("conduct a security audit of the API", False),
+        ("plan the database migration", False),
+        ("produce a list of recommendations", False),
+        ("can you investigate the flaky tests?", False),
     ],
 )
 def test_heuristic_keeps_only_precise_verdicts(adapter, message, expected):
@@ -88,7 +89,7 @@ def test_heuristic_keeps_pipeline_action_phrases_precise(adapter, message):
     assert adapter._heuristic_action_request_intent(message) is True
 
 
-def test_narrative_prefixed_observational_task_routes_directly_to_action(adapter):
+def test_narrative_prefixed_observational_task_is_read_only(adapter):
     message = (
         "we tried to implement some stuff yesterday via discord but it was a bit "
         "of a disaster. look through the site the way a human would and try to "
@@ -96,7 +97,7 @@ def test_narrative_prefixed_observational_task_routes_directly_to_action(adapter
         "areas you changed and focus on those. produce a list of recommendations"
     )
 
-    assert adapter._heuristic_action_request_intent(message) is True
+    assert adapter._heuristic_action_request_intent(message) is False
 
 
 @pytest.mark.parametrize(
@@ -110,8 +111,10 @@ def test_narrative_prefixed_observational_task_routes_directly_to_action(adapter
         "provide recommendations for the next iteration",
     ],
 )
-def test_read_only_task_requests_route_directly_to_action(adapter, message):
-    assert adapter._heuristic_action_request_intent(message) is True
+@pytest.mark.asyncio
+async def test_read_only_task_requests_use_read_only_runtime(adapter, message):
+    assert adapter._heuristic_action_request_intent(message) is False
+    assert await adapter._classify_discord_runtime_mode(message) is RuntimeMode.READ_ONLY
 
 
 @pytest.mark.parametrize(

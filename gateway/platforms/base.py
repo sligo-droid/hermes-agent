@@ -1451,11 +1451,29 @@ class MessageEvent:
     feature_summary: Optional[Dict[str, Any]] = None
     project_summary: Optional[Dict[str, Any]] = None
 
-    # Discord adapter intent verdict for the current user turn. True selects
-    # action runtime behavior, False selects ordinary question behavior while
-    # retaining action-thread identity, and None preserves legacy/synthetic
-    # routing based on structural thread metadata.
+    # Deprecated Discord intake verdict retained only for synthetic/plugin
+    # compatibility. New code must set ``discord_runtime_mode`` instead.
     discord_action_request_intent: Optional[bool] = None
+
+    # Explicit Discord turn capability. New adapter/gateway code uses this
+    # single representation; ``discord_action_request_intent`` is retained
+    # only as a narrow compatibility input for older synthetic callers.
+    discord_runtime_mode: Optional[str] = None
+
+    # Per-event authority for the READ_ONLY -> ACTION control-plane handoff.
+    # ``False`` is a structural denial (for example "plan only"), while
+    # ``True`` means an otherwise ambiguous read-only turn may request a clean
+    # replay.  ``None`` is fail-closed for escalation.
+    discord_action_escalation_allowed: Optional[bool] = None
+
+    # Stable classifier rationale retained with the event for audit/debugging.
+    # This is transient routing metadata, not model-authored conversation text.
+    discord_runtime_reason: Optional[str] = None
+
+    # True only when the user explicitly denied action (for example
+    # "plan only" or "do not implement"). Within one coalesced semantic
+    # turn this is monotonic: later action/ambiguous fragments cannot erase it.
+    discord_explicit_no_action_denial: bool = False
 
     # Discord channel prompt before any per-turn direct-question overlay.
     # This is transient intake metadata used when coalescing inbound messages.
@@ -1755,9 +1773,16 @@ def merge_discord_action_request_metadata(
     verdict wins, while a legacy/synthetic ``None`` verdict never replaces an
     earlier explicit one. The matching prompt metadata moves with that verdict.
     """
+    from agent.runtime_capabilities import normalize_runtime_mode
+
+    incoming_mode = getattr(event, "discord_runtime_mode", None)
     incoming_intent = getattr(event, "discord_action_request_intent", None)
-    if incoming_intent is None:
+    if incoming_mode is None and incoming_intent is None:
         return
+    incoming_mode = normalize_runtime_mode(
+        incoming_mode,
+        legacy_action_intent=incoming_intent,
+    ).value
 
     base_prompt_attr = "discord_action_request_base_channel_prompt"
     legacy_base_prompt_attr = "_discord_action_request_base_channel_prompt"
@@ -1769,9 +1794,34 @@ def merge_discord_action_request_metadata(
     if incoming_base_prompt is None:
         incoming_base_prompt = getattr(existing, legacy_base_prompt_attr, None)
 
-    existing.discord_action_request_intent = incoming_intent
+    existing_denial = bool(
+        getattr(existing, "discord_explicit_no_action_denial", False)
+    )
+    incoming_denial = bool(
+        getattr(event, "discord_explicit_no_action_denial", False)
+    )
+    if existing_denial or incoming_denial:
+        denial_event = event if incoming_denial else existing
+        denial_prompt = getattr(denial_event, "channel_prompt", None)
+        denial_reason = getattr(denial_event, "discord_runtime_reason", None)
+        existing.discord_runtime_mode = "read_only"
+        existing.discord_action_request_intent = None
+        existing.discord_action_escalation_allowed = False
+        existing.discord_runtime_reason = denial_reason
+        existing.discord_explicit_no_action_denial = True
+        existing.discord_action_request_base_channel_prompt = incoming_base_prompt
+        existing.channel_prompt = denial_prompt
+        return
+
+    existing.discord_runtime_mode = incoming_mode
+    existing.discord_action_request_intent = None
+    existing.discord_action_escalation_allowed = bool(
+        getattr(event, "discord_action_escalation_allowed", False)
+    )
+    existing.discord_runtime_reason = getattr(event, "discord_runtime_reason", None)
+    existing.discord_explicit_no_action_denial = False
     existing.discord_action_request_base_channel_prompt = incoming_base_prompt
-    if incoming_intent is True:
+    if incoming_mode == "action":
         existing.channel_prompt = incoming_base_prompt
     else:
         existing.channel_prompt = getattr(event, "channel_prompt", None)
@@ -4468,7 +4518,10 @@ class BasePlatformAdapter(ABC):
         work_item_id = getattr(event, "work_item_id", None)
         if (
             not work_item_id
-            or not getattr(event, "participates_in_work_lifecycle", True)
+            or (
+                not getattr(event, "participates_in_work_lifecycle", True)
+                and not getattr(event, "discord_drain_recovery", False)
+            )
             or getattr(event, "defer_work_completion", False)
         ):
             return

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from copy import deepcopy
@@ -41,6 +42,7 @@ def _discord_event(message_id="m1", text="do the work"):
         message_type=MessageType.TEXT,
         source=source,
         message_id=message_id,
+        discord_runtime_mode="action",
     )
 
 
@@ -149,12 +151,13 @@ def test_ledger_deduplicates_discord_message_ids(tmp_path):
     assert len(ledger.incomplete_items()) == 1
 
 
-def test_ledger_persists_only_base_prompt_for_direct_question(tmp_path):
+def test_ledger_persists_effective_and_base_prompts_for_read_only_recovery(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="intent-message")
-    event.discord_action_request_intent = False
+    event.discord_runtime_mode = "read_only"
+    event.discord_action_escalation_allowed = True
     event.discord_action_request_base_channel_prompt = "Project instructions"
-    event.channel_prompt = "Project instructions\n\nDirect question overlay"
+    event.channel_prompt = "Project instructions\n\nRead-only runtime overlay"
 
     item = ledger.accept_event(
         event,
@@ -164,13 +167,30 @@ def test_ledger_persists_only_base_prompt_for_direct_question(tmp_path):
 
     assert item is not None
     stored = ledger.get(item["id"])
-    assert stored["channel_prompt"] == "Project instructions"
+    assert stored["channel_prompt"] == "Project instructions\n\nRead-only runtime overlay"
     assert "discord_action_request_intent" not in stored
-    assert "discord_action_request_base_channel_prompt" not in stored
+    assert stored["discord_action_request_base_channel_prompt"] == "Project instructions"
     replay = ledger.event_from_item(stored)
+    assert replay.discord_runtime_mode == "read_only"
     assert replay.discord_action_request_intent is None
-    assert replay.discord_action_request_base_channel_prompt is None
-    assert replay.channel_prompt == "Project instructions"
+    assert replay.discord_action_request_base_channel_prompt == "Project instructions"
+    assert replay.channel_prompt == "Project instructions\n\nRead-only runtime overlay"
+
+
+def test_legacy_ledger_prompt_is_base_prompt_compatibility_fallback(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="legacy-prompt")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    stored = ledger.get(item["id"])
+    stored.pop("discord_action_request_base_channel_prompt", None)
+
+    replay = ledger.event_from_item(stored)
+
+    assert replay.discord_action_request_base_channel_prompt == stored["channel_prompt"]
 
 
 def test_legacy_ledger_item_replays_with_none_action_intent(tmp_path):
@@ -185,7 +205,68 @@ def test_legacy_ledger_item_replays_with_none_action_intent(tmp_path):
     stored = ledger.get(item["id"])
     replay = ledger.event_from_item(stored)
 
+    assert replay.discord_runtime_mode == "action"
     assert replay.discord_action_request_intent is None
+
+
+def test_drain_ledger_persists_read_only_runtime_authority_and_lifecycle(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="read-only-drain", text="audit only")
+    event.discord_runtime_mode = "read_only"
+    event.discord_runtime_reason = "classified_read_only"
+    event.discord_action_escalation_allowed = True
+    event.discord_explicit_no_action_denial = False
+    event.participates_in_work_lifecycle = False
+
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        drain_recovery=True,
+    )
+
+    assert item is not None
+    stored = ledger.get(item["id"])
+    assert stored["discord_runtime_mode"] == "read_only"
+    assert stored["discord_runtime_reason"] == "classified_read_only"
+    assert stored["discord_action_escalation_allowed"] is True
+    assert stored["participates_in_work_lifecycle"] is False
+    replay = ledger.event_from_item(stored)
+    assert replay.discord_runtime_mode == "read_only"
+    assert replay.discord_runtime_reason == "classified_read_only"
+    assert replay.discord_action_escalation_allowed is True
+    assert replay.participates_in_work_lifecycle is False
+    assert replay.discord_drain_recovery is True
+
+
+def test_legacy_ledger_row_without_runtime_metadata_defaults_to_action(tmp_path):
+    path = tmp_path / "work_ledger.json"
+    ledger = GatewayWorkLedger(path)
+    event = _discord_event(message_id="legacy-runtime")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = 1
+    raw = payload["items"][item["id"]]
+    for field in (
+        "discord_runtime_mode",
+        "discord_runtime_reason",
+        "discord_action_escalation_allowed",
+        "discord_explicit_no_action_denial",
+        "participates_in_work_lifecycle",
+        "drain_recovery",
+    ):
+        raw.pop(field, None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    replay = ledger.event_from_item(ledger.get(item["id"]))
+
+    assert replay.discord_runtime_mode == "action"
+    assert replay.participates_in_work_lifecycle is True
+    assert replay.discord_action_escalation_allowed is False
 
 
 def test_ledger_strips_transient_summary_objects(tmp_path):
@@ -2398,6 +2479,67 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_startup_replays_drain_recovery_as_read_only_without_lifecycle(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._background_tasks = set()
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+
+    event = _discord_event(message_id="read-only-restart", text="audit only")
+    event.discord_runtime_mode = "read_only"
+    event.discord_runtime_reason = "explicit_no_implementation"
+    event.discord_explicit_no_action_denial = True
+    event.participates_in_work_lifecycle = False
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        drain_recovery=True,
+    )
+    assert item is not None
+    runner.work_ledger.claim(item["id"])
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    replay = adapter.handle_message.await_args.args[0]
+    assert replay.work_item_id == item["id"]
+    assert replay.discord_runtime_mode == "read_only"
+    assert replay.discord_runtime_reason == "explicit_no_implementation"
+    assert replay.discord_explicit_no_action_denial is True
+    assert replay.participates_in_work_lifecycle is False
+    assert replay.discord_drain_recovery is True
+
+
+def test_read_only_drain_recovery_can_complete_internal_ledger_row(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    ledger = MagicMock()
+    monkeypatch.setattr("gateway.work_ledger.GatewayWorkLedger", lambda: ledger)
+    event = _discord_event(message_id="read-only-complete", text="audit only")
+    event.work_item_id = "work-read-only"
+    event.participates_in_work_lifecycle = False
+    event.discord_drain_recovery = True
+
+    BasePlatformAdapter._mark_work_item_completed(
+        SimpleNamespace(name="test-adapter"),
+        event,
+        SimpleNamespace(message_id="reply-1"),
+    )
+
+    ledger.mark_completed.assert_called_once_with(
+        "work-read-only",
+        result_message_id="reply-1",
+        confirmed_message_ids=("reply-1",),
+    )
+
+
+@pytest.mark.asyncio
 async def test_startup_replays_recently_heartbeating_dead_process_work(tmp_path):
     now = [time.time()]
     runner = object.__new__(GatewayRunner)
@@ -2673,7 +2815,7 @@ async def test_post_delivery_summary_recovers_existing_discord_work_item(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_direct_question_completes_ledger_without_mutating_action_summary(tmp_path):
+async def test_read_only_question_never_enters_or_mutates_action_ledger(tmp_path):
     runner = object.__new__(GatewayRunner)
     runner._session_db = None
     runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
@@ -2695,21 +2837,14 @@ async def test_direct_question_completes_ledger_without_mutating_action_summary(
     }
     original_summary = dict(feature_summary)
     event.feature_summary = feature_summary
-    event.discord_action_request_intent = False
+    event.discord_runtime_mode = "read_only"
+    event.discord_action_request_intent = None
     session_key = build_session_key(event.source)
-    item = runner.work_ledger.accept_event(
+    item = runner._accept_discord_work_item(
         event,
-        session_key=session_key,
-        freshness_seconds=60,
+        session_key,
     )
-    assert item is not None
-    event.work_item_id = item["id"]
-    runner.work_ledger.mark_agent_done(
-        item["id"],
-        final_response="The parser and deployment verification are still outstanding.",
-        feature_summary=feature_summary,
-    )
-    runner.work_ledger.mark_response_delivered(item["id"], result_message_id="answer-1")
+    assert item is None
 
     runner._register_discord_summary_post_delivery(
         event=event,
@@ -2721,13 +2856,10 @@ async def test_direct_question_completes_ledger_without_mutating_action_summary(
         agent_result={"completed": True},
     )
 
-    assert len(callbacks) == 1
-    assert await callbacks[0]() is True
+    assert callbacks == []
     adapter.update_feature_summary.assert_not_awaited()
     assert feature_summary == original_summary
-    stored = runner.work_ledger.get(item["id"])
-    assert stored["status"] == "completed"
-    assert stored["final_response"].startswith("The parser")
+    assert runner.work_ledger.incomplete_items() == []
 
 
 @pytest.mark.asyncio

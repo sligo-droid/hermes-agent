@@ -170,6 +170,7 @@ def test_discord_acceptance_applies_repository_visual_override(tmp_path, monkeyp
         text="Build a responsive dashboard with a mobile sidebar.",
         source=source,
         message_id="repo-visual-override",
+        discord_runtime_mode="action",
     )
 
     item = runner._accept_discord_work_item(
@@ -439,6 +440,53 @@ def test_normal_action_creates_and_reuses_thread_worktree(tmp_path, monkeypatch)
     assert reused_error is None
     assert reused_cwd == cwd
     assert reused_worktree == cwd
+
+
+def test_read_only_turn_never_provisions_but_can_reuse_existing_action_worktree(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    workspaces = tmp_path / "workspaces"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_DISCORD_ACTION_WORKTREE_ROOT", workspaces)
+    source = _source(canonical)
+    session_key = "agent:main:discord:thread:thread-123"
+
+    read_cwd, read_error, read_worktree = gateway_run._resolve_gateway_turn_cwd(
+        source,
+        _feature_summary(),
+        _config(canonical),
+        session_key,
+        "read_only",
+    )
+    assert read_cwd == str(canonical)
+    assert read_error is None
+    assert read_worktree is None
+    assert not workspaces.exists()
+
+    action_cwd, action_error, action_worktree = gateway_run._resolve_gateway_turn_cwd(
+        source,
+        _feature_summary(),
+        _config(canonical),
+        session_key,
+        "action",
+    )
+    assert action_error is None
+    assert action_worktree == action_cwd
+
+    reused_cwd, reused_error, reused_worktree = gateway_run._resolve_gateway_turn_cwd(
+        source,
+        _feature_summary(),
+        _config(canonical),
+        session_key,
+        "read_only",
+    )
+    assert reused_error is None
+    assert reused_cwd == action_cwd
+    assert reused_worktree == action_cwd
 
 
 def test_action_worktree_branch_and_path_advance_together_on_collision(
@@ -2153,6 +2201,7 @@ async def test_action_runtime_installs_visual_checkpoint_callback_for_fable_and_
         session_id="session-1",
         session_key="agent:main:discord:thread:thread-123",
         feature_summary={"initial_request": "Implement the responsive dashboard."},
+        discord_runtime_mode="action",
         fable_plan_metadata=(
             {
                 "command": "fable",
@@ -2272,7 +2321,7 @@ async def test_successful_intake_escalation_queues_clean_action_turn_without_rep
         source=_source(canonical),
         message_id="message-1",
         feature_summary=feature_summary,
-        discord_action_request_intent=True,
+        discord_runtime_mode="action",
         internal=True,
     )
     adapter = SimpleNamespace(
@@ -2298,7 +2347,8 @@ async def test_successful_intake_escalation_queues_clean_action_turn_without_rep
         text="Can you explain this first?",
         source=source,
         message_id="message-1",
-        discord_action_request_intent=False,
+        discord_runtime_mode="read_only",
+        discord_action_escalation_allowed=True,
     )
     async def _promote_then_stop(**_kwargs):
         return {
@@ -2354,6 +2404,76 @@ async def test_successful_intake_escalation_queues_clean_action_turn_without_rep
 
 
 @pytest.mark.asyncio
+async def test_explicit_no_action_turn_rejects_model_escalation_and_writes_no_transcript(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical = canonical_root / "PID"
+    _init_repo(canonical)
+    _protect(monkeypatch, canonical_root)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: _config(canonical))
+
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    adapter = SimpleNamespace(
+        _active_sessions={},
+        _pending_messages={},
+        promote_event_to_action_request=AsyncMock(),
+        register_post_delivery_callback=lambda *args, **kwargs: None,
+        send=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_has_pending_background_workers = lambda *args, **kwargs: False
+
+    def _set_session_env(
+        context,
+        *,
+        session_cwd="",
+        discord_action_escalation_allowed=False,
+    ):
+        captured["escalation_allowed"] = discord_action_escalation_allowed
+        return []
+
+    runner._set_session_env = _set_session_env
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": ".NO_REPLY",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "agent_persisted": False,
+            "action_escalation_requested": {
+                "success": True,
+                "action_escalation_requested": True,
+            },
+        }
+    )
+    source = _source(canonical)
+    event = MessageEvent(
+        text="Do not implement; plan only.",
+        source=source,
+        message_id="message-1",
+        discord_runtime_mode="read_only",
+        discord_action_escalation_allowed=False,
+        discord_runtime_reason="explicit_no_implementation",
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:discord:thread:thread-123",
+        1,
+    )
+
+    assert captured["escalation_allowed"] is False
+    assert "kept this turn read-only" in response
+    adapter.promote_event_to_action_request.assert_not_awaited()
+    runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fable_implementation", [False, True])
 @pytest.mark.parametrize("discord_action_request_intent", [None, False])
 async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
@@ -2392,6 +2512,7 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
         message_id="message-1",
     )
     event.feature_summary = _feature_summary()
+    event.discord_runtime_mode = "action"
     event.discord_action_request_intent = discord_action_request_intent
     if fable_implementation:
         event.fable_plan_metadata = {
@@ -2422,6 +2543,7 @@ async def test_action_turn_injects_worktree_as_project_path_and_agent_cwd(
         run_kwargs["discord_action_request_intent"]
         is discord_action_request_intent
     )
+    assert run_kwargs["discord_runtime_mode"] == "action"
     assert str(canonical) not in run_kwargs["context_prompt"]
     assert f"Path: `{worktree_cwd}`" in run_kwargs["context_prompt"]
 
@@ -2475,6 +2597,7 @@ async def test_direct_closeout_policy_preserves_pr_lifecycle_intent(
         message_id="message-1",
     )
     event.feature_summary = {"initial_request": initial_request}
+    event.discord_runtime_mode = "action"
     if fable_implementation:
         event.fable_plan_metadata = {
             "command": "fable",

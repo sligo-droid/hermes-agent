@@ -531,38 +531,7 @@ _TERMINAL_MUTATION_PATTERNS = re.compile(
     re.VERBOSE,
 )
 
-_DELEGATION_OBSERVATION_TOOLS = frozenset({
-    "delegate_task",
-    "ha_get_state",
-    "ha_list_entities",
-    "ha_list_services",
-    "read_file",
-    "read_terminal",
-    "search_files",
-    "session_search",
-    "skill_view",
-    "skills_list",
-    "tool_describe",
-    "tool_search",
-    "vision_analyze",
-    "web_extract",
-    "web_search",
-})
-
-_DISCORD_INTAKE_OBSERVATION_TOOLS = (
-    _DELEGATION_OBSERVATION_TOOLS - {"delegate_task"}
-) | frozenset({
-    "clarify",
-    "escalate_to_action",
-    "discord_get_channel",
-    "discord_get_message",
-    "discord_get_reactions",
-    "discord_get_thread",
-    "discord_list_channels",
-    "discord_list_guilds",
-    "discord_list_recent",
-    "discord_search_messages",
-})
+_READ_ONLY_BRIDGE_TOOLS = frozenset({"tool_describe", "tool_search"})
 
 
 
@@ -577,21 +546,11 @@ def _delegation_mutation_block(
     if not read_only and not broker_only:
         return None
     args = function_args or {}
+    if read_only:
+        return _read_only_runtime_block(agent, function_name, args)
     if broker_only and function_name == "request_coding_task":
         return None
-    if function_name == "terminal":
-        # Shell command surfaces are too expressive for a durable fail-closed
-        # delegated read-only contract. Nominally observational commands can
-        # still write through command-specific options, aliases, hooks, or
-        # pagers (for example git diff/show --output and tree -o).
-        allowed = False
-    elif function_name == "process":
-        allowed = str(args.get("action") or "") in {"list", "poll", "log", "wait"}
-    else:
-        allowed = function_name in _DELEGATION_OBSERVATION_TOOLS
-    if allowed:
-        return None
-    policy = "read-only" if read_only else "broker-only mutation"
+    policy = "broker-only mutation"
     return (
         f"Blocked {function_name}: this delegated agent is in {policy} mode. "
         "Only explicit observation tools are allowed; terminal execution and "
@@ -599,27 +558,59 @@ def _delegation_mutation_block(
     )
 
 
+def _read_only_runtime_block(
+    agent: Any,
+    function_name: str,
+    function_args: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Fail closed on durable side effects for every read-only runtime."""
+    from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
+
+    runtime_mode = normalize_runtime_mode(
+        getattr(agent, "_runtime_mode", None),
+        legacy_action_intent=(
+            False if getattr(agent, "_discord_intake_read_only", False) else None
+        ),
+    )
+    if (
+        runtime_mode is not RuntimeMode.READ_ONLY
+        and not getattr(agent, "_delegation_read_only", False)
+    ):
+        return None
+    if function_name in _READ_ONLY_BRIDGE_TOOLS:
+        return None
+    from tools.registry import registry
+
+    if function_name == "tool_call":
+        try:
+            from tools.tool_search import resolve_underlying_call
+
+            underlying_name, underlying_args, error = resolve_underlying_call(
+                function_args or {}
+            )
+        except Exception:
+            underlying_name, underlying_args, error = None, {}, "bridge policy unavailable"
+        if error or not underlying_name:
+            return f"Blocked tool_call: {error or 'underlying tool is unavailable'}."
+        block = registry.read_only_block(underlying_name, underlying_args)
+        if block is None:
+            return None
+        return f"{block} Escalate to action only if the user's request requires durable change."
+
+    block = registry.read_only_block(function_name, function_args or {})
+    if block is None:
+        return None
+    return f"{block} Escalate to action only if the user's request requires durable change."
+
+
 def _discord_intake_mutation_block(
     agent: Any,
     function_name: str,
     function_args: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Fail closed on side effects while a Discord turn is still intake-only."""
-    if not getattr(agent, "_discord_intake_read_only", False):
-        return None
-    args = function_args or {}
-    if function_name == "process":
-        allowed = str(args.get("action") or "") in {"list", "poll", "log", "wait"}
-    else:
-        allowed = function_name in _DISCORD_INTAKE_OBSERVATION_TOOLS
-    if allowed:
-        return None
-    return (
-        f"Blocked {function_name}: this Discord turn is in safe question/intake "
-        "mode. Delegation and task-level execution are unavailable here. Use "
-        "lightweight observation tools to answer a question, or call "
-        "escalate_to_action before performing work."
-    )
+    """Compatibility alias for the former Discord-intake guard."""
+
+    return _read_only_runtime_block(agent, function_name, function_args)
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -1135,6 +1126,11 @@ def _run_agent_tool_execution_middleware(
     def _execute(next_args: dict) -> Any:
         nonlocal observed_args
         observed_args = next_args if isinstance(next_args, dict) else function_args
+        read_only_block = _read_only_runtime_block(
+            agent, function_name, observed_args
+        )
+        if read_only_block is not None:
+            return json.dumps({"error": read_only_block}, ensure_ascii=False)
         return execute(observed_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
@@ -1294,7 +1290,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         elif block_result is None:
             block_message = _delegation_mutation_block(agent, function_name, function_args)
             if block_message is None:
-                block_message = _discord_intake_mutation_block(
+                block_message = _read_only_runtime_block(
                     agent, function_name, function_args
                 )
             if block_message is None:
@@ -2046,7 +2042,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         else:
             _block_msg = _delegation_mutation_block(agent, function_name, function_args)
             if _block_msg is None:
-                _block_msg = _discord_intake_mutation_block(
+                _block_msg = _read_only_runtime_block(
                     agent, function_name, function_args
                 )
             if _block_msg is None:
@@ -2468,6 +2464,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    runtime_mode=getattr(agent, "_runtime_mode", None),
                 )
                 _spinner_result = function_result
             except Exception as tool_error:
@@ -2493,6 +2490,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    runtime_mode=getattr(agent, "_runtime_mode", None),
                 )
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"

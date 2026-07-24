@@ -13,7 +13,13 @@ to ``_run_agent``'s return dict and uses it for the slice.
 """
 
 
-from gateway.run import _preserve_queued_followup_history_offset
+from copy import deepcopy
+
+from gateway.run import (
+    _build_gateway_agent_history,
+    _gateway_history_message_chars,
+    _preserve_queued_followup_history_offset,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -323,3 +329,185 @@ class TestTranscriptHistoryOffset:
         )
 
         assert merged["history_offset"] == 3
+
+    def test_read_only_history_bounds_api_copy_without_splitting_tool_groups(self):
+        history = []
+        for index in range(30):
+            call_id = f"call-{index}"
+            history.extend(
+                [
+                    {"role": "user", "content": f"question {index}"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": "observed " + ("x" * 1200),
+                    },
+                    {"role": "assistant", "content": f"answer {index}"},
+                ]
+            )
+        durable_before = deepcopy(history)
+
+        bounded, _ = _build_gateway_agent_history(
+            history,
+            runtime_mode="read_only",
+        )
+
+        assert len(bounded) <= 48
+        assert bounded[0]["role"] == "user"
+        assert bounded[-1]["content"] == "answer 29"
+        for index, message in enumerate(bounded):
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                continue
+            call_id = message["tool_calls"][0]["id"]
+            assert bounded[index + 1]["role"] == "tool"
+            assert bounded[index + 1]["tool_call_id"] == call_id
+        assert history == durable_before
+
+    def test_read_only_history_truncates_only_api_tool_copy_and_persists_new_turn(self):
+        huge_tool_output = "prefix-" + ("z" * 100_000) + "-suffix"
+        history = [
+            {"role": "user", "content": "inspect it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-huge",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-huge",
+                "content": huge_tool_output,
+            },
+            {"role": "assistant", "content": "prior finding"},
+        ]
+        durable_before = deepcopy(history)
+
+        bounded, _ = _build_gateway_agent_history(
+            history,
+            runtime_mode="read_only",
+        )
+        assert "older read-only tool output truncated" in bounded[2]["content"]
+        assert bounded[2]["content"].startswith("prefix-")
+        assert bounded[2]["content"].endswith("-suffix")
+
+        returned_messages = bounded + [
+            {"role": "user", "content": "current question"},
+            {"role": "assistant", "content": "current answer"},
+        ]
+        persisted_new_rows = returned_messages[len(bounded):]
+        assert persisted_new_rows == [
+            {"role": "user", "content": "current question"},
+            {"role": "assistant", "content": "current answer"},
+        ]
+        assert history == durable_before
+
+    def test_read_only_history_bounds_single_100k_user_message(self):
+        history = [{"role": "user", "content": "u" * 100_000}]
+
+        bounded, _ = _build_gateway_agent_history(history, runtime_mode="read_only")
+
+        assert len(bounded) == 1
+        assert sum(_gateway_history_message_chars(message) for message in bounded) <= 80_000
+        assert "older read-only history truncated" in bounded[0]["content"]
+
+    def test_read_only_history_bounds_61_message_single_group_without_splitting_pairs(self):
+        history = [{"role": "user", "content": "inspect the process tree"}]
+        for index in range(30):
+            call_id = f"single-group-{index}"
+            history.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "process", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": f"result {index}",
+                    },
+                ]
+            )
+        assert len(history) == 61
+
+        bounded, _ = _build_gateway_agent_history(history, runtime_mode="read_only")
+
+        assert len(bounded) <= 48
+        assert bounded[0]["role"] == "user"
+        for index, message in enumerate(bounded):
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                assert bounded[index + 1]["role"] == "tool"
+                assert bounded[index + 1]["tool_call_id"] == message["tool_calls"][0]["id"]
+
+    def test_read_only_history_counts_and_bounds_structured_multimodal_content(self):
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "x" * 100_000},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + ("a" * 20_000)},
+                    },
+                ],
+            }
+        ]
+
+        bounded, _ = _build_gateway_agent_history(history, runtime_mode="read_only")
+
+        assert len(bounded) == 1
+        assert isinstance(bounded[0]["content"], str)
+        assert "structured historical content omitted" in bounded[0]["content"]
+        assert sum(_gateway_history_message_chars(message) for message in bounded) <= 80_000
+
+    def test_read_only_history_fails_closed_when_one_tool_pair_chunk_is_indivisible(self):
+        calls = [
+            {
+                "id": f"call-{index}",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+            for index in range(60)
+        ]
+        history = [
+            {"role": "user", "content": "inspect everything"},
+            {"role": "assistant", "tool_calls": calls},
+            *[
+                {"role": "tool", "tool_call_id": call["id"], "content": "ok"}
+                for call in calls
+            ],
+        ]
+
+        bounded, _ = _build_gateway_agent_history(history, runtime_mode="read_only")
+
+        assert bounded == [
+            {
+                "role": "assistant",
+                "content": (
+                    "Earlier read-only context exceeded the safe replay ceiling and was omitted. "
+                    "Answer from the current request and available inspection tools; ask the user to "
+                    "run /reset if exact prior context is required."
+                ),
+            }
+        ]

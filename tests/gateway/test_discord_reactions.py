@@ -2059,6 +2059,8 @@ async def test_thumbsup_on_hermes_message_dispatches_ship_it(adapter):
     assert event.source.user_id == "42"
     assert event.source.user_name == "Jezza"
     assert event.source.guild_id == "10"
+    assert event.discord_runtime_mode == "action"
+    assert event.participates_in_work_lifecycle is True
 
 
 @pytest.mark.asyncio

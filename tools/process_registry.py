@@ -2264,27 +2264,39 @@ PROCESS_SCHEMA = {
 }
 
 
-def _redact_process_result(result: dict) -> dict:
+def _redact_process_result(result: dict, *, force: bool = False) -> dict:
     """Redact secrets from background-process output and command text."""
     if not isinstance(result, dict):
         return result
     from agent.redact import redact_sensitive_text, redact_terminal_output
 
+    result = dict(result)
     command = result.get("command") or ""
     for field in ("output", "output_preview"):
         value = result.get(field)
         if isinstance(value, str) and value:
-            result[field] = redact_terminal_output(value, command)
+            result[field] = redact_terminal_output(value, command, force=force)
     if isinstance(result.get("command"), str) and result["command"]:
         result["command"] = redact_sensitive_text(
-            result["command"], code_file=True
+            result["command"],
+            force=force,
+            # Commands from prior ACTION processes are untrusted output at the
+            # READ_ONLY boundary.  Treat them as source code only for the
+            # ordinary configurable-redaction path; forced redaction must also
+            # mask inline environment/config assignments.
+            code_file=not force,
         )
     return result
 
 
 def _handle_process(args, **kw):
+    from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
+
     task_id = kw.get("task_id")
     action = args.get("action", "")
+    force_redaction = (
+        normalize_runtime_mode(kw.get("runtime_mode")) is RuntimeMode.READ_ONLY
+    )
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
@@ -2294,10 +2306,16 @@ def _handle_process(args, **kw):
             session_key = get_current_session_key(default="") or ""
         except Exception:
             session_key = ""
+        processes = process_registry.list_sessions(
+            task_id=task_id, session_key=session_key or None
+        )
         return json.dumps(
-            {"processes": process_registry.list_sessions(
-                task_id=task_id, session_key=session_key or None
-            )},
+            {
+                "processes": [
+                    _redact_process_result(item, force=force_redaction)
+                    for item in processes
+                ]
+            },
             ensure_ascii=False,
         )
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
@@ -2305,15 +2323,19 @@ def _handle_process(args, **kw):
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
             return json.dumps(
-                _redact_process_result(process_registry.poll(session_id)),
+                _redact_process_result(
+                    process_registry.poll(session_id), force=force_redaction
+                ),
                 ensure_ascii=False,
             )
         elif action == "log":
             return json.dumps(_redact_process_result(process_registry.read_log(
-                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
+                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200)),
+                force=force_redaction), ensure_ascii=False)
         elif action == "wait":
             return json.dumps(_redact_process_result(
-                process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
+                process_registry.wait(session_id, timeout=args.get("timeout")),
+                force=force_redaction), ensure_ascii=False)
         elif action == "kill":
             return json.dumps(
                 _redact_process_result(process_registry.kill_process(session_id)),
@@ -2334,4 +2356,10 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if str(args.get("action") or "") in {"list", "poll", "log", "wait"}
+        else "only list, poll, log, and wait are read-only"
+    ),
 )

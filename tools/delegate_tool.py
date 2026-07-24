@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 from hermes_constants import VALID_REASONING_EFFORTS
 from toolsets import TOOLSETS
+from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -1688,6 +1689,7 @@ def _build_child_agent(
         skip_context_files=True,
         skip_memory=True,
         session_role="worker",
+        runtime_mode=("read_only" if read_only else "action"),
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
@@ -1717,6 +1719,10 @@ def _build_child_agent(
     )
     set_runtime_audit_context(child, **audit_context)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Read-only delegation may query the parent's session store through the
+    # bounded session_search handler, but the child itself must never create a
+    # session, append messages, persist token accounting, or compact history.
+    child._persist_disabled = bool(read_only)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
@@ -3111,8 +3117,20 @@ def delegate_task(
 
     # Read-only is monotonic down the delegation tree. A child cannot turn off
     # a restriction imposed by its parent.
-    inherited_read_only = bool(getattr(parent_agent, "_delegation_read_only", False))
+    inherited_read_only = bool(
+        getattr(parent_agent, "_delegation_read_only", False)
+        or normalize_runtime_mode(
+            getattr(parent_agent, "_runtime_mode", None),
+            default=RuntimeMode.ACTION,
+        )
+        is RuntimeMode.READ_ONLY
+    )
     top_read_only = inherited_read_only or is_truthy_value(read_only, default=False)
+    if top_read_only and (acp_command is not None or acp_args is not None):
+        return tool_error(
+            "Read-only delegation does not accept model-supplied ACP transport overrides. "
+            "Configure the delegation transport outside the tool call instead."
+        )
     background_requested = is_truthy_value(background, default=False)
     background = background_requested
 
@@ -3195,6 +3213,15 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+
+    if top_read_only and any(
+        isinstance(task, dict)
+        and any(field in task for field in _MODEL_HIDDEN_TASK_FIELDS)
+        for task in task_list
+    ):
+        return tool_error(
+            "Read-only delegation does not accept per-task ACP transport overrides."
+        )
 
     # Validate every task, including per-task broker grants, before constructing
     # any child. A batch must fail atomically rather than partially building a
@@ -4144,11 +4171,14 @@ def _build_top_level_description() -> str:
         "synchronous read-only analysis can still run concurrently with other "
         "delegation calls when emitted together in one assistant batch. "
         "Background single tasks and batches share the same global concurrency "
-        "cap and persist completed results for restart-safe delivery.\n\n"
+        "cap and persist completed results as Hermes-internal runtime state for "
+        "restart-safe delivery; this is not user/project mutation.\n\n"
         "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
         "one append-only human-readable log file per task (under "
         "cache/delegation/live/<delegation_id>/). Each child streams its "
         "assistant text, tool calls, and tool results there while it runs. "
+        "These redacted logs/manifests are Hermes-internal cache state, not "
+        "user/project mutation. "
         "Read (or `tail -f` in a terminal) those paths any time you or the "
         "user want to see what a subagent is actually doing instead of "
         "waiting for the final summary.\n\n"
@@ -4186,12 +4216,13 @@ def _build_top_level_description() -> str:
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
         "delegate_task, clarify, memory, send_message, execute_code.\n"
-        "- read_only=false is the default. Use it when a worker may need bounded "
+        "- read_only=false is the default in ACTION runtime. Use it when a worker may need bounded "
         "workspace exploration, setup, or in-scope mutation; terminal and file "
         "tools remain available.\n"
-        "- read_only=true is opt-in, enforced at dispatch time, and propagates to nested "
-        "delegate_task calls. It blocks file writes, all terminal execution, "
-        "execute_code, and coding-worker mutation.\n"
+        "- read_only=true is inherited automatically from a READ_ONLY parent (you may omit "
+        "the argument there), enforced at dispatch time, and propagates to nested "
+        "delegate_task calls. It blocks file writes, mutable terminal/process actions, "
+        "execute_code, and coding-worker mutation while retaining bounded observation.\n"
         "- background=true requires read_only=true for every task. Detached "
         "repository mutation belongs on delegate_coding_task.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
@@ -4363,8 +4394,10 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "read_only": {
                             "type": "boolean",
-                            "default": False,
-                            "description": "Enforce read-only execution for this task and all descendants.",
+                            "description": (
+                                "Enforce read-only execution for this task and descendants. "
+                                "Inherited automatically when the parent runtime is read-only."
+                            ),
                         },
                         "allow_nested_coding": {
                             "type": "boolean",
@@ -4397,9 +4430,9 @@ DELEGATE_TASK_SCHEMA = {
             },
             "read_only": {
                 "type": "boolean",
-                "default": False,
                 "description": (
-                    "Opt-in runtime-enforced repository read-only mode. Default false: "
+                    "Runtime-enforced repository read-only mode. In a READ_ONLY parent this "
+                    "is inherited automatically and may be omitted. In ACTION runtime, false: "
                     "workers may use terminal/file tools for bounded exploration, setup, "
                     "and in-scope mutation. True propagates to descendants."
                 ),
@@ -4411,8 +4444,9 @@ DELEGATE_TASK_SCHEMA = {
                     "Run as a detached background unit and deliver consolidated "
                     "completion in a later turn. Requires read_only=true for every "
                     "task; detached repository mutation uses delegate_coding_task. "
-                    "Completed results are persisted for restart-safe delivery, and "
-                    "the response includes live transcript paths."
+                    "Completed results are persisted as Hermes-internal runtime state "
+                    "for restart-safe delivery, and the response includes redacted live "
+                    "transcript paths. This does not grant user/project mutation."
                 ),
             },
             "allow_nested_coding": {
@@ -4652,6 +4686,26 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+    effect="conditional",
+    read_only_check=lambda args: (
+        True
+        if (
+            args.get("allow_nested_coding") is not True
+            and (
+                (
+                    isinstance(args.get("tasks"), list)
+                    and bool(args.get("tasks"))
+                    and all(
+                        isinstance(task, dict)
+                        and task.get("allow_nested_coding") is not True
+                        for task in args.get("tasks")
+                    )
+                )
+                or not args.get("tasks")
+            )
+        )
+        else "read-only delegation requires valid tasks and nested coding disabled"
+    ),
 )
 
 registry.register(
@@ -4673,4 +4727,5 @@ registry.register(
     ),
     check_fn=check_delegate_requirements,
     emoji="code",
+    effect="mutating",
 )

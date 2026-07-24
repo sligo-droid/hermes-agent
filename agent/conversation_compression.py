@@ -1048,6 +1048,22 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # A read-only turn must never rotate, compact, lock, or otherwise mutate
+    # durable session state. Gateway history is bounded before dispatch, and if
+    # a single observational turn still overflows we fail closed (callers may
+    # apply their deterministic in-memory emergency shrink) rather than invoke
+    # a provider/plugin compressor with unknown side effects.
+    if str(getattr(agent, "_runtime_mode", "") or "").strip().lower() == "read_only":
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = agent._build_system_prompt(system_message)
+        logger.info(
+            "Skipping durable context compression in read-only runtime "
+            "(session=%s)",
+            agent.session_id or "none",
+        )
+        return messages, existing_prompt
+
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking
     # the actual thread (#36801). Route compaction to the app server's own

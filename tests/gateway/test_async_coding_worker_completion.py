@@ -483,7 +483,8 @@ async def test_missing_origin_coding_completion_does_not_guess_action_runtime():
     assert synth_event.internal is True
     assert synth_event.work_item_id is None
     assert synth_event.feature_summary is None
-    assert synth_event.discord_action_request_intent is False
+    assert synth_event.discord_action_request_intent is None
+    assert synth_event.discord_runtime_mode == "read_only"
     assert synth_event.channel_prompt is None
     assert synth_event.discord_action_request_base_channel_prompt is None
 

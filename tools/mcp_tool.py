@@ -4890,6 +4890,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     tools_filter = config.get("tools") or {}
     include_set = _normalize_name_filter(tools_filter.get("include"), f"mcp_servers.{name}.tools.include")
     exclude_set = _normalize_name_filter(tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude")
+    read_only_set = _normalize_name_filter(
+        config.get("read_only_tools"),
+        f"mcp_servers.{name}.read_only_tools",
+    )
 
     def _should_register(tool_name: str) -> bool:
         if include_set:
@@ -4927,6 +4931,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            # Server-supplied readOnlyHint annotations are advisory, not a
+            # security boundary. Only an operator-owned exact allowlist may
+            # expose an arbitrary MCP operation in Hermes read-only mode.
+            effect=("read_only" if mcp_tool.name in read_only_set else "unknown"),
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
@@ -4964,6 +4972,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            # These utility handlers are host-owned list/read operations;
+            # unlike arbitrary server tools, their semantics are bounded here.
+            effect="read_only",
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)

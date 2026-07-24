@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -192,6 +193,7 @@ def test_queued_continuation_recovers_structural_metadata_with_legacy_intent() -
     assert event.work_item_id == "work-1"
     assert event.message_id == "queued-message"
     assert event.channel_prompt == "Project instructions"
+    assert event.discord_runtime_mode == "action"
     assert event.discord_action_request_intent is None
     assert event.discord_action_request_base_channel_prompt is None
     assert gateway_run._is_standard_discord_action_request(
@@ -220,6 +222,9 @@ async def test_process_completion_inherits_discord_action_metadata(monkeypatch) 
     runner._build_process_event_source = lambda _evt: source
     runner._ledger = lambda: ledger
     runner._load_background_notifications_mode = lambda: "result"
+    runner._completion_delivery_lock = threading.Lock()
+    runner._completion_deliveries_inflight = set()
+    runner._completion_deliveries_delivered = set()
 
     process_registry_module = importlib.import_module("tools.process_registry")
     monkeypatch.setattr(
@@ -259,6 +264,7 @@ async def test_process_completion_inherits_discord_action_metadata(monkeypatch) 
     assert event.project_summary == {"title": "Dashboard"}
     assert event.work_item_id == "work-1"
     assert event.work_replay is True
+    assert event.discord_runtime_mode == "action"
     assert event.discord_action_request_intent is None
     assert event.channel_prompt == "Project instructions"
     assert event.discord_action_request_base_channel_prompt is None
@@ -284,6 +290,7 @@ def test_internal_restart_event_does_not_copy_stored_false_intent() -> None:
     )
 
     assert event.feature_summary["initial_request"] == "Deploy the dashboard"
+    assert event.discord_runtime_mode == "action"
     assert event.discord_action_request_intent is None
     assert event.channel_prompt == "Project instructions"
     assert event.discord_action_request_base_channel_prompt is None

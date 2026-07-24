@@ -935,31 +935,32 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            parent_session_id=getattr(agent, "_parent_session_id", None),
-            root_session_id=str(
-                getattr(
-                    getattr(agent, "_delegate_root_agent", agent),
-                    "session_id",
-                    agent.session_id,
-                )
-                or agent.session_id
-            ),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not getattr(agent, "_persist_disabled", False):
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                parent_session_id=getattr(agent, "_parent_session_id", None),
+                root_session_id=str(
+                    getattr(
+                        getattr(agent, "_delegate_root_agent", agent),
+                        "session_id",
+                        agent.session_id,
+                    )
+                    or agent.session_id
+                ),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
     # gateway path (fresh AIAgent per turn → reads from this row every
     # subsequent turn).
-    if agent._session_db:
+    if agent._session_db and not getattr(agent, "_persist_disabled", False):
         try:
             agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
         except Exception as exc:
@@ -2965,7 +2966,11 @@ def run_conversation(
                     # is skipped or fails. Gateway/session-store writes use
                     # absolute totals, so they safely overwrite these per-call
                     # deltas instead of double-counting them.
-                    if agent._session_db and agent.session_id:
+                    if (
+                        agent._session_db
+                        and agent.session_id
+                        and not getattr(agent, "_persist_disabled", False)
+                    ):
                         try:
                             # Ensure the session row exists before attempting UPDATE.
                             # Under concurrent load (cron/kanban), the initial

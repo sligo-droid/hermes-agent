@@ -918,4 +918,5 @@ registry.register(
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
+    effect="read_only",
 )

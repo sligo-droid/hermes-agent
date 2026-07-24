@@ -774,6 +774,8 @@ class TestBusySessionAck:
         assert items[0]["text"] == "keep going after restart"
         assert items[0]["status"] == "claimed"
         assert items[0]["session_key"] == sk
+        assert items[0]["discord_runtime_mode"] == "read_only"
+        assert items[0]["participates_in_work_lifecycle"] is False
         assert sk in adapter._pending_messages
 
     @pytest.mark.asyncio
@@ -808,6 +810,8 @@ class TestBusySessionAck:
         assert len(items) == 1
         assert items[0]["text"] == "start this after restart"
         assert items[0]["status"] == "claimed"
+        assert items[0]["discord_runtime_mode"] == "read_only"
+        assert items[0]["participates_in_work_lifecycle"] is False
         assert event.defer_work_completion is True
 
     @pytest.mark.asyncio

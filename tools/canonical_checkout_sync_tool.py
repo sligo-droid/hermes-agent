@@ -125,4 +125,5 @@ registry.register(
     handler=_registry_handler,
     check_fn=check_canonical_checkout_sync_requirements,
     emoji="↻",
+    effect="mutating",
 )
