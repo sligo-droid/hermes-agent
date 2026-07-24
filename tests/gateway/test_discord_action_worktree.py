@@ -2392,8 +2392,7 @@ async def test_successful_intake_escalation_queues_clean_action_turn_without_rep
         1,
     )
 
-    assert "starting the work" in response
-    assert "https://discord.com/channels/guild-1/thread-123" in response
+    assert response is None
     assert event.source is source
     assert event.feature_summary is None
     assert adapter._pending_messages[
