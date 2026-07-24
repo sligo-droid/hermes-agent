@@ -345,6 +345,9 @@ def _visual_qa_worker_route_for_event(event: Any) -> Any:
     fable_metadata = getattr(event, "fable_plan_metadata", None)
     if isinstance(fable_metadata, dict):
         return fable_metadata.get("route")
+    opus_metadata = getattr(event, "opus_plan_metadata", None)
+    if isinstance(opus_metadata, dict):
+        return opus_metadata.get("route")
     return None
 
 
@@ -3424,7 +3427,7 @@ class GatewayWorkLedger:
                 source or existing.get("source") or "direct"
             ).strip().lower()
             if (
-                normalized_source in {"direct", "fable"}
+                normalized_source in {"direct", "fable", "opus"}
                 and str(canonical_path or "").strip()
                 and _repo_backed_discord_item(item)
                 and _delivery_intent_for_item(item) == "full_lifecycle"
@@ -3559,7 +3562,7 @@ class GatewayWorkLedger:
             if _required_async_completion_state(item).get("attempt_cancelled") is True:
                 return None
             state = normalize_closeout_state(item["closeout"])
-            if state["mode"] == "off" or state["source"] not in {"direct", "fable"}:
+            if state["mode"] == "off" or state["source"] not in {"direct", "fable", "opus"}:
                 return None
             if str(state["pr"].get("head_sha") or "").strip().lower() != expected_head:
                 return None
@@ -4230,7 +4233,7 @@ class GatewayWorkLedger:
             and any(state["policy"]["post_merge_requirements"].values())
         )
         if (
-            current["source"] not in {"direct", "fable"}
+            current["source"] not in {"direct", "fable", "opus"}
             or state["source"] != current["source"]
             or state["mode"] != "enforce"
             or not (closeout_terminal_eligible(state) or pending_exact_post_merge)

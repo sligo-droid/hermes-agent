@@ -45,6 +45,21 @@ def test_fable_implementation_is_not_persisted_as_a_plan_artifact():
     )
 
 
+def test_should_persist_opus_command_even_when_shorter_than_generic_threshold():
+    text = "# Implementation Plan\n\n1. Inspect.\n2. Implement.\n3. Verify."
+
+    assert should_persist_discord_plan(text, metadata={"command": "opus"})
+    assert should_persist_discord_plan(text, metadata={"command": "/opus"})
+    assert should_persist_discord_plan(text, metadata={"response_kind": "opus_plan"})
+
+
+def test_opus_implementation_is_not_persisted_as_a_plan_artifact():
+    assert not should_persist_discord_plan(
+        "Implemented the requested feature.",
+        metadata={"command": "opus", "opus_mode": "implementation"},
+    )
+
+
 def test_persist_and_lookup_discord_plan_artifact(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

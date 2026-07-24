@@ -90,7 +90,7 @@ def observe_merged_direct_closeout(
     if not closeout or item.get("closeout_authoritative") is True:
         return None
     state = normalize_closeout_state(closeout)
-    if state["mode"] != "enforce" or state["source"] not in {"direct", "fable"}:
+    if state["mode"] != "enforce" or state["source"] not in {"direct", "fable", "opus"}:
         return None
     workspace = state["workspace"]
     root_text = str(workspace.get("path") or "").strip()

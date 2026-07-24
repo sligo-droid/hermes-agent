@@ -61,6 +61,16 @@ FORK_DEFAULT_ADDITIONS = {
         "max_tokens": 12000,
         "save_local_plan": False,
     },
+    "opus": {
+        "enabled": True,
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "route": "anthropic_oauth",
+        "enabled_toolsets": ["file", "terminal", "web", "browser", "discord"],
+        "timeout_seconds": 300,
+        "max_tokens": 12000,
+        "save_local_plan": False,
+    },
     "auxiliary": {
         "vision": {"api_mode": ""},
         "web_extract": {"api_mode": ""},

@@ -109,9 +109,13 @@ def should_persist_discord_plan(
         # Discord `/fable <request>` is an implementation turn.  Only the
         # explicit `/fable plan <request>` route owns plan artifacts.
         return False
-    if command in {"meeting", "/meeting", "goal", "/goal", "plan", "/plan", "fable", "/fable"}:
+    if command in {"opus", "/opus"} and str(meta.get("opus_mode") or "").strip().lower() == "implementation":
+        # Discord `/opus <request>` is an implementation turn. Only the
+        # explicit `/opus plan <request>` route owns plan artifacts.
+        return False
+    if command in {"meeting", "/meeting", "goal", "/goal", "plan", "/plan", "fable", "/fable", "opus", "/opus"}:
         return True
-    if kind in {"meeting_plan", "implementation_plan", "discord_plan", "plan", "fable_plan"}:
+    if kind in {"meeting_plan", "implementation_plan", "discord_plan", "plan", "fable_plan", "opus_plan"}:
         return True
 
     if len(text) < MIN_PLAN_CHARS:

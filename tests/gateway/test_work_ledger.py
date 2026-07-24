@@ -3169,7 +3169,7 @@ def test_visual_completion_is_sanitized_and_late_h_receipt_is_rejected_after_h2(
     assert ledger.get(item["id"]) == before
 
 
-@pytest.mark.parametrize("source", ["direct", "fable"])
+@pytest.mark.parametrize("source", ["direct", "fable", "opus"])
 def test_verified_h2_publication_invalidates_h_gates_and_active_lease(
     tmp_path,
     source,
