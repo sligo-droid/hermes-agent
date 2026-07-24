@@ -5849,6 +5849,57 @@ class _GatewayRunnerCore(
             return "all"
         return mode
 
+    def _is_stale_discord_process_completion(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Return whether a terminal-process completion arrived after final delivery.
+
+        ``notify_on_complete`` terminal jobs can finish while their originating
+        Discord action is still running. The adapter correctly queues the
+        synthetic completion behind that action, but it must not later reclaim
+        a work item whose final response is already visible. Doing so turns a
+        stale process result into a fresh model turn and produces misleading
+        follow-up replies long after the task was closed.
+
+        Keep ordinary completions and completions for still-active work items
+        intact; only discard terminal-process events whose originating item is
+        already past response delivery. The process registry remains the
+        durable source for the actual command output.
+        """
+        if not getattr(event, "background_process_completion", False):
+            return False
+        if getattr(getattr(event, "source", None), "platform", None) != Platform.DISCORD:
+            return False
+
+        try:
+            work_item_id = str(
+                getattr(event, "work_item_id", "")
+                or self._discord_work_item_id_for_event(event, session_key)
+                or ""
+            )
+            item = self._ledger().get(work_item_id) if work_item_id else None
+        except Exception:
+            logger.debug(
+                "Could not resolve Discord work item for process completion",
+                exc_info=True,
+            )
+            return False
+        if not isinstance(item, dict):
+            return False
+
+        status = str(item.get("status") or "").strip().lower()
+        return status in {
+            "response_delivered",
+            "summary_updated",
+            "completed",
+            "failed",
+            "blocked",
+            "cancelled",
+            "expired",
+        }
+
     @staticmethod
     def _session_has_pending_background_workers(
         session_key: str,
@@ -17268,6 +17319,13 @@ class _GatewayRunnerCore(
                 "please resend shortly."
             )
 
+        if self._is_stale_discord_process_completion(event, _quick_key):
+            logger.info(
+                "Dropping stale terminal-process completion for completed Discord work item: %s",
+                getattr(event, "work_item_id", "") or "unknown",
+            )
+            return None
+
         _flow_admission_ts = time.time()
         _flow_route_type = _gateway_flow_route_type(event, command)
         # ── Claim this session before any await ───────────────────────
@@ -26954,6 +27012,7 @@ class _GatewayRunnerCore(
             internal=True,
             message_id=str(evt.get("message_id") or "").strip() or None,
         )
+        synth_event.background_process_completion = True
         if source.platform == Platform.DISCORD:
             self._hydrate_discord_continuation_event_from_work_item(
                 synth_event,

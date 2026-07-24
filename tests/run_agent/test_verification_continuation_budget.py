@@ -69,6 +69,7 @@ def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeyp
 
     agent._interruptible_api_call = model_call
     agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    agent._emit_status = MagicMock()
     monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
 
     with (
@@ -81,6 +82,7 @@ def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeyp
     # Only the exactly-once terminal fallback remains; private scaffolding was
     # removed before persistence/return.
     assert not result["messages"][1].get("_verification_stop_synthetic")
+    agent._emit_status.assert_not_called()
 
 
 def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch):
