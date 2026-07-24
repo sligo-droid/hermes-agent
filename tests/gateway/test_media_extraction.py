@@ -259,6 +259,190 @@ caption
         )
         assert tags == []
 
+    def test_gateway_auto_attaches_qa_screenshots_used_by_vision(self):
+        """A QA manifest plus a matching vision call is explicit evidence.
+
+        This mirrors a visual-QA script that writes screenshot paths to a JSON
+        result, then asks ``vision_analyze`` to inspect each captured image.
+        The final prose can omit the individual paths without losing Discord
+        attachments.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "manifest", "function": {"name": "read_file"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "manifest",
+                "content": '13| "screenshot": "/tmp/qa/desktop.png"',
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "vision",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": '{"image_url": "/tmp/qa/desktop.png", "question": "Check this QA screenshot"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "vision",
+                "content": '{"success": true, "analysis": "looks good"}',
+            },
+            {"role": "assistant", "content": "QA finished; see the report directory."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == ["MEDIA:/tmp/qa/desktop.png"]
+        assert voice is False
+
+    def test_gateway_does_not_attach_an_unproven_vision_input(self):
+        """A local image alone might be a user upload, not a new screenshot."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "vision",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": '{"image_url": "/tmp/user-image.png", "question": "Describe this"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "vision",
+                "content": '{"success": true, "analysis": "a user image"}',
+            },
+        ]
+
+        tags, _ = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == []
+
+    def test_gateway_auto_attaches_direct_browser_screenshot(self):
+        """First-party browser captures are evidence without a QA manifest."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "browser", "function": {"name": "browser_vision"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "browser",
+                "content": '{"success": true, "screenshot_path": "/tmp/browser/shot.png"}',
+            },
+        ]
+
+        tags, _ = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == ["MEDIA:/tmp/browser/shot.png"]
+
+    def test_gateway_appends_missing_screenshot_when_response_has_media(self):
+        """One explicit attachment must not suppress other QA screenshots."""
+        from gateway.run import _append_auto_media_tags
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "manifest", "function": {"name": "read_file"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "manifest",
+                "content": (
+                    '"screenshot": "/tmp/qa/desktop.png", '
+                    '"panelScreenshot": "/tmp/qa/mobile.png"'
+                ),
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "desktop",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": '{"image_url": "/tmp/qa/desktop.png", "question": "QA"}',
+                        },
+                    },
+                    {
+                        "id": "mobile",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": '{"image_url": "/tmp/qa/mobile.png", "question": "QA"}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "desktop", "content": '{"success": true}'},
+            {"role": "tool", "tool_call_id": "mobile", "content": '{"success": true}'},
+        ]
+
+        response = _append_auto_media_tags(
+            "Done.\nMEDIA:/tmp/qa/desktop.png",
+            messages,
+            history_offset=0,
+        )
+
+        assert response.count("MEDIA:/tmp/qa/desktop.png") == 1
+        assert response.endswith("MEDIA:/tmp/qa/mobile.png")
+
+    def test_gateway_does_not_reattach_screenshot_after_compression(self):
+        """Delivered QA evidence must not recur when history is rescanned."""
+        from gateway.run import (
+            _collect_auto_append_media_tags,
+            _collect_history_media_paths,
+        )
+
+        history = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "manifest", "function": {"name": "read_file"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "manifest",
+                "content": '"screenshot_path": "/tmp/qa/desktop.png"',
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "vision",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": '{"image_url": "/tmp/qa/desktop.png", "question": "QA"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "vision", "content": '{"success": true}'},
+        ]
+
+        history_paths = _collect_history_media_paths(history)
+        tags, _ = _collect_auto_append_media_tags(
+            history,
+            history_offset=9999,
+            history_media_paths=history_paths,
+        )
+
+        assert history_paths == {"/tmp/qa/desktop.png"}
+        assert tags == []
+
     def test_collect_history_media_paths_includes_image_generate_json(self):
         """Regression for #46627: the history media-path collector must pick up
         image_generate JSON-payload paths (no MEDIA: tag), not just MEDIA:

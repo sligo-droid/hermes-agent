@@ -965,6 +965,13 @@ class TestPromptBuilderConstants:
         # Local media delivery guidance must remain intact in the base hint.
         assert "include MEDIA:" in hint
 
+    def test_discord_hint_requires_screenshot_evidence_delivery(self):
+        """Visual evidence must be attached, not left in a local directory."""
+        hint = PLATFORM_HINTS["discord"].lower()
+        assert "screenshot" in hint
+        assert "media:" in hint
+        assert "local directory" in hint
+
     def test_platform_hints_mattermost(self):
         hint = PLATFORM_HINTS["mattermost"]
         assert "Mattermost" in hint

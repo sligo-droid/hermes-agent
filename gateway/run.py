@@ -96,6 +96,17 @@ _AUTO_CONTINUE_FALLBACK_PREFIX = "[System note: A new message"
 _JSON_MEDIA_TOOL_PATH_FIELDS = (
     "host_image", "image", "agent_visible_image",
 )
+# A screenshot is an image explicitly recorded by a tool result, then selected
+# by the agent for vision analysis.  Requiring both signals lets the gateway
+# deliver visual evidence without treating every local image path mentioned in
+# arbitrary logs, docs, or user uploads as an attachment.
+_SCREENSHOT_FIELD_RE = re.compile(
+    r'''(?ix)
+    (?:"[^"]*screenshot[^"]*"|'[^']*screenshot[^']*'|\b[\w-]*screenshot[\w-]*\b)
+    \s*:\s*
+    (?:"(?P<double>(?:\\.|[^"])*)"|'(?P<single>(?:\\.|[^'])*)')
+    '''
+)
 _TOOL_MEDIA_RE = re.compile(
     r'MEDIA:((?:[A-Za-z]:[/\\]|/|~/)\S+\.(?:png|jpe?g|gif|webp|'
     r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|'
@@ -30936,25 +30947,9 @@ class _GatewayRunnerCore(
                 runtime_mode=turn_runtime_mode,
             )
 
-            # Collect MEDIA paths already in history so we can exclude them
-            # from the current turn's extraction. This is compression-safe:
-            # even if the message list shrinks, we know which paths are old.
-            _history_media_paths: set = set()
-            for _hm in agent_history:
-                if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
-                    if "MEDIA:" in _hc:
-                        _TOOL_MEDIA_RE = re.compile(
-                            r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-                            r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-                            r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                            r'txt|csv|apk|ipa))',
-                            re.IGNORECASE
-                        )
-                        for _match in _TOOL_MEDIA_RE.finditer(_hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
+            # Collect attachments already delivered in history so current-turn
+            # evidence survives compression without being sent twice.
+            _history_media_paths: set = _collect_history_media_paths(agent_history)
 
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -31360,67 +31355,12 @@ class _GatewayRunnerCore(
                     ),
                 }
 
-            # Scan tool results for MEDIA:<path> tags that need to be delivered
-            # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-            # in its JSON response, but the model's final text reply usually
-            # doesn't include them.  We collect unique tags from tool results and
-            # append any that aren't already present in the final response, so the
-            # adapter's extract_media() can find and deliver the files exactly once.
-            #
-            # Scope the scan to THIS turn's tool results only. ``agent_history``
-            # was passed into run_conversation as ``conversation_history``, so the
-            # agent's returned ``messages`` list is ``agent_history`` followed by
-            # the messages produced this turn. Slicing at ``len(agent_history)``
-            # isolates the current turn precisely, so a stale MEDIA: path emitted
-            # by a tool several turns earlier (still present in the full message
-            # list) can never leak onto a later text-only reply. (Fixes #34608)
-            #
-            # Path-based deduplication against _history_media_paths (collected
-            # before run_conversation) is retained as a secondary guard. It is
-            # also the sole guard on the fallback branch taken when mid-run
-            # context compression shrinks the message list below the original
-            # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                _all_msgs = result.get("messages", [])
-                _history_len = len(agent_history)
-                # Only trust the slice boundary when the message list still
-                # contains the full history prefix. Mid-run compression can
-                # rewrite/shrink the list; in that case fall back to scanning
-                # everything and rely on _history_media_paths for dedup.
-                if _history_len and len(_all_msgs) >= _history_len:
-                    _scan_msgs = _all_msgs[_history_len:]
-                else:
-                    _scan_msgs = _all_msgs
-                for msg in _scan_msgs:
-                    if msg.get("role") in {"tool", "function"}:
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            _TOOL_MEDIA_RE = re.compile(
-                                r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-                                r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-                                r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                                r'txt|csv|apk|ipa))',
-                                re.IGNORECASE
-                            )
-                            for match in _TOOL_MEDIA_RE.finditer(content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
-
-                if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+            final_response = _append_auto_media_tags(
+                final_response,
+                result.get("messages", []),
+                history_offset=len(agent_history),
+                history_media_paths=_history_media_paths,
+            )
 
             # Auto-generate session title after first exchange (non-blocking)
             if (
@@ -36972,43 +36912,12 @@ class _GatewayRunnerCore(
                         "context_length": _context_length,
                     }
 
-                # Scan tool results for MEDIA:<path> tags that need to be delivered
-                # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-                # in its JSON response, but the model's final text reply usually
-                # doesn't include them.  We collect unique tags from tool results and
-                # append any that aren't already present in the final response, so the
-                # adapter's extract_media() can find and deliver the files exactly once.
-                #
-                # Scope the scan to THIS turn's tool results only. ``agent_history``
-                # was passed into run_conversation as ``conversation_history``, so the
-                # agent's returned ``messages`` list is ``agent_history`` followed by
-                # the messages produced this turn. Slicing at ``len(agent_history)``
-                # isolates the current turn precisely, so a stale MEDIA: path emitted
-                # by a tool several turns earlier (still present in the full message
-                # list) can never leak onto a later text-only reply. (Fixes #34608)
-                #
-                # Path-based deduplication against _history_media_paths (collected
-                # before run_conversation) is retained as a secondary guard. It is
-                # also the sole guard on the fallback branch taken when mid-run
-                # context compression shrinks the message list below the original
-                # history length, preserving the compression-safe behaviour of #160.
-                if "MEDIA:" not in final_response:
-                    media_tags, has_voice_directive = _collect_auto_append_media_tags(
-                        result.get("messages", []),
-                        history_offset=len(agent_history),
-                        history_media_paths=_history_media_paths,
-                    )
-
-                    if media_tags:
-                        seen = set()
-                        unique_tags = []
-                        for tag in media_tags:
-                            if tag not in seen:
-                                seen.add(tag)
-                                unique_tags.append(tag)
-                        if has_voice_directive:
-                            unique_tags.insert(0, "[[audio_as_voice]]")
-                        final_response = final_response + "\n" + "\n".join(unique_tags)
+                final_response = _append_auto_media_tags(
+                    final_response,
+                    result.get("messages", []),
+                    history_offset=len(agent_history),
+                    history_media_paths=_history_media_paths,
+                )
 
                 # Auto-generate session title after first exchange (non-blocking)
                 if final_response and self._session_db:
@@ -39404,28 +39313,124 @@ def _strip_auto_continue_noise(content: Any) -> Any:
         text = text[end + 1 :].lstrip()
     return text
 
+def _tool_call_details(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Index tool names and decoded arguments by call ID."""
+    details: Dict[str, Dict[str, Any]] = {}
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            call_id = call.get("id") or call.get("call_id")
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or call.get("name") or "")
+            if not call_id or not name:
+                continue
+            raw_arguments = fn.get("arguments")
+            if raw_arguments is None:
+                raw_arguments = call.get("arguments")
+            if isinstance(raw_arguments, dict):
+                arguments = raw_arguments
+            elif isinstance(raw_arguments, str):
+                try:
+                    decoded = json.loads(raw_arguments)
+                except Exception:
+                    decoded = None
+                arguments = decoded if isinstance(decoded, dict) else {}
+            else:
+                arguments = {}
+            details[str(call_id)] = {"name": name, "arguments": arguments}
+    return details
+
+
+def _local_screenshot_path(value: Any) -> Optional[str]:
+    """Return an attachment-shaped local image path, or ``None``.
+
+    The final platform-side validator still checks existence, symlinks, and
+    denied directories. This early shape gate only keeps URLs, arbitrary text,
+    and non-image files out of the automatic evidence path.
+    """
+    if not isinstance(value, str):
+        return None
+    path = value.strip().strip("`\"'")
+    if path.lower().startswith("file://"):
+        path = path[7:]
+    if not path or not re.match(r"(?:[A-Za-z]:[/\\\\]|/|~/)", path):
+        return None
+    if not _TOOL_MEDIA_RE.fullmatch(f"MEDIA:{path}"):
+        return None
+    return path
+
+
+def _screenshot_paths_declared_in_content(content: Any) -> List[str]:
+    """Find screenshot paths in structured tool output without trusting paths alone."""
+    paths: List[str] = []
+    text = str(content or "")
+    for match in _SCREENSHOT_FIELD_RE.finditer(text):
+        raw_path = match.group("double")
+        if raw_path is not None:
+            try:
+                raw_path = json.loads(f'"{raw_path}"')
+            except Exception:
+                pass
+        else:
+            raw_path = match.group("single")
+        path = _local_screenshot_path(raw_path)
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _collect_screenshot_evidence_media_tags(
+    messages: List[Dict[str, Any]],
+    *,
+    history_media_paths: set,
+) -> List[str]:
+    """Collect current-turn screenshots that were actually used as evidence.
+
+    A browser capture is a first-party screenshot artifact. For screenshots
+    generated by a QA script, require two independent signals: a tool result
+    names the file in a ``*screenshot*`` field and the agent then passes that
+    exact local image to ``vision_analyze``. This avoids auto-uploading generic
+    image paths found in logs, documentation, or user-upload caches.
+    """
+    call_details = _tool_call_details(messages)
+    declared_paths: set[str] = set()
+    for msg in messages:
+        if msg.get("role") in {"tool", "function"}:
+            declared_paths.update(_screenshot_paths_declared_in_content(msg.get("content")))
+
+    tags: List[str] = []
+    for msg in messages:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        call = call_details.get(call_id) or {}
+        tool_name = call.get("name")
+        if tool_name == "browser_vision":
+            paths = _screenshot_paths_declared_in_content(msg.get("content"))
+        elif tool_name == "vision_analyze":
+            path = _local_screenshot_path((call.get("arguments") or {}).get("image_url"))
+            paths = [path] if path and path in declared_paths else []
+        else:
+            continue
+        for path in paths:
+            if path not in history_media_paths:
+                tags.append(f"MEDIA:{path}")
+    return tags
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
 ) -> tuple[List[str], bool]:
-    """Collect real media tags from current-turn producer-tool results only.
+    """Collect deliverable artifacts from the current turn only.
 
-    Two layered guards keep stale/example MEDIA: strings out of the reply:
-
-    1. Producer-tool allowlist: only tools that intentionally emit deliverable
-       artifacts (TTS) are eligible. Documentation, logs, and search results can
-       contain example strings such as MEDIA:/absolute/path/to/file, which must
-       never be delivered as attachments. (Fixes the original report behind #16721.)
-    2. Current-turn isolation: only messages produced this turn are scanned, so a
-       tool result from an earlier turn (still present in the full message list)
-       cannot leak onto a later text-only reply (#34608).
-
-    Mid-run context compression can rewrite/shrink the message list below the
-    original history length. When that happens the slice boundary is no longer
-    trustworthy, so fall back to scanning every message and rely on
-    ``history_media_paths`` for dedup, preserving the compression-safe behaviour
-    of #160. The producer-tool allowlist still applies on the fallback path.
+    Explicit producer tools retain their narrow allowlist so a ``MEDIA:``
+    example in a document cannot become an attachment. Screenshot evidence has
+    its own stricter provenance rule in
+    :func:`_collect_screenshot_evidence_media_tags`. Both paths are isolated to
+    the current turn and deduplicated against prior delivery.
     """
     history_media_paths = history_media_paths or set()
     # Only trust the slice boundary when the message list still contains the
@@ -39435,27 +39440,21 @@ def _collect_auto_append_media_tags(
     else:
         new_messages = messages
 
-    tool_name_by_call_id: Dict[str, str] = {}
-    for msg in new_messages:
-        if msg.get("role") != "assistant":
-            continue
-        for call in msg.get("tool_calls") or []:
-            call_id = call.get("id") or call.get("call_id")
-            fn = call.get("function") or {}
-            name = str(fn.get("name") or call.get("name") or "")
-            if call_id and name:
-                tool_name_by_call_id[str(call_id)] = name
-
-    media_tags: List[str] = []
+    call_details = _tool_call_details(new_messages)
+    media_tags: List[str] = _collect_screenshot_evidence_media_tags(
+        new_messages,
+        history_media_paths=history_media_paths,
+    )
     has_voice_directive = False
     for msg in new_messages:
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        call = call_details.get(call_id) or {}
+        tool_name = call.get("name")
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
@@ -39484,6 +39483,38 @@ def _collect_auto_append_media_tags(
 
     return media_tags, has_voice_directive
 
+
+def _append_auto_media_tags(
+    final_response: str,
+    messages: List[Dict[str, Any]],
+    *,
+    history_offset: int,
+    history_media_paths: Optional[set] = None,
+) -> str:
+    """Append only missing automatic attachment directives to a final reply."""
+    media_tags, has_voice_directive = _collect_auto_append_media_tags(
+        messages,
+        history_offset=history_offset,
+        history_media_paths=history_media_paths,
+    )
+    if not media_tags:
+        return final_response
+
+    seen: set[str] = set()
+    missing_tags: List[str] = []
+    for tag in media_tags:
+        if tag not in seen and tag not in final_response:
+            seen.add(tag)
+            missing_tags.append(tag)
+    if not missing_tags:
+        return final_response
+
+    directives = missing_tags
+    if has_voice_directive and "[[audio_as_voice]]" not in final_response:
+        directives = ["[[audio_as_voice]]", *directives]
+    separator = "" if not final_response or final_response.endswith("\n") else "\n"
+    return final_response + separator + "\n".join(directives)
+
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     """Collect every media path already delivered in prior tool results.
 
@@ -39492,6 +39523,8 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
       * ``MEDIA:<path>`` text tags in tool results, and
       * ``image_generate`` JSON-payload paths (``host_image`` / ``image`` /
         ``agent_visible_image``), which carry no MEDIA: tag.
+      * screenshot artifacts that were captured directly or declared by a QA
+        tool and subsequently passed to ``vision_analyze``.
 
     Missing the JSON-payload shape caused #46627: after a compression
     boundary the auto-append fallback rescans full history, re-discovers an
@@ -39499,15 +39532,7 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     and re-emits the MEDIA tag every turn.
     """
     paths: set = set()
-    tool_name_by_call_id: Dict[str, str] = {}
-    for msg in agent_history:
-        if msg.get("role") == "assistant":
-            for call in msg.get("tool_calls") or []:
-                cid = call.get("id") or call.get("call_id")
-                fn = call.get("function") or {}
-                name = str(fn.get("name") or call.get("name") or "")
-                if cid and name:
-                    tool_name_by_call_id[str(cid)] = name
+    tool_details = _tool_call_details(agent_history)
     for msg in agent_history:
         if msg.get("role") not in {"tool", "function"}:
             continue
@@ -39519,7 +39544,7 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
                     paths.add(p)
             continue
         cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(cid) == "image_generate":
+        if (tool_details.get(cid) or {}).get("name") == "image_generate":
             try:
                 payload = json.loads(content)
             except Exception:
@@ -39530,6 +39555,11 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
                     if isinstance(jp, str) and jp:
                         paths.add(jp)
                         break
+    for tag in _collect_screenshot_evidence_media_tags(
+        agent_history,
+        history_media_paths=paths,
+    ):
+        paths.add(tag.removeprefix("MEDIA:"))
     return paths
 
 def _planned_restart_notification_path() -> Path:

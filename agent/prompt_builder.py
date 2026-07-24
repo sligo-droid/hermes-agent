@@ -639,7 +639,10 @@ PLATFORM_HINTS = {
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "
-        "in markdown format ![alt](url) and they will be sent as attachments."
+        "in markdown format ![alt](url) and they will be sent as attachments. "
+        "When you capture or generate screenshots as user-facing evidence, attach "
+        "the screenshot files in the final delivery with MEDIA: directives; never "
+        "leave the user only a local directory or file path."
     ),
     "slack": (
         "You are in a Slack workspace communicating with your user. "
