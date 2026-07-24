@@ -273,6 +273,46 @@ async def test_consumed_agent_completion_does_not_post_a_second_notice(
     adapter.send.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        ("response_delivered", True),
+        ("summary_updated", True),
+        ("completed", True),
+        ("failed", True),
+        ("agent_running", False),
+        ("agent_done", False),
+    ],
+)
+def test_stale_discord_process_completion_only_drops_after_final_delivery(
+    status, expected,
+):
+    """A late terminal result cannot reopen an already-delivered action item."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    runner = object.__new__(GatewayRunner)
+    runner._ledger = lambda: SimpleNamespace(get=lambda _work_id: {"status": status})
+    event = MessageEvent(
+        text="[IMPORTANT: Background process finished]",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+            thread_id="thread-1",
+        ),
+        internal=True,
+        work_item_id="work-1",
+        background_process_completion=True,
+    )
+
+    assert runner._is_stale_discord_process_completion(
+        event,
+        "agent:main:discord:thread:thread-1:thread-1",
+    ) is expected
+
+
 @pytest.mark.asyncio
 async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
     """thread_id from watcher dict is forwarded as metadata to adapter.send()."""

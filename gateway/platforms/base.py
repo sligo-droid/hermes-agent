@@ -1529,6 +1529,10 @@ class MessageEvent:
     background_completion_kind: Optional[str] = None
     background_completion_success: Optional[bool] = None
     background_completion_generation: Optional[int] = None
+    # True for a terminal-tool process completion. These events are distinct
+    # from detached delegation completions and may be discarded when their
+    # originating Discord work item already has a delivered final response.
+    background_process_completion: bool = False
     suppress_user_output: bool = False
     participates_in_work_lifecycle: bool = True
     background_completion_required_failed: bool = False
