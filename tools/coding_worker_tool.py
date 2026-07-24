@@ -4070,6 +4070,7 @@ def recover_durable_coding_workers(
         "enumerated": 0,
         "already_owned": 0,
         "waiting_alive": 0,
+        "deferred": 0,
         "claimed": 0,
         "launched": 0,
         "completed": 0,
@@ -4424,6 +4425,7 @@ def recover_durable_coding_workers(
                     )
             elif result.get("status") == "deferred":
                 logger.info("Durable coding Worker Run %s deferred for capacity", delegation_id)
+                report["deferred"] += 1
             elif (
                 dispatch_pid == current_pid
                 and dispatch_epoch == process_epoch
