@@ -424,7 +424,7 @@ def _discord_action_request_model_tier(
         cfg,
         "discord",
         "action_request_model_tier",
-        default="basic",
+        default="discord_action",
     )
     return resolve_model_tier(cfg, tier_name)
 

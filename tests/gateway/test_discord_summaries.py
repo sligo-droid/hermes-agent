@@ -275,7 +275,7 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
     assert tier is not None
     assert (tier.name, tier.model, tier.reasoning_effort) == (
-        "basic",
+        "discord_action",
         "gpt-5.6-sol",
         "low",
     )
@@ -3216,7 +3216,7 @@ async def test_existing_thread_native_voice_promotes_action_from_transcript(
         tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
         assert tier is not None
         assert (tier.name, tier.model, tier.reasoning_effort) == (
-            "basic",
+            "discord_action",
             "gpt-5.6-sol",
             "low",
         )
@@ -3528,7 +3528,7 @@ async def test_native_voice_metadata_without_message_flag_triages_from_transcrip
     tier = gateway_run._discord_action_request_model_tier({}, event.feature_summary)
     assert tier is not None
     assert (tier.name, tier.model, tier.reasoning_effort) == (
-        "basic",
+        "discord_action",
         "gpt-5.6-sol",
         "low",
     )
