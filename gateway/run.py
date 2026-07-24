@@ -9405,6 +9405,7 @@ class _GatewayRunnerCore(
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        self._startup_restore_typing_tasks = {}
 
         connected_count = 0
         enabled_platform_count = 0
@@ -33419,12 +33420,227 @@ class _GatewayRunnerCore(
                 if self._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
                     self._release_running_agent_state(session_key)
 
+    async def _startup_restore_typing_heartbeat(
+            self,
+            event: MessageEvent,
+            adapter: BasePlatformAdapter,
+            stop_event: asyncio.Event,
+            handoff_event: asyncio.Event,
+        ) -> None:
+            """Keep a visible inbound message alive while startup restore drains.
+
+            The normal adapter pipeline starts its typing task from
+            ``_process_message_background``.  Startup restore intentionally
+            queues messages before that pipeline is entered, so a user can
+            otherwise see no activity while the gateway waits for recovered
+            sessions.  This heartbeat owns only the queue interval.  On a
+            successful handoff it leaves platform typing state intact for the
+            normal turn to clean up; dropped/failed events stop it here.
+            """
+            source = getattr(event, "source", None)
+            chat_id = getattr(source, "chat_id", None)
+            send_typing = getattr(adapter, "send_typing", None)
+            if not chat_id or not callable(send_typing):
+                return
+
+            metadata = self._thread_metadata_for_source(
+                source,
+                self._reply_anchor_for_event(event),
+            )
+            try:
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            send_typing(chat_id, metadata=metadata),
+                            timeout=1.5,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.debug(
+                            "Startup-restore typing heartbeat timed out for %s",
+                            chat_id,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug(
+                            "Startup-restore typing heartbeat failed for %s",
+                            chat_id,
+                            exc_info=True,
+                        )
+
+                    if stop_event.is_set():
+                        break
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        continue
+            finally:
+                # A successful drain hands any platform-owned persistent typing
+                # task to the normal adapter turn.  If the event is dropped or
+                # dispatch fails, this task remains the sole owner and must
+                # clear the platform state itself.
+                if not handoff_event.is_set():
+                    try:
+                        stop_with_metadata = getattr(
+                            adapter, "_stop_typing_with_metadata", None
+                        )
+                        if callable(stop_with_metadata):
+                            await stop_with_metadata(chat_id, metadata)
+                        else:
+                            stop_typing = getattr(adapter, "stop_typing", None)
+                            if callable(stop_typing):
+                                await stop_typing(chat_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug(
+                            "Startup-restore typing cleanup failed for %s",
+                            chat_id,
+                            exc_info=True,
+                        )
+
+    def _start_startup_restore_typing(self, event: MessageEvent) -> None:
+            """Start queue-time typing for a visible inbound event."""
+            if (
+                getattr(event, "internal", False)
+                or getattr(event, "suppress_user_output", False)
+                or getattr(event, "message_type", None) is MessageType.COMMAND
+            ):
+                return
+            # Deterministic gateway commands (for example /stop and /restart)
+            # can be handled inline by the adapter and therefore have no
+            # normal background typing owner to receive a handoff.
+            try:
+                if event.get_command():
+                    return
+            except Exception:
+                pass
+            source = getattr(event, "source", None)
+            adapter = self._adapter_for_source(source)
+            if adapter is None or not callable(getattr(adapter, "send_typing", None)):
+                return
+
+            registry = getattr(self, "_startup_restore_typing_tasks", None)
+            if registry is None:
+                registry = {}
+                self._startup_restore_typing_tasks = registry
+            event_key = id(event)
+            if event_key in registry:
+                return
+
+            stop_event = asyncio.Event()
+            handoff_event = asyncio.Event()
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(
+                    self._startup_restore_typing_heartbeat(
+                        event,
+                        adapter,
+                        stop_event,
+                        handoff_event,
+                    )
+                )
+            except RuntimeError:
+                # The queue is normally entered from an async gateway turn,
+                # but a defensive guard keeps synthetic callers from trying
+                # to schedule work when no loop is active.
+                return
+
+            record = {
+                "task": task,
+                "stop_event": stop_event,
+                "handoff_event": handoff_event,
+            }
+            registry[event_key] = record
+
+            def _forget_startup_restore_typing(done_task):
+                current = registry.get(event_key)
+                if current is record and current.get("task") is done_task:
+                    registry.pop(event_key, None)
+
+            task.add_done_callback(_forget_startup_restore_typing)
+
+    async def _release_startup_restore_typing(
+            self,
+            event: MessageEvent,
+            *,
+            handoff: bool,
+        ) -> None:
+            """Stop queue typing, optionally preserving platform ownership."""
+            registry = getattr(self, "_startup_restore_typing_tasks", None)
+            if not registry:
+                return
+            record = registry.pop(id(event), None)
+            if record is None:
+                return
+            if handoff:
+                record["handoff_event"].set()
+            record["stop_event"].set()
+            task = record.get("task")
+            if task is None or task.done() or task is asyncio.current_task():
+                return
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            except asyncio.CancelledError:
+                if not task.done():
+                    task.cancel()
+            except asyncio.TimeoutError:
+                if not task.done():
+                    task.cancel()
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            except Exception:
+                logger.debug(
+                    "Startup-restore typing task failed during cleanup",
+                    exc_info=True,
+                )
+
+    async def _cancel_startup_restore_typing(self) -> None:
+            """Stop all queue-time typing when startup restore is abandoned."""
+            registry = getattr(self, "_startup_restore_typing_tasks", None)
+            if not registry:
+                return
+            records = list(registry.values())
+            registry.clear()
+            for record in records:
+                record["stop_event"].set()
+                task = record.get("task")
+                if task is None or task.done() or task is asyncio.current_task():
+                    continue
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if not task.done():
+                        task.cancel()
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.debug(
+                            "Startup-restore typing task failed during abort cleanup",
+                            exc_info=True,
+                        )
+                except asyncio.CancelledError:
+                    if not task.done():
+                        task.cancel()
+                except Exception:
+                    logger.debug(
+                        "Startup-restore typing task failed during abort cleanup",
+                        exc_info=True,
+                    )
+
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
             queue = getattr(self, "_startup_restore_queue", None)
             if queue is None:
                 queue = []
                 self._startup_restore_queue = queue
             queue.append(event)
+            self._start_startup_restore_typing(event)
             try:
                 source = event.source
                 logger.info(
@@ -33446,6 +33662,7 @@ class _GatewayRunnerCore(
                 source = getattr(event, "source", None)
                 adapter = self._adapter_for_source(source)
                 if adapter is None:
+                    await self._release_startup_restore_typing(event, handoff=False)
                     logger.debug(
                         "Dropping startup-restore queued message: adapter unavailable for %s",
                         getattr(getattr(source, "platform", None), "value", None),
@@ -33457,7 +33674,12 @@ class _GatewayRunnerCore(
                     setattr(event, "_hermes_startup_restore_replay", True)
                 except Exception:
                     pass
-                await adapter.handle_message(event)
+                try:
+                    await adapter.handle_message(event)
+                except Exception:
+                    await self._release_startup_restore_typing(event, handoff=False)
+                    raise
+                await self._release_startup_restore_typing(event, handoff=True)
                 drained += 1
             return drained
 
@@ -33473,7 +33695,11 @@ class _GatewayRunnerCore(
                             exc_info=(type(result), result, result.__traceback__),
                         )
             self._startup_restore_tasks = []
-            drained = await self._drain_startup_restore_queue()
+            try:
+                drained = await self._drain_startup_restore_queue()
+            except Exception:
+                await self._cancel_startup_restore_typing()
+                raise
             self._startup_restore_in_progress = False
             if drained:
                 logger.info("Drained %d inbound message(s) queued during startup restore", drained)
@@ -33493,6 +33719,7 @@ class _GatewayRunnerCore(
             """Clean up and exit startup when restart/shutdown begins mid-startup."""
             if not self._startup_should_abort():
                 return False
+            await self._cancel_startup_restore_typing()
             if adapter is not None and platform is not None:
                 try:
                     await adapter.cancel_background_tasks()

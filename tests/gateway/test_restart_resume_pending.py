@@ -1508,9 +1508,11 @@ async def test_auto_resume_skips_sessions_with_running_agent():
 @pytest.mark.asyncio
 async def test_startup_restore_gate_queues_real_inbound_messages():
     """Real inbound messages wait while startup restore is in progress."""
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
+    adapter.send_typing = AsyncMock()
+    adapter.stop_typing = AsyncMock()
 
     inbound = MessageEvent(
         text="hello",
@@ -1522,6 +1524,68 @@ async def test_startup_restore_gate_queues_real_inbound_messages():
 
     assert result is None
     assert runner._startup_restore_queue == [inbound]
+    await asyncio.sleep(0)
+    adapter.send_typing.assert_awaited()
+    await runner._release_startup_restore_typing(inbound, handoff=False)
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_typing_handoffs_to_normal_turn():
+    """A drained event keeps platform typing alive for its normal turn."""
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._startup_restore_queue = []
+    adapter.send_typing = AsyncMock()
+    adapter.stop_typing = AsyncMock()
+    adapter.handle_message = AsyncMock()
+
+    inbound = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="restore-chat",
+            chat_type="thread",
+            thread_id="restore-thread",
+            user_id="u1",
+        ),
+    )
+
+    runner._queue_startup_restore_event(inbound)
+    await asyncio.sleep(0)
+    adapter.send_typing.assert_awaited()
+    assert adapter.send_typing.await_args.kwargs["metadata"] == {
+        "thread_id": "restore-thread",
+    }
+
+    assert await runner._drain_startup_restore_queue() == 1
+    adapter.handle_message.assert_awaited_once_with(inbound)
+    assert not getattr(runner, "_startup_restore_typing_tasks", {})
+    adapter.stop_typing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_typing_stops_when_dispatch_fails():
+    """A dropped startup replay cannot leave a persistent typing indicator."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_queue = []
+    adapter.send_typing = AsyncMock()
+    adapter.stop_typing = AsyncMock()
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("dispatch failed"))
+
+    inbound = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-chat"),
+    )
+
+    runner._queue_startup_restore_event(inbound)
+    await asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        await runner._drain_startup_restore_queue()
+
+    adapter.stop_typing.assert_awaited()
+    assert not getattr(runner, "_startup_restore_typing_tasks", {})
 
 
 @pytest.mark.asyncio
