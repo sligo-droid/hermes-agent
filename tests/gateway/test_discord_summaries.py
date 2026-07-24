@@ -467,6 +467,17 @@ async def test_discord_runtime_mode_distinguishes_mutation_ambiguity_and_thread_
         ) is gateway_run.RuntimeMode.READ_ONLY
 
 
+def test_read_only_prompt_lightly_prefers_direct_work_without_restricting_delegation(adapter):
+    prompt = adapter._append_direct_question_prompt("")
+
+    assert "small, tightly coupled observations" in prompt
+    assert "working directly is often faster" in prompt
+    assert "parallelism, independent verification, context isolation, or deeper reasoning" in prompt
+    assert "read-only delegation remains available" in prompt
+    assert "any configured tier that matches the subtask's difficulty" in prompt
+    assert "read-only does not limit tier choice" in prompt
+
+
 @pytest.mark.parametrize(
     "request_text",
     [
