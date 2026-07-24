@@ -3478,7 +3478,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 34,
+    "_config_version": 35,
 }
 
 # Keep fork-owned lifecycle, worker-routing, Discord, and Command Center
@@ -6524,6 +6524,26 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "  ✓ Removed persisted built-in model tiers and obsolete "
                     "delegation.model_tier_routing; custom tiers were preserved."
                 )
+
+    # ── Version 34 → 35: keep Discord actions on their dedicated Sol/low tier ──
+    # `basic` used to be the persisted Discord-route default while it resolved
+    # to Sol/low. It now means Luna/xhigh, so rewrite only that exact former
+    # route default. Explicit custom tiers and disabled routes remain intact.
+    if current_ver < 35:
+        config = read_raw_config()
+        discord_config = config.get("discord")
+        if (
+            isinstance(discord_config, dict)
+            and discord_config.get("action_request_model_tier") == "basic"
+        ):
+            discord_config["action_request_model_tier"] = "discord_action"
+            config["discord"] = discord_config
+            _persist_migration(config)
+            results["config_added"].append(
+                "discord.action_request_model_tier=discord_action (preserved Sol/low route)"
+            )
+            if not quiet:
+                print("  ✓ Kept Discord action requests on discord_action (Sol/low)")
 
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
     # Users can hand-edit mcp_servers, and older installs may already contain a

@@ -1425,6 +1425,49 @@ class TestDiscordActionTierMigration:
         assert "action_request_complex_model_tier" not in raw["discord"]
         assert not any("migrated from former default" in value for value in results["config_added"])
 
+    def test_migrate_to_v35_preserves_the_former_sol_low_discord_default(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 34,
+                    "discord": {"action_request_model_tier": "basic"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert raw["discord"]["action_request_model_tier"] == "discord_action"
+        assert (
+            "discord.action_request_model_tier=discord_action (preserved Sol/low route)"
+            in results["config_added"]
+        )
+
+    @pytest.mark.parametrize("custom_value", ["intermediate", ""])
+    def test_migrate_to_v35_preserves_custom_or_disabled_values(self, tmp_path, custom_value):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 34,
+                    "discord": {"action_request_model_tier": custom_value},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["discord"]["action_request_model_tier"] == custom_value
+        assert not any("preserved Sol/low route" in value for value in results["config_added"])
+
 
 class TestCodingWorkerTierMigration:
     def test_migrate_to_v27_removes_duplicate_worker_tier_catalog(self, tmp_path):

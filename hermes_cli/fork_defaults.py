@@ -354,7 +354,7 @@ FORK_DEFAULT_ADDITIONS = {
     "discord": {
         "action_request_channels": "",
         "feature_request_channels": "",
-        "action_request_model_tier": "basic",
+        "action_request_model_tier": "discord_action",
         "action_request_reasoning_effort": "xhigh",
         "feature_request_reasoning_effort": "xhigh",
         "action_worktree_warmup": "auto",
