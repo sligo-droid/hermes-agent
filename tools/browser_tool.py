@@ -513,6 +513,9 @@ def _ensure_cdp_supervisor(task_id: str, *, execution_guard: Any = None) -> None
          and config-set overrides.
       2. ``_active_sessions[task_id]["cdp_url"]`` — covers Browserbase + any
          other cloud provider whose ``create_session`` returns a raw CDP URL.
+      3. A local agent-browser session's ``get cdp-url`` result. The endpoint
+         is retained only for the supervisor; normal browser commands keep
+         using ``--session`` so their existing local-daemon routing is intact.
 
     Swallows all errors — failing to attach the supervisor must not break
     the browser session itself.  The agent simply won't see
@@ -523,12 +526,22 @@ def _ensure_cdp_supervisor(task_id: str, *, execution_guard: Any = None) -> None
     cdp_url = _get_cdp_override()
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
-        # cloud provider (Browserbase sets this).
+        # cloud provider (Browserbase sets this), or a previously-discovered
+        # local agent-browser endpoint reserved for the supervisor.
         with _cleanup_lock:
             session_info = _active_sessions.get(task_id, {})
-        maybe = str(session_info.get("cdp_url") or "")
+        maybe = str(
+            session_info.get("cdp_url")
+            or session_info.get("supervisor_cdp_url")
+            or ""
+        )
         if maybe:
             cdp_url = _resolve_cdp_override(maybe)
+        elif bool((session_info.get("features") or {}).get("local")):
+            cdp_url = _discover_local_session_cdp_url(
+                task_id,
+                execution_guard=execution_guard,
+            )
     if not cdp_url:
         return
     try:
@@ -555,6 +568,55 @@ def _ensure_cdp_supervisor(task_id: str, *, execution_guard: Any = None) -> None
             task_id,
             exc,
         )
+
+
+def _discover_local_session_cdp_url(
+    task_id: str,
+    *,
+    execution_guard: Any = None,
+) -> str:
+    """Return agent-browser's local CDP endpoint without changing its routing.
+
+    ``agent-browser`` retains a CDP endpoint for every local ``--session``.
+    Hermes historically treated local sessions as CDP-less, which left the
+    trusted visual assertion runner without its required supervisor even after
+    successful browser navigation. Cache this endpoint under a supervisor-only
+    key; assigning it to ``cdp_url`` would make ordinary browser calls switch
+    from their owned local ``--session`` daemon to ``--cdp``.
+    """
+    if execution_guard is not None:
+        execution_guard.check()
+        timeout = max(1, min(10, int(execution_guard.remaining())))
+    else:
+        timeout = 10
+    try:
+        result = _run_browser_command(
+            task_id,
+            "get",
+            ["cdp-url"],
+            timeout=timeout,
+        )
+        data = result.get("data") if isinstance(result, dict) else None
+        raw_url = ""
+        if isinstance(data, dict):
+            raw_url = str(data.get("cdpUrl") or data.get("cdp_url") or "")
+        cdp_url = _resolve_cdp_override(raw_url) if raw_url else ""
+        if not cdp_url:
+            return ""
+        if execution_guard is not None:
+            execution_guard.check()
+        with _cleanup_lock:
+            session_info = _active_sessions.get(task_id)
+            if isinstance(session_info, dict):
+                session_info["supervisor_cdp_url"] = cdp_url
+        return cdp_url
+    except Exception as exc:
+        logger.debug(
+            "local CDP discovery for task=%s failed (non-fatal): %s",
+            task_id,
+            exc,
+        )
+        return ""
 
 
 def _stop_cdp_supervisor(task_id: str) -> None:
@@ -2090,12 +2152,11 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         )
         _active_sessions[task_id] = session_info
 
-    # Lazy-start the CDP supervisor now that the session exists (if the
-    # backend surfaces a CDP URL via override or session_info["cdp_url"]).
-    # Idempotent; swallows errors. See _ensure_cdp_supervisor for details.
-    # Skip for local sidecars — they have no CDP URL.
-    if not force_local:
-        _ensure_cdp_supervisor(task_id)
+    # Lazy-start the CDP supervisor now that the session exists. Local
+    # agent-browser sessions also expose a per-session CDP endpoint through
+    # ``get cdp-url``; _ensure_cdp_supervisor discovers it without changing
+    # normal ``--session`` command routing. Idempotent and non-fatal.
+    _ensure_cdp_supervisor(task_id)
 
     return session_info
 
