@@ -19022,12 +19022,16 @@ class _GatewayRunnerCore(
                         "initialize its isolated Discord action runtime. Nothing was "
                         "implemented. Please retry or use an action-request channel."
                     )
-                if promoted_thread_url:
-                    return (
-                        "Switching this request into action mode and starting the work "
-                        f"there:\n\n{promoted_thread_url}"
-                    )
-                return "Switching this request into action mode and starting the work here."
+                # The action replay is the user-visible continuation. A separate
+                # acknowledgement in the question thread is redundant (and can
+                # look like an extra bot response when the promoted thread is
+                # already visible in Discord), so let the action turn speak for
+                # itself. Keep the URL available for logging/debugging only.
+                logger.info(
+                    "Discord action escalation dispatched without acknowledgement: %s",
+                    promoted_thread_url or "same-thread",
+                )
+                return None
 
             response = agent_result.get("final_response") or ""
             # Hidden-reasoning-only retry exhaustion has no user-visible model
