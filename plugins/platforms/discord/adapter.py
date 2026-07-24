@@ -3376,6 +3376,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     generation_is_current=generation_is_current,
                 )
                 created_thread = thread_channel is not None
+                self._preseed_discord_thread_dedup(thread_channel)
             thread_id = str(getattr(thread_channel, "id", "") or "").strip()
 
         if thread_channel is None or not thread_id:
@@ -3474,6 +3475,7 @@ class DiscordAdapter(BasePlatformAdapter):
             discord_action_request_intent=None,
             discord_action_escalation_allowed=False,
             discord_runtime_reason="promoted_action_replay",
+            discord_explicit_no_action_denial=False,
             participates_in_work_lifecycle=True,
             internal=False,
             suppress_user_output=False,
@@ -9436,6 +9438,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("Discord /%s DM notice failed: %s", command, exc)
             return False
 
+        event.discord_runtime_mode = RuntimeMode.ACTION.value
+        event.discord_action_request_intent = None
+        event.discord_action_escalation_allowed = False
+        event.discord_runtime_reason = "action_thread_slash_command"
+        event.discord_explicit_no_action_denial = False
+        event.participates_in_work_lifecycle = True
+
         thread_channel = getattr(interaction, "channel", None)
         if getattr(source, "thread_id", None):
             parent_channel = self._thread_parent_channel(thread_channel)
@@ -10328,6 +10337,12 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_text=getattr(message, "content", None) or None,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
             auto_skill=self._resolve_channel_skills(channel_id, parent_id or None),
+            discord_runtime_mode=RuntimeMode.ACTION.value,
+            discord_action_request_intent=None,
+            discord_action_escalation_allowed=False,
+            discord_runtime_reason="ship_it_reaction",
+            discord_explicit_no_action_denial=False,
+            participates_in_work_lifecycle=True,
         )
 
     async def _handle_raw_reaction_add(self, payload: Any) -> None:
@@ -12407,6 +12422,22 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
         return thread_name
 
+    def _preseed_discord_thread_dedup(self, thread: Any) -> None:
+        """Mark a newly-created thread starter id before Discord replays it."""
+
+        thread_id = str(getattr(thread, "id", "") or "").strip()
+        if not thread_id:
+            return
+        try:
+            self._dedup.is_duplicate(thread_id)
+        except Exception:
+            logger.debug(
+                "[%s] Failed to pre-seed Discord thread starter dedup for %s",
+                self.name,
+                thread_id,
+                exc_info=True,
+            )
+
     def _meeting_thread_name(self, message: Any) -> str:
         created_at = getattr(message, "created_at", None)
         date_part = ""
@@ -13828,6 +13859,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if is_parent_channel_message and is_meeting_command_message and meeting_audio_attachments:
             thread = await self._create_meeting_thread(message)
             if thread:
+                self._preseed_discord_thread_dedup(thread)
                 parent_channel_id = str(message.channel.id)
                 is_thread = True
                 thread_id = str(thread.id)
@@ -13840,6 +13872,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._mark_discord_stage(_intake_timing, "thread_create", _stage_started)
             direct_question_prompt = True
             if thread:
+                self._preseed_discord_thread_dedup(thread)
                 parent_channel_id = str(message.channel.id)
                 is_thread = True
                 thread_id = str(thread.id)
@@ -13916,6 +13949,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread = await self._auto_create_thread(message)
                 self._mark_discord_stage(_intake_timing, "thread_create", _stage_started)
                 if thread:
+                    self._preseed_discord_thread_dedup(thread)
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
                     thread_id = str(thread.id)
@@ -13927,16 +13961,6 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel_id=parent_channel_id,
                         auto_created=True,
                     )
-                    # Pre-seed dedup: when _auto_create_thread creates a thread
-                    # via message.create_thread(), Discord fires a second
-                    # MESSAGE_CREATE event for the "thread starter message".
-                    # That starter message carries id == thread.id and may
-                    # arrive with type=default (not type=21/thread_starter_message),
-                    # so the type filter above does not catch it.  Marking the
-                    # thread id in the dedup cache now ensures that duplicate
-                    # event is dropped before it can trigger a second agent run.
-                    # Fixes #51057.
-                    self._dedup.is_duplicate(str(thread.id))
                 else:
                     # Auto-threading is the configured routing target for this
                     # message; if it fails we must NOT silently fall back to an
@@ -14512,6 +14536,11 @@ class DiscordAdapter(BasePlatformAdapter):
             discord_action_request_intent=None,
             discord_action_escalation_allowed=discord_action_escalation_allowed,
             discord_runtime_reason=discord_runtime_reason,
+            discord_explicit_no_action_denial=bool(
+                self._explicit_no_action_constraint_reason(
+                    normalized_content or voice_action_transcript
+                )
+            ),
             discord_action_request_base_channel_prompt=_base_channel_prompt,
             channel_context=_channel_context,
             goal_thread_context=_goal_thread_context,

@@ -70,6 +70,11 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
    never provisions a directory, branch, worktree, dependency link, warmup, or
    closeout record. Otherwise it observes the mapped canonical/session cwd under
    read-only tool enforcement.
+10. Redacted delegation live transcripts/manifests and restart-safe background
+    completion records live only under Hermes-owned runtime/cache state. They are
+    operational observability and delivery metadata, not user or project
+    mutation. Read-only children still cannot write project files, persist
+    conversation memory, or request service changes through their transport.
 
 ## Consequences
 

@@ -1470,6 +1470,11 @@ class MessageEvent:
     # This is transient routing metadata, not model-authored conversation text.
     discord_runtime_reason: Optional[str] = None
 
+    # True only when the user explicitly denied action (for example
+    # "plan only" or "do not implement"). Within one coalesced semantic
+    # turn this is monotonic: later action/ambiguous fragments cannot erase it.
+    discord_explicit_no_action_denial: bool = False
+
     # Discord channel prompt before any per-turn direct-question overlay.
     # This is transient intake metadata used when coalescing inbound messages.
     discord_action_request_base_channel_prompt: Optional[str] = None
@@ -1789,12 +1794,32 @@ def merge_discord_action_request_metadata(
     if incoming_base_prompt is None:
         incoming_base_prompt = getattr(existing, legacy_base_prompt_attr, None)
 
+    existing_denial = bool(
+        getattr(existing, "discord_explicit_no_action_denial", False)
+    )
+    incoming_denial = bool(
+        getattr(event, "discord_explicit_no_action_denial", False)
+    )
+    if existing_denial or incoming_denial:
+        denial_event = event if incoming_denial else existing
+        denial_prompt = getattr(denial_event, "channel_prompt", None)
+        denial_reason = getattr(denial_event, "discord_runtime_reason", None)
+        existing.discord_runtime_mode = "read_only"
+        existing.discord_action_request_intent = None
+        existing.discord_action_escalation_allowed = False
+        existing.discord_runtime_reason = denial_reason
+        existing.discord_explicit_no_action_denial = True
+        existing.discord_action_request_base_channel_prompt = incoming_base_prompt
+        existing.channel_prompt = denial_prompt
+        return
+
     existing.discord_runtime_mode = incoming_mode
     existing.discord_action_request_intent = None
     existing.discord_action_escalation_allowed = bool(
         getattr(event, "discord_action_escalation_allowed", False)
     )
     existing.discord_runtime_reason = getattr(event, "discord_runtime_reason", None)
+    existing.discord_explicit_no_action_denial = False
     existing.discord_action_request_base_channel_prompt = incoming_base_prompt
     if incoming_mode == "action":
         existing.channel_prompt = incoming_base_prompt
@@ -4493,7 +4518,10 @@ class BasePlatformAdapter(ABC):
         work_item_id = getattr(event, "work_item_id", None)
         if (
             not work_item_id
-            or not getattr(event, "participates_in_work_lifecycle", True)
+            or (
+                not getattr(event, "participates_in_work_lifecycle", True)
+                and not getattr(event, "discord_drain_recovery", False)
+            )
             or getattr(event, "defer_work_completion", False)
         ):
             return

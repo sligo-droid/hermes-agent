@@ -763,19 +763,40 @@ class TestToolNamePreservation(unittest.TestCase):
         self.assertEqual(captured["acp_command"], "copilot")
 
     def test_schema_never_exposes_acp_transport_fields(self):
-        """delegate_task must never make ACP transport model-facing."""
-        from tools.delegate_tool import _build_dynamic_schema_overrides
+        """READ_ONLY model schemas hide operator-owned ACP transport fields."""
+        import model_tools
 
-        with patch("shutil.which", return_value="/usr/local/bin/copilot"):
-            overrides = _build_dynamic_schema_overrides()
-
-        props = overrides["parameters"]["properties"]
-        self.assertIn("acp_command", props)
-        self.assertIn("acp_args", props)
-
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=["delegation"],
+            quiet_mode=True,
+            runtime_mode="read_only",
+        )
+        schema = next(
+            item["function"]
+            for item in definitions
+            if item["function"]["name"] == "delegate_task"
+        )
+        props = schema["parameters"]["properties"]
+        self.assertNotIn("acp_command", props)
+        self.assertNotIn("acp_args", props)
         task_item_props = props["tasks"]["items"]["properties"]
-        self.assertIn("acp_command", task_item_props)
-        self.assertIn("acp_args", task_item_props)
+        self.assertNotIn("acp_command", task_item_props)
+        self.assertNotIn("acp_args", task_item_props)
+
+    def test_read_only_dispatch_rejects_stale_model_acp_override(self):
+        parent = _make_mock_parent(depth=0)
+        parent._runtime_mode = "read_only"
+
+        payload = json.loads(
+            delegate_task(
+                goal="inspect safely",
+                acp_command="copilot",
+                acp_args=["--acp"],
+                parent_agent=parent,
+            )
+        )
+
+        self.assertIn("does not accept model-supplied ACP", payload["error"])
 
     def test_saved_tool_names_set_on_child_before_run(self):
         """_run_single_child must set _delegate_saved_tool_names on the child
@@ -3025,7 +3046,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
 
-    def test_model_acp_args_preserve_public_compatibility(self):
+    def test_read_only_model_acp_args_are_rejected(self):
         import run_agent
 
         captured = {}
@@ -3035,8 +3056,9 @@ class TestDispatchDelegateTask(unittest.TestCase):
             return "{}"
 
         parent = _make_mock_parent(depth=0)
+        parent._runtime_mode = "read_only"
         with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
-            run_agent.AIAgent._dispatch_delegate_task(
+            result = run_agent.AIAgent._dispatch_delegate_task(
                 parent,
                 {
                     "goal": "test",
@@ -3053,12 +3075,8 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(captured["acp_command"], "claude")
-        self.assertEqual(captured["acp_args"], ["--acp", "--stdio"])
-        self.assertEqual(captured["goal"], "test")
-        self.assertEqual(captured["model_tier"], "trivial")
-        self.assertEqual(captured["tasks"][0]["acp_command"], "codex")
-        self.assertEqual(captured["tasks"][0]["acp_args"], ["--acp"])
+        self.assertIn("rejects model-supplied ACP", json.loads(result)["error"])
+        self.assertEqual(captured, {})
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

@@ -6243,6 +6243,20 @@ class AIAgent:
             # coding turn, but repository mutation stays on the trusted coding
             # worker path. This is deliberately not a Fable-only rule.
             read_only = True
+        if read_only and (
+            function_args.get("acp_command") is not None
+            or function_args.get("acp_args") is not None
+            or any(
+                isinstance(task, dict)
+                and ("acp_command" in task or "acp_args" in task)
+                for task in (function_args.get("tasks") or [])
+            )
+        ):
+            from tools.registry import tool_error
+
+            return tool_error(
+                "Read-only delegation rejects model-supplied ACP transport overrides."
+            )
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),

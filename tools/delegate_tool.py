@@ -3126,6 +3126,11 @@ def delegate_task(
         is RuntimeMode.READ_ONLY
     )
     top_read_only = inherited_read_only or is_truthy_value(read_only, default=False)
+    if top_read_only and (acp_command is not None or acp_args is not None):
+        return tool_error(
+            "Read-only delegation does not accept model-supplied ACP transport overrides. "
+            "Configure the delegation transport outside the tool call instead."
+        )
     background_requested = is_truthy_value(background, default=False)
     background = background_requested
 
@@ -3208,6 +3213,15 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+
+    if top_read_only and any(
+        isinstance(task, dict)
+        and any(field in task for field in _MODEL_HIDDEN_TASK_FIELDS)
+        for task in task_list
+    ):
+        return tool_error(
+            "Read-only delegation does not accept per-task ACP transport overrides."
+        )
 
     # Validate every task, including per-task broker grants, before constructing
     # any child. A batch must fail atomically rather than partially building a
@@ -4157,11 +4171,14 @@ def _build_top_level_description() -> str:
         "synchronous read-only analysis can still run concurrently with other "
         "delegation calls when emitted together in one assistant batch. "
         "Background single tasks and batches share the same global concurrency "
-        "cap and persist completed results for restart-safe delivery.\n\n"
+        "cap and persist completed results as Hermes-internal runtime state for "
+        "restart-safe delivery; this is not user/project mutation.\n\n"
         "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
         "one append-only human-readable log file per task (under "
         "cache/delegation/live/<delegation_id>/). Each child streams its "
         "assistant text, tool calls, and tool results there while it runs. "
+        "These redacted logs/manifests are Hermes-internal cache state, not "
+        "user/project mutation. "
         "Read (or `tail -f` in a terminal) those paths any time you or the "
         "user want to see what a subagent is actually doing instead of "
         "waiting for the final summary.\n\n"
@@ -4427,8 +4444,9 @@ DELEGATE_TASK_SCHEMA = {
                     "Run as a detached background unit and deliver consolidated "
                     "completion in a later turn. Requires read_only=true for every "
                     "task; detached repository mutation uses delegate_coding_task. "
-                    "Completed results are persisted for restart-safe delivery, and "
-                    "the response includes live transcript paths."
+                    "Completed results are persisted as Hermes-internal runtime state "
+                    "for restart-safe delivery, and the response includes redacted live "
+                    "transcript paths. This does not grant user/project mutation."
                 ),
             },
             "allow_nested_coding": {

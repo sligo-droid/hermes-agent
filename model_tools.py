@@ -468,6 +468,34 @@ def _compute_tool_definitions(
                 str(tool.get("function", {}).get("name") or "")
             )
         ]
+        # ACP command/argument overrides are operator transport configuration,
+        # not model authority. Keep action-runtime compatibility for trusted
+        # callers, but remove both top-level and per-task fields from the
+        # model-visible READ_ONLY schema. Deep-copy the one schema before
+        # editing so registry/dynamic-schema caches remain immutable.
+        for index, tool in enumerate(filtered_tools):
+            function = tool.get("function", {})
+            if function.get("name") != "delegate_task":
+                continue
+            import copy
+
+            safe_tool = copy.deepcopy(tool)
+            properties = (
+                safe_tool.get("function", {})
+                .get("parameters", {})
+                .get("properties", {})
+            )
+            properties.pop("acp_command", None)
+            properties.pop("acp_args", None)
+            task_properties = (
+                properties.get("tasks", {})
+                .get("items", {})
+                .get("properties", {})
+            )
+            task_properties.pop("acp_command", None)
+            task_properties.pop("acp_args", None)
+            filtered_tools[index] = safe_tool
+            break
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references

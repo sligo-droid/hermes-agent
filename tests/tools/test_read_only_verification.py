@@ -8,7 +8,10 @@ import pytest
 import tools.read_only_verification_tool as verification_tool
 from tools.read_only_command_policy import read_only_terminal_check
 from tools.read_only_verification_tool import (
+    _MEMORY_LIMIT_BYTES,
     _OUTPUT_LIMIT,
+    _TASK_LIMIT,
+    _with_verification_cgroup,
     _prepared_dependency_roots,
     _verification_environment,
     parse_read_only_verification_command,
@@ -151,6 +154,58 @@ def test_verification_environment_is_allowlist_not_redaction(monkeypatch):
         "PYTHONDONTWRITEBYTECODE", "CI", "GIT_CONFIG_NOSYSTEM",
         "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT",
     }
+
+
+def test_verification_cgroup_wrapper_sets_aggregate_memory_and_task_limits(monkeypatch):
+    monkeypatch.setattr(verification_tool.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        verification_tool,
+        "_cgroup_v2_limiter_available",
+        lambda probe=True: True,
+    )
+
+    argv = _with_verification_cgroup(
+        ["/usr/bin/true"],
+        command_env={"HOME": "/tmp/home", "CI": "1"},
+    )
+
+    assert argv[:5] == [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+    ]
+    assert f"MemoryMax={_MEMORY_LIMIT_BYTES}" in argv
+    assert f"TasksMax={_TASK_LIMIT}" in argv
+    assert "/usr/bin/env" in argv
+    assert "HOME=/tmp/home" in argv
+    assert "CI=1" in argv
+    assert argv[-1] == "/usr/bin/true"
+
+
+def test_read_only_verify_fails_closed_without_cgroup_limiter(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    _git(repo, "add", "test_ok.py")
+    _git(repo, "commit", "-m", "limiter fixture")
+    monkeypatch.setattr(
+        verification_tool,
+        "_cgroup_v2_limiter_available",
+        lambda probe=True: False,
+    )
+
+    payload = json.loads(
+        read_only_verify(
+            command="python -m pytest -q",
+            workdir=str(repo),
+            runtime_mode="read_only",
+        )
+    )
+
+    assert "failed closed" in payload["error"]
+    assert "cgroup v2" in payload["error"]
 
 
 def test_read_only_verify_neutralizes_escaping_symlink_and_hides_host_paths(tmp_path):
@@ -372,3 +427,37 @@ def test_git_inspect_bounds_large_diff_output(tmp_path):
     assert payload["success"] is True
     assert payload["output_truncated"] is True
     assert len(payload["output"]) <= 100_000
+
+
+@pytest.mark.parametrize("operation", ["diff", "show", "log"])
+def test_git_inspect_never_invokes_repository_textconv(tmp_path, operation):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    marker = tmp_path / f"textconv-{operation}-invoked"
+    converter = repo / "converter.sh"
+    converter.write_text(
+        "#!/bin/sh\n"
+        f"touch {str(marker)!r}\n"
+        "cat \"$1\"\n",
+        encoding="utf-8",
+    )
+    converter.chmod(0o755)
+    (repo / ".gitattributes").write_text("*.dat diff=unsafe\n", encoding="utf-8")
+    (repo / "sample.dat").write_text("one\n", encoding="utf-8")
+    _git(repo, "config", "diff.unsafe.textconv", str(converter))
+    _git(repo, "add", ".gitattributes", "sample.dat")
+    _git(repo, "commit", "-m", "textconv fixture")
+    (repo / "sample.dat").write_text("two\n", encoding="utf-8")
+
+    payload = json.loads(
+        git_inspect(
+            operation=operation,
+            revision="HEAD" if operation in {"show", "log"} else "",
+            paths=["sample.dat"],
+            workdir=str(repo),
+            runtime_mode="read_only",
+        )
+    )
+
+    assert payload["success"] is True, payload
+    assert not marker.exists()

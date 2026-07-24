@@ -144,15 +144,20 @@ def git_inspect(
         "core.hooksPath=/dev/null",
         "-c",
         "core.pager=cat",
+        "-c",
+        "interactive.diffFilter=",
+        "-c",
+        "diff.external=",
         "--literal-pathspecs",
         "--no-optional-locks",
     ]
     if operation == "status":
         command += ["status", "--short", "--branch", "--untracked-files=normal"]
     elif operation == "diff":
-        command += ["diff", "--no-ext-diff", "--no-color", "--stat"] if revision == "stat" else [
+        command += ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--stat"] if revision == "stat" else [
             "diff",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-color",
         ]
         if staged:
@@ -164,6 +169,7 @@ def git_inspect(
     elif operation == "log":
         command += [
             "log",
+            "--no-textconv",
             f"--max-count={limit_value}",
             "--date=iso-strict",
             "--pretty=format:%h%x09%ad%x09%an%x09%s",
@@ -176,7 +182,14 @@ def git_inspect(
         target = revision or "HEAD"
         if not _REF_RE.fullmatch(target):
             return tool_error("Git revision contains unsupported characters")
-        command += ["show", "--no-ext-diff", "--no-color", "--format=fuller", target]
+        command += [
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--format=fuller",
+            target,
+        ]
     elif operation == "branches":
         command += [
             "for-each-ref",

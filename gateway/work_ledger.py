@@ -1934,7 +1934,7 @@ class GatewayWorkLedger:
         self._now = now_fn
 
     def _empty(self) -> dict[str, Any]:
-        return {"version": 1, "items": {}}
+        return {"version": 2, "items": {}}
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -1950,7 +1950,14 @@ class GatewayWorkLedger:
         items = data.get("items")
         if not isinstance(items, dict):
             data["items"] = {}
-        data.setdefault("version", 1)
+        # v2 adds explicit Discord runtime/lifecycle metadata. Rows are
+        # migrated lazily: missing fields retain the legacy ACTION contract in
+        # event_from_item(), while the next mutation writes version 2.
+        try:
+            prior_version = int(data.get("version") or 1)
+        except (TypeError, ValueError):
+            prior_version = 1
+        data["version"] = max(2, prior_version)
         return data
 
     def _write(self, data: dict[str, Any]) -> None:
@@ -1987,6 +1994,7 @@ class GatewayWorkLedger:
         freshness_seconds: float,
         status: str = "accepted",
         visual_qa_config: Any = None,
+        drain_recovery: bool = False,
     ) -> dict[str, Any] | None:
         source = getattr(event, "source", None)
         work_id = self.id_for_event(event, session_key)
@@ -2029,6 +2037,20 @@ class GatewayWorkLedger:
             "channel_prompt": channel_prompt,
             "channel_context": getattr(event, "channel_context", None),
             "goal_thread_context": getattr(event, "goal_thread_context", None),
+            "discord_runtime_mode": str(
+                getattr(event, "discord_runtime_mode", None) or "action"
+            ),
+            "discord_runtime_reason": getattr(event, "discord_runtime_reason", None),
+            "discord_action_escalation_allowed": bool(
+                getattr(event, "discord_action_escalation_allowed", False)
+            ),
+            "discord_explicit_no_action_denial": bool(
+                getattr(event, "discord_explicit_no_action_denial", False)
+            ),
+            "participates_in_work_lifecycle": bool(
+                getattr(event, "participates_in_work_lifecycle", True)
+            ),
+            "drain_recovery": bool(drain_recovery),
             "feature_summary": _durable_metadata(getattr(event, "feature_summary", None)),
             "project_summary": _durable_metadata(getattr(event, "project_summary", None)),
             # These are deliberately normalized before persistence. The
@@ -5295,11 +5317,21 @@ class GatewayWorkLedger:
     @staticmethod
     def event_from_item(item: dict[str, Any]):
         from gateway.platforms.base import MessageEvent, MessageType
+        from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 
         try:
             msg_type = MessageType(str(item.get("message_type") or "text"))
         except ValueError:
             msg_type = MessageType.TEXT
+        runtime_mode = normalize_runtime_mode(
+            item.get("discord_runtime_mode"),
+            default=RuntimeMode.ACTION,
+        )
+        lifecycle = (
+            bool(item.get("participates_in_work_lifecycle"))
+            if "participates_in_work_lifecycle" in item
+            else True
+        )
         event = MessageEvent(
             text=str(item.get("text") or ""),
             message_type=msg_type,
@@ -5312,11 +5344,19 @@ class GatewayWorkLedger:
             project_summary=item.get("project_summary"),
             channel_context=item.get("channel_context"),
             goal_thread_context=item.get("goal_thread_context"),
-            discord_runtime_mode="action",
-            participates_in_work_lifecycle=True,
+            discord_runtime_mode=runtime_mode.value,
+            discord_action_escalation_allowed=bool(
+                item.get("discord_action_escalation_allowed", False)
+            ),
+            discord_runtime_reason=item.get("discord_runtime_reason"),
+            discord_explicit_no_action_denial=bool(
+                item.get("discord_explicit_no_action_denial", False)
+            ),
+            participates_in_work_lifecycle=lifecycle,
         )
         event.work_item_id = item.get("id")
         event.work_replay = True
+        event.discord_drain_recovery = bool(item.get("drain_recovery", False))
         event.visual_qa_requirement = normalize_visual_requirement(item.get("visual_qa_requirement"))
         event.visual_qa_config = normalize_visual_qa_config(item.get("visual_qa_config"))
         return event

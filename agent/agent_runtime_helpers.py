@@ -1720,6 +1720,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 
+        # ACP is an execution transport, not just an HTTP client. Bind the
+        # turn capability explicitly so a configured or inherited transport
+        # cannot service filesystem mutation requests for a READ_ONLY child.
+        client_kwargs["runtime_mode"] = getattr(agent, "_runtime_mode", "action")
         client = CopilotACPClient(**client_kwargs)
         _ra().logger.info(
             "Copilot ACP client created (%s, shared=%s) %s",

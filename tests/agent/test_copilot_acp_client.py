@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.copilot_acp_client import CopilotACPClient
@@ -154,6 +155,84 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
 
         outcome = (((response.get("result") or {}).get("outcome") or {}).get("outcome"))
         self.assertEqual(outcome, "cancelled")
+
+    def test_read_only_runtime_denies_service_mutation_permission(self) -> None:
+        client = CopilotACPClient(acp_cwd="/tmp", runtime_mode="read_only")
+        process = _FakeProcess()
+
+        handled = client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "session/request_permission",
+                "params": {
+                    "toolCall": {
+                        "title": "Restart gateway service",
+                        "kind": "execute",
+                    }
+                },
+            },
+            process=process,
+            cwd="/tmp",
+            text_parts=[],
+            reasoning_parts=[],
+        )
+
+        self.assertTrue(handled)
+        response = json.loads(process.stdin.getvalue().strip())
+        outcome = (((response.get("result") or {}).get("outcome") or {}).get("outcome"))
+        self.assertEqual(outcome, "cancelled")
+
+    def test_read_only_runtime_rejects_filesystem_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "blocked.txt"
+            client = CopilotACPClient(acp_cwd=str(root), runtime_mode="read_only")
+            process = _FakeProcess()
+            handled = client._handle_server_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "fs/write_text_file",
+                    "params": {"path": str(target), "content": "blocked"},
+                },
+                process=process,
+                cwd=str(root),
+                text_parts=[],
+                reasoning_parts=[],
+            )
+
+            self.assertTrue(handled)
+            response = json.loads(process.stdin.getvalue().strip())
+            self.assertIn("read-only runtime", response["error"]["message"])
+            self.assertFalse(target.exists())
+
+    def test_configured_acp_client_receives_parent_runtime_mode(self) -> None:
+        from agent.agent_runtime_helpers import create_openai_client
+
+        agent = SimpleNamespace(
+            provider="copilot-acp",
+            _runtime_mode="read_only",
+            _client_log_context=lambda: "test-client",
+        )
+        kwargs = {
+            "api_key": "copilot-acp",
+            "base_url": "acp://copilot",
+            "acp_command": "copilot",
+        }
+        with patch("agent.auxiliary_client._validate_proxy_env_urls"), patch(
+            "agent.auxiliary_client._validate_base_url"
+        ), patch("agent.copilot_acp_client.CopilotACPClient") as client_cls:
+            client = create_openai_client(
+                agent,
+                kwargs,
+                reason="configured delegation transport",
+                shared=False,
+            )
+
+        self.assertIs(client, client_cls.return_value)
+        self.assertEqual(client_cls.call_args.kwargs["runtime_mode"], "read_only")
+        self.assertNotIn("runtime_mode", kwargs)
 
     def test_read_text_file_blocks_internal_hermes_hub_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

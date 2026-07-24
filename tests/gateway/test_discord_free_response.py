@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+from agent.runtime_capabilities import RuntimeMode
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
 
@@ -1055,7 +1056,7 @@ async def test_discord_native_voice_in_free_response_channel_auto_threads(adapte
 
     created_thread = FakeThread(channel_id=777, parent=FakeTextChannel(channel_id=789))
     adapter._auto_create_thread = AsyncMock(return_value=created_thread)
-    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._classify_discord_runtime_mode = AsyncMock(return_value=RuntimeMode.READ_ONLY)
     adapter._preprocess_voice_for_feature_triage = AsyncMock(return_value=({}, "quick status check"))
 
     message = make_message(
@@ -1095,7 +1096,7 @@ async def test_discord_native_voice_auto_tag_non_free_channel_auto_threads(adapt
     parent_channel = FakeTextChannel(channel_id=123)
     created_thread = FakeThread(channel_id=888, parent=parent_channel)
     adapter._auto_create_thread = AsyncMock(return_value=created_thread)
-    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._classify_discord_runtime_mode = AsyncMock(return_value=RuntimeMode.READ_ONLY)
     adapter._preprocess_voice_for_feature_triage = AsyncMock(return_value=({}, "quick status check"))
 
     message = make_message(
@@ -1541,7 +1542,7 @@ async def test_auto_threaded_direct_question_skips_parent_channel_backfill(adapt
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
     adapter.config.extra["history_backfill"] = True
-    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._classify_discord_runtime_mode = AsyncMock(return_value=RuntimeMode.READ_ONLY)
     adapter._fetch_channel_context = AsyncMock(
         return_value="[Recent channel messages]\n[Alice] old task"
     )
@@ -1566,7 +1567,7 @@ async def test_auto_threaded_direct_question_skips_parent_channel_backfill(adapt
     assert event.source.chat_type == "thread"
     assert event.text == "What changed?"
     assert event.channel_context is None
-    assert "classified as a direct question, not an action request" in event.channel_prompt
+    assert "default READ-ONLY runtime" in event.channel_prompt
 
 
 @pytest.mark.asyncio
@@ -1575,7 +1576,7 @@ async def test_mentioned_existing_thread_still_backfills_thread_history(adapter,
     monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
     adapter.config.extra["history_backfill"] = True
-    adapter._classify_discord_action_request = AsyncMock(return_value=False)
+    adapter._classify_discord_runtime_mode = AsyncMock(return_value=RuntimeMode.READ_ONLY)
     adapter._fetch_channel_context = AsyncMock(
         return_value="[Recent channel messages]\n[Alice] thread note"
     )

@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    SessionSource,
+    merge_pending_message_event,
+)
 
 
 # =====================================================================
@@ -203,6 +208,70 @@ class TestDiscordTextBatching:
         for task in list(adapter._pending_text_batch_tasks.values()):
             task.cancel()
         await asyncio.sleep(0)
+
+    @pytest.mark.parametrize(
+        ("first_mode", "first_denial", "second_mode", "second_denial"),
+        [
+            ("read_only", True, "action", False),
+            ("action", False, "read_only", True),
+            ("read_only", True, "read_only", False),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_explicit_no_action_denial_is_monotonic_within_text_batch(
+        self,
+        first_mode,
+        first_denial,
+        second_mode,
+        second_denial,
+    ):
+        adapter = _make_discord_adapter()
+        adapter._text_batch_delay_seconds = 30
+        first = _make_event("first", Platform.DISCORD)
+        first.discord_runtime_mode = first_mode
+        first.discord_explicit_no_action_denial = first_denial
+        first.discord_runtime_reason = "explicit_plan_only" if first_denial else "ordinary"
+        first.channel_prompt = "read-only prompt" if first_mode == "read_only" else "base"
+        second = _make_event("second", Platform.DISCORD)
+        second.discord_runtime_mode = second_mode
+        second.discord_explicit_no_action_denial = second_denial
+        second.discord_runtime_reason = "explicit_plan_only" if second_denial else "ordinary"
+        second.channel_prompt = "read-only prompt" if second_mode == "read_only" else "base"
+
+        adapter._enqueue_text_event(first)
+        adapter._enqueue_text_event(second)
+
+        pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
+        assert pending.discord_runtime_mode == "read_only"
+        assert pending.discord_explicit_no_action_denial is True
+        assert pending.discord_action_escalation_allowed is False
+
+        for task in list(adapter._pending_text_batch_tasks.values()):
+            task.cancel()
+        await asyncio.sleep(0)
+
+    def test_explicit_denial_is_monotonic_for_media_text_batch_only(self):
+        pending = {}
+        photo = _make_event("plan only", Platform.DISCORD, msg_type=MessageType.PHOTO)
+        photo.media_urls = ["one.png"]
+        photo.media_types = ["image/png"]
+        photo.discord_runtime_mode = "read_only"
+        photo.discord_explicit_no_action_denial = True
+        photo.discord_runtime_reason = "explicit_plan_only"
+        action = _make_event("now implement it", Platform.DISCORD)
+        action.discord_runtime_mode = "action"
+
+        merge_pending_message_event(pending, "same", photo)
+        merge_pending_message_event(pending, "same", action, merge_text=True)
+
+        assert pending["same"].discord_runtime_mode == "read_only"
+        assert pending["same"].discord_explicit_no_action_denial is True
+
+        independent = _make_event("implement independently", Platform.DISCORD)
+        independent.discord_runtime_mode = "action"
+        merge_pending_message_event(pending, "later", independent)
+        assert pending["later"].discord_runtime_mode == "action"
+        assert pending["later"].discord_explicit_no_action_denial is False
 
     @pytest.mark.asyncio
     async def test_three_way_split_aggregated(self):

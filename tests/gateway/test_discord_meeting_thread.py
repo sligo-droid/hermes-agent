@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent.runtime_capabilities import RuntimeMode
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
 from plugins.platforms.discord.adapter import DiscordAdapter
@@ -33,8 +34,8 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
 
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
-    classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
+    classifier = AsyncMock(return_value=RuntimeMode.READ_ONLY)
+    monkeypatch.setattr(adapter, "_classify_discord_runtime_mode", classifier)
     feature_summary = AsyncMock()
     feature_summary.return_value = {"thread_id": "777", "message_id": "summary-1"}
     monkeypatch.setattr(adapter, "initialize_feature_summary", feature_summary)
@@ -73,7 +74,7 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
     _, kwargs = create_thread.call_args
     assert kwargs["name"] == "Meeting notes — 2026-05-19 — client kickoff"
     assert kwargs["auto_archive_duration"] == 1440
-    feature_summary.assert_not_awaited()
+    feature_summary.assert_awaited_once()
     classifier.assert_not_awaited()
 
     assert len(captured) == 1
@@ -86,7 +87,9 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
     assert event.source.chat_id == "777"
     assert event.source.thread_id == "777"
     assert event.source.parent_chat_id == "12345"
-    assert event.feature_summary is None
+    assert event.feature_summary == {"thread_id": "777", "message_id": "summary-1"}
+    assert event.discord_runtime_mode == "action"
+    assert event.participates_in_work_lifecycle is True
 
 
 @pytest.mark.asyncio
@@ -103,8 +106,8 @@ async def test_mentioned_meeting_command_with_audio_canonicalizes_after_mention_
 
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
-    classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
+    classifier = AsyncMock(return_value=RuntimeMode.READ_ONLY)
+    monkeypatch.setattr(adapter, "_classify_discord_runtime_mode", classifier)
 
     guild = SimpleNamespace(id=42, name="Guild")
     channel = SimpleNamespace(id=12345, name="general", guild=guild)
@@ -139,6 +142,8 @@ async def test_mentioned_meeting_command_with_audio_canonicalizes_after_mention_
     assert event.message_type == MessageType.COMMAND
     assert event.media_urls == ["/tmp/uploaded-meeting.ogg"]
     assert event.source.thread_id == "777"
+    assert event.discord_runtime_mode == "action"
+    assert event.participates_in_work_lifecycle is True
     classifier.assert_not_awaited()
 
 
@@ -158,8 +163,8 @@ async def test_mentioned_audio_without_meeting_command_triggers_meeting_intake(a
 
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
-    classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
+    classifier = AsyncMock(return_value=RuntimeMode.READ_ONLY)
+    monkeypatch.setattr(adapter, "_classify_discord_runtime_mode", classifier)
     feature_summary = AsyncMock()
     feature_summary.return_value = {"thread_id": "778", "message_id": "summary-2"}
     monkeypatch.setattr(adapter, "initialize_feature_summary", feature_summary)
@@ -191,7 +196,7 @@ async def test_mentioned_audio_without_meeting_command_triggers_meeting_intake(a
 
     create_thread.assert_awaited_once()
     assert create_thread.call_args.kwargs["name"] == "Meeting notes — 2026-05-19 — client kickoff"
-    feature_summary.assert_not_awaited()
+    feature_summary.assert_awaited_once()
     classifier.assert_not_awaited()
 
     assert len(captured) == 1
@@ -201,7 +206,9 @@ async def test_mentioned_audio_without_meeting_command_triggers_meeting_intake(a
     assert event.media_urls == ["/tmp/uploaded-meeting.ogg"]
     assert event.media_types == ["audio/ogg"]
     assert event.source.thread_id == "778"
-    assert event.feature_summary is None
+    assert event.feature_summary == {"thread_id": "778", "message_id": "summary-2"}
+    assert event.discord_runtime_mode == "action"
+    assert event.participates_in_work_lifecycle is True
 
 
 @pytest.mark.asyncio
@@ -214,8 +221,8 @@ async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adap
         captured.append(event)
 
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
-    classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
+    classifier = AsyncMock(return_value=RuntimeMode.READ_ONLY)
+    monkeypatch.setattr(adapter, "_classify_discord_runtime_mode", classifier)
     # This test isolates the meeting-intake gate: plain mentioned text should
     # not be promoted to /meeting. Disable the separate generic auto-thread
     # path so its direct-question thread creation does not mask that assertion.
@@ -266,7 +273,10 @@ async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adap
             "alex: Please prepare the client kickoff notes.",
         ],
         actionable_thread_context=False,
+        force_action=False,
     )
+    assert event.discord_runtime_mode == "read_only"
+    assert event.participates_in_work_lifecycle is False
 
 
 @pytest.mark.asyncio
@@ -283,7 +293,8 @@ async def test_bare_text_meeting_command_reuses_existing_recording_thread(adapte
 
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
-    monkeypatch.setattr(adapter, "_classify_discord_action_request", AsyncMock(return_value=False))
+    classifier = AsyncMock(return_value=RuntimeMode.READ_ONLY)
+    monkeypatch.setattr(adapter, "_classify_discord_runtime_mode", classifier)
 
     guild = SimpleNamespace(id=42, name="Guild")
     channel = SimpleNamespace(id=12345, name="general", guild=guild)
@@ -313,6 +324,9 @@ async def test_bare_text_meeting_command_reuses_existing_recording_thread(adapte
     assert len(captured) == 1
     assert captured[0].source.chat_id == "888"
     assert captured[0].source.thread_id == "888"
+    assert captured[0].discord_runtime_mode == "action"
+    assert captured[0].participates_in_work_lifecycle is True
+    classifier.assert_not_awaited()
 
 
 def test_register_slash_commands_does_not_include_native_meeting_attachment_command(adapter, monkeypatch):

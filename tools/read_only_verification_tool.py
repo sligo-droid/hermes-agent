@@ -27,6 +27,11 @@ _SAFE_SCRIPT_NAMES = re.compile(
 )
 _OUTPUT_LIMIT = 100_000
 _CAPTURE_LIMIT = 1_000_000
+_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+_MEMORY_SWAP_LIMIT_BYTES = 512 * 1024 * 1024
+_TASK_LIMIT = 256
+_CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
+_cgroup_limiter_probe: bool | None = None
 _VERIFICATION_ENV_ALLOWLIST = frozenset(
     {
         "LANG",
@@ -44,7 +49,105 @@ _VERIFICATION_ENV_ALLOWLIST = frozenset(
 
 
 def check_read_only_verification_requirements() -> bool:
-    return bool(shutil.which("git") and shutil.which("bwrap"))
+    return bool(
+        shutil.which("git")
+        and shutil.which("bwrap")
+        and shutil.which("systemd-run")
+        and (_CGROUP_V2_ROOT / "cgroup.controllers").is_file()
+    )
+
+
+def _cgroup_v2_limiter_available(*, probe: bool = True) -> bool:
+    """Return whether aggregate memory/tasks limits can be enforced.
+
+    RLIMIT_NPROC is scoped to the shared host UID and is therefore neither a
+    precise nor safe per-verification process quota. A transient user scope
+    gives the entire bwrap process tree one cgroup-v2 memory/tasks boundary.
+    """
+
+    global _cgroup_limiter_probe
+    controllers_path = _CGROUP_V2_ROOT / "cgroup.controllers"
+    systemd_run = shutil.which("systemd-run")
+    try:
+        controllers = set(controllers_path.read_text(encoding="utf-8").split())
+    except OSError:
+        return False
+    if not systemd_run or not {"memory", "pids"}.issubset(controllers):
+        return False
+    if not probe:
+        return True
+    if _cgroup_limiter_probe is not None:
+        return _cgroup_limiter_probe
+    try:
+        result = subprocess.run(
+            [
+                systemd_run,
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "-p",
+                f"MemoryMax={_MEMORY_LIMIT_BYTES}",
+                "-p",
+                f"MemorySwapMax={_MEMORY_SWAP_LIMIT_BYTES}",
+                "-p",
+                f"TasksMax={_TASK_LIMIT}",
+                "/usr/bin/true",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        _cgroup_limiter_probe = result.returncode == 0
+    except Exception:
+        _cgroup_limiter_probe = False
+    return _cgroup_limiter_probe
+
+
+def _with_verification_cgroup(
+    argv: list[str],
+    *,
+    command_env: dict[str, str] | None = None,
+) -> list[str]:
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run or not _cgroup_v2_limiter_available():
+        raise RuntimeError(
+            "cgroup v2 memory and task limiters are unavailable; refusing verification"
+        )
+    wrapped = [
+        systemd_run,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "-p",
+        f"MemoryMax={_MEMORY_LIMIT_BYTES}",
+        "-p",
+        f"MemorySwapMax={_MEMORY_SWAP_LIMIT_BYTES}",
+        "-p",
+        f"TasksMax={_TASK_LIMIT}",
+    ]
+    if command_env is not None:
+        wrapped.extend(
+            [
+                "/usr/bin/env",
+                "-i",
+                *(f"{key}={value}" for key, value in sorted(command_env.items())),
+            ]
+        )
+    return [*wrapped, *argv]
+
+
+def _cgroup_launcher_environment() -> dict[str, str]:
+    """Minimal host environment needed to reach the user systemd manager."""
+
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    for key in ("HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        value = os.environ.get(key)
+        if isinstance(value, str) and value:
+            env[key] = value
+    return env
 
 
 def _path_arg_is_safe(arg: str) -> bool:
@@ -407,12 +510,13 @@ def _run_bounded(
     env: dict[str, str],
     timeout_value: int,
 ) -> tuple[int, bytes, bytes, bool]:
+    argv = _with_verification_cgroup(argv, command_env=env)
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         process = subprocess.Popen(
             argv,
             stdout=stdout_file,
             stderr=stderr_file,
-            env=env,
+            env=_cgroup_launcher_environment(),
             start_new_session=True,
             preexec_fn=_resource_limits(timeout_value),
         )
@@ -444,6 +548,11 @@ def read_only_verify(
 
     if normalize_runtime_mode(runtime_mode) is not RuntimeMode.READ_ONLY:
         return tool_error("read_only_verify is available only in a read-only runtime")
+    if not _cgroup_v2_limiter_available():
+        return tool_error(
+            "Read-only verification failed closed: cgroup v2 memory and task "
+            "limiters are unavailable"
+        )
     argv, error = parse_read_only_verification_command(command)
     if error or argv is None:
         return tool_error(f"Unsafe verification command: {error}")
@@ -614,7 +723,9 @@ def read_only_verify(
                     "sandbox": (
                         "temporary snapshot; only system runtime and prepared dependencies "
                         "mounted read-only; host home/workspaces and network, PID, IPC, and "
-                        "runtime sockets isolated"
+                        "runtime sockets isolated; cgroup v2 aggregate limits: "
+                        f"memory={_MEMORY_LIMIT_BYTES} bytes, swap={_MEMORY_SWAP_LIMIT_BYTES} "
+                        f"bytes, tasks={_TASK_LIMIT}"
                     ),
                     "artifacts_cleaned": True,
                 },

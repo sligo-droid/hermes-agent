@@ -4,9 +4,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.work_ledger import GatewayWorkLedger
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 def _source(*, chat_id="thread-1", chat_type="thread", thread_id="thread-1"):
@@ -73,6 +75,116 @@ async def test_same_session_action_escalation_is_prepended_before_followups():
     )
     adapter.handle_message.assert_not_awaited()
     runner._evict_cached_agent.assert_called_once_with("discord:thread-1")
+
+
+def test_busy_target_promotion_stays_ahead_of_racing_followup():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    source = _source()
+    promoted = MessageEvent(text="Build it", source=source, discord_runtime_mode="action")
+    promoted._discord_promotion_origin_session_key = "discord:thread-1"
+    promoted._discord_promotion_origin_generation = 1
+    followup = MessageEvent(text="one more detail", source=source)
+    adapter = SimpleNamespace(_pending_messages={"discord:thread-1": followup})
+    runner._queued_events = {}
+
+    assert runner._defer_promoted_replay_to_fresh_turn(
+        event=promoted,
+        session_key="discord:thread-1",
+        adapter=adapter,
+    ) is True
+
+    assert adapter._pending_messages["discord:thread-1"] is promoted
+    assert runner._queued_events["discord:thread-1"] == [followup]
+
+
+def test_read_only_turn_leaves_promoted_action_for_fresh_adapter_entry():
+    source = _source()
+    promoted = MessageEvent(text="Build it", source=source, discord_runtime_mode="action")
+    promoted._discord_promotion_origin_session_key = "discord:thread-1"
+    promoted._discord_promotion_origin_generation = 1
+    pending = {"discord:thread-1": promoted}
+
+    class Adapter:
+        def get_pending_message(self, session_key):
+            return pending.pop(session_key, None)
+
+    replay = gateway_run._dequeue_pending_event_for_turn(
+        Adapter(),
+        "discord:thread-1",
+        "read_only",
+    )
+
+    assert replay is None
+    assert pending["discord:thread-1"] is promoted
+
+
+def test_promotion_queued_during_restart_is_durable_action_work(tmp_path):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = _source()
+    promoted = MessageEvent(
+        text="Build it",
+        source=source,
+        message_id="message-1",
+        discord_runtime_mode="action",
+        discord_runtime_reason="promoted_action_replay",
+        participates_in_work_lifecycle=True,
+    )
+    promoted._discord_promotion_origin_session_key = "discord:thread-1"
+    promoted._discord_promotion_origin_generation = 1
+
+    item = runner._record_discord_work_for_drain(promoted, "discord:thread-1")
+
+    assert item is not None
+    replay = runner.work_ledger.event_from_item(
+        runner.work_ledger.get(item["id"])
+    )
+    assert replay.discord_runtime_mode == "action"
+    assert replay.discord_runtime_reason == "promoted_action_replay"
+    assert replay.participates_in_work_lifecycle is True
+    assert not hasattr(replay, "_discord_promotion_origin_generation")
+
+
+@pytest.mark.asyncio
+async def test_new_promotion_thread_preseeds_starter_dedup():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    parent = SimpleNamespace(id=123, name="planning")
+    thread = SimpleNamespace(
+        id=456,
+        name="Build it",
+        parent=parent,
+        guild=SimpleNamespace(id=789),
+    )
+    raw_message = SimpleNamespace(channel=parent, thread=None)
+    event = MessageEvent(
+        text="Build it",
+        source=_source(chat_id="parent-1", chat_type="group", thread_id=None),
+        raw_message=raw_message,
+        message_id="message-1",
+        discord_runtime_mode="read_only",
+        discord_action_escalation_allowed=True,
+        project_summary={"message_id": "project-summary"},
+    )
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
+    adapter._load_feature_summary_handle_for_request = MagicMock(
+        return_value={
+            "thread_id": "456",
+            "message_id": "feature-summary",
+            "initial_request": "Build it",
+        }
+    )
+    adapter._threads.mark = MagicMock()
+    adapter._mark_discord_thread_participation = MagicMock()
+
+    promoted, _url = await adapter.promote_event_to_action_request(
+        event,
+        initial_request="Build it",
+    )
+
+    assert promoted is not None
+    assert promoted.discord_runtime_mode == "action"
+    assert adapter._dedup.is_duplicate("456") is True
 
 
 @pytest.mark.asyncio

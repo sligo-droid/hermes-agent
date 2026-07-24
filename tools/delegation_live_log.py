@@ -21,8 +21,10 @@ Design constraints:
   failure disables the writer and degrades to a debug log.
 * **Survive child crashes.** Files are opened in append mode per write —
   no long-lived handle to lose, every event is flushed when written.
-* **Side-channel only.** Nothing here touches message content, so prompt
-  caching is unaffected.
+* **Internal runtime state only.** Redacted logs and manifests are Hermes-owned
+  cache/observability state, not user or project mutation. Nothing here touches
+  project files or message content, so read-only authority and prompt caching
+  are unaffected.
 * **No config knobs.** Retention is a module constant (7 days), pruned
   opportunistically on each new dispatch.
 """

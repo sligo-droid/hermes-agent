@@ -6618,13 +6618,25 @@ class _GatewayRunnerCore(
         event: MessageEvent,
         session_key: str,
     ) -> Optional[dict]:
-        item = self._accept_discord_work_item(
+        if getattr(event, "internal", False):
+            return None
+        if getattr(getattr(event, "source", None), "platform", None) != Platform.DISCORD:
+            return None
+        runtime_mode = _discord_runtime_mode_for(event)
+        event.discord_runtime_mode = runtime_mode.value
+        if runtime_mode is RuntimeMode.READ_ONLY:
+            event.participates_in_work_lifecycle = False
+        ledger = self._ledger()
+        item = ledger.accept_event(
             event,
-            session_key,
-            defer_completion=True,
+            session_key=session_key,
+            freshness_seconds=_auto_continue_freshness_window(),
+            drain_recovery=True,
         )
         if item and item.get("id"):
-            self._ledger().claim(str(item["id"]))
+            event.work_item_id = item.get("id")
+            event.defer_work_completion = True
+            ledger.claim(str(item["id"]))
         return item
 
     def _try_steer_busy_event(
@@ -7957,12 +7969,24 @@ class _GatewayRunnerCore(
         if work_id:
             event.work_item_id = work_id
             event.work_replay = True
-        if (
-            getattr(event, "discord_runtime_mode", None) is None
-            and getattr(event, "discord_action_request_intent", None) is None
-        ):
-            event.discord_runtime_mode = RuntimeMode.ACTION.value
-            event.participates_in_work_lifecycle = True
+        event.discord_runtime_mode = _discord_runtime_mode_for(
+            item.get("discord_runtime_mode"),
+            default=RuntimeMode.ACTION,
+        ).value
+        event.discord_action_request_intent = None
+        event.discord_runtime_reason = item.get("discord_runtime_reason")
+        event.discord_action_escalation_allowed = bool(
+            item.get("discord_action_escalation_allowed", False)
+        )
+        event.discord_explicit_no_action_denial = bool(
+            item.get("discord_explicit_no_action_denial", False)
+        )
+        event.participates_in_work_lifecycle = (
+            bool(item.get("participates_in_work_lifecycle"))
+            if "participates_in_work_lifecycle" in item
+            else True
+        )
+        event.discord_drain_recovery = bool(item.get("drain_recovery", False))
         session_id = str(item.get("session_id") or "").strip()
         if session_id:
             event.session_id = session_id
@@ -8180,6 +8204,25 @@ class _GatewayRunnerCore(
         if consume:
             delattr(event, "_discord_promotion_origin_session_key")
             delattr(event, "_discord_promotion_origin_generation")
+        return True
+
+    @staticmethod
+    def _is_promoted_discord_replay(event: Optional[MessageEvent]) -> bool:
+        return bool(
+            event is not None
+            and hasattr(event, "_discord_promotion_origin_generation")
+        )
+
+    def _defer_promoted_replay_to_fresh_turn(
+        self,
+        *,
+        event: Optional[MessageEvent],
+        session_key: str,
+        adapter: Any,
+    ) -> bool:
+        if not self._is_promoted_discord_replay(event):
+            return False
+        self._prepend_fifo(session_key, event, adapter)
         return True
 
     def _discord_work_item_id_for_event(
@@ -31206,7 +31249,6 @@ class _GatewayRunnerCore(
                     if (
                         source.platform == Platform.DISCORD
                         and getattr(source, "auto_thread_created", False)
-                        and turn_runtime_mode is RuntimeMode.ACTION
                     ):
                         title_callbacks.append(
                             lambda title: self._schedule_discord_semantic_thread_rename(
@@ -31778,6 +31820,17 @@ class _GatewayRunnerCore(
                     # order, and (b) causes any mid-chain /queue to correctly
                     # route to overflow rather than jumping the queue.
                     pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                    if self._defer_promoted_replay_to_fresh_turn(
+                        event=pending_event,
+                        session_key=session_key,
+                        adapter=adapter,
+                    ):
+                        # Promotion is a control-plane handoff, not an in-band
+                        # continuation. Put it back so BasePlatformAdapter starts
+                        # a fresh semantic turn after this task unwinds. That fresh
+                        # entry consumes the generation fence and runs normal
+                        # ledger/worktree/runtime/lifecycle selection exactly once.
+                        pending_event = None
                     if (
                         pending_event is not None
                         and not await self._consume_promoted_replay_fence(
@@ -31853,6 +31906,18 @@ class _GatewayRunnerCore(
                         pass
 
             if self._draining and (pending_event or pending):
+                if pending_event is not None:
+                    try:
+                        pending_source = getattr(pending_event, "source", None) or source
+                        self._record_discord_work_for_drain(
+                            pending_event,
+                            self._session_key_for_source(pending_source),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist queued Discord replay during drain",
+                            exc_info=True,
+                        )
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
                     session_key or "?",
@@ -37087,6 +37152,16 @@ class _GatewayRunnerCore(
                     # order, and (b) causes any mid-chain /queue to correctly
                     # route to overflow rather than jumping the queue.
                     pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                    if self._defer_promoted_replay_to_fresh_turn(
+                        event=pending_event,
+                        session_key=session_key,
+                        adapter=adapter,
+                    ):
+                        # Promotion must re-enter through the normal adapter
+                        # path so its generation fence, ledger acceptance,
+                        # runtime/worktree selection, and persistence happen
+                        # exactly once in a fresh semantic turn.
+                        pending_event = None
                     if (
                         pending_event is not None
                         and not await self._consume_promoted_replay_fence(
@@ -37169,6 +37244,18 @@ class _GatewayRunnerCore(
                             pass
 
                 if self._draining and (pending_event or pending):
+                    if pending_event is not None:
+                        try:
+                            pending_source = getattr(pending_event, "source", None) or source
+                            self._record_discord_work_for_drain(
+                                pending_event,
+                                self._session_key_for_source(pending_source),
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to persist queued Discord replay during drain",
+                                exc_info=True,
+                            )
                     logger.info(
                         "Discarding pending follow-up for session %s during gateway %s",
                         session_key or "?",
