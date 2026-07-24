@@ -80,6 +80,10 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# Final platform delivery outlives the runner's ``_running_agents`` entry by a
+# short interval.  Idle shutdown remains immediate; this grace applies only
+# while an adapter still owns a live per-session processing task.
+_SHUTDOWN_DELIVERY_GRACE_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
     {"local", "api_server", "webhook", "msgraph_webhook"}
@@ -4136,6 +4140,7 @@ class _GatewayRunnerCore(
     _busy_input_mode: str = "steer"
     _busy_text_mode: str = "steer"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    _shutdown_delivery_grace_seconds: float = _SHUTDOWN_DELIVERY_GRACE_SECS_DEFAULT
     _exit_code: Optional[int] = None
     _draining: bool = False
     _restart_requested: bool = False
@@ -6022,6 +6027,50 @@ class _GatewayRunnerCore(
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
+    def _registered_adapters_for_shutdown(self) -> list[BasePlatformAdapter]:
+        """Return every primary/profile adapter once for drain accounting."""
+
+        adapters: list[BasePlatformAdapter] = []
+        seen: set[int] = set()
+        registries = [getattr(self, "adapters", {})]
+        registries.extend(
+            profile_adapters
+            for profile_adapters in getattr(self, "_profile_adapters", {}).values()
+            if isinstance(profile_adapters, dict)
+        )
+        for registry in registries:
+            if not isinstance(registry, dict):
+                continue
+            for adapter in registry.values():
+                if adapter is None or id(adapter) in seen:
+                    continue
+                seen.add(id(adapter))
+                adapters.append(adapter)
+        return adapters
+
+    def _snapshot_adapter_processing_tasks(
+        self,
+    ) -> list[tuple[BasePlatformAdapter, str, asyncio.Task]]:
+        """Snapshot live adapter-owned message processing/delivery tasks."""
+
+        snapshot: list[tuple[BasePlatformAdapter, str, asyncio.Task]] = []
+        for adapter in self._registered_adapters_for_shutdown():
+            get_active = getattr(adapter, "active_processing_tasks", None)
+            if not callable(get_active):
+                continue
+            try:
+                active = get_active()
+            except Exception:
+                logger.debug(
+                    "Failed to inspect %s adapter processing tasks during shutdown",
+                    getattr(adapter, "name", type(adapter).__name__),
+                    exc_info=True,
+                )
+                continue
+            for session_key, task in active.items():
+                snapshot.append((adapter, session_key, task))
+        return snapshot
+
     @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
         """Return True when *running_agent* is currently driving subagents
@@ -7093,21 +7142,24 @@ class _GatewayRunnerCore(
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
         last_coding_worker_count = self._active_coding_worker_count()
+        last_adapter_count = len(self._snapshot_adapter_processing_tasks())
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_coding_worker_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count, last_coding_worker_count, last_adapter_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
             coding_worker_count = self._active_coding_worker_count()
+            adapter_count = len(self._snapshot_adapter_processing_tasks())
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
                 or coding_worker_count != last_coding_worker_count
+                or adapter_count != last_adapter_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
@@ -7115,6 +7167,7 @@ class _GatewayRunnerCore(
                 last_cron_count = cron_count
                 last_api_count = api_count
                 last_coding_worker_count = coding_worker_count
+                last_adapter_count = adapter_count
                 last_status_at = now
 
         if (
@@ -7122,32 +7175,54 @@ class _GatewayRunnerCore(
             and last_cron_count == 0
             and last_api_count == 0
             and last_coding_worker_count == 0
+            and last_adapter_count == 0
         ):
             _maybe_update_status(force=True)
             return snapshot, False
 
         _maybe_update_status(force=True)
-        if timeout <= 0:
-            return snapshot, True
+        loop = asyncio.get_running_loop()
+        primary_deadline = loop.time() + max(float(timeout), 0.0)
+        delivery_deadline: Optional[float] = None
+        timed_out = False
 
-        deadline = asyncio.get_running_loop().time() + timeout
-        while (
-            (
+        while True:
+            non_delivery_active = bool(
                 self._running_agents
                 or self._active_cron_job_count()
                 or self._active_api_run_count()
                 or self._active_coding_worker_count()
             )
-            and asyncio.get_running_loop().time() < deadline
-        ):
+            adapter_count = len(self._snapshot_adapter_processing_tasks())
+            if not non_delivery_active and adapter_count == 0:
+                break
+
+            now = loop.time()
+            if non_delivery_active:
+                if now >= primary_deadline:
+                    timed_out = True
+                    break
+                current_deadline = primary_deadline
+            else:
+                if delivery_deadline is None:
+                    try:
+                        grace = max(float(self._shutdown_delivery_grace_seconds), 0.0)
+                    except (TypeError, ValueError):
+                        grace = _SHUTDOWN_DELIVERY_GRACE_SECS_DEFAULT
+                    delivery_deadline = now + grace
+                    logger.info(
+                        "Gateway model work drained; waiting up to %.1fs for %d "
+                        "adapter delivery task(s)",
+                        grace,
+                        adapter_count,
+                    )
+                if now >= delivery_deadline:
+                    timed_out = True
+                    break
+                current_deadline = delivery_deadline
+
             _maybe_update_status()
-            await asyncio.sleep(0.1)
-        timed_out = (
-            bool(self._running_agents)
-            or bool(self._active_cron_job_count())
-            or bool(self._active_api_run_count())
-            or bool(self._active_coding_worker_count())
-        )
+            await asyncio.sleep(min(0.1, max(current_deadline - now, 0.0)))
         _maybe_update_status(force=True)
         return snapshot, timed_out
 
@@ -14860,11 +14935,14 @@ class _GatewayRunnerCore(
             _api_at_start = self._active_api_run_count()
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
+            _adapter_processing_at_timeout = (
+                self._snapshot_adapter_processing_tasks() if timed_out else []
+            )
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, adapter_now=%d)",
                 _phase_elapsed(),
                 time.monotonic() - _drain_started_at,
                 timed_out,
@@ -14874,17 +14952,28 @@ class _GatewayRunnerCore(
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                len(_adapter_processing_at_timeout),
             )
 
             if timed_out:
+                try:
+                    _delivery_grace = max(
+                        float(self._shutdown_delivery_grace_seconds), 0.0
+                    )
+                except (TypeError, ValueError):
+                    _delivery_grace = _SHUTDOWN_DELIVERY_GRACE_SECS_DEFAULT
                 logger.warning(
-                    "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "Gateway drain timed out (agent budget %.1fs, delivery grace %.1fs) "
+                    "with %d active agent(s), "
+                    "%d in-flight cron job(s), %d api_server run(s), and %d "
+                    "adapter delivery task(s); "
                     "interrupting remaining work.",
                     timeout,
+                    _delivery_grace,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    len(_adapter_processing_at_timeout),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -14927,6 +15016,40 @@ class _GatewayRunnerCore(
                     _marked_resume,
                     "restart" if self._restart_requested else "shutdown",
                 )
+
+                # A model turn can finish and clear ``_running_agents`` before
+                # BasePlatformAdapter resumes from its handler await to record
+                # the final delivery obligation.  Those adapter-only tasks are
+                # not agent interruptions, but aborting them would still lose a
+                # generated response.  Arm cancellation-time resume persistence
+                # on every primary/profile adapter before requesting cancel.
+                _adapter_only_sessions: dict[BasePlatformAdapter, set[str]] = {}
+                _running_session_keys = set(self._running_agents)
+                for _adapter, _session_key, _task in _adapter_processing_at_timeout:
+                    if _session_key in _running_session_keys:
+                        continue
+                    _adapter_only_sessions.setdefault(_adapter, set()).add(_session_key)
+                _adapter_cancelled = 0
+                for _adapter, _session_keys in _adapter_only_sessions.items():
+                    try:
+                        if getattr(_adapter, "_session_store", None) is None:
+                            _adapter.set_session_store(self.session_store)
+                        _cancelled_sessions = _adapter.cancel_processing_sessions_for_shutdown(
+                            _session_keys,
+                            reason=_resume_reason,
+                        )
+                        _adapter_cancelled += len(_cancelled_sessions)
+                    except Exception as _e:
+                        logger.warning(
+                            "Failed to arm adapter delivery recovery for %s: %s",
+                            getattr(_adapter, "name", type(_adapter).__name__),
+                            _e,
+                        )
+                if _adapter_cancelled:
+                    logger.info(
+                        "Cancelled %d adapter delivery task(s) with resume-pending recovery armed",
+                        _adapter_cancelled,
+                    )
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
