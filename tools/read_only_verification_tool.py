@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import resource
 import shlex
@@ -35,6 +36,24 @@ _cgroup_limiter_probe: bool | None = None
 _PACKAGE_JSON_LIMIT = 1_000_000
 _PNPM_PACKAGE_MANAGER_RE = re.compile(
     r"^pnpm@(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+\S+)?$"
+)
+_JAVASCRIPT_LOCK_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock")
+_WRITABLE_NODE_CACHE_DIRS = (".vite", ".vite-temp")
+_SANDBOX_RESERVED_MOUNT_PREFIXES = tuple(
+    Path(value)
+    for value in (
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/sbin",
+        "/etc",
+        "/proc",
+        "/dev",
+        "/run",
+        "/opt",
+        "/var",
+    )
 )
 _VERIFICATION_ENV_ALLOWLIST = frozenset(
     {
@@ -315,7 +334,16 @@ def _resolved_verification_argv(
     if base == "pnpm":
         if not has_pnpm_runtime:
             raise RuntimeError("a prepared offline pnpm runtime is unavailable")
-        return ["/usr/bin/node", "/opt/hermes-pnpm/bin/pnpm.cjs", *resolved[1:]]
+        tail = resolved[1:]
+        script_index = 1 if tail[:1] == ["run"] else 0
+        separator_index = script_index + 1
+        if (
+            len(tail) > separator_index + 1
+            and tail[separator_index] == "--"
+            and all(not value.startswith("-") for value in tail[separator_index + 1 :])
+        ):
+            tail = tail[:separator_index] + tail[separator_index + 1 :]
+        return ["/usr/bin/node", "/opt/hermes-pnpm/bin/pnpm.cjs", *tail]
     if "/" not in resolved[0]:
         executable = shutil.which(resolved[0])
         if executable:
@@ -403,6 +431,7 @@ def _pnpm_package_manager_pin(
 def _prepared_dependency_roots(
     source_root: Path,
     *,
+    source_cwd: Path | None = None,
     pnpm_runtime: Path | None = None,
 ) -> dict[str, Path]:
     """Locate trusted prepared dependencies for a linked worktree snapshot."""
@@ -444,31 +473,86 @@ def _prepared_dependency_roots(
                     roots["python_runtime"] = python_binary.parent.parent
             break
 
-    hermes_source = Path(__file__).resolve().parents[1]
-    hermes_common = _git(
-        hermes_source,
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-        timeout=10,
+    node_modules = _prepared_node_modules(
+        source_root,
+        source_cwd or source_root,
+        primary_root,
     )
-    hermes_primary = hermes_source
-    if hermes_common.returncode == 0:
-        common_dir = Path(hermes_common.stdout.decode(errors="replace").strip()).resolve()
-        if common_dir.name == ".git":
-            hermes_primary = common_dir.parent
-
-    for relative, key in ((Path("node_modules"), "node_modules"), (Path("ui-tui/node_modules"), "ui_node_modules")):
-        for root in dict.fromkeys(
-            (*repository_roots, hermes_primary, hermes_source)
-        ):
-            candidate = root / relative
-            if candidate.is_dir():
-                roots[key] = candidate.resolve()
-                break
+    if node_modules is not None:
+        modules_path, modules_relative = node_modules
+        roots["node_modules"] = modules_path
+        roots["node_modules_relative"] = modules_relative
     if pnpm_runtime is not None:
         roots["pnpm_runtime"] = pnpm_runtime.resolve()
     return roots
+
+
+def _nearest_ancestor_with_file(
+    start: Path,
+    stop: Path,
+    names: tuple[str, ...],
+) -> tuple[Path | None, str | None]:
+    current = start
+    while True:
+        for name in names:
+            if (current / name).is_file():
+                return current, name
+        if current == stop or current.parent == current:
+            return None, None
+        current = current.parent
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.read_bytes() == right.read_bytes()
+    except OSError:
+        return False
+
+
+def _prepared_node_modules(
+    source_root: Path,
+    source_cwd: Path,
+    primary_root: Path,
+) -> tuple[Path, Path] | None:
+    """Find dependencies for the actual verification package/lock context."""
+
+    package_root, _ = _nearest_ancestor_with_file(
+        source_cwd,
+        source_root,
+        ("package.json",),
+    )
+    if package_root is None:
+        return None
+    lock_root, lock_name = _nearest_ancestor_with_file(
+        package_root,
+        source_root,
+        _JAVASCRIPT_LOCK_NAMES,
+    )
+
+    context_roots = [package_root]
+    if lock_root is not None and lock_root != package_root:
+        context_roots.append(lock_root)
+
+    candidates: list[tuple[Path, Path]] = []
+    for context_root in context_roots:
+        relative = context_root.relative_to(source_root)
+        candidates.append((context_root, relative))
+        if primary_root != source_root:
+            primary_context = primary_root / relative
+            if lock_root is not None and lock_name is not None:
+                primary_lock_root = primary_root / lock_root.relative_to(source_root)
+                if not _same_file(
+                    lock_root / lock_name,
+                    primary_lock_root / lock_name,
+                ):
+                    continue
+            candidates.append((primary_context, relative))
+
+    for context_root, relative in candidates:
+        modules = context_root / "node_modules"
+        if modules.is_dir():
+            return modules.resolve(), relative / "node_modules"
+    return None
 
 
 def _verification_environment() -> dict[str, str]:
@@ -531,6 +615,124 @@ def _sandbox_parent_dirs(path: Path) -> list[str]:
     args: list[str] = []
     for parent in reversed(parents):
         args.extend(["--dir", parent])
+    return args
+
+
+def _iter_pnpm_package_links(node_modules: Path):
+    """Yield bounded top-level/scoped package symlinks without entering .pnpm."""
+
+    yielded = 0
+    try:
+        entries = tuple(node_modules.iterdir())
+    except OSError:
+        return
+    for entry in entries[:4096]:
+        if entry.is_symlink():
+            yield entry
+            yielded += 1
+        elif entry.name.startswith("@") and entry.is_dir():
+            try:
+                scoped = tuple(entry.iterdir())
+            except OSError:
+                continue
+            for package in scoped[:4096 - yielded]:
+                if package.is_symlink():
+                    yield package
+                    yielded += 1
+        if yielded >= 4096:
+            return
+
+
+def _pnpm_store_aliases(
+    node_modules: Path,
+    sandbox_node_modules: Path,
+) -> tuple[Path, ...]:
+    """Find sandbox aliases needed by relocated pnpm package symlinks."""
+
+    store = (node_modules / ".pnpm").resolve(strict=False)
+    if not store.is_dir():
+        return ()
+    aliases: list[Path] = []
+    for link in _iter_pnpm_package_links(node_modules):
+        try:
+            suffix = link.resolve(strict=False).relative_to(store)
+            raw_target = Path(os.readlink(link))
+        except (OSError, ValueError):
+            continue
+        sandbox_link = sandbox_node_modules / link.relative_to(node_modules)
+        if raw_target.is_absolute():
+            sandbox_target = raw_target
+        else:
+            sandbox_target = Path(
+                posixpath.normpath(str(sandbox_link.parent / raw_target))
+            )
+        alias = sandbox_target
+        for _part in suffix.parts:
+            alias = alias.parent
+        if not alias.is_absolute() or alias == Path("/"):
+            continue
+        try:
+            alias.relative_to(sandbox_node_modules)
+        except ValueError:
+            pass
+        else:
+            continue
+        if any(
+            alias == path or path in alias.parents
+            for path in _SANDBOX_RESERVED_MOUNT_PREFIXES
+        ):
+            continue
+        if alias not in aliases:
+            aliases.append(alias)
+        if len(aliases) >= 16:
+            break
+    return tuple(aliases)
+
+
+def _node_modules_sandbox_args(
+    node_modules: Path,
+    relative: Path,
+    temp_root: Path,
+) -> list[str]:
+    """Mount dependencies read-only with only standard Vite caches writable."""
+
+    destination = Path("/tmp/workspace") / relative
+    overlay_root = temp_root / "node-modules-overlay"
+    skeleton = overlay_root / "skeleton"
+    caches = overlay_root / "caches"
+    skeleton.mkdir(parents=True, exist_ok=True)
+    caches.mkdir(parents=True, exist_ok=True)
+    for name in _WRITABLE_NODE_CACHE_DIRS:
+        (skeleton / name).mkdir()
+        (caches / name).mkdir()
+
+    args = [
+        "--dir",
+        str(destination),
+        "--overlay-src",
+        str(node_modules),
+        "--overlay-src",
+        str(skeleton),
+        "--ro-overlay",
+        str(destination),
+    ]
+    store = (node_modules / ".pnpm").resolve(strict=False)
+    if store.is_dir():
+        for alias in _pnpm_store_aliases(node_modules, destination):
+            args += [
+                *_sandbox_parent_dirs(alias),
+                "--dir",
+                str(alias),
+                "--ro-bind",
+                str(store),
+                str(alias),
+            ]
+    for name in _WRITABLE_NODE_CACHE_DIRS:
+        args += [
+            "--bind",
+            str(caches / name),
+            str(destination / name),
+        ]
     return args
 
 
@@ -677,14 +879,11 @@ def read_only_verify(
 
             dependencies = _prepared_dependency_roots(
                 source_root,
+                source_cwd=source_cwd,
                 pnpm_runtime=pnpm_runtime,
             )
             if "venv" in dependencies:
                 (snapshot_root / ".venv").mkdir(exist_ok=True)
-            if "node_modules" in dependencies:
-                (snapshot_root / "node_modules").mkdir(exist_ok=True)
-            if "ui_node_modules" in dependencies:
-                (snapshot_root / "ui-tui" / "node_modules").mkdir(parents=True, exist_ok=True)
             argv = _resolved_verification_argv(
                 argv,
                 has_venv="venv" in dependencies,
@@ -740,17 +939,11 @@ def read_only_verify(
                     str(runtime_root),
                 ]
             if "node_modules" in dependencies:
-                sandbox_argv += [
-                    "--ro-bind",
-                    str(dependencies["node_modules"]),
-                    "/tmp/workspace/node_modules",
-                ]
-            if "ui_node_modules" in dependencies:
-                sandbox_argv += [
-                    "--ro-bind",
-                    str(dependencies["ui_node_modules"]),
-                    "/tmp/workspace/ui-tui/node_modules",
-                ]
+                sandbox_argv += _node_modules_sandbox_args(
+                    dependencies["node_modules"],
+                    dependencies["node_modules_relative"],
+                    temp_root,
+                )
             if "pnpm_runtime" in dependencies:
                 sandbox_argv += [
                     "--dir",
@@ -770,6 +963,16 @@ def read_only_verify(
                 env=env,
                 timeout_value=timeout_value,
             )
+            dependency_labels = [
+                key
+                for key in dependencies
+                if key not in {"node_modules", "node_modules_relative"}
+            ]
+            if "node_modules" in dependencies:
+                dependency_labels.append(
+                    "node_modules:"
+                    + dependencies["node_modules_relative"].as_posix()
+                )
             return json.dumps(
                 {
                     "success": return_code == 0,
@@ -779,10 +982,12 @@ def read_only_verify(
                     "error": _bounded_output(stderr) or None,
                     "output_truncated": output_truncated,
                     "neutralized_symlinks": neutralized_symlinks[:100],
-                    "dependencies": sorted(dependencies),
+                    "dependencies": sorted(dependency_labels),
                     "sandbox": (
                         "temporary snapshot; only system runtime and prepared dependencies "
-                        "mounted read-only; host home/workspaces and network, PID, IPC, and "
+                        "mounted read-only, with disposable writable node_modules/.vite and "
+                        ".vite-temp caches when JavaScript dependencies are present; host "
+                        "home and non-dependency workspace paths plus network, PID, IPC, and "
                         "runtime sockets isolated; cgroup v2 aggregate limits: "
                         f"memory={_MEMORY_LIMIT_BYTES} bytes, swap={_MEMORY_SWAP_LIMIT_BYTES} "
                         f"bytes, tasks={_TASK_LIMIT}"

@@ -285,15 +285,17 @@ def _available_cached_pnpm_version() -> str | None:
     return None
 
 
-def test_prepared_dependencies_include_python_and_node_for_linked_worktree():
+def test_prepared_dependencies_include_python_and_exact_pnpm_runtime():
     root = Path(__file__).resolve().parents[2]
     version = _available_cached_pnpm_version()
     runtime = _prepared_pnpm_runtime(version) if version else None
-    dependencies = _prepared_dependency_roots(root, pnpm_runtime=runtime)
+    dependencies = _prepared_dependency_roots(
+        root,
+        source_cwd=root,
+        pnpm_runtime=runtime,
+    )
 
     assert (dependencies["venv"] / "bin" / "python").is_file()
-    assert dependencies["node_modules"].is_dir()
-    assert dependencies["ui_node_modules"].is_dir()
     if runtime is not None:
         assert dependencies["pnpm_runtime"] == runtime
 
@@ -325,6 +327,25 @@ def test_pnpm_runtime_selection_uses_exact_repo_pin_not_newest_cache(tmp_path, m
     assert manifest == repo / "package.json"
     assert version == "8.15.7"
     assert _prepared_pnpm_runtime(version) == (corepack / "pnpm" / version).resolve()
+
+
+def test_nested_package_without_dependencies_does_not_fall_back_to_hermes(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    dashboard = repo / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "package.json").write_text("{}\n", encoding="utf-8")
+    (dashboard / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n",
+        encoding="utf-8",
+    )
+
+    dependencies = _prepared_dependency_roots(
+        repo,
+        source_cwd=dashboard,
+    )
+
+    assert "node_modules" not in dependencies
 
 
 def test_read_only_verify_fails_before_sandbox_when_exact_pnpm_pin_is_absent(
@@ -389,40 +410,118 @@ def test_read_only_verify_runs_repository_test_wrapper(tmp_path):
     assert "1 passed" in payload["output"]
 
 
-def test_read_only_verify_runs_pnpm_test_with_read_only_node_modules(tmp_path):
+def test_read_only_verify_mounts_nested_dependencies_and_writable_vite_caches(tmp_path):
     pnpm_version = _available_cached_pnpm_version()
     if pnpm_version is None:
         pytest.skip("no complete Corepack pnpm runtime is cached")
     repo = tmp_path / "repo"
     _init_repo(repo)
-    (repo / "package.json").write_text(
+    dashboard = repo / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "package.json").write_text(
         json.dumps(
             {
                 "private": True,
                 "packageManager": f"pnpm@{pnpm_version}",
-                "scripts": {
-                    "test": "node -e \"console.log('offline-pnpm-ok')\""
-                },
+                "type": "module",
+                "scripts": {"test": "node verify-dependencies.mjs"},
             }
         ),
         encoding="utf-8",
     )
-    _git(repo, "add", "package.json")
-    _git(repo, "commit", "-m", "pnpm fixture")
+    (dashboard / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n",
+        encoding="utf-8",
+    )
+    (dashboard / "verify-dependencies.mjs").write_text(
+        "import assert from 'node:assert/strict';\n"
+        "import { mkdir, writeFile } from 'node:fs/promises';\n"
+        "import marker from 'nested-fixture-dependency';\n"
+        "assert.equal(marker, 'nested-module-resolved');\n"
+        "assert.equal(process.argv[2], 'fixture-selector');\n"
+        "for (const cache of ['.vite', '.vite-temp']) {\n"
+        "  const directory = new URL(`./node_modules/${cache}/`, import.meta.url);\n"
+        "  await mkdir(directory, { recursive: true });\n"
+        "  await writeFile(new URL('sandbox-cache.txt', directory), cache);\n"
+        "}\n"
+        "let dependencyWriteBlocked = false;\n"
+        "try {\n"
+        "  const mutation = new URL(\n"
+        "    './node_modules/nested-fixture-dependency/mutation.txt',\n"
+        "    import.meta.url,\n"
+        "  );\n"
+        "  await writeFile(mutation, 'blocked');\n"
+        "} catch (error) {\n"
+        "  dependencyWriteBlocked = ['EACCES', 'EPERM', 'EROFS'].includes(error.code);\n"
+        "}\n"
+        "assert.equal(dependencyWriteBlocked, true);\n"
+        "console.log('nested-dependency-and-vite-cache-ok');\n",
+        encoding="utf-8",
+    )
+    modules = dashboard / "node_modules"
+    package = (
+        modules
+        / ".pnpm"
+        / "nested-fixture-dependency@1.0.0"
+        / "node_modules"
+        / "nested-fixture-dependency"
+    )
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "nested-fixture-dependency",
+                "version": "1.0.0",
+                "type": "module",
+                "exports": "./index.mjs",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (package / "index.mjs").write_text(
+        "export default 'nested-module-resolved';\n",
+        encoding="utf-8",
+    )
+    (modules / "nested-fixture-dependency").symlink_to(
+        Path(".pnpm")
+        / "nested-fixture-dependency@1.0.0"
+        / "node_modules"
+        / "nested-fixture-dependency",
+        target_is_directory=True,
+    )
+    (modules / ".vite").mkdir()
+    (modules / ".vite" / "host-sentinel.txt").write_text(
+        "host dependency cache",
+        encoding="utf-8",
+    )
+    _git(
+        repo,
+        "add",
+        "dashboard/package.json",
+        "dashboard/pnpm-lock.yaml",
+        "dashboard/verify-dependencies.mjs",
+    )
+    _git(repo, "commit", "-m", "nested pnpm fixture")
 
     payload = json.loads(
         read_only_verify(
-            command="pnpm test",
-            workdir=str(repo),
+            command="pnpm test -- fixture-selector",
+            workdir=str(dashboard),
             timeout=90,
             runtime_mode="read_only",
         )
     )
 
     assert payload["success"] is True, payload
-    assert "node_modules" in payload["dependencies"]
+    assert "node_modules:dashboard/node_modules" in payload["dependencies"]
     assert "pnpm_runtime" in payload["dependencies"]
-    assert "offline-pnpm-ok" in payload["output"]
+    assert "nested-dependency-and-vite-cache-ok" in payload["output"]
+    assert not (modules / ".vite-temp").exists()
+    assert not (modules / ".vite" / "sandbox-cache.txt").exists()
+    assert (modules / ".vite" / "host-sentinel.txt").read_text(encoding="utf-8") == (
+        "host dependency cache"
+    )
+    assert not (package / "mutation.txt").exists()
 
 
 def test_read_only_verify_bounds_output(tmp_path):
