@@ -2018,8 +2018,6 @@ class GatewayWorkLedger:
             "discord_action_request_base_channel_prompt",
             None,
         )
-        if base_channel_prompt is not None:
-            channel_prompt = base_channel_prompt
         item = {
             "id": work_id,
             "status": status,
@@ -2035,6 +2033,11 @@ class GatewayWorkLedger:
             "reply_to_message_id": getattr(event, "reply_to_message_id", None),
             "reply_to_text": getattr(event, "reply_to_text", None),
             "channel_prompt": channel_prompt,
+            # Keep the effective read-only prompt for restart recovery and the
+            # unmodified operator/channel prompt for a later action promotion.
+            # Older rows stored only the base prompt in ``channel_prompt``;
+            # event_from_item() treats that value as the compatibility fallback.
+            "discord_action_request_base_channel_prompt": base_channel_prompt,
             "channel_context": getattr(event, "channel_context", None),
             "goal_thread_context": getattr(event, "goal_thread_context", None),
             "discord_runtime_mode": str(
@@ -5332,6 +5335,10 @@ class GatewayWorkLedger:
             if "participates_in_work_lifecycle" in item
             else True
         )
+        base_channel_prompt = item.get(
+            "discord_action_request_base_channel_prompt",
+            item.get("channel_prompt"),
+        )
         event = MessageEvent(
             text=str(item.get("text") or ""),
             message_type=msg_type,
@@ -5340,6 +5347,7 @@ class GatewayWorkLedger:
             reply_to_message_id=item.get("reply_to_message_id"),
             reply_to_text=item.get("reply_to_text"),
             channel_prompt=item.get("channel_prompt"),
+            discord_action_request_base_channel_prompt=base_channel_prompt,
             feature_summary=item.get("feature_summary"),
             project_summary=item.get("project_summary"),
             channel_context=item.get("channel_context"),

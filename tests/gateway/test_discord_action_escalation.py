@@ -146,6 +146,61 @@ def test_promotion_queued_during_restart_is_durable_action_work(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_restart_recovered_read_only_escalation_restores_base_channel_prompt(
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = _source()
+    event = MessageEvent(
+        text="Please implement the recommended change",
+        source=source,
+        message_id="message-1",
+        discord_runtime_mode="read_only",
+        discord_runtime_reason="classified_read_only",
+        discord_action_escalation_allowed=True,
+        channel_prompt="Project instructions\n\nRead-only runtime overlay",
+        discord_action_request_base_channel_prompt="Project instructions",
+        feature_summary={
+            "thread_id": "thread-1",
+            "message_id": "feature-summary",
+            "initial_request": "Earlier task",
+        },
+    )
+    item = ledger.accept_event(
+        event,
+        session_key="discord:thread-1",
+        freshness_seconds=60,
+        drain_recovery=True,
+    )
+    replay = ledger.event_from_item(ledger.get(item["id"]))
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread = SimpleNamespace(
+        id="thread-1",
+        parent=SimpleNamespace(id="parent-1"),
+        guild=SimpleNamespace(id="guild-1"),
+    )
+    adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
+    adapter._load_feature_summary_handle_for_request = MagicMock(
+        return_value=replay.feature_summary
+    )
+    adapter._resolve_project_context_for_channel = MagicMock(return_value=None)
+    adapter._threads.mark = MagicMock()
+    adapter._mark_discord_thread_participation = MagicMock()
+
+    promoted, _url = await adapter.promote_event_to_action_request(
+        replay,
+        initial_request=replay.text,
+    )
+
+    assert replay.channel_prompt.endswith("Read-only runtime overlay")
+    assert replay.discord_action_request_base_channel_prompt == "Project instructions"
+    assert promoted is not None
+    assert promoted.discord_runtime_mode == "action"
+    assert promoted.channel_prompt == "Project instructions"
+
+
+@pytest.mark.asyncio
 async def test_new_promotion_thread_preseeds_starter_dedup():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     parent = SimpleNamespace(id=123, name="planning")

@@ -151,12 +151,13 @@ def test_ledger_deduplicates_discord_message_ids(tmp_path):
     assert len(ledger.incomplete_items()) == 1
 
 
-def test_ledger_persists_only_base_prompt_for_direct_question(tmp_path):
+def test_ledger_persists_effective_and_base_prompts_for_read_only_recovery(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="intent-message")
-    event.discord_action_request_intent = False
+    event.discord_runtime_mode = "read_only"
+    event.discord_action_escalation_allowed = True
     event.discord_action_request_base_channel_prompt = "Project instructions"
-    event.channel_prompt = "Project instructions\n\nDirect question overlay"
+    event.channel_prompt = "Project instructions\n\nRead-only runtime overlay"
 
     item = ledger.accept_event(
         event,
@@ -166,14 +167,30 @@ def test_ledger_persists_only_base_prompt_for_direct_question(tmp_path):
 
     assert item is not None
     stored = ledger.get(item["id"])
-    assert stored["channel_prompt"] == "Project instructions"
+    assert stored["channel_prompt"] == "Project instructions\n\nRead-only runtime overlay"
     assert "discord_action_request_intent" not in stored
-    assert "discord_action_request_base_channel_prompt" not in stored
+    assert stored["discord_action_request_base_channel_prompt"] == "Project instructions"
     replay = ledger.event_from_item(stored)
-    assert replay.discord_runtime_mode == "action"
+    assert replay.discord_runtime_mode == "read_only"
     assert replay.discord_action_request_intent is None
-    assert replay.discord_action_request_base_channel_prompt is None
-    assert replay.channel_prompt == "Project instructions"
+    assert replay.discord_action_request_base_channel_prompt == "Project instructions"
+    assert replay.channel_prompt == "Project instructions\n\nRead-only runtime overlay"
+
+
+def test_legacy_ledger_prompt_is_base_prompt_compatibility_fallback(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="legacy-prompt")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    stored = ledger.get(item["id"])
+    stored.pop("discord_action_request_base_channel_prompt", None)
+
+    replay = ledger.event_from_item(stored)
+
+    assert replay.discord_action_request_base_channel_prompt == stored["channel_prompt"]
 
 
 def test_legacy_ledger_item_replays_with_none_action_intent(tmp_path):
