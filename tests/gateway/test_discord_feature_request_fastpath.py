@@ -293,7 +293,7 @@ async def test_invalid_routine_tier_preserves_legacy_action_fallback(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_existing_action_thread_direct_question_uses_ordinary_runtime(monkeypatch):
+async def test_existing_action_thread_direct_question_uses_discord_action_tier_without_action_semantics(monkeypatch):
     _patch_agent_runtime(monkeypatch)
     runner = _make_runner()
     feature_summary = {
@@ -313,10 +313,10 @@ async def test_existing_action_thread_direct_question_uses_ordinary_runtime(monk
         channel_prompt="Answer this current direct question in place.",
     )
 
-    assert result["reasoning_effort"] == "high"
+    assert result["reasoning_effort"] == "low"
     init = _CapturingAgent.last_init
-    assert init["model"] == "gpt-5.6-terra"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert init["model"] == "gpt-5.6-sol"
+    assert init["reasoning_config"] == {"enabled": True, "effort": "low"}
     assert "tool_delay" not in init
     assert "verify_on_stop" not in init
     assert init["runtime_mode"] == "read_only"
@@ -324,10 +324,60 @@ async def test_existing_action_thread_direct_question_uses_ordinary_runtime(monk
     assert "Discord action-request thread guidance" not in init["ephemeral_system_prompt"]
     assert "Answer this current direct question in place." in init["ephemeral_system_prompt"]
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
-    assert audit["model_tier"] == ""
-    assert audit["model_tier_source"] == "model_override"
-    assert audit["runtime_route"] == "gateway"
+    assert audit["model_tier"] == "discord_action"
+    assert audit["model_tier_source"] == "route"
+    assert audit["runtime_route"] == "discord_read_only"
+    assert audit["reasoning_source"] == "model_tier"
     assert feature_summary["initial_request"] == "Build bounded Federal Register evidence ingestion"
+
+
+@pytest.mark.asyncio
+async def test_bare_discord_read_only_turn_uses_discord_action_tier(monkeypatch):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+    captured_cache_keys = []
+
+    def capture_signature(
+        model,
+        runtime,
+        enabled_toolsets,
+        ephemeral_prompt,
+        cache_keys=None,
+        user_id=None,
+        user_id_alt=None,
+    ):
+        captured_cache_keys.append(dict(cache_keys or {}))
+        return "captured-read-only-signature"
+
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_agent_config_signature",
+        staticmethod(capture_signature),
+    )
+
+    result = await _run_discord_agent(
+        runner,
+        None,
+        intent=False,
+        message="What is the current deployment status?",
+        escalation_allowed=False,
+    )
+
+    assert result["reasoning_effort"] == "low"
+    init = _CapturingAgent.last_init
+    assert init["model"] == "gpt-5.6-sol"
+    assert init["reasoning_config"] == {"enabled": True, "effort": "low"}
+    assert init["runtime_mode"] == "read_only"
+    assert "tool_delay" not in init
+    assert "verify_on_stop" not in init
+    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
+    assert audit["model_tier"] == "discord_action"
+    assert audit["model_tier_source"] == "route"
+    assert audit["runtime_route"] == "discord_read_only"
+    assert captured_cache_keys[0]["gateway.discord_action_model_route"] is True
+    assert captured_cache_keys[0]["gateway.discord_action_model_tier"] == "discord_action"
+    assert captured_cache_keys[0]["gateway.discord_action_request_fast_path"] is False
+    assert captured_cache_keys[0]["gateway.discord_feature_request_fast_path"] is False
 
 
 @pytest.mark.asyncio

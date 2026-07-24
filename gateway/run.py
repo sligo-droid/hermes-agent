@@ -29307,6 +29307,16 @@ class _GatewayRunnerCore(
             standard_discord_action_thread
             and turn_runtime_mode is RuntimeMode.ACTION
         )
+        # READ_ONLY Discord turns use the same route tier as action requests so
+        # observation does not pay the ordinary gateway tier's Luna/xhigh
+        # latency/cost.  Keep this separate from ``discord_action_runtime``:
+        # the latter is the authority for mutable worktree/lifecycle behavior,
+        # fast-path prompts, zero tool delay, and verification-on-stop.
+        discord_read_only_runtime = (
+            source.platform == _GATEWAY_PLATFORM.DISCORD
+            and turn_runtime_mode is RuntimeMode.READ_ONLY
+        )
+        discord_action_model_route = discord_action_runtime or discord_read_only_runtime
         fable_mode = str(
             (fable_plan_metadata or {}).get("fable_mode", "")
             if isinstance(fable_plan_metadata, dict)
@@ -30186,7 +30196,7 @@ class _GatewayRunnerCore(
 
             try:
                 action_request_tier = None
-                if discord_action_runtime:
+                if discord_action_model_route:
                     action_request_tier = _discord_action_request_model_tier(
                         user_config,
                         feature_summary,
@@ -30222,7 +30232,7 @@ class _GatewayRunnerCore(
 
                     resolved_fable_reasoning = resolve_fable_reasoning_config(user_config)
                 reasoning_config = dict(resolved_fable_reasoning)
-            elif discord_action_runtime:
+            elif discord_action_model_route:
                 reasoning_config = _discord_action_request_reasoning_config(
                     user_config,
                     action_request_tier,
@@ -30381,6 +30391,12 @@ class _GatewayRunnerCore(
                     "gateway.runtime_mode": turn_runtime_mode.value,
                     "gateway.discord_action_request_fast_path": discord_action_runtime,
                     "gateway.discord_feature_request_fast_path": discord_action_runtime,
+                    "gateway.discord_action_model_route": discord_action_model_route,
+                    "gateway.discord_action_model_tier": (
+                        action_request_tier.name
+                        if action_request_tier is not None
+                        else None
+                    ),
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
                     "gateway.fable_oauth_tool_name_compat": fable_oauth_tool_name_compat,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
@@ -30571,6 +30587,9 @@ class _GatewayRunnerCore(
             elif discord_action_runtime:
                 runtime_route = "discord_action_request"
                 active_tier = action_request_tier
+            elif discord_read_only_runtime:
+                runtime_route = "discord_read_only"
+                active_tier = action_request_tier
             else:
                 active_tier = _gateway_model_tier(user_config)
             _set_gateway_runtime_audit(
@@ -30583,9 +30602,9 @@ class _GatewayRunnerCore(
                     "fable"
                     if fable_plan_metadata
                     else "model_tier"
-                    if discord_action_runtime and active_tier is not None
+                    if discord_action_model_route and active_tier is not None
                     else "discord_config"
-                    if discord_action_runtime and reasoning_config is not None
+                    if discord_action_model_route and reasoning_config is not None
                     else "session_override"
                     if session_reasoning_override
                     else "model_tier"
