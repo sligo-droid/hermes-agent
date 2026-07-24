@@ -79,10 +79,12 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
     reasoning profile for consistent observation quality and latency. This is a
     model-route choice only: `discord_action_runtime` remains the separate
     authority for mutable worktrees, action prompts, zero tool delay,
-    verification-on-stop, and action lifecycle behavior. Read-only delegation
-    may explicitly select a bounded exploratory tier such as `trivial`
-    (Luna/medium) or `basic` (Luna/xhigh); omitted tiers inherit the route-tier
-    parent (Sol/low by default) while preserving read-only enforcement.
+    verification-on-stop, and action lifecycle behavior. Read-only orchestration
+    should usually handle small, tightly coupled observations directly to retain
+    context and reduce latency, but may delegate whenever parallelism, independent
+    verification, context isolation, or deeper reasoning adds value. Any configured
+    delegation tier remains available; omitted tiers inherit the route-tier parent
+    (Sol/low by default) while preserving read-only enforcement.
 
 ## Consequences
 
