@@ -311,6 +311,27 @@ class TestExtractCacheBustingConfig:
 
         assert out["tools.registry_generation"] == 12345
 
+    def test_project_observation_registry_busts_cached_agent(self):
+        from gateway.run import GatewayRunner
+
+        before = GatewayRunner._extract_cache_busting_config(
+            {"project_observations": {}}
+        )
+        after = GatewayRunner._extract_cache_busting_config(
+            {
+                "project_observations": {
+                    "pid-runtime-status": {
+                        "cwd": "/srv/pid",
+                        "argv": ["python3", "scripts/runtime_status.py"],
+                    }
+                }
+            }
+        )
+
+        assert before["project_observations"] == {}
+        assert "pid-runtime-status" in after["project_observations"]
+        assert before != after
+
 
     def test_skips_honcho_config_read_when_provider_is_not_honcho(self, monkeypatch):
         """Non-Honcho gateways must not read/parse honcho.json on every message."""

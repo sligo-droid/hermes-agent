@@ -271,7 +271,7 @@ class TestResolveToolsetIncludeRegistry:
         # not part of the static definition — it must only appear in the merged view.
         assert "read_terminal" in merged
         assert "read_terminal" not in static
-        assert {"read_only_verify", "git_inspect"} <= merged
+        assert {"read_only_verify", "git_inspect", "project_observe"} <= merged
 
     def test_get_toolset_include_registry_false_is_static(self):
         ts = get_toolset("delegation", include_registry=False)

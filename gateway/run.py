@@ -27727,6 +27727,13 @@ class _GatewayRunnerCore(
                 out[f"{section}.{key}"] = section_val.get(key)
             else:
                 out[f"{section}.{key}"] = None
+        # project_observe schemas freeze configured names/options into the
+        # AIAgent tool list. Include the whole small registry so config edits
+        # rebuild cached gateway agents on their next turn without a restart.
+        project_observations = cfg.get("project_observations")
+        out["project_observations"] = (
+            project_observations if isinstance(project_observations, dict) else None
+        )
         try:
             from tools.registry import registry
 

@@ -1014,6 +1014,9 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Operator-owned fixed commands exposed through the read-only
+    # project_observe tool. Empty by default; see the configuration guide.
+    "project_observations": {},
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).
