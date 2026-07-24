@@ -9700,11 +9700,11 @@ class _GatewayRunnerCore(
         await self._send_durable_coding_worker_recovery_notices(
             recovered_required.get("notices") or []
         )
-        self._start_owned_runner(
-            "durable-coding-worker-recovery",
-            self._durable_coding_worker_reconciler,
-            restart_on_exit=True,
-        )
+        if self._durable_coding_worker_recovery_needs_retry(recovered_required):
+            self._start_owned_runner(
+                "durable-coding-worker-recovery",
+                self._durable_coding_worker_reconciler,
+            )
         self._start_owned_runner(
             "required-async-reconciler",
             self._required_async_reconciler,
@@ -11240,6 +11240,17 @@ class _GatewayRunnerCore(
             event.set()
         return report
 
+    @staticmethod
+    def _durable_coding_worker_recovery_needs_retry(report: Any) -> bool:
+        """Return whether startup recovery has deferred work to revisit."""
+
+        if not isinstance(report, dict):
+            return True
+        return any(
+            int(report.get(key) or 0) > 0
+            for key in ("waiting_alive", "deferred", "failed")
+        )
+
     async def _send_durable_coding_worker_recovery_notices(
         self,
         notices: Any,
@@ -11313,6 +11324,7 @@ class _GatewayRunnerCore(
         """Retry deferred alive/capacity recovery without replaying the parent."""
 
         while self._running:
+            await asyncio.sleep(max(0.25, interval))
             try:
                 report = await asyncio.to_thread(self._recover_durable_coding_workers)
                 await self._send_durable_coding_worker_recovery_notices(
@@ -11322,7 +11334,9 @@ class _GatewayRunnerCore(
                 raise
             except Exception:
                 logger.exception("Durable coding-worker reconciliation failed")
-            await asyncio.sleep(max(0.25, interval))
+                continue
+            if not self._durable_coding_worker_recovery_needs_retry(report):
+                return
 
     async def _required_async_reconciler(
         self,

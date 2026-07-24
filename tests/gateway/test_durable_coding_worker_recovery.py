@@ -720,7 +720,12 @@ async def test_periodic_reconciler_sends_late_recovery_notices():
 
     def recover():
         runner._running = False
-        return {"notices": [{"delegation_id": "deleg-late"}]}
+        return {
+            "notices": [{"delegation_id": "deleg-late"}],
+            "waiting_alive": 0,
+            "deferred": 0,
+            "failed": 0,
+        }
 
     runner._recover_durable_coding_workers = recover
 
@@ -733,6 +738,16 @@ async def test_periodic_reconciler_sends_late_recovery_notices():
     await runner._durable_coding_worker_reconciler(interval=0.01)
 
     assert sent == [{"delegation_id": "deleg-late"}]
+
+
+def test_recovery_retry_is_only_needed_for_deferred_or_failed_work():
+    needs_retry = GatewayRunner._durable_coding_worker_recovery_needs_retry
+
+    assert needs_retry({"launched": 2, "waiting_alive": 0, "deferred": 0, "failed": 0}) is False
+    assert needs_retry({"waiting_alive": 1}) is True
+    assert needs_retry({"deferred": 1}) is True
+    assert needs_retry({"failed": 1}) is True
+    assert needs_retry(None) is True
 
 
 def test_stale_owner_terminal_result_cannot_overwrite_recovery_claim(tmp_path):
