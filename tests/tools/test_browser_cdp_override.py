@@ -187,6 +187,98 @@ class TestGetCdpOverride:
         with patch("hermes_cli.config.read_raw_config", return_value={}):
             assert bc.is_camofox_mode() is False
 
+class TestLocalSessionCdpDiscovery:
+    def test_local_sidecar_starts_supervisor_when_session_is_created(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        started = []
+        monkeypatch.setattr(browser_tool, "_active_sessions", {})
+        monkeypatch.setattr(browser_tool, "_session_last_activity", {})
+        monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_tool, "_update_session_activity", lambda _task_id: None)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(
+            browser_tool,
+            "_ensure_cdp_supervisor",
+            lambda task_id: started.append(task_id),
+        )
+
+        session = browser_tool._get_session_info("task-local::local")
+
+        assert session["features"] == {"local": True}
+        assert started == ["task-local::local"]
+
+    def test_starts_supervisor_from_local_agent_browser_endpoint(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        session = {
+            "session_name": "local-session",
+            "cdp_url": None,
+            "features": {"local": True},
+        }
+        starts = []
+        browser_calls = []
+
+        monkeypatch.setattr(browser_tool, "_active_sessions", {"task-local": session})
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(browser_tool, "_get_dialog_policy_config", lambda: ("auto_dismiss", 30.0))
+        monkeypatch.setattr(
+            browser_tool,
+            "_run_browser_command",
+            lambda task_id, command, args, **kwargs: (
+                browser_calls.append((task_id, command, args, kwargs))
+                or {"success": True, "data": {"cdpUrl": WS_URL}}
+            ),
+        )
+        monkeypatch.setattr(
+            SUPERVISOR_REGISTRY,
+            "get_or_start",
+            lambda **kwargs: starts.append(kwargs),
+        )
+
+        browser_tool._ensure_cdp_supervisor("task-local")
+
+        assert browser_calls == [("task-local", "get", ["cdp-url"], {"timeout": 10})]
+        assert starts == [
+            {
+                "task_id": "task-local",
+                "cdp_url": WS_URL,
+                "dialog_policy": "auto_dismiss",
+                "dialog_timeout_s": 30.0,
+            }
+        ]
+        assert session["cdp_url"] is None
+        assert session["supervisor_cdp_url"] == WS_URL
+
+    def test_local_discovery_is_not_attempted_for_nonlocal_sessions(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {"task-cloud": {"session_name": "cloud-session", "features": {"cloud": True}}},
+        )
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(
+            browser_tool,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("local CDP discovery must not run for cloud sessions")
+            ),
+        )
+        monkeypatch.setattr(
+            SUPERVISOR_REGISTRY,
+            "get_or_start",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("supervisor must not start without a CDP endpoint")
+            ),
+        )
+
+        browser_tool._ensure_cdp_supervisor("task-cloud")
+
+
 class TestCreateCdpSession:
     """_create_cdp_session() must sanitize the CDP URL before logging.
 
