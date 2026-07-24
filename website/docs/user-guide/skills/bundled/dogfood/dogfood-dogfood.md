@@ -178,4 +178,4 @@ Save the report to `{output_dir}/report.md`.
 - **Test navigation flows** — click through multi-step processes end-to-end.
 - **Check responsive behavior** by noting any layout issues visible in screenshots.
 - **Don't forget edge cases**: empty states, very long text, special characters, rapid clicking.
-- When reporting screenshots to the user, include `MEDIA:<screenshot_path>` so they can see the evidence inline.
+- When reporting screenshots to the user, include `MEDIA:<screenshot_path>` so they can see the evidence inline. On a messaging platform, this is a delivery requirement: attach the evidence images in the final response, not just a local output directory or a list of paths.
