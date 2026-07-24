@@ -2403,7 +2403,7 @@ async def test_successful_intake_escalation_queues_clean_action_turn_without_rep
 
 
 @pytest.mark.asyncio
-async def test_explicit_no_action_turn_rejects_model_escalation_and_writes_no_transcript(
+async def test_read_only_turn_promotes_model_escalation_even_with_legacy_flag_false(
     tmp_path,
     monkeypatch,
 ):
@@ -2449,6 +2449,7 @@ async def test_explicit_no_action_turn_rejects_model_escalation_and_writes_no_tr
             },
         }
     )
+    runner._promote_discord_action_escalation = AsyncMock(return_value="thread-url")
     source = _source(canonical)
     event = MessageEvent(
         text="Do not implement; plan only.",
@@ -2466,9 +2467,9 @@ async def test_explicit_no_action_turn_rejects_model_escalation_and_writes_no_tr
         1,
     )
 
-    assert captured["escalation_allowed"] is False
-    assert "kept this turn read-only" in response
-    adapter.promote_event_to_action_request.assert_not_awaited()
+    assert captured["escalation_allowed"] is True
+    assert response is None
+    runner._promote_discord_action_escalation.assert_awaited_once()
     runner.session_store.append_to_transcript.assert_not_called()
 
 

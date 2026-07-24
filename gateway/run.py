@@ -8202,7 +8202,6 @@ class _GatewayRunnerCore(
         if (
             source.platform != Platform.DISCORD
             or _discord_runtime_mode_for(event) is not RuntimeMode.READ_ONLY
-            or getattr(event, "discord_action_escalation_allowed", None) is not True
             or not isinstance(agent_result.get("action_escalation_requested"), dict)
             or not self._is_session_run_current(session_key, run_generation)
         ):
@@ -18297,7 +18296,6 @@ class _GatewayRunnerCore(
                 _set_env_kwargs["discord_action_escalation_allowed"] = bool(
                     source.platform == Platform.DISCORD
                     and discord_runtime_mode is RuntimeMode.READ_ONLY
-                    and getattr(event, "discord_action_escalation_allowed", None) is True
                 )
             # Some focused tests replace _set_session_env with a minimal
             # one-arg stub; only pass kwargs its signature accepts.
@@ -19094,7 +19092,8 @@ class _GatewayRunnerCore(
                         None,
                     ),
                     discord_action_escalation_allowed=bool(
-                        getattr(event, "discord_action_escalation_allowed", False)
+                        source.platform == Platform.DISCORD
+                        and discord_runtime_mode is RuntimeMode.READ_ONLY
                     ),
                     fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
                     fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
@@ -19182,15 +19181,6 @@ class _GatewayRunnerCore(
                 agent_result.get("action_escalation_requested"), dict
             )
             if escalation_requested:
-                if getattr(event, "discord_action_escalation_allowed", None) is not True:
-                    logger.warning(
-                        "Ignoring model-emitted Discord action escalation denied by event authority: %s",
-                        getattr(event, "discord_runtime_reason", None) or "unspecified",
-                    )
-                    return (
-                        "I kept this turn read-only because the current request does not "
-                        "authorize action-mode work. No durable changes were made."
-                    )
                 promoted_thread_url = await self._promote_discord_action_escalation(
                     event=event,
                     source=source,
@@ -29521,16 +29511,11 @@ class _GatewayRunnerCore(
         if (
             source.platform == _GATEWAY_PLATFORM.DISCORD
             and turn_runtime_mode is RuntimeMode.READ_ONLY
-            and discord_action_escalation_allowed is True
             and "discord-action-escalation" not in enabled_toolsets
         ):
             enabled_toolsets = sorted(
                 [*enabled_toolsets, "discord-action-escalation"]
             )
-        elif not discord_action_escalation_allowed:
-            enabled_toolsets = [
-                name for name in enabled_toolsets if name != "discord-action-escalation"
-            ]
         if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
             enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
         if fable_plan_only:
@@ -30723,9 +30708,8 @@ class _GatewayRunnerCore(
             agent._runtime_mode = turn_runtime_mode.value
             agent.memory_read_only = turn_runtime_mode is RuntimeMode.READ_ONLY
             agent._discord_intake_read_only = turn_runtime_mode is RuntimeMode.READ_ONLY
-            agent._discord_action_escalation_allowed = bool(
+            agent._discord_action_escalation_allowed = (
                 turn_runtime_mode is RuntimeMode.READ_ONLY
-                and discord_action_escalation_allowed
             )
             agent._action_escalation_requested = None
             if (

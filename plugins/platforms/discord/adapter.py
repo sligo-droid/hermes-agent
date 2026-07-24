@@ -3337,7 +3337,6 @@ class DiscordAdapter(BasePlatformAdapter):
         if (
             source is None
             or not request_text
-            or getattr(event, "discord_action_escalation_allowed", None) is not True
             or not self._promotion_is_current(generation_is_current)
         ):
             return None, ""
@@ -3823,7 +3822,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "would ", "could you explain", "what's", "whats",
         )
         feature_verbs = (
-            "build", "create", "add", "implement", "fix", "change", "update",
+            "build", "create", "add", "implement", "fix", "repair", "change", "update",
             "remove", "delete", "ship", "deploy", "make", "refactor", "wire",
             "integrate", "set up", "setup", "turn on", "enable", "disable",
             "support", "replace", "migrate", "simplify", "clean up", "run",
@@ -3837,7 +3836,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "execute the pipeline", "execute the entire pipeline",
         )
         imperative_starts = (
-            "build ", "create ", "add ", "implement ", "fix ", "remove ",
+            "build ", "create ", "add ", "implement ", "fix ", "repair ", "remove ",
             "delete ", "refactor ", "wire ", "integrate ", "set up ",
             "turn on ", "enable ", "disable ", "replace ", "migrate ",
             "simplify ", "clean up ", "rerun ", "re-run ", "execute ",
@@ -3874,7 +3873,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if any(
             re.search(
                 r"(?:[.;,:]\s*|\b(?:and|then)\s+)(?:please\s+)?"
-                r"(?:rerun|re-run|restart|deploy|ship|execute|commit|push|merge|"
+                r"(?:repair|fix|implement|build|create|update|change|rerun|re-run|"
+                r"restart|deploy|ship|execute|commit|push|merge|"
                 r"apply|run\s+(?:the\s+)?(?:pipeline|workflow|job|command))\b",
                 candidate,
             )
@@ -3955,7 +3955,7 @@ class DiscordAdapter(BasePlatformAdapter):
             re.fullmatch(
                 r"(?:(?:let(?:['’]?s)|lets|let us)\s+|"
                 r"(?:go ahead|please)\s+(?:and\s+)?)"
-                r"(?:build|create|add|implement|fix|change|update|remove|ship|"
+                r"(?:build|create|add|implement|fix|repair|change|update|remove|ship|"
                 r"deploy|make|refactor|wire|integrate|run|execute|do)\s+"
                 r"(?:it|this|that)(?:\s+now)?[.!]*",
                 candidate,
@@ -4048,16 +4048,23 @@ class DiscordAdapter(BasePlatformAdapter):
         force_action: bool = False,
     ) -> tuple[str, bool]:
         no_action_reason = self._explicit_no_action_constraint_reason(text)
-        if no_action_reason:
-            return no_action_reason, False
         if mode is RuntimeMode.ACTION:
-            return ("structural_action_context" if force_action else "explicit_action_request"), False
+            return (
+                no_action_reason
+                or ("structural_action_context" if force_action else "explicit_action_request"),
+                False,
+            )
+        # The handoff control is always available to a Discord read-only turn.
+        # Classification decides the default runtime, not whether a real repair
+        # request may request its transactional action replay.
+        if no_action_reason:
+            return no_action_reason, True
         heuristic = self._heuristic_action_request_intent(
             text,
             actionable_thread_context=actionable_thread_context,
         )
         if heuristic is False:
-            return "classified_read_only", False
+            return "classified_read_only", True
         return "ambiguous_read_only", True
 
     def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:

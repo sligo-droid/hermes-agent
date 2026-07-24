@@ -381,7 +381,7 @@ async def test_bare_discord_read_only_turn_uses_discord_action_tier(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_explicit_no_action_read_only_turn_omits_escalation_schema(monkeypatch):
+async def test_read_only_turn_exposes_escalation_schema_despite_legacy_flag(monkeypatch):
     _patch_agent_runtime(monkeypatch)
     runner = _make_runner()
 
@@ -394,9 +394,9 @@ async def test_explicit_no_action_read_only_turn_omits_escalation_schema(monkeyp
     )
 
     assert result["final_response"] == "ok"
-    assert "discord-action-escalation" not in _CapturingAgent.last_init["enabled_toolsets"]
+    assert "discord-action-escalation" in _CapturingAgent.last_init["enabled_toolsets"]
     cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
-    assert cached_agent._discord_action_escalation_allowed is False
+    assert cached_agent._discord_action_escalation_allowed is True
 
 
 @pytest.mark.asyncio

@@ -336,7 +336,7 @@ async def test_narrative_prefixed_review_request_runs_read_only_directly(
     assert "default READ-ONLY runtime" in event.channel_prompt
     assert event.feature_summary is None
     assert event.participates_in_work_lifecycle is False
-    assert event.discord_action_escalation_allowed is False
+    assert event.discord_action_escalation_allowed is True
     assert event.discord_runtime_reason == "classified_read_only"
     assert event.source.chat_id == "200"
     adapter._auto_create_thread.assert_awaited_once()
@@ -383,7 +383,7 @@ async def test_discord_message_link_explicit_plan_only_stays_read_only(adapter, 
 
     event = adapter.handle_message.await_args.args[0]
     assert event.discord_runtime_mode == "read_only"
-    assert event.discord_action_escalation_allowed is False
+    assert event.discord_action_escalation_allowed is True
     assert event.feature_summary is None
 
 
@@ -487,6 +487,7 @@ def test_read_only_prompt_lightly_prefers_direct_work_without_restricting_delega
         "Please deploy the current branch.",
         "Please update the retry policy.",
         "Please implement read-only parser mode.",
+        "Review the local district map panel and repair its layout.",
     ],
 )
 @pytest.mark.asyncio
@@ -507,14 +508,14 @@ async def test_discord_message_links_keep_action_fast_path_but_no_action_wins(ad
     ) is gateway_run.RuntimeMode.READ_ONLY
 
 
-def test_classifier_authority_disables_only_classified_no_action_and_allows_ambiguity(adapter):
+def test_classifier_authority_keeps_escalation_available_on_read_only_turns(adapter):
     reason, allowed = adapter._discord_runtime_authority(
         "Tell me what you would do to fix it.",
         gateway_run.RuntimeMode.READ_ONLY,
         force_action=True,
     )
     assert reason == "hypothetical_action_only"
-    assert allowed is False
+    assert allowed is True
 
     reason, allowed = adapter._discord_runtime_authority(
         "Could this be improved?",
