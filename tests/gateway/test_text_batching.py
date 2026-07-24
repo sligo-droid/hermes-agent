@@ -244,7 +244,7 @@ class TestDiscordTextBatching:
         pending = adapter._pending_text_batches[adapter._text_batch_key(first)]
         assert pending.discord_runtime_mode == "read_only"
         assert pending.discord_explicit_no_action_denial is True
-        assert pending.discord_action_escalation_allowed is False
+        assert pending.discord_action_escalation_allowed is True
 
         for task in list(adapter._pending_text_batch_tasks.values()):
             task.cancel()

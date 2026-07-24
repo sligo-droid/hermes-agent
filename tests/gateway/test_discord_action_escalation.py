@@ -285,7 +285,7 @@ async def test_cross_session_action_escalation_dispatches_new_thread():
 
 
 @pytest.mark.asyncio
-async def test_explicit_no_action_event_cannot_promote_even_with_model_payload():
+async def test_read_only_event_promotes_even_when_legacy_flag_is_false():
     runner = object.__new__(gateway_run.GatewayRunner)
     source = _source()
     event = MessageEvent(
@@ -295,12 +295,20 @@ async def test_explicit_no_action_event_cannot_promote_even_with_model_payload()
         discord_action_escalation_allowed=False,
         discord_runtime_reason="explicit_no_implementation",
     )
+    promoted = MessageEvent(
+        text=event.text,
+        source=source,
+        discord_runtime_mode="action",
+    )
     adapter = SimpleNamespace(
-        promote_event_to_action_request=AsyncMock(),
+        promote_event_to_action_request=AsyncMock(return_value=(promoted, "thread-url")),
         rollback_promoted_action_request=AsyncMock(),
     )
     runner._adapter_for_source = lambda _source: adapter
     runner._session_run_generation = {"discord:thread-1": 1}
+    runner._session_key_for_source = lambda _source: "discord:thread-1"
+    runner._prepend_fifo = MagicMock()
+    runner._evict_cached_agent = MagicMock()
 
     assert await runner._promote_discord_action_escalation(
         event=event,
@@ -308,8 +316,8 @@ async def test_explicit_no_action_event_cannot_promote_even_with_model_payload()
         session_key="discord:thread-1",
         run_generation=1,
         agent_result=_result(),
-    ) is None
-    adapter.promote_event_to_action_request.assert_not_awaited()
+    ) == "thread-url"
+    adapter.promote_event_to_action_request.assert_awaited_once()
 
 
 @pytest.mark.asyncio

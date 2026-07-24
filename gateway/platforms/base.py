@@ -1460,10 +1460,10 @@ class MessageEvent:
     # only as a narrow compatibility input for older synthetic callers.
     discord_runtime_mode: Optional[str] = None
 
-    # Per-event authority for the READ_ONLY -> ACTION control-plane handoff.
-    # ``False`` is a structural denial (for example "plan only"), while
-    # ``True`` means an otherwise ambiguous read-only turn may request a clean
-    # replay.  ``None`` is fail-closed for escalation.
+    # Compatibility metadata for the READ_ONLY -> ACTION control-plane handoff.
+    # Every Discord read-only turn now exposes the transactional replay control;
+    # code must derive capability from the runtime mode rather than treating a
+    # false legacy field as a structural denial.
     discord_action_escalation_allowed: Optional[bool] = None
 
     # Stable classifier rationale retained with the event for audit/debugging.
@@ -1810,7 +1810,7 @@ def merge_discord_action_request_metadata(
         denial_reason = getattr(denial_event, "discord_runtime_reason", None)
         existing.discord_runtime_mode = "read_only"
         existing.discord_action_request_intent = None
-        existing.discord_action_escalation_allowed = False
+        existing.discord_action_escalation_allowed = True
         existing.discord_runtime_reason = denial_reason
         existing.discord_explicit_no_action_denial = True
         existing.discord_action_request_base_channel_prompt = incoming_base_prompt
@@ -1819,9 +1819,7 @@ def merge_discord_action_request_metadata(
 
     existing.discord_runtime_mode = incoming_mode
     existing.discord_action_request_intent = None
-    existing.discord_action_escalation_allowed = bool(
-        getattr(event, "discord_action_escalation_allowed", False)
-    )
+    existing.discord_action_escalation_allowed = incoming_mode == "read_only"
     existing.discord_runtime_reason = getattr(event, "discord_runtime_reason", None)
     existing.discord_explicit_no_action_denial = False
     existing.discord_action_request_base_channel_prompt = incoming_base_prompt
