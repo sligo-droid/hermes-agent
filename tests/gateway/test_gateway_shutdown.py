@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -176,6 +177,22 @@ async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monk
     # of always).  StartLimitBurst still bounds accidental loops.
     assert runner._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert (tmp_path / ".restart_pending.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_from_systemd_restart_marks_home_notification(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("INVOCATION_ID", "systemd-test")
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._signal_initiated_shutdown = True
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    marker = json.loads((tmp_path / ".restart_pending.json").read_text())
+    assert marker["systemd_signal_restart"] is True
+    assert marker["via_service"] is False
 
 
 @pytest.mark.asyncio
