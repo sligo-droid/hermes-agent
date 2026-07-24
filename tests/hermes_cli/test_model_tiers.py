@@ -57,8 +57,8 @@ def test_default_routes_reference_resolvable_tiers():
     } == {
         "trivial": "medium",
         "basic": "xhigh",
-        "intermediate": "medium",
-        "advanced": "high",
+        "intermediate": "low",
+        "advanced": "medium",
         "discord_action": "low",
     }
     assert {
@@ -145,11 +145,22 @@ def test_review_spills_high_to_xhigh_and_implementation_caps_at_high():
     assert classify_task_purpose("Review the flow and fix the race") == "implementation"
     assert classify_task_purpose("Analyze the request") == "implementation"
 
-    advanced = resolve_model_tier({}, "advanced")
-    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").name == "advanced"
-    assert restrict_model_tier_for_task({}, advanced, "Implement the fix").reasoning_effort == "high"
-    assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").name == "advanced"
-    assert restrict_model_tier_for_task({}, advanced, "Audit the auth flow").reasoning_effort == "xhigh"
+    high_effort = resolve_model_tier(
+        {
+            "model_tiers": {
+                "high_effort": {
+                    "model": "custom/high",
+                    "opencode_model": "custom/high-worker",
+                    "reasoning_effort": "high",
+                }
+            }
+        },
+        "high_effort",
+    )
+    assert restrict_model_tier_for_task({}, high_effort, "Implement the fix").name == "high_effort"
+    assert restrict_model_tier_for_task({}, high_effort, "Implement the fix").reasoning_effort == "high"
+    assert restrict_model_tier_for_task({}, high_effort, "Audit the auth flow").name == "high_effort"
+    assert restrict_model_tier_for_task({}, high_effort, "Audit the auth flow").reasoning_effort == "xhigh"
     assert restrict_reasoning_effort_for_task("max", "Apply the patch") == "max"
     assert restrict_reasoning_effort_for_task("ultra", "Review the authentication flow") == "ultra"
     assert restrict_reasoning_effort_for_task("high", "Review the authentication flow") == "xhigh"
