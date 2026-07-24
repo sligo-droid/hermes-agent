@@ -65,6 +65,7 @@ import time
 import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
+from urllib.parse import urlsplit
 from agent.auxiliary_client import call_llm
 from agent.redact import redact_cdp_url
 from hermes_constants import (
@@ -226,6 +227,7 @@ MIN_FIRST_OPEN_TIMEOUT = 120
 # web_extract paths share the same truncate-and-store pattern, so the model
 # gets the same per-page budget from both.
 SNAPSHOT_SUMMARIZE_THRESHOLD = 15000
+PLAIN_JSON_OBSERVATION_LIMIT = 50_000
 
 # Hard ceiling on the full-snapshot file written to cache/web when a snapshot
 # is truncated or LLM-summarized. Mirrors web_tools.MAX_STORED_TEXT_CHARS —
@@ -1815,7 +1817,7 @@ atexit.register(_stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). Plain JSON responses, including health endpoints, are returned directly as bounded structured data. For other plain-text endpoints — URLs ending in .md, .txt, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer web_extract; the browser stack is overkill and much slower. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2757,6 +2759,81 @@ def _redact_browser_output(value: Any) -> Any:
     return value
 
 
+def _plain_json_document_observation(task_id: str) -> Optional[Dict[str, Any]]:
+    """Return bounded JSON from the current document without model-side eval."""
+
+    expression = (
+        "JSON.stringify({contentType:document.contentType||'',"
+        "text:(document.body&&document.body.innerText)||'',"
+        "status:(performance.getEntriesByType('navigation')[0]||{}).responseStatus||null})"
+    )
+    try:
+        result = _run_browser_command(
+            task_id,
+            "eval",
+            [expression],
+            timeout=5,
+        )
+    except Exception as exc:
+        logger.debug("plain JSON document probe failed: %s", exc)
+        return None
+    if not result.get("success"):
+        return None
+    raw = result.get("data", {}).get("result")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    content_type = str(raw.get("contentType") or "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json" and not content_type.endswith("+json"):
+        return None
+    body = str(raw.get("text") or "")
+    observation: Dict[str, Any] = {"content_type": content_type}
+    status = raw.get("status")
+    if isinstance(status, int) and 100 <= status <= 599:
+        observation["http_status"] = status
+    if len(body) > PLAIN_JSON_OBSERVATION_LIMIT:
+        half = (PLAIN_JSON_OBSERVATION_LIMIT - 80) // 2
+        observation["body"] = (
+            body[:half]
+            + "\n...[JSON response truncated]...\n"
+            + body[-half:]
+        )
+        observation["json_truncated"] = True
+        return _redact_browser_output(observation)
+    try:
+        observation["json"] = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        observation["body"] = body
+        observation["json_parse_error"] = True
+    return _redact_browser_output(observation)
+
+
+def _should_probe_plain_json(url: str, title: str) -> bool:
+    """Avoid an extra browser round trip on ordinary titled HTML pages."""
+
+    if not str(title or "").strip():
+        return True
+    try:
+        path = urlsplit(str(url or "")).path.lower().rstrip("/")
+    except ValueError:
+        return False
+    name = path.rsplit("/", 1)[-1]
+    return name.endswith(".json") or name in {
+        "health",
+        "healthz",
+        "live",
+        "livez",
+        "ready",
+        "readyz",
+        "status",
+        "version",
+    }
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -2968,6 +3045,12 @@ def browser_navigate(
                     "Consider upgrading Browserbase plan for proxy support."
                 )
             response["stealth_features"] = active_features
+
+        if _should_probe_plain_json(final_url, title):
+            json_observation = _plain_json_document_observation(nav_session_key)
+            if json_observation is not None:
+                response.update(json_observation)
+                return json.dumps(response, ensure_ascii=False)
 
         # Auto-take a compact snapshot so the model can act immediately
         # without a separate browser_snapshot call.

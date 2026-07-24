@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from agent.runtime_capabilities import RuntimeMode, ToolEffect, normalize_runtime_mode
+from agent.runtime_capabilities import ToolEffect
 from gateway.session_context import get_session_env
 from tools.registry import registry, tool_error
 
@@ -32,6 +32,10 @@ _MEMORY_SWAP_LIMIT_BYTES = 512 * 1024 * 1024
 _TASK_LIMIT = 256
 _CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
 _cgroup_limiter_probe: bool | None = None
+_PACKAGE_JSON_LIMIT = 1_000_000
+_PNPM_PACKAGE_MANAGER_RE = re.compile(
+    r"^pnpm@(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+\S+)?$"
+)
 _VERIFICATION_ENV_ALLOWLIST = frozenset(
     {
         "LANG",
@@ -319,9 +323,7 @@ def _resolved_verification_argv(
     return resolved
 
 
-def _prepared_pnpm_runtime() -> Path | None:
-    """Find a complete Corepack-cached pnpm distribution for offline use."""
-
+def _pnpm_cache_roots() -> tuple[Path, ...]:
     cache_candidates: list[Path] = []
     configured = os.environ.get("COREPACK_HOME")
     if configured:
@@ -339,30 +341,70 @@ def _prepared_pnpm_runtime() -> Path | None:
                 shim_path.parents[2] / ".cache" / "node" / "corepack"
             )
 
-    def version_key(path: Path) -> tuple[int, ...]:
-        match = re.fullmatch(r"(\d+(?:\.\d+)*)", path.name)
-        return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+    return tuple(
+        dict.fromkeys(path.resolve(strict=False) for path in cache_candidates)
+    )
 
-    for cache_root in dict.fromkeys(path.resolve(strict=False) for path in cache_candidates):
+
+def _prepared_pnpm_runtime(version: str) -> Path | None:
+    """Find the exact complete Corepack-cached pnpm distribution requested."""
+
+    if not _PNPM_PACKAGE_MANAGER_RE.fullmatch(f"pnpm@{version}"):
+        return None
+    for cache_root in _pnpm_cache_roots():
         pnpm_root = cache_root / "pnpm"
-        if not pnpm_root.is_dir():
-            continue
-        versions = sorted(
-            (path for path in pnpm_root.iterdir() if version_key(path)),
-            key=version_key,
-            reverse=True,
-        )
-        for candidate in versions:
-            if (
-                (candidate / ".corepack").is_file()
-                and (candidate / "bin" / "pnpm.cjs").is_file()
-                and (candidate / "dist" / "pnpm.cjs").is_file()
-            ):
-                return candidate.resolve()
+        candidate = pnpm_root / version
+        if (
+            (candidate / ".corepack").is_file()
+            and (candidate / "bin" / "pnpm.cjs").is_file()
+            and (candidate / "dist" / "pnpm.cjs").is_file()
+        ):
+            return candidate.resolve()
     return None
 
 
-def _prepared_dependency_roots(source_root: Path) -> dict[str, Path]:
+def _pnpm_package_manager_pin(
+    source_cwd: Path,
+    source_root: Path,
+) -> tuple[str | None, Path | None, str | None]:
+    """Resolve the nearest repository packageManager field for a pnpm command."""
+
+    current = source_cwd
+    while True:
+        manifest = current / "package.json"
+        if manifest.is_file():
+            try:
+                if manifest.stat().st_size > _PACKAGE_JSON_LIMIT:
+                    return None, manifest, "package.json is too large to inspect safely"
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                return None, manifest, f"could not parse package.json: {type(exc).__name__}"
+            if isinstance(data, dict) and "packageManager" in data:
+                package_manager = str(data.get("packageManager") or "").strip()
+                match = _PNPM_PACKAGE_MANAGER_RE.fullmatch(package_manager)
+                if match is None:
+                    return None, manifest, (
+                        "packageManager must pin an exact pnpm runtime such as "
+                        "pnpm@10.25.0"
+                    )
+                return match.group("version"), manifest, None
+        if current == source_root:
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None, None, (
+        "pnpm verification requires an exact packageManager pin in the relevant "
+        "repository package.json"
+    )
+
+
+def _prepared_dependency_roots(
+    source_root: Path,
+    *,
+    pnpm_runtime: Path | None = None,
+) -> dict[str, Path]:
     """Locate trusted prepared dependencies for a linked worktree snapshot."""
 
     roots: dict[str, Path] = {}
@@ -424,9 +466,8 @@ def _prepared_dependency_roots(source_root: Path) -> dict[str, Path]:
             if candidate.is_dir():
                 roots[key] = candidate.resolve()
                 break
-    pnpm_runtime = _prepared_pnpm_runtime()
     if pnpm_runtime is not None:
-        roots["pnpm_runtime"] = pnpm_runtime
+        roots["pnpm_runtime"] = pnpm_runtime.resolve()
     return roots
 
 
@@ -546,13 +587,7 @@ def read_only_verify(
 ) -> str:
     """Run a recognized verification command in a disposable read-only sandbox."""
 
-    if normalize_runtime_mode(runtime_mode) is not RuntimeMode.READ_ONLY:
-        return tool_error("read_only_verify is available only in a read-only runtime")
-    if not _cgroup_v2_limiter_available():
-        return tool_error(
-            "Read-only verification failed closed: cgroup v2 memory and task "
-            "limiters are unavailable"
-        )
+    del runtime_mode  # The sandbox contract is observational in either mode.
     argv, error = parse_read_only_verification_command(command)
     if error or argv is None:
         return tool_error(f"Unsafe verification command: {error}")
@@ -566,6 +601,28 @@ def read_only_verify(
         relative_cwd = source_cwd.relative_to(source_root)
     except ValueError:
         return tool_error("verification workdir is outside its Git root")
+
+    pnpm_runtime: Path | None = None
+    if Path(argv[0]).name.lower() == "pnpm":
+        pnpm_version, manifest, pin_error = _pnpm_package_manager_pin(
+            source_cwd,
+            source_root,
+        )
+        if pin_error or pnpm_version is None:
+            location = f" ({manifest})" if manifest is not None else ""
+            return tool_error(f"Unsafe pnpm verification{location}: {pin_error}")
+        pnpm_runtime = _prepared_pnpm_runtime(pnpm_version)
+        if pnpm_runtime is None:
+            return tool_error(
+                f"Exact Corepack pnpm runtime {pnpm_version} required by {manifest} "
+                "is not cached; refusing offline verification"
+            )
+
+    if not _cgroup_v2_limiter_available():
+        return tool_error(
+            "Read-only verification failed closed: cgroup v2 memory and task "
+            "limiters are unavailable"
+        )
 
     try:
         timeout_value = max(1, min(int(timeout), 600))
@@ -618,7 +675,10 @@ def read_only_verify(
             if not snapshot_cwd.is_dir():
                 return tool_error("verification workdir is unavailable in the disposable snapshot")
 
-            dependencies = _prepared_dependency_roots(source_root)
+            dependencies = _prepared_dependency_roots(
+                source_root,
+                pnpm_runtime=pnpm_runtime,
+            )
             if "venv" in dependencies:
                 (snapshot_root / ".venv").mkdir(exist_ok=True)
             if "node_modules" in dependencies:
