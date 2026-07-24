@@ -9,7 +9,7 @@ pairing code to the chat.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -98,6 +98,7 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True, "Synthetic completion event must be marked internal"
+    assert event.background_process_completion is True
 
 
 @pytest.mark.asyncio
@@ -187,6 +188,41 @@ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
     assert not auth_called, (
         "_is_user_authorized should NOT be called for internal events"
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_process_completion_does_not_reclaim_completed_discord_work(
+    monkeypatch, tmp_path,
+):
+    """A queued terminal result must not reopen a work item after final delivery."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("", encoding="utf-8")
+
+    runner = GatewayRunner(GatewayConfig())
+    claim = MagicMock()
+    runner._ledger = lambda: SimpleNamespace(
+        get=lambda _work_id: {"status": "completed"},
+        claim=claim,
+    )
+    runner._handle_message_with_agent = AsyncMock()
+    event = MessageEvent(
+        text="[IMPORTANT: Background process completed]",
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+            thread_id="thread-1",
+        ),
+        internal=True,
+        work_item_id="work-1",
+        background_process_completion=True,
+    )
+
+    assert await runner._handle_message(event) is None
+    claim.assert_not_called()
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
