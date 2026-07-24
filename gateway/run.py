@@ -15110,7 +15110,19 @@ class _GatewayRunnerCore(
             if active_agents:
                 self._increment_restart_failure_counts(set(active_agents.keys()))
 
-            if self._restart_requested and self._restart_command_source is None:
+            # A direct ``systemctl restart`` sends SIGTERM without going
+            # through Hermes' /restart path.  Preserve the same home-channel
+            # notification contract as a planned terminal/service restart so
+            # operators can distinguish a healthy reconnect from silence.
+            systemd_signal_restart = (
+                bool(os.environ.get("INVOCATION_ID"))
+                and bool(getattr(self, "_signal_initiated_shutdown", False))
+                and not self._restart_requested
+            )
+            if (
+                (self._restart_requested and self._restart_command_source is None)
+                or systemd_signal_restart
+            ):
                 try:
                     atomic_json_write(
                         _planned_restart_notification_path(),
@@ -15118,6 +15130,7 @@ class _GatewayRunnerCore(
                             "requested_at": time.time(),
                             "via_service": bool(self._restart_via_service),
                             "detached": bool(self._restart_detached),
+                            "systemd_signal_restart": systemd_signal_restart,
                         },
                         indent=None,
                     )
@@ -39086,7 +39099,7 @@ def _planned_restart_notification_path() -> Path:
     return _hermes_home / ".restart_pending.json"
 
 def _planned_restart_notification_pending() -> bool:
-    """Return True when a non-chat planned restart should notify home channels."""
+    """Return True when a non-chat restart should notify home channels."""
     return _planned_restart_notification_path().exists()
 
 def _clear_planned_restart_notification() -> None:
