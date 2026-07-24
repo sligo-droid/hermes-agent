@@ -6,7 +6,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import HomeChannel, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -117,6 +117,154 @@ async def test_gateway_stop_drains_running_agents_before_disconnect():
     running_agent.interrupt.assert_not_called()
     disconnect_mock.assert_awaited_once()
     assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_grants_delivery_grace_after_agent_registry_clears():
+    """A completed model response must reach the adapter before disconnect.
+
+    The runner releases ``_running_agents`` inside its message handler, while
+    BasePlatformAdapter still has to resume that await, build the final payload,
+    record its transport obligation, and send it.  Shutdown must drain that
+    adapter-owned tail instead of treating the gateway as idle.
+    """
+
+    runner, adapter = make_restart_runner()
+    runner._shutdown_delivery_grace_seconds = 0.5
+    adapter.platform = Platform.DISCORD
+    runner.adapters = {Platform.DISCORD: adapter}
+    adapter.set_session_store(runner.session_store)
+    adapter.disconnect = AsyncMock()
+
+    source = make_restart_source()
+    source.platform = Platform.DISCORD
+    event = MessageEvent(text="work", source=source, message_id="1")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+
+    async def finish_model(_event):
+        runner._running_agents.clear()
+        return "final response"
+
+    async def block_delivery(chat_id, content, reply_to=None, metadata=None):
+        delivery_started.set()
+        await release_delivery.wait()
+        adapter.sent.append(content)
+        return SendResult(success=True, message_id="delivered")
+
+    adapter.set_message_handler(finish_model)
+    adapter.send = block_delivery
+    await adapter.handle_message(event)
+    await asyncio.wait_for(delivery_started.wait(), timeout=1.0)
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        stop_task = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0.02)
+        assert not stop_task.done()
+        adapter.disconnect.assert_not_awaited()
+        release_delivery.set()
+        await asyncio.wait_for(stop_task, timeout=2.0)
+
+    assert adapter.sent == ["final response"]
+    adapter.disconnect.assert_awaited_once()
+    runner.session_store.mark_resume_pending.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_delivery_grace_includes_profile_adapters():
+    runner, adapter = make_restart_runner()
+    runner._shutdown_delivery_grace_seconds = 0.5
+    adapter.platform = Platform.DISCORD
+    runner.adapters = {}
+    runner._profile_adapters = {"secondary": {Platform.DISCORD: adapter}}
+    adapter.set_session_store(runner.session_store)
+    adapter.disconnect = AsyncMock()
+
+    source = make_restart_source()
+    source.platform = Platform.DISCORD
+    event = MessageEvent(text="profile work", source=source, message_id="2")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    model_finished = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def finish_model_before_returning_response(_event):
+        runner._running_agents.clear()
+        model_finished.set()
+        await release_response.wait()
+        return "profile final response"
+
+    adapter.set_message_handler(finish_model_before_returning_response)
+    await adapter.handle_message(event)
+    await asyncio.wait_for(model_finished.wait(), timeout=1.0)
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        stop_task = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0.02)
+        assert not stop_task.done()
+        adapter.disconnect.assert_not_awaited()
+        release_response.set()
+        await asyncio.wait_for(stop_task, timeout=2.0)
+
+    assert adapter.sent == ["profile final response"]
+    adapter.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("restart", "expected_reason"),
+    ((False, "shutdown_timeout"), (True, "restart_timeout")),
+)
+async def test_gateway_stop_aborted_pre_delivery_task_becomes_resume_pending(
+    restart,
+    expected_reason,
+):
+    """Regression for cancellation before the delivery ledger can be written."""
+
+    runner, adapter = make_restart_runner()
+    runner._shutdown_delivery_grace_seconds = 0.01
+    adapter.platform = Platform.DISCORD
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.session_store.mark_resume_pending = MagicMock(return_value=True)
+    adapter.set_session_store(runner.session_store)
+    adapter.disconnect = AsyncMock()
+
+    source = make_restart_source()
+    source.platform = Platform.DISCORD
+    event = MessageEvent(text="work", source=source, message_id="3")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    model_finished = asyncio.Event()
+    never_release_response = asyncio.Event()
+
+    async def finish_model_but_stall_before_returning_response(_event):
+        runner._running_agents.clear()
+        model_finished.set()
+        await never_release_response.wait()
+        return "response that never reached delivery setup"
+
+    adapter.set_message_handler(finish_model_but_stall_before_returning_response)
+
+    with patch("gateway.delivery_ledger.record_obligation") as record_obligation, patch(
+        "gateway.status.remove_pid_file"
+    ), patch("gateway.status.write_runtime_status"):
+        await adapter.handle_message(event)
+        await asyncio.wait_for(model_finished.wait(), timeout=1.0)
+        await asyncio.wait_for(runner.stop(restart=restart), timeout=2.0)
+
+    record_obligation.assert_not_called()
+    runner.session_store.mark_resume_pending.assert_called_once_with(
+        session_key,
+        expected_reason,
+    )
+    assert adapter.sent == []
+    adapter.disconnect.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -2098,6 +2098,12 @@ class BasePlatformAdapter(ABC):
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
+        # Session tasks that gateway shutdown has explicitly chosen to abort
+        # after the delivery-only grace window.  The task itself persists the
+        # resume marker when cancellation is delivered, closing the window
+        # between the runner's agent registry clearing and final transport
+        # delivery starting.
+        self._shutdown_resume_pending_reasons: Dict[str, str] = {}
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
         # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
@@ -4090,6 +4096,91 @@ class BasePlatformAdapter(ABC):
             task.add_done_callback(self._expected_cancelled_tasks.discard)
         return True
 
+    def active_processing_tasks(self) -> Dict[str, asyncio.Task]:
+        """Return live per-session processing tasks owned by this adapter.
+
+        ``_background_tasks`` can also contain platform-lifecycle tasks such as
+        polling-error watchers, so shutdown drain accounting must use the
+        session-owner map rather than treating every adapter task as a pending
+        user response.
+        """
+
+        active: Dict[str, asyncio.Task] = {}
+        for session_key, task in list(getattr(self, "_session_tasks", {}).items()):
+            try:
+                if task.done():
+                    continue
+            except Exception:
+                # A task-like object without a reliable done() result is safer
+                # to treat as active during shutdown.
+                pass
+            active[session_key] = task
+        return active
+
+    def cancel_processing_sessions_for_shutdown(
+        self,
+        session_keys: set[str],
+        *,
+        reason: str,
+    ) -> set[str]:
+        """Cancel selected session tasks and persist recovery from their unwind.
+
+        Arming and cancelling happen without an await between them, so a task
+        cannot finish normally after being selected but before cancellation is
+        requested.  ``_process_message_background`` writes ``resume_pending``
+        when it receives the cancellation.
+        """
+
+        cancelled: set[str] = set()
+        reasons = getattr(self, "_shutdown_resume_pending_reasons", None)
+        if reasons is None:
+            reasons = {}
+            self._shutdown_resume_pending_reasons = reasons
+        for session_key, task in self.active_processing_tasks().items():
+            if session_key not in session_keys:
+                continue
+            reasons[session_key] = reason
+            self._expected_cancelled_tasks.add(task)
+            task.cancel()
+            cancelled.add(session_key)
+        return cancelled
+
+    async def _persist_shutdown_resume_pending(self, session_key: str) -> None:
+        """Persist the recovery marker armed by gateway shutdown."""
+
+        reasons = getattr(self, "_shutdown_resume_pending_reasons", {})
+        reason = reasons.pop(session_key, None)
+        if not reason:
+            return
+        store = getattr(self, "_session_store", None)
+        mark = getattr(store, "mark_resume_pending", None)
+        if not callable(mark):
+            logger.warning(
+                "[%s] Cannot mark shutdown-aborted delivery resume-pending for %s: "
+                "session store unavailable",
+                self.name,
+                session_key,
+            )
+            return
+        try:
+            if inspect.iscoroutinefunction(mark):
+                marked = await mark(session_key, reason)
+            else:
+                marked = await asyncio.to_thread(mark, session_key, reason)
+            if marked:
+                logger.info(
+                    "[%s] Marked shutdown-aborted delivery resume-pending for %s",
+                    self.name,
+                    session_key,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to mark shutdown-aborted delivery resume-pending for %s: %s",
+                self.name,
+                session_key,
+                exc,
+            )
+
     async def cancel_session_processing(
         self,
         session_key: str,
@@ -5227,6 +5318,7 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             if delivery_fenced and not delivery_complete:
                 self._mark_work_item_delivery_uncertain(event)
+            await self._persist_shutdown_resume_pending(session_key)
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -5443,8 +5535,13 @@ class BasePlatformAdapter(ABC):
             if not tasks:
                 break
             for task in tasks:
-                self._expected_cancelled_tasks.add(task)
-                task.cancel()
+                # A delivery-grace timeout may already have requested
+                # cancellation so the task can persist resume_pending from its
+                # CancelledError handler.  Do not cancel it a second time while
+                # that persistence await is in flight.
+                if task not in self._expected_cancelled_tasks:
+                    self._expected_cancelled_tasks.add(task)
+                    task.cancel()
             try:
                 await asyncio.wait_for(
                     asyncio.gather(
