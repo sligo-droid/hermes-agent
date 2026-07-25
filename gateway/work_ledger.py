@@ -5113,11 +5113,17 @@ class GatewayWorkLedger:
             item["summary_status"] = str(gate.get("summary_status") or "Blocked")
             item["updated_at"] = self._now()
             item["blocked_at"] = item["updated_at"]
+            item["terminal_reaction_state"] = (
+                "blocked" if item["status"] == "blocked" else "errored"
+            )
+            item["terminal_reaction_sync_pending"] = True
             _record_provider_progress(item, "ledger_status_blocked", status=str(item["status"]))
             self._write(data)
             return True
         item["status"] = "completed"
         item["updated_at"] = self._now()
+        item["terminal_reaction_state"] = "done"
+        item["terminal_reaction_sync_pending"] = True
         _record_provider_progress(item, "ledger_status_completed", status="completed")
         self._write(data)
         return True

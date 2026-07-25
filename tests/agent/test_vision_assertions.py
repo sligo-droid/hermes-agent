@@ -41,7 +41,7 @@ def test_parse_compact_vision_assertion_output():
 
 
 @pytest.mark.asyncio
-async def test_active_custom_route_and_single_attempt_are_forwarded():
+async def test_visual_inspector_route_and_single_attempt_are_forwarded():
     seen = {}
     events = []
 
@@ -58,24 +58,37 @@ async def test_active_custom_route_and_single_attempt_are_forwarded():
             ]
         )
 
-    result = await evaluate_screenshot_assertions(
-        "data:image/png;base64,cG5n",
-        [{"id": "appearance", "expectation": "balanced layout"}],
-        provider="openrouter",
-        model="anthropic/claude-opus-4.6",
-        base_url="https://runtime.example/v1",
-        api_key="runtime-credential",
-        api_mode="codex_responses",
-        cfg={"model": {"supports_vision": True}},
-        call_llm=call_llm,
-        on_provider_start=lambda: events.append("start"),
-    )
+    with patch(
+        "agent.vision_assertions._resolve_visual_inspector_runtime",
+        return_value={
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "base_url": "https://inspector.example/v1",
+            "api_key": "inspector-credential",
+            "api_mode": "anthropic_messages",
+        },
+    ):
+        result = await evaluate_screenshot_assertions(
+            "data:image/png;base64,cG5n",
+            [{"id": "appearance", "expectation": "balanced layout"}],
+            # A distinct orchestrator route must never reach the visual call.
+            provider="custom",
+            model="gpt-5.6-sol",
+            base_url="https://orchestrator.example/v1",
+            api_key="orchestrator-credential",
+            api_mode="codex_responses",
+            cfg={},
+            call_llm=call_llm,
+            on_provider_start=lambda: events.append("start"),
+        )
 
     assert result["status"] == "passed"
     assert events == ["start", "request"]
-    assert seen["base_url"] == "https://runtime.example/v1"
-    assert seen["api_key"] == "runtime-credential"
-    assert seen["api_mode"] == "codex_responses"
+    assert seen["provider"] == "anthropic"
+    assert seen["model"] == "claude-sonnet-5"
+    assert seen["base_url"] == "https://inspector.example/v1"
+    assert seen["api_key"] == "inspector-credential"
+    assert seen["api_mode"] == "anthropic_messages"
     assert seen["single_attempt"] is True
     assert seen["strict_vision_capability"] is True
 
@@ -105,6 +118,15 @@ async def test_strict_assertion_routes_once_to_known_vision_backend():
     fallback_client = SimpleNamespace()
 
     with patch(
+        "agent.vision_assertions._resolve_visual_inspector_runtime",
+        return_value={
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "base_url": "https://inspector.example/v1",
+            "api_key": "inspector-credential",
+            "api_mode": "anthropic_messages",
+        },
+    ), patch(
         "agent.auxiliary_client._resolve_task_provider_model",
         return_value=("auto", None, None, None, None),
     ), patch(

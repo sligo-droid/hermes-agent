@@ -7,7 +7,6 @@ import re
 from typing import Any, Awaitable, Callable, Optional
 
 from agent.visual_assertions import aggregate_assertion_results, sanitize_assertion_result
-from agent.vision_capabilities import resolve_vision_capabilities
 
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
@@ -75,6 +74,28 @@ def _assertion_prompt(assertions: list[dict[str, Any]]) -> str:
     )
 
 
+def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str, str]:
+    """Resolve the dedicated model route used only for screenshot judgement."""
+
+    from hermes_cli.model_tiers import resolve_model_tier
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    tier = resolve_model_tier(cfg, "visual_inspector")
+    if tier is None or not tier.provider:
+        raise RuntimeError("visual_inspector model tier is unavailable")
+    runtime = resolve_runtime_provider(
+        requested=tier.provider,
+        target_model=tier.model,
+    )
+    return {
+        "provider": str(runtime.get("provider") or tier.provider),
+        "model": tier.model,
+        "base_url": str(runtime.get("base_url") or ""),
+        "api_key": str(runtime.get("api_key") or ""),
+        "api_mode": str(runtime.get("api_mode") or ""),
+    }
+
+
 async def evaluate_screenshot_assertions(
     image_data_url: str,
     assertions: list[dict[str, Any]],
@@ -101,12 +122,14 @@ async def evaluate_screenshot_assertions(
     else:
         from agent.auxiliary_client import extract_content_or_reasoning
 
-    resolution = resolve_vision_capabilities(
-        provider,
-        model,
-        cfg,
-        api_mode=api_mode,
-    )
+    # Screenshot assertions are a dedicated visual-inspection phase. Never
+    # inherit the parent/orchestrator route, even when it accepts image input.
+    # The Luna sweep and Opus critique remain explicit delegation purposes;
+    # this bounded receipt evaluator is the Sonnet inspector stage.
+    try:
+        inspector = _resolve_visual_inspector_runtime(cfg)
+    except Exception:
+        return _uncertain_results(expected_ids, "vision_call_failed")
     call_kwargs: dict[str, Any] = {
         "task": "vision",
         "messages": [
@@ -123,18 +146,12 @@ async def evaluate_screenshot_assertions(
         "timeout": max(1.0, min(float(timeout_s), 30.0)),
         "single_attempt": True,
         "strict_vision_capability": True,
+        "provider": inspector["provider"],
+        "model": inspector["model"],
+        "base_url": inspector["base_url"],
+        "api_key": inspector["api_key"],
+        "api_mode": inspector["api_mode"],
     }
-    if resolution.native_tool_result_supported:
-        if provider:
-            call_kwargs["provider"] = provider
-        if model:
-            call_kwargs["model"] = model
-        if base_url:
-            call_kwargs["base_url"] = base_url
-        if api_key:
-            call_kwargs["api_key"] = api_key
-        if api_mode:
-            call_kwargs["api_mode"] = api_mode
     try:
         if on_provider_start is not None:
             on_provider_start()
