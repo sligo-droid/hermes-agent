@@ -329,8 +329,10 @@ def test_prompt_hidden_skill_remains_listed_and_explicitly_loadable(
         "---\n"
         "name: quiet-expert\n"
         "description: Load only when explicitly requested.\n"
-        "visibility:\n"
-        "  prompt_index: false\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    visibility:\n"
+        "      prompt_index: false\n"
         "---\n\nExplicit body.\n",
         encoding="utf-8",
     )

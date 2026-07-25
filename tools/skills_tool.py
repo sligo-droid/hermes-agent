@@ -34,9 +34,11 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
     platforms: [macos]            # Optional — restrict to specific OS platforms
                                   #   Valid: macos, linux, windows
                                   #   Omit to load on all platforms (default)
-    visibility:                    # Optional offer-surface metadata
-      prompt_index: false          #   Hide from always-loaded prompt only;
-                                  #   explicit list/view/slash loads still work
+    metadata:
+      hermes:
+        visibility:                # Optional offer-surface metadata
+          prompt_index: false      # Hide from always-loaded prompt only;
+                                   # explicit list/view/slash loads still work
     prerequisites:                # Optional — legacy runtime requirements
       env_vars: [API_KEY]         #   Legacy env var names are normalized into
                                   #   required_environment_variables on load.

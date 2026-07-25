@@ -861,11 +861,25 @@ def resolve_skill_category(skill_file: Path, skills_root: Path) -> str:
 def skill_prompt_index_visible(frontmatter: Dict[str, Any]) -> bool:
     """Return whether a skill belongs in the always-loaded prompt index.
 
-    ``visibility.prompt_index: false`` is deliberately an offer-surface hint,
-    not a loadability gate. ``skills_list``, slash invocation, explicit paths,
-    and ``skill_view`` continue to work normally.
+    ``metadata.hermes.visibility.prompt_index: false`` is the canonical form;
+    the original top-level ``visibility`` spelling remains accepted for
+    compatibility. This is deliberately an offer-surface hint, not a
+    loadability gate. ``skills_list``, slash invocation, explicit paths, and
+    ``skill_view`` continue to work normally.
     """
     visibility = frontmatter.get("visibility")
+    if not isinstance(visibility, dict):
+        metadata = frontmatter.get("metadata")
+        hermes_metadata = (
+            metadata.get("hermes")
+            if isinstance(metadata, dict)
+            else None
+        )
+        visibility = (
+            hermes_metadata.get("visibility")
+            if isinstance(hermes_metadata, dict)
+            else None
+        )
     if not isinstance(visibility, dict):
         return True
     value = visibility.get("prompt_index", True)
