@@ -1094,6 +1094,43 @@ def test_draft_becomes_ready_only_after_current_head_gates(monkeypatch, tmp_path
     assert not any(args[:3] == ["gh", "pr", "merge"] for args in calls)
 
 
+def test_external_repo_without_hermes_workflows_does_not_wait_for_impossible_checks(
+    monkeypatch,
+    tmp_path,
+):
+    """Closeout must not require Hermes-only CI names in another project repo."""
+
+    _patch_repo_boundary(monkeypatch)
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "scrape.yml").write_text("name: Scrape\n", encoding="utf-8")
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ["gh", "auth", "status"]:
+            return _completed(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return _completed(args, stdout=json.dumps(_pr_payload(draft=True, checks=[])))
+        if args[:3] == ["gh", "pr", "ready"]:
+            return _completed(args)
+        raise AssertionError(args)
+
+    transition = closeout.reconcile_trusted_closeout(_state(tmp_path), now=100, run=run)
+
+    assert transition.outcome == "ready_pending"
+    assert transition.state["ci"] == {
+        "head_sha": HEAD_SHA,
+        "status": "passed",
+        "total": 0,
+        "failed": [],
+        "wait_state": "not_required",
+        "required": [],
+    }
+    assert transition.state["pr"]["is_draft"] is False
+    assert any(args[:3] == ["gh", "pr", "ready"] for args in calls)
+
+
 @pytest.mark.parametrize("visual_status", ["pending", "stale", "failed"])
 def test_incomplete_visual_gate_never_readies_or_merges(
     monkeypatch,
