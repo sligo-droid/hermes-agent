@@ -1442,6 +1442,17 @@ def _allow_private_urls() -> bool:
     return _cached_allow_private_urls
 
 
+def _read_only_url_blocked(url: str) -> bool:
+    """Return whether read-only browser policy blocks ``url``.
+
+    The operator may explicitly allow ordinary private/internal targets, but
+    that opt-in never overrides the always-blocked cloud-metadata floor.
+    """
+    return _is_always_blocked_url(url) or (
+        not _allow_private_urls() and not _is_safe_url(url)
+    )
+
+
 def _socket_safe_tmpdir() -> str:
     """Return a short temp directory path suitable for Unix domain sockets.
 
@@ -2957,10 +2968,7 @@ def browser_navigate(
     # shortcut. Localhost, RFC1918/link-local targets, internal DNS names, and
     # control-plane endpoints stay blocked unless the operator explicitly
     # enabled private URLs in Hermes security/browser config.
-    if read_only and (
-        _is_always_blocked_url(url)
-        or (not _allow_private_urls() and not _is_safe_url(url))
-    ):
+    if read_only and _read_only_url_blocked(url):
         return json.dumps({
             "success": False,
             "error": "Blocked: read-only browser navigation targets a private, internal, or control-plane address",
@@ -3048,10 +3056,7 @@ def browser_navigate(
                 "error": "Blocked: redirect landed on a cloud metadata endpoint",
             })
 
-        if read_only and final_url and (
-            _is_always_blocked_url(final_url)
-            or (not _allow_private_urls() and not _is_safe_url(final_url))
-        ):
+        if read_only and final_url and _read_only_url_blocked(final_url):
             _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
             return json.dumps({
                 "success": False,
@@ -3549,7 +3554,10 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
     ``browser_vision``: the SSRF guard is only meaningful for non-local
     backends (cloud browser, or a containerized terminal whose browser-on-host
     can reach internal networks the terminal can't), and is skipped for local
-    sidecar sessions and when ``allow_private_urls`` is set.
+    sidecar sessions and when ``allow_private_urls`` is set. Read-only
+    sessions keep the guard active even with that opt-in so the
+    always-blocked metadata floor can still be enforced; individual URL
+    decisions use ``_read_only_url_blocked`` to honor the operator setting.
     """
     if str(effective_task_id or "").endswith("::read-only"):
         return True
@@ -3567,7 +3575,10 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
 _JS_URL_LITERAL_RE = re.compile(r"""https?://[^\s'"`)\]<>]+""", re.IGNORECASE)
 
 
-def _expression_targets_private_url(expression: str) -> Optional[str]:
+def _expression_targets_private_url(
+    expression: str,
+    effective_task_id: Optional[str] = None,
+) -> Optional[str]:
     """Return the first private/always-blocked URL literal in a JS expression.
 
     Best-effort: scans for ``http(s)://...`` literals (fetch/XHR/navigation
@@ -3577,9 +3588,15 @@ def _expression_targets_private_url(expression: str) -> Optional[str]:
     """
     if not isinstance(expression, str):
         return None
+    read_only = str(effective_task_id or "").endswith("::read-only")
     for match in _JS_URL_LITERAL_RE.findall(expression):
         candidate = match.rstrip(".,;")
-        if _is_always_blocked_url(candidate) or not _is_safe_url(candidate):
+        blocked = (
+            _read_only_url_blocked(candidate)
+            if read_only
+            else _is_always_blocked_url(candidate) or not _is_safe_url(candidate)
+        )
+        if blocked:
             return candidate
     return None
 
@@ -3605,11 +3622,9 @@ def _current_page_private_url(effective_task_id: str) -> Optional[str]:
             )
             read_only = str(effective_task_id or "").endswith("::read-only")
             if current_url and (
-                _is_always_blocked_url(current_url)
-                or (
-                    not _is_safe_url(current_url)
-                    and not (read_only and _allow_private_urls())
-                )
+                _read_only_url_blocked(current_url)
+                if read_only
+                else _is_always_blocked_url(current_url) or not _is_safe_url(current_url)
             ):
                 return current_url
     except Exception as exc:
@@ -3775,7 +3790,9 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     effective_task_id = _last_session_key(task_id or "default")
 
     if _eval_ssrf_guard_active(effective_task_id):
-        blocked_literal = _expression_targets_private_url(expression)
+        blocked_literal = _expression_targets_private_url(
+            expression, effective_task_id
+        )
         if blocked_literal:
             return json.dumps({
                 "success": False,
@@ -3914,7 +3931,7 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 
 def _camofox_current_page_private_url(
-    tab_id: str, user_id: str
+    tab_id: str, user_id: str, effective_task_id: str = ""
 ) -> Optional[str]:
     """Return the current Camofox URL when it targets a private address.
 
@@ -3932,8 +3949,11 @@ def _camofox_current_page_private_url(
             data.get("result") if isinstance(data, dict) else data or ""
         )
         current_url = current_url.strip().strip('"').strip("'")
+        read_only = str(effective_task_id or "").endswith("::read-only")
         if current_url and (
-            _is_always_blocked_url(current_url) or not _is_safe_url(current_url)
+            _read_only_url_blocked(current_url)
+            if read_only
+            else _is_always_blocked_url(current_url) or not _is_safe_url(current_url)
         ):
             return current_url
     except Exception as exc:
@@ -3965,7 +3985,9 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                 pass
 
         if _eval_ssrf_guard_active(task_id or "default"):
-            blocked_url = _camofox_current_page_private_url(tab_id, user_id)
+            blocked_url = _camofox_current_page_private_url(
+                tab_id, user_id, task_id or "default"
+            )
             if blocked_url:
                 return json.dumps(
                     {
@@ -5019,9 +5041,7 @@ def _read_only_browser_navigate_check(args: dict) -> bool | str:
     url = str(args.get("url") or "").strip()
     if urlsplit(url).scheme.lower() not in {"http", "https"}:
         return "only explicit http:// or https:// navigation is available"
-    if _is_always_blocked_url(url) or (
-        not _allow_private_urls() and not _is_safe_url(url)
-    ):
+    if _read_only_url_blocked(url):
         return "private, internal, localhost, and control-plane targets require operator approval"
     return True
 
