@@ -823,7 +823,9 @@ def _resolve_analysis_handoffs(
     root = getattr(parent_agent, "_delegate_root_agent", parent_agent)
     registry = getattr(root, "_delegation_handoffs", None)
     if not isinstance(registry, dict):
-        return [], "No structured delegation handoffs are registered for this root turn."
+        # Handoffs enrich the worker prompt but are not required to execute the
+        # explicit coding task. Recovered turns may lose this in-memory registry.
+        return [], None
     from tools.delegate_tool import (
         _ASYNC_HANDOFF_MAX_AGE_SECONDS,
         _delegation_binding,
@@ -4852,7 +4854,8 @@ CODING_WORKER_SCHEMA = {
                 "description": (
                     "Structured delegate handoff IDs previously returned by "
                     "delegate_task. Hermes resolves them from root-owned state; "
-                    "unknown or fabricated IDs are rejected."
+                    "unknown or fabricated IDs are rejected when the registry is "
+                    "available; unavailable recovered state is ignored."
                 ),
                 "items": {"type": "string"},
             },

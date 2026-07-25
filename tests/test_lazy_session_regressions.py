@@ -403,6 +403,26 @@ class TestGatewaySurfacesNullResponse:
         assert "500 Internal Server Error" in response
         assert "/reset" in response
 
+    def test_failed_billing_400_on_long_session_is_not_context_overflow(self):
+        """Long histories must not turn unrelated provider 400s into overflow."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 0,
+            "failed": True,
+            "error": "HTTP 400: Third-party apps require extra usage credits.",
+        }
+
+        response = _normalize_empty_agent_response(
+            agent_result,
+            "",
+            history_len=132,
+        )
+
+        assert "Third-party apps require extra usage credits" in response
+        assert "context window" not in response
+
     def test_nonempty_response_passes_through(self):
         """Non-empty response is returned unchanged."""
         from gateway.run import _normalize_empty_agent_response

@@ -1695,6 +1695,16 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
                 "succeeded": required_async["required_succeeded"],
             },
         }
+    reported_status = str(item.get("summary_status") or "").strip().lower()
+    if repo_backed and reported_status == "failed":
+        return {
+            "allowed_to_complete": False,
+            "summary_status": "Failed",
+            "terminal_status": "blocked",
+            "reason": "agent_turn_failed",
+            "delivery_intent": intent,
+            "repo_backed": repo_backed,
+        }
     gate_summary_status = str(item.get("summary_status") or "Complete")
     if gate_summary_status.lower() == "blocked":
         gate_summary_status = "Complete"
@@ -5113,11 +5123,17 @@ class GatewayWorkLedger:
             item["summary_status"] = str(gate.get("summary_status") or "Blocked")
             item["updated_at"] = self._now()
             item["blocked_at"] = item["updated_at"]
+            item["terminal_reaction_state"] = (
+                "blocked" if item["status"] == "blocked" else "errored"
+            )
+            item["terminal_reaction_sync_pending"] = True
             _record_provider_progress(item, "ledger_status_blocked", status=str(item["status"]))
             self._write(data)
             return True
         item["status"] = "completed"
         item["updated_at"] = self._now()
+        item["terminal_reaction_state"] = "done"
+        item["terminal_reaction_sync_pending"] = True
         _record_provider_progress(item, "ledger_status_completed", status="completed")
         self._write(data)
         return True

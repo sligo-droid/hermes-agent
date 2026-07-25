@@ -838,6 +838,26 @@ def test_discord_thread_reaction_uses_latest_terminal_after_incomplete_clears(tm
     assert ledger.discord_thread_reaction_state(second) == "done"
 
 
+def test_completion_marks_terminal_reaction_for_later_discord_sync(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="completed-reaction")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    assert ledger.mark_completed(item["id"])
+
+    stored = ledger.get(item["id"])
+    assert stored["terminal_reaction_state"] == "done"
+    assert stored["terminal_reaction_sync_pending"] is True
+    assert [pending["id"] for pending in ledger.pending_terminal_reaction_items()] == [
+        item["id"]
+    ]
+
+
 def test_run_state_cas_finalizes_only_unchanged_active_run(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     event = _discord_event(message_id="run-state-success")
@@ -1541,6 +1561,37 @@ def test_repo_backed_self_declared_incomplete_response_is_blocked(tmp_path):
     stored = ledger.get(item["id"])
     assert stored["status"] == "blocked"
     assert ledger.incomplete_items() == []
+
+
+def test_failed_repo_action_response_cannot_complete_work_item(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement the feature")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Session too large for the model's context window. Use /compact.",
+        summary_status="Failed",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"] == {
+        "allowed_to_complete": False,
+        "summary_status": "Failed",
+        "terminal_status": "blocked",
+        "reason": "agent_turn_failed",
+        "delivery_intent": "full_lifecycle",
+        "repo_backed": True,
+    }
+    ledger.mark_response_delivered(item["id"], result_message_id="error-message")
+    ledger.mark_summary_updated(item["id"])
+    ledger.mark_completed(item["id"])
+    assert ledger.get(item["id"])["status"] == "blocked"
 
 
 def test_explicit_pr_only_request_allows_intentionally_unmerged_final(tmp_path):

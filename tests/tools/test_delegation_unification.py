@@ -433,6 +433,15 @@ def test_structured_handoffs_are_deep_copied_and_reject_stale_identity(tmp_path)
     assert "handoff_1" not in root._delegation_handoffs
 
 
+def test_missing_handoff_registry_does_not_block_explicit_coding_task():
+    parent = SimpleNamespace()
+
+    resolved, error = cwt._resolve_analysis_handoffs(parent, ["handoff_lost"])
+
+    assert resolved == []
+    assert error is None
+
+
 def test_recent_read_only_handoff_can_cross_completion_turn(tmp_path):
     root = SimpleNamespace(
         session_key="agent:main:discord:thread:1:2",
