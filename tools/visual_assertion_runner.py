@@ -4,26 +4,34 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
+import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from agent.execution_guard import CooperativeExecutionGuard, ExecutionGuardExpired
 from agent.visual_assertions import (
     aggregate_assertion_results,
-    validate_visual_assertion_coverage,
+    validate_visual_execution_contract,
     visual_assertion_contract_id,
+    visual_execution_contract_id,
 )
 from agent.visual_qa import (
     normalize_visual_qa_config,
     normalize_visual_requirement,
     visual_requirement_id,
+    visual_requirement_uses_orchestrator_contract,
 )
 
 
 _MUTATION_LOCK = threading.Lock()
 _MUTATION_GENERATIONS: dict[str, int] = {}
+_ARTIFACT_CLEANUP_LOCK = threading.Lock()
+_LAST_ARTIFACT_CLEANUP = 0.0
+_MAX_SCREENSHOT_EVIDENCE_BYTES = 8 * 1024 * 1024
 
 
 def record_trusted_visual_mutation(task_id: str) -> int:
@@ -48,6 +56,38 @@ def clear_trusted_visual_mutation(task_id: str) -> None:
     key = str(task_id or "default")
     with _MUTATION_LOCK:
         _MUTATION_GENERATIONS.pop(key, None)
+
+
+def _visual_qa_artifact_paths(
+    task_id: str,
+    contract_id: str,
+    count: int,
+) -> list[Path]:
+    """Return stable, opaque screenshot paths and prune stale QA artifacts."""
+
+    from hermes_constants import get_hermes_dir
+
+    screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    global _LAST_ARTIFACT_CLEANUP
+    now = time.time()
+    with _ARTIFACT_CLEANUP_LOCK:
+        if now - _LAST_ARTIFACT_CLEANUP >= 3600:
+            _LAST_ARTIFACT_CLEANUP = now
+            cutoff = now - 24 * 3600
+            for path in screenshots_dir.glob("visual_qa_screenshot_*.png"):
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError:
+                    pass
+    opaque_run_id = hashlib.sha256(
+        f"{task_id or 'default'}:{contract_id}:{secrets.token_hex(12)}".encode("utf-8")
+    ).hexdigest()[:24]
+    return [
+        screenshots_dir / f"visual_qa_screenshot_{opaque_run_id}_{index + 1}.png"
+        for index in range(max(0, min(int(count), 4)))
+    ]
 
 
 def _accepts_keyword(function: Callable[..., Any], keyword: str) -> bool:
@@ -181,6 +221,11 @@ async def _run_attempt(
     vision_allowed: bool,
     execution_guard: CooperativeExecutionGuard,
     on_provider_start: Callable[[], None],
+    execution_context: Optional[dict[str, Any]],
+    target_locator: Optional[dict[str, str]],
+    screenshot_artifacts: list[dict[str, Any]],
+    artifact_paths: list[Path],
+    artifact_sink: list[dict[str, str]],
 ) -> dict[str, Any]:
     deterministic = [item for item in assertions if item["kind"] != "screenshot_appearance"]
     appearance = [item for item in assertions if item["kind"] == "screenshot_appearance"]
@@ -207,19 +252,73 @@ async def _run_attempt(
                 for item in appearance
             )
         else:
-            screenshot = await _thread_call(
-                supervisor.capture_screenshot_memory,
-                execution_guard=execution_guard,
-            )
-            if not screenshot.get("ok"):
+            artifact_sink.clear()
+            images: list[str] = []
+            total_image_bytes = 0
+            capture_failed = False
+            for index, artifact in enumerate(screenshot_artifacts[:4]):
+                screenshot_kwargs: dict[str, Any] = {}
+                locator = artifact.get("locator")
+                if not isinstance(locator, dict) and len(screenshot_artifacts) == 1:
+                    locator = target_locator
+                if isinstance(locator, dict) and _declares_keyword(
+                    supervisor.capture_screenshot_memory,
+                    "locator",
+                ):
+                    screenshot_kwargs["locator"] = locator
+                viewport = artifact.get("viewport")
+                if (
+                    isinstance(viewport, dict)
+                    and {"width", "height"}.issubset(viewport)
+                    and _declares_keyword(supervisor.capture_screenshot_memory, "viewport")
+                ):
+                    screenshot_kwargs["viewport"] = {
+                        "width": viewport["width"],
+                        "height": viewport["height"],
+                    }
+                screenshot = await _thread_call(
+                    supervisor.capture_screenshot_memory,
+                    execution_guard=execution_guard,
+                    **screenshot_kwargs,
+                )
+                if not screenshot.get("ok"):
+                    capture_failed = True
+                    continue
+                raw = screenshot.pop("image_bytes", b"")
+                if not isinstance(raw, bytes) or not raw:
+                    capture_failed = True
+                    continue
+                if total_image_bytes + len(raw) > _MAX_SCREENSHOT_EVIDENCE_BYTES:
+                    capture_failed = True
+                    raw = b""
+                    continue
+                total_image_bytes += len(raw)
+                images.append(
+                    "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+                )
+                if index < len(artifact_paths):
+                    try:
+                        await _thread_call(
+                            artifact_paths[index].write_bytes,
+                            raw,
+                            execution_guard=execution_guard,
+                        )
+                    except Exception:
+                        pass
+                    else:
+                        artifact_sink.append(
+                            {
+                                "kind": str(artifact.get("kind") or "context"),
+                                "screenshot_path": str(artifact_paths[index]),
+                            }
+                        )
+                raw = b""
+            if capture_failed or not images:
                 results.extend(
                     {"id": item["id"], "status": "blocked", "code": "screenshot_unavailable"}
                     for item in appearance
                 )
             else:
-                raw = screenshot.pop("image_bytes", b"")
-                data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
-                raw = b""
                 if vision_sweeper is not None:
                     sweep_kwargs = {
                         "cfg": cfg,
@@ -230,7 +329,7 @@ async def _run_attempt(
                     else:
                         _mark_provider_started()
                     execution_guard.check()
-                    if not await vision_sweeper(data_url, **sweep_kwargs):
+                    if not await vision_sweeper(images, **sweep_kwargs):
                         results.extend(
                             {"id": item["id"], "status": "uncertain", "code": "vision_call_failed"}
                             for item in appearance
@@ -247,6 +346,11 @@ async def _run_attempt(
                     "cfg": cfg,
                     "timeout_s": vision_timeout_s,
                 }
+                if execution_context and _declares_keyword(
+                    vision_evaluator,
+                    "execution_context",
+                ):
+                    evaluator_kwargs["execution_context"] = execution_context
                 if _declares_keyword(vision_evaluator, "on_provider_start"):
                     evaluator_kwargs["on_provider_start"] = _mark_provider_started
                 else:
@@ -255,11 +359,11 @@ async def _run_attempt(
                     _mark_provider_started()
                 execution_guard.check()
                 vision_result = await vision_evaluator(
-                    data_url,
+                    images,
                     appearance,
                     **evaluator_kwargs,
                 )
-                data_url = ""
+                images = []
                 results.extend(vision_result.get("results") or [])
     aggregate = aggregate_assertion_results(results)
     aggregate["vision_calls"] = provider_start_count
@@ -270,7 +374,8 @@ async def run_visual_assertions(
     *,
     task_id: str,
     requirement: Any,
-    assertions: Any,
+    contract: Any = None,
+    assertions: Any = None,
     config: Any = None,
     provider: str = "",
     model: str = "",
@@ -292,16 +397,63 @@ async def run_visual_assertions(
         return execution_guard.remaining()
 
     normalized_requirement = normalize_visual_requirement(requirement)
-    normalized_assertions = validate_visual_assertion_coverage(
+    raw_contract = (
+        contract
+        if isinstance(contract, dict)
+        else {"assertions": assertions}
+    )
+    normalized_contract = validate_visual_execution_contract(
         normalized_requirement,
-        assertions,
+        raw_contract,
         max_assertions=visual_config["max_assertions"],
     )
+    normalized_assertions = normalized_contract.get("assertions") or []
     if normalized_requirement["level"] == "none" or not normalized_assertions:
         return {"status": "uncertain", "code": "invalid_visual_contract", "attempts": []}
     requirement_id = visual_requirement_id(normalized_requirement)
-    contract_id = visual_assertion_contract_id(normalized_assertions)
+    orchestrated_contract = visual_requirement_uses_orchestrator_contract(
+        normalized_requirement
+    )
+    contract_id = (
+        visual_execution_contract_id(normalized_contract)
+        if orchestrated_contract
+        else visual_assertion_contract_id(normalized_assertions)
+    )
     assertion_ids = [item["id"] for item in normalized_assertions]
+    coverage_ids = [
+        str(item.get("id") or "")
+        for item in normalized_requirement.get("assertions") or []
+        if isinstance(item, dict)
+    ]
+    target = normalized_contract.get("target")
+    target_locator = (
+        target.get("locator")
+        if isinstance(target, dict) and isinstance(target.get("locator"), dict)
+        else None
+    )
+    execution_context = (
+        {
+            "target": {
+                "description": str(target.get("description") or "")
+            },
+            **{
+                key: normalized_contract[key]
+                for key in ("page", "viewport", "state")
+                if key in normalized_contract
+            },
+            "artifacts": [
+                {
+                    key: item[key]
+                    for key in ("kind", "description", "viewport")
+                    if key in item
+                }
+                for item in normalized_contract.get("artifacts") or []
+                if isinstance(item, dict)
+            ],
+        }
+        if orchestrated_contract and isinstance(target, dict)
+        else None
+    )
 
     def _receipt(
         status: str,
@@ -315,7 +467,7 @@ async def run_visual_assertions(
             code = str(item.get("code") or "") if isinstance(item, dict) else ""
             if code and code not in codes:
                 codes.append(code)
-        return {
+        receipt = {
             "requirement_id": requirement_id,
             "contract_id": contract_id,
             "assertion_ids": assertion_ids,
@@ -328,6 +480,9 @@ async def run_visual_assertions(
             ),
             "diagnostic_codes": codes[:12],
         }
+        if orchestrated_contract:
+            receipt["coverage_ids"] = coverage_ids
+        return receipt
 
     if supervisor is None:
         try:
@@ -391,10 +546,34 @@ async def run_visual_assertions(
     if vision_sweeper is None:
         vision_sweeper = run_visual_sweep
 
-    locators = [item["locator"] for item in normalized_assertions if "locator" in item]
+    screenshot_artifacts = normalized_contract.get("artifacts")
+    if not isinstance(screenshot_artifacts, list) or not screenshot_artifacts:
+        screenshot_artifacts = [
+            {
+                "kind": "focused" if target_locator else "context",
+                "description": "Visual QA evidence",
+                **({"locator": target_locator} if target_locator else {}),
+                "viewport": {},
+            }
+        ]
+    artifact_paths = _visual_qa_artifact_paths(
+        task_id,
+        contract_id,
+        len(screenshot_artifacts),
+    )
+
+    locators: list[dict[str, str]] = []
+    for locator in [
+        target_locator,
+        *(item.get("locator") for item in normalized_assertions),
+        *(item.get("locator") for item in screenshot_artifacts),
+    ]:
+        if isinstance(locator, dict) and locator not in locators:
+            locators.append(locator)
     attempts: list[dict[str, Any]] = []
     vision_calls = 0
     final: dict[str, Any] = {"status": "uncertain", "results": []}
+    latest_artifacts: list[dict[str, str]] = []
     for attempt_index in range(visual_config["max_attempts"]):
         remaining = _remaining()
         if remaining <= 0:
@@ -456,6 +635,11 @@ async def run_visual_assertions(
                     vision_allowed=vision_allowed,
                     execution_guard=attempt_guard,
                     on_provider_start=_provider_started,
+                    execution_context=execution_context,
+                    target_locator=target_locator,
+                    screenshot_artifacts=screenshot_artifacts,
+                    artifact_paths=artifact_paths,
+                    artifact_sink=latest_artifacts,
                 ),
                 timeout=attempt_timeout,
             )
@@ -526,6 +710,8 @@ async def run_visual_assertions(
         "attempts": attempts[:2],
         "visual_qa_receipt": receipt,
     }
+    if latest_artifacts:
+        output["screenshot_artifacts"] = latest_artifacts[:4]
     if len(str(output)) > visual_config["max_output_chars"]:
         output["results"] = []
         output["code"] = "output_compacted"

@@ -1,10 +1,11 @@
 import asyncio
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agent.visual_qa import normalize_visual_requirement
+from agent.visual_qa import classify_visual_requirement, normalize_visual_requirement
 from tools.visual_assertion_runner import (
     record_trusted_visual_mutation,
     run_visual_assertions,
@@ -59,6 +60,227 @@ class FakeSupervisor:
             "viewport_contained": self.contained or self.state_calls > 1,
             "no_horizontal_overflow": True,
         }
+
+
+@pytest.mark.asyncio
+async def test_incident_contract_is_orchestrator_supplied_and_target_scoped():
+    requirement = classify_visual_requirement(
+        "in the Issue Attention graph in the State Brief page:\n"
+        "-the bar graphs clip through the x axis\n"
+        "-we should lightly label the y axis",
+        worker_route="action",
+    )
+    contract = {
+        "target": {
+            "description": "Issue Attention graph region",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+        },
+        "page": {
+            "state": "prepared",
+            "description": "State Brief page with Issue Attention visible",
+        },
+        "viewport": {
+            "description": "current desktop viewport",
+            "width": 1440,
+            "height": 900,
+        },
+        "state": ["chart data loaded", "bars and both axes visible"],
+        "assertions": [
+            {
+                "kind": "screenshot_appearance",
+                "expectation": (
+                    "Every rounded bar terminates above the x-axis; no filled polygon crosses "
+                    "the baseline."
+                ),
+            },
+            {
+                "kind": "screenshot_appearance",
+                "expectation": (
+                    "Y-axis labels are visible and intentionally subtle without competing with "
+                    "the bars."
+                ),
+            },
+        ],
+    }
+
+    class IncidentSupervisor(FakeSupervisor):
+        capture_calls = None
+
+        def capture_screenshot_memory(self, *, locator=None, viewport=None):
+            if self.capture_calls is None:
+                self.capture_calls = []
+            self.capture_calls.append({"locator": locator, "viewport": viewport})
+            return {
+                "ok": True,
+                "image_bytes": b"focused-png" if locator else b"context-png",
+            }
+
+    supervisor = IncidentSupervisor(contained=True)
+    seen_context = {}
+    seen_images = []
+
+    async def sweeper(images, *, on_provider_start, **_kwargs):
+        seen_images.append(("sweep", list(images)))
+        on_provider_start()
+        return True
+
+    async def evaluator(
+        images,
+        assertions,
+        *,
+        execution_context,
+        on_provider_start,
+        **_kwargs,
+    ):
+        seen_images.append(("inspect", list(images)))
+        seen_context.update(execution_context)
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {
+                    "id": item["id"],
+                    "status": "passed",
+                    "code": "appearance_satisfied",
+                }
+                for item in assertions
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="incident-contract",
+        requirement=requirement,
+        contract=contract,
+        supervisor=supervisor,
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "passed"
+    assert supervisor.capture_calls == [
+        {
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+            "viewport": {"width": 1440, "height": 900},
+        },
+        {"locator": None, "viewport": {"width": 1440, "height": 900}},
+    ]
+    assert seen_images[0][0] == "sweep"
+    assert seen_images[1] == ("inspect", seen_images[0][1])
+    assert len(seen_images[0][1]) == 2
+    assert seen_context == {
+        "target": {"description": "Issue Attention graph region"},
+        "page": contract["page"],
+        "viewport": contract["viewport"],
+        "state": contract["state"],
+        "artifacts": [
+            {
+                "kind": "focused",
+                "description": "Issue Attention graph region",
+                "viewport": contract["viewport"],
+            },
+            {
+                "kind": "context",
+                "description": "Surrounding page context",
+                "viewport": contract["viewport"],
+            },
+        ],
+    }
+    artifacts = result["screenshot_artifacts"]
+    assert [item["kind"] for item in artifacts] == ["focused", "context"]
+    assert [Path(item["screenshot_path"]).read_bytes() for item in artifacts] == [
+        b"focused-png",
+        b"context-png",
+    ]
+    receipt = result["visual_qa_receipt"]
+    assert receipt["coverage_ids"] == [requirement["assertions"][0]["id"]]
+    assert all(item.startswith("vassert_") for item in receipt["assertion_ids"])
+    assert "Issue Attention" not in repr(receipt)
+    assert "x-axis" not in repr(receipt)
+    assert "screenshot_path" not in repr(receipt)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_artifacts_do_not_turn_uncertain_inspection_into_success():
+    requirement = classify_visual_requirement(
+        "Make the dashboard chart visually balanced.",
+        worker_route="action",
+    )
+    contract = {
+        "target": {"description": "dashboard chart"},
+        "page": {"state": "already_open", "description": "dashboard page"},
+        "viewport": {"description": "current desktop viewport"},
+        "state": ["chart data loaded"],
+        "assertions": [
+            {
+                "kind": "screenshot_appearance",
+                "expectation": "The chart is visually balanced.",
+            }
+        ],
+    }
+
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self):
+            return {"ok": True, "image_bytes": b"uncertain-evidence"}
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(_images, assertions, *, on_provider_start, **_kwargs):
+        on_provider_start()
+        return {
+            "status": "uncertain",
+            "results": [
+                {
+                    "id": item["id"],
+                    "status": "uncertain",
+                    "code": "appearance_uncertain",
+                }
+                for item in assertions
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="uncertain-artifact",
+        requirement=requirement,
+        contract=contract,
+        supervisor=ScreenshotSupervisor(),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "uncertain"
+    assert result["visual_qa_receipt"]["status"] == "uncertain"
+    assert len(result["screenshot_artifacts"]) == 1
+    assert Path(result["screenshot_artifacts"][0]["screenshot_path"]).read_bytes() == (
+        b"uncertain-evidence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrated_requirement_rejects_assertions_without_semantic_contract():
+    requirement = classify_visual_requirement(
+        "Fix the Issue Attention chart on the State Brief page.",
+        worker_route="action",
+    )
+
+    result = await run_visual_assertions(
+        task_id="missing-orchestrator-contract",
+        requirement=requirement,
+        assertions=[
+            {
+                "kind": "screenshot_appearance",
+                "expectation": "The chart looks correct.",
+            }
+        ],
+        supervisor=FakeSupervisor(contained=True),
+    )
+
+    assert result == {
+        "status": "uncertain",
+        "code": "invalid_visual_contract",
+        "attempts": [],
+    }
 
 
 @pytest.mark.asyncio

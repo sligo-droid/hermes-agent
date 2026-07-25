@@ -11,7 +11,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.visual_qa import normalize_visual_requirement, visual_requirement_id
+from agent.visual_qa import (
+    normalize_visual_requirement,
+    visual_requirement_id,
+    visual_requirement_uses_orchestrator_contract,
+)
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import Platform, SessionSource, build_session_key
@@ -45,10 +49,11 @@ def _event(message_id="m1", text="ship the change"):
 
 def _visual_receipt(requirement, *, order=3, status="passed"):
     normalized = normalize_visual_requirement(requirement)
-    return {
+    coverage_ids = [item["id"] for item in normalized["assertions"]]
+    receipt = {
         "requirement_id": visual_requirement_id(normalized),
         "contract_id": "vac_" + ("a" * 24),
-        "assertion_ids": [item["id"] for item in normalized["assertions"]],
+        "assertion_ids": coverage_ids,
         "status": status,
         "attempts": 1,
         "vision_calls": 0,
@@ -56,6 +61,11 @@ def _visual_receipt(requirement, *, order=3, status="passed"):
         "diagnostic_codes": ["no_horizontal_overflow_satisfied"],
         "order": order,
     }
+    if visual_requirement_uses_orchestrator_contract(normalized):
+        receipt["coverage_ids"] = coverage_ids
+        receipt["assertion_ids"] = ["vassert_" + ("c" * 24)]
+        receipt["diagnostic_codes"] = ["appearance_satisfied"]
+    return receipt
 
 
 def _install_blocking_git(monkeypatch, tmp_path: Path) -> Path:

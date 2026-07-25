@@ -107,3 +107,101 @@ def test_state_fingerprint_contains_no_locator_material():
 
     assert len(fingerprint) == 24
     assert "protected-selector" not in fingerprint
+
+
+def test_target_screenshot_uses_only_host_authored_locator_clip():
+    supervisor = _supervisor()
+    with patch.object(
+        supervisor,
+        "trusted_element_state",
+        return_value={
+            "ok": True,
+            "visible": True,
+            "bounds": {
+                "page_x": 20,
+                "page_y": 40,
+                "width": 640,
+                "height": 360,
+            },
+        },
+    ), patch.object(
+        supervisor,
+        "_page_cdp_call",
+        return_value={
+            "ok": True,
+            "response": {"result": {"data": "cG5n"}},
+        },
+    ) as cdp_call:
+        result = supervisor.capture_screenshot_memory(
+            locator={"by": "test_id", "value": "issue-attention-graph"}
+        )
+
+    assert result == {
+        "ok": True,
+        "image_bytes": b"png",
+        "mime_type": "image/png",
+    }
+    assert cdp_call.call_args.args == (
+        "Page.captureScreenshot",
+        {
+            "format": "png",
+            "fromSurface": True,
+            "captureBeyondViewport": False,
+            "clip": {
+                "x": 20.0,
+                "y": 40.0,
+                "width": 640.0,
+                "height": 360.0,
+                "scale": 1,
+            },
+        },
+    )
+
+
+def test_responsive_screenshot_uses_bounded_viewport_and_restores_it():
+    supervisor = _supervisor()
+    calls = []
+
+    def cdp_call(method, params, **_kwargs):
+        calls.append((method, params))
+        if method == "Page.captureScreenshot":
+            return {"ok": True, "response": {"result": {"data": "cG5n"}}}
+        return {"ok": True, "response": {"result": {}}}
+
+    with patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
+        result = supervisor.capture_screenshot_memory(
+            viewport={"width": 390, "height": 844}
+        )
+
+    assert result["image_bytes"] == b"png"
+    assert calls == [
+        (
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": 390,
+                "height": 844,
+                "deviceScaleFactor": 1,
+                "mobile": False,
+            },
+        ),
+        (
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "fromSurface": True,
+                "captureBeyondViewport": False,
+            },
+        ),
+        ("Emulation.clearDeviceMetricsOverride", {}),
+    ]
+
+
+def test_responsive_screenshot_rejects_out_of_bounds_viewport_without_cdp():
+    supervisor = _supervisor()
+    with patch.object(supervisor, "_page_cdp_call") as cdp_call:
+        result = supervisor.capture_screenshot_memory(
+            viewport={"width": 100, "height": 844}
+        )
+
+    assert result == {"ok": False, "error": "invalid trusted viewport"}
+    cdp_call.assert_not_called()

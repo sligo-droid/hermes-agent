@@ -241,17 +241,12 @@ def _storage_safe_tool_args(tool_name: str, args: dict) -> dict:
     if tool_name == "browser_type" and "text" in safe_args:
         safe_args = {**safe_args, "text": "[REDACTED_BROWSER_INPUT]"}
     if tool_name == "visual_qa":
-        assertions = []
-        for raw in safe_args.get("assertions") if isinstance(safe_args.get("assertions"), list) else []:
-            if not isinstance(raw, dict):
-                continue
-            assertion_id = str(raw.get("id") or "")[:48]
-            kind = str(raw.get("kind") or "")[:48]
-            if assertion_id and kind:
-                assertions.append({"id": assertion_id, "kind": kind})
-            if len(assertions) >= 6:
-                break
-        safe_args = {"assertions": assertions}
+        try:
+            from agent.visual_assertions import storage_safe_visual_qa_args
+
+            safe_args = storage_safe_visual_qa_args(safe_args)
+        except Exception:
+            safe_args = {"assertions": []}
     return safe_args
 
 

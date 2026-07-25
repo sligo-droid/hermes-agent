@@ -738,7 +738,14 @@ class CDPSupervisor:
                 visible,
                 viewport_contained: rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight,
                 no_horizontal_overflow: node.scrollWidth <= node.clientWidth + 1,
-                bounds: {{x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)}},
+                bounds: {{
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    page_x: Math.round(rect.x + window.scrollX),
+                    page_y: Math.round(rect.y + window.scrollY),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                }},
             }};
         }})()"""
 
@@ -885,18 +892,87 @@ class CDPSupervisor:
     def capture_screenshot_memory(
         self,
         *,
+        locator: Optional[Dict[str, Any]] = None,
+        viewport: Optional[Dict[str, Any]] = None,
         timeout: float = 10.0,
         max_bytes: int = 8 * 1024 * 1024,
         execution_guard: Any = None,
     ) -> Dict[str, Any]:
-        """Capture PNG bytes in memory only; never write or persist them."""
+        """Capture PNG bytes, optionally clipped and temporarily viewport-sized."""
 
-        response = self._page_cdp_call(
-            "Page.captureScreenshot",
-            {"format": "png", "fromSurface": True, "captureBeyondViewport": False},
-            timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
-            execution_guard=execution_guard,
-        )
+        viewport_override = False
+        if viewport is not None:
+            try:
+                width = int(viewport.get("width"))
+                height = int(viewport.get("height"))
+            except (AttributeError, TypeError, ValueError):
+                return {"ok": False, "error": "invalid trusted viewport"}
+            if not (200 <= width <= 7680 and 200 <= height <= 4320):
+                return {"ok": False, "error": "invalid trusted viewport"}
+            override = self._page_cdp_call(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": 1,
+                    "mobile": False,
+                },
+                timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+                execution_guard=execution_guard,
+            )
+            if not override.get("ok"):
+                return {"ok": False, "error": "trusted viewport unavailable"}
+            viewport_override = True
+
+        try:
+            params: Dict[str, Any] = {
+                "format": "png",
+                "fromSurface": True,
+                "captureBeyondViewport": False,
+            }
+            if locator is not None:
+                state = self.trusted_element_state(
+                    locator,
+                    timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+                    execution_guard=execution_guard,
+                )
+                bounds = state.get("bounds") if isinstance(state.get("bounds"), dict) else {}
+                try:
+                    x = max(0.0, float(bounds.get("page_x")))
+                    y = max(0.0, float(bounds.get("page_y")))
+                    width = float(bounds.get("width"))
+                    height = float(bounds.get("height"))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "target screenshot bounds unavailable"}
+                if (
+                    state.get("ok") is not True
+                    or state.get("visible") is not True
+                    or width <= 0
+                    or height <= 0
+                    or width > 16_384
+                    or height > 16_384
+                ):
+                    return {"ok": False, "error": "target screenshot bounds unavailable"}
+                params["clip"] = {
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                    "scale": 1,
+                }
+            response = self._page_cdp_call(
+                "Page.captureScreenshot",
+                params,
+                timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+                execution_guard=execution_guard,
+            )
+        finally:
+            if viewport_override:
+                self._page_cdp_call(
+                    "Emulation.clearDeviceMetricsOverride",
+                    {},
+                    timeout=max(0.01, min(timeout, 10.0)),
+                )
         if not response.get("ok"):
             return response
         payload = response.get("response") or {}

@@ -55,17 +55,7 @@ ASSERTION_RESULT_CODES = frozenset(
     }
 )
 
-_MAX_TARGET_CHARS = 120
-_MAX_ASSERTION_CHARS = 240
-_MAX_CHECK_CHARS = 120
-_MAX_EVIDENCE_REF_CHARS = 240
 _MAX_ASSERTIONS = 6
-_UNSAFE_REFERENCE_RE = re.compile(
-    r"(?:https?://|\b(?:cookie|set-cookie|authorization|bearer)\b|"
-    r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\b|"
-    r"(?:^|[?&])[^\s=&]*(?:token|key|secret|password)[^\s=&]*=)",
-    re.IGNORECASE,
-)
 _ACTION_RE = re.compile(
     r"\b(?:add|build|change|create|fix|implement|make|redesign|render|replace|update)\b",
     re.IGNORECASE,
@@ -89,7 +79,6 @@ _SURFACE_RE = re.compile(
     r"sidebar|modal|dialog|control|button|chart|map|dashboard|page|screen|overflow)\b",
     re.IGNORECASE,
 )
-_SAFE_TEXT_RE = re.compile(r"[^A-Za-z0-9 .,:;()/_+-]+")
 _RECEIPT_ID_RE = re.compile(r"^(?:vrq|vac)_[0-9a-f]{24}$")
 _OPAQUE_REQUIREMENT_RE = re.compile(r"^(?:vtarget|vassert)_[0-9a-f]{24}$")
 _ASSERTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
@@ -103,7 +92,12 @@ _VIEWPORT_CONTAINMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _HOST_ASSERTION_KINDS = frozenset(
-    {"no_horizontal_overflow", "viewport_contained", "screenshot_appearance"}
+    {
+        "no_horizontal_overflow",
+        "orchestrator_contract",
+        "viewport_contained",
+        "screenshot_appearance",
+    }
 )
 _ACTIVE_VISUAL_REQUIREMENT: contextvars.ContextVar[dict[str, Any] | None] = (
     contextvars.ContextVar("hermes_active_visual_requirement", default=None)
@@ -135,33 +129,6 @@ def _route_is_actionable(value: Any) -> bool:
         "implementer",
         "worker",
     }
-
-
-def _clean_text(value: Any, *, limit: int) -> str:
-    text = " ".join(str(value or "").split())
-    text = _SAFE_TEXT_RE.sub("", text).strip(" .,:;/-")
-    return text[:limit].rstrip()
-
-
-def _safe_reference(value: Any) -> str:
-    text = " ".join(str(value or "").split())
-    if not text or len(text) > _MAX_EVIDENCE_REF_CHARS or _UNSAFE_REFERENCE_RE.search(text):
-        return ""
-    return _clean_text(text, limit=_MAX_EVIDENCE_REF_CHARS)
-
-
-def _safe_requirement_text(value: Any, *, limit: int) -> str:
-    """Return display-safe request metadata, dropping credential-bearing text."""
-    text = " ".join(str(value or "").split())
-    if not text or _UNSAFE_REFERENCE_RE.search(text):
-        return ""
-    return _clean_text(text, limit=limit)
-
-
-def _bounded_safe_value(value: Any, *, limit: int) -> bool:
-    """Reject (rather than silently truncate) possible raw tool output/secrets."""
-    text = " ".join(str(value or "").split())
-    return bool(text) and len(text) <= limit and not _UNSAFE_REFERENCE_RE.search(text)
 
 
 def _clamped_int(raw: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -314,6 +281,17 @@ def visual_requirement_id(value: Any) -> str:
     return "vrq_" + hashlib.sha256(encoded).hexdigest()[:24]
 
 
+def visual_requirement_uses_orchestrator_contract(value: Any) -> bool:
+    """Return whether semantics must be supplied by the action orchestrator."""
+
+    normalized = normalize_visual_requirement(value)
+    assertions = normalized.get("assertions") or []
+    return bool(assertions) and all(
+        isinstance(item, dict) and item.get("kind") == "orchestrator_contract"
+        for item in assertions
+    )
+
+
 def set_active_visual_requirement(value: Any) -> None:
     """Bind the trusted visual requirement to the current task context."""
 
@@ -332,36 +310,6 @@ def get_active_visual_requirement() -> dict[str, Any]:
         "target": "",
         "assertions": [],
     }
-
-
-def _target_from_text(text: str, level: str) -> str:
-    if level == "artifact":
-        match = re.search(r".{0,45}\b(?:png|pdf|canvas|image|svg|export)\b.{0,45}", text, re.IGNORECASE)
-    else:
-        match = re.search(r".{0,45}" + _SURFACE_RE.pattern + r".{0,45}", text, re.IGNORECASE)
-    target = _safe_requirement_text(match.group(0) if match else "", limit=_MAX_TARGET_CHARS)
-    return target or ("rendered artifact" if level == "artifact" else "rendered surface")
-
-
-def _assertions_from_text(text: str, level: str, target: str) -> list[str]:
-    candidates: list[str] = []
-    for sentence in re.split(r"(?<=[.!?;])\s+|\n+", text):
-        if not sentence.strip():
-            continue
-        if level == "artifact" and _ARTIFACT_RE.search(sentence):
-            candidates.append(sentence)
-        elif level == "surface" and _SURFACE_RE.search(sentence):
-            candidates.append(sentence)
-    cleaned = [_safe_requirement_text(item, limit=_MAX_ASSERTION_CHARS) for item in candidates]
-    cleaned = [item for item in cleaned if item]
-    if cleaned:
-        return cleaned[:_MAX_ASSERTIONS]
-    # A classified explicit implementation request still gets a narrowly
-    # phrased assertion.  It is a receipt requirement, not a claim that a
-    # generic navigation already proved the result.
-    if level == "artifact":
-        return [f"{target} renders as requested without clipping or missing content"]
-    return [f"{target} renders at the requested viewport without unintended overflow"]
 
 
 def classify_visual_requirement(
@@ -392,16 +340,23 @@ def classify_visual_requirement(
     level = "artifact" if _ARTIFACT_RE.search(text) else ("surface" if _SURFACE_RE.search(text) else "none")
     if level == "none":
         return {"level": "none", "target": "", "assertions": []}
-    # Changed paths remain advisory only. The trusted action route can support
-    # rendered-surface text without requiring the user to phrase it as an
-    # imperative, but it cannot create a visual requirement without that text.
+    # Intake owns only the explicit visual/artifact applicability gate.  The
+    # action orchestrator owns the transient semantic execution contract during
+    # its normal implementation turn; do not invent targets or assertions here
+    # from a finite request vocabulary.
     _ = changed_paths
-    target = _target_from_text(text, level)
+    target = _opaque_requirement_value(f"{level}:{structured_text}", "vtarget")
+    coverage_id = _opaque_requirement_value(
+        f"{level}:orchestrator_contract:{structured_text}",
+        "vassert",
+    )
     return normalize_visual_requirement(
         {
             "level": level,
             "target": target,
-            "assertions": _assertions_from_text(structured_text, level, target),
+            "assertions": [
+                {"id": coverage_id, "kind": "orchestrator_contract"}
+            ],
         }
     )
 
@@ -419,6 +374,7 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
     allowed_fields = {
         "requirement_id",
         "contract_id",
+        "coverage_ids",
         "assertion_ids",
         "status",
         "attempts",
@@ -432,6 +388,7 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
     requirement_id = str(raw.get("requirement_id") or "").strip().lower()
     contract_id = str(raw.get("contract_id") or "").strip().lower()
     assertion_ids = raw.get("assertion_ids")
+    coverage_ids = raw.get("coverage_ids")
     status = str(raw.get("status") or "").strip().lower()
     status = {
         "pass": "passed",
@@ -466,8 +423,22 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
         if not all(isinstance(item, dict) for item in required_assertions):
             return None
         required_ids = [str(item.get("id") or "") for item in required_assertions]
-        if len(required_ids) != len(normalized_ids) or set(required_ids) != set(normalized_ids):
-            return None
+        if visual_requirement_uses_orchestrator_contract(requirement_value):
+            if not isinstance(coverage_ids, (list, tuple)):
+                return None
+            normalized_coverage_ids = [str(item or "").strip() for item in coverage_ids]
+            if (
+                len(normalized_coverage_ids) != len(required_ids)
+                or normalized_coverage_ids != required_ids
+                or any(not _OPAQUE_REQUIREMENT_RE.fullmatch(item) for item in normalized_ids)
+            ):
+                return None
+        else:
+            normalized_coverage_ids = []
+            if len(required_ids) != len(normalized_ids) or set(required_ids) != set(normalized_ids):
+                return None
+    else:
+        normalized_coverage_ids = []
 
     def _metric(name: str, maximum: int) -> int:
         try:
@@ -499,6 +470,8 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
         "duration_ms": _metric("duration_ms", 60_000),
         "diagnostic_codes": diagnostic_codes,
     }
+    if normalized_coverage_ids:
+        safe["coverage_ids"] = normalized_coverage_ids
     order = _metric("order", 2_147_483_647)
     if order > 0:
         safe["order"] = order
@@ -546,9 +519,11 @@ def build_visual_qa_followup_nudge(
         return None
     return (
         "[System: This explicit visual change needs one compact visual-QA receipt before finishing. "
-        f"You must call the `visual_qa` tool for the smallest relevant {normalized['level']} target "
-        "described by the accepted request and check every classified visual requirement. "
-        "Use declarative assertions and an explicit passed/failed/blocked/uncertain result. "
+        f"You must call the `visual_qa` tool for the smallest relevant {normalized['level']} target. "
+        "Using the full accepted request/thread and your code understanding, formulate the transient "
+        "target, page/browser state, viewport/state assumptions, and concrete declarative assertions. "
+        "The host binds that contract to the trusted requirement and the bounded inspector—not you—"
+        "decides passed/failed/blocked/uncertain. "
         "Do not attach receipt arguments to terminal, "
         "browser, or vision tools. Do not treat navigation, a generic screenshot, or console success "
         "as proof; if inspection is unavailable, let `visual_qa` record the concrete blocker.]"
@@ -568,4 +543,5 @@ __all__ = [
     "set_active_visual_requirement",
     "visual_receipt_completion",
     "visual_requirement_id",
+    "visual_requirement_uses_orchestrator_contract",
 ]

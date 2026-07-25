@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent.provider_progress import clear_provider_progress_signal, latest_provider_progress_signal
-from agent.visual_qa import normalize_visual_requirement, visual_requirement_id
+from agent.visual_qa import (
+    classify_visual_requirement,
+    normalize_visual_requirement,
+    visual_requirement_id,
+    visual_requirement_uses_orchestrator_contract,
+)
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
@@ -69,6 +74,10 @@ def _visual_receipt(requirement, *, order=3, status="passed", evidence_ref=""):
         "diagnostic_codes": ["no_horizontal_overflow_satisfied"],
         "order": order,
     }
+    if visual_requirement_uses_orchestrator_contract(normalized):
+        receipt["coverage_ids"] = assertion_ids
+        receipt["assertion_ids"] = ["vassert_" + ("c" * 24)]
+        receipt["diagnostic_codes"] = ["appearance_satisfied"]
     if evidence_ref:
         receipt["evidence_ref"] = evidence_ref
     return receipt
@@ -328,7 +337,7 @@ def test_ledger_persists_normalized_visual_requirement_from_feature_summary(tmp_
     assert requirement["level"] == "surface"
     assert requirement["target"].startswith("vtarget_")
     assert all(
-        item["id"].startswith("vassert_") and item["kind"] == "screenshot_appearance"
+        item["id"].startswith("vassert_") and item["kind"] == "orchestrator_contract"
         for item in requirement["assertions"]
     )
     assert "responsive dashboard" not in repr(requirement).lower()
@@ -401,17 +410,17 @@ def test_shadow_visual_qa_reports_missing_fresh_receipt_without_blocking(tmp_pat
 def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     from gateway.run import _visual_qa_context_prompt, _visual_qa_turn_result
 
-    requirement = normalize_visual_requirement(
-        {
-            "level": "surface",
-            "target": "responsive dashboard",
-            "assertions": ["dashboard has no unintended overflow"],
-        }
+    requirement = classify_visual_requirement(
+        "Build a responsive dashboard with a mobile sidebar.",
+        worker_route="action",
     )
     config = {"mode": "enforce_explicit", "max_receipts_per_turn": 1, "max_followup_turns": 1}
     prompt = _visual_qa_context_prompt(requirement, config)
     assert "mode=enforce_explicit" in prompt
-    assert "call the dedicated `visual_qa` tool" in prompt
+    assert "call `visual_qa`" in prompt
+    assert "you own the transient semantic contract" in prompt
+    assert "smallest relevant target/region" in prompt
+    assert "bounded inspector—not your prose—decides pass/fail" in prompt
     assert "attach receipt arguments" in prompt
     assert "Generic navigation" in prompt
 

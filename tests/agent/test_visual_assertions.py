@@ -1,4 +1,45 @@
-from agent.visual_assertions import aggregate_assertion_results, validate_visual_assertions
+from agent.visual_assertions import (
+    aggregate_assertion_results,
+    normalize_orchestrated_visual_contract,
+    storage_safe_visual_qa_args,
+    validate_visual_assertions,
+    visual_execution_contract_id,
+)
+
+
+def _incident_contract():
+    return {
+        "target": {
+            "description": "Issue Attention graph region",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+        },
+        "page": {
+            "state": "prepared",
+            "description": "State Brief page with Issue Attention visible",
+        },
+        "viewport": {
+            "description": "current desktop viewport",
+            "width": 1440,
+            "height": 900,
+        },
+        "state": ["chart data loaded", "bars and both axes visible"],
+        "assertions": [
+            {
+                "kind": "screenshot_appearance",
+                "expectation": (
+                    "Every rounded bar terminates above the x-axis; no filled polygon crosses "
+                    "the baseline."
+                ),
+            },
+            {
+                "kind": "screenshot_appearance",
+                "expectation": (
+                    "Y-axis labels are visible and intentionally subtle without competing with "
+                    "the bars."
+                ),
+            },
+        ],
+    }
 
 
 def test_validation_accepts_bounded_declarative_assertions():
@@ -68,3 +109,118 @@ def test_aggregate_fails_closed_for_every_non_pass_status():
     assert aggregate_assertion_results([{"id": "a", "status": "failed", "code": "exists_mismatch"}])["status"] == "failed"
     assert aggregate_assertion_results([{"id": "a", "status": "passed", "code": "model_prose"}])["status"] == "uncertain"
     assert aggregate_assertion_results([])["status"] == "uncertain"
+
+
+def test_orchestrated_contract_preserves_rich_semantics_only_transiently():
+    raw = _incident_contract()
+
+    normalized = normalize_orchestrated_visual_contract(raw)
+    safe = storage_safe_visual_qa_args(raw)
+
+    assert normalized["target"]["description"] == "Issue Attention graph region"
+    assert normalized["page"]["state"] == "prepared"
+    assert normalized["viewport"]["width"] == 1440
+    assert normalized["state"] == ["chart data loaded", "bars and both axes visible"]
+    assert normalized["artifacts"] == [
+        {
+            "kind": "focused",
+            "description": "Issue Attention graph region",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+            "viewport": raw["viewport"],
+        },
+        {
+            "kind": "context",
+            "description": "Surrounding page context",
+            "viewport": raw["viewport"],
+        },
+    ]
+    assert len(normalized["assertions"]) == 2
+    assert all(item["id"].startswith("vassert_") for item in normalized["assertions"])
+    assert safe == {
+        "contract_id": visual_execution_contract_id(normalized),
+        "assertions": [
+            {"id": item["id"], "kind": "screenshot_appearance"}
+            for item in normalized["assertions"]
+        ],
+    }
+    serialized = repr(safe)
+    assert "Issue Attention" not in serialized
+    assert "x-axis" not in serialized
+    assert "y-axis" not in serialized.lower()
+    assert "issue-attention-graph" not in serialized
+
+
+def test_orchestrated_contract_deduplicates_and_bounds_screenshot_artifacts():
+    raw = _incident_contract()
+    raw["artifacts"] = [
+        {
+            "kind": "focused",
+            "description": "Changed chart",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+        },
+        {
+            "kind": "focused",
+            "description": "Duplicate capture",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+        },
+        {
+            "kind": "context",
+            "description": "State Brief context",
+        },
+        {
+            "kind": "responsive",
+            "description": "Narrow chart layout",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+            "viewport": {
+                "description": "narrow responsive viewport",
+                "width": 390,
+                "height": 844,
+            },
+        },
+    ]
+
+    normalized = normalize_orchestrated_visual_contract(raw)
+
+    assert [item["kind"] for item in normalized["artifacts"]] == [
+        "focused",
+        "context",
+        "responsive",
+    ]
+    assert normalized["artifacts"][2]["viewport"]["width"] == 390
+
+    raw["artifacts"].append(
+        {"kind": "context", "description": "A fifth requested screenshot"}
+    )
+    assert normalize_orchestrated_visual_contract(raw) == {}
+
+
+def test_responsive_artifact_requires_bounded_dimensions():
+    raw = _incident_contract()
+    raw["artifacts"] = [
+        {
+            "kind": "responsive",
+            "description": "Narrow chart layout",
+            "viewport": {"description": "narrow responsive viewport"},
+        }
+    ]
+
+    assert normalize_orchestrated_visual_contract(raw) == {}
+
+
+def test_orchestrated_contract_requires_visual_judgement_and_rejects_protected_surfaces():
+    no_appearance = _incident_contract()
+    no_appearance["assertions"] = [
+        {
+            "kind": "visible",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+        }
+    ]
+    unsafe_url = _incident_contract()
+    unsafe_url["page"]["description"] = "https://internal.example.test/state-brief"
+    unsafe_execution = _incident_contract()
+    unsafe_execution["assertions"][0]["javascript"] = "document.body"
+
+    assert normalize_orchestrated_visual_contract(no_appearance) == {}
+    assert normalize_orchestrated_visual_contract(unsafe_url) == {}
+    assert normalize_orchestrated_visual_contract(unsafe_execution) == {}
+    assert storage_safe_visual_qa_args(unsafe_execution) == {"assertions": []}
