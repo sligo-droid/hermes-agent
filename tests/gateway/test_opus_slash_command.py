@@ -136,7 +136,7 @@ async def test_opus_plan_command_routes_through_normal_agent_with_opus_override(
     assert agent_event.text == "PLAN SKILL: build X"
     assert agent_event.invoked_skill_command == "opus"
     assert agent_event.opus_enabled_toolsets == ["file", "terminal", "web", "browser", "discord"]
-    assert agent_event.opus_reasoning_config == {"enabled": True, "effort": "high"}
+    assert agent_event.opus_reasoning_config == {"enabled": True, "effort": "medium"}
     assert agent_event.opus_transcript_user_message == "/opus plan build X"
     assert build_session_key(agent_event.source) not in runner._session_model_overrides
 
@@ -441,7 +441,7 @@ def test_opus_run_agent_disables_fallback_and_restricts_provider(monkeypatch):
     assert captured["model"] == "claude-opus-5"
     assert captured["provider"] == "anthropic"
     assert captured["enabled_toolsets"] == ["file", "terminal", "web", "browser", "discord"]
-    assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
     assert captured["fallback_model"] is None
     assert captured["providers_allowed"] == ["anthropic"]
 
