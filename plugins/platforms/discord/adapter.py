@@ -2536,6 +2536,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return "⏳ Running"
         return "⏳ In progress"
 
+    def _feature_summary_message_has_status(self, message: Any, status: str) -> bool:
+        """Return whether a fetched feature-summary embed already has ``status``."""
+
+        expected = self._summary_status_label(status)
+        for embed in getattr(message, "embeds", None) or []:
+            for field in getattr(embed, "fields", None) or []:
+                name = getattr(field, "name", None)
+                value = getattr(field, "value", None)
+                if isinstance(field, dict):
+                    name = field.get("name", name)
+                    value = field.get("value", value)
+                if str(name or "").strip().lower() == "status":
+                    return str(value or "").strip() == expected
+        return False
+
     def _summary_color(self, status: str):
         try:
             lower = status.lower()
@@ -6405,7 +6420,14 @@ class DiscordAdapter(BasePlatformAdapter):
         item: Dict[str, Any],
         state: Optional[str] = None,
     ) -> Optional[str]:
-        """Repair a thread-origin reaction using only persisted ledger metadata."""
+        """Repair every persisted terminal visual for a Discord work item.
+
+        A terminal work item has two user-visible status targets: the feature
+        summary embed and the post that opened its thread.  Treat them as one
+        durable operation.  In particular, do not clear the ledger retry flag
+        merely because one reaction call was attempted; startup recovery must
+        be able to retry whenever either visual remains stale.
+        """
 
         ledger = self._work_ledger_for_reactions()
         if ledger is None or not isinstance(item, dict):
@@ -6418,24 +6440,110 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id = str(source.get("thread_id") or "").strip()
         if not thread_id and str(source.get("chat_type") or "").strip() == "thread":
             thread_id = str(source.get("chat_id") or "").strip()
-        message = None
-        if thread_id:
-            thread = await self._resolve_summary_channel(thread_id)
-            if thread is not None:
-                message = await self._thread_origin_message(thread)
-        else:
-            channel_id = str(source.get("chat_id") or "").strip()
-            message_id = str(item.get("message_id") or source.get("message_id") or "").strip()
-            channel = await self._resolve_summary_channel(channel_id)
-            fetch_message = getattr(channel, "fetch_message", None)
-            if callable(fetch_message) and message_id.isdigit():
+
+        feature_summary = item.get("feature_summary")
+        if isinstance(feature_summary, dict):
+            summary_status = {
+                "done": "Complete",
+                "blocked": "Blocked",
+                "errored": "Failed",
+                "running": "Running",
+                "active": "In progress",
+                "foreman": "Foreman",
+            }.get(str(resolved_state or "").strip(), "In progress")
+            summary_thread_id = str(feature_summary.get("thread_id") or thread_id).strip()
+            summary_thread = None
+            if summary_thread_id:
+                summary_thread = await self._resolve_summary_channel(summary_thread_id)
+            if summary_thread is None:
+                return None
+
+            summary_message_id = str(feature_summary.get("message_id") or "").strip()
+            fetch_summary = getattr(summary_thread, "fetch_message", None)
+            if not summary_message_id.isdigit() or not callable(fetch_summary):
+                return None
+            try:
+                summary_message = await fetch_summary(int(summary_message_id))
+            except Exception:
+                return None
+            if summary_message is None:
+                return None
+            if not self._feature_summary_message_has_status(summary_message, summary_status):
                 try:
-                    message = await fetch_message(int(message_id))
+                    summary_ok = await self.update_feature_summary(
+                        feature_summary,
+                        final_response=str(item.get("final_response") or ""),
+                        status=summary_status,
+                        title=str(item.get("title") or "") or None,
+                        runtime_breakdown=(
+                            item.get("runtime_breakdown")
+                            if isinstance(item.get("runtime_breakdown"), dict)
+                            else None
+                        ),
+                    )
                 except Exception:
-                    message = None
-        if message is None or not hasattr(message, "add_reaction"):
-            return None
-        await self._set_message_reaction_state(message, emoji)
+                    logger.debug(
+                        "[%s] Failed to reconcile Discord feature summary for %s",
+                        self.name,
+                        item.get("id"),
+                        exc_info=True,
+                    )
+                    return None
+                if not summary_ok:
+                    return None
+                try:
+                    # Refresh after the embed edit: the pre-edit reaction cache can
+                    # still report the old hourglass even when the edit's helper
+                    # already changed it.
+                    summary_message = await fetch_summary(int(summary_message_id))
+                except Exception:
+                    return None
+            if (
+                summary_message is None
+                or not hasattr(summary_message, "add_reaction")
+                or not await self._set_message_reaction_state(summary_message, emoji)
+            ):
+                return None
+
+            try:
+                source_messages = await self._feature_summary_source_reaction_messages(
+                    feature_summary,
+                    summary_thread,
+                    summary_message=summary_message,
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to resolve Discord feature-summary source for %s",
+                    self.name,
+                    item.get("id"),
+                    exc_info=True,
+                )
+                return None
+            if not source_messages:
+                return None
+            for message in source_messages:
+                if not await self._set_message_reaction_state(message, emoji):
+                    return None
+        else:
+            message = None
+            if thread_id:
+                thread = await self._resolve_summary_channel(thread_id)
+                if thread is not None:
+                    message = await self._thread_origin_message(thread)
+            else:
+                channel_id = str(source.get("chat_id") or "").strip()
+                message_id = str(item.get("message_id") or source.get("message_id") or "").strip()
+                channel = await self._resolve_summary_channel(channel_id)
+                fetch_message = getattr(channel, "fetch_message", None)
+                if callable(fetch_message) and message_id.isdigit():
+                    try:
+                        message = await fetch_message(int(message_id))
+                    except Exception:
+                        message = None
+            if message is None or not hasattr(message, "add_reaction"):
+                return None
+            if not await self._set_message_reaction_state(message, emoji):
+                return None
         ledger.mark_discord_thread_reaction_synced(item)
         return resolved_state
 
@@ -6447,14 +6555,22 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[%s] Failed to reopen Discord feature summary: %s", self.name, exc)
 
-    async def _set_message_reaction_state(self, message: Any, emoji: Optional[str]) -> None:
+    async def _set_message_reaction_state(self, message: Any, emoji: Optional[str]) -> bool:
+        """Set one status reaction and report whether every mutation succeeded."""
+
+        success = True
         target_present = self._message_has_own_reaction(message, emoji) if emoji else False
         for existing in _DISCORD_STATUS_REACTION_EMOJIS:
             if emoji and existing == emoji:
                 continue
-            await self._remove_reaction(message, existing)
+            existing_present = self._message_has_own_reaction(message, existing)
+            removed = await self._remove_reaction(message, existing)
+            if existing_present is True and not removed:
+                success = False
         if emoji and target_present is not True:
-            await self._add_reaction(message, emoji)
+            if not await self._add_reaction(message, emoji):
+                success = False
+        return success
 
     def _message_has_own_reaction(self, message: Any, emoji: Optional[str]) -> Optional[bool]:
         if not emoji:
@@ -7126,6 +7242,16 @@ class DiscordAdapter(BasePlatformAdapter):
                     ledger_state = ledger.discord_thread_reaction_state(work_item)
             except Exception as exc:
                 logger.debug("[%s] Failed to aggregate Discord work reaction: %s", self.name, exc)
+        if (
+            isinstance(work_item, dict)
+            and work_item.get("terminal_reaction_sync_pending") is True
+            and ledger_state in {"done", "blocked", "errored"}
+        ):
+            # The persisted terminal reconciliation covers both the summary
+            # embed and its OP.  Do not fall through and clear its retry marker
+            # after only attempting the event's raw-message reaction.
+            await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
+            return
         action_lifecycle = self._action_lifecycle_enabled(event)
         is_premium_event = action_lifecycle and (self._is_fable_event(event) or self._is_opus_event(event))
         kanban_state = None
@@ -7138,35 +7264,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
         kanban_emoji = self._feature_kanban_reaction_emoji(kanban_state)
         ledger_emoji = self._feature_kanban_reaction_emoji(ledger_state)
-        has_feature_summary = action_lifecycle and getattr(event, "feature_summary", None) is not None
         messages = await self._processing_reaction_messages(event)
         if not messages and isinstance(work_item, dict) and ledger_state:
             await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
             return
+        outcome_emoji = {
+            ProcessingOutcome.SUCCESS: "✅",
+            ProcessingOutcome.FAILURE: "❌",
+        }.get(outcome)
+        reactions_synced = True
         for message in messages:
             if not hasattr(message, "add_reaction"):
                 continue
-            if kanban_emoji:
-                await self._set_message_reaction_state(message, kanban_emoji)
-                continue
-            if ledger_emoji:
-                await self._set_message_reaction_state(message, ledger_emoji)
-                continue
-            if not has_feature_summary:
-                if outcome == ProcessingOutcome.SUCCESS:
-                    await self._set_message_reaction_state(message, "✅")
-                elif outcome == ProcessingOutcome.FAILURE:
-                    await self._set_message_reaction_state(message, "❌")
-                else:
-                    await self._set_message_reaction_state(message, None)
-                continue
-            if outcome == ProcessingOutcome.SUCCESS:
-                await self._set_message_reaction_state(message, "✅")
-            elif outcome == ProcessingOutcome.FAILURE:
-                await self._set_message_reaction_state(message, "❌")
-            else:
-                await self._set_message_reaction_state(message, None)
-        if ledger is not None and isinstance(work_item, dict) and ledger_state:
+            target_emoji = kanban_emoji or ledger_emoji or outcome_emoji
+            reactions_synced = bool(
+                await self._set_message_reaction_state(message, target_emoji)
+            ) and reactions_synced
+        if (
+            reactions_synced
+            and ledger is not None
+            and isinstance(work_item, dict)
+            and ledger_state
+        ):
             ledger.mark_discord_thread_reaction_synced(work_item)
 
     async def send(
