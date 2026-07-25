@@ -11,8 +11,12 @@ make_image tool several turns earlier must not leak onto a later
 text-only reply, even when the path-based dedup set fails to capture it.
 """
 
-import pytest
+import json
 import re
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 
 def extract_media_tags_fixed(result_messages, history_len):
@@ -351,6 +355,164 @@ caption
         tags, _ = _collect_auto_append_media_tags(messages, history_offset=0)
 
         assert tags == ["MEDIA:/tmp/browser/shot.png"]
+
+    def test_gateway_auto_attaches_bounded_visual_qa_artifacts_with_dedupe_and_cap(self):
+        """Visual-QA screenshots are first-party evidence even on uncertain receipts."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        artifacts = [
+            {"kind": "focused", "screenshot_path": "/tmp/qa/focused.png"},
+            {"kind": "context", "screenshot_path": "/tmp/qa/context.png"},
+            {"kind": "context", "screenshot_path": "/tmp/qa/focused.png"},
+            {"kind": "responsive", "screenshot_path": "/tmp/qa/mobile.png"},
+            {"kind": "responsive", "screenshot_path": "/tmp/qa/tablet.png"},
+            {"kind": "responsive", "screenshot_path": "/tmp/qa/overflow.png"},
+        ]
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "qa", "function": {"name": "visual_qa"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "qa",
+                "content": json.dumps(
+                    {
+                        "status": "uncertain",
+                        "visual_qa_receipt": {"status": "uncertain"},
+                        "screenshot_artifacts": artifacts,
+                    }
+                ),
+            },
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == [
+            "MEDIA:/tmp/qa/focused.png",
+            "MEDIA:/tmp/qa/context.png",
+            "MEDIA:/tmp/qa/mobile.png",
+            "MEDIA:/tmp/qa/tablet.png",
+        ]
+        assert voice is False
+
+    def test_gateway_dedupes_visual_qa_artifacts_against_history(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "qa", "function": {"name": "visual_qa"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "qa",
+                "content": json.dumps(
+                    {
+                        "status": "passed",
+                        "screenshot_artifacts": [
+                            {
+                                "kind": "focused",
+                                "screenshot_path": "/tmp/qa/focused.png",
+                            },
+                            {
+                                "kind": "context",
+                                "screenshot_path": "/tmp/qa/context.png",
+                            },
+                        ],
+                    }
+                ),
+            },
+        ]
+
+        tags, _ = _collect_auto_append_media_tags(
+            messages,
+            history_offset=0,
+            history_media_paths={"/tmp/qa/focused.png"},
+        )
+
+        assert tags == ["MEDIA:/tmp/qa/context.png"]
+
+    @pytest.mark.asyncio
+    async def test_visual_qa_artifacts_batch_through_existing_media_delivery(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+        from gateway.run import GatewayRunner, _append_auto_media_tags
+        from gateway.session import SessionSource
+
+        root = tmp_path / "screenshots"
+        root.mkdir()
+        focused = root / "focused.png"
+        context = root / "context.png"
+        focused.write_bytes(b"focused")
+        context.write_bytes(b"context")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (root,),
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "qa", "function": {"name": "visual_qa"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "qa",
+                "content": json.dumps(
+                    {
+                        "status": "passed",
+                        "screenshot_artifacts": [
+                            {"kind": "focused", "screenshot_path": str(focused)},
+                            {"kind": "context", "screenshot_path": str(context)},
+                        ],
+                    }
+                ),
+            },
+        ]
+        response = _append_auto_media_tags("Visual QA passed.", messages, history_offset=0)
+        event = MessageEvent(
+            text="implement this",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="thread-1",
+                chat_type="channel",
+                thread_id="thread-1",
+            ),
+            message_id="message-1",
+        )
+        adapter = SimpleNamespace(
+            name="discord",
+            extract_media=BasePlatformAdapter.extract_media,
+            extract_images=BasePlatformAdapter.extract_images,
+            extract_local_files=BasePlatformAdapter.extract_local_files,
+            send_multiple_images=AsyncMock(),
+            send_voice=AsyncMock(),
+            send_document=AsyncMock(),
+            send_video=AsyncMock(),
+        )
+        runner = SimpleNamespace(
+            _thread_metadata_for_source=lambda _source, _anchor=None: {
+                "thread_id": "thread-1"
+            },
+            _reply_anchor_for_event=lambda _event: None,
+        )
+
+        await GatewayRunner._deliver_media_from_response(
+            runner,
+            response,
+            event,
+            adapter,
+        )
+
+        adapter.send_multiple_images.assert_awaited_once()
+        assert [
+            image[0] for image in adapter.send_multiple_images.await_args.kwargs["images"]
+        ] == [f"file://{focused}", f"file://{context}"]
 
     def test_gateway_appends_missing_screenshot_when_response_has_media(self):
         """One explicit attachment must not suppress other QA screenshots."""

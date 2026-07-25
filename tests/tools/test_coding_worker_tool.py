@@ -320,6 +320,7 @@ def test_worker_prompt_preserves_visual_requirement_and_dev_first_inspection(
     assert "Originating trusted visual-QA requirement" in prompt
     assert '"level":"surface"' in prompt
     assert "parent action orchestrator owns the transient `visual_qa`" in prompt
+    assert "focused/context/responsive screenshot evidence" in prompt
     assert "do not invent or self-declare a receipt" in prompt
     local = prompt.index("http://127.0.0.1:5173/")
     external = prompt.index("https://dev.example.test/")

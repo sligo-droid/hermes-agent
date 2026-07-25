@@ -43,7 +43,8 @@ def test_visual_qa_schema_has_no_arbitrary_execution_or_protected_inputs():
     assert VISUAL_QA_SCHEMA["parameters"]["additionalProperties"] is False
     property_names = {name.lower() for name in _schema_property_names(VISUAL_QA_SCHEMA)}
     assert VISUAL_QA_SCHEMA["parameters"]["required"] == ["assertions"]
-    assert {"target", "page", "viewport", "state", "assertions"} <= property_names
+    assert {"target", "page", "viewport", "state", "artifacts", "assertions"} <= property_names
+    assert VISUAL_QA_SCHEMA["parameters"]["properties"]["artifacts"]["maxItems"] == 4
     assert "receipt_assertions" not in property_names
     assert property_names.isdisjoint(
         {

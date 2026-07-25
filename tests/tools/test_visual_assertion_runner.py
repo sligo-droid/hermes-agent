@@ -1,5 +1,6 @@
 import asyncio
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -103,27 +104,35 @@ async def test_incident_contract_is_orchestrator_supplied_and_target_scoped():
     }
 
     class IncidentSupervisor(FakeSupervisor):
-        captured_locator = None
+        capture_calls = None
 
-        def capture_screenshot_memory(self, *, locator=None):
-            self.captured_locator = locator
-            return {"ok": True, "image_bytes": b"png"}
+        def capture_screenshot_memory(self, *, locator=None, viewport=None):
+            if self.capture_calls is None:
+                self.capture_calls = []
+            self.capture_calls.append({"locator": locator, "viewport": viewport})
+            return {
+                "ok": True,
+                "image_bytes": b"focused-png" if locator else b"context-png",
+            }
 
     supervisor = IncidentSupervisor(contained=True)
     seen_context = {}
+    seen_images = []
 
-    async def sweeper(*_args, on_provider_start, **_kwargs):
+    async def sweeper(images, *, on_provider_start, **_kwargs):
+        seen_images.append(("sweep", list(images)))
         on_provider_start()
         return True
 
     async def evaluator(
-        _image,
+        images,
         assertions,
         *,
         execution_context,
         on_provider_start,
         **_kwargs,
     ):
+        seen_images.append(("inspect", list(images)))
         seen_context.update(execution_context)
         on_provider_start()
         return {
@@ -148,21 +157,104 @@ async def test_incident_contract_is_orchestrator_supplied_and_target_scoped():
     )
 
     assert result["status"] == "passed"
-    assert supervisor.captured_locator == {
-        "by": "test_id",
-        "value": "issue-attention-graph",
-    }
+    assert supervisor.capture_calls == [
+        {
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+            "viewport": {"width": 1440, "height": 900},
+        },
+        {"locator": None, "viewport": {"width": 1440, "height": 900}},
+    ]
+    assert seen_images[0][0] == "sweep"
+    assert seen_images[1] == ("inspect", seen_images[0][1])
+    assert len(seen_images[0][1]) == 2
     assert seen_context == {
         "target": {"description": "Issue Attention graph region"},
         "page": contract["page"],
         "viewport": contract["viewport"],
         "state": contract["state"],
+        "artifacts": [
+            {
+                "kind": "focused",
+                "description": "Issue Attention graph region",
+                "viewport": contract["viewport"],
+            },
+            {
+                "kind": "context",
+                "description": "Surrounding page context",
+                "viewport": contract["viewport"],
+            },
+        ],
     }
+    artifacts = result["screenshot_artifacts"]
+    assert [item["kind"] for item in artifacts] == ["focused", "context"]
+    assert [Path(item["screenshot_path"]).read_bytes() for item in artifacts] == [
+        b"focused-png",
+        b"context-png",
+    ]
     receipt = result["visual_qa_receipt"]
     assert receipt["coverage_ids"] == [requirement["assertions"][0]["id"]]
     assert all(item.startswith("vassert_") for item in receipt["assertion_ids"])
     assert "Issue Attention" not in repr(receipt)
     assert "x-axis" not in repr(receipt)
+    assert "screenshot_path" not in repr(receipt)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_artifacts_do_not_turn_uncertain_inspection_into_success():
+    requirement = classify_visual_requirement(
+        "Make the dashboard chart visually balanced.",
+        worker_route="action",
+    )
+    contract = {
+        "target": {"description": "dashboard chart"},
+        "page": {"state": "already_open", "description": "dashboard page"},
+        "viewport": {"description": "current desktop viewport"},
+        "state": ["chart data loaded"],
+        "assertions": [
+            {
+                "kind": "screenshot_appearance",
+                "expectation": "The chart is visually balanced.",
+            }
+        ],
+    }
+
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self):
+            return {"ok": True, "image_bytes": b"uncertain-evidence"}
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(_images, assertions, *, on_provider_start, **_kwargs):
+        on_provider_start()
+        return {
+            "status": "uncertain",
+            "results": [
+                {
+                    "id": item["id"],
+                    "status": "uncertain",
+                    "code": "appearance_uncertain",
+                }
+                for item in assertions
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="uncertain-artifact",
+        requirement=requirement,
+        contract=contract,
+        supervisor=ScreenshotSupervisor(),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "uncertain"
+    assert result["visual_qa_receipt"]["status"] == "uncertain"
+    assert len(result["screenshot_artifacts"]) == 1
+    assert Path(result["screenshot_artifacts"][0]["screenshot_path"]).read_bytes() == (
+        b"uncertain-evidence"
+    )
 
 
 @pytest.mark.asyncio

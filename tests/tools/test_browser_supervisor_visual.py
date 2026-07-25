@@ -156,3 +156,52 @@ def test_target_screenshot_uses_only_host_authored_locator_clip():
             },
         },
     )
+
+
+def test_responsive_screenshot_uses_bounded_viewport_and_restores_it():
+    supervisor = _supervisor()
+    calls = []
+
+    def cdp_call(method, params, **_kwargs):
+        calls.append((method, params))
+        if method == "Page.captureScreenshot":
+            return {"ok": True, "response": {"result": {"data": "cG5n"}}}
+        return {"ok": True, "response": {"result": {}}}
+
+    with patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
+        result = supervisor.capture_screenshot_memory(
+            viewport={"width": 390, "height": 844}
+        )
+
+    assert result["image_bytes"] == b"png"
+    assert calls == [
+        (
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": 390,
+                "height": 844,
+                "deviceScaleFactor": 1,
+                "mobile": False,
+            },
+        ),
+        (
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "fromSurface": True,
+                "captureBeyondViewport": False,
+            },
+        ),
+        ("Emulation.clearDeviceMetricsOverride", {}),
+    ]
+
+
+def test_responsive_screenshot_rejects_out_of_bounds_viewport_without_cdp():
+    supervisor = _supervisor()
+    with patch.object(supervisor, "_page_cdp_call") as cdp_call:
+        result = supervisor.capture_screenshot_memory(
+            viewport={"width": 100, "height": 844}
+        )
+
+    assert result == {"ok": False, "error": "invalid trusted viewport"}
+    cdp_call.assert_not_called()

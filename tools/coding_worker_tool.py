@@ -2289,8 +2289,10 @@ def _delegate_coding_task_impl(
                 "Treat this as explicit visual work. Implement with enough concrete handoff "
                 "detail for the parent action orchestrator to identify the smallest affected "
                 "region, intended page/browser state, viewport/state assumptions, and requested "
-                "visual outcomes. The parent action orchestrator owns the transient `visual_qa` "
-                "execution contract and trusted receipt; do not invent or self-declare a receipt.",
+                "visual outcomes, including meaningful focused/context/responsive screenshot "
+                "evidence when relevant. The parent action orchestrator owns the transient "
+                "`visual_qa` execution contract and trusted receipt; do not invent or self-declare "
+                "a receipt.",
             ]
         )
     if project_context:

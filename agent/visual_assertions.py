@@ -49,11 +49,13 @@ _UNSAFE_RE = re.compile(
 _UNSAFE_CSS_RE = re.compile(r"[{};]|(?:javascript|expression|fetch|eval)\s*\(", re.IGNORECASE)
 _DIAGNOSTIC_CURSOR_RE = re.compile(r"^dcur_[0-9]+_[0-9a-f]{24}$")
 _PAGE_STATES = frozenset({"already_open", "prepared"})
+_SCREENSHOT_ARTIFACT_KINDS = frozenset({"context", "focused", "responsive"})
 _MAX_TARGET_DESCRIPTION = 160
 _MAX_PAGE_DESCRIPTION = 160
 _MAX_VIEWPORT_DESCRIPTION = 120
 _MAX_STATE_DESCRIPTION = 160
 _MAX_STATE_ITEMS = 4
+_MAX_SCREENSHOT_ARTIFACTS = 4
 
 
 def _bounded_text(value: Any, limit: int) -> str:
@@ -214,6 +216,89 @@ def _normalize_contract_state(value: Any) -> list[str]:
     return state
 
 
+def _normalize_contract_artifacts(
+    value: Any,
+    *,
+    target: dict[str, Any],
+    viewport: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_artifacts = value if isinstance(value, list) and value else None
+    if raw_artifacts is None:
+        raw_artifacts = []
+        if isinstance(target.get("locator"), dict):
+            raw_artifacts.append(
+                {
+                    "kind": "focused",
+                    "description": target["description"],
+                    "locator": target["locator"],
+                }
+            )
+        raw_artifacts.append(
+            {
+                "kind": "context",
+                "description": "Surrounding page context",
+            }
+        )
+    if not 1 <= len(raw_artifacts) <= _MAX_SCREENSHOT_ARTIFACTS:
+        return []
+
+    artifacts: list[dict[str, Any]] = []
+    seen_capture_specs: set[str] = set()
+    for raw_value in raw_artifacts:
+        raw = raw_value if isinstance(raw_value, dict) else {}
+        if set(raw) - {"kind", "description", "locator", "viewport"}:
+            return []
+        kind = str(raw.get("kind") or "").strip().lower()
+        description = _bounded_text(raw.get("description"), _MAX_STATE_DESCRIPTION)
+        if kind not in _SCREENSHOT_ARTIFACT_KINDS or not description:
+            return []
+        locator = None
+        if raw.get("locator") is not None:
+            locator = _normalize_locator(raw.get("locator"))
+            if locator is None:
+                return []
+        elif kind == "focused" and isinstance(target.get("locator"), dict):
+            locator = target["locator"]
+        if kind == "focused" and locator is None:
+            return []
+        if kind == "context" and locator is not None:
+            return []
+
+        artifact_viewport = viewport
+        if raw.get("viewport") is not None:
+            artifact_viewport = _normalize_contract_viewport(raw.get("viewport"))
+            if artifact_viewport is None:
+                return []
+        if kind == "responsive" and not {
+            "width",
+            "height",
+        }.issubset(artifact_viewport):
+            return []
+
+        capture_spec = json.dumps(
+            {
+                "locator": locator,
+                "width": artifact_viewport.get("width"),
+                "height": artifact_viewport.get("height"),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if capture_spec in seen_capture_specs:
+            continue
+        seen_capture_specs.add(capture_spec)
+        artifact: dict[str, Any] = {
+            "kind": kind,
+            "description": description,
+            "viewport": artifact_viewport,
+        }
+        if locator is not None:
+            artifact["locator"] = locator
+        artifacts.append(artifact)
+    return artifacts[:_MAX_SCREENSHOT_ARTIFACTS]
+
+
 def _assertion_allowed_fields(kind: str) -> set[str]:
     common = {"id", "kind"}
     if kind in _ELEMENT_KINDS:
@@ -238,18 +323,28 @@ def normalize_orchestrated_visual_contract(
     """Normalize one transient semantic contract and assign opaque assertion IDs."""
 
     raw = value if isinstance(value, dict) else {}
-    if set(raw) - {"target", "page", "viewport", "state", "assertions"}:
+    if set(raw) - {"target", "page", "viewport", "state", "artifacts", "assertions"}:
         return {}
     target = _normalize_contract_target(raw.get("target"))
     page = _normalize_contract_page(raw.get("page"))
     viewport = _normalize_contract_viewport(raw.get("viewport"))
     state = _normalize_contract_state(raw.get("state"))
+    artifacts = (
+        _normalize_contract_artifacts(
+            raw.get("artifacts"),
+            target=target,
+            viewport=viewport,
+        )
+        if target is not None and viewport is not None
+        else []
+    )
     raw_assertions = raw.get("assertions")
     if (
         target is None
         or page is None
         or viewport is None
         or not state
+        or not artifacts
         or not isinstance(raw_assertions, list)
         or not raw_assertions
     ):
@@ -296,6 +391,7 @@ def normalize_orchestrated_visual_contract(
         "page": page,
         "viewport": viewport,
         "state": state,
+        "artifacts": artifacts,
         "assertions": assertions,
     }
 
@@ -352,7 +448,7 @@ def storage_safe_visual_qa_args(value: Any) -> dict[str, Any]:
             ],
         }
     raw = value if isinstance(value, dict) else {}
-    if any(key in raw for key in ("target", "page", "viewport", "state")):
+    if any(key in raw for key in ("target", "page", "viewport", "state", "artifacts")):
         return {"assertions": []}
     assertions = []
     for item in raw.get("assertions") if isinstance(raw.get("assertions"), list) else []:

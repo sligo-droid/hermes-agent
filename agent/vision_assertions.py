@@ -22,6 +22,17 @@ def _uncertain_results(expected_ids: list[str], code: str) -> dict[str, Any]:
     }
 
 
+def _bounded_image_data_urls(value: Any) -> list[str]:
+    raw_values = value if isinstance(value, list) else [value]
+    images: list[str] = []
+    for raw in raw_values[:4]:
+        image = str(raw or "")
+        if not image.startswith("data:image/"):
+            return []
+        images.append(image)
+    return images
+
+
 def parse_vision_assertion_output(
     value: Any,
     *,
@@ -70,7 +81,7 @@ def _assertion_prompt(
     context = execution_context if isinstance(execution_context, dict) else {}
     bounded_context = {
         key: context[key]
-        for key in ("target", "page", "viewport", "state")
+        for key in ("target", "page", "viewport", "state", "artifacts")
         if key in context
     }
     context_note = (
@@ -80,7 +91,8 @@ def _assertion_prompt(
         else ""
     )
     return (
-        "Evaluate only the listed visual appearance assertions against the image. "
+        "Evaluate only the listed visual appearance assertions against the ordered images. "
+        "Artifact descriptions in the supplied context use the same image order. "
         "Return JSON only with exactly this shape: "
         '{"results":[{"id":"...","status":"passed|failed|uncertain",'
         '"confidence":"high|medium|low"}]}. '
@@ -135,7 +147,7 @@ def _resolve_visual_sweep_runtime(cfg: Optional[dict[str, Any]]) -> dict[str, st
 
 
 async def run_visual_sweep(
-    image_data_url: str,
+    image_data_url: Any,
     *,
     cfg: Optional[dict[str, Any]] = None,
     timeout_s: float = 30.0,
@@ -144,7 +156,8 @@ async def run_visual_sweep(
 ) -> bool:
     """Use Luna to validate that fresh browser evidence is inspectable."""
 
-    if not image_data_url.startswith("data:image/"):
+    images = _bounded_image_data_urls(image_data_url)
+    if not images:
         return False
     if call_llm is None:
         from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
@@ -165,11 +178,14 @@ async def run_visual_sweep(
                         {
                             "type": "text",
                             "text": (
-                                "Confirm this is a rendered UI screenshot suitable for a "
-                                "subsequent bounded visual assertion. Return exactly READY."
+                                "Confirm every attached image is a rendered UI screenshot suitable "
+                                "for one subsequent bounded visual assertion pass. Return exactly READY."
                             ),
                         },
-                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                        *[
+                            {"type": "image_url", "image_url": {"url": image}}
+                            for image in images
+                        ],
                     ],
                 }
             ],
@@ -190,7 +206,7 @@ async def run_visual_sweep(
 
 
 async def evaluate_screenshot_assertions(
-    image_data_url: str,
+    image_data_url: Any,
     assertions: list[dict[str, Any]],
     *,
     provider: str = "",
@@ -207,7 +223,8 @@ async def evaluate_screenshot_assertions(
     """Run one bounded compact vision call and return assertion-safe fields."""
 
     expected_ids = [str(item.get("id") or "") for item in assertions[:6]]
-    if not image_data_url.startswith("data:image/") or not expected_ids:
+    images = _bounded_image_data_urls(image_data_url)
+    if not images or not expected_ids:
         return _uncertain_results(expected_ids, "invalid_vision_input")
     if call_llm is None:
         from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
@@ -234,7 +251,10 @@ async def evaluate_screenshot_assertions(
                         "type": "text",
                         "text": _assertion_prompt(assertions, execution_context),
                     },
-                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                    *[
+                        {"type": "image_url", "image_url": {"url": image}}
+                        for image in images
+                    ],
                 ],
             }
         ],

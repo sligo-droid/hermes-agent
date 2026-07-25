@@ -7,6 +7,7 @@ import pytest
 from agent.vision_assertions import (
     evaluate_screenshot_assertions,
     parse_vision_assertion_output,
+    run_visual_sweep,
 )
 
 
@@ -69,7 +70,10 @@ async def test_visual_inspector_route_and_single_attempt_are_forwarded():
         },
     ):
         result = await evaluate_screenshot_assertions(
-            "data:image/png;base64,cG5n",
+            [
+                "data:image/png;base64,Zm9jdXNlZA==",
+                "data:image/png;base64,Y29udGV4dA==",
+            ],
             [{"id": "appearance", "expectation": "balanced layout"}],
             # A distinct orchestrator route must never reach the visual call.
             provider="custom",
@@ -104,6 +108,56 @@ async def test_visual_inspector_route_and_single_attempt_are_forwarded():
     assert "Issue Attention graph region" in prompt
     assert "State Brief page" in prompt
     assert "chart data loaded" in prompt
+    assert len(
+        [
+            item
+            for item in seen["messages"][0]["content"]
+            if item["type"] == "image_url"
+        ]
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_visual_sweep_accepts_multiple_images_in_one_provider_call():
+    seen = {}
+    starts = []
+
+    async def call_llm(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content="READY"))
+            ]
+        )
+
+    with patch(
+        "agent.vision_assertions._resolve_visual_sweep_runtime",
+        return_value={
+            "provider": "openrouter",
+            "model": "moonshotai/kimi-k2.5",
+            "base_url": "https://sweep.example/v1",
+            "api_key": "sweep-credential",
+            "api_mode": "openai_chat_completions",
+        },
+    ):
+        ready = await run_visual_sweep(
+            [
+                "data:image/png;base64,Zm9jdXNlZA==",
+                "data:image/png;base64,Y29udGV4dA==",
+            ],
+            call_llm=call_llm,
+            on_provider_start=lambda: starts.append(True),
+        )
+
+    assert ready is True
+    assert starts == [True]
+    assert len(
+        [
+            item
+            for item in seen["messages"][0]["content"]
+            if item["type"] == "image_url"
+        ]
+    ) == 2
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,17 @@ _LOCATOR_SCHEMA = {
     "required": ["by", "value"],
 }
 
+_VIEWPORT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "description": {"type": "string", "maxLength": 120},
+        "width": {"type": "integer", "minimum": 200, "maximum": 7680},
+        "height": {"type": "integer", "minimum": 200, "maximum": 4320},
+    },
+    "required": ["description"],
+}
+
 VISUAL_QA_SCHEMA = {
     "name": "visual_qa",
     "description": (
@@ -29,7 +40,9 @@ VISUAL_QA_SCHEMA = {
         "state, viewport assumptions, and concrete assertion intent from the full accepted "
         "request and code understanding. This tool accepts only "
         "trusted assertion kinds; it does not accept JavaScript, CDP commands, shell commands, "
-        "URLs, screenshots, cookies, or headers. Reuse every host-provided opaque assertion ID "
+        "URLs, screenshot inputs, cookies, or headers. Request up to four meaningful human-facing "
+        "artifacts from the screenshots used by QA; focused target plus surrounding context is the "
+        "default when artifacts are omitted. Reuse every host-provided opaque assertion ID "
         "with its exact required kind only for a legacy requirement; new orchestrator-owned "
         "contracts receive host-generated opaque assertion IDs. Missing, duplicate, substituted, "
         "unrelated, or incomplete coverage is rejected. Only an explicit passed receipt satisfies an enforced visual gate; "
@@ -60,21 +73,31 @@ VISUAL_QA_SCHEMA = {
                 },
                 "required": ["state", "description"],
             },
-            "viewport": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "description": {"type": "string", "maxLength": 120},
-                    "width": {"type": "integer", "minimum": 200, "maximum": 7680},
-                    "height": {"type": "integer", "minimum": 200, "maximum": 4320},
-                },
-                "required": ["description"],
-            },
+            "viewport": _VIEWPORT_SCHEMA,
             "state": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 4,
                 "items": {"type": "string", "maxLength": 160},
+            },
+            "artifacts": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["focused", "context", "responsive"],
+                        },
+                        "description": {"type": "string", "maxLength": 160},
+                        "locator": _LOCATOR_SCHEMA,
+                        "viewport": _VIEWPORT_SCHEMA,
+                    },
+                    "required": ["kind", "description"],
+                },
             },
             "assertions": {
                 "type": "array",
