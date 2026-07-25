@@ -279,6 +279,12 @@ class HonchoMemoryProvider(MemoryProvider):
         # Base context cache — refreshed on context_cadence, not frozen
         self._base_context_cache: Optional[str] = None
         self._base_context_lock = threading.Lock()
+        # The API-bound memory block is persisted on each user message and
+        # replayed on later turns. Re-emitting an unchanged cached base block
+        # therefore grows the conversation linearly without adding context.
+        # Track the last emitted bytes per provider/session and only append the
+        # base layer again after Honcho returns materially different context.
+        self._last_injected_base_context = ""
 
         # Recall cadence and liveness state.
         self._turn_count = 0
@@ -912,8 +918,12 @@ class HonchoMemoryProvider(MemoryProvider):
                             self._base_context_cache = formatted
                         base_context = formatted
 
-            if base_context:
+            if (
+                base_context
+                and base_context != self._last_injected_base_context
+            ):
                 parts.append(base_context)
+                self._last_injected_base_context = base_context
 
         # ----- Layer 2: Dialectic supplement -----
         # Turn 1 may briefly wait for dialectic; unfinished work remains async.

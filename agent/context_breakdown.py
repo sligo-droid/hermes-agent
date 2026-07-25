@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
+_MEMORY_CONTEXT_RE = re.compile(r"<memory-context>.*?</memory-context>", re.DOTALL)
 
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
 
@@ -24,6 +26,7 @@ _CATEGORY_COLORS = {
     "mcp": "var(--context-usage-mcp)",
     "subagent_definitions": "var(--context-usage-subagents)",
     "memory": "var(--context-usage-memory)",
+    "memory_sidecars": "var(--context-usage-memory)",
     "conversation": "var(--context-usage-conversation)",
 }
 
@@ -86,6 +89,27 @@ def _strip_blocks(text: str, *blocks: str) -> str:
     return out.strip()
 
 
+def _api_view_messages(messages: Sequence[dict]) -> List[dict]:
+    """Return the message shape actually sent after api_content substitution."""
+    from agent.turn_context import substitute_api_content
+
+    rendered = deepcopy(list(messages))
+    for message in rendered:
+        if isinstance(message, dict):
+            substitute_api_content(message)
+    return rendered
+
+
+def _memory_sidecar_tokens(messages: Sequence[dict]) -> int:
+    chars = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            continue
+        chars += sum(len(match.group(0)) for match in _MEMORY_CONTEXT_RE.finditer(content))
+    return (chars + 3) // 4 if chars else 0
+
+
 def compute_session_context_breakdown(
     agent: Any,
     messages: Optional[List[dict]] = None,
@@ -112,7 +136,12 @@ def compute_session_context_breakdown(
     tools = list(getattr(agent, "tools", None) or [])
     builtin_tools, mcp_tools, subagent_tools = _split_tools(tools)
 
-    conversation_tokens = estimate_messages_tokens_rough(messages or [])
+    api_messages = _api_view_messages(messages or [])
+    memory_sidecar_tokens = _memory_sidecar_tokens(api_messages)
+    conversation_tokens = max(
+        0,
+        estimate_messages_tokens_rough(api_messages) - memory_sidecar_tokens,
+    )
 
     categories = [
         ("system_prompt", "System prompt", _chars_to_tokens(system_prompt_text)),
@@ -122,6 +151,7 @@ def compute_session_context_breakdown(
         ("mcp", "MCP", _json_tokens(mcp_tools)),
         ("subagent_definitions", "Subagent definitions", _json_tokens(subagent_tools)),
         ("memory", "Memory", _chars_to_tokens(memory_text)),
+        ("memory_sidecars", "Memory sidecars", memory_sidecar_tokens),
         ("conversation", "Conversation", conversation_tokens),
     ]
 
