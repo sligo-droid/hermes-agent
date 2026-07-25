@@ -55,6 +55,7 @@ class _ReplacementDeliveryAdapter(BasePlatformAdapter):
             Platform.DISCORD,
         )
         self.sent: list[str] = []
+        self.image_batches: list[list[tuple[str, str]]] = []
         self.connected = True
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -71,6 +72,10 @@ class _ReplacementDeliveryAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id, metadata=None) -> None:
         return None
+
+    async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0):
+        if self.connected:
+            self.image_batches.append(list(images))
 
     async def get_chat_info(self, chat_id):
         return {"id": chat_id}
@@ -270,13 +275,19 @@ async def test_stale_fatal_notification_from_superseded_adapter_is_ignored(monke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", [None, "reviewer"], ids=["primary", "secondary"])
 async def test_inflight_final_reply_uses_replacement_adapter_after_reconnect(
-    tmp_path, profile
+    tmp_path, profile, monkeypatch
 ):
     config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")},
         sessions_dir=tmp_path / "sessions",
     )
     runner = GatewayRunner(config)
+    screenshot = tmp_path / "visual-qa.png"
+    screenshot.write_bytes(b"screenshot")
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+        (tmp_path,),
+    )
     old_adapter = _ReplacementDeliveryAdapter()
     replacement = _ReplacementDeliveryAdapter()
     old_adapter.gateway_runner = runner
@@ -295,7 +306,7 @@ async def test_inflight_final_reply_uses_replacement_adapter_after_reconnect(
         await old_adapter.send("channel-1", "partial preview")
         handler_started.set()
         await release_handler.wait()
-        return "complete final reply"
+        return f"complete final reply\nMEDIA:{screenshot}"
 
     old_adapter.set_message_handler(handler)
     event = MessageEvent(
@@ -325,3 +336,5 @@ async def test_inflight_final_reply_uses_replacement_adapter_after_reconnect(
 
     assert old_adapter.sent == ["partial preview"]
     assert replacement.sent == ["complete final reply"]
+    assert old_adapter.image_batches == []
+    assert replacement.image_batches == [[(f"file://{screenshot}", "")]]

@@ -5105,7 +5105,13 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        # The agent may have started on an adapter that was
+                        # disconnected and replaced while it was working.
+                        # Resolve the transport at each final attachment send,
+                        # just as the text path above does, so a stale adapter
+                        # cannot silently drop its evidence files.
+                        delivery_adapter = self._final_delivery_adapter(event.source)
+                        await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
@@ -5155,7 +5161,8 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        delivery_adapter = self._final_delivery_adapter(event.source)
+                        await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
@@ -5176,21 +5183,22 @@ class BasePlatformAdapter(ABC):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
+                        delivery_adapter = self._final_delivery_adapter(event.source)
                         ext = Path(media_path).suffix.lower()
-                        if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            media_result = await self.send_voice(
+                        if should_send_media_as_audio(delivery_adapter.platform, ext, is_voice=is_voice):
+                            media_result = await delivery_adapter.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
                         elif ext in _VIDEO_EXTS:
-                            media_result = await self.send_video(
+                            media_result = await delivery_adapter.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            media_result = await self.send_document(
+                            media_result = await delivery_adapter.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
@@ -5214,15 +5222,16 @@ class BasePlatformAdapter(ABC):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
+                        delivery_adapter = self._final_delivery_adapter(event.source)
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            local_result = await self.send_video(
+                            local_result = await delivery_adapter.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            local_result = await self.send_document(
+                            local_result = await delivery_adapter.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
