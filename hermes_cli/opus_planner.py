@@ -16,7 +16,7 @@ OPUS_ROUTE = "anthropic_oauth"
 OPUS_TRANSPORT = "anthropic_oauth"
 OPUS_PROXY_ROUTE = "anthropic_proxy"
 OPUS_PROXY_TRANSPORT = "anthropic_proxy"
-OPUS_REASONING = {"enabled": True, "effort": "high"}
+OPUS_REASONING = {"enabled": True, "effort": "medium"}
 OPUS_DEFAULT_TOOLSETS = ["file", "terminal", "web", "browser", "discord"]
 OPUS_PLAN_MODE = "plan"
 OPUS_IMPLEMENTATION_MODE = "implementation"
@@ -105,39 +105,17 @@ def opus_enabled_toolsets(config: dict[str, Any] | None = None) -> list[str]:
 
 
 def opus_reasoning_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Resolve Opus's reasoning level without inheriting the agent default.
+    """Return Opus's fixed reasoning level.
 
-    Opus is a dedicated planning route. Its reasoning level follows the
-    Discord action/feature setting when one is configured, but an absent,
-    empty, or invalid value must not turn into ``None`` and later inherit the
-    global agent default (which may be ``medium``).
+    Opus is a dedicated premium route with a deliberately pinned reasoning
+    level. It intentionally ignores ``discord.action_request_reasoning_effort``
+    and ``discord.feature_request_reasoning_effort``: those knobs size ordinary
+    Discord action requests, and letting them raise or lower this route made
+    the effort drift with unrelated config (a configured ``xhigh`` silently
+    promoted every opus turn). ``config`` is accepted for call-site
+    compatibility and is not read.
     """
-    if config is None:
-        try:
-            from hermes_cli.config import load_config
-
-            config = load_config()
-        except Exception:
-            config = {}
-
-    discord_cfg = config.get("discord") if isinstance(config, dict) else {}
-    if not isinstance(discord_cfg, dict):
-        discord_cfg = {}
-
-    raw_effort = discord_cfg.get("action_request_reasoning_effort")
-    if raw_effort is None:
-        raw_effort = discord_cfg.get("feature_request_reasoning_effort")
-
-    if raw_effort is None or not str(raw_effort).strip():
-        return dict(OPUS_REASONING)
-
-    try:
-        from hermes_constants import parse_reasoning_effort
-
-        parsed = parse_reasoning_effort(str(raw_effort))
-    except Exception:
-        parsed = None
-    return parsed or dict(OPUS_REASONING)
+    return dict(OPUS_REASONING)
 
 
 def build_opus_user_instruction(request: OpusPlanRequest) -> str:

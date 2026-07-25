@@ -379,28 +379,27 @@ def test_opus_enabled_toolsets_allows_config_override():
     assert opus_enabled_toolsets(config={"opus": {"enabled_toolsets": ["file", "web"]}}) == ["file", "web"]
 
 
-def test_opus_reasoning_config_uses_configured_discord_feature_effort():
-    assert opus_reasoning_config(
-        {
-            "agent": {"reasoning_effort": "medium"},
-            "discord": {"feature_request_reasoning_effort": "high"},
-        }
-    ) == {"enabled": True, "effort": "high"}
+def test_opus_reasoning_config_is_pinned_and_ignores_discord_effort_config():
+    """The route's effort is fixed policy, not a knob shared with actions."""
+    for effort in ("xhigh", "max", "low", "minimal", "bogus"):
+        assert opus_reasoning_config(
+            {"discord": {"action_request_reasoning_effort": effort}}
+        ) == {"enabled": True, "effort": "medium"}
+        assert opus_reasoning_config(
+            {"discord": {"feature_request_reasoning_effort": effort}}
+        ) == {"enabled": True, "effort": "medium"}
 
 
-def test_opus_reasoning_config_does_not_inherit_medium_when_unconfigured():
-    assert opus_reasoning_config({"agent": {"reasoning_effort": "medium"}}) == {
+def test_opus_reasoning_config_does_not_inherit_the_global_agent_default():
+    assert opus_reasoning_config({"agent": {"reasoning_effort": "minimal"}}) == {
         "enabled": True,
-        "effort": "high",
+        "effort": "medium",
     }
 
 
-def test_opus_reasoning_config_falls_back_high_for_invalid_config():
-    assert opus_reasoning_config({"discord": {"feature_request_reasoning_effort": "bogus"}}) == {
-        "enabled": True,
-        "effort": "high",
-    }
-
+def test_opus_reasoning_config_handles_missing_and_malformed_config():
+    for cfg in (None, {}, {"discord": None}, {"discord": "nonsense"}):
+        assert opus_reasoning_config(cfg) == {"enabled": True, "effort": "medium"}
 
 def test_opus_metadata_for_artifact():
     metadata = opus_metadata()
