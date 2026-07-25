@@ -211,6 +211,85 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert agent.api_mode == "anthropic_messages"
 
+    def test_named_custom_claude_fallback_overrides_primary_codex_transport(self):
+        """A Claude fallback through the same OpenAI-compatible proxy as a
+        Codex primary must construct a chat-completions client, not inherit the
+        named provider's primary/default ``codex_responses`` wrapper."""
+        config = {
+            "providers": {
+                "cli-proxy-api": {
+                    "api": "http://127.0.0.1:8317/v1",
+                    "api_key": "provider-key",
+                    "default_model": "gpt-5.6-sol",
+                    "api_mode": "codex_responses",
+                }
+            }
+        }
+        agent = _make_agent(
+            fallback_model={
+                "provider": "cli-proxy-api",
+                "model": "claude-sonnet-5",
+                "base_url": "http://127.0.0.1:9417/v1",
+                "api_key": "fallback-key",
+            }
+        )
+        agent.model = "gpt-5.6-sol"
+        agent.provider = "cli-proxy-api"
+        agent.base_url = "http://127.0.0.1:8317/v1"
+        agent.api_mode = "codex_responses"
+
+        with (
+            patch("hermes_cli.runtime_provider.load_config", return_value=config),
+            patch("hermes_cli.config.load_config", return_value=config),
+            patch("agent.model_metadata.get_model_context_length", return_value=200_000),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        assert agent.api_mode == "chat_completions"
+        assert not isinstance(agent.client, CodexAuxiliaryClient)
+        assert str(agent.client.base_url).rstrip("/") == "http://127.0.0.1:9417/v1"
+        assert agent.client.api_key == "fallback-key"
+
+
+def test_named_custom_resolver_explicit_chat_mode_returns_plain_client():
+    """The resolver boundary must honor a fallback-specific transport before
+    the provider entry's default transport chooses a wrapper."""
+    config = {
+        "providers": {
+            "cli-proxy-api": {
+                "api": "http://127.0.0.1:8317/v1",
+                "api_key": "provider-key",
+                "default_model": "gpt-5.6-sol",
+                "api_mode": "codex_responses",
+            }
+        }
+    }
+
+    from agent.auxiliary_client import CodexAuxiliaryClient, resolve_provider_client
+
+    with (
+        patch("hermes_cli.runtime_provider.load_config", return_value=config),
+        patch(
+            "hermes_cli.runtime_provider.load_pool",
+            side_effect=AssertionError("explicit fallback key must bypass provider pool"),
+        ),
+    ):
+        client, model = resolve_provider_client(
+            "cli-proxy-api",
+            model="claude-sonnet-5",
+            raw_codex=True,
+            explicit_base_url="http://127.0.0.1:9417/v1",
+            explicit_api_key="fallback-key",
+            api_mode="chat_completions",
+        )
+
+    assert model == "claude-sonnet-5"
+    assert not isinstance(client, CodexAuxiliaryClient)
+    assert str(client.base_url).rstrip("/") == "http://127.0.0.1:9417/v1"
+    assert client.api_key == "fallback-key"
+
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 
