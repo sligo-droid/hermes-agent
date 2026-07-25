@@ -156,6 +156,35 @@ async def test_direct_question_thread_uses_normal_lifecycle_reactions(adapter):
 
 
 @pytest.mark.asyncio
+async def test_thread_reactions_update_triggering_message_and_opener(adapter):
+    origin_message = SimpleNamespace(
+        id=100,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    thread = SimpleNamespace(id=200, parent_id=50, starter_message=origin_message)
+    raw_message = SimpleNamespace(
+        id=300,
+        channel=thread,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("300", raw_message)
+    event.source.chat_type = "thread"
+    event.source.chat_id = "200"
+    event.source.thread_id = "200"
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    for message in (raw_message, origin_message):
+        assert [call.args for call in message.add_reaction.await_args_list] == [
+            ("⏳",),
+            ("✅",),
+        ]
+
+
+@pytest.mark.asyncio
 async def test_reaction_completion_waits_for_queued_follow_up(adapter):
     first_message = SimpleNamespace(
         add_reaction=AsyncMock(),
@@ -653,8 +682,11 @@ async def test_processing_complete_success_resolves_stale_kanban_running_to_done
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    followup_message.add_reaction.assert_not_awaited()
-    followup_message.remove_reaction.assert_not_awaited()
+    assert [call.args for call in followup_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
+    followup_message.add_reaction.assert_awaited_once_with("✅")
     assert [call.args for call in op_message.remove_reaction.await_args_list] == _status_remove_calls(
         adapter,
         except_emoji="✅",
@@ -1638,7 +1670,7 @@ async def test_status_reaction_state_replaces_different_target(adapter):
 
 
 @pytest.mark.asyncio
-async def test_thread_followup_reactions_target_origin_message(adapter):
+async def test_thread_followup_reactions_target_message_and_origin(adapter):
     origin_message = SimpleNamespace(
         id=1000,
         add_reaction=AsyncMock(),
@@ -1674,16 +1706,15 @@ async def test_thread_followup_reactions_target_origin_message(adapter):
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     parent.fetch_message.assert_awaited_with(1000)
-    followup_message.add_reaction.assert_not_awaited()
-    followup_message.remove_reaction.assert_not_awaited()
-    assert [call.args for call in origin_message.remove_reaction.await_args_list] == [
-        *_status_remove_calls(adapter, except_emoji="⏳"),
-        *_status_remove_calls(adapter, except_emoji="✅"),
-    ]
-    assert [call.args for call in origin_message.add_reaction.await_args_list] == [
-        ("⏳",),
-        ("✅",),
-    ]
+    for message in (followup_message, origin_message):
+        assert [call.args for call in message.remove_reaction.await_args_list] == [
+            *_status_remove_calls(adapter, except_emoji="⏳"),
+            *_status_remove_calls(adapter, except_emoji="✅"),
+        ]
+        assert [call.args for call in message.add_reaction.await_args_list] == [
+            ("⏳",),
+            ("✅",),
+        ]
 
 
 @pytest.mark.asyncio
@@ -1834,7 +1865,7 @@ async def test_thread_origin_message_fetches_missing_parent_from_parent_id(adapt
 
 
 @pytest.mark.asyncio
-async def test_batched_thread_followup_reactions_target_origin_message(adapter):
+async def test_batched_thread_followup_reactions_target_message_and_origin(adapter):
     origin_message = SimpleNamespace(
         id=1000,
         add_reaction=AsyncMock(),
@@ -1864,16 +1895,15 @@ async def test_batched_thread_followup_reactions_target_origin_message(adapter):
     await adapter.on_processing_start(event)
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    followup_message.add_reaction.assert_not_awaited()
-    followup_message.remove_reaction.assert_not_awaited()
-    assert [call.args for call in origin_message.remove_reaction.await_args_list] == [
-        *_status_remove_calls(adapter, except_emoji="⏳"),
-        *_status_remove_calls(adapter, except_emoji="✅"),
-    ]
-    assert [call.args for call in origin_message.add_reaction.await_args_list] == [
-        ("⏳",),
-        ("✅",),
-    ]
+    for message in (followup_message, origin_message):
+        assert [call.args for call in message.remove_reaction.await_args_list] == [
+            *_status_remove_calls(adapter, except_emoji="⏳"),
+            *_status_remove_calls(adapter, except_emoji="✅"),
+        ]
+        assert [call.args for call in message.add_reaction.await_args_list] == [
+            ("⏳",),
+            ("✅",),
+        ]
 
 
 @pytest.mark.asyncio
@@ -2083,8 +2113,10 @@ async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter, monkeyp
     await adapter.on_processing_start(event)
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    followup_message.add_reaction.assert_not_awaited()
-    followup_message.remove_reaction.assert_not_awaited()
+    assert [call.args for call in followup_message.add_reaction.await_args_list] == [
+        ("⏳",),
+        ("⏳",),
+    ]
     assert [call.args for call in origin_message.add_reaction.await_args_list] == [
         ("⏳",),
         ("⏳",),
