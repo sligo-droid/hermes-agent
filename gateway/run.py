@@ -523,6 +523,18 @@ def _fable_fail_closed_error(detail: str = "", route: str = "") -> str:
     return base
 
 
+def _opus_fail_closed_error(detail: str = "", route: str = "") -> str:
+    route_label = "Anthropic proxy route" if route == "anthropic_proxy" else "Anthropic OAuth route"
+    base = (
+        f"⚠️ /opus is pinned to Claude Opus 5 via Hermes' {route_label} "
+        "and will not fall back to another model or provider."
+    )
+    cleaned = " ".join(str(detail or "").split())[:500]
+    if cleaned:
+        return f"{base} {cleaned}"
+    return base
+
+
 def _discord_feature_request_reasoning_config(config: Optional[dict]) -> dict | None:
     return _discord_action_request_reasoning_config(config)
 
@@ -3771,12 +3783,13 @@ def _gateway_action_closeout_contract(
     normalized_source = str(source or "direct").strip().lower()
     surface_enabled = surfaces.get("direct") is not False
     legacy_fable_lifecycle = ""
+    if normalized_source in {"fable", "opus"}:
+        surface_enabled = surface_enabled and surfaces.get(normalized_source) is not False
     if normalized_source == "fable":
         # Bounded migration compatibility for pre-unification installations.
         # New configs omit both legacy keys and use the ordinary direct policy.
         # Explicit old opt-outs remain authoritative and cannot silently gain
         # PR/merge authority after upgrade.
-        surface_enabled = surface_enabled and surfaces.get("fable") is not False
         fable_config = _closeout_mapping(config.get("fable"))
         if "git_lifecycle" in fable_config:
             legacy_fable_lifecycle = str(
@@ -6521,7 +6534,7 @@ class _GatewayRunnerCore(
         from hermes_cli.trusted_closeout import normalize_closeout_state
 
         state = normalize_closeout_state(item["closeout"])
-        if state["mode"] == "off" or state["source"] not in {"direct", "fable"}:
+        if state["mode"] == "off" or state["source"] not in {"direct", "fable", "opus"}:
             return None
 
         def notify_closeout() -> None:
@@ -10229,7 +10242,7 @@ class _GatewayRunnerCore(
             if watcher is not None:
                 watcher.notify(work_id)
             return True, "closeout"
-        if closeout["source"] not in {"direct", "fable"}:
+        if closeout["source"] not in {"direct", "fable", "opus"}:
             return False, "unsupported_closeout_source"
 
         rows = sorted(
@@ -17020,6 +17033,13 @@ class _GatewayRunnerCore(
             command = None
             canonical = None
 
+        if canonical == "opus":
+            opus_result = await self._handle_opus_command(event, _quick_key)
+            if opus_result is not None:
+                return opus_result
+            command = None
+            canonical = None
+
         if canonical == "help":
             return await self._handle_help_command(event)
 
@@ -17503,12 +17523,19 @@ class _GatewayRunnerCore(
             _flow_dispatch_start_ts = time.time()
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             _fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
+            _opus_plan_metadata = getattr(event, "opus_plan_metadata", None)
             if (
                 _fable_plan_metadata
                 and isinstance(_agent_result, str)
                 and not _agent_result.startswith("⚠️ /fable is pinned")
             ):
                 _agent_result = MetadataReply(_agent_result, _fable_plan_metadata)
+            if (
+                _opus_plan_metadata
+                and isinstance(_agent_result, str)
+                and not _agent_result.startswith("⚠️ /opus is pinned")
+            ):
+                _agent_result = MetadataReply(_agent_result, _opus_plan_metadata)
             self._log_gateway_flow_telemetry(
                 route_type=_flow_route_type,
                 source=source,
@@ -17555,6 +17582,16 @@ class _GatewayRunnerCore(
             self._release_turn_lease(_quick_key, _run_generation)
             if getattr(event, "fable_plan_metadata", None):
                 previous_override = getattr(event, "fable_previous_model_override", None)
+                if previous_override is None:
+                    self._session_model_overrides.pop(_quick_key, None)
+                else:
+                    self._session_model_overrides[_quick_key] = previous_override
+                try:
+                    self._evict_cached_agent(_quick_key)
+                except Exception:
+                    pass
+            if getattr(event, "opus_plan_metadata", None):
+                previous_override = getattr(event, "opus_previous_model_override", None)
                 if previous_override is None:
                     self._session_model_overrides.pop(_quick_key, None)
                 else:
@@ -18208,26 +18245,43 @@ class _GatewayRunnerCore(
             _pcfg,
         )
 
-        # Plan-only Fable turns retain the mapped canonical checkout for
-        # inspection. Fable implementation turns must receive the same
+        # Plan-only Fable/Opus turns retain the mapped canonical checkout for
+        # inspection. Premium implementation turns must receive the same
         # per-thread mutable worktree as ordinary Discord action requests.
-        # Normally _handle_fable_command has already provisioned it so its
+        # Normally the command handler has already provisioned it so its
         # prompt names the effective workdir; keep this branch as a robust
         # fallback for callers that inject Fable metadata directly.
         _fable_turn_metadata = getattr(event, "fable_plan_metadata", None)
+        _opus_turn_metadata = getattr(event, "opus_plan_metadata", None)
         _fable_implementation_turn = bool(
             isinstance(_fable_turn_metadata, dict)
             and str(_fable_turn_metadata.get("fable_mode") or "").strip().lower()
             == "implementation"
         )
+        _opus_implementation_turn = bool(
+            isinstance(_opus_turn_metadata, dict)
+            and str(_opus_turn_metadata.get("opus_mode") or "").strip().lower()
+            == "implementation"
+        )
+        _premium_implementation_turn = (
+            _fable_implementation_turn or _opus_implementation_turn
+        )
+        _premium_plan_turn = bool(
+            (_fable_turn_metadata or _opus_turn_metadata)
+            and not _premium_implementation_turn
+        )
+        _premium_closeout_source = (
+            "opus" if _opus_implementation_turn else "fable"
+            if _fable_implementation_turn else "direct"
+        )
         discord_runtime_mode = (
             RuntimeMode.ACTION
-            if _fable_implementation_turn
+            if _premium_implementation_turn
             else _discord_runtime_mode_for(event)
             if source.platform == Platform.DISCORD
             else RuntimeMode.ACTION
         )
-        if _fable_turn_metadata and not _fable_implementation_turn:
+        if _premium_plan_turn:
             session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
             session_cwd_error = None
             action_worktree_cwd = None
@@ -18269,7 +18323,7 @@ class _GatewayRunnerCore(
                     _pcfg,
                     repository=repository,
                     request=_gateway_action_request_text(event),
-                    source="fable" if _fable_implementation_turn else "direct",
+                    source=_premium_closeout_source,
                     visual_requirement=visual_requirement,
                     visual_config=getattr(event, "visual_qa_config", None),
                 )
@@ -18278,7 +18332,7 @@ class _GatewayRunnerCore(
                     mutable_path=action_worktree_cwd,
                     canonical_path=str(source.project_path or ""),
                     config=_pcfg,
-                    source="fable" if _fable_implementation_turn else "direct",
+                    source=_premium_closeout_source,
                     mode=direct_mode,
                     policy=direct_policy,
                 )
@@ -19110,6 +19164,10 @@ class _GatewayRunnerCore(
                     fable_toolsets=getattr(event, "fable_enabled_toolsets", None),
                     fable_reasoning_config=getattr(event, "fable_reasoning_config", None),
                     fable_transcript_user_message=getattr(event, "fable_transcript_user_message", None),
+                    opus_plan_metadata=getattr(event, "opus_plan_metadata", None),
+                    opus_toolsets=getattr(event, "opus_enabled_toolsets", None),
+                    opus_reasoning_config=getattr(event, "opus_reasoning_config", None),
+                    opus_transcript_user_message=getattr(event, "opus_transcript_user_message", None),
                     session_cwd_override=session_cwd,
                     visual_qa_requirement=getattr(event, "visual_qa_requirement", None),
                     visual_qa_config=getattr(event, "visual_qa_config", None),
@@ -19263,6 +19321,36 @@ class _GatewayRunnerCore(
                         session_key,
                         len(original_message_text or ""),
                     )
+            opus_plan_metadata = getattr(event, "opus_plan_metadata", None)
+            if opus_plan_metadata:
+                actual_model = str(agent_result.get("model") or "")
+                actual_provider = str(agent_result.get("provider") or "")
+                if agent_result.get("failed"):
+                    detail = str(agent_result.get("error") or response or "Opus route unavailable.")
+                    return _opus_fail_closed_error(detail, str(opus_plan_metadata.get("route") or ""))
+                if actual_model != "claude-opus-5" or actual_provider != "anthropic":
+                    logger.error(
+                        "/opus resolved unexpected route provider=%r model=%r; refusing fallback result for session %s",
+                        actual_provider,
+                        actual_model,
+                        session_key,
+                    )
+                    return _opus_fail_closed_error(
+                        "Resolved unexpected route "
+                        f"provider={actual_provider!r} model={actual_model!r}; refusing fallback result.",
+                        str(opus_plan_metadata.get("route") or ""),
+                    )
+                transcript_user_message = str(
+                    getattr(event, "opus_transcript_user_message", "") or ""
+                ).strip()
+                if transcript_user_message:
+                    original_message_text = message_text
+                    message_text = transcript_user_message
+                    logger.debug(
+                        "Persisting /opus command text for session %s instead of plan-only skill payload (%d chars elided)",
+                        session_key,
+                        len(original_message_text or ""),
+                    )
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -19277,7 +19365,9 @@ class _GatewayRunnerCore(
                 )
             agent_messages = agent_result.get("messages", [])
             transcript_user_message = str(
-                getattr(event, "fable_transcript_user_message", "") or ""
+                getattr(event, "fable_transcript_user_message", "")
+                or getattr(event, "opus_transcript_user_message", "")
+                or ""
             ).strip()
             if transcript_user_message:
                 try:
@@ -19892,6 +19982,9 @@ class _GatewayRunnerCore(
             fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
             if fable_plan_metadata and response and not agent_result.get("failed"):
                 return MetadataReply(response, fable_plan_metadata)
+            opus_plan_metadata = getattr(event, "opus_plan_metadata", None)
+            if opus_plan_metadata and response and not agent_result.get("failed"):
+                return MetadataReply(response, opus_plan_metadata)
             return response
 
         except Exception as e:
@@ -25654,6 +25747,157 @@ class _GatewayRunnerCore(
             pass
         return None
 
+    async def _handle_opus_command(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """Route Opus to plan-only or Discord implementation mode."""
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return "Usage: /opus <request> or /opus plan <request>"
+
+        try:
+            cfg = _load_gateway_runtime_config()
+        except Exception:
+            cfg = {}
+        try:
+            session_cwd = _resolve_gateway_session_cwd(event.source, cfg)
+        except Exception:
+            session_cwd = ""
+
+        from hermes_cli.opus_planner import (
+            OPUS_IMPLEMENTATION_MODE,
+            OPUS_PLAN_MODE,
+            OpusPlanRequest,
+            build_opus_implementation_instruction,
+            build_opus_plan_invocation,
+            opus_enabled_toolsets,
+            opus_metadata,
+            opus_reasoning_config,
+            opus_session_model_override,
+            parse_opus_command_args,
+        )
+
+        is_discord = getattr(event.source, "platform", None) == Platform.DISCORD
+        mode, prompt = (
+            parse_opus_command_args(raw_args)
+            if is_discord
+            else (OPUS_PLAN_MODE, raw_args)
+        )
+        if not prompt:
+            return (
+                "Usage: /opus plan <request>"
+                if mode == OPUS_PLAN_MODE
+                else "Usage: /opus <request>"
+            )
+        if mode == OPUS_IMPLEMENTATION_MODE and not _is_standard_discord_action_request(
+            event.source,
+            getattr(event, "feature_summary", None),
+        ):
+            return (
+                "⚠️ Discord `/opus <request>` must run in a normal non-Kanban "
+                "action-request thread. Use `/opus plan <request>` for a plan-only artifact."
+            )
+
+        override, error = opus_session_model_override(cfg)
+        if error or not override:
+            return f"⚠️ {error or 'Opus 5 route unavailable.'}"
+
+        if mode == OPUS_IMPLEMENTATION_MODE:
+            session_cwd, session_cwd_error, action_worktree_cwd = await asyncio.to_thread(
+                _resolve_gateway_turn_cwd,
+                event.source,
+                getattr(event, "feature_summary", None),
+                cfg,
+                session_key,
+            )
+            if session_cwd_error:
+                logger.error(
+                    "Opus action-worktree preparation failed for session %s: %s",
+                    session_key,
+                    session_cwd_error,
+                )
+                return (
+                    "⚠️ I could not start this Discord `/opus` implementation safely "
+                    f"in a mutable Git worktree. {session_cwd_error}"
+                )
+            if action_worktree_cwd:
+                repository = _gateway_repository_for_source(
+                    event.source,
+                    workspace_path=action_worktree_cwd,
+                )
+                if not repository:
+                    try:
+                        from hermes_cli.github_remote import github_origin_repo
+
+                        repository = str(github_origin_repo(action_worktree_cwd) or "")
+                    except Exception:
+                        repository = ""
+                closeout_mode, closeout_policy = _gateway_action_closeout_contract(
+                    cfg,
+                    repository=repository,
+                    request=_gateway_action_request_text(event),
+                    source="opus",
+                    visual_requirement=getattr(event, "visual_qa_requirement", None),
+                    visual_config=getattr(event, "visual_qa_config", None),
+                )
+                self._persist_action_closeout_workspace(
+                    event,
+                    mutable_path=action_worktree_cwd,
+                    canonical_path=str(event.source.project_path or ""),
+                    config=cfg,
+                    source="opus",
+                    mode=closeout_mode,
+                    policy=closeout_policy,
+                )
+                source = dataclasses.replace(event.source, project_path=action_worktree_cwd)
+                try:
+                    event.source = source
+                except Exception:
+                    pass
+                self._cache_session_source(session_key, source)
+
+        original_text = str(event.text or "").strip()
+        request = OpusPlanRequest(
+            prompt=prompt,
+            session_id=session_key,
+            workdir=session_cwd,
+            source_text=original_text,
+            platform=event.source.platform.value if event.source.platform else "",
+        )
+        if mode == OPUS_PLAN_MODE:
+            msg = build_opus_plan_invocation(request, task_id=session_key)
+            if not msg:
+                return "⚠️ /opus plan requires the `plan` skill, but it is not installed or could not be loaded."
+        else:
+            msg = build_opus_implementation_instruction(request)
+
+        try:
+            event.text = msg
+            event.invoked_skill_name = "plan" if mode == OPUS_PLAN_MODE else "opus"
+            event.invoked_skill_command = "opus"
+            event.opus_plan_metadata = {
+                **opus_metadata(config=cfg, mode=mode),
+                "session_id": session_key,
+                "source_message_id": str(event.message_id or ""),
+            }
+            if mode == OPUS_PLAN_MODE:
+                event.opus_enabled_toolsets = opus_enabled_toolsets(cfg)
+            event.opus_reasoning_config = opus_reasoning_config(cfg)
+            event.opus_transcript_user_message = original_text
+            event.opus_implementation = mode == OPUS_IMPLEMENTATION_MODE
+        except Exception:
+            pass
+
+        previous_override = self._session_model_overrides.get(session_key)
+        self._session_model_overrides[session_key] = override
+        try:
+            self._evict_cached_agent(session_key)
+        except Exception:
+            pass
+        try:
+            event.opus_previous_model_override = previous_override
+        except Exception:
+            pass
+        return None
+
     # ------------------------------------------------------------------
     # Slash-command confirmation primitive (generic)
     # ------------------------------------------------------------------
@@ -29392,6 +29636,10 @@ class _GatewayRunnerCore(
         fable_toolsets: Optional[List[str]] = None,
         fable_reasoning_config: Optional[Dict[str, Any]] = None,
         fable_transcript_user_message: Optional[str] = None,
+        opus_plan_metadata: Optional[Dict[str, Any]] = None,
+        opus_toolsets: Optional[List[str]] = None,
+        opus_reasoning_config: Optional[Dict[str, Any]] = None,
+        opus_transcript_user_message: Optional[str] = None,
         session_cwd_override: Optional[str] = None,
         visual_qa_requirement: Optional[Dict[str, Any]] = None,
         visual_qa_config: Optional[Dict[str, Any]] = None,
@@ -29513,6 +29761,22 @@ class _GatewayRunnerCore(
             if isinstance(fable_plan_metadata, dict)
             else False
         )
+        opus_mode = str(
+            (opus_plan_metadata or {}).get("opus_mode", "")
+            if isinstance(opus_plan_metadata, dict)
+            else ""
+        ).strip().lower() or "plan"
+        opus_plan_only = bool(opus_plan_metadata) and opus_mode == "plan"
+        opus_implementation = bool(opus_plan_metadata) and opus_mode == "implementation"
+        opus_oauth_tool_name_compat = bool(
+            (opus_plan_metadata or {}).get("anthropic_oauth_tool_name_compat", False)
+            if isinstance(opus_plan_metadata, dict)
+            else False
+        )
+        premium_plan_metadata = fable_plan_metadata or opus_plan_metadata
+        premium_oauth_tool_name_compat = (
+            fable_oauth_tool_name_compat or opus_oauth_tool_name_compat
+        )
 
         from hermes_cli.tools_config import _get_platform_tools
         default_discord_kanban_intake = bool(
@@ -29533,6 +29797,10 @@ class _GatewayRunnerCore(
             from hermes_cli.fable_planner import fable_enabled_toolsets
 
             enabled_toolsets = list(fable_toolsets or fable_enabled_toolsets(user_config))
+        elif opus_plan_only:
+            from hermes_cli.opus_planner import opus_enabled_toolsets
+
+            enabled_toolsets = list(opus_toolsets or opus_enabled_toolsets(user_config))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -30411,6 +30679,13 @@ class _GatewayRunnerCore(
 
                     resolved_fable_reasoning = resolve_fable_reasoning_config(user_config)
                 reasoning_config = dict(resolved_fable_reasoning)
+            elif opus_plan_metadata:
+                resolved_opus_reasoning = opus_reasoning_config
+                if resolved_opus_reasoning is None:
+                    from hermes_cli.opus_planner import opus_reasoning_config as resolve_opus_reasoning_config
+
+                    resolved_opus_reasoning = resolve_opus_reasoning_config(user_config)
+                reasoning_config = dict(resolved_opus_reasoning)
             elif discord_action_model_route:
                 reasoning_config = _discord_action_request_reasoning_config(
                     user_config,
@@ -30578,6 +30853,8 @@ class _GatewayRunnerCore(
                     ),
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
                     "gateway.fable_oauth_tool_name_compat": fable_oauth_tool_name_compat,
+                    "gateway.opus_mode": opus_mode if opus_plan_metadata else "",
+                    "gateway.opus_oauth_tool_name_compat": opus_oauth_tool_name_compat,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
                     "gateway.tool_delay": 0.0 if discord_action_runtime else None,
                     "gateway.verify_on_stop": True if discord_action_runtime else None,
@@ -30640,11 +30917,13 @@ class _GatewayRunnerCore(
                     "thread_id": source.thread_id,
                     "gateway_session_key": session_key,
                     "session_db": self._session_db,
-                    "fallback_model": None if fable_plan_metadata else self._fallback_model,
+                    "fallback_model": None if premium_plan_metadata else self._fallback_model,
                     "runtime_mode": turn_runtime_mode.value,
                     "memory_read_only": turn_runtime_mode is RuntimeMode.READ_ONLY,
                 }
                 if fable_plan_metadata:
+                    agent_kwargs["providers_allowed"] = ["anthropic"]
+                if opus_plan_metadata:
                     agent_kwargs["providers_allowed"] = ["anthropic"]
                 if discord_action_runtime:
                     agent_kwargs["tool_delay"] = 0.0
@@ -30741,14 +31020,20 @@ class _GatewayRunnerCore(
                     )
 
                 agent._visual_qa_stop_callback = _visual_qa_stop_callback
-            # Fable proxy credentials are not OAuth tokens, but the trusted
+            # Premium proxy credentials are not OAuth tokens, but the trusted
             # proxy route can terminate against Claude Code OAuth upstream.
             # Reset this on every turn so a cached agent cannot leak the wire
-            # format into an unrelated non-Fable request.
-            agent._anthropic_oauth_tool_name_compat = fable_oauth_tool_name_compat
+            # format into an unrelated non-premium request.
+            agent._anthropic_oauth_tool_name_compat = premium_oauth_tool_name_compat
             # Retained only as model/provenance metadata; lifecycle and worker
             # behavior are identical to ordinary Discord action requests.
             agent._fable_implementation_turn = fable_implementation
+            agent._opus_implementation_turn = opus_implementation
+            agent._coding_worker_backend_override = (
+                str((opus_plan_metadata or {}).get("coding_worker_backend") or "").strip().lower()
+                if opus_implementation and isinstance(opus_plan_metadata, dict)
+                else ""
+            )
             session_model_override = bool(
                 (getattr(self, "_session_model_overrides", {}) or {}).get(session_key)
             )
@@ -30762,6 +31047,9 @@ class _GatewayRunnerCore(
             if fable_plan_metadata:
                 runtime_route = "gateway_fable"
                 model_override_source = "fable"
+            elif opus_plan_metadata:
+                runtime_route = "gateway_opus"
+                model_override_source = "opus"
             elif discord_action_runtime:
                 runtime_route = "discord_action_request"
                 active_tier = action_request_tier
@@ -30779,6 +31067,8 @@ class _GatewayRunnerCore(
                 reasoning_source=(
                     "fable"
                     if fable_plan_metadata
+                    else "opus"
+                    if opus_plan_metadata
                     else "model_tier"
                     if discord_action_model_route and active_tier is not None
                     else "discord_config"
@@ -31177,7 +31467,11 @@ class _GatewayRunnerCore(
                     "task_id": session_id,
                 }
                 _persist_user_message = (
-                    str(fable_transcript_user_message or "").strip()
+                    str(
+                        fable_transcript_user_message
+                        or opus_transcript_user_message
+                        or ""
+                    ).strip()
                 )
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message or message

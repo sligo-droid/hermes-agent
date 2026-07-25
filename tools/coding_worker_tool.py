@@ -2093,10 +2093,18 @@ def _delegate_coding_task_impl(
             load_coding_worker_backend,
         )
 
-        try:
-            backend = load_coding_worker_backend(config=loaded_config)
-        except TypeError:
-            backend = load_coding_worker_backend()
+        backend_override = str(
+            getattr(parent_agent, "_coding_worker_backend_override", "") or ""
+        ).strip().lower()
+        if backend_override:
+            from agent.opencode_worker import normalize_coding_worker_backend
+
+            backend = normalize_coding_worker_backend(backend_override)
+        else:
+            try:
+                backend = load_coding_worker_backend(config=loaded_config)
+            except TypeError:
+                backend = load_coding_worker_backend()
     except Exception:
         BACKEND_CODEX = "codex"
         BACKEND_OPENCODE = "opencode"

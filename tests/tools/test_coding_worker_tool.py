@@ -2930,6 +2930,40 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     ]
 
 
+def test_opus_turn_forces_codex_backend_over_configured_opencode(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    FakeSession.instances = []
+    FakeSession.results = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "opencode"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+    parent._opus_implementation_turn = True
+    parent._coding_worker_backend_override = "codex"
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            context="focus on src/parser.py",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["backend"] == "codex"
+    assert len(FakeSession.instances) == 1
+
+
 def test_opencode_exception_emits_failed_observer_closeout(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 

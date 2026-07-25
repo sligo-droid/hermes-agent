@@ -1414,7 +1414,7 @@ def test_uncertain_push_reobserves_fenced_exact_head_not_moving_branch(
     assert not any(args[:2] == ["git", "push"] for args in calls)
 
 
-@pytest.mark.parametrize("source", ["direct", "fable"])
+@pytest.mark.parametrize("source", ["direct", "fable", "opus"])
 def test_new_closeout_pushes_immutable_head_refspec_without_force(
     monkeypatch,
     tmp_path,

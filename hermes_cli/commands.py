@@ -203,6 +203,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", args_hint="<what to learn from>"),
     CommandDef("fable", "Use Claude Fable 5 (Discord executes; /fable plan saves a plan artifact)",
                "Tools & Skills", args_hint="[plan] <request>", subcommands=("plan",)),
+    CommandDef("opus", "Use Claude Opus 5 (Discord executes; /opus plan saves a plan artifact)",
+               "Tools & Skills", args_hint="[plan] <request>", subcommands=("plan",)),
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
@@ -1178,7 +1180,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (the rehaul folded the old /credits + /billing surfaces into /topup.)
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
-#   - coding-worker and fable: fork-specific orchestration controls. They stay
+#   - coding-worker, fable, and opus: fork-specific orchestration controls. They stay
 #     native on Discord/Telegram and reachable as /hermes subcommands on Slack
 #     without displacing upstream's /update and /version command slots.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
@@ -1187,6 +1189,7 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
     "moa",
     "coding-worker",
     "fable",
+    "opus",
     "debug",
 })
 

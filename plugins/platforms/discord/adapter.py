@@ -2792,7 +2792,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if not isinstance(handle, dict) or "kanban_board" not in handle:
             return False
         initial_request = str(handle.get("initial_request") or "").strip()
-        return not self._is_fable_command_text(initial_request)
+        return not (
+            self._is_fable_command_text(initial_request)
+            or self._is_opus_command_text(initial_request)
+        )
 
     def _feature_summary_reaction_emoji(
         self,
@@ -4089,7 +4092,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         command = match.group(1).lower()
         args = (match.group(2) or "").strip()
-        if command == "fable":
+        if command in {"fable", "opus"}:
             return bool(args)
         if command != "goal":
             return False
@@ -4107,7 +4110,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not match:
             return False
         command = match.group(1).lower()
-        if command == "fable":
+        if command in {"fable", "opus"}:
             return False
         return self._slash_command_starts_threaded_work(cleaned)
 
@@ -7050,6 +7053,14 @@ class DiscordAdapter(BasePlatformAdapter):
             and str(fable_plan_metadata.get("command", "") or "").strip().lower() == "fable"
         )
 
+    def _is_opus_event(self, event: MessageEvent) -> bool:
+        invoked_skill_command = str(getattr(event, "invoked_skill_command", "") or "").strip().lower()
+        opus_plan_metadata = getattr(event, "opus_plan_metadata", None)
+        return invoked_skill_command == "opus" or (
+            isinstance(opus_plan_metadata, dict)
+            and str(opus_plan_metadata.get("command", "") or "").strip().lower() == "opus"
+        )
+
     @staticmethod
     def _action_lifecycle_enabled(event: MessageEvent) -> bool:
         """Return whether this turn may mutate action summary/reaction state."""
@@ -7130,9 +7141,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(work_item, dict) and ledger_state:
                 await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
             return
-        is_fable_event = self._is_fable_event(event)
+        is_premium_event = self._is_fable_event(event) or self._is_opus_event(event)
         kanban_state = None
-        if not is_fable_event:
+        if not is_premium_event:
             kanban_state = self._feature_kanban_reaction_state(getattr(event, "feature_summary", None))
             if outcome == ProcessingOutcome.SUCCESS:
                 kanban_state = self._feature_kanban_completion_state(
@@ -9339,6 +9350,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._is_fable_command_text(command_text):
             if not await self._route_fable_slash_to_thread(interaction, event, command_text):
                 return
+        if self._is_opus_command_text(command_text):
+            if not await self._route_opus_slash_to_thread(interaction, event, command_text):
+                return
         await self.handle_message(event)
         if not deferred_response:
             return
@@ -9355,6 +9369,10 @@ class DiscordAdapter(BasePlatformAdapter):
         return bool(re.match(r"^/fable(?:\s|$)", str(text or "").strip(), re.IGNORECASE))
 
     @staticmethod
+    def _is_opus_command_text(text: str) -> bool:
+        return bool(re.match(r"^/opus(?:\s|$)", str(text or "").strip(), re.IGNORECASE))
+
+    @staticmethod
     def _command_request_text(text: str) -> str:
         match = re.match(r"^/[^\s]+(?:\s+(.*))?$", str(text or "").strip(), re.DOTALL)
         return str(match.group(1) or "").strip() if match else ""
@@ -9366,6 +9384,15 @@ class DiscordAdapter(BasePlatformAdapter):
         content = re.sub(r"<#\d+>", "", content)
         content = re.sub(r"\s+", " ", content).strip()
         base = f"Fable plan — {content}" if content else "Fable plan"
+        return base[:80] if len(base) <= 80 else base[:77].rstrip() + "..."
+
+    @staticmethod
+    def _opus_thread_name(command_text: str) -> str:
+        content = re.sub(r"^/opus(?:\s+|$)", "", str(command_text or "").strip(), flags=re.IGNORECASE)
+        content = re.sub(r"<@[!&]?\d+>", "", content)
+        content = re.sub(r"<#\d+>", "", content)
+        content = re.sub(r"\s+", " ", content).strip()
+        base = f"Opus plan — {content}" if content else "Opus plan"
         return base[:80] if len(base) <= 80 else base[:77].rstrip() + "..."
 
     @staticmethod
@@ -9636,6 +9663,95 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 logger.debug("Discord /fable malformed thread notice failed: %s", exc)
+            return False
+
+        source.parent_chat_id = parent_chat_id
+        source.chat_id = thread_id
+        source.thread_id = thread_id
+        source.chat_type = "thread"
+        if thread_name:
+            guild = getattr(interaction, "guild", None)
+            guild_name = str(getattr(guild, "name", "") or "").strip()
+            source.chat_name = f"{guild_name} / #{thread_name}" if guild_name else thread_name
+        return True
+
+
+    async def _route_opus_slash_to_thread(
+        self,
+        interaction: Any,
+        event: MessageEvent,
+        command_text: str,
+    ) -> bool:
+        """Route Opus plans or implementations to their appropriate Discord flow."""
+
+        try:
+            from hermes_cli.opus_planner import (
+                OPUS_IMPLEMENTATION_MODE,
+                parse_opus_command_args,
+            )
+
+            opus_mode, request = parse_opus_command_args(self._command_request_text(command_text))
+        except Exception:
+            OPUS_IMPLEMENTATION_MODE = "implementation"
+            opus_mode, request = "plan", self._command_request_text(command_text)
+        if not request:
+            try:
+                await interaction.edit_original_response(
+                    content="Usage: /opus <request> or /opus plan <request>"
+                )
+            except Exception as exc:
+                logger.debug("Discord /opus usage notice failed: %s", exc)
+            return False
+        if opus_mode == OPUS_IMPLEMENTATION_MODE:
+            return await self._route_action_request_slash_to_thread(
+                interaction,
+                event,
+                command_text,
+                reason_command="opus",
+                thread_prefix="Opus",
+            )
+
+        source = getattr(event, "source", None)
+        if source is None:
+            return True
+        if getattr(source, "chat_type", "") == "dm" or getattr(source, "thread_id", None):
+            return True
+
+        result = await self._create_thread(
+            interaction,
+            name=self._opus_thread_name(command_text),
+            message="",
+            auto_archive_duration=1440,
+            reason_command="opus",
+        )
+        if not result.get("success"):
+            error = str(result.get("error") or "unknown Discord thread creation failure")
+            logger.warning("[%s] /opus thread creation failed; refusing top-level delivery: %s", self.name, error)
+            try:
+                await interaction.edit_original_response(
+                    content=(
+                        "⚠️ Failed to create a Discord thread for `/opus`, so I did not run it "
+                        f"in the top-level channel. {error}"
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Discord /opus thread failure notice failed: %s", exc)
+            return False
+
+        parent_chat_id = str(getattr(interaction, "channel_id", "") or getattr(source, "chat_id", "") or "")
+        thread_id = str(result.get("thread_id") or "").strip()
+        thread_name = str(result.get("thread_name") or self._opus_thread_name(command_text)).strip()
+        if not thread_id:
+            logger.warning("[%s] /opus thread creation returned success without a thread_id; refusing top-level delivery", self.name)
+            try:
+                await interaction.edit_original_response(
+                    content=(
+                        "⚠️ Failed to create a Discord thread for `/opus`, so I did not run it "
+                        "in the top-level channel. Discord did not return a thread id."
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Discord /opus malformed thread notice failed: %s", exc)
             return False
 
         source.parent_chat_id = parent_chat_id
@@ -13726,6 +13842,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 is_fable_implementation_command = not bool(
                     re.match(r"^/fable\s+plan(?:\s|$)", normalized_content, re.IGNORECASE)
                 )
+        is_opus_implementation_command = False
+        if self._is_opus_command_text(normalized_content):
+            try:
+                from hermes_cli.opus_planner import (
+                    OPUS_IMPLEMENTATION_MODE,
+                    parse_opus_command_args,
+                )
+
+                opus_mode, opus_request = parse_opus_command_args(
+                    self._command_request_text(normalized_content)
+                )
+                is_opus_implementation_command = bool(
+                    opus_request and opus_mode == OPUS_IMPLEMENTATION_MODE
+                )
+            except Exception:
+                # Keep the safe parallel behavior if the Opus parser is unavailable:
+                # only explicit `/opus plan` is plan-only.
+                is_opus_implementation_command = not bool(
+                    re.match(r"^/opus\s+plan(?:\s|$)", normalized_content, re.IGNORECASE)
+                )
         is_meeting_command_message = self._is_meeting_command_text(normalized_content)
         if (
             not is_meeting_command_message
@@ -14165,7 +14301,7 @@ class DiscordAdapter(BasePlatformAdapter):
             and not slash_goal_uses_attachment_body
             and slash_command_starts_threaded_work
         ):
-            if is_fable_implementation_command:
+            if is_fable_implementation_command or is_opus_implementation_command:
                 # These commands must operate on a pre-existing normal action
                 # thread. Do not replace a worker/non-action summary with a
                 # new one that would make the gateway misclassify the thread.

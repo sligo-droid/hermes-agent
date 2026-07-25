@@ -1090,6 +1090,172 @@ async def test_fable_slash_refuses_top_level_dispatch_when_thread_creation_fails
     assert "did not run it in the top-level channel" in kwargs["content"]
     assert "no thread perms" in kwargs["content"]
     interaction.delete_original_response.assert_not_awaited()
+def test_opus_text_command_counts_as_threaded_work(adapter):
+    assert adapter._slash_command_starts_threaded_work("/opus plan reporting") is True
+    assert adapter._slash_command_starts_threaded_work("/OPUS plan reporting") is True
+    assert adapter._slash_command_starts_threaded_work("/opus") is False
+    assert adapter._slash_command_starts_threaded_work("/usage") is False
+
+
+def test_opus_text_command_does_not_create_worker_board(adapter):
+    assert adapter._slash_command_creates_worker_board("/opus plan reporting") is False
+    assert adapter._slash_command_creates_worker_board("/OPUS plan reporting") is False
+    assert adapter._slash_command_creates_worker_board("/goal ship reporting") is True
+    assert adapter._slash_command_creates_worker_board("/goal stop") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_text", "thread_name"),
+    [
+        ("/opus plan the work", "Opus plan — plan the work"),
+        ("/opus help me plan to ship the work", "Opus plan — help me plan to ship the work"),
+    ],
+)
+async def test_opus_plan_slash_in_parent_channel_creates_thread_before_dispatch(
+    adapter,
+    command_text,
+    thread_name,
+):
+    parent = _FakeTextChannel(channel_id=123, name="planning")
+    interaction = SimpleNamespace(
+        channel=parent,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock(
+        return_value={"success": True, "thread_id": "555", "thread_name": thread_name}
+    )
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = AsyncMock(side_effect=capture_handle)
+
+    await adapter._run_simple_slash(interaction, command_text)
+
+    adapter._create_thread.assert_awaited_once_with(
+        interaction,
+        name=thread_name,
+        message="",
+        auto_archive_duration=1440,
+        reason_command="opus",
+    )
+    adapter.handle_message.assert_awaited_once()
+    event = captured_events[0]
+    assert event.text == command_text
+    assert event.source.chat_id == "555"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "555"
+    assert event.source.parent_chat_id == "123"
+    interaction.delete_original_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_opus_implementation_slash_uses_normal_non_kanban_action_thread(adapter):
+    parent = _FakeTextChannel(channel_id=123, name="planning")
+    thread = _FakeThreadChannel(channel_id=555, name="Opus — build the work", parent_id=123)
+    thread.parent = parent
+    interaction = SimpleNamespace(
+        channel=parent,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock(
+        return_value={
+            "success": True,
+            "thread_id": "555",
+            "thread_name": "Opus — build the work",
+            "_thread": thread,
+        }
+    )
+    adapter._resolve_project_context_for_channel = MagicMock(return_value={"project_path": "/repo"})
+    adapter.initialize_feature_summary = AsyncMock(
+        return_value={"initial_request": "/opus build the work", "kanban_board": None}
+    )
+    captured_events = []
+    adapter.handle_message = AsyncMock(side_effect=lambda event: captured_events.append(event))
+
+    await adapter._run_simple_slash(interaction, "/opus build the work")
+
+    adapter._create_thread.assert_awaited_once_with(
+        interaction,
+        name="Opus — build the work",
+        message="",
+        auto_archive_duration=1440,
+        reason_command="opus",
+    )
+    adapter.initialize_feature_summary.assert_awaited_once()
+    assert captured_events[0].text == "/opus build the work"
+    assert captured_events[0].source.chat_type == "thread"
+    assert captured_events[0].feature_summary["kanban_board"] is None
+    assert captured_events[0].discord_runtime_mode == "action"
+    assert captured_events[0].discord_runtime_reason == "action_thread_slash_command"
+    assert captured_events[0].participates_in_work_lifecycle is True
+
+
+@pytest.mark.asyncio
+async def test_opus_slash_in_existing_thread_does_not_create_nested_thread(adapter):
+    thread = _FakeThreadChannel(channel_id=555, name="already-threaded", parent_id=123)
+    interaction = SimpleNamespace(
+        channel=thread,
+        channel_id=555,
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock()
+    captured_events = []
+    adapter.handle_message = AsyncMock(side_effect=lambda event: captured_events.append(event))
+
+    await adapter._run_simple_slash(interaction, "/opus plan the work")
+
+    adapter._create_thread.assert_not_awaited()
+    event = captured_events[0]
+    assert event.source.chat_id == "555"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "555"
+
+
+@pytest.mark.asyncio
+async def test_opus_slash_refuses_top_level_dispatch_when_thread_creation_fails(adapter):
+    parent = _FakeTextChannel(channel_id=123, name="planning")
+    interaction = SimpleNamespace(
+        channel=parent,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock(return_value={"error": "no thread perms"})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._run_simple_slash(interaction, "/opus plan the work")
+
+    adapter.handle_message.assert_not_awaited()
+    interaction.edit_original_response.assert_awaited_once()
+    _args, kwargs = interaction.edit_original_response.await_args
+    assert "did not run it in the top-level channel" in kwargs["content"]
+    assert "no thread perms" in kwargs["content"]
+    interaction.delete_original_response.assert_not_awaited()
+
 
 
 @pytest.mark.asyncio

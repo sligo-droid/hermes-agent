@@ -10070,6 +10070,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         _cprint("\033[1;31m/fable requires the `plan` skill, but it is not installed or could not be loaded.\033[0m")
 
+    def _handle_opus_command(self, cmd: str) -> None:
+        """Handle /opus <request> by enqueueing the plan skill for the agent loop."""
+        parts = cmd.split(None, 1)
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+        if not prompt:
+            _cprint("  Usage: /opus <request>")
+            return
+
+        from hermes_cli.opus_planner import OpusPlanRequest, build_opus_plan_invocation
+
+        msg = build_opus_plan_invocation(OpusPlanRequest(
+            prompt=prompt,
+            session_id=getattr(self, "session_id", "") or "",
+            workdir=os.getcwd(),
+            source_text=cmd,
+            platform="cli",
+        ))
+        if msg:
+            if hasattr(self, '_pending_input'):
+                self._pending_input.put(msg)
+            else:
+                print(msg)
+            return
+        _cprint("\033[1;31m/opus requires the `plan` skill, but it is not installed or could not be loaded.\033[0m")
+
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
         from hermes_cli.skills_hub import handle_skills_slash
@@ -10380,6 +10405,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "fable":
             with self._busy_command("Generating Fable plan..."):
                 self._handle_fable_command(cmd_original)
+        elif canonical == "opus":
+            with self._busy_command("Generating Opus plan..."):
+                self._handle_opus_command(cmd_original)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
