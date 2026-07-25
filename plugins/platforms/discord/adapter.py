@@ -6310,18 +6310,17 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
-    async def _processing_reaction_message_for_raw(self, raw_message: Any) -> Any:
-        """Return the Discord message whose reactions represent ``raw_message``."""
+    async def _processing_reaction_messages_for_raw(self, raw_message: Any) -> List[Any]:
+        """Return a turn's message and, for threads, its opener as status targets."""
+        if raw_message is None:
+            return []
+        messages = [raw_message]
         channel = getattr(raw_message, "channel", None)
         if channel is not None and self._get_parent_channel_id(channel):
             origin = await self._thread_origin_message(channel)
             if origin is not None:
-                return origin
-        return raw_message
-
-    async def _processing_reaction_message(self, event: MessageEvent) -> Any:
-        """Return the user Discord message whose reactions represent this turn."""
-        return await self._processing_reaction_message_for_raw(getattr(event, "raw_message", None))
+                messages.append(origin)
+        return messages
 
     async def _thread_origin_message(self, thread_channel: Any) -> Optional[Any]:
         """Resolve the message that started a Discord thread, when possible."""
@@ -6370,28 +6369,23 @@ class DiscordAdapter(BasePlatformAdapter):
         return None
 
     async def _processing_reaction_messages(self, event: MessageEvent) -> List[Any]:
-        """Return all user Discord messages whose reactions represent this turn."""
+        """Return all user messages whose reactions represent this turn."""
         messages = getattr(event, "_batched_raw_messages", None)
         if messages is None:
-            message = await self._processing_reaction_message(event)
-            return [message] if message is not None else []
+            messages = [getattr(event, "raw_message", None)]
         if not isinstance(messages, (list, tuple, set)):
             messages = [messages]
 
         result = []
         seen = set()
         for raw_message in messages:
-            if raw_message is None:
-                continue
-            message = await self._processing_reaction_message_for_raw(raw_message)
-            if message is None:
-                continue
-            message_id = getattr(message, "id", None)
-            identity = ("id", str(message_id)) if message_id is not None else ("obj", id(message))
-            if identity in seen:
-                continue
-            seen.add(identity)
-            result.append(message)
+            for message in await self._processing_reaction_messages_for_raw(raw_message):
+                message_id = getattr(message, "id", None)
+                identity = ("id", str(message_id)) if message_id is not None else ("obj", id(message))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                result.append(message)
         return result
 
     def _work_ledger_for_reactions(self) -> Any:
@@ -7077,19 +7071,13 @@ class DiscordAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 
-        Feature-thread turns still reopen/update the summary embed, but
-        lifecycle reactions belong on the triggering user message (including
-        the original post a newly-created thread is based on), not on Hermes'
-        own summary/embed message.
+        Action turns reopen/update the summary embed. Every turn updates the
+        triggering user message and, within a thread, its original post.
         """
-        if not self._action_lifecycle_enabled(event):
-            await asyncio.to_thread(
-                self._record_discord_processing_start,
-                event,
-                emoji_ack=False,
-            )
-            return
+        action_lifecycle = self._action_lifecycle_enabled(event)
         if (
+            action_lifecycle
+            and
             getattr(event, "background_completion_kind", None) == "coding_worker"
             and getattr(event, "background_completion_required_failed", False)
         ):
@@ -7102,7 +7090,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 emoji_ack=False,
             )
             return
-        await self._mark_feature_summary_running(event)
+        if action_lifecycle:
+            await self._mark_feature_summary_running(event)
         acked = False
         if self._reactions_enabled():
             messages = await self._processing_reaction_messages(event)
@@ -7137,13 +7126,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     ledger_state = ledger.discord_thread_reaction_state(work_item)
             except Exception as exc:
                 logger.debug("[%s] Failed to aggregate Discord work reaction: %s", self.name, exc)
-        if not self._action_lifecycle_enabled(event):
-            if isinstance(work_item, dict) and ledger_state:
-                await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
-            return
-        is_premium_event = self._is_fable_event(event) or self._is_opus_event(event)
+        action_lifecycle = self._action_lifecycle_enabled(event)
+        is_premium_event = action_lifecycle and (self._is_fable_event(event) or self._is_opus_event(event))
         kanban_state = None
-        if not is_premium_event:
+        if action_lifecycle and not is_premium_event:
             kanban_state = self._feature_kanban_reaction_state(getattr(event, "feature_summary", None))
             if outcome == ProcessingOutcome.SUCCESS:
                 kanban_state = self._feature_kanban_completion_state(
@@ -7152,7 +7138,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
         kanban_emoji = self._feature_kanban_reaction_emoji(kanban_state)
         ledger_emoji = self._feature_kanban_reaction_emoji(ledger_state)
-        has_feature_summary = getattr(event, "feature_summary", None) is not None
+        has_feature_summary = action_lifecycle and getattr(event, "feature_summary", None) is not None
         messages = await self._processing_reaction_messages(event)
         if not messages and isinstance(work_item, dict) and ledger_state:
             await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)

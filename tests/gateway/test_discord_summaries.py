@@ -3828,7 +3828,7 @@ def test_feature_summary_renders_only_safe_artifact_links_between_runtime_and_ka
 
 
 @pytest.mark.asyncio
-async def test_direct_question_processing_start_and_end_leave_action_lifecycle_unchanged(adapter):
+async def test_direct_question_updates_reactions_without_touching_action_lifecycle(adapter):
     feature_summary = {
         "thread_id": "200",
         "message_id": "300",
@@ -3852,15 +3852,24 @@ async def test_direct_question_processing_start_and_end_leave_action_lifecycle_u
     )
     adapter._reactions_enabled = MagicMock(return_value=True)
     adapter.update_feature_summary = AsyncMock(return_value=True)
-    adapter._processing_reaction_messages = AsyncMock(return_value=[SimpleNamespace(id=400)])
+    messages = [
+        SimpleNamespace(id=400, add_reaction=AsyncMock()),
+        SimpleNamespace(id=300, add_reaction=AsyncMock()),
+    ]
+    adapter._processing_reaction_messages = AsyncMock(return_value=messages)
     adapter._set_message_reaction_state = AsyncMock()
 
     await adapter.on_processing_start(event)
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     adapter.update_feature_summary.assert_not_awaited()
-    adapter._processing_reaction_messages.assert_not_awaited()
-    adapter._set_message_reaction_state.assert_not_awaited()
+    assert adapter._processing_reaction_messages.await_count == 2
+    assert [call.args for call in adapter._set_message_reaction_state.await_args_list] == [
+        (messages[0], "⏳"),
+        (messages[1], "⏳"),
+        (messages[0], "✅"),
+        (messages[1], "✅"),
+    ]
     assert feature_summary == before
 
 
