@@ -5262,6 +5262,8 @@ def resolve_provider_client(
             # main agent, auxiliary tasks, and the local proxy.
             custom_runtime = _resolve_named_custom_runtime(
                 requested_provider=custom_requested,
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=explicit_base_url,
             )
             if custom_runtime is None:
                 return None, None
