@@ -52,6 +52,35 @@ def test_classifier_allows_explicit_visual_fix_after_review_framing():
     assert requirement["assertions"]
 
 
+def test_classifier_recognizes_direct_visual_defects_and_desired_state_requests():
+    incident = classify_visual_requirement(
+        "in the Issue Attention graph in the State Brief page:\n"
+        "-the bar graphs clip through the x axis\n"
+        "-we should lightly label the y axis",
+        worker_route="action",
+    )
+    defect_only = classify_visual_requirement(
+        "The dashboard chart bars clip through the x axis.",
+        worker_route="action",
+    )
+    desired_state = classify_visual_requirement("The dashboard should lightly label the y axis.")
+
+    assert incident["level"] == "surface"
+    assert incident["assertions"]
+    assert incident["assertions"][0]["kind"] == "screenshot_appearance"
+    assert defect_only["level"] == "surface"
+    assert desired_state["level"] == "surface"
+
+
+def test_classifier_keeps_visual_defect_review_only_requests_non_actionable():
+    requirement = classify_visual_requirement(
+        "Review this screenshot where the dashboard chart clips and explain why.",
+        worker_route="read_only",
+    )
+
+    assert requirement["level"] == "none"
+
+
 def test_classifier_drops_credential_bearing_request_text_from_requirement():
     requirement = classify_visual_requirement(
         "Add a PNG export at https://example.test/export?access_token=super-secret-token "

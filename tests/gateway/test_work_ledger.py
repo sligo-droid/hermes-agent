@@ -338,6 +338,30 @@ def test_ledger_persists_normalized_visual_requirement_from_feature_summary(tmp_
     assert replay.visual_qa_config == stored["visual_qa_config"]
 
 
+def test_ledger_requires_visual_qa_for_direct_rendered_defect_language(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(text="Please handle this request.")
+    event.feature_summary = {
+        "initial_request": (
+            "in the Issue Attention graph in the State Brief page:\n"
+            "-the bar graphs clip through the x axis\n"
+            "-we should lightly label the y axis"
+        ),
+    }
+
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+
+    assert item is not None
+    stored = ledger.get(item["id"])
+    assert stored["visual_qa_requirement"]["level"] == "surface"
+    assert stored["visual_qa_requirement"]["assertions"]
+
+
 def test_shadow_visual_qa_reports_missing_fresh_receipt_without_blocking(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(text="Build a responsive dashboard with a mobile sidebar.")

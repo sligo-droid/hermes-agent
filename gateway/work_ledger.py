@@ -384,16 +384,18 @@ def _durable_metadata(value: Any) -> Any:
 def _visual_qa_worker_route_for_event(event: Any) -> Any:
     """Return advisory route metadata without making it durable request data."""
 
-    route = getattr(event, "worker_route", None)
-    if route:
-        return route
     fable_metadata = getattr(event, "fable_plan_metadata", None)
-    if isinstance(fable_metadata, dict):
-        return fable_metadata.get("route")
     opus_metadata = getattr(event, "opus_plan_metadata", None)
-    if isinstance(opus_metadata, dict):
-        return opus_metadata.get("route")
-    return None
+    return {
+        "worker_route": getattr(event, "worker_route", None),
+        "fable_route": (
+            fable_metadata.get("route") if isinstance(fable_metadata, dict) else None
+        ),
+        "opus_route": (
+            opus_metadata.get("route") if isinstance(opus_metadata, dict) else None
+        ),
+        "runtime_mode": getattr(event, "discord_runtime_mode", None),
+    }
 
 
 def _visual_qa_requirement_for_event(event: Any) -> dict[str, Any]:
