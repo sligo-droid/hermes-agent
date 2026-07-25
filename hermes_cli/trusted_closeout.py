@@ -41,6 +41,25 @@ _REQUIRED_PR_CHECK_WORKFLOWS = {
     ("Basic Tests", "basic"): ".github/workflows/tests.yml",
     ("PR Body Format", "pr body"): ".github/workflows/pr-body-format.yml",
 }
+
+
+def _repo_uses_trusted_required_checks(root: Path) -> bool:
+    """Return whether this repository opts into Hermes' named CI gates.
+
+    The trusted closeout engine is also used for external project repositories.
+    Requiring Hermes-specific workflow/check names there leaves closeout waiting
+    forever for checks that repository can never produce.  An existing workflow
+    directory with none of the trusted workflow files is an explicit opt-out.
+    A missing directory retains the historical behavior for callers/tests that
+    operate before a checkout is fully materialized.
+    """
+
+    workflows = root / ".github" / "workflows"
+    if not workflows.is_dir():
+        return True
+    return any((root / path).is_file() for path in _REQUIRED_PR_CHECK_WORKFLOWS.values())
+
+
 CLOSEOUT_MODES = frozenset({"off", "shadow", "enforce"})
 MERGE_POLICIES = frozenset({"auto", "manual", "never"})
 PR_OPEN_POLICIES = frozenset({"after_review_approval", "never"})
@@ -1003,7 +1022,12 @@ def _pr_ref(state: Mapping[str, Any]) -> str:
     return str(pr.get("url") or pr.get("number") or "").strip()
 
 
-def _apply_pr_payload(state: dict[str, Any], payload: Mapping[str, Any]) -> str:
+def _apply_pr_payload(
+    state: dict[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    require_trusted_checks: bool = True,
+) -> str:
     """Apply one authoritative GitHub PR snapshot, including same-head changes."""
 
     pr = state["pr"]
@@ -1025,7 +1049,17 @@ def _apply_pr_payload(state: dict[str, Any], payload: Mapping[str, Any]) -> str:
     merge_commit = payload.get("mergeCommit") if isinstance(payload.get("mergeCommit"), Mapping) else {}
     reported_merge_sha = str(merge_commit.get("oid") or "").strip().lower()
     pr["merge_sha"] = reported_merge_sha if _SHA_RE.fullmatch(reported_merge_sha) else ""
-    state["ci"] = summarize_required_checks(payload.get("statusCheckRollup"), head_sha=new_head)
+    if require_trusted_checks:
+        state["ci"] = summarize_required_checks(payload.get("statusCheckRollup"), head_sha=new_head)
+    else:
+        state["ci"] = {
+            "head_sha": new_head,
+            "status": "passed",
+            "total": 0,
+            "failed": [],
+            "wait_state": "not_required",
+            "required": [],
+        }
     return new_head
 
 
@@ -1786,12 +1820,14 @@ def _reconcile_trusted_closeout_impl(
         return _blocked(original, state, code="pr_refresh_invalid_json", message=exc, now=current_time, retry=True, poll_seconds=poll)
     if not isinstance(payload, Mapping):
         return _blocked(original, state, code="pr_refresh_invalid_payload", message="PR refresh returned non-object JSON", now=current_time, retry=True, poll_seconds=poll)
-    payload = enrich_required_check_identities(
-        payload,
-        repo=repo,
-        root=root,
-        run=execute,
-    )
+    require_trusted_checks = _repo_uses_trusted_required_checks(root)
+    if require_trusted_checks:
+        payload = enrich_required_check_identities(
+            payload,
+            repo=repo,
+            root=root,
+            run=execute,
+        )
     identity_error = sanitize_closeout_error(
         payload.pop("_required_check_identity_error", "")
     )
@@ -1808,7 +1844,11 @@ def _reconcile_trusted_closeout_impl(
 
     pr = state["pr"]
     try:
-        new_head = _apply_pr_payload(state, payload)
+        new_head = _apply_pr_payload(
+            state,
+            payload,
+            require_trusted_checks=require_trusted_checks,
+        )
     except ValueError as exc:
         return _blocked(
             original,
@@ -2140,12 +2180,13 @@ def _reconcile_trusted_closeout_impl(
         return _blocked(original, state, code="premerge_refresh_invalid_json", message=exc, now=current_time, retry=True, poll_seconds=poll)
     if not isinstance(premerge_payload, Mapping):
         return _blocked(original, state, code="premerge_refresh_invalid_payload", message="Pre-merge PR refresh returned non-object JSON", now=current_time, retry=True, poll_seconds=poll)
-    premerge_payload = enrich_required_check_identities(
-        premerge_payload,
-        repo=repo,
-        root=root,
-        run=execute,
-    )
+    if require_trusted_checks:
+        premerge_payload = enrich_required_check_identities(
+            premerge_payload,
+            repo=repo,
+            root=root,
+            run=execute,
+        )
     identity_error = sanitize_closeout_error(
         premerge_payload.pop("_required_check_identity_error", "")
     )
@@ -2160,7 +2201,11 @@ def _reconcile_trusted_closeout_impl(
             poll_seconds=poll,
         )
     try:
-        refreshed_head = _apply_pr_payload(state, premerge_payload)
+        refreshed_head = _apply_pr_payload(
+            state,
+            premerge_payload,
+            require_trusted_checks=require_trusted_checks,
+        )
     except ValueError as exc:
         return _blocked(
             original,
