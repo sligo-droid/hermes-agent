@@ -3,6 +3,8 @@
 import copy
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_role_tier_supplies_model_and_reasoning(monkeypatch):
     from hermes_cli import kanban_codex_workers as workers
@@ -123,6 +125,25 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
         "-c", 'model_reasoning_effort="high"',
         "-c", 'service_tier="normal"',
     ]
+
+
+def test_bare_opencode_model_is_rejected_before_worker_profile_launch():
+    from agent.opencode_worker import load_coding_worker_pass_profiles
+
+    config = {
+        "model_tiers": {
+            "broken": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-5",
+                "opencode_model": "claude-sonnet-5",
+                "reasoning_effort": "medium",
+            }
+        },
+        "coding_worker": {"model_tier": "broken"},
+    }
+
+    with pytest.raises(ValueError, match="opencode_model in provider/model form"):
+        load_coding_worker_pass_profiles(config)
 
 
 def test_host_spawner_forwards_tier_models_to_the_child(monkeypatch, tmp_path):

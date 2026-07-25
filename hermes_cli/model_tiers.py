@@ -1,8 +1,9 @@
 """Shared named model tiers for Hermes runtime routes.
 
-The tiers intentionally describe a model together with its reasoning effort.
-They are distinct from Hermes runtime *profiles* (separate ``HERMES_HOME``
-instances) and can be referenced by gateway, cron, and Kanban role settings.
+The tiers intentionally describe a model, optional direct-agent provider, and
+reasoning effort. They are distinct from Hermes runtime *profiles* (separate
+``HERMES_HOME`` instances) and can be referenced by gateway, cron, and Kanban
+role settings.
 """
 
 from __future__ import annotations
@@ -49,7 +50,44 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "low",
     },
+    # Rendered-UI sweep workers: drive the browser across viewports/routes and
+    # collect evidence. The work is navigation and protocol-following, not
+    # reasoning, so this pairs the cheapest capable model with high effort.
+    # Outside MODEL_TIER_LADDER for the same reason as ``discord_action``.
+    "visual_sweep": {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "opencode_model": "hermes-codex/gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
+    },
+    # Screenshot-appearance judgement. Medium is the route default: this is a
+    # bounded inspection pass rather than the unbounded critique slot below.
+    "visual_inspector": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-5",
+        "opencode_model": "anthropic/claude-sonnet-5",
+        "reasoning_effort": "medium",
+    },
+    # Unbounded aesthetic critique over already-collected evidence. The
+    # strongest available judgement model is worth one call — this is the slot
+    # that should replace fanned-out premium workers.
+    "visual_critique": {
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "opencode_model": "anthropic/claude-opus-5",
+        "reasoning_effort": "medium",
+    },
 }
+
+VISUAL_DELEGATION_PURPOSE_TIERS: dict[str, str] = {
+    "visual_sweep": "visual_sweep",
+    "visual_inspector": "visual_inspector",
+    "visual_critique": "visual_critique",
+}
+
+NEWLY_RESERVED_VISUAL_TIER_NAMES: frozenset[str] = frozenset(
+    VISUAL_DELEGATION_PURPOSE_TIERS.values()
+)
 
 # Built-in names are reserved runtime policy, not user configuration. Persisted
 # ``model_tiers`` entries may add genuinely custom names, but they must never
@@ -172,12 +210,13 @@ _AUTOMATIC_REASONING_EFFORT_CEILING = "xhigh"
 
 @dataclass(frozen=True)
 class ModelTier:
-    """A validated model-and-effort pair resolved from ``model_tiers``."""
+    """A validated runtime route resolved from ``model_tiers``."""
 
     name: str
     model: str
     opencode_model: str
     reasoning_effort: str
+    provider: str | None = None
 
     def reasoning_config(self) -> dict[str, Any] | None:
         """Return the OpenAI-compatible reasoning payload for this tier."""
@@ -270,6 +309,7 @@ def restrict_model_tier_for_task(
         return tier
     return ModelTier(
         name=tier.name,
+        provider=tier.provider,
         model=tier.model,
         opencode_model=tier.opencode_model,
         reasoning_effort=safe_effort,
@@ -334,6 +374,56 @@ def strip_reserved_model_tier_config(config: Mapping[str, Any] | None) -> dict[s
     return result if changed else dict(config)
 
 
+def rename_newly_reserved_visual_tier_config(
+    config: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Preserve pre-existing custom tiers that collide with new visual names."""
+    if not isinstance(config, Mapping):
+        return {}, {}
+
+    result = copy.deepcopy(dict(config))
+    configured = result.get("model_tiers")
+    if not isinstance(configured, Mapping):
+        return result, {}
+
+    renamed_tiers = copy.deepcopy(dict(configured))
+    renames: dict[str, str] = {}
+    for raw_name in list(configured):
+        normalized = _normalized_name(raw_name)
+        if normalized not in NEWLY_RESERVED_VISUAL_TIER_NAMES:
+            continue
+        candidate = f"legacy_{normalized}"
+        suffix = 2
+        normalized_existing = {_normalized_name(name) for name in renamed_tiers}
+        while candidate in normalized_existing:
+            candidate = f"legacy_{normalized}_{suffix}"
+            suffix += 1
+        renamed_tiers[candidate] = renamed_tiers.pop(raw_name)
+        renames[str(raw_name)] = candidate
+
+    if renames:
+        result["model_tiers"] = renamed_tiers
+        normalized_renames = {_normalized_name(old): new for old, new in renames.items()}
+
+        def rewrite_route_references(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if (
+                        isinstance(value, str)
+                        and (str(key) == "model_tier" or str(key).endswith("_model_tier"))
+                        and _normalized_name(value) in normalized_renames
+                    ):
+                        node[key] = normalized_renames[_normalized_name(value)]
+                    else:
+                        rewrite_route_references(value)
+            elif isinstance(node, list):
+                for value in node:
+                    rewrite_route_references(value)
+
+        rewrite_route_references(result)
+    return result, renames
+
+
 def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier | None:
     """Resolve a configured tier, returning ``None`` for blank or invalid input."""
     normalized = _normalized_name(name)
@@ -346,6 +436,7 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
 
     model = str(raw_tier.get("model") or "").strip()
     opencode_model = str(raw_tier.get("opencode_model") or model).strip()
+    provider = str(raw_tier.get("provider") or "").strip().lower() or None
     reasoning_effort = normalize_reasoning_effort(raw_tier.get("reasoning_effort"))
     if reasoning_effort in {"max", "ultra"}:
         reasoning_effort = _AUTOMATIC_REASONING_EFFORT_CEILING
@@ -354,10 +445,33 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
 
     return ModelTier(
         name=normalized,
+        provider=provider,
         model=model,
         opencode_model=opencode_model,
         reasoning_effort=reasoning_effort,
     )
+
+
+def require_worker_model_tier(
+    config: Mapping[str, Any] | None,
+    name: Any,
+) -> ModelTier | None:
+    """Resolve a worker tier or fail before launch for invalid configuration."""
+    normalized = _normalized_name(name)
+    if not normalized or normalized in {"none", "off", "disabled"}:
+        return None
+    tier = resolve_model_tier(config, normalized)
+    if (
+        tier is None
+        or "/" not in tier.opencode_model
+        or tier.opencode_model.startswith("/")
+        or tier.opencode_model.endswith("/")
+    ):
+        raise ValueError(
+            f"Invalid worker model_tier {normalized!r}: define model, reasoning_effort, "
+            "and opencode_model in provider/model form."
+        )
+    return tier
 
 
 def resolve_model_tier_offset(

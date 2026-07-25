@@ -158,11 +158,11 @@ def _role_runtime_settings(
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
     try:
         from hermes_cli.model_tiers import (
-            resolve_model_tier,
+            require_worker_model_tier,
             restrict_model_tier_for_task,
         )
 
-        model_tier = resolve_model_tier(cfg, role_cfg.get("model_tier"))
+        model_tier = require_worker_model_tier(cfg, role_cfg.get("model_tier"))
         purpose = "review" if role == "reviewer" else "implementation"
         model_tier = restrict_model_tier_for_task(
             cfg,
@@ -170,6 +170,8 @@ def _role_runtime_settings(
             task,
             purpose=purpose,
         )
+    except ValueError:
+        raise
     except Exception:
         model_tier = None
 

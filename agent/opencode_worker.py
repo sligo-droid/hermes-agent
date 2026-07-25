@@ -338,7 +338,7 @@ def load_coding_worker_pass_profiles(
     tiers_disabled = _coding_worker_model_tiers_disabled(coding_cfg, worker_config)
 
     from hermes_cli.model_tiers import (
-        resolve_model_tier,
+        require_worker_model_tier,
         restrict_model_tier_for_task,
         restrict_reasoning_effort_for_task,
     )
@@ -371,7 +371,7 @@ def load_coding_worker_pass_profiles(
                 if pass_tier_key in worker_cfg
                 else global_tier_name or coding_cfg.get(pass_tier_key)
             )
-            tier = resolve_model_tier(cfg, tier_name)
+            tier = require_worker_model_tier(cfg, tier_name)
         reasoning_key = f"{pass_name}_reasoning_level"
         explicit_reasoning = worker_cfg.get(reasoning_key) if reasoning_key in worker_cfg else None
         configured_reasoning = coding_cfg.get(reasoning_key)

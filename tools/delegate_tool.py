@@ -3071,6 +3071,7 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     model_tier: Optional[str] = None,
+    purpose: Optional[str] = None,
     read_only: bool = False,
     background: bool = False,
     allow_nested_coding: bool = False,
@@ -3080,8 +3081,8 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, role, and model_tier)
-      - Batch:  provide tasks array [{goal, context, role, model_tier}, ...]
+      - Single: provide goal (+ optional context, role, model_tier, and purpose)
+      - Batch:  provide tasks array [{goal, context, role, model_tier, purpose}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -3204,6 +3205,7 @@ def delegate_task(
                 "toolsets": toolsets,
                 "role": top_role,
                 "model_tier": model_tier,
+                "purpose": purpose,
                 "read_only": top_read_only,
                 "allow_nested_coding": requested_nested_coding,
             }
@@ -3243,6 +3245,7 @@ def delegate_task(
         task["model_tier"] = (
             task.get("model_tier") if "model_tier" in task else model_tier
         )
+        task["purpose"] = task.get("purpose") if "purpose" in task else purpose
         grant_error = _nested_coding_grant_error(
             requested=bool(task["allow_nested_coding"]),
             background=background_requested,
@@ -3265,30 +3268,62 @@ def delegate_task(
     # child/runtime setup so a bad batch fails atomically. Tier selection is
     # per-task because a batch may deliberately mix difficulty levels.
     task_runtimes: List[tuple[Any, Dict[str, Any]]] = []
-    credential_cache: Dict[Optional[str], Dict[str, Any]] = {}
+    credential_cache: Dict[tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
     for i, task in enumerate(task_list):
+        from hermes_cli.model_tiers import (
+            DEFAULT_MODEL_TIERS,
+            VISUAL_DELEGATION_PURPOSE_TIERS,
+            restrict_model_tier_for_task,
+        )
+
+        requested_purpose = str(task.get("purpose") or "").strip().lower()
+        purpose_tier = VISUAL_DELEGATION_PURPOSE_TIERS.get(requested_purpose)
+        if requested_purpose and purpose_tier is None:
+            supported = ", ".join(VISUAL_DELEGATION_PURPOSE_TIERS)
+            return tool_error(
+                f"Task {i}: unknown delegation purpose {requested_purpose!r}. "
+                f"Supported purposes: {supported}."
+            )
         requested_tier = str(task.get("model_tier") or "").strip()
+        if purpose_tier and requested_tier and requested_tier.lower() != purpose_tier:
+            return tool_error(
+                f"Task {i}: purpose {requested_purpose!r} requires model_tier "
+                f"{purpose_tier!r}, not {requested_tier!r}. Omit model_tier to "
+                "select the purpose tier automatically."
+            )
+        if purpose_tier:
+            requested_tier = purpose_tier
+            task["model_tier"] = purpose_tier
         resolved_tier = _resolve_delegation_model_tier(cfg, requested_tier)
         if requested_tier and resolved_tier is None:
-            from hermes_cli.model_tiers import DEFAULT_MODEL_TIERS
-
             built_ins = ", ".join(DEFAULT_MODEL_TIERS)
             return tool_error(
                 f"Task {i}: unknown model_tier {requested_tier!r}. Configure a "
                 f"custom tier under model_tiers or use a built-in tier: {built_ins}."
             )
+        if resolved_tier is not None and purpose_tier:
+            resolved_tier = restrict_model_tier_for_task(
+                cfg,
+                resolved_tier,
+                task.get("goal"),
+                task.get("context"),
+                purpose="review",
+            )
         target_model = resolved_tier.model if resolved_tier else None
-        task_creds = credential_cache.get(target_model)
+        target_provider = resolved_tier.provider if resolved_tier else None
+        credential_key = (target_provider, target_model)
+        task_creds = credential_cache.get(credential_key)
         if task_creds is None:
             try:
                 task_creds = _resolve_delegation_credentials(
                     cfg,
                     parent_agent,
                     target_model=target_model,
+                    target_provider=target_provider,
                 )
             except ValueError as exc:
                 return tool_error(str(exc))
-            credential_cache[target_model] = task_creds
+            credential_cache[credential_key] = task_creds
         task_runtimes.append((resolved_tier, task_creds))
 
     overall_start = time.monotonic()
@@ -3929,12 +3964,13 @@ def _resolve_delegation_credentials(
     parent_agent,
     *,
     target_model: Optional[str] = None,
+    target_provider: Optional[str] = None,
 ) -> dict:
     """Resolve credentials for subagent delegation.
 
-    ``target_model`` is the task's explicit named-tier model. It overrides the
-    legacy ``delegation.model`` value and is passed through provider resolution
-    so provider compatibility/auth validation still runs before child launch.
+    ``target_model`` and ``target_provider`` are the task's explicit named-tier
+    route. They override legacy delegation runtime values and are passed through
+    provider resolution so compatibility/auth validation runs before launch.
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
@@ -3955,7 +3991,7 @@ def _resolve_delegation_credentials(
     Raises ValueError with a user-friendly message on credential failure.
     """
     configured_model = str(target_model or cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
+    configured_provider = str(target_provider or cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
@@ -4202,6 +4238,12 @@ def _build_top_level_description() -> str:
         "straightforward bounded work, intermediate for ordinary multi-step "
         "work, and advanced only for the hardest cross-cutting or high-risk "
         "work. Omit model_tier to inherit your runtime model and reasoning.\n"
+        "- For visual QA, use the explicit purpose field instead of guessing a "
+        "tier from task wording: visual_sweep for one browser/navigation evidence "
+        "pass, visual_inspector for bounded screenshot judgement over collected "
+        "evidence, and visual_critique for at most one final aesthetic critique. "
+        "Run the sweep before judgement passes; do not fan out duplicate browser "
+        "setup. Each purpose selects its designated model tier automatically.\n"
         "- If the user is writing in a non-English language, or asked for "
         "output in a specific language / tone / style, say so in 'context' "
         "(e.g. \"respond in Chinese\", \"return output in Japanese\"). "
@@ -4247,7 +4289,7 @@ def _build_tasks_param_description() -> str:
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
         "When provided, top-level goal/context/role are ignored. Top-level "
-        "model_tier remains the batch default; a per-task model_tier overrides it."
+        "model_tier and purpose remain batch defaults; per-task values override them."
     )
 
 
@@ -4392,6 +4434,14 @@ DELEGATE_TASK_SCHEMA = {
                                 "cross-cutting/high-risk work. Custom configured names are valid."
                             ),
                         },
+                        "purpose": {
+                            "type": "string",
+                            "enum": ["visual_sweep", "visual_inspector", "visual_critique"],
+                            "description": (
+                                "Explicit visual-workflow purpose. Selects the matching "
+                                "visual model tier automatically without task-text inference."
+                            ),
+                        },
                         "read_only": {
                             "type": "boolean",
                             "description": (
@@ -4426,6 +4476,15 @@ DELEGATE_TASK_SCHEMA = {
                     "ordinary multi-step work, and advanced only for the hardest cross-cutting "
                     "or high-risk work. Custom configured names are valid. Omit to inherit "
                     "the parent runtime model and reasoning."
+                ),
+            },
+            "purpose": {
+                "type": "string",
+                "enum": ["visual_sweep", "visual_inspector", "visual_critique"],
+                "description": (
+                    "Explicit visual-workflow purpose for a single task or batch default. "
+                    "Selects the matching visual tier automatically. Use one visual_sweep "
+                    "before evidence-only inspector passes and at most one visual_critique."
                 ),
             },
             "read_only": {
@@ -4678,6 +4737,7 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         model_tier=args.get("model_tier"),
+        purpose=args.get("purpose"),
         read_only=bool(args.get("read_only", False)),
         background=_model_background_value(args, kw.get("parent_agent")),
         allow_nested_coding=bool(args.get("allow_nested_coding", False)),

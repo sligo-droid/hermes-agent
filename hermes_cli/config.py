@@ -3481,7 +3481,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 35,
+    "_config_version": 36,
 }
 
 # Keep fork-owned lifecycle, worker-routing, Discord, and Command Center
@@ -6505,6 +6505,31 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "delegation.max_concurrent_children now caps background "
                     "delegations too."
                 )
+
+    # ── Version 35 → 36: preserve custom tiers colliding with visual policy ──
+    # This runs before the older reserved-tier cleanup below so configs from any
+    # earlier version keep pre-existing custom visual_* definitions. The new
+    # code-owned names remain reserved, while the user's definitions move to a
+    # deterministic legacy_* name instead of disappearing on load/save.
+    if current_ver < 36:
+        config = read_raw_config()
+        from hermes_cli.model_tiers import rename_newly_reserved_visual_tier_config
+
+        renamed, tier_renames = rename_newly_reserved_visual_tier_config(config)
+        if tier_renames:
+            _persist_migration(renamed)
+            summary = ", ".join(
+                f"model_tiers.{old}→model_tiers.{new}"
+                for old, new in tier_renames.items()
+            )
+            warning = (
+                "Renamed custom model tiers that now collide with built-in visual "
+                f"routing: {summary}. Model-tier route references were updated."
+            )
+            results["warnings"].append(warning)
+            results["config_added"].append(summary)
+            if not quiet:
+                print(f"  ⚠ {warning}")
 
     # ── Version 33 → 34: reserve built-in model tiers and remove hidden routing ──
     # Built-in tiers are now code-owned policy. Older configs commonly contain
