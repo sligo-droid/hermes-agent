@@ -4006,11 +4006,7 @@ def _normalize_empty_agent_response(
 
     if agent_result.get("failed"):
         error_detail = agent_result.get("error", "unknown error")
-        error_str = str(error_detail).lower()
-        is_context_failure = any(
-            p in error_str
-            for p in ("context", "token", "too large", "too long", "exceed", "payload")
-        ) or ("400" in error_str and history_len > 50)
+        is_context_failure = _is_context_overflow_failure(agent_result)
         if is_context_failure:
             return (
                 "⚠️ Session too large for the model's context window.\n"
@@ -4050,6 +4046,30 @@ def _normalize_empty_agent_response(
         )
 
     return response
+
+
+def _is_context_overflow_failure(agent_result: dict) -> bool:
+    """Return whether a failed turn has explicit context-overflow evidence."""
+    if not agent_result.get("failed"):
+        return False
+    error_text = str(agent_result.get("error", "")).lower()
+    return bool(agent_result.get("compression_exhausted")) or any(
+        phrase in error_text
+        for phrase in (
+            "context length",
+            "context size",
+            "context window",
+            "maximum context",
+            "token limit",
+            "too many tokens",
+            "reduce the length",
+            "exceeds the limit",
+            "request entity too large",
+            "prompt is too long",
+            "payload too large",
+            "input is too long",
+        )
+    )
 
 
 def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
@@ -19656,22 +19676,7 @@ class _GatewayRunnerCore(
             hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(
                 agent_result
             )
-            _err_str_for_classify = str(agent_result.get("error", "")).lower()
-            # Use specific multi-word phrases (not bare "exceed" or "token")
-            # to avoid false positives on transient errors like "rate limit
-            # exceeded" or "invalid auth token". Matches run_agent.py's
-            # own context-length classifier.
-            is_context_overflow_failure = agent_failed_early and (
-                bool(agent_result.get("compression_exhausted"))
-                or any(p in _err_str_for_classify for p in (
-                    "context length", "context size", "context window",
-                    "maximum context", "token limit", "too many tokens",
-                    "reduce the length", "exceeds the limit",
-                    "request entity too large", "prompt is too long",
-                    "payload too large", "input is too long",
-                ))
-                or ("400" in _err_str_for_classify and len(history) > 50)
-            )
+            is_context_overflow_failure = _is_context_overflow_failure(agent_result)
             if is_context_overflow_failure:
                 logger.info(
                     "Skipping transcript persistence for context-overflow "
