@@ -27,7 +27,7 @@ FORK_DEFAULT_ADDITIONS = {
             "max_followup_turns": 1,
             "max_attempts": 2,
             "max_assertions": 6,
-            "max_vision_calls": 1,
+            "max_vision_calls": 2,
             "attempt_timeout_s": 30,
             "total_timeout_s": 60,
             "max_output_chars": 6000,

@@ -262,6 +262,10 @@ async def test_timed_out_vision_attempt_consumes_single_provider_budget():
         await asyncio.sleep(2)
         return {"status": "passed", "results": []}
 
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
     result = await run_visual_assertions(
         task_id="vision-budget-task",
         requirement=_APPEARANCE_REQUIREMENT,
@@ -274,6 +278,7 @@ async def test_timed_out_vision_attempt_consumes_single_provider_budget():
         ],
         supervisor=ScreenshotSupervisor(fingerprints=("same", "same", "same")),
         vision_evaluator=evaluator,
+        vision_sweeper=sweeper,
         config={
             "agent": {
                 "visual_qa": {
@@ -287,9 +292,88 @@ async def test_timed_out_vision_attempt_consumes_single_provider_budget():
     )
 
     assert len(calls) == 1
-    assert result["visual_qa_receipt"]["vision_calls"] == 1
-    assert [attempt["vision_calls"] for attempt in result["attempts"]] == [1, 0]
+    assert result["visual_qa_receipt"]["vision_calls"] == 2
+    assert [attempt["vision_calls"] for attempt in result["attempts"]] == [2, 0]
     assert result["status"] != "passed"
+
+
+@pytest.mark.asyncio
+async def test_required_sweep_runs_before_sonnet_inspection():
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self):
+            return {"ok": True, "image_bytes": b"png"}
+
+    calls = []
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        calls.append("luna")
+        on_provider_start()
+        return True
+
+    async def evaluator(*_args, on_provider_start, **_kwargs):
+        calls.append("sonnet")
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {"id": _APPEARANCE_ID, "status": "passed", "code": "appearance_satisfied"}
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="mandatory-sweep",
+        requirement=_APPEARANCE_REQUIREMENT,
+        assertions=[
+            {"id": _APPEARANCE_ID, "kind": "screenshot_appearance", "expectation": "balanced layout"}
+        ],
+        supervisor=ScreenshotSupervisor(),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+        config={"agent": {"visual_qa": {"max_vision_calls": 2}}},
+    )
+
+    assert result["status"] == "passed"
+    assert calls == ["luna", "sonnet"]
+    assert result["visual_qa_receipt"]["vision_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_custom_inspector_cannot_bypass_default_sweep(monkeypatch):
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self):
+            return {"ok": True, "image_bytes": b"png"}
+
+    calls = []
+
+    async def default_sweeper(*_args, on_provider_start, **_kwargs):
+        calls.append("luna")
+        on_provider_start()
+        return True
+
+    async def evaluator(*_args, on_provider_start, **_kwargs):
+        calls.append("sonnet")
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {"id": _APPEARANCE_ID, "status": "passed", "code": "appearance_satisfied"}
+            ],
+        }
+
+    monkeypatch.setattr("agent.vision_assertions.run_visual_sweep", default_sweeper)
+    result = await run_visual_assertions(
+        task_id="default-sweep",
+        requirement=_APPEARANCE_REQUIREMENT,
+        assertions=[
+            {"id": _APPEARANCE_ID, "kind": "screenshot_appearance", "expectation": "balanced layout"}
+        ],
+        supervisor=ScreenshotSupervisor(),
+        vision_evaluator=evaluator,
+        config={"agent": {"visual_qa": {"max_vision_calls": 2}}},
+    )
+
+    assert result["status"] == "passed"
+    assert calls == ["luna", "sonnet"]
 
 
 @pytest.mark.asyncio
@@ -409,6 +493,10 @@ async def test_external_caller_timeout_prevents_late_provider_start():
         provider_starts.append(True)
         return {"status": "passed", "results": []}
 
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(
             run_visual_assertions(
@@ -419,6 +507,7 @@ async def test_external_caller_timeout_prevents_late_provider_start():
                 ],
                 supervisor=ScreenshotSupervisor(),
                 vision_evaluator=evaluator,
+                vision_sweeper=sweeper,
             ),
             timeout=0.05,
         )

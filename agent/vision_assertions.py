@@ -96,6 +96,83 @@ def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str
     }
 
 
+def _resolve_visual_sweep_runtime(cfg: Optional[dict[str, Any]]) -> dict[str, str]:
+    """Resolve the dedicated Luna route used to sweep captured evidence."""
+
+    from hermes_cli.model_tiers import resolve_model_tier
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    tier = resolve_model_tier(cfg, "visual_sweep")
+    if tier is None or not tier.provider:
+        raise RuntimeError("visual_sweep model tier is unavailable")
+    runtime = resolve_runtime_provider(
+        requested=tier.provider,
+        target_model=tier.model,
+    )
+    return {
+        "provider": str(runtime.get("provider") or tier.provider),
+        "model": tier.model,
+        "base_url": str(runtime.get("base_url") or ""),
+        "api_key": str(runtime.get("api_key") or ""),
+        "api_mode": str(runtime.get("api_mode") or ""),
+    }
+
+
+async def run_visual_sweep(
+    image_data_url: str,
+    *,
+    cfg: Optional[dict[str, Any]] = None,
+    timeout_s: float = 30.0,
+    call_llm: Optional[Callable[..., Awaitable[Any]]] = None,
+    on_provider_start: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Use Luna to validate that fresh browser evidence is inspectable."""
+
+    if not image_data_url.startswith("data:image/"):
+        return False
+    if call_llm is None:
+        from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+
+        call_llm = async_call_llm
+    else:
+        from agent.auxiliary_client import extract_content_or_reasoning
+    try:
+        sweep = _resolve_visual_sweep_runtime(cfg)
+        if on_provider_start is not None:
+            on_provider_start()
+        response = await call_llm(
+            task="vision",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Confirm this is a rendered UI screenshot suitable for a "
+                                "subsequent bounded visual assertion. Return exactly READY."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ],
+                }
+            ],
+            temperature=0.0,
+            max_tokens=20,
+            timeout=max(1.0, min(float(timeout_s), 30.0)),
+            single_attempt=True,
+            strict_vision_capability=True,
+            provider=sweep["provider"],
+            model=sweep["model"],
+            base_url=sweep["base_url"],
+            api_key=sweep["api_key"],
+            api_mode=sweep["api_mode"],
+        )
+        return extract_content_or_reasoning(response).strip().upper() == "READY"
+    except Exception:
+        return False
+
+
 async def evaluate_screenshot_assertions(
     image_data_url: str,
     assertions: list[dict[str, Any]],
@@ -165,4 +242,5 @@ async def evaluate_screenshot_assertions(
 __all__ = [
     "evaluate_screenshot_assertions",
     "parse_vision_assertion_output",
+    "run_visual_sweep",
 ]

@@ -170,6 +170,7 @@ async def _run_attempt(
     assertions: list[dict[str, Any]],
     *,
     vision_evaluator: Callable[..., Awaitable[dict[str, Any]]],
+    vision_sweeper: Optional[Callable[..., Awaitable[bool]]],
     provider: str,
     model: str,
     base_url: str,
@@ -191,14 +192,13 @@ async def _run_attempt(
         )
         for item in deterministic
     ]
-    provider_started = False
+    provider_start_count = 0
 
     def _mark_provider_started() -> None:
-        nonlocal provider_started
+        nonlocal provider_start_count
         execution_guard.check()
-        if not provider_started:
-            on_provider_start()
-            provider_started = True
+        on_provider_start()
+        provider_start_count += 1
 
     if appearance:
         if not vision_allowed:
@@ -220,6 +220,24 @@ async def _run_attempt(
                 raw = screenshot.pop("image_bytes", b"")
                 data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
                 raw = b""
+                if vision_sweeper is not None:
+                    sweep_kwargs = {
+                        "cfg": cfg,
+                        "timeout_s": vision_timeout_s,
+                    }
+                    if _declares_keyword(vision_sweeper, "on_provider_start"):
+                        sweep_kwargs["on_provider_start"] = _mark_provider_started
+                    else:
+                        _mark_provider_started()
+                    execution_guard.check()
+                    if not await vision_sweeper(data_url, **sweep_kwargs):
+                        results.extend(
+                            {"id": item["id"], "status": "uncertain", "code": "vision_call_failed"}
+                            for item in appearance
+                        )
+                        aggregate = aggregate_assertion_results(results)
+                        aggregate["vision_calls"] = provider_start_count
+                        return aggregate
                 evaluator_kwargs = {
                     "provider": provider,
                     "model": model,
@@ -244,7 +262,7 @@ async def _run_attempt(
                 data_url = ""
                 results.extend(vision_result.get("results") or [])
     aggregate = aggregate_assertion_results(results)
-    aggregate["vision_calls"] = int(provider_started)
+    aggregate["vision_calls"] = provider_start_count
     return aggregate
 
 
@@ -261,6 +279,7 @@ async def run_visual_assertions(
     api_mode: str = "",
     supervisor: Any = None,
     vision_evaluator: Optional[Callable[..., Awaitable[dict[str, Any]]]] = None,
+    vision_sweeper: Optional[Callable[..., Awaitable[bool]]] = None,
 ) -> dict[str, Any]:
     """Run one attempt plus one state-change-gated retry under hard deadlines."""
 
@@ -302,7 +321,7 @@ async def run_visual_assertions(
             "assertion_ids": assertion_ids,
             "status": status,
             "attempts": max(0, min(int(attempts_count), 2)),
-            "vision_calls": max(0, min(int(vision_count), 1)),
+            "vision_calls": max(0, min(int(vision_count), 2)),
             "duration_ms": max(
                 0,
                 min(int((time.monotonic() - total_started) * 1000), 60_000),
@@ -366,10 +385,11 @@ async def run_visual_assertions(
             "attempts": [],
             "visual_qa_receipt": receipt,
         }
+    from agent.vision_assertions import evaluate_screenshot_assertions, run_visual_sweep
     if vision_evaluator is None:
-        from agent.vision_assertions import evaluate_screenshot_assertions
-
         vision_evaluator = evaluate_screenshot_assertions
+    if vision_sweeper is None:
+        vision_sweeper = run_visual_sweep
 
     locators = [item["locator"] for item in normalized_assertions if "locator" in item]
     attempts: list[dict[str, Any]] = []
@@ -403,7 +423,11 @@ async def run_visual_assertions(
         attempt_guard = CooperativeExecutionGuard(
             min(deadline, time.monotonic() + attempt_timeout)
         )
-        vision_allowed = vision_calls < visual_config["max_vision_calls"]
+        required_vision_calls = 2 if vision_sweeper is not None else 1
+        vision_allowed = (
+            vision_calls + required_vision_calls
+            <= visual_config["max_vision_calls"]
+        )
         attempt_vision_calls = 0
 
         def _provider_started() -> None:
@@ -421,6 +445,7 @@ async def run_visual_assertions(
                     supervisor,
                     normalized_assertions,
                     vision_evaluator=vision_evaluator,
+                    vision_sweeper=vision_sweeper,
                     provider=provider,
                     model=model,
                     base_url=base_url,

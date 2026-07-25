@@ -221,7 +221,7 @@ def test_config_invalid_values_fall_back_to_bounded_shadow_mode():
         "max_followup_turns": 1,
         "max_attempts": 2,
         "max_assertions": 6,
-        "max_vision_calls": 1,
+        "max_vision_calls": 2,
         "attempt_timeout_s": 30.0,
         "total_timeout_s": 60.0,
         "max_output_chars": 6000,
@@ -252,3 +252,7 @@ def test_config_allows_lower_budgets_without_allowing_unbounded_work():
         "total_timeout_s": 8.0,
         "max_output_chars": 900,
     }
+
+
+def test_config_upgrades_legacy_one_call_vision_budget_to_required_pair():
+    assert normalize_visual_qa_config({"max_vision_calls": 1})["max_vision_calls"] == 2
