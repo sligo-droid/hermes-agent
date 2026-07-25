@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.visual_qa import visual_requirement_id
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.session import SessionSource, build_session_key
@@ -471,6 +472,96 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, monkeypatc
         for existing in STATUS_REACTION_EMOJIS
         if existing != emoji
     ]
+
+
+def test_enforced_visual_qa_gate_keeps_prose_and_reaction_state_synchronized(
+    adapter,
+    tmp_path,
+):
+    blocked_ledger = GatewayWorkLedger(tmp_path / "blocked-ledger.json")
+    blocked_event = MessageEvent(
+        text="Build a responsive dashboard with a mobile sidebar.",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="blocked-thread",
+            chat_type="thread",
+            thread_id="blocked-thread",
+            guild_id="77",
+            message_id="blocked-message",
+        ),
+        message_id="blocked-message",
+    )
+    blocked = blocked_ledger.accept_event(
+        blocked_event,
+        session_key=build_session_key(blocked_event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert blocked is not None
+    assert blocked_ledger.mark_agent_done(
+        blocked["id"],
+        final_response="Fresh verification passed.",
+        visual_qa_receipts=[],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=2,
+    )
+    blocked_stored = blocked_ledger.get(blocked["id"])
+    assert blocked_stored["final_response"].startswith("⚠️ **Completion blocked.**")
+    assert "Fresh verification passed." in blocked_stored["final_response"]
+    assert blocked_ledger.mark_completed(blocked["id"])
+    blocked_state = blocked_ledger.discord_thread_reaction_state(blocked)
+    assert blocked_state == "blocked"
+    assert adapter._feature_kanban_reaction_emoji(blocked_state) == "❓"
+
+    successful_ledger = GatewayWorkLedger(tmp_path / "successful-ledger.json")
+    successful_event = MessageEvent(
+        text="Build a responsive dashboard with a mobile sidebar.",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="successful-thread",
+            chat_type="thread",
+            thread_id="successful-thread",
+            guild_id="77",
+            message_id="successful-message",
+        ),
+        message_id="successful-message",
+    )
+    successful = successful_ledger.accept_event(
+        successful_event,
+        session_key=build_session_key(successful_event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert successful is not None
+    requirement = successful["visual_qa_requirement"]
+    assertion_ids = [item["id"] for item in requirement["assertions"]]
+    assert successful_ledger.mark_agent_done(
+        successful["id"],
+        final_response="Fresh verification passed.",
+        visual_qa_receipts=[
+            {
+                "requirement_id": visual_requirement_id(requirement),
+                "contract_id": "vac_" + ("a" * 24),
+                "assertion_ids": assertion_ids,
+                "status": "passed",
+                "attempts": 1,
+                "vision_calls": 0,
+                "duration_ms": 25,
+                "diagnostic_codes": [],
+                "order": 2,
+            }
+        ],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=2,
+    )
+    successful_stored = successful_ledger.get(successful["id"])
+    assert successful_stored["final_response"] == "Fresh verification passed."
+    assert successful_ledger.mark_completed(successful["id"])
+    successful_state = successful_ledger.discord_thread_reaction_state(successful)
+    assert successful_state == "done"
+    assert adapter._feature_kanban_reaction_emoji(successful_state) == "✅"
 
 
 @pytest.mark.asyncio

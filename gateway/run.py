@@ -19477,6 +19477,7 @@ class _GatewayRunnerCore(
                 response = _append_runtime_footer(response, _footer_line)
 
             work_item_id = self._discord_work_item_id_for_event(event, session_key)
+            _streaming_gate_notice = ""
             if (
                 work_item_id
                 and source.platform == Platform.DISCORD
@@ -19569,6 +19570,16 @@ class _GatewayRunnerCore(
                         )
                         response = None
                     if agent_done:
+                        current_item = self._ledger().get(str(work_item_id)) or {}
+                        persisted_response = str(current_item.get("final_response") or "")
+                        if persisted_response != response:
+                            response = persisted_response
+                            if agent_result.get("already_sent") and not agent_result.get("failed"):
+                                from gateway.work_ledger import enforced_visual_qa_block_notice
+
+                                _streaming_gate_notice = enforced_visual_qa_block_notice(
+                                    current_item
+                                )
                         try:
                             from agent.provider_progress import record_provider_progress_signal
 
@@ -19962,6 +19973,23 @@ class _GatewayRunnerCore(
                             )
                     except Exception as _e:
                         logger.debug("meeting auto-goal status send failed: %s", _e)
+                if _streaming_gate_notice:
+                    try:
+                        _gate_adapter = self._adapter_for_source(source)
+                        if _gate_adapter:
+                            await _gate_adapter.send(
+                                source.chat_id,
+                                _streaming_gate_notice,
+                                metadata=self._thread_metadata_for_source(
+                                    source,
+                                    self._reply_anchor_for_event(event),
+                                ),
+                            )
+                    except Exception as _e:
+                        logger.warning(
+                            "enforced visual-QA blocked notice send failed: %s",
+                            _e,
+                        )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.

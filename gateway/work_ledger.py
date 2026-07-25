@@ -90,6 +90,51 @@ _CLOSEOUT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CLOSEOUT_VISUAL_STATUSES = frozenset(
     {"passed", "failed", "blocked", "uncertain", "missing"}
 )
+_ENFORCED_VISUAL_QA_BLOCK_NOTICE = (
+    "⚠️ **Completion blocked.** Enforced visual QA is active, and the work "
+    "ledger did not authorize completion."
+)
+
+
+def enforced_visual_qa_block_notice(item: Any) -> str:
+    """Return the user-visible notice for an enforced blocked completion gate."""
+
+    if not isinstance(item, dict):
+        return ""
+    config = normalize_visual_qa_config(item.get("visual_qa_config"))
+    gate = item.get("completion_gate")
+    if (
+        config.get("mode") != "enforce_explicit"
+        or not isinstance(gate, dict)
+        or gate.get("allowed_to_complete") is not False
+    ):
+        return ""
+
+    notice = _ENFORCED_VISUAL_QA_BLOCK_NOTICE
+    reason = str(gate.get("reason") or item.get("blocked_reason") or "").strip()
+    if reason:
+        readable_reason = re.sub(r"\s+", " ", reason.replace("_", " ")).strip()
+        if readable_reason:
+            notice = f"{notice} Gate reason: {readable_reason[:160]}."
+    return notice
+
+
+def annotate_enforced_visual_qa_blocked_response(
+    item: Any,
+    final_response: str,
+    *,
+    already_delivered: bool = False,
+) -> str:
+    """Keep successful-path bytes unchanged and visibly qualify enforced blocks."""
+
+    notice = enforced_visual_qa_block_notice(item)
+    if not notice or notice in final_response:
+        return final_response
+    if not final_response:
+        return notice
+    if already_delivered:
+        return f"{final_response}\n\n{notice}"
+    return f"{notice}\n\n{final_response}"
 
 
 def _bounded_delivery_message_ids(
@@ -4845,6 +4890,11 @@ class GatewayWorkLedger:
                     item["project_summary"] = downgrade_verified_metadata(item["project_summary"], blocked_surfaces)
         else:
             item["summary_status"] = str(gate.get("summary_status") or "Complete")
+        item["final_response"] = annotate_enforced_visual_qa_blocked_response(
+            item,
+            item["final_response"],
+            already_delivered=already_delivered,
+        )
         _record_discord_board_final_response(item)
         self._write(data)
         return True

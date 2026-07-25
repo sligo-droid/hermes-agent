@@ -524,29 +524,60 @@ def _ensure_cdp_supervisor(task_id: str, *, execution_guard: Any = None) -> None
     if execution_guard is not None:
         execution_guard.check()
     cdp_url = _get_cdp_override()
+    local_session = False
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
         # cloud provider (Browserbase sets this), or a previously-discovered
         # local agent-browser endpoint reserved for the supervisor.
         with _cleanup_lock:
             session_info = _active_sessions.get(task_id, {})
-        maybe = str(
-            session_info.get("cdp_url")
-            or session_info.get("supervisor_cdp_url")
-            or ""
-        )
-        if maybe:
-            cdp_url = _resolve_cdp_override(maybe)
-        elif bool((session_info.get("features") or {}).get("local")):
-            cdp_url = _discover_local_session_cdp_url(
-                task_id,
-                execution_guard=execution_guard,
+            session_cdp_url = str(session_info.get("cdp_url") or "")
+            cached_supervisor_url = str(
+                session_info.get("supervisor_cdp_url") or ""
             )
+            local_session = bool(
+                (session_info.get("features") or {}).get("local")
+            )
+        if session_cdp_url:
+            cdp_url = _resolve_cdp_override(session_cdp_url)
+        elif local_session:
+            # Local agent-browser may restart Chromium on a new ephemeral CDP
+            # port while retaining the same --session name. Reuse the cached
+            # supervisor-only URL only while the matching supervisor is
+            # actually attached; its reconnect thread can remain alive while
+            # retrying an immutable, dead endpoint indefinitely.
+            cached_is_healthy = False
+            if cached_supervisor_url:
+                try:
+                    from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
+
+                    existing = SUPERVISOR_REGISTRY.get(task_id)
+                    cached_is_healthy = bool(
+                        existing is not None
+                        and existing.cdp_url == cached_supervisor_url
+                        and existing.snapshot().active
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "local CDP supervisor health check for task=%s failed: %s",
+                        task_id,
+                        exc,
+                    )
+            if cached_is_healthy:
+                cdp_url = cached_supervisor_url
+            else:
+                cdp_url = _discover_local_session_cdp_url(
+                    task_id,
+                    execution_guard=execution_guard,
+                )
     if not cdp_url:
         return
+    supervisor_registry = None
+    start_kwargs = None
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
 
+        supervisor_registry = SUPERVISOR_REGISTRY
         policy, timeout_s = _get_dialog_policy_config()
         if execution_guard is not None:
             execution_guard.check()
@@ -561,8 +592,27 @@ def _ensure_cdp_supervisor(task_id: str, *, execution_guard: Any = None) -> None
                 start_timeout=min(15.0, execution_guard.remaining()),
                 execution_guard=execution_guard,
             )
-        SUPERVISOR_REGISTRY.get_or_start(**start_kwargs)
+        supervisor_registry.get_or_start(**start_kwargs)
     except Exception as exc:
+        # A local daemon can move again between discovery and supervisor
+        # attachment. Perform one bounded rediscovery on connection failure
+        # and retry only when agent-browser reports a different endpoint.
+        if local_session and supervisor_registry is not None and start_kwargs is not None:
+            try:
+                refreshed_url = _discover_local_session_cdp_url(
+                    task_id,
+                    execution_guard=execution_guard,
+                )
+                if refreshed_url and refreshed_url != cdp_url:
+                    start_kwargs["cdp_url"] = refreshed_url
+                    supervisor_registry.get_or_start(**start_kwargs)
+                    return
+            except Exception as retry_exc:
+                logger.debug(
+                    "CDP supervisor recovery for task=%s failed (non-fatal): %s",
+                    task_id,
+                    retry_exc,
+                )
         logger.debug(
             "CDP supervisor attach for task=%s failed (non-fatal): %s",
             task_id,

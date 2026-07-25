@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -277,6 +278,203 @@ class TestLocalSessionCdpDiscovery:
         )
 
         browser_tool._ensure_cdp_supervisor("task-cloud")
+
+    def test_dead_local_endpoint_is_rediscovered_and_registry_moves(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        endpoint_a = "ws://127.0.0.1:34163/devtools/browser/a"
+        endpoint_b = "ws://127.0.0.1:44541/devtools/browser/b"
+        session = {
+            "session_name": "local-session",
+            "cdp_url": None,
+            "supervisor_cdp_url": endpoint_a,
+            "features": {"local": True},
+        }
+        current = SimpleNamespace(
+            cdp_url=endpoint_a,
+            snapshot=lambda: SimpleNamespace(active=False),
+        )
+        discoveries = []
+        starts = []
+
+        monkeypatch.setattr(browser_tool, "_active_sessions", {"task-local": session})
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_dialog_policy_config",
+            lambda: ("auto_dismiss", 30.0),
+        )
+        monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda _task_id: current)
+
+        def _browser_command(task_id, command, args, **kwargs):
+            discoveries.append((task_id, command, args, kwargs))
+            return {"success": True, "data": {"cdpUrl": endpoint_b}}
+
+        def _start(**kwargs):
+            nonlocal current
+            starts.append(kwargs)
+            current = SimpleNamespace(
+                cdp_url=kwargs["cdp_url"],
+                snapshot=lambda: SimpleNamespace(active=True),
+            )
+            return current
+
+        monkeypatch.setattr(browser_tool, "_run_browser_command", _browser_command)
+        monkeypatch.setattr(SUPERVISOR_REGISTRY, "get_or_start", _start)
+
+        browser_tool._ensure_cdp_supervisor("task-local")
+        browser_tool._ensure_cdp_supervisor("task-local")
+
+        assert discoveries == [
+            ("task-local", "get", ["cdp-url"], {"timeout": 10})
+        ]
+        assert [item["cdp_url"] for item in starts] == [endpoint_b, endpoint_b]
+        assert endpoint_a not in [item["cdp_url"] for item in starts]
+        assert current.cdp_url == endpoint_b
+        assert session["supervisor_cdp_url"] == endpoint_b
+
+    def test_healthy_local_cached_endpoint_is_idempotent(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        endpoint = "ws://127.0.0.1:34163/devtools/browser/healthy"
+        session = {
+            "session_name": "local-session",
+            "cdp_url": None,
+            "supervisor_cdp_url": endpoint,
+            "features": {"local": True},
+        }
+        supervisor = SimpleNamespace(
+            cdp_url=endpoint,
+            snapshot=lambda: SimpleNamespace(active=True),
+        )
+        starts = []
+
+        monkeypatch.setattr(browser_tool, "_active_sessions", {"task-local": session})
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_dialog_policy_config",
+            lambda: ("auto_dismiss", 30.0),
+        )
+        monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda _task_id: supervisor)
+        monkeypatch.setattr(
+            browser_tool,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("healthy cached endpoint must not be rediscovered")
+            ),
+        )
+        monkeypatch.setattr(
+            SUPERVISOR_REGISTRY,
+            "get_or_start",
+            lambda **kwargs: starts.append(kwargs) or supervisor,
+        )
+
+        browser_tool._ensure_cdp_supervisor("task-local")
+        browser_tool._ensure_cdp_supervisor("task-local")
+
+        assert [item["cdp_url"] for item in starts] == [endpoint, endpoint]
+        assert session["supervisor_cdp_url"] == endpoint
+
+    def test_local_attach_failure_gets_one_bounded_endpoint_refresh(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        endpoint_a = "ws://127.0.0.1:34163/devtools/browser/a"
+        endpoint_b = "ws://127.0.0.1:44541/devtools/browser/b"
+        session = {
+            "session_name": "local-session",
+            "cdp_url": None,
+            "supervisor_cdp_url": endpoint_a,
+            "features": {"local": True},
+        }
+        supervisor = SimpleNamespace(
+            cdp_url=endpoint_a,
+            snapshot=lambda: SimpleNamespace(active=True),
+        )
+        discoveries = []
+        starts = []
+
+        monkeypatch.setattr(browser_tool, "_active_sessions", {"task-local": session})
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_dialog_policy_config",
+            lambda: ("auto_dismiss", 30.0),
+        )
+        monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda _task_id: supervisor)
+
+        def _browser_command(task_id, command, args, **kwargs):
+            discoveries.append((task_id, command, args, kwargs))
+            return {"success": True, "data": {"cdpUrl": endpoint_b}}
+
+        def _start(**kwargs):
+            starts.append(kwargs["cdp_url"])
+            if kwargs["cdp_url"] == endpoint_a:
+                raise RuntimeError("connection failed")
+            return SimpleNamespace(cdp_url=endpoint_b)
+
+        monkeypatch.setattr(browser_tool, "_run_browser_command", _browser_command)
+        monkeypatch.setattr(SUPERVISOR_REGISTRY, "get_or_start", _start)
+
+        browser_tool._ensure_cdp_supervisor("task-local")
+
+        assert discoveries == [
+            ("task-local", "get", ["cdp-url"], {"timeout": 10})
+        ]
+        assert starts == [endpoint_a, endpoint_b]
+        assert session["supervisor_cdp_url"] == endpoint_b
+
+    def test_explicit_and_cloud_endpoints_do_not_trigger_local_rediscovery(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        explicit = "ws://explicit.example/devtools/browser/override"
+        cloud = "wss://cloud.example/devtools/browser/session"
+        starts = []
+
+        monkeypatch.setattr(
+            browser_tool,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("explicit/cloud endpoints must not use local discovery")
+            ),
+        )
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_dialog_policy_config",
+            lambda: ("auto_dismiss", 30.0),
+        )
+        monkeypatch.setattr(
+            SUPERVISOR_REGISTRY,
+            "get_or_start",
+            lambda **kwargs: starts.append(kwargs),
+        )
+
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {"task-explicit": {"features": {"local": True}}},
+        )
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: explicit)
+        browser_tool._ensure_cdp_supervisor("task-explicit")
+
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {
+                "task-cloud": {
+                    "cdp_url": cloud,
+                    "features": {"browser_use": True},
+                }
+            },
+        )
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        browser_tool._ensure_cdp_supervisor("task-cloud")
+
+        assert [item["cdp_url"] for item in starts] == [explicit, cloud]
 
 
 class TestCreateCdpSession:
