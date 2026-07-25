@@ -1563,6 +1563,37 @@ def test_repo_backed_self_declared_incomplete_response_is_blocked(tmp_path):
     assert ledger.incomplete_items() == []
 
 
+def test_failed_repo_action_response_cannot_complete_work_item(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement the feature")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Session too large for the model's context window. Use /compact.",
+        summary_status="Failed",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"] == {
+        "allowed_to_complete": False,
+        "summary_status": "Failed",
+        "terminal_status": "blocked",
+        "reason": "agent_turn_failed",
+        "delivery_intent": "full_lifecycle",
+        "repo_backed": True,
+    }
+    ledger.mark_response_delivered(item["id"], result_message_id="error-message")
+    ledger.mark_summary_updated(item["id"])
+    ledger.mark_completed(item["id"])
+    assert ledger.get(item["id"])["status"] == "blocked"
+
+
 def test_explicit_pr_only_request_allows_intentionally_unmerged_final(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Open a PR but don't merge it")

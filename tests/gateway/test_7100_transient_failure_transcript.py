@@ -10,8 +10,8 @@ of the last turn on the next attempt.
 
 The gateway classifier must distinguish:
 
-* ``compression_exhausted=True`` OR context-keyword errors OR a generic
-  ``400`` on a long history  → context-overflow → skip transcript
+* ``compression_exhausted=True`` OR explicit context-keyword errors
+  → context-overflow → skip transcript
 * everything else that fails → transient → persist the user message
 """
 
@@ -33,7 +33,6 @@ def _classify(agent_result: dict, history_len: int) -> tuple[bool, bool]:
             "request entity too large", "prompt is too long",
             "payload too large", "input is too long",
         ))
-        or ("400" in err and history_len > 50)
     )
     return agent_failed_early, is_context_overflow_failure
 
@@ -60,14 +59,14 @@ class TestContextOverflowStillSkipsTranscript:
         assert failed
         assert ctx_overflow
 
-    def test_generic_400_on_large_session_is_context_overflow(self):
+    def test_generic_400_on_large_session_is_transient(self):
         agent_result = {
             "failed": True,
             "error": "error code: 400 - {'type': 'error', 'message': 'Error'}",
         }
         failed, ctx_overflow = _classify(agent_result, history_len=100)
         assert failed
-        assert ctx_overflow
+        assert not ctx_overflow
 
 
 class TestTransientFailureKeepsUserMessage:
