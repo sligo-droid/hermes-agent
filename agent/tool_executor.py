@@ -849,6 +849,8 @@ def _record_turn_verification_evidence(
     result: Any,
     is_error: bool,
     duration_s: float = 0.0,
+    *,
+    visual_assertion_args: dict[str, Any] | None = None,
 ) -> None:
     stats = getattr(agent, "_turn_runtime_stats", None)
     if not isinstance(stats, dict):
@@ -910,7 +912,11 @@ def _record_turn_verification_evidence(
         requirement = getattr(agent, "visual_qa_requirement", None)
         receipt = classify_tool_visual_receipt(
             function_name,
-            function_args,
+            (
+                visual_assertion_args
+                if function_name == "visual_qa" and visual_assertion_args is not None
+                else function_args
+            ),
             result,
             is_error,
             order=order,
@@ -1805,7 +1811,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         )
         if not blocked:
             _record_turn_verification_evidence(
-                agent, name, storage_args, function_result, is_error, tool_duration,
+                agent,
+                name,
+                storage_args,
+                function_result,
+                is_error,
+                tool_duration,
+                visual_assertion_args=args,
             )
 
         # Print cute message per tool
@@ -2577,7 +2589,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         )
         if not _execution_blocked:
             _record_turn_verification_evidence(
-                agent, function_name, storage_args, function_result, _is_error_result, tool_duration,
+                agent,
+                function_name,
+                storage_args,
+                function_result,
+                _is_error_result,
+                tool_duration,
+                visual_assertion_args=function_args,
             )
 
         # Track file-mutation outcome for the turn-end verifier.  See

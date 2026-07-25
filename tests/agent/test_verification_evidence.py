@@ -234,6 +234,59 @@ def test_dedicated_visual_tool_records_distinct_safe_receipt():
     assert agent._turn_runtime_stats["visual_qa_check_duration_s"] == 2.5
 
 
+def test_visual_receipt_uses_execution_args_after_storage_redaction():
+    requirement = normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": "dashboard",
+            "assertions": ["dashboard matches the requested appearance"],
+        }
+    )
+    assertion_id = requirement["assertions"][0]["id"]
+    assertions = [
+        {
+            "id": assertion_id,
+            "kind": "screenshot_appearance",
+            "expectation": "dashboard matches the requested appearance",
+        }
+    ]
+    receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": visual_assertion_contract_id(assertions),
+        "assertion_ids": [assertion_id],
+        "status": "blocked",
+        "attempts": 1,
+        "vision_calls": 0,
+        "duration_ms": 10,
+        "diagnostic_codes": ["screenshot_unavailable"],
+    }
+    result = json.dumps({"status": "blocked", "visual_qa_receipt": receipt})
+    execution_args = {"assertions": assertions}
+    storage_args = tool_executor._storage_safe_tool_args("visual_qa", execution_args)
+    agent = SimpleNamespace(
+        _turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0),
+        visual_qa_requirement=requirement,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+
+    assert storage_args == {
+        "assertions": [{"id": assertion_id, "kind": "screenshot_appearance"}]
+    }
+    tool_executor._record_turn_tool_runtime(agent, "visual_qa", 0.1, result, False)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "visual_qa",
+        storage_args,
+        result,
+        False,
+        visual_assertion_args=execution_args,
+    )
+
+    assert agent._turn_runtime_stats["visual_qa_receipts"] == [
+        {**receipt, "order": 1}
+    ]
+
+
 def test_later_visual_receipt_replaces_earlier_failure_after_edit():
     requirement = normalize_visual_requirement(
         {
