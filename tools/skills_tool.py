@@ -34,6 +34,9 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
     platforms: [macos]            # Optional — restrict to specific OS platforms
                                   #   Valid: macos, linux, windows
                                   #   Omit to load on all platforms (default)
+    visibility:                    # Optional offer-surface metadata
+      prompt_index: false          #   Hide from always-loaded prompt only;
+                                  #   explicit list/view/slash loads still work
     prerequisites:                # Optional — legacy runtime requirements
       env_vars: [API_KEY]         #   Legacy env var names are normalized into
                                   #   required_environment_variables on load.
@@ -82,6 +85,7 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS
 from agent.skill_utils import is_excluded_skill_path as _is_excluded_skill_path
+from agent.skill_utils import resolve_skill_category
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +99,8 @@ logger = logging.getLogger(__name__)
 #   - a short TTL bounds staleness from in-place SKILL.md edits, which
 #     bump only the file's mtime, invisible to any directory signature.
 # skip_disabled True/False are cached separately.
-_SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_list)}
+_SKILLS_CACHE: dict = {}  # {cache_key: (signature, timestamp, skills_list, diagnostics)}
+_LAST_SKILLS_DISCOVERY_REPORT: dict = {}
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
@@ -601,10 +606,8 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
         pass
     for skills_dir in dirs_to_check:
         try:
-            rel_path = skill_path.relative_to(skills_dir)
-            parts = rel_path.parts
-            if len(parts) >= 3:
-                return parts[0]
+            skill_path.relative_to(skills_dir)
+            return resolve_skill_category(skill_path, skills_dir)
         except ValueError:
             continue
     return None
@@ -705,10 +708,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     signature changes (dir/category mtimes or the disabled-set) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
+    global _LAST_SKILLS_DISCOVERY_REPORT
     from agent.skill_utils import (
+        discover_skill_offers,
         get_external_skills_dirs,
         get_inherited_skills_dirs,
-        iter_skill_index_files,
     )
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
@@ -725,8 +729,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     if active_skills_dir.exists():
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
+    inherited_dirs = get_inherited_skills_dirs()
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature([*dirs_to_scan, *inherited_dirs], disabled)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -738,76 +743,61 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # Per-call shallow copies: callers mutate the returned dicts
         # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
         # out the cached objects would poison the cache for everyone else.
+        _LAST_SKILLS_DISCOVERY_REPORT = dict(cached[3]) if len(cached) > 3 else {}
         return [dict(s) for s in cached[2]]
 
+    offers, diagnostics = discover_skill_offers(
+        dirs_to_scan,
+        inherited_dirs,
+        disabled=disabled,
+        filter_environment=True,
+    )
     skills = []
-    seen_names: set = set()
-
-
-    # Scan local dir first, then external dirs (local takes precedence) —
-    # dirs_to_scan already resolved above for the signature.
-    dirs_to_scan.extend(get_inherited_skills_dirs())
-
-    for scan_dir in dirs_to_scan:
-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
-                continue
-
-            skill_dir = skill_md.parent
-
-            try:
-                content = skill_md.read_text(encoding="utf-8")[:4000]
-                frontmatter, body = _parse_frontmatter(content)
-
-                if not skill_matches_platform(frontmatter):
-                    continue
-
-                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
-                    continue
-                if name in disabled:
-                    continue
-
-                description = frontmatter.get("description", "")
-                if not description:
-                    for line in body.strip().split("\n"):
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            description = line
-                            break
-
-                if len(description) > MAX_DESCRIPTION_LENGTH:
-                    description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
-
-                category = _get_category_from_path(skill_md)
-
-                seen_names.add(name)
-                skills.append({
-                    "name": name,
-                    "description": description,
-                    "category": category,
-                })
-
-            except (UnicodeDecodeError, PermissionError) as e:
-                logger.debug("Failed to read skill file %s: %s", skill_md, e)
-                continue
-            except Exception as e:
-                logger.debug(
-                    "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
-                )
-                continue
+    for offer in offers:
+        # Never truncate an advertised lookup token: skill_view must receive
+        # the exact name that discovery exposed.
+        name = str(offer["name"])
+        description = str(offer.get("description") or "")
+        if len(description) > MAX_DESCRIPTION_LENGTH:
+            description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
+        skills.append(
+            {
+                "name": name,
+                "description": description,
+                "category": offer.get("category") or "general",
+            }
+        )
+    _LAST_SKILLS_DISCOVERY_REPORT = diagnostics
 
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
-    _SKILLS_CACHE[cache_key] = (signature, now, skills)
+    _SKILLS_CACHE[cache_key] = (signature, now, skills, diagnostics)
     return [dict(s) for s in skills]
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
+
+
+def _public_skills_diagnostics(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep skills_list diagnostics useful without echoing every scanned path."""
+    return {
+        key: report.get(key)
+        for key in (
+            "raw_path_count",
+            "unique_name_count",
+            "offered_count",
+            "collision_count",
+            "collision_names",
+            "collisions",
+            "filtered_count",
+            "filtered_counts",
+        )
+        if key in report
+    }
 
 
 def _skill_view_json_size(payload: Dict[str, Any]) -> int:
@@ -994,6 +984,13 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
         # Find all skills
         all_skills = _find_all_skills()
+        diagnostics = _public_skills_diagnostics(_LAST_SKILLS_DISCOVERY_REPORT)
+        if diagnostics.get("collision_count"):
+            logger.warning(
+                "Omitted %d ambiguous skill name(s) from skills_list: %s",
+                diagnostics["collision_count"],
+                ", ".join(diagnostics.get("collision_names") or []),
+            )
 
         if not all_skills:
             return json.dumps(
@@ -1002,6 +999,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                     "skills": [],
                     "categories": [],
                     "message": "No skills found in skills/ directory.",
+                    "diagnostics": diagnostics,
                 },
                 ensure_ascii=False,
             )
@@ -1024,6 +1022,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
+                "diagnostics": diagnostics,
                 "hint": "Use skill_view(name) for a bounded overview; pass full_content=true for the complete root body",
             },
             ensure_ascii=False,

@@ -475,87 +475,74 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands = {}
     try:
 
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from tools.skills_tool import SKILLS_DIR, _get_disabled_skill_names
+        from agent.skill_utils import (
+            discover_skill_offers,
+            get_external_skills_dirs,
+            get_inherited_skills_dirs,
+        )
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
-        seen_names: set = set()
 
-        # Scan local dir first, then external dirs
+        # Local and configured external roots use the same primary lookup tier
+        # as skill_view; inherited roots remain fallback-only.
         dirs_to_scan = []
         if SKILLS_DIR.exists():
             dirs_to_scan.append(SKILLS_DIR)
         dirs_to_scan.extend(get_external_skills_dirs())
+        offers, diagnostics = discover_skill_offers(
+            dirs_to_scan,
+            get_inherited_skills_dirs(),
+            disabled=disabled,
+            filter_environment=True,
+        )
+        if diagnostics.get("collision_count"):
+            logger.warning(
+                "Omitted %d ambiguous skill name(s) from slash discovery: %s",
+                diagnostics["collision_count"],
+                ", ".join(diagnostics.get("collision_names") or []),
+            )
 
-        for scan_dir in dirs_to_scan:
-            for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
+        for offer in offers:
+            try:
+                name = str(offer["name"])
+                description = str(offer.get("description") or "")
+                skill_md = Path(str(offer["path"]))
+                # Normalize to hyphen-separated slug, stripping non-alnum
+                # chars to avoid invalid Telegram command names downstream.
+                cmd_name = name.lower().replace(" ", "-").replace("_", "-")
+                cmd_name = _SKILL_INVALID_CHARS.sub("", cmd_name)
+                cmd_name = _SKILL_MULTI_HYPHEN.sub("-", cmd_name).strip("-")
+                if not cmd_name:
                     continue
-                try:
-                    content = skill_md.read_text(encoding='utf-8')
-                    frontmatter, body = _parse_frontmatter(content)
-                    # Skip skills incompatible with the current OS platform
-                    if not skill_matches_platform(frontmatter):
-                        continue
-                    # Skip skills not relevant to the current runtime env
-                    # (kanban/docker/s6). Offer-time only; explicit load bypasses.
-                    if not skill_matches_environment(frontmatter):
-                        continue
-                    name = frontmatter.get('name', skill_md.parent.name)
-                    if name in seen_names:
-                        continue
-                    # Respect user's disabled skills config
-                    if name in disabled:
-                        continue
-                    description = frontmatter.get('description', '')
-                    if not description:
-                        for line in body.strip().split('\n'):
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                description = line[:80]
-                                break
-                    seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
-                    if not cmd_name:
-                        continue
-                    # Skip if this skill's auto-generated /command collides
-                    # with a core Hermes slash command (name or alias). The
-                    # skill remains fully loadable via /skill <name>.
-                    # Uses resolve_command() so aliases and case variants are
-                    # covered without maintaining a separate cache.
-                    if resolve_command(cmd_name) is not None:
-                        logger.warning(
-                            "Skill %r generates slash command '/%s' which "
-                            "collides with a core Hermes command; skipping "
-                            "auto-registration. Use '/skill %s' instead.",
-                            name, cmd_name, name,
-                        )
-                        continue
-                    # Dedup on the resolved slug, not just the raw name: two
-                    # distinct frontmatter names can normalize to the same
-                    # slug (e.g. "git_helper" vs "git-helper"). First-wins
-                    # preserves local-before-external precedence.
-                    cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
-                        logger.warning(
-                            "Skill %r maps to slash command %s already claimed "
-                            "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
-                        )
-                        continue
-                    _skill_commands[cmd_key] = {
-                        "name": name,
-                        "description": description or f"Invoke the {name} skill",
-                        "skill_md_path": str(skill_md),
-                        "skill_dir": str(skill_md.parent),
-                    }
-                except Exception:
+                if resolve_command(cmd_name) is not None:
+                    logger.warning(
+                        "Skill %r generates slash command '/%s' which "
+                        "collides with a core Hermes command; skipping "
+                        "auto-registration. Use '/skill %s' instead.",
+                        name,
+                        cmd_name,
+                        name,
+                    )
                     continue
+                cmd_key = f"/{cmd_name}"
+                if cmd_key in _skill_commands:
+                    logger.warning(
+                        "Skill %r maps to slash command %s already claimed "
+                        "by %r; keeping the first and skipping this one.",
+                        name,
+                        cmd_key,
+                        _skill_commands[cmd_key]["name"],
+                    )
+                    continue
+                _skill_commands[cmd_key] = {
+                    "name": name,
+                    "description": description or f"Invoke the {name} skill",
+                    "skill_md_path": str(skill_md),
+                    "skill_dir": str(skill_md.parent),
+                }
+            except Exception:
+                continue
     except Exception:
         pass
     return _skill_commands

@@ -205,7 +205,7 @@ class TestGetCategoryFromPath:
             skill_md = tmp_path / "my-skill" / "SKILL.md"
             skill_md.parent.mkdir(parents=True)
             skill_md.touch()
-            assert _get_category_from_path(skill_md) is None
+            assert _get_category_from_path(skill_md) == "general"
 
     def test_outside_skills_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
@@ -369,6 +369,18 @@ class TestSkillsList:
         assert result["count"] == 1
         assert result["categories"] == ["linked"]
         assert result["skills"][0]["name"] == "knowledge-brain"
+
+    def test_ambiguous_bare_names_are_omitted_with_paths(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "shared", category="alpha")
+            _make_skill(tmp_path, "shared", category="beta")
+            result = json.loads(skills_list())
+
+        assert result["skills"] == []
+        diagnostics = result["diagnostics"]
+        assert diagnostics["collision_names"] == ["shared"]
+        assert diagnostics["collision_count"] == 1
+        assert len(diagnostics["collisions"][0]["paths"]) == 2
 
 
 # ---------------------------------------------------------------------------
