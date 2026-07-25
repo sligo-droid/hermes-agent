@@ -358,6 +358,7 @@ def test_shadow_visual_qa_reports_missing_fresh_receipt_without_blocking(tmp_pat
     )
 
     stored = ledger.get(item["id"])
+    assert stored["final_response"] == "Implemented the dashboard."
     assert stored["completion_gate"]["allowed_to_complete"] is True
     assert stored["completion_gate"]["visual_qa"] == {
         "mode": "shadow",
@@ -436,6 +437,12 @@ def test_enforced_visual_qa_requires_a_fresh_post_edit_receipt(tmp_path):
     stale_stored = ledger.get(stale["id"])
     assert stale_stored["completion_gate"]["allowed_to_complete"] is False
     assert stale_stored["completion_gate"]["reason"] == "visual_qa_receipt_missing"
+    assert stale_stored["final_response"].startswith(
+        "⚠️ **Completion blocked.** Enforced visual QA is active"
+    )
+    assert stale_stored["final_response"].endswith("Implemented the dashboard.")
+    assert "Gate reason: visual qa receipt missing." in stale_stored["final_response"]
+    assert "None" not in stale_stored["final_response"]
 
     fresh_event = _discord_event(
         message_id="fresh",
@@ -462,6 +469,38 @@ def test_enforced_visual_qa_requires_a_fresh_post_edit_receipt(tmp_path):
     fresh_stored = ledger.get(fresh["id"])
     assert fresh_stored["completion_gate"]["allowed_to_complete"] is True
     assert fresh_stored["completion_gate"]["visual_qa"]["status"] == "passed"
+    assert fresh_stored["final_response"] == "Implemented the dashboard."
+
+
+def test_enforced_visual_qa_streamed_block_appends_notice_without_none(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(
+        message_id="streamed-visual-block",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Fresh verification passed.",
+        visual_qa_receipts=[],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=2,
+        already_delivered=True,
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "response_delivered"
+    assert stored["final_response"].startswith("Fresh verification passed.\n\n")
+    assert "⚠️ **Completion blocked.**" in stored["final_response"]
+    assert "Gate reason: visual qa receipt missing." in stored["final_response"]
+    assert "None" not in stored["final_response"]
 
 
 def test_enforced_visual_qa_blocks_unverifiable_mutation_and_strips_unsafe_receipt(tmp_path):

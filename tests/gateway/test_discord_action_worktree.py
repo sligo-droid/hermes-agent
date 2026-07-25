@@ -2055,6 +2055,134 @@ def _runner_for_action_turn(tmp_path, captured: dict) -> gateway_run.GatewayRunn
     return runner
 
 
+def _accept_enforced_visual_action_item(runner, event, session_key):
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    event.work_item_id = item["id"]
+    event.visual_qa_config = item["visual_qa_config"]
+    event.visual_qa_requirement = item["visual_qa_requirement"]
+    runner._discord_work_item_id_for_event = lambda *_args, **_kwargs: item["id"]
+    runner._activate_direct_closeout_after_checkpoint = lambda *_args, **_kwargs: None
+    runner._session_has_pending_background_workers = lambda *_args, **_kwargs: False
+    return item
+
+
+@pytest.mark.asyncio
+async def test_enforced_visual_gate_prefixes_actual_discord_delivery_response(tmp_path):
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = _source(tmp_path)
+    event = MessageEvent(
+        text="Build a responsive dashboard with a mobile sidebar.",
+        source=source,
+        message_id="visual-blocked-response",
+        discord_runtime_mode="action",
+    )
+    session_key = "agent:main:discord:thread:thread-123"
+    item = _accept_enforced_visual_action_item(runner, event, session_key)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Fresh verification passed.",
+            "messages": [
+                {"role": "user", "content": event.text},
+                {"role": "assistant", "content": "Fresh verification passed."},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "visual_qa": {
+                "receipts": [],
+                "code_mutation_observed": True,
+                "min_receipt_order": 2,
+            },
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        1,
+    )
+
+    assert response.startswith("⚠️ **Completion blocked.** Enforced visual QA is active")
+    assert "Fresh verification passed." in response
+    assert "None" not in response
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["final_response"] == response
+
+
+@pytest.mark.asyncio
+async def test_enforced_visual_gate_sends_notice_after_streamed_discord_response(tmp_path):
+    captured: dict = {}
+    runner = _runner_for_action_turn(tmp_path, captured)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    adapter = SimpleNamespace(
+        platform=Platform.DISCORD,
+        _active_sessions={},
+        send=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+    source = _source(tmp_path)
+    event = MessageEvent(
+        text="Build a responsive dashboard with a mobile sidebar.",
+        source=source,
+        message_id="visual-blocked-stream",
+        discord_runtime_mode="action",
+    )
+    session_key = "agent:main:discord:thread:thread-123"
+    item = _accept_enforced_visual_action_item(runner, event, session_key)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Fresh verification passed.",
+            "messages": [
+                {"role": "user", "content": event.text},
+                {"role": "assistant", "content": "Fresh verification passed."},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "already_sent": True,
+            "visual_qa": {
+                "receipts": [],
+                "code_mutation_observed": True,
+                "min_receipt_order": 2,
+            },
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        1,
+    )
+
+    assert response is None
+    notice_calls = [
+        call
+        for call in adapter.send.await_args_list
+        if len(call.args) > 1
+        and str(call.args[1]).startswith("⚠️ **Completion blocked.**")
+    ]
+    assert len(notice_calls) == 1
+    notice = notice_calls[0].args[1]
+    assert notice.startswith("⚠️ **Completion blocked.** Enforced visual QA is active")
+    assert "Fresh verification passed." not in notice
+    assert "None" not in notice
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    assert stored["final_response"] == f"Fresh verification passed.\n\n{notice}"
+
+
 @pytest.mark.asyncio
 async def test_parent_exception_seals_released_required_worker_attempt(tmp_path):
     captured: dict = {}
