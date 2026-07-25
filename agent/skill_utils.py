@@ -10,7 +10,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
@@ -29,6 +29,9 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".git",
         ".github",
         ".hub",
+        ".curator_backups",
+        ".relocation-backups",
+        "_qmd-index",
         ".archive",
         ".venv",
         "venv",
@@ -47,7 +50,19 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # skill_view(skill, file_path=...). They are not standalone skills and must not
 # be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
 # archive workflow preserves a complete old skill package under references/.
-SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+SKILL_SUPPORT_DIRS = frozenset(
+    (
+        "references",
+        "templates",
+        "assets",
+        "scripts",
+        "docs",
+        "examples",
+        "resources",
+        "fixtures",
+        "tests",
+    )
+)
 
 
 def is_excluded_skill_path(path) -> bool:
@@ -823,6 +838,287 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
     if len(desc) > 60:
         return desc[:57] + "..."
     return desc
+
+
+# ── Canonical offer discovery ─────────────────────────────────────────────
+
+
+def resolve_skill_category(skill_file: Path, skills_root: Path) -> str:
+    """Return the stable category for a ``SKILL.md`` path.
+
+    Top-level skills use ``general``. Nested categories retain their full
+    relative path (for example ``foundations/runtime``), so the prompt,
+    ``skills_list``, and slash discovery cannot disagree about category depth.
+    """
+    try:
+        relative = skill_file.relative_to(skills_root)
+    except ValueError:
+        return "general"
+    category_parts = relative.parts[:-2]
+    return "/".join(category_parts) if category_parts else "general"
+
+
+def skill_prompt_index_visible(frontmatter: Dict[str, Any]) -> bool:
+    """Return whether a skill belongs in the always-loaded prompt index.
+
+    ``metadata.hermes.visibility.prompt_index: false`` is the canonical form;
+    the original top-level ``visibility`` spelling remains accepted for
+    compatibility. This is deliberately an offer-surface hint, not a
+    loadability gate. ``skills_list``, slash invocation, explicit paths, and
+    ``skill_view`` continue to work normally.
+    """
+    visibility = frontmatter.get("visibility")
+    if not isinstance(visibility, dict):
+        metadata = frontmatter.get("metadata")
+        hermes_metadata = (
+            metadata.get("hermes")
+            if isinstance(metadata, dict)
+            else None
+        )
+        visibility = (
+            hermes_metadata.get("visibility")
+            if isinstance(hermes_metadata, dict)
+            else None
+        )
+    if not isinstance(visibility, dict):
+        return True
+    value = visibility.get("prompt_index", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "hide",
+            "hidden",
+        }
+    return bool(value)
+
+
+def skill_matches_conditions(
+    conditions: Dict[str, Any],
+    available_tools: Optional[Set[str]],
+    available_toolsets: Optional[Set[str]],
+) -> bool:
+    """Apply shared tool/toolset offer conditions.
+
+    Missing availability context preserves the historical fail-open behavior.
+    """
+    if available_tools is None and available_toolsets is None:
+        return True
+    tools = available_tools or set()
+    toolsets = available_toolsets or set()
+    if any(value in toolsets for value in conditions.get("fallback_for_toolsets", [])):
+        return False
+    if any(value in tools for value in conditions.get("fallback_for_tools", [])):
+        return False
+    if any(value not in toolsets for value in conditions.get("requires_toolsets", [])):
+        return False
+    if any(value not in tools for value in conditions.get("requires_tools", [])):
+        return False
+    return True
+
+
+def make_skill_offer_candidate(
+    skill_file: Path,
+    skills_root: Path,
+    frontmatter: Dict[str, Any],
+    body: str = "",
+    *,
+    source_tier: str = "primary",
+) -> Dict[str, Any]:
+    """Build the common metadata record consumed by every offer surface."""
+    directory_name = skill_file.parent.name
+    advertised_name = str(frontmatter.get("name") or directory_name).strip()
+    description = str(frontmatter.get("description") or "").strip()
+    if not description:
+        for line in body.strip().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                description = line
+                break
+    try:
+        relative_path = str(skill_file.relative_to(skills_root))
+    except ValueError:
+        relative_path = str(skill_file)
+    return {
+        "name": advertised_name,
+        "directory_name": directory_name,
+        "description": description,
+        "category": resolve_skill_category(skill_file, skills_root),
+        "path": str(skill_file),
+        "relative_path": relative_path,
+        "root": str(skills_root),
+        "source_tier": source_tier,
+        "frontmatter": frontmatter,
+        "conditions": extract_skill_conditions(frontmatter),
+        "prompt_index": skill_prompt_index_visible(frontmatter),
+    }
+
+
+def finalize_skill_offer_candidates(
+    candidates: Iterable[Dict[str, Any]],
+    *,
+    disabled: Optional[Set[str]] = None,
+    available_tools: Optional[Set[str]] = None,
+    available_toolsets: Optional[Set[str]] = None,
+    filter_environment: bool = True,
+    prompt_index: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Resolve source precedence, collisions, and shared offer filters.
+
+    The collision model mirrors ``skill_view``: local/configured-external
+    (``primary``) roots are considered before inherited fallback roots, and a
+    bare lookup matches both a skill's frontmatter name and directory name.
+    An advertised name is omitted unless that exact bare lookup resolves to
+    one candidate. Categorized/explicit paths remain loadable.
+    """
+    disabled = disabled or set()
+    raw_candidates: List[Dict[str, Any]] = []
+    seen_paths: Set[Path] = set()
+    for raw in candidates:
+        candidate = dict(raw)
+        try:
+            resolved = Path(str(candidate.get("path", ""))).resolve()
+        except (OSError, RuntimeError):
+            resolved = Path(str(candidate.get("path", ""))).absolute()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        raw_candidates.append(candidate)
+
+    lookup_groups: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for candidate in raw_candidates:
+        tokens = {str(candidate.get("name") or "").strip(), str(candidate.get("directory_name") or "").strip()}
+        for token in tokens - {""}:
+            tier = "inherited" if candidate.get("source_tier") == "inherited" else "primary"
+            lookup_groups.setdefault(token, {"primary": [], "inherited": []})[tier].append(candidate)
+
+    collisions: List[Dict[str, Any]] = []
+    collision_names: Set[str] = set()
+    for lookup_name in sorted(lookup_groups):
+        tiers = lookup_groups[lookup_name]
+        effective = tiers["primary"] or tiers["inherited"]
+        if len(effective) <= 1:
+            continue
+        collision_names.add(lookup_name)
+        collisions.append(
+            {
+                "name": lookup_name,
+                "count": len(effective),
+                "paths": sorted(str(item.get("path") or "") for item in effective),
+                "relative_paths": sorted(
+                    str(item.get("relative_path") or "") for item in effective
+                ),
+            }
+        )
+
+    filtered_counts: Dict[str, int] = {}
+    filtered: List[Dict[str, str]] = []
+    offered: List[Dict[str, Any]] = []
+
+    def reject(candidate: Dict[str, Any], reason: str) -> None:
+        filtered_counts[reason] = filtered_counts.get(reason, 0) + 1
+        filtered.append(
+            {
+                "name": str(candidate.get("name") or ""),
+                "path": str(candidate.get("path") or ""),
+                "reason": reason,
+            }
+        )
+
+    for candidate in raw_candidates:
+        name = str(candidate.get("name") or "").strip()
+        directory_name = str(candidate.get("directory_name") or "").strip()
+        if not name:
+            reject(candidate, "missing_name")
+            continue
+        tiers = lookup_groups.get(name, {"primary": [], "inherited": []})
+        effective = tiers["primary"] or tiers["inherited"]
+        if candidate not in effective:
+            reject(candidate, "shadowed_by_primary")
+            continue
+        if name in collision_names:
+            reject(candidate, "collision")
+            continue
+        frontmatter = candidate.get("frontmatter")
+        if not isinstance(frontmatter, dict):
+            frontmatter = {}
+        if name in disabled or directory_name in disabled:
+            reject(candidate, "disabled")
+            continue
+        if not skill_matches_platform(frontmatter):
+            reject(candidate, "platform")
+            continue
+        if filter_environment and not skill_matches_environment(frontmatter):
+            reject(candidate, "environment")
+            continue
+        if not skill_matches_conditions(
+            candidate.get("conditions") or {}, available_tools, available_toolsets
+        ):
+            reject(candidate, "tool_conditions")
+            continue
+        if prompt_index and not bool(candidate.get("prompt_index", True)):
+            reject(candidate, "prompt_index_hidden")
+            continue
+        offered.append(candidate)
+
+    diagnostics = {
+        "raw_path_count": len(raw_candidates),
+        "raw_paths": sorted(str(item.get("path") or "") for item in raw_candidates),
+        "unique_name_count": len({str(item.get("name") or "") for item in offered}),
+        "offered_count": len(offered),
+        "collision_count": len(collisions),
+        "collision_names": sorted(collision_names),
+        "collisions": collisions,
+        "filtered_count": len(filtered),
+        "filtered_counts": dict(sorted(filtered_counts.items())),
+        "filtered": filtered,
+    }
+    return offered, diagnostics
+
+
+def discover_skill_offers(
+    primary_roots: Iterable[Path],
+    inherited_roots: Iterable[Path] = (),
+    **finalize_options: Any,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Scan roots and return the canonical offer catalog plus diagnostics."""
+    candidates: List[Dict[str, Any]] = []
+    read_errors: List[Dict[str, str]] = []
+    for source_tier, roots in (
+        ("primary", primary_roots),
+        ("inherited", inherited_roots),
+    ):
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for skill_file in iter_skill_index_files(root, "SKILL.md"):
+                try:
+                    content = skill_file.read_text(encoding="utf-8")
+                    frontmatter, body = parse_frontmatter(content)
+                    candidates.append(
+                        make_skill_offer_candidate(
+                            skill_file,
+                            root,
+                            frontmatter,
+                            body,
+                            source_tier=source_tier,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("Could not read skill candidate %s: %s", skill_file, exc)
+                    read_errors.append(
+                        {"path": str(skill_file), "reason": f"read_error: {exc}"}
+                    )
+    offered, diagnostics = finalize_skill_offer_candidates(
+        candidates, **finalize_options
+    )
+    if read_errors:
+        diagnostics["read_errors"] = read_errors
+        diagnostics["filtered_count"] += len(read_errors)
+        diagnostics["filtered_counts"]["read_error"] = len(read_errors)
+    return offered, diagnostics
 
 
 # ── File iteration ────────────────────────────────────────────────────────

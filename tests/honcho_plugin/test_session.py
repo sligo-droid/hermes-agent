@@ -1355,6 +1355,43 @@ class TestBaseContextSummary:
         formatted = provider._format_first_turn_context(ctx)
         assert "Session Summary" not in formatted
 
+    @staticmethod
+    def _provider_with_cached_context(text="cached base context"):
+        provider = HonchoMemoryProvider()
+        provider._config = SimpleNamespace(context_tokens=None)
+        provider._manager = MagicMock()
+        provider._manager.pop_context_result.return_value = None
+        provider._session_key = "test-session"
+        provider._session_initialized = True
+        provider._base_context_cache = text
+        provider._turn_count = 2
+        provider._last_context_turn = 1
+        provider._last_dialectic_turn = 2
+        return provider
+
+    def test_prefetch_does_not_reinject_unchanged_cached_base_context(self):
+        provider = self._provider_with_cached_context()
+
+        assert provider.prefetch("first substantive question") == "cached base context"
+        assert provider.prefetch("second substantive question") == ""
+
+    def test_prefetch_reinjects_base_context_after_material_refresh(self):
+        provider = self._provider_with_cached_context()
+
+        assert provider.prefetch("first substantive question") == "cached base context"
+        provider._base_context_cache = "refreshed base context"
+
+        assert provider.prefetch("second substantive question") == "refreshed base context"
+
+    def test_unchanged_base_does_not_suppress_new_dialectic_supplement(self):
+        provider = self._provider_with_cached_context()
+        assert provider.prefetch("first substantive question") == "cached base context"
+        with provider._prefetch_lock:
+            provider._prefetch_result = "new dialectic supplement"
+            provider._prefetch_result_fired_at = 2
+
+        assert provider.prefetch("second substantive question") == "new dialectic supplement"
+
     def test_format_filters_stale_task_logs_and_bounds_sections(self):
         """Default injection should keep small cards without dumping representations."""
         provider = HonchoMemoryProvider()

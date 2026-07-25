@@ -293,3 +293,81 @@ def test_category_descriptions_are_capped_at_160_chars(monkeypatch, tmp_path):
 
     assert ("A" * 157) + "..." in result
     assert "A" * 180 not in result
+
+
+def test_duplicate_bare_name_is_omitted_with_collision_diagnostics(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _seed_skill(tmp_path, "alpha", "shared", "Alpha version")
+    _seed_skill(tmp_path, "beta", "shared", "Beta version")
+
+    result = build_skills_system_prompt()
+    report = get_last_skills_index_report()
+
+    assert "shared: Alpha version" not in result
+    assert "shared: Beta version" not in result
+    discovery = report["discovery"]
+    assert discovery["collision_count"] == 1
+    assert discovery["collision_names"] == ["shared"]
+    assert discovery["collisions"][0]["count"] == 2
+    assert len(discovery["collisions"][0]["paths"]) == 2
+    assert discovery["filtered_counts"]["collision"] == 2
+
+
+def test_prompt_hidden_skill_remains_listed_and_explicitly_loadable(
+    monkeypatch, tmp_path
+):
+    import json
+
+    from tools.skills_tool import skill_view, skills_list
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = tmp_path / "skills" / "specialists" / "quiet-expert"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: quiet-expert\n"
+        "description: Load only when explicitly requested.\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    visibility:\n"
+        "      prompt_index: false\n"
+        "---\n\nExplicit body.\n",
+        encoding="utf-8",
+    )
+
+    prompt = build_skills_system_prompt()
+    clear_skills_system_prompt_cache(clear_snapshot=False)
+    warm_prompt = build_skills_system_prompt()
+    listed = json.loads(skills_list())
+    viewed = json.loads(skill_view("quiet-expert", preprocess=False))
+
+    assert "quiet-expert" not in prompt
+    assert warm_prompt == prompt
+    assert [skill["name"] for skill in listed["skills"]] == ["quiet-expert"]
+    assert viewed["success"] is True
+    assert "Explicit body" in viewed["content"]
+    report = get_last_skills_index_report()
+    assert report["discovery"]["filtered_counts"]["prompt_index_hidden"] == 1
+
+
+def test_category_parity_for_top_level_and_nested_skills(monkeypatch, tmp_path):
+    import json
+
+    from tools.skills_tool import skills_list
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _seed_skill(tmp_path, "", "top-level", "Top level")
+    _seed_skill(tmp_path, "foundations/runtime", "nested", "Nested")
+
+    prompt = build_skills_system_prompt()
+    listed = json.loads(skills_list())
+    categories = {skill["name"]: skill["category"] for skill in listed["skills"]}
+
+    assert categories == {
+        "top-level": "general",
+        "nested": "foundations/runtime",
+    }
+    assert "  general:" in prompt
+    assert "  foundations/runtime:" in prompt

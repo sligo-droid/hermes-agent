@@ -59,6 +59,14 @@ class TestScanSkillCommands:
         assert "/my-skill" in result
         assert result["/my-skill"]["name"] == "my-skill"
 
+    def test_ambiguous_bare_name_does_not_register_slash_command(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "shared", category="alpha")
+            _make_skill(tmp_path, "shared", category="beta")
+            result = scan_skill_commands()
+
+        assert "/shared" not in result
+
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             result = scan_skill_commands()

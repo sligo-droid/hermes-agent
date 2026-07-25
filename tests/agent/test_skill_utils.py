@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from agent.skill_utils import (
     extract_skill_config_vars,
     extract_skill_conditions,
@@ -239,6 +241,54 @@ def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
     assert found == [scripts_skill / "SKILL.md", templates_skill / "SKILL.md"]
     assert is_skill_support_path(scripts_skill / "SKILL.md") is False
     assert is_excluded_skill_path(scripts_skill / "SKILL.md") is False
+
+
+@pytest.mark.parametrize(
+    "excluded_dir",
+    [
+        ".curator_backups",
+        ".relocation-backups",
+        "_qmd-index",
+        ".hub",
+    ],
+)
+def test_iter_skill_index_files_prunes_backup_and_generated_roots(
+    tmp_path, excluded_dir
+):
+    leaked = tmp_path / excluded_dir / "copied-skill"
+    leaked.mkdir(parents=True)
+    (leaked / "SKILL.md").write_text(
+        "---\nname: copied-skill\n---\n", encoding="utf-8"
+    )
+    real = tmp_path / "real-skill"
+    real.mkdir()
+    (real / "SKILL.md").write_text(
+        "---\nname: real-skill\n---\n", encoding="utf-8"
+    )
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [
+        real / "SKILL.md"
+    ]
+
+
+@pytest.mark.parametrize("support_dir", ["docs", "examples", "resources", "fixtures", "tests"])
+def test_iter_skill_index_files_prunes_common_support_packages(
+    tmp_path, support_dir
+):
+    root = tmp_path / "umbrella"
+    root.mkdir()
+    (root / "SKILL.md").write_text(
+        "---\nname: umbrella\n---\n", encoding="utf-8"
+    )
+    copied = root / support_dir / "copied"
+    copied.mkdir(parents=True)
+    (copied / "SKILL.md").write_text(
+        "---\nname: copied\n---\n", encoding="utf-8"
+    )
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [
+        root / "SKILL.md"
+    ]
 
 
 # ── skill_matches_platform on Termux ──────────────────────────────────────

@@ -58,3 +58,23 @@ def test_breakdown_uses_measured_context_when_available():
 
     assert data["context_used"] == 42_000
     assert data["context_percent"] == 21
+
+
+def test_breakdown_reports_persisted_memory_sidecars_separately():
+    agent, parts = _make_agent(tools=[])
+    history = [{
+        "role": "user",
+        "content": "hello",
+        "api_content": (
+            "hello\n\n<memory-context>\n"
+            "Relevant remembered preference.\n"
+            "</memory-context>"
+        ),
+    }]
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, history)
+
+    by_id = {item["id"]: item for item in data["categories"]}
+    assert by_id["memory_sidecars"]["tokens"] > 0
+    assert by_id["conversation"]["tokens"] > 0

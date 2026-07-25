@@ -21,12 +21,17 @@ from agent.skill_utils import (
     SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
     extract_skill_description,
-    get_all_skills_dirs,
     get_disabled_skill_names,
+    get_external_skills_dirs,
+    get_inherited_skills_dirs,
+    finalize_skill_offer_candidates,
     iter_skill_index_files,
+    make_skill_offer_candidate,
     parse_frontmatter,
+    resolve_skill_category,
+    skill_matches_conditions,
     skill_matches_platform,
-    skill_matches_platform_list,
+    skill_prompt_index_visible,
 )
 from utils import atomic_json_write
 
@@ -1176,7 +1181,7 @@ _SKILLS_PROMPT_CACHE: OrderedDict[
     tuple[str, dict[str, Any] | None],
 ] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2
 _LAST_INDEX_REPORT: dict[str, Any] | None = None
 SKILLS_INDEX_MAX_CHARS = 12_000
 SKILLS_CATEGORY_DESCRIPTION_MAX_CHARS = 160
@@ -1218,6 +1223,9 @@ def get_last_skills_index_report() -> dict[str, Any] | None:
                 str(cat): dict(info)
                 for cat, info in (_LAST_INDEX_REPORT.get("categories") or {}).items()
             },
+            "discovery": json.loads(
+                json.dumps(_LAST_INDEX_REPORT.get("discovery") or {})
+            ),
         }
 
 
@@ -1292,13 +1300,7 @@ def _build_snapshot_entry(
 ) -> dict:
     """Build a serialisable metadata dict for one skill."""
     rel_path = skill_file.relative_to(skills_dir)
-    parts = rel_path.parts
-    if len(parts) >= 2:
-        skill_name = parts[-2]
-        category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
-    else:
-        category = "general"
-        skill_name = skill_file.parent.name
+    skill_name = skill_file.parent.name
 
     platforms = frontmatter.get("platforms") or []
     if isinstance(platforms, str):
@@ -1306,10 +1308,13 @@ def _build_snapshot_entry(
 
     return {
         "skill_name": skill_name,
-        "category": category,
-        "frontmatter_name": str(frontmatter.get("name", skill_name)),
+        "category": resolve_skill_category(skill_file, skills_dir),
+        "relative_path": str(rel_path),
+        "frontmatter_name": str(frontmatter.get("name") or skill_name),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
+        "environments": frontmatter.get("environments") or [],
+        "prompt_index": skill_prompt_index_visible(frontmatter),
         "conditions": extract_skill_conditions(frontmatter),
     }
 
@@ -1343,29 +1348,7 @@ def _skill_should_show(
     available_toolsets: "set[str] | None",
 ) -> bool:
     """Return False if the skill's conditional activation rules exclude it."""
-    if available_tools is None and available_toolsets is None:
-        return True  # No filtering info — show everything (backward compat)
-
-    at = available_tools or set()
-    ats = available_toolsets or set()
-
-    # fallback_for: hide when the primary tool/toolset IS available
-    for ts in conditions.get("fallback_for_toolsets", []):
-        if ts in ats:
-            return False
-    for t in conditions.get("fallback_for_tools", []):
-        if t in at:
-            return False
-
-    # requires: hide when a required tool/toolset is NOT available
-    for ts in conditions.get("requires_toolsets", []):
-        if ts not in ats:
-            return False
-    for t in conditions.get("requires_tools", []):
-        if t not in at:
-            return False
-
-    return True
+    return skill_matches_conditions(conditions, available_tools, available_toolsets)
 
 
 
@@ -1523,6 +1506,7 @@ def _build_skills_index_report(
     category_report: dict[str, dict[str, Any]],
     full_equivalent: str,
     rendered: str,
+    discovery_report: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     try:
         rendered_chars = len(rendered)
@@ -1553,6 +1537,7 @@ def _build_skills_index_report(
             "bytes_full_equivalent": len(full_equivalent.encode("utf-8")),
             "bytes_rendered": len(rendered.encode("utf-8")),
         }
+        report["discovery"] = dict(discovery_report or {})
         if _skills_index_debug_enabled():
             demoted = [
                 category
@@ -1725,17 +1710,18 @@ def build_skills_system_prompt(
 
     Additional skill directories (``skills.external_dirs`` in config.yaml and
     ``HERMES_INHERITED_SKILLS_DIRS``) are scanned alongside the local
-    ``~/.hermes/skills/`` directory.  Additional dirs are read-only — they
-    appear in the index but new skills are always created in the local dir.
-    Local skills take precedence when names collide.
+    ``~/.hermes/skills/`` directory. Configured external roots share the
+    primary lookup tier; inherited roots are fallback-only.
     """
     global _LAST_INDEX_REPORT
 
     compact_category_set = _normalized_compact_categories(compact_categories)
     skills_dir = get_skills_dir()
-    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+    external_dirs = get_external_skills_dirs()
+    inherited_dirs = get_inherited_skills_dirs()
+    additional_dirs = [*external_dirs, *inherited_dirs]
 
-    if not skills_dir.exists() and not external_dirs:
+    if not skills_dir.exists() and not additional_dirs:
         with _SKILLS_PROMPT_CACHE_LOCK:
             _LAST_INDEX_REPORT = None
         return ""
@@ -1749,6 +1735,7 @@ def build_skills_system_prompt(
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
+        tuple(str(d) for d in inherited_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
@@ -1766,7 +1753,7 @@ def build_skills_system_prompt(
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
 
-    skills_by_category: dict[str, list[tuple[str, str]]] = {}
+    candidates: list[dict[str, Any]] = []
     category_descriptions: dict[str, str] = {}
 
     if snapshot is not None:
@@ -1775,22 +1762,25 @@ def build_skills_system_prompt(
             if not isinstance(entry, dict):
                 continue
             skill_name = entry.get("skill_name") or ""
-            category = entry.get("category") or "general"
             frontmatter_name = entry.get("frontmatter_name") or skill_name
-            platforms = entry.get("platforms") or []
-            if not skill_matches_platform_list(platforms):
-                continue
-            if frontmatter_name in disabled or skill_name in disabled:
-                continue
-            if not _skill_should_show(
-                entry.get("conditions") or {},
-                available_tools,
-                available_toolsets,
-            ):
-                continue
-            skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
+            relative_path = entry.get("relative_path") or str(
+                Path(entry.get("category") or "general") / skill_name / "SKILL.md"
             )
+            frontmatter = {
+                "name": frontmatter_name,
+                "description": entry.get("description", ""),
+                "platforms": entry.get("platforms") or [],
+                "environments": entry.get("environments") or [],
+            }
+            candidate = make_skill_offer_candidate(
+                skills_dir / relative_path,
+                skills_dir,
+                frontmatter,
+                source_tier="primary",
+            )
+            candidate["conditions"] = entry.get("conditions") or {}
+            candidate["prompt_index"] = entry.get("prompt_index", True)
+            candidates.append(candidate)
         category_descriptions = {
             str(k): str(v)
             for k, v in (snapshot.get("category_descriptions") or {}).items()
@@ -1799,22 +1789,16 @@ def build_skills_system_prompt(
         # Cold path: full filesystem scan + write snapshot for next time
         skill_entries: list[dict] = []
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+            _is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
             entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
             skill_entries.append(entry)
-            if not is_compatible:
-                continue
-            skill_name = entry["skill_name"]
-            if entry["frontmatter_name"] in disabled or skill_name in disabled:
-                continue
-            if not _skill_should_show(
-                extract_skill_conditions(frontmatter),
-                available_tools,
-                available_toolsets,
-            ):
-                continue
-            skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
+            candidates.append(
+                make_skill_offer_candidate(
+                    skill_file,
+                    skills_dir,
+                    frontmatter,
+                    source_tier="primary",
+                )
             )
 
         # Read category-level DESCRIPTION.md files
@@ -1839,62 +1823,75 @@ def build_skills_system_prompt(
         )
 
     # ── Additional skill directories ───────────────────────────────────
-    # Scan external and inherited dirs directly (no snapshot caching — they're
-    # read-only and typically small).  Local skills already in
-    # skills_by_category take precedence: we track seen names and skip
-    # duplicates from additional dirs.
-    seen_skill_names: set[str] = set()
-    for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
-            seen_skill_names.add(name)
-
-    for ext_dir in external_dirs:
-        if not ext_dir.exists():
+    # These stay outside the local disk snapshot, but feed the same canonical
+    # collision/filter pass as local entries.
+    for scan_dir in additional_dirs:
+        if not scan_dir.exists():
             continue
-        for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
+        source_tier = "inherited" if scan_dir in inherited_dirs else "primary"
+        for skill_file in iter_skill_index_files(scan_dir, "SKILL.md"):
             try:
-                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-                if not is_compatible:
-                    continue
-                entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
-                skill_name = entry["skill_name"]
-                frontmatter_name = entry["frontmatter_name"]
-                if frontmatter_name in seen_skill_names:
-                    continue
-                if frontmatter_name in disabled or skill_name in disabled:
-                    continue
-                if not _skill_should_show(
-                    extract_skill_conditions(frontmatter),
-                    available_tools,
-                    available_toolsets,
-                ):
-                    continue
-                seen_skill_names.add(frontmatter_name)
-                skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                _is_compatible, frontmatter, _desc = _parse_skill_file(skill_file)
+                candidates.append(
+                    make_skill_offer_candidate(
+                        skill_file,
+                        scan_dir,
+                        frontmatter,
+                        source_tier=source_tier,
+                    )
                 )
             except Exception as e:
-                logger.debug("Error reading external skill %s: %s", skill_file, e)
+                logger.debug("Error reading additional skill %s: %s", skill_file, e)
 
-        # External category descriptions
-        for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
+        # Additional category descriptions
+        for desc_file in iter_skill_index_files(scan_dir, "DESCRIPTION.md"):
             try:
                 content = desc_file.read_text(encoding="utf-8")
                 fm, _ = parse_frontmatter(content)
                 cat_desc = fm.get("description")
                 if not cat_desc:
                     continue
-                rel = desc_file.relative_to(ext_dir)
+                rel = desc_file.relative_to(scan_dir)
                 cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
                 category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
-                logger.debug("Could not read external skill description %s: %s", desc_file, e)
+                logger.debug("Could not read additional skill description %s: %s", desc_file, e)
+
+    offered, discovery_report = finalize_skill_offer_candidates(
+        candidates,
+        disabled=disabled,
+        available_tools=available_tools,
+        available_toolsets=available_toolsets,
+        filter_environment=True,
+        prompt_index=True,
+    )
+    if discovery_report.get("collision_count"):
+        logger.warning(
+            "Omitted %d ambiguous skill name(s) from prompt index: %s",
+            discovery_report["collision_count"],
+            ", ".join(discovery_report.get("collision_names") or []),
+        )
+
+    skills_by_category: dict[str, list[tuple[str, str]]] = {}
+    for offer in offered:
+        skills_by_category.setdefault(
+            str(offer.get("category") or "general"), []
+        ).append((str(offer["name"]), extract_skill_description(offer["frontmatter"])))
 
     if not skills_by_category:
         result = ""
-        report = None
+        report = _build_skills_index_report(
+            compact_categories=frozenset(),
+            requested_compact_categories=compact_category_set,
+            auto_demoted_categories=frozenset(),
+            omitted_categories=frozenset(),
+            category_report={},
+            full_equivalent="",
+            rendered="",
+            discovery_report=discovery_report,
+        )
         with _SKILLS_PROMPT_CACHE_LOCK:
-            _LAST_INDEX_REPORT = None
+            _LAST_INDEX_REPORT = report
     else:
         (
             result,
@@ -1916,6 +1913,7 @@ def build_skills_system_prompt(
             category_report=category_report,
             full_equivalent=full_equivalent,
             rendered=result,
+            discovery_report=discovery_report,
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
