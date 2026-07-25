@@ -12,13 +12,15 @@ from typing import Any, Awaitable, Callable, Optional
 from agent.execution_guard import CooperativeExecutionGuard, ExecutionGuardExpired
 from agent.visual_assertions import (
     aggregate_assertion_results,
-    validate_visual_assertion_coverage,
+    validate_visual_execution_contract,
     visual_assertion_contract_id,
+    visual_execution_contract_id,
 )
 from agent.visual_qa import (
     normalize_visual_qa_config,
     normalize_visual_requirement,
     visual_requirement_id,
+    visual_requirement_uses_orchestrator_contract,
 )
 
 
@@ -181,6 +183,8 @@ async def _run_attempt(
     vision_allowed: bool,
     execution_guard: CooperativeExecutionGuard,
     on_provider_start: Callable[[], None],
+    execution_context: Optional[dict[str, Any]],
+    target_locator: Optional[dict[str, str]],
 ) -> dict[str, Any]:
     deterministic = [item for item in assertions if item["kind"] != "screenshot_appearance"]
     appearance = [item for item in assertions if item["kind"] == "screenshot_appearance"]
@@ -207,9 +211,16 @@ async def _run_attempt(
                 for item in appearance
             )
         else:
+            screenshot_kwargs: dict[str, Any] = {}
+            if target_locator and _declares_keyword(
+                supervisor.capture_screenshot_memory,
+                "locator",
+            ):
+                screenshot_kwargs["locator"] = target_locator
             screenshot = await _thread_call(
                 supervisor.capture_screenshot_memory,
                 execution_guard=execution_guard,
+                **screenshot_kwargs,
             )
             if not screenshot.get("ok"):
                 results.extend(
@@ -247,6 +258,11 @@ async def _run_attempt(
                     "cfg": cfg,
                     "timeout_s": vision_timeout_s,
                 }
+                if execution_context and _declares_keyword(
+                    vision_evaluator,
+                    "execution_context",
+                ):
+                    evaluator_kwargs["execution_context"] = execution_context
                 if _declares_keyword(vision_evaluator, "on_provider_start"):
                     evaluator_kwargs["on_provider_start"] = _mark_provider_started
                 else:
@@ -270,7 +286,8 @@ async def run_visual_assertions(
     *,
     task_id: str,
     requirement: Any,
-    assertions: Any,
+    contract: Any = None,
+    assertions: Any = None,
     config: Any = None,
     provider: str = "",
     model: str = "",
@@ -292,16 +309,54 @@ async def run_visual_assertions(
         return execution_guard.remaining()
 
     normalized_requirement = normalize_visual_requirement(requirement)
-    normalized_assertions = validate_visual_assertion_coverage(
+    raw_contract = (
+        contract
+        if isinstance(contract, dict)
+        else {"assertions": assertions}
+    )
+    normalized_contract = validate_visual_execution_contract(
         normalized_requirement,
-        assertions,
+        raw_contract,
         max_assertions=visual_config["max_assertions"],
     )
+    normalized_assertions = normalized_contract.get("assertions") or []
     if normalized_requirement["level"] == "none" or not normalized_assertions:
         return {"status": "uncertain", "code": "invalid_visual_contract", "attempts": []}
     requirement_id = visual_requirement_id(normalized_requirement)
-    contract_id = visual_assertion_contract_id(normalized_assertions)
+    orchestrated_contract = visual_requirement_uses_orchestrator_contract(
+        normalized_requirement
+    )
+    contract_id = (
+        visual_execution_contract_id(normalized_contract)
+        if orchestrated_contract
+        else visual_assertion_contract_id(normalized_assertions)
+    )
     assertion_ids = [item["id"] for item in normalized_assertions]
+    coverage_ids = [
+        str(item.get("id") or "")
+        for item in normalized_requirement.get("assertions") or []
+        if isinstance(item, dict)
+    ]
+    target = normalized_contract.get("target")
+    target_locator = (
+        target.get("locator")
+        if isinstance(target, dict) and isinstance(target.get("locator"), dict)
+        else None
+    )
+    execution_context = (
+        {
+            "target": {
+                "description": str(target.get("description") or "")
+            },
+            **{
+                key: normalized_contract[key]
+                for key in ("page", "viewport", "state")
+                if key in normalized_contract
+            },
+        }
+        if orchestrated_contract and isinstance(target, dict)
+        else None
+    )
 
     def _receipt(
         status: str,
@@ -315,7 +370,7 @@ async def run_visual_assertions(
             code = str(item.get("code") or "") if isinstance(item, dict) else ""
             if code and code not in codes:
                 codes.append(code)
-        return {
+        receipt = {
             "requirement_id": requirement_id,
             "contract_id": contract_id,
             "assertion_ids": assertion_ids,
@@ -328,6 +383,9 @@ async def run_visual_assertions(
             ),
             "diagnostic_codes": codes[:12],
         }
+        if orchestrated_contract:
+            receipt["coverage_ids"] = coverage_ids
+        return receipt
 
     if supervisor is None:
         try:
@@ -391,7 +449,13 @@ async def run_visual_assertions(
     if vision_sweeper is None:
         vision_sweeper = run_visual_sweep
 
-    locators = [item["locator"] for item in normalized_assertions if "locator" in item]
+    locators: list[dict[str, str]] = []
+    for locator in [
+        target_locator,
+        *(item.get("locator") for item in normalized_assertions),
+    ]:
+        if isinstance(locator, dict) and locator not in locators:
+            locators.append(locator)
     attempts: list[dict[str, Any]] = []
     vision_calls = 0
     final: dict[str, Any] = {"status": "uncertain", "results": []}
@@ -456,6 +520,8 @@ async def run_visual_assertions(
                     vision_allowed=vision_allowed,
                     execution_guard=attempt_guard,
                     on_provider_start=_provider_started,
+                    execution_context=execution_context,
+                    target_locator=target_locator,
                 ),
                 timeout=attempt_timeout,
             )

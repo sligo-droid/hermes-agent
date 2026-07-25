@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 from agent import conversation_loop, tool_executor
 from agent.visual_assertions import visual_assertion_contract_id
-from agent.visual_qa import normalize_visual_requirement, visual_requirement_id
+from agent.visual_qa import (
+    classify_visual_requirement,
+    normalize_visual_requirement,
+    visual_requirement_id,
+)
 from agent.verification_evidence import (
     claim_constraints_for_text,
     classify_tool_visual_receipt,
@@ -285,6 +289,50 @@ def test_visual_receipt_uses_execution_args_after_storage_redaction():
     assert agent._turn_runtime_stats["visual_qa_receipts"] == [
         {**receipt, "order": 1}
     ]
+
+
+def test_orchestrated_visual_contract_is_opaque_in_durable_tool_calls():
+    requirement = classify_visual_requirement(
+        "Fix the Issue Attention graph on the State Brief page.",
+        worker_route="action",
+    )
+    execution_args = {
+        "target": {
+            "description": "Issue Attention graph region",
+            "locator": {"by": "test_id", "value": "issue-attention-graph"},
+        },
+        "page": {"state": "prepared", "description": "State Brief page"},
+        "viewport": {"description": "current desktop viewport"},
+        "state": ["chart data loaded"],
+        "assertions": [
+            {
+                "kind": "screenshot_appearance",
+                "expectation": "Rounded bars stop above the x-axis and never cross the baseline.",
+            }
+        ],
+    }
+
+    safe_calls = tool_executor.storage_safe_tool_calls(
+        [
+            {
+                "function": {
+                    "name": "visual_qa",
+                    "arguments": json.dumps(execution_args),
+                }
+            }
+        ]
+    )
+
+    stored_args = json.loads(safe_calls[0]["function"]["arguments"])
+    assert stored_args["contract_id"].startswith("vac_")
+    assert stored_args["assertions"][0]["id"].startswith("vassert_")
+    assert stored_args["assertions"][0]["kind"] == "screenshot_appearance"
+    serialized = repr(safe_calls)
+    assert "Issue Attention" not in serialized
+    assert "State Brief" not in serialized
+    assert "issue-attention-graph" not in serialized
+    assert "x-axis" not in serialized
+    assert requirement["assertions"][0]["kind"] == "orchestrator_contract"
 
 
 def test_later_visual_receipt_replaces_earlier_failure_after_edit():

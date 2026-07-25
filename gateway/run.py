@@ -364,17 +364,39 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         if mode == "enforce_explicit"
         else "This is shadow-only reporting and does not block completion."
     )
-    required = ", ".join(
-        f"{item.get('id')}={item.get('kind')}"
-        for item in requirement.get("assertions") or []
-        if isinstance(item, dict) and item.get("id") and item.get("kind")
-    )
+    try:
+        from agent.visual_qa import visual_requirement_uses_orchestrator_contract
+
+        orchestrated = visual_requirement_uses_orchestrator_contract(requirement)
+    except Exception:
+        orchestrated = False
+    if orchestrated:
+        contract_instruction = (
+            "Using the full accepted request/thread plus the code you inspect, you own the "
+            "transient semantic contract. After the relevant edit and after preparing the existing "
+            "browser session, call `visual_qa` with: the smallest relevant target/region (and a "
+            "safe locator when available), the intended or already-open page state, applicable "
+            "viewport and state assumptions, and concrete assertions for every requested visual "
+            "outcome. Include at least one `screenshot_appearance` assertion. The host assigns "
+            "opaque assertion IDs and binds the result to the trusted requirement; the bounded "
+            "inspector—not your prose—decides pass/fail."
+        )
+    else:
+        required = ", ".join(
+            f"{item.get('id')}={item.get('kind')}"
+            for item in requirement.get("assertions") or []
+            if isinstance(item, dict) and item.get("id") and item.get("kind")
+        )
+        contract_instruction = (
+            "After the relevant code edit, call the dedicated `visual_qa` tool with "
+            f"one executable assertion for each legacy required ID/kind ({required}). "
+            "Reuse each opaque ID and exact kind; add the transient locator or expectation needed "
+            "to execute it."
+        )
     return (
         "[Visual QA: "
         f"mode={mode}; the accepted request has an opaque {requirement.get('level')} requirement. "
-        "After the relevant code edit, call the dedicated `visual_qa` tool with "
-        f"one executable assertion for each required ID/kind ({required}). "
-        "Reuse each opaque ID and exact kind; add the transient locator or expectation needed to execute it. "
+        f"{contract_instruction} "
         "Do not attach receipt arguments to terminal/browser/vision calls. Generic navigation, screenshots, "
         f"or console success do not count. {enforcement}]"
     )

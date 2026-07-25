@@ -78,6 +78,15 @@ async def test_visual_inspector_route_and_single_attempt_are_forwarded():
             api_key="orchestrator-credential",
             api_mode="codex_responses",
             cfg={},
+            execution_context={
+                "target": {"description": "Issue Attention graph region"},
+                "page": {
+                    "state": "prepared",
+                    "description": "State Brief page",
+                },
+                "viewport": {"description": "current desktop viewport"},
+                "state": ["chart data loaded"],
+            },
             call_llm=call_llm,
             on_provider_start=lambda: events.append("start"),
         )
@@ -91,6 +100,10 @@ async def test_visual_inspector_route_and_single_attempt_are_forwarded():
     assert seen["api_mode"] == "anthropic_messages"
     assert seen["single_attempt"] is True
     assert seen["strict_vision_capability"] is True
+    prompt = seen["messages"][0]["content"][0]["text"]
+    assert "Issue Attention graph region" in prompt
+    assert "State Brief page" in prompt
+    assert "chart data loaded" in prompt
 
 
 @pytest.mark.asyncio

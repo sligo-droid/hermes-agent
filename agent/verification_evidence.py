@@ -699,14 +699,17 @@ def classify_tool_visual_receipt(
         return None
     try:
         from agent.visual_assertions import (
-            validate_visual_assertion_coverage,
+            validate_visual_execution_contract,
             visual_assertion_contract_id,
+            visual_execution_contract_id,
         )
+        from agent.visual_qa import visual_requirement_uses_orchestrator_contract
 
-        assertions = validate_visual_assertion_coverage(
+        contract = validate_visual_execution_contract(
             requirement,
-            raw_assertions,
+            tool_args,
         )
+        assertions = contract.get("assertions") or []
     except Exception:
         return None
     # Validation normally omits malformed, duplicate, or over-limit entries.
@@ -715,7 +718,11 @@ def classify_tool_visual_receipt(
     if len(assertions) != len(raw_assertions):
         return None
     assertion_ids = [item["id"] for item in assertions]
-    contract_id = visual_assertion_contract_id(assertions)
+    contract_id = (
+        visual_execution_contract_id(contract)
+        if visual_requirement_uses_orchestrator_contract(requirement)
+        else visual_assertion_contract_id(assertions)
+    )
     if not contract_id:
         return None
 

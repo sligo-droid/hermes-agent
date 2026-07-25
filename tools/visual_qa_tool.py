@@ -24,17 +24,58 @@ VISUAL_QA_SCHEMA = {
     "name": "visual_qa",
     "description": (
         "Run bounded declarative visual assertions against the existing task browser session. "
-        "Use this after an explicit rendered UI or artifact change. This tool accepts only "
+        "Use this after an explicit rendered UI or artifact change. During the normal "
+        "implementation turn, formulate the smallest relevant target, prepared/current page "
+        "state, viewport assumptions, and concrete assertion intent from the full accepted "
+        "request and code understanding. This tool accepts only "
         "trusted assertion kinds; it does not accept JavaScript, CDP commands, shell commands, "
         "URLs, screenshots, cookies, or headers. Reuse every host-provided opaque assertion ID "
-        "with its exact required kind; missing, duplicate, substituted, unrelated, or legacy "
-        "coverage is rejected. Only an explicit passed receipt satisfies an enforced visual gate; "
+        "with its exact required kind only for a legacy requirement; new orchestrator-owned "
+        "contracts receive host-generated opaque assertion IDs. Missing, duplicate, substituted, "
+        "unrelated, or incomplete coverage is rejected. Only an explicit passed receipt satisfies an enforced visual gate; "
         "failed, blocked, uncertain, malformed, and timed-out checks do not."
     ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "target": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "description": {"type": "string", "maxLength": 160},
+                    "locator": _LOCATOR_SCHEMA,
+                },
+                "required": ["description"],
+            },
+            "page": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": ["already_open", "prepared"],
+                    },
+                    "description": {"type": "string", "maxLength": 160},
+                },
+                "required": ["state", "description"],
+            },
+            "viewport": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "description": {"type": "string", "maxLength": 120},
+                    "width": {"type": "integer", "minimum": 200, "maximum": 7680},
+                    "height": {"type": "integer", "minimum": 200, "maximum": 4320},
+                },
+                "required": ["description"],
+            },
+            "state": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {"type": "string", "maxLength": 160},
+            },
             "assertions": {
                 "type": "array",
                 "minItems": 1,
@@ -70,7 +111,7 @@ VISUAL_QA_SCHEMA = {
                             "maxLength": 96,
                         },
                     },
-                    "required": ["id", "kind"],
+                    "required": ["kind"],
                 },
             },
         },
@@ -95,7 +136,7 @@ async def _visual_qa_handler(args: dict[str, Any], **kwargs: Any) -> str:
     result = await run_visual_assertions(
         task_id=str(kwargs.get("task_id") or "default"),
         requirement=requirement,
-        assertions=args.get("assertions"),
+        contract=args,
         config=cfg,
         provider=str(runtime.get("provider") or ""),
         model=str(runtime.get("model") or ""),

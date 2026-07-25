@@ -2286,9 +2286,11 @@ def _delegate_coding_task_impl(
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-                "Treat this as explicit visual work. Complete the smallest relevant "
-                "assertion-driven rendered check and return the dedicated visual-QA "
-                "receipt without adding a URL to the receipt.",
+                "Treat this as explicit visual work. Implement with enough concrete handoff "
+                "detail for the parent action orchestrator to identify the smallest affected "
+                "region, intended page/browser state, viewport/state assumptions, and requested "
+                "visual outcomes. The parent action orchestrator owns the transient `visual_qa` "
+                "execution contract and trusted receipt; do not invent or self-declare a receipt.",
             ]
         )
     if project_context:

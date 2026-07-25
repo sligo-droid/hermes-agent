@@ -565,7 +565,7 @@ def test_enforced_visual_qa_gate_keeps_prose_and_reaction_state_synchronized(
     )
     assert successful is not None
     requirement = successful["visual_qa_requirement"]
-    assertion_ids = [item["id"] for item in requirement["assertions"]]
+    coverage_ids = [item["id"] for item in requirement["assertions"]]
     assert successful_ledger.mark_agent_done(
         successful["id"],
         final_response="Fresh verification passed.",
@@ -573,7 +573,8 @@ def test_enforced_visual_qa_gate_keeps_prose_and_reaction_state_synchronized(
             {
                 "requirement_id": visual_requirement_id(requirement),
                 "contract_id": "vac_" + ("a" * 24),
-                "assertion_ids": assertion_ids,
+                "coverage_ids": coverage_ids,
+                "assertion_ids": ["vassert_" + ("c" * 24)],
                 "status": "passed",
                 "attempts": 1,
                 "vision_calls": 0,

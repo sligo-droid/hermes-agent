@@ -16,7 +16,9 @@ Adopt two related, bounded mechanisms.
 ### Visual QA
 
 - Classify only explicit rendered UI or artifact implementation requests. Routing metadata and changed paths may support a classification but cannot create a visual requirement by themselves.
+- Intake classification owns only that applicability gate. During the existing action implementation turn, the action orchestrator uses the accepted request/thread and its code understanding to formulate the transient semantic execution contract: the smallest relevant target/region, intended or already-prepared page state, viewport/state assumptions, and concrete assertion intent. This does not add a classifier/model call or cycle stage.
 - Run visual QA through the dedicated declarative assertion surface against the task's existing browser session. The surface does not accept JavaScript, CDP or shell commands, URLs, screenshots, cookies, headers, or credentials.
+- The host binds the orchestrator-supplied contract to an opaque trusted requirement, assigns opaque assertion identifiers, requires at least one bounded screenshot-appearance judgement for new contracts, and accepts only the executor-produced receipt. The orchestrator cannot self-declare success.
 - Enforce hard runtime ceilings: at most six assertions, two attempts, one vision call, one receipt, one follow-up turn, 30 seconds per attempt, 60 seconds total, and 6,000 output characters.
 - Persist only a sanitized, prose-free receipt containing opaque requirement/contract/assertion identifiers, status, bounded counters, order, and allowlisted diagnostic codes.
 - An enforced gate passes only on the latest fresh `passed` receipt matching the trusted requirement. Missing, failed, blocked, uncertain, malformed, stale, or timed-out evidence never satisfies the gate.

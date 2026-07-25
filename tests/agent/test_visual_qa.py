@@ -6,6 +6,7 @@ from agent.visual_qa import (
     sanitize_visual_receipt,
     visual_receipt_completion,
     visual_requirement_id,
+    visual_requirement_uses_orchestrator_contract,
 )
 
 
@@ -14,7 +15,7 @@ def _receipt(requirement, *, status="passed", order=4):
     assertion_ids = [
         item["id"] for item in normalized["assertions"] if isinstance(item, dict)
     ]
-    return {
+    receipt = {
         "requirement_id": visual_requirement_id(normalized),
         "contract_id": "vac_" + ("a" * 24),
         "assertion_ids": assertion_ids,
@@ -25,6 +26,10 @@ def _receipt(requirement, *, status="passed", order=4):
         "diagnostic_codes": ["viewport_contained_satisfied"],
         "order": order,
     }
+    if visual_requirement_uses_orchestrator_contract(normalized):
+        receipt["coverage_ids"] = assertion_ids
+        receipt["assertion_ids"] = ["vassert_" + ("c" * 24)]
+    return receipt
 
 
 def test_classifier_recognizes_explicit_artifact_and_surface_work():
@@ -33,10 +38,10 @@ def test_classifier_recognizes_explicit_artifact_and_surface_work():
 
     assert artifact["level"] == "artifact"
     assert artifact["assertions"]
-    assert artifact["assertions"][0]["kind"] == "screenshot_appearance"
+    assert artifact["assertions"][0]["kind"] == "orchestrator_contract"
     assert surface["level"] == "surface"
     assert surface["assertions"]
-    assert surface["assertions"][0]["kind"] == "no_horizontal_overflow"
+    assert surface["assertions"][0]["kind"] == "orchestrator_contract"
 
 
 def test_classifier_excludes_review_only_work():
@@ -67,7 +72,7 @@ def test_classifier_recognizes_direct_visual_defects_and_desired_state_requests(
 
     assert incident["level"] == "surface"
     assert incident["assertions"]
-    assert incident["assertions"][0]["kind"] == "screenshot_appearance"
+    assert incident["assertions"][0]["kind"] == "orchestrator_contract"
     assert defect_only["level"] == "surface"
     assert desired_state["level"] == "surface"
 
@@ -158,6 +163,23 @@ def test_receipt_requires_safe_assertion_driven_metadata():
     ) is None
 
 
+def test_orchestrated_receipt_requires_exact_host_coverage_binding():
+    requirement = classify_visual_requirement(
+        "Fix the Issue Attention chart on the State Brief page.",
+        worker_route="action",
+    )
+    receipt = _receipt(requirement)
+
+    assert sanitize_visual_receipt(receipt, requirement) is not None
+    without_coverage = dict(receipt)
+    without_coverage.pop("coverage_ids")
+    assert sanitize_visual_receipt(without_coverage, requirement) is None
+    assert sanitize_visual_receipt(
+        {**receipt, "coverage_ids": ["vassert_" + ("d" * 24)]},
+        requirement,
+    ) is None
+
+
 def test_receipt_completion_uses_latest_fresh_matching_receipt():
     requirement = {
         "level": "surface",
@@ -186,19 +208,17 @@ def test_visual_followup_is_single_and_requires_code_change():
     assert build_visual_qa_followup_nudge(requirement, [], [], attempts=0) is None
 
 
-def test_classifier_preserves_newline_boundaries_before_assertion_extraction():
+def test_classifier_uses_one_opaque_orchestrator_coverage_anchor():
     requirement = classify_visual_requirement(
         "Implement the responsive toolbar.\n"
         "Keep the toolbar inside the mobile viewport without horizontal overflow."
     )
 
     assert requirement["level"] == "surface"
-    assert len(requirement["assertions"]) == 2
-    assert all(item["id"].startswith("vassert_") for item in requirement["assertions"])
-    assert [item["kind"] for item in requirement["assertions"]] == [
-        "screenshot_appearance",
-        "no_horizontal_overflow",
-    ]
+    assert len(requirement["assertions"]) == 1
+    assert requirement["assertions"][0]["id"].startswith("vassert_")
+    assert requirement["assertions"][0]["kind"] == "orchestrator_contract"
+    assert visual_requirement_uses_orchestrator_contract(requirement) is True
     assert "responsive toolbar" not in repr(requirement).lower()
     assert "mobile viewport" not in repr(requirement).lower()
 

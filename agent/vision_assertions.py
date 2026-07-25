@@ -59,17 +59,33 @@ def parse_vision_assertion_output(
     return aggregate_assertion_results(results)
 
 
-def _assertion_prompt(assertions: list[dict[str, Any]]) -> str:
+def _assertion_prompt(
+    assertions: list[dict[str, Any]],
+    execution_context: Optional[dict[str, Any]] = None,
+) -> str:
     compact = [
         {"id": item["id"], "expectation": item["expectation"]}
         for item in assertions[:6]
     ]
+    context = execution_context if isinstance(execution_context, dict) else {}
+    bounded_context = {
+        key: context[key]
+        for key in ("target", "page", "viewport", "state")
+        if key in context
+    }
+    context_note = (
+        " Inspect only this orchestrator-supplied scope and assumptions: "
+        f"{json.dumps(bounded_context, ensure_ascii=True, separators=(',', ':'))}."
+        if bounded_context
+        else ""
+    )
     return (
         "Evaluate only the listed visual appearance assertions against the image. "
         "Return JSON only with exactly this shape: "
         '{"results":[{"id":"...","status":"passed|failed|uncertain",'
         '"confidence":"high|medium|low"}]}. '
-        "Do not describe the page, quote visible text, include URLs, selectors, or add prose. "
+        "Do not describe the page, quote visible text, include URLs, selectors, or add prose."
+        f"{context_note} "
         f"Assertions: {json.dumps(compact, ensure_ascii=True, separators=(',', ':'))}"
     )
 
@@ -183,6 +199,7 @@ async def evaluate_screenshot_assertions(
     api_key: str = "",
     api_mode: str = "",
     cfg: Optional[dict[str, Any]] = None,
+    execution_context: Optional[dict[str, Any]] = None,
     timeout_s: float = 30.0,
     call_llm: Optional[Callable[..., Awaitable[Any]]] = None,
     on_provider_start: Optional[Callable[[], None]] = None,
@@ -213,7 +230,10 @@ async def evaluate_screenshot_assertions(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _assertion_prompt(assertions)},
+                    {
+                        "type": "text",
+                        "text": _assertion_prompt(assertions, execution_context),
+                    },
                     {"type": "image_url", "image_url": {"url": image_data_url}},
                 ],
             }
