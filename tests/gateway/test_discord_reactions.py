@@ -1671,6 +1671,18 @@ async def test_status_reaction_state_replaces_different_target(adapter):
 
 
 @pytest.mark.asyncio
+async def test_status_reaction_state_reports_failure_to_remove_a_known_stale_state(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(side_effect=RuntimeError("Discord unavailable")),
+        reactions=[SimpleNamespace(emoji="⏳", me=True)],
+    )
+
+    assert await adapter._set_message_reaction_state(raw_message, "✅") is False
+    raw_message.add_reaction.assert_awaited_once_with("✅")
+
+
+@pytest.mark.asyncio
 async def test_thread_followup_reactions_target_message_and_origin(adapter):
     origin_message = SimpleNamespace(
         id=1000,
@@ -1765,6 +1777,147 @@ async def test_expired_work_reconciliation_fetches_thread_origin_without_raw_mes
     assert state == "errored"
     origin_message.add_reaction.assert_awaited_once_with("❌")
     assert ledger.pending_terminal_reaction_items() == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciliation_repairs_summary_embed_and_source_post(
+    adapter,
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1000",
+        chat_type="thread",
+        thread_id="1000",
+        parent_chat_id="55",
+        guild_id="77",
+        message_id="1000",
+    )
+    summary_handle = {
+        "thread_id": "1000",
+        "message_id": "2000",
+        "source_message_id": "1000",
+        "parent_channel_id": "55",
+        "initial_request": "Implement the dashboard repair",
+        "kanban_board": None,
+    }
+    event = MessageEvent(
+        text="Implement the dashboard repair",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="1000",
+        feature_summary=summary_handle,
+        discord_runtime_mode="action",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    assert ledger.mark_agent_done(item["id"], final_response="Dashboard repair completed.")
+    assert ledger.mark_response_delivered(item["id"], result_message_id="3000")
+    assert ledger.mark_summary_updated(item["id"])
+    assert ledger.mark_completed(item["id"])
+    event.work_item_id = item["id"]
+
+    origin_message = SimpleNamespace(
+        id=1000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="⏳", me=True)],
+    )
+    summary_message = SimpleNamespace(
+        id=2000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="⏳", me=True)],
+        embeds=[
+            SimpleNamespace(
+                fields=[SimpleNamespace(name="Status", value="⏳ Running")]
+            )
+        ],
+    )
+
+    async def fetch_message(message_id):
+        return {1000: origin_message, 2000: summary_message}[int(message_id)]
+
+    parent = SimpleNamespace(id=55, fetch_message=AsyncMock(side_effect=fetch_message))
+    thread = SimpleNamespace(
+        id=1000,
+        parent=parent,
+        parent_id=55,
+        fetch_message=AsyncMock(side_effect=fetch_message),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+    adapter.gateway_runner = SimpleNamespace(work_ledger=ledger)
+    adapter.update_feature_summary = AsyncMock(return_value=True)
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter.update_feature_summary.assert_awaited_once_with(
+        summary_handle,
+        final_response="Dashboard repair completed.",
+        status="Complete",
+        title=None,
+        runtime_breakdown=None,
+    )
+    summary_message.add_reaction.assert_awaited_once_with("✅")
+    origin_message.add_reaction.assert_awaited_once_with("✅")
+    assert ledger.pending_terminal_reaction_items() == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciliation_keeps_retry_marker_when_summary_sync_fails(
+    adapter,
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1000",
+        chat_type="thread",
+        thread_id="1000",
+        parent_chat_id="55",
+        guild_id="77",
+        message_id="1000",
+    )
+    summary_handle = {
+        "thread_id": "1000",
+        "message_id": "2000",
+        "source_message_id": "1000",
+        "initial_request": "Implement the dashboard repair",
+        "kanban_board": None,
+    }
+    event = MessageEvent(
+        text="Implement the dashboard repair",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="1000",
+        feature_summary=summary_handle,
+        discord_runtime_mode="action",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    assert ledger.mark_agent_done(item["id"], final_response="Dashboard repair completed.")
+    assert ledger.mark_response_delivered(item["id"], result_message_id="3000")
+    assert ledger.mark_summary_updated(item["id"])
+    assert ledger.mark_completed(item["id"])
+    event.work_item_id = item["id"]
+
+    adapter.gateway_runner = SimpleNamespace(work_ledger=ledger)
+    adapter.update_feature_summary = AsyncMock(return_value=False)
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert [pending["id"] for pending in ledger.pending_terminal_reaction_items()] == [
+        item["id"]
+    ]
 
 
 @pytest.mark.asyncio
