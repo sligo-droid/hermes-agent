@@ -526,6 +526,77 @@ def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
     assert calls == []
 
 
+def test_read_only_page_navigate_allows_operator_approved_private_url(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        browser_cdp_tool,
+        "_resolve_cdp_endpoint",
+        lambda: "ws://127.0.0.1:9222/devtools/browser/mock",
+    )
+
+    import tools.browser_tool as bt
+
+    monkeypatch.setattr(bt, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(bt, "_is_safe_url", lambda _url: False)
+    monkeypatch.setattr(bt, "_allow_private_urls", lambda: True)
+
+    async def fake_call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"frameId": "f"}
+
+    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", fake_call)
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Page.navigate",
+            params={"url": "http://127.0.0.1:8000/dashboard"},
+            task_id="visual-turn::read-only",
+        )
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 1
+
+
+def test_read_only_page_navigate_blocks_metadata_with_private_opt_in(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        browser_cdp_tool,
+        "_resolve_cdp_endpoint",
+        lambda: "ws://127.0.0.1:9222/devtools/browser/mock",
+    )
+
+    import tools.browser_tool as bt
+
+    monkeypatch.setattr(
+        bt,
+        "_is_always_blocked_url",
+        lambda url: "169.254.169.254" in url,
+    )
+    monkeypatch.setattr(bt, "_is_safe_url", lambda _url: False)
+    monkeypatch.setattr(bt, "_allow_private_urls", lambda: True)
+
+    async def fake_call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"frameId": "f"}
+
+    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", fake_call)
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Page.navigate",
+            params={"url": PRIVATE_URL},
+            task_id="visual-turn::read-only",
+        )
+    )
+
+    assert "error" in result
+    assert PRIVATE_URL in result["error"]
+    assert calls == []
+
+
 def test_private_guard_inactive_does_not_probe(monkeypatch, cdp_server):
     cdp_server.on("Runtime.evaluate", lambda params, sid: {"result": {"value": "ok"}})
 

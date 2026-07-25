@@ -147,10 +147,16 @@ def _browser_cdp_private_guard(
 
         if method == "Page.navigate":
             target_url = str((params or {}).get("url") or "").strip()
-            if target_url and (
-                bt._is_always_blocked_url(target_url)  # type: ignore[attr-defined]
-                or not bt._is_safe_url(target_url)  # type: ignore[attr-defined]
-            ):
+            read_only = str(task_id or "").endswith("::read-only")
+            blocked_target = (
+                bt._read_only_url_blocked(target_url)  # type: ignore[attr-defined]
+                if read_only
+                else (
+                    bt._is_always_blocked_url(target_url)  # type: ignore[attr-defined]
+                    or not bt._is_safe_url(target_url)  # type: ignore[attr-defined]
+                )
+            )
+            if target_url and blocked_target:
                 return tool_error(
                     "Blocked: CDP Page.navigate target is a private or "
                     f"internal address ({target_url}).",
@@ -160,7 +166,9 @@ def _browser_cdp_private_guard(
 
         if method == "Runtime.evaluate":
             expression = str((params or {}).get("expression") or "")
-            blocked_literal = bt._expression_targets_private_url(expression)  # type: ignore[attr-defined]
+            blocked_literal = bt._expression_targets_private_url(  # type: ignore[attr-defined]
+                expression, task_id
+            )
             if blocked_literal:
                 return tool_error(
                     "Blocked: CDP Runtime.evaluate expression targets a "

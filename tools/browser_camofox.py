@@ -570,7 +570,7 @@ def _camofox_private_page_block(
         )
         return None
     blocked_url = probe(
-        session["tab_id"], session["user_id"]
+        session["tab_id"], session["user_id"], task_id or "default"
     )
     if not blocked_url:
         return None
