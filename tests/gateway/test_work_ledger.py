@@ -838,6 +838,26 @@ def test_discord_thread_reaction_uses_latest_terminal_after_incomplete_clears(tm
     assert ledger.discord_thread_reaction_state(second) == "done"
 
 
+def test_completion_marks_terminal_reaction_for_later_discord_sync(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="completed-reaction")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    assert ledger.mark_completed(item["id"])
+
+    stored = ledger.get(item["id"])
+    assert stored["terminal_reaction_state"] == "done"
+    assert stored["terminal_reaction_sync_pending"] is True
+    assert [pending["id"] for pending in ledger.pending_terminal_reaction_items()] == [
+        item["id"]
+    ]
+
+
 def test_run_state_cas_finalizes_only_unchanged_active_run(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     event = _discord_event(message_id="run-state-success")
