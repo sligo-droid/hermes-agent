@@ -319,7 +319,7 @@ def test_ledger_persists_normalized_visual_requirement_from_feature_summary(tmp_
         "max_followup_turns": 1,
         "max_attempts": 2,
         "max_assertions": 6,
-        "max_vision_calls": 1,
+        "max_vision_calls": 2,
         "attempt_timeout_s": 30.0,
         "total_timeout_s": 60.0,
         "max_output_chars": 6000,

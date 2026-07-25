@@ -164,6 +164,14 @@ def normalize_visual_qa_config(config: Any = None) -> dict[str, Any]:
     mode = str(raw.get("mode") or "shadow").strip().lower()
     if mode not in VISUAL_QA_MODES:
         mode = "shadow"
+    max_vision_calls = _clamped_int(
+        raw.get("max_vision_calls"), default=2, minimum=0, maximum=2
+    )
+    # A positive visual-QA budget is the mandatory Luna sweep plus Sonnet
+    # assertion inspection. Preserve zero as an explicit no-vision setting,
+    # but upgrade legacy one-call configuration to the required pair.
+    if max_vision_calls == 1:
+        max_vision_calls = 2
     return {
         "mode": mode,
         "max_receipts_per_turn": 1,
@@ -174,9 +182,7 @@ def normalize_visual_qa_config(config: Any = None) -> dict[str, Any]:
         "max_assertions": _clamped_int(
             raw.get("max_assertions"), default=6, minimum=1, maximum=6
         ),
-        "max_vision_calls": _clamped_int(
-            raw.get("max_vision_calls"), default=1, minimum=0, maximum=1
-        ),
+        "max_vision_calls": max_vision_calls,
         "attempt_timeout_s": _clamped_float(
             raw.get("attempt_timeout_s"), default=30.0, minimum=1.0, maximum=30.0
         ),
