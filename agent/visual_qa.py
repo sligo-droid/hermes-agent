@@ -70,6 +70,10 @@ _ACTION_RE = re.compile(
     r"\b(?:add|build|change|create|fix|implement|make|redesign|render|replace|update)\b",
     re.IGNORECASE,
 )
+_DESIRED_STATE_RE = re.compile(
+    r"\b(?:should|must|needs?\s+to|has\s+to|ought\s+to)\b",
+    re.IGNORECASE,
+)
 _DOC_ONLY_RE = re.compile(r"\b(?:docs?|documentation|readme|changelog)\b", re.IGNORECASE)
 _CONCRETE_IMPLEMENTATION_ACTION_RE = re.compile(
     r"\b(?:add|build|create|fix|implement|redesign|render|replace)\b",
@@ -104,6 +108,33 @@ _HOST_ASSERTION_KINDS = frozenset(
 _ACTIVE_VISUAL_REQUIREMENT: contextvars.ContextVar[dict[str, Any] | None] = (
     contextvars.ContextVar("hermes_active_visual_requirement", default=None)
 )
+
+
+def _route_is_actionable(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _route_is_actionable(value.get(key))
+            for key in (
+                "mode",
+                "route",
+                "runtime_mode",
+                "worker_route",
+                "fable_route",
+                "opus_route",
+                "role",
+                "kind",
+            )
+        )
+    route = str(value or "").strip().lower().replace("-", "_")
+    return route in {
+        "action",
+        "coding",
+        "dev",
+        "developer",
+        "implementation",
+        "implementer",
+        "worker",
+    }
 
 
 def _clean_text(value: Any, *, limit: int) -> str:
@@ -347,7 +378,11 @@ def classify_visual_requirement(
     """
     structured_text = merge_request_fragments(request_text)
     text = flatten_request_for_matching(structured_text)
-    if not text or not _ACTION_RE.search(text):
+    if not text:
+        return {"level": "none", "target": "", "assertions": []}
+    has_action = bool(_ACTION_RE.search(text))
+    has_desired_state = bool(_DESIRED_STATE_RE.search(text))
+    if not (has_action or has_desired_state or _route_is_actionable(worker_route)):
         return {"level": "none", "target": "", "assertions": []}
     # A concrete implementation action wins over review/audit framing (for
     # example, "review the dashboard and fix mobile overflow").  Generic
@@ -357,9 +392,10 @@ def classify_visual_requirement(
     level = "artifact" if _ARTIFACT_RE.search(text) else ("surface" if _SURFACE_RE.search(text) else "none")
     if level == "none":
         return {"level": "none", "target": "", "assertions": []}
-    # Metadata is intentionally not a classifier signal.  Reading it avoids
-    # callers having to special-case the API, while keeping routing advisory.
-    _ = worker_route, changed_paths
+    # Changed paths remain advisory only. The trusted action route can support
+    # rendered-surface text without requiring the user to phrase it as an
+    # imperative, but it cannot create a visual requirement without that text.
+    _ = changed_paths
     target = _target_from_text(text, level)
     return normalize_visual_requirement(
         {
