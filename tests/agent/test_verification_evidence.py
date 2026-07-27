@@ -887,6 +887,90 @@ def test_normal_browser_navigation_remains_successful_browser_evidence():
     assert latest["browser"]["status"] == "success"
 
 
+def test_authenticated_qa_success_supersedes_expected_login_boundary():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    login_result = json.dumps(
+        {
+            "success": True,
+            "url": "https://pid.sligolabs.com/",
+            "title": "Sign In to Home | Agora",
+            "snapshot": "Username Password Sign In",
+        }
+    )
+    qa_output = """> pid-dashboard qa:auth
+{
+  "ok": true,
+  "baseUrl": "https://pid.sligolabs.com",
+  "paths": ["/"],
+  "routeCount": 1,
+  "routes": [{"path": "/", "finalPath": "/", "screenshotPath": "artifacts/home.png"}],
+  "consoleErrorCount": 0,
+  "pageErrorCount": 0
+}
+"""
+    qa_result = json.dumps(
+        {"output": qa_output, "exit_code": 0, "error": None}
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "browser_navigate",
+        {"url": "https://pid.sligolabs.com/"},
+        login_result,
+        False,
+    )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "env PID_QA_PATH=/ PID_QA_VIEWPORT_WIDTH=390 "
+                "PID_QA_VIEWPORT_HEIGHT=844 pnpm qa:auth"
+            )
+        },
+        qa_result,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert latest["browser"]["status"] == "success"
+    assert latest["production"]["status"] == "success"
+    assert latest["production_browser"]["status"] == "success"
+    assert latest["production_browser"]["check_name"] == (
+        "qa:auth https://pid.sligolabs.com"
+    )
+    assert claim_constraints_for_text(
+        "Authenticated production QA passed with no console or page errors.",
+        agent._turn_runtime_stats["verification_evidence"],
+    )["allowed"] is True
+
+
+def test_authenticated_qa_requires_structured_success_payload():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": (
+                '> app qa:auth\n{"ok":false,"baseUrl":"https://example.com",'
+                '"paths":["/"],"routeCount":1,"routes":[{"path":"/",'
+                '"finalPath":"/"}],"consoleErrorCount":1,"pageErrorCount":0}'
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": "pnpm qa:auth"},
+        result,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert latest["production_browser"]["status"] == "failure"
+
+
 def test_verify_path_name_alone_is_not_verification_evidence():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     result = json.dumps(
