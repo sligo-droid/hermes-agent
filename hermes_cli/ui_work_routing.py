@@ -125,6 +125,16 @@ _DEFAULT_VISUAL_INTENT_KEYWORDS = [
     "design system",
 ]
 
+_LAYOUT_INTENT_KEYWORDS = [
+    "centered",
+    "center horizontally",
+    "center vertically",
+    "horizontally and vertically",
+    "equal size",
+    "equally sized",
+    "fit within",
+]
+
 _SOFT_VERIFICATION_NEGATIVE_KEYWORDS = {
     "smoke",
     "verify",
@@ -406,23 +416,52 @@ def _classify_ui_work(
     if not visual_intent_keywords:
         visual_intent_keywords = _DEFAULT_VISUAL_INTENT_KEYWORDS
 
+    primary_text = _normalize_text(title, task)
     body_text = _normalize_text(title, task, context)
 
     # CWD/project names are deliberately not positive evidence: repository names
     # like PID or Command Center should not route backend, docs, test, or review
     # work to the visual specialist model.
-    negative = _first_match(body_text, negative_keywords)
-    visual_intent = _first_match(body_text, visual_intent_keywords)
+    primary_negative = _first_match(primary_text, negative_keywords)
+    primary_visual_intent = _first_match(
+        primary_text,
+        [*visual_intent_keywords, *_LAYOUT_INTENT_KEYWORDS],
+    )
+    primary_action = _first_match(primary_text, action_keywords)
+    primary_surface = (
+        _first_match(primary_text, surface_keywords) or primary_visual_intent
+    )
+    # Supplemental implementation context often names backend/schema constraints
+    # for an otherwise explicit visual request.  Those words must not veto the
+    # user-facing task itself.  Negative-only task framing remains authoritative,
+    # while an explicit visual action may still mention backend/schema constraints
+    # without losing its route. Context can supply positive evidence when the
+    # primary request is not already an explicit visual action.
+    explicit_primary_visual = bool(
+        primary_action and primary_surface and primary_visual_intent
+    )
+    negative = (
+        ""
+        if explicit_primary_visual
+        else primary_negative or _first_match(body_text, negative_keywords)
+    )
+    visual_intent = primary_visual_intent or _first_match(
+        body_text, [*visual_intent_keywords, *_LAYOUT_INTENT_KEYWORDS]
+    )
     if negative and not (
         negative in _SOFT_VERIFICATION_NEGATIVE_KEYWORDS and visual_intent
     ):
         return False, f"negative keyword: {negative}"
 
-    action = _first_match(body_text, action_keywords)
+    action = primary_action or _first_match(body_text, action_keywords)
     if not action:
         return False, "no visual ui action"
 
-    non_visual_domain = _first_match(body_text, non_visual_domain_keywords)
+    non_visual_domain = (
+        ""
+        if explicit_primary_visual
+        else primary_negative or _first_match(body_text, non_visual_domain_keywords)
+    )
     if non_visual_domain and not visual_intent:
         return False, f"non-visual domain keyword: {non_visual_domain}"
 
@@ -500,7 +539,6 @@ def resolve_ui_work_route(
         if (
             requested.source == "deterministic_default"
             and enabled
-            and bool(ui_cfg.get("route_delegate_task", False))
             and advisory_matched
         ):
             automatic_fields = {

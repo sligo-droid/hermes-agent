@@ -194,6 +194,47 @@ def test_orchestrated_contract_deduplicates_and_bounds_screenshot_artifacts():
     assert normalize_orchestrated_visual_contract(raw) == {}
 
 
+def test_orchestrated_contract_accepts_safe_schema_permitted_model_shapes():
+    raw = _incident_contract()
+    raw["artifacts"] = [
+        {
+            "kind": "context",
+            "description": "Updates row context",
+            "locator": {"by": "css", "value": ".updates-grid"},
+        },
+        {
+            "kind": "focused",
+            "description": "Current page visual",
+        },
+    ]
+    raw["assertions"] = [
+        {
+            "kind": "text_present",
+            "locator": {"by": "css", "value": ".update-panel--polls"},
+            "text": "Recent Polls",
+        },
+        {
+            "kind": "screenshot_appearance",
+            "locator": {"by": "css", "value": ".update-panel--polls"},
+            "policy": "literal_request_text",
+            "expectation": "The recent polls panel matches the adjacent panel height.",
+        },
+    ]
+
+    normalized = normalize_orchestrated_visual_contract(raw)
+
+    assert [item["kind"] for item in normalized["artifacts"]] == [
+        "context",
+        "focused",
+    ]
+    assert normalized["assertions"][0]["kind"] == "text_present"
+    assert normalized["assertions"][0]["policy"] == "literal_request_text"
+    assert "locator" not in normalized["assertions"][0]
+    assert normalized["assertions"][1]["kind"] == "screenshot_appearance"
+    assert "locator" not in normalized["assertions"][1]
+    assert "policy" not in normalized["assertions"][1]
+
+
 def test_responsive_artifact_requires_bounded_dimensions():
     raw = _incident_contract()
     raw["artifacts"] = [

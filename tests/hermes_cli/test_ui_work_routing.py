@@ -184,8 +184,8 @@ def test_explicit_ui_route_overrides_review_keyword_veto():
     assert decision.route_decision_source == "orchestrator"
     assert decision.route_decision_confidence == 0.8
     assert decision.route_decision_rationale == "review feedback requires visual implementation"
-    assert decision.advisory_matched is False
-    assert "negative keyword: review" in decision.advisory_reason
+    assert decision.advisory_matched is True
+    assert "visual ui work" in decision.advisory_reason
 
 
 def test_visual_keywords_without_route_select_automatic_opus_advisor():
@@ -255,6 +255,25 @@ def test_backend_api_work_with_ui_context_does_not_route():
     assert "negative keyword" in decision.advisory_reason
 
 
+def test_visual_task_is_not_vetoed_by_backend_constraints_in_context():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task=(
+            "Implement the Race page visual: replace the General chart with an "
+            "equally sized panel and center the message horizontally and vertically."
+        ),
+        context=(
+            "Inspect existing backend fields and do not invent schema or API changes."
+        ),
+    )
+
+    assert decision.matched is True
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.route_decision_source == "deterministic_explicit_visual"
+    assert decision.advisory_matched is True
+    assert "visual ui work" in decision.advisory_reason
+
+
 @pytest.mark.parametrize(
     "task",
     [
@@ -314,7 +333,7 @@ def test_visual_table_chart_and_card_work_selects_automatic_advisor(task):
     assert "visual ui work" in decision.advisory_reason
 
 
-def test_route_delegate_task_false_preserves_advisory_only_behavior():
+def test_legacy_route_delegate_task_false_does_not_disable_automatic_advisor():
     cfg = _cfg()
     cfg["ui_work"]["route_delegate_task"] = False
 
@@ -323,8 +342,8 @@ def test_route_delegate_task_false_preserves_advisory_only_behavior():
         task="Implement responsive dashboard card visual polish.",
     )
 
-    assert decision.matched is False
-    assert decision.selected_route == "default_coding_worker"
+    assert decision.matched is True
+    assert decision.selected_route == "ui_visual_specialist"
     assert decision.advisory_matched is True
 
 

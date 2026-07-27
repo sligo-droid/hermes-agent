@@ -2067,7 +2067,7 @@ ui_work:
   enabled: true
 ```
 
-Legacy `ui_work.provider`, `model`, `route`, `reasoning_effort`, `specialist_backend`, `claude_code`, `codex`, and `fallback` keys are ignored and can be removed. Configure runtime model and reasoning selection under `coding_worker` instead.
+Legacy `ui_work.route_delegate_task`, `provider`, `model`, `route`, `reasoning_effort`, `specialist_backend`, `claude_code`, `codex`, and `fallback` keys are ignored and can be removed. `ui_work.enabled` alone controls automatic explicit-visual routing; configure runtime model and reasoning selection under `coding_worker` instead.
 
 ## Clarify
 

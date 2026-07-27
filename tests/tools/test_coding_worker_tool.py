@@ -1713,6 +1713,7 @@ def test_automatic_visual_route_injects_opus_advisor_guidance(monkeypatch, tmp_p
 
 def test_ui_visual_advisor_helper_caches_same_turn_result(monkeypatch, tmp_path):
     cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["ui_work"]["route_delegate_task"] = False
     parent = _parent(tmp_path)
     parent._current_turn_id = "turn-visual-1"
     calls = []
@@ -2397,8 +2398,8 @@ def test_ui_work_uses_normal_codex_model_tier(monkeypatch, tmp_path):
     assert route["selected_model"] == ""
     assert route["fallback_used"] is False
     assert route["fallback_reason"] == ""
-    assert route["advisory_matched"] is False
-    assert "negative keyword: review" in route["advisory_reason"]
+    assert route["advisory_matched"] is True
+    assert "visual ui work" in route["advisory_reason"]
     assert route["recommended_skills"] == [
         "taste-skill",
         "claude-design",
