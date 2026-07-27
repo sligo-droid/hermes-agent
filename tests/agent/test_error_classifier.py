@@ -1483,11 +1483,12 @@ class TestAdversarialEdgeCases:
         assert result.should_rotate_credential is True
 
     def test_400_anthropic_third_party_extra_usage_gate(self):
-        """The production OAuth wording must mark the credential exhausted.
+        """A third-party billing-policy notice is not quota exhaustion.
 
-        Without this phrase the error fell through as format_error, so a queued
-        Opus follow-up retried the same depleted route instead of making the
-        pool preflight available to bounded visual fallbacks.
+        This wording can accompany a successful subscription-backed Opus turn
+        when a redundant follow-up request is attempted. Rotating or exhausting
+        the credential pool would turn a gateway sequencing bug into a false
+        account-wide outage.
         """
         e = MockAPIError(
             "Third-party apps now draw from your extra usage, not your plan limits. "
@@ -1506,10 +1507,10 @@ class TestAdversarialEdgeCases:
 
         result = classify_api_error(e, provider="anthropic")
 
-        assert result.reason == FailoverReason.billing
+        assert result.reason == FailoverReason.format_error
         assert result.should_fallback is True
         assert result.retryable is False
-        assert result.should_rotate_credential is True
+        assert result.should_rotate_credential is False
 
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""

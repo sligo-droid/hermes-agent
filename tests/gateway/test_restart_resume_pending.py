@@ -1133,6 +1133,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True
+    assert event.metadata == {"gateway_startup_resume": True}
     assert event.message_type == MessageType.TEXT
     assert event.source == source
     assert "Continue the turn" in event.text

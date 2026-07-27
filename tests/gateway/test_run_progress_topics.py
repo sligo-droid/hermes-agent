@@ -783,6 +783,8 @@ async def _run_with_agent(
     *,
     session_id,
     pending_text=None,
+    pending_internal=False,
+    pending_metadata=None,
     config_data=None,
     platform=Platform.TELEGRAM,
     chat_id="-1001",
@@ -825,6 +827,8 @@ async def _run_with_agent(
             message_type=MessageType.TEXT,
             source=source,
             message_id="queued-1",
+            internal=pending_internal,
+            metadata=dict(pending_metadata or {}),
         )
 
     result = await runner._run_agent(
@@ -1131,6 +1135,34 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
     assert "final response 1" in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_run_agent_drops_redundant_startup_resume_after_success(monkeypatch, tmp_path):
+    """A timed-out restart marker must not replay after the original turn wins.
+
+    Production sequence: Opus completed and delivered its answer, then the
+    queued synthetic restart note launched a needless second Opus request that
+    emitted an HTTP 400 beside the valid response.
+    """
+    QueuedCommentaryAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-redundant-startup-resume",
+        pending_text=(
+            "Continue the turn that was interrupted by the gateway restart. "
+            "Use the existing transcript/tool results and report what was completed."
+        ),
+        pending_internal=True,
+        pending_metadata={"gateway_startup_resume": True},
+        config_data={"display": {"interim_assistant_messages": True}},
+    )
+
+    assert QueuedCommentaryAgent.calls == 1
+    assert result["final_response"] == "final response 1"
+    assert "final response 2" not in [call["content"] for call in adapter.sent]
 
 
 @pytest.mark.asyncio

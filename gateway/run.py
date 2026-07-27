@@ -1024,6 +1024,7 @@ def _format_long_running_status_detail(activity: Dict[str, Any]) -> str:
 # is still classified fresh.  Override via
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+_STARTUP_RESUME_EVENT_METADATA_KEY = "gateway_startup_resume"
 
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
@@ -4136,6 +4137,36 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _is_startup_resume_event(event: Any) -> bool:
+    """Return whether ``event`` is the synthetic restart-recovery turn."""
+
+    if event is None or not getattr(event, "internal", False):
+        return False
+    metadata = getattr(event, "metadata", None)
+    return bool(
+        isinstance(metadata, dict)
+        and metadata.get(_STARTUP_RESUME_EVENT_METADATA_KEY) is True
+    )
+
+
+def _redundant_startup_resume_after_success(
+    event: Any,
+    agent_result: dict,
+) -> bool:
+    """Drop a queued restart replay when the supposedly interrupted turn won.
+
+    A planned gateway restart can time out while an executor-backed model turn
+    keeps running. The new startup recovery event then lands in the adapter's
+    pending slot. If the original turn subsequently completes successfully,
+    replaying the synthetic recovery note creates a second provider call and a
+    second user-visible result even though no work remains to recover.
+    """
+
+    return _is_startup_resume_event(event) and _should_clear_resume_pending_after_turn(
+        agent_result
+    )
 
 
 def _preserve_queued_followup_history_offset(
@@ -8703,6 +8734,7 @@ class _GatewayRunnerCore(
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                metadata={_STARTUP_RESUME_EVENT_METADATA_KEY: True},
             )
             if source.platform == Platform.DISCORD:
                 self._hydrate_discord_resume_event_from_work_item(
@@ -32111,6 +32143,8 @@ class _GatewayRunnerCore(
                 return False
             if getattr(consumer, "final_response_sent", False):
                 return True
+            if getattr(consumer, "final_content_delivered", False):
+                return True
             if previewed:
                 has_delivered_text = getattr(consumer, "has_delivered_text", None)
                 if callable(has_delivered_text):
@@ -32449,6 +32483,23 @@ class _GatewayRunnerCore(
                             pending = None
                     except Exception:
                         pass
+
+            if _redundant_startup_resume_after_success(pending_event, result):
+                logger.info(
+                    "Discarding queued startup resume for session %s: original turn completed successfully.",
+                    session_key or "?",
+                )
+                pending_event = None
+                pending = None
+                if session_key:
+                    try:
+                        await self.async_session_store.clear_resume_pending(session_key)
+                    except Exception:
+                        logger.debug(
+                            "clear_resume_pending failed while dropping redundant startup resume for %s",
+                            session_key,
+                            exc_info=True,
+                        )
 
             if self._draining and (pending_event or pending):
                 if pending_event is not None:
@@ -37629,6 +37680,8 @@ class _GatewayRunnerCore(
                     return False
                 if getattr(consumer, "final_response_sent", False):
                     return True
+                if getattr(consumer, "final_content_delivered", False):
+                    return True
                 if previewed:
                     has_delivered_text = getattr(consumer, "has_delivered_text", None)
                     if callable(has_delivered_text):
@@ -37982,6 +38035,23 @@ class _GatewayRunnerCore(
                                 pending = None
                         except Exception:
                             pass
+
+                if _redundant_startup_resume_after_success(pending_event, result):
+                    logger.info(
+                        "Discarding queued startup resume for session %s: original turn completed successfully.",
+                        session_key or "?",
+                    )
+                    pending_event = None
+                    pending = None
+                    if session_key:
+                        try:
+                            await self.async_session_store.clear_resume_pending(session_key)
+                        except Exception:
+                            logger.debug(
+                                "clear_resume_pending failed while dropping redundant startup resume for %s",
+                                session_key,
+                                exc_info=True,
+                            )
 
                 if self._draining and (pending_event or pending):
                     if pending_event is not None:

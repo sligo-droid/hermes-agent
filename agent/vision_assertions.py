@@ -117,12 +117,16 @@ def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str
         fallback_reason = _anthropic_budget_preflight_error()
     except Exception:
         fallback_reason = ""
-    tier_name = "visual_inspector_fallback" if fallback_reason else "visual_inspector"
+    tier_name = "visual_sweep" if fallback_reason else "visual_inspector"
     tier = resolve_model_tier(cfg, tier_name)
     if tier is None or not tier.provider:
         raise RuntimeError(f"{tier_name} model tier is unavailable")
+    # Opus preflight failures fall back through the already-configured main
+    # provider route. In Sligo deployments that is CLIProxyAPI's OpenAI
+    # subscription; do not invent an external aggregator dependency here.
+    requested_provider = None if fallback_reason else tier.provider
     runtime = resolve_runtime_provider(
-        requested=tier.provider,
+        requested=requested_provider,
         target_model=tier.model,
     )
     return {
@@ -132,7 +136,7 @@ def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str
         "api_key": str(runtime.get("api_key") or ""),
         "api_mode": str(runtime.get("api_mode") or ""),
         "fallback_used": bool(fallback_reason),
-        "fallback_reason": "opus_budget_exhausted" if fallback_reason else "",
+        "fallback_reason": "opus_preflight_unavailable" if fallback_reason else "",
     }
 
 
