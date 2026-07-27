@@ -130,6 +130,10 @@ _WORKFLOW_LOOKUP_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 _BROWSER_RE = re.compile(r"\b(browser|playwright|chromium|chrome|modal)\b", re.IGNORECASE)
+_AUTHENTICATED_QA_COMMAND_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?qa:auth\b",
+    re.IGNORECASE,
+)
 _BROWSER_AUTH_BOUNDARY_RE = re.compile(
     r'''(?:"title"\s*:\s*"[^"\n]*\b(?:sign[ -]?in|log[ -]?in|login)\b)|'''
     r"(?:<title>[^<\n]*\b(?:sign[ -]?in|log[ -]?in|login)\b)|"
@@ -211,6 +215,87 @@ def _json_object(value: Any) -> dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _last_embedded_json_object(value: Any) -> dict[str, Any]:
+    """Return the last JSON object embedded in bounded command output."""
+    text = str(value or "")
+    decoder = json.JSONDecoder()
+    found: dict[str, Any] = {}
+    found_span = 0
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            candidate, end = decoder.raw_decode(text[index:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(candidate, dict) and end > found_span:
+            found = candidate
+            found_span = end
+    return found
+
+
+def _authenticated_qa_evidence(
+    command: str,
+    output: str,
+    *,
+    is_error: bool,
+    order: int | None,
+) -> list[dict[str, Any]]:
+    """Classify repository-native authenticated browser QA output."""
+    if not _AUTHENTICATED_QA_COMMAND_RE.search(command):
+        return []
+    payload = _last_embedded_json_object(output)
+    base_url = str(payload.get("baseUrl") or "").strip()
+    routes = payload.get("routes") if isinstance(payload.get("routes"), list) else []
+    paths = payload.get("paths") if isinstance(payload.get("paths"), list) else []
+    if not base_url or not routes:
+        return []
+    route_count = payload.get("routeCount")
+    try:
+        route_count_ok = int(route_count) == len(routes) and len(routes) > 0
+    except (TypeError, ValueError):
+        route_count_ok = False
+    routes_ok = all(
+        isinstance(item, dict)
+        and str(item.get("path") or "").startswith("/")
+        and str(item.get("finalPath") or "").startswith("/")
+        for item in routes
+    )
+    success = bool(
+        not is_error
+        and payload.get("ok") is True
+        and route_count_ok
+        and routes_ok
+        and int(payload.get("consoleErrorCount") or 0) == 0
+        and int(payload.get("pageErrorCount") or 0) == 0
+    )
+    detail = json.dumps(
+        {
+            "ok": payload.get("ok") is True,
+            "baseUrl": base_url,
+            "paths": [str(path)[:120] for path in paths[:8]],
+            "routeCount": len(routes),
+            "consoleErrorCount": payload.get("consoleErrorCount"),
+            "pageErrorCount": payload.get("pageErrorCount"),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    check_name = _text(f"qa:auth {base_url}", limit=160)
+    return [
+        {
+            "schema_version": 1,
+            "surface": surface,
+            "check_name": check_name,
+            "status": "success" if success else "failure",
+            "order": int(order or 0),
+            "detail": detail[:240],
+        }
+        for surface in _surfaces_for("browser_authenticated_qa", base_url, detail)
+    ]
 
 
 def _text(value: Any, limit: int = 500) -> str:
@@ -657,7 +742,8 @@ def classify_tool_verification_evidence(
     name = str(tool_name or "")
     args = tool_args if isinstance(tool_args, dict) else {}
     data = _json_object(result)
-    result_text = _text(data.get("output") or data.get("error") or result)
+    full_result_text = str(data.get("output") or data.get("error") or result or "")
+    result_text = _text(full_result_text)
     raw_check_name = str(args.get("command") or args.get("url") or args.get("route") or name)
     check_name = _text(raw_check_name, limit=160)
 
@@ -665,6 +751,14 @@ def classify_tool_verification_evidence(
         return []
 
     if name == "terminal":
+        authenticated_qa = _authenticated_qa_evidence(
+            raw_check_name,
+            full_result_text,
+            is_error=is_error,
+            order=order,
+        )
+        if authenticated_qa:
+            return authenticated_qa
         # Inspect the complete command. Compound closeout commands often put
         # formatting, staging, or synchronization before the actual tests, so
         # the verification segment may begin after the bounded display label.
