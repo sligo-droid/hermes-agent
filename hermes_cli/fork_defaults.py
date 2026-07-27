@@ -347,7 +347,10 @@ FORK_DEFAULT_ADDITIONS = {
                 "review feedback",
             ],
         },
-        "route_delegate_task": False,
+        # Explicit visual implementation work gets one read-only Opus design
+        # consultation before the normal Codex/OpenCode coding worker. Set
+        # false to keep detection advisory-only.
+        "route_delegate_task": True,
     },
     "skills": {"index": {"workers": "focus", "debug": False}},
     "worktrees": {

@@ -6,6 +6,34 @@ from run_agent import AIAgent
 from tools import coding_worker_tool as cwt
 
 
+def test_dispatch_delegate_task_forwards_visual_purpose(monkeypatch):
+    from tools import delegate_tool as dt
+
+    captured = {}
+
+    def fake_delegate_task(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"results": []})
+
+    monkeypatch.setattr(dt, "delegate_task", fake_delegate_task)
+    agent = object.__new__(AIAgent)
+    agent._runtime_mode = "action"
+    agent._coding_worker_required_this_turn = False
+
+    result = agent._dispatch_delegate_task(
+        {
+            "goal": "Review the visual direction",
+            "purpose": "visual_advisor",
+            "read_only": True,
+        }
+    )
+
+    assert json.loads(result) == {"results": []}
+    assert captured["purpose"] == "visual_advisor"
+    assert captured["read_only"] is True
+    assert captured["parent_agent"] is agent
+
+
 def test_dispatch_coding_task_forwards_route_decision(monkeypatch):
     captured = {}
 

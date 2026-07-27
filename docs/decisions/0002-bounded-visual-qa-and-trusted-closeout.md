@@ -25,6 +25,14 @@ Adopt two related, bounded mechanisms.
 - Persist only a sanitized, prose-free receipt containing opaque requirement/contract/assertion identifiers, status, bounded counters, order, and allowlisted diagnostic codes.
 - An enforced gate passes only on the latest fresh `passed` receipt matching the trusted requirement. Missing, failed, blocked, uncertain, malformed, stale, or timed-out evidence never satisfies the gate.
 
+### Visual design advisor
+
+- The same conservative explicit-visual classifier may select a bounded hybrid implementation route. Before the normal Codex/OpenCode coding worker starts, Hermes runs one read-only Claude Opus 5 design consultation and injects its bounded guidance into the worker brief.
+- Opus is the design director and rendered-result reviewer, not the mutation engine. The ordinary coding worker retains repository edits, focused verification, worktree isolation, recovery, and git/PR lifecycle boundaries.
+- Rendered QA keeps the cheap Luna evidence sweep, then uses one Opus appearance-judgement call. Failed or uncertain appearance assertions may return one bounded implementation-oriented correction to the active orchestrator; this transient correction is not copied into the durable receipt.
+- Advisor or Opus-review unavailability is conspicuous and fail-open for implementation, but it never becomes passing QA evidence. When the Anthropic pool already reports Opus extra-usage exhaustion, the rendered review selects the configured OpenRouter Sonnet fallback before the provider call rather than retrying the exhausted route. Enforced visual closeout still requires the existing host-produced receipt.
+- Operators can disable the pre-implementation consultation with `ui_work.route_delegate_task: false`, and an explicit `default_coding_worker` route remains a per-task opt-out.
+
 ### Trusted closeout
 
 - Persist closeout state on the exact gateway work item. In `enforce` mode that state is authoritative for lifecycle completion; the model or legacy finalizer must not independently claim completion.
@@ -63,6 +71,7 @@ Both mechanisms are non-enforcing by default.
 Positive:
 
 - Visual evidence is faster and cheaper without turning screenshots or browser state into an unbounded durable record.
+- Premium visual-model spend is concentrated on design judgement and one rendered review while mechanical implementation remains on the normal coding worker.
 - CI, merge, canonical sync, and post-merge ownership survive gateway restarts without foreground polling or model replay.
 - A newer PR head or mismatched post-merge SHA fails closed instead of inheriting stale success.
 

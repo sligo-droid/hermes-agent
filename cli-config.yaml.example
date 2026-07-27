@@ -1171,6 +1171,15 @@ code_execution:
   timeout: 300         # Max seconds per script before kill (default: 300 = 5 min)
   max_tool_calls: 50   # Max RPC tool calls per execution (default: 50)
 
+# Explicit rendered-UI implementation is routed through one read-only Opus
+# design consultation before the normal coding worker. The bounded visual-QA
+# screenshot inspector also uses Opus after the cheap evidence sweep. Disable
+# route_delegate_task to keep visual detection advisory-only and skip the
+# pre-implementation premium call.
+# ui_work:
+#   enabled: true
+#   route_delegate_task: true
+
 # =============================================================================
 # Subagent Delegation
 # =============================================================================

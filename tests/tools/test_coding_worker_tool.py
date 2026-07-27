@@ -25,6 +25,9 @@ from tools import coding_worker_tool as cwt
 from tools.process_registry import process_registry
 
 
+_REAL_UI_VISUAL_ADVISOR = cwt._run_ui_visual_advisor
+
+
 class FakeSession:
     instances = []
     results = []
@@ -70,6 +73,11 @@ def _default_codex_backend(monkeypatch, tmp_path):
     codex_home = tmp_path / "default-codex-home"
     codex_home.mkdir(exist_ok=True)
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        cwt,
+        "_run_ui_visual_advisor",
+        lambda **kwargs: ("", {"advisor_invoked": False}),
+    )
 
 
 def _parent(tmp_path, api_mode="chat_completions"):
@@ -1658,6 +1666,176 @@ def test_ui_specialist_route_uses_normal_codex_backend_and_skills(monkeypatch, t
             "model_tier": None,
         },
     ]
+
+
+def test_automatic_visual_route_injects_opus_advisor_guidance(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    calls = []
+
+    def fake_advisor(**kwargs):
+        calls.append(kwargs)
+        return (
+            "Use a strong information hierarchy, restrained color, and compact responsive spacing.",
+            {
+                "advisor_invoked": True,
+                "advisor_status": "completed",
+                "advisor_model": "claude-opus-5",
+                "advisor_cached": False,
+            },
+        )
+
+    monkeypatch.setattr(cwt, "_run_ui_visual_advisor", fake_advisor)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Polish the responsive dashboard card spacing and typography.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 1
+    assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
+    assert result["ui_work_route"]["route_decision_source"] == "deterministic_explicit_visual"
+    assert result["ui_work_route"]["advisor_model"] == "claude-opus-5"
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Opus visual advisor guidance" in prompt
+    assert "strong information hierarchy" in prompt
+
+
+def test_ui_visual_advisor_helper_caches_same_turn_result(monkeypatch, tmp_path):
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    parent = _parent(tmp_path)
+    parent._current_turn_id = "turn-visual-1"
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.opus_planner._anthropic_budget_preflight_error",
+        lambda: "",
+    )
+
+    def fake_delegate_task(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "results": [
+                    {
+                        "status": "completed",
+                        "summary": "Keep the layout calm and align controls to one grid.",
+                        "model": "claude-opus-5",
+                        "handoff": {"handoff_id": "handoff_visual_1"},
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", fake_delegate_task)
+    route = SimpleNamespace(
+        selected_route="ui_visual_specialist",
+        launch_worker=True,
+    )
+    args = dict(
+        loaded_config=cfg,
+        ui_route=route,
+        task="Polish responsive dashboard spacing.",
+        context="Keep existing components.",
+        workdir=str(tmp_path),
+        relevant_files=[{"path": "src/App.tsx", "note": "dashboard"}],
+        approach="Reuse the grid.",
+        constraints="Do not change APIs.",
+        parent_agent=parent,
+    )
+
+    first_guidance, first_metadata = _REAL_UI_VISUAL_ADVISOR(**args)
+    second_guidance, second_metadata = _REAL_UI_VISUAL_ADVISOR(**args)
+
+    assert len(calls) == 1
+    assert calls[0]["purpose"] == "visual_advisor"
+    assert calls[0]["read_only"] is True
+    assert first_guidance == second_guidance
+    assert first_metadata["advisor_status"] == "completed"
+    assert second_metadata["advisor_cached"] is True
+
+
+def test_ui_visual_advisor_failure_is_fail_open(monkeypatch, tmp_path):
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    parent = _parent(tmp_path)
+    monkeypatch.setattr(
+        "hermes_cli.opus_planner._anthropic_budget_preflight_error",
+        lambda: "",
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool.delegate_task",
+        lambda **kwargs: json.dumps(
+            {
+                "results": [
+                    {
+                        "status": "failed",
+                        "exit_reason": "provider_failure",
+                        "model": "claude-opus-5",
+                    }
+                ]
+            }
+        ),
+    )
+
+    guidance, metadata = _REAL_UI_VISUAL_ADVISOR(
+        loaded_config=cfg,
+        ui_route=SimpleNamespace(
+            selected_route="ui_visual_specialist",
+            launch_worker=True,
+        ),
+        task="Polish responsive dashboard spacing.",
+        context="",
+        workdir=str(tmp_path),
+        relevant_files=None,
+        approach=None,
+        constraints=None,
+        parent_agent=parent,
+    )
+
+    assert guidance == ""
+    assert metadata["advisor_invoked"] is True
+    assert metadata["advisor_status"] == "failed"
+    assert metadata["advisor_failure_class"] == "provider_failure"
+
+
+def test_ui_visual_advisor_skips_known_opus_budget_exhaustion(monkeypatch, tmp_path):
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    parent = _parent(tmp_path)
+    monkeypatch.setattr(
+        "hermes_cli.opus_planner._anthropic_budget_preflight_error",
+        lambda: "Opus extra usage exhausted",
+    )
+    delegate = MagicMock()
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", delegate)
+
+    guidance, metadata = _REAL_UI_VISUAL_ADVISOR(
+        loaded_config=cfg,
+        ui_route=SimpleNamespace(
+            selected_route="ui_visual_specialist",
+            launch_worker=True,
+        ),
+        task="Polish responsive dashboard spacing.",
+        context="",
+        workdir=str(tmp_path),
+        relevant_files=None,
+        approach=None,
+        constraints=None,
+        parent_agent=parent,
+    )
+
+    assert guidance == ""
+    assert metadata["advisor_status"] == "skipped"
+    assert metadata["advisor_failure_class"] == "opus_budget_exhausted"
+    delegate.assert_not_called()
 
 
 def test_ui_specialist_route_uses_normal_opencode_backend(monkeypatch, tmp_path):

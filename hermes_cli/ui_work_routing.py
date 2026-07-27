@@ -497,6 +497,25 @@ def resolve_ui_work_route(
         )
 
     if requested.route == _DEFAULT_ROUTE:
+        if (
+            requested.source == "deterministic_default"
+            and enabled
+            and bool(ui_cfg.get("route_delegate_task", False))
+            and advisory_matched
+        ):
+            automatic_fields = {
+                **base_fields,
+                "route_decision": _UI_SPECIALIST_ROUTE,
+                "route_decision_source": "deterministic_explicit_visual",
+                "route_decision_rationale": advisory_reason,
+            }
+            return UIWorkRouteDecision(
+                matched=True,
+                enabled=True,
+                reason="explicit visual UI work selected the Opus advisor route",
+                selected_route=_UI_SPECIALIST_ROUTE,
+                **automatic_fields,
+            )
         reason = (
             "orchestrator route selected default coding worker"
             if requested.source != "deterministic_default"

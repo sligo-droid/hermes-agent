@@ -1374,6 +1374,7 @@ def _build_child_agent(
     read_only: bool = False,
     allow_nested_coding: bool = False,
     runtime_audit_context: Optional[Dict[str, Any]] = None,
+    inherit_fallback: bool = True,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1627,7 +1628,11 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        getattr(parent_agent, "_fallback_chain", None) or None
+        if inherit_fallback
+        else None
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -3443,6 +3448,10 @@ def delegate_task(
                     "runtime_pass": "selected" if resolved_tier is not None else "inherited",
                     "reasoning_source": reasoning_source,
                 },
+                # Explicit visual purposes designate an exact runtime. Do not
+                # silently turn an Opus/Luna/Sonnet visual stage into a parent
+                # fallback model while retaining the visual-purpose label.
+                inherit_fallback=not bool(t.get("purpose")),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -4238,8 +4247,9 @@ def _build_top_level_description() -> str:
         "straightforward bounded work, intermediate for ordinary multi-step "
         "work, and advanced only for the hardest cross-cutting or high-risk "
         "work. Omit model_tier to inherit your runtime model and reasoning.\n"
-        "- For visual QA, use the explicit purpose field instead of guessing a "
-        "tier from task wording: visual_sweep for one browser/navigation evidence "
+        "- For visual work, use the explicit purpose field instead of guessing a "
+        "tier from task wording: visual_advisor for one read-only pre-implementation "
+        "design consultation, visual_sweep for one browser/navigation evidence "
         "pass, visual_inspector for bounded screenshot judgement over collected "
         "evidence, and visual_critique for at most one final aesthetic critique. "
         "Run the sweep before judgement passes; do not fan out duplicate browser "
@@ -4436,7 +4446,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "purpose": {
                             "type": "string",
-                            "enum": ["visual_sweep", "visual_inspector", "visual_critique"],
+                            "enum": ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
                             "description": (
                                 "Explicit visual-workflow purpose. Selects the matching "
                                 "visual model tier automatically without task-text inference."
@@ -4480,10 +4490,11 @@ DELEGATE_TASK_SCHEMA = {
             },
             "purpose": {
                 "type": "string",
-                "enum": ["visual_sweep", "visual_inspector", "visual_critique"],
+                "enum": ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
                 "description": (
                     "Explicit visual-workflow purpose for a single task or batch default. "
-                    "Selects the matching visual tier automatically. Use one visual_sweep "
+                    "Selects the matching visual tier automatically. Use visual_advisor "
+                    "once before explicit visual implementation, one visual_sweep "
                     "before evidence-only inspector passes and at most one visual_critique."
                 ),
             },

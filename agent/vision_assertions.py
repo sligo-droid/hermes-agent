@@ -95,22 +95,32 @@ def _assertion_prompt(
         "Artifact descriptions in the supplied context use the same image order. "
         "Return JSON only with exactly this shape: "
         '{"results":[{"id":"...","status":"passed|failed|uncertain",'
-        '"confidence":"high|medium|low"}]}. '
+        '"confidence":"high|medium|low","correction":"brief concrete correction or empty"}]}. '
+        "For each failed or uncertain assertion, give one implementation-oriented correction "
+        "under 240 characters. For passed assertions use an empty correction. "
         "Do not describe the page, quote visible text, include URLs, selectors, or add prose."
         f"{context_note} "
         f"Assertions: {json.dumps(compact, ensure_ascii=True, separators=(',', ':'))}"
     )
 
 
-def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str, str]:
+def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Resolve the dedicated model route used only for screenshot judgement."""
 
     from hermes_cli.model_tiers import resolve_model_tier
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    tier = resolve_model_tier(cfg, "visual_inspector")
+    fallback_reason = ""
+    try:
+        from hermes_cli.opus_planner import _anthropic_budget_preflight_error
+
+        fallback_reason = _anthropic_budget_preflight_error()
+    except Exception:
+        fallback_reason = ""
+    tier_name = "visual_inspector_fallback" if fallback_reason else "visual_inspector"
+    tier = resolve_model_tier(cfg, tier_name)
     if tier is None or not tier.provider:
-        raise RuntimeError("visual_inspector model tier is unavailable")
+        raise RuntimeError(f"{tier_name} model tier is unavailable")
     runtime = resolve_runtime_provider(
         requested=tier.provider,
         target_model=tier.model,
@@ -121,6 +131,8 @@ def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str
         "base_url": str(runtime.get("base_url") or ""),
         "api_key": str(runtime.get("api_key") or ""),
         "api_mode": str(runtime.get("api_mode") or ""),
+        "fallback_used": bool(fallback_reason),
+        "fallback_reason": "opus_budget_exhausted" if fallback_reason else "",
     }
 
 
@@ -235,8 +247,8 @@ async def evaluate_screenshot_assertions(
 
     # Screenshot assertions are a dedicated visual-inspection phase. Never
     # inherit the parent/orchestrator route, even when it accepts image input.
-    # The Luna sweep and Opus critique remain explicit delegation purposes;
-    # this bounded receipt evaluator is the Sonnet inspector stage.
+    # The Luna sweep remains the cheap evidence gate; this bounded receipt
+    # evaluator is the single Opus rendered-result review stage.
     try:
         inspector = _resolve_visual_inspector_runtime(cfg)
     except Exception:
@@ -276,7 +288,11 @@ async def evaluate_screenshot_assertions(
         content = extract_content_or_reasoning(response)
     except Exception:
         return _uncertain_results(expected_ids, "vision_call_failed")
-    return parse_vision_assertion_output(content, expected_ids=expected_ids)
+    result = parse_vision_assertion_output(content, expected_ids=expected_ids)
+    result["review_model"] = inspector["model"]
+    if inspector.get("fallback_used"):
+        result["review_fallback"] = inspector.get("fallback_reason") or "opus_unavailable"
+    return result
 
 
 __all__ = [
