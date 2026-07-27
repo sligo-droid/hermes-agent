@@ -169,6 +169,21 @@ _UNSAFE_VERIFY_SHELL_RE = re.compile(r"\|\||(?<!&)&(?!&)|(?<!\|)\|(?!\|)|[<>`]|\
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _GIT_OPTION_ARGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
 _NON_VERIFY_GIT_PATHSPEC_COMMANDS = {"add", "rm", "mv", "restore", "checkout", "reset"}
+_READ_ONLY_INSPECTION_COMMANDS = {
+    "awk",
+    "cat",
+    "echo",
+    "find",
+    "grep",
+    "head",
+    "ls",
+    "printf",
+    "rg",
+    "sed",
+    "stat",
+    "tail",
+    "wc",
+}
 
 _CLAIM_WORD_RE = re.compile(r"\b(shipped|verified|visible|checked|confirmed|passed|deployed|merged)\b", re.IGNORECASE)
 _NEGATED_CLAIM_RE = re.compile(r"\b(?:not|isn['’]?t|failed|failure|blocked|unverified|not_verified)\b", re.IGNORECASE)
@@ -267,6 +282,29 @@ def _is_non_verification_git_pathspec_segment(segment: str) -> bool:
     if index >= len(parts):
         return False
     return parts[index] in _NON_VERIFY_GIT_PATHSPEC_COMMANDS
+
+
+def _is_read_only_inspection_segment(segment: str) -> bool:
+    """Return True when a shell segment only displays or searches content.
+
+    Verification-looking words in filenames (for example
+    ``authenticated-qa-smoke.mjs``) must not turn ``sed``/``grep`` source
+    inspection into pass/fail evidence. Actual execution of that same script
+    remains verification because its executable is ``node``, not an inspector.
+    """
+
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        parts = segment.split()
+    if not parts:
+        return False
+    index = 0
+    while index < len(parts) and _ENV_ASSIGNMENT_RE.fullmatch(parts[index]):
+        index += 1
+    if index >= len(parts):
+        return False
+    return Path(parts[index]).name in _READ_ONLY_INSPECTION_COMMANDS
 
 
 def _clean_token(token: str) -> str:
@@ -591,7 +629,11 @@ def classify_verification_command(
 def _terminal_command_looks_like_verification(command: str) -> bool:
     for segment in _SHELL_SEGMENT_RE.split(command):
         segment = segment.strip()
-        if not segment or _is_non_verification_git_pathspec_segment(segment):
+        if (
+            not segment
+            or _is_non_verification_git_pathspec_segment(segment)
+            or _is_read_only_inspection_segment(segment)
+        ):
             continue
         if _VERIFY_COMMAND_RE.search(segment):
             return True

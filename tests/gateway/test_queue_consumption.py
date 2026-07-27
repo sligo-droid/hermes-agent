@@ -430,6 +430,22 @@ class TestBusyInputModeQueueFifo:
         # The last accepted overflow item is msg-{cap-1}.
         assert runner._queued_events[session_key][-1].text == f"msg-{cap - 1:03d}"
 
+    def test_duplicate_work_replay_is_queued_only_once(self):
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:replay"
+        first = self._text_event("recovered work")
+        first.work_item_id = "work-123"
+        first.work_replay = True
+        duplicate = self._text_event("recovered work")
+        duplicate.work_item_id = "work-123"
+        duplicate.work_replay = True
+
+        assert runner._queue_or_replace_pending_event(session_key, first) is True
+        assert runner._queue_or_replace_pending_event(session_key, duplicate) is False
+
+        assert runner._queue_depth(session_key, adapter=adapter) == 1
+        assert adapter._pending_messages[session_key] is first
+
     def test_photo_burst_still_merges_in_head_slot(self):
         """Photo bursts must keep album-merge semantics, not split into N turns."""
         runner, adapter = self._make_runner_and_adapter()

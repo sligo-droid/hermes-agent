@@ -494,6 +494,28 @@ class TestBusySessionAck:
         assert "Steered" not in content
 
     @pytest.mark.asyncio
+    async def test_work_replay_queues_silently_when_session_is_busy(self):
+        """Recovery control traffic must not emit a second user queue bubble."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        event = _make_event(text="recovered request")
+        event.work_replay = True
+        event.work_item_id = "work-replay-1"
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=False)
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        assert adapter._pending_messages[sk] is event
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_steer_mode_folds_into_claimed_turn_when_agent_pending(
         self,
         monkeypatch,
