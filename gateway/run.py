@@ -5447,6 +5447,36 @@ class _GatewayRunnerCore(
         else:
             pending_slot[session_key] = queued_event
 
+    @staticmethod
+    def _queued_event_identity(event: Any) -> tuple[str, str] | None:
+        """Return a durable identity only for replay-safe deduplication."""
+
+        if not getattr(event, "work_replay", False):
+            return None
+        work_id = str(getattr(event, "work_item_id", "") or "").strip()
+        if work_id:
+            return ("work_item", work_id)
+        message_id = str(getattr(event, "message_id", "") or "").strip()
+        if message_id:
+            return ("discord_message", message_id)
+        return None
+
+    def _queued_event_already_present(
+        self,
+        session_key: str,
+        event: "MessageEvent",
+        adapter: Any,
+    ) -> bool:
+        identity = self._queued_event_identity(event)
+        if identity is None:
+            return False
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        head = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if self._queued_event_identity(head) == identity:
+            return True
+        overflow = (getattr(self, "_queued_events", None) or {}).get(session_key, [])
+        return any(self._queued_event_identity(candidate) == identity for candidate in overflow)
+
     def _prepend_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Put an event back at the head without disturbing later FIFO order."""
         if adapter is None:
@@ -6267,10 +6297,17 @@ class _GatewayRunnerCore(
         except Exception:
             return False
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
+        if self._queued_event_already_present(session_key, event, adapter):
+            logger.info(
+                "Suppressing duplicate queued replay for session %s identity=%s",
+                session_key,
+                self._queued_event_identity(event),
+            )
+            return False
         # Text follow-ups are distinct user turns. Keep photo/media bursts
         # mergeable, but otherwise append through the bounded FIFO used by
         # /queue so rapid messages cannot overwrite the single adapter slot.
@@ -6288,7 +6325,7 @@ class _GatewayRunnerCore(
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -6296,9 +6333,10 @@ class _GatewayRunnerCore(
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     def _start_user_followup_lock(self):
         """Return the lazy lock used by bare-runner-safe startup guidance."""
@@ -6788,6 +6826,16 @@ class _GatewayRunnerCore(
             return None
         if getattr(event.source, "platform", None) != Platform.DISCORD:
             return None
+        # A slash command that arrives while this session is already running
+        # is handled immediately by the busy-command path (usually with a
+        # "wait or /stop" response). It never launches an agent turn, so
+        # accepting it into the durable work ledger would leave an orphaned
+        # claimed item that startup recovery later replays as duplicate work.
+        if (
+            getattr(event, "message_type", None) is MessageType.COMMAND
+            and session_key in getattr(self, "_running_agents", {})
+        ):
+            return None
         if _discord_runtime_mode_for(event) is not RuntimeMode.ACTION:
             return None
         if not getattr(event, "participates_in_work_lifecycle", True):
@@ -6951,6 +6999,13 @@ class _GatewayRunnerCore(
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+
+            if getattr(event, "work_replay", False):
+                logger.info(
+                    "Suppressing busy acknowledgement for Discord work replay %s during drain",
+                    getattr(event, "work_item_id", "") or getattr(event, "message_id", ""),
+                )
+                return True
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -7147,6 +7202,13 @@ class _GatewayRunnerCore(
         # configurable status acknowledgements.
         if effective_mode == "interrupt":
             logger.debug("Busy interrupt ack suppressed for session %s", session_key)
+            return True
+
+        if getattr(event, "work_replay", False):
+            logger.info(
+                "Suppressing busy acknowledgement for Discord work replay %s",
+                getattr(event, "work_item_id", "") or getattr(event, "message_id", ""),
+            )
             return True
 
         # Check if busy ack is disabled — skip sending but still process the input.
@@ -16912,6 +16974,12 @@ class _GatewayRunnerCore(
                 if self._queue_during_drain_enabled():
                     self._record_discord_work_for_drain(event, _quick_key)
                     self._queue_or_replace_pending_event(_quick_key, event)
+                if getattr(event, "work_replay", False):
+                    logger.info(
+                        "Suppressing priority busy acknowledgement for Discord work replay %s during drain",
+                        getattr(event, "work_item_id", "") or getattr(event, "message_id", ""),
+                    )
+                    return None
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if self._queue_during_drain_enabled()
@@ -16937,6 +17005,12 @@ class _GatewayRunnerCore(
                         return "⏩ Steered into the current run; it will apply at the next safe boundary."
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
+                if getattr(event, "work_replay", False):
+                    logger.info(
+                        "Suppressing priority busy acknowledgement for Discord work replay %s",
+                        getattr(event, "work_item_id", "") or getattr(event, "message_id", ""),
+                    )
+                    return None
                 return "⏳ Queued for the immediate next turn — live steering was unavailable."
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt

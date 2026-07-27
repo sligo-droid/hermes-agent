@@ -908,6 +908,33 @@ def test_verify_path_name_alone_is_not_verification_evidence():
     assert agent._turn_runtime_stats.get("verification_evidence", []) == []
 
 
+def test_read_only_source_inspection_of_smoke_script_is_not_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": "async function loginIfNeeded(page) {",
+            "exit_code": 124,
+            "error": "Command timed out after 30 seconds",
+        }
+    )
+    command = (
+        "sed -n '370,400p' dashboard/scripts/authenticated-qa-smoke.mjs; "
+        "echo '=== signIn ==='; "
+        "grep -n 'async function signIn' -A 30 dashboard/scripts/authenticated-qa-smoke.mjs"
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 30.0, result, True)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": command},
+        result,
+        True,
+    )
+
+    assert agent._turn_runtime_stats.get("verification_evidence", []) == []
+
+
 def test_git_add_smoke_pathspec_failure_is_not_verification_evidence():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     result = json.dumps(

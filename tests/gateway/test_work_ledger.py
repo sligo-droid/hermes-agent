@@ -58,6 +58,20 @@ def _repo_discord_event(message_id="m1", text="do the work"):
     return event
 
 
+def test_busy_discord_command_is_not_accepted_into_durable_work_ledger(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(message_id="busy-opus", text="/opus continue")
+    event.message_type = MessageType.COMMAND
+    session_key = build_session_key(event.source)
+    runner._running_agents = {session_key: object()}
+
+    accepted = runner._accept_discord_work_item(event, session_key)
+
+    assert accepted is None
+    assert runner.work_ledger.incomplete_items() == []
+
+
 def _visual_receipt(requirement, *, order=3, status="passed", evidence_ref=""):
     normalized = normalize_visual_requirement(requirement)
     assertion_ids = [
