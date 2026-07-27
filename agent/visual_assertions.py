@@ -259,10 +259,11 @@ def _normalize_contract_artifacts(
                 return []
         elif kind == "focused" and isinstance(target.get("locator"), dict):
             locator = target["locator"]
-        if kind == "focused" and locator is None:
-            return []
-        if kind == "context" and locator is not None:
-            return []
+        # The public tool schema permits a locator on any artifact.  A context
+        # capture may intentionally scope to a surrounding region, and a focused
+        # capture without a locator can still use the contract target or current
+        # viewport.  Keep those safe forms executable instead of rejecting the
+        # entire receipt contract.
 
         artifact_viewport = viewport
         if raw.get("viewport") is not None:
@@ -361,9 +362,22 @@ def normalize_orchestrated_visual_contract(
     for index, raw_value in enumerate(raw_assertions):
         raw_assertion = raw_value if isinstance(raw_value, dict) else {}
         kind = str(raw_assertion.get("kind") or "").strip().lower()
-        if set(raw_assertion) - _assertion_allowed_fields(kind):
-            return {}
         candidate = dict(raw_assertion)
+        # Locators on page-wide text and appearance checks are harmless but not
+        # consumed by their executors; the target/artifact contract owns capture
+        # scope.  The tool schema exposes locator uniformly, so discard it here
+        # rather than turning a safe model-authored contract into an opaque
+        # invalid_visual_contract failure.
+        if kind in {"text_present", "screenshot_appearance"}:
+            candidate.pop("locator", None)
+        if kind == "text_present":
+            candidate.setdefault("policy", "literal_request_text")
+        elif kind == "screenshot_appearance":
+            # Models sometimes attach the literal-request policy to an
+            # appearance assertion.  It carries no execution authority here.
+            candidate.pop("policy", None)
+        if set(candidate) - _assertion_allowed_fields(kind):
+            return {}
         candidate["id"] = "contract-slot"
         validated = validate_visual_assertions([candidate], max_assertions=1)
         if len(validated) != 1:

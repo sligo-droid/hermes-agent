@@ -826,12 +826,8 @@ def _run_ui_visual_advisor(
 ) -> tuple[str, dict[str, Any]]:
     """Run one cached read-only Opus design consultation for visual work."""
 
-    ui_cfg = loaded_config.get("ui_work") if isinstance(loaded_config, dict) else {}
-    if not isinstance(ui_cfg, dict):
-        ui_cfg = {}
     if not (
-        bool(ui_cfg.get("route_delegate_task", False))
-        and ui_route is not None
+        ui_route is not None
         and getattr(ui_route, "selected_route", "") == "ui_visual_specialist"
         and getattr(ui_route, "launch_worker", True)
     ):
