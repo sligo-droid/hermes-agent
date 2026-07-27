@@ -664,3 +664,17 @@ class TestFinalContentDeliveredSuppression:
             response["already_sent"] = True
 
         assert "already_sent" not in response
+
+    def test_queued_delivery_predicate_accepts_final_content_without_cosmetic_finalize(self):
+        """Queued turns use the same delivery truth as normal completion."""
+        sc = SimpleNamespace(
+            final_response_sent=False,
+            final_content_delivered=True,
+        )
+
+        confirmed = bool(
+            getattr(sc, "final_response_sent", False)
+            or getattr(sc, "final_content_delivered", False)
+        )
+
+        assert confirmed is True

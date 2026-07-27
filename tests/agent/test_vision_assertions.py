@@ -12,7 +12,7 @@ from agent.vision_assertions import (
 )
 
 
-def test_visual_inspector_preflights_opus_budget_and_selects_sonnet(monkeypatch):
+def test_visual_inspector_preflight_falls_back_through_configured_main_route(monkeypatch):
     seen = {}
 
     monkeypatch.setattr(
@@ -23,11 +23,11 @@ def test_visual_inspector_preflights_opus_budget_and_selects_sonnet(monkeypatch)
     def fake_runtime_provider(*, requested, target_model, **kwargs):
         seen.update(requested=requested, target_model=target_model)
         return {
-            "provider": requested,
+            "provider": "cli-proxy-api",
             "model": target_model,
-            "base_url": "https://api.anthropic.com",
-            "api_key": "test-oauth-token",
-            "api_mode": "anthropic_messages",
+            "base_url": "http://proxy.example/v1",
+            "api_key": "proxy-token",
+            "api_mode": "codex_responses",
         }
 
     monkeypatch.setattr(
@@ -38,12 +38,13 @@ def test_visual_inspector_preflights_opus_budget_and_selects_sonnet(monkeypatch)
     runtime = _resolve_visual_inspector_runtime({})
 
     assert seen == {
-        "requested": "openrouter",
-        "target_model": "anthropic/claude-sonnet-5",
+        "requested": None,
+        "target_model": "gpt-5.6-luna",
     }
-    assert runtime["model"] == "anthropic/claude-sonnet-5"
+    assert runtime["provider"] == "cli-proxy-api"
+    assert runtime["model"] == "gpt-5.6-luna"
     assert runtime["fallback_used"] is True
-    assert runtime["fallback_reason"] == "opus_budget_exhausted"
+    assert runtime["fallback_reason"] == "opus_preflight_unavailable"
 
 
 def test_parse_compact_vision_assertion_output():

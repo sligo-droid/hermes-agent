@@ -68,14 +68,6 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "opencode_model": "anthropic/claude-opus-5",
         "reasoning_effort": "medium",
     },
-    # Budget-safe rendered review fallback. Select this before the provider
-    # call when the Anthropic pool already reports Opus extra-usage exhaustion.
-    "visual_inspector_fallback": {
-        "provider": "openrouter",
-        "model": "anthropic/claude-sonnet-5",
-        "opencode_model": "anthropic/claude-sonnet-5",
-        "reasoning_effort": "medium",
-    },
     # Unbounded aesthetic critique over already-collected evidence. The
     # strongest available judgement model is worth one call — this is the slot
     # that should replace fanned-out premium workers.
