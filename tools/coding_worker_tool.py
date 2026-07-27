@@ -1125,6 +1125,7 @@ def _git_changed_paths(workdir: str) -> list[str]:
 def _scope_check(workdir: str, scope_paths: list[str]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "scope_paths": list(scope_paths),
+        "changed_files": [],
         "out_of_scope_files": [],
         "clean": False,
     }
@@ -1141,6 +1142,7 @@ def _scope_check(workdir: str, scope_paths: list[str]) -> dict[str, Any]:
         )
 
     out_of_scope = [path for path in changed if not in_scope(path)]
+    result["changed_files"] = changed
     result["out_of_scope_files"] = out_of_scope
     result["clean"] = not out_of_scope
     return result

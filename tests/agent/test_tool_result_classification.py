@@ -1,12 +1,19 @@
 """Tests for shared tool result classification helpers."""
 
 import json
+from types import SimpleNamespace
 
 from agent.tool_result_classification import (
+    coding_worker_mutation_paths,
     file_mutation_result_landed,
 )
 from agent.display import _detect_tool_failure
-from agent.tool_executor import _process_closeout_receipt
+from agent.tool_executor import (
+    _process_closeout_receipt,
+    _record_coding_worker_mutation_paths,
+    _record_visual_qa_edit_order,
+)
+from agent.visual_qa import classify_visual_requirement
 
 
 def test_write_file_with_nested_lint_error_counts_as_landed():
@@ -32,6 +39,63 @@ def test_top_level_file_mutation_error_does_not_count_as_landed():
     result = json.dumps({"success": True, "error": "post-write verification failed"})
 
     assert file_mutation_result_landed("patch", result) is False
+
+
+def test_coding_worker_host_scope_evidence_counts_as_landed_mutation():
+    result = json.dumps(
+        {
+            "success": True,
+            "scope_check": {
+                "scope_paths": ["dashboard"],
+                "changed_files": ["dashboard/src/App.svelte"],
+                "out_of_scope_files": [],
+                "clean": True,
+            },
+        }
+    )
+
+    assert coding_worker_mutation_paths(result) == ["dashboard/src/App.svelte"]
+    assert file_mutation_result_landed("delegate_coding_task", result) is True
+
+
+def test_coding_worker_mutation_promotes_parent_visual_gate_and_order():
+    result = json.dumps(
+        {
+            "success": True,
+            "scope_check": {
+                "scope_paths": ["dashboard"],
+                "changed_files": ["dashboard/src/App.svelte"],
+                "out_of_scope_files": [],
+                "clean": True,
+            },
+        }
+    )
+    agent = SimpleNamespace(
+        _turn_file_mutation_paths=set(),
+        _turn_runtime_stats={"tool_calls": 3},
+        _turn_mutation_generation=0,
+        _turn_mutation_boundary=0,
+        _runtime_mode="action",
+        _current_task_id="worker-visual-mutation",
+        visual_qa_config={"mode": "enforce_explicit"},
+        visual_qa_requirement=classify_visual_requirement(
+            "Implement a responsive dashboard visual.",
+            worker_route="action",
+        ),
+    )
+
+    _record_coding_worker_mutation_paths(agent, "delegate_coding_task", result)
+    _record_visual_qa_edit_order(
+        agent,
+        "delegate_coding_task",
+        result,
+        task_id="worker-visual-mutation",
+    )
+
+    assert agent._turn_file_mutation_paths == {"dashboard/src/App.svelte"}
+    assert agent.visual_qa_requirement["level"] == "surface"
+    assert agent._turn_mutation_generation == 1
+    assert agent._turn_mutation_boundary == 4
 
 
 def test_side_effect_classification_keeps_session_mutations():
