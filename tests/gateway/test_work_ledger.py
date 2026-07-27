@@ -160,6 +160,60 @@ def test_ledger_deduplicates_discord_message_ids(tmp_path):
     assert len(ledger.incomplete_items()) == 1
 
 
+def test_visual_requirement_uses_reply_and_goal_thread_context(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="contextual", text="Please proceed with that.")
+    event.reply_to_text = "Let's repair the local district maps."
+    event.goal_thread_context = "Use a nonpartisan color scheme on the dashboard."
+
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+
+    assert item is not None
+    assert item["visual_qa_requirement"]["level"] == "surface"
+
+
+def test_post_edit_visual_promotion_tightens_closeout_policy(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="promote", text="Implement the requested behavior.")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    assert item["visual_qa_requirement"]["level"] == "none"
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        repository="acme/example",
+        branch="feature/rendered-fallback",
+        source="direct",
+        mode="enforce",
+        policy={
+            "merge": "auto",
+            "require_local_verification": True,
+            "require_visual_qa": False,
+        },
+    )
+    assert attached is not None
+    promoted = classify_visual_requirement(
+        "Fix the local district maps.",
+        worker_route="action",
+    )
+
+    stored = ledger.promote_visual_qa_requirement(item["id"], promoted)
+
+    assert stored is not None
+    assert stored["visual_qa_requirement"]["level"] == "surface"
+    assert stored["closeout"]["policy"]["require_visual_qa"] is True
+    assert stored["closeout"]["visual_qa"] == {"status": "pending"}
+
+
 def test_ledger_persists_effective_and_base_prompts_for_read_only_recovery(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="intent-message")
@@ -419,6 +473,8 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert "mode=enforce_explicit" in prompt
     assert "call `visual_qa`" in prompt
     assert "you own the transient semantic contract" in prompt
+    assert "use `browser_authenticate`" in prompt
+    assert "never type or inspect credentials" in prompt
     assert "smallest relevant target/region" in prompt
     assert "bounded inspector—not your prose—decides pass/fail" in prompt
     assert "attach receipt arguments" in prompt
@@ -441,6 +497,7 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert state == {
         "receipts": [_visual_receipt(requirement, order=3)],
         "code_mutation_observed": True,
+        "requirement": requirement,
         "min_receipt_order": 3,
     }
     assert "private/workspace" not in str(state)

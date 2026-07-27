@@ -76,7 +76,17 @@ _ARTIFACT_RE = re.compile(
 )
 _SURFACE_RE = re.compile(
     r"\b(?:ui|user interface|layout|responsive|viewport|mobile|desktop|toolbar|"
-    r"sidebar|modal|dialog|control|button|chart|map|dashboard|page|screen|overflow)\b",
+    r"sidebars?|modals?|dialogs?|controls?|buttons?|charts?|maps?|dashboards?|pages?|screens?|overflow)\b",
+    re.IGNORECASE,
+)
+_RENDERED_PATH_RE = re.compile(
+    r"(?:^|/)(?!tests?(?:/|$)|docs?(?:/|$)|fixtures?(?:/|$)|snapshots?(?:/|$))"
+    r"[^/]+\.(?:svelte|tsx|jsx|vue|html?|css|scss|sass|less|svg)$",
+    re.IGNORECASE,
+)
+_NON_RENDERED_PATH_RE = re.compile(
+    r"(?:^|/)(?:[^/]+\.)?(?:test|spec|stories?)\.[^/]+$|"
+    r"(?:^|/)(?:tests?|docs?|fixtures?|snapshots?)(?:/|$)",
     re.IGNORECASE,
 )
 _RECEIPT_ID_RE = re.compile(r"^(?:vrq|vac)_[0-9a-f]{24}$")
@@ -361,6 +371,57 @@ def classify_visual_requirement(
     )
 
 
+def promote_visual_requirement_for_mutations(
+    requirement: Any,
+    changed_paths: Iterable[Any] | None,
+    *,
+    actionable: bool,
+) -> dict[str, Any]:
+    """Fail closed when an action turn edits an obvious rendered surface.
+
+    Intake remains the primary applicability gate. This bounded fallback only
+    promotes an otherwise-unclassified action after Hermes has observed a
+    mutation to a rendered component or stylesheet; paths alone never create a
+    requirement for read-only/review turns.
+    """
+
+    normalized = normalize_visual_requirement(requirement)
+    if normalized["level"] != "none" or not actionable:
+        return normalized
+    rendered_paths = sorted(
+        {
+            str(path).strip().replace("\\", "/")
+            for path in changed_paths or []
+            if str(path).strip()
+            and not _NON_RENDERED_PATH_RE.search(str(path).strip().replace("\\", "/"))
+            and _RENDERED_PATH_RE.search(str(path).strip().replace("\\", "/"))
+        }
+    )
+    if not rendered_paths:
+        return normalized
+    fingerprint = "\n".join(rendered_paths[:32])
+    target = _opaque_requirement_value(
+        f"surface:post-edit-rendered-path:{fingerprint}",
+        "vtarget",
+    )
+    coverage_id = _opaque_requirement_value(
+        f"surface:orchestrator_contract:post-edit-rendered-path:{fingerprint}",
+        "vassert",
+    )
+    return normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": target,
+            "assertions": [
+                {
+                    "id": coverage_id,
+                    "kind": "orchestrator_contract",
+                }
+            ],
+        }
+    )
+
+
 def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, Any] | None:
     """Validate one prose-free, assertion-driven durable receipt.
 
@@ -539,6 +600,7 @@ __all__ = [
     "get_active_visual_requirement",
     "normalize_visual_qa_config",
     "normalize_visual_requirement",
+    "promote_visual_requirement_for_mutations",
     "sanitize_visual_receipt",
     "set_active_visual_requirement",
     "visual_receipt_completion",

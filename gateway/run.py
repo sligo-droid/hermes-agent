@@ -374,7 +374,9 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         contract_instruction = (
             "Using the full accepted request/thread plus the code you inspect, you own the "
             "transient semantic contract. After the relevant edit and after preparing the existing "
-            "browser session, call `visual_qa` with: the smallest relevant target/region (and a "
+            "browser session, use `browser_authenticate` if a protected login page is visible and "
+            "an operator profile is configured; never type or inspect credentials yourself. Then "
+            "call `visual_qa` with: the smallest relevant target/region (and a "
             "safe locator when available), the intended or already-open page state, applicable "
             "viewport and state assumptions, and concrete assertions for every requested visual "
             "outcome. Include at least one `screenshot_appearance` assertion. Request up to four "
@@ -412,7 +414,11 @@ def _visual_qa_turn_result(
 ) -> dict[str, Any]:
     """Extract bounded post-turn receipt evidence without exposing changed paths."""
 
-    normalized_requirement, config = _normalize_gateway_visual_qa_contract(requirement, None)
+    effective_requirement = getattr(agent, "visual_qa_requirement", requirement)
+    normalized_requirement, config = _normalize_gateway_visual_qa_contract(
+        effective_requirement,
+        None,
+    )
     receipts: list[dict[str, Any]] = []
     try:
         from agent.verification_evidence import visual_receipts_from_runtime_breakdown
@@ -432,6 +438,7 @@ def _visual_qa_turn_result(
     result: dict[str, Any] = {
         "receipts": receipts,
         "code_mutation_observed": mutation_observed,
+        "requirement": normalized_requirement,
     }
     if mutation_observed:
         try:
@@ -19529,6 +19536,23 @@ class _GatewayRunnerCore(
                 and not _pending_background_workers
             ):
                 try:
+                    visual_turn = (
+                        agent_result.get("visual_qa")
+                        if isinstance(agent_result.get("visual_qa"), dict)
+                        else {}
+                    )
+                    promoted_requirement = visual_turn.get("requirement")
+                    if isinstance(promoted_requirement, dict):
+                        promoted_item = await asyncio.to_thread(
+                            self._ledger().promote_visual_qa_requirement,
+                            str(work_item_id),
+                            promoted_requirement,
+                            expected_run_state=work_item_expected_run_state,
+                        )
+                        if isinstance(promoted_item, dict):
+                            event.visual_qa_requirement = promoted_item.get(
+                                "visual_qa_requirement"
+                            )
                     await asyncio.to_thread(
                         self._activate_direct_closeout_after_checkpoint,
                         str(work_item_id),
@@ -19577,6 +19601,11 @@ class _GatewayRunnerCore(
                         project_summary=getattr(event, "project_summary", None),
                         runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
                         provider_no_progress=agent_result.get("provider_no_progress") if isinstance(agent_result, dict) else None,
+                        visual_qa_requirement=(
+                            agent_result.get("visual_qa", {}).get("requirement")
+                            if isinstance(agent_result.get("visual_qa"), dict)
+                            else None
+                        ),
                         visual_qa_receipts=(
                             agent_result.get("visual_qa", {}).get("receipts")
                             if isinstance(agent_result.get("visual_qa"), dict)

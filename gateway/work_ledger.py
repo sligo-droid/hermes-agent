@@ -405,6 +405,8 @@ def _visual_qa_requirement_for_event(event: Any) -> dict[str, Any]:
     request_text = merge_request_fragments(
         getattr(event, "text", ""),
         feature_summary.get("initial_request") if isinstance(feature_summary, dict) else "",
+        getattr(event, "reply_to_text", ""),
+        getattr(event, "goal_thread_context", ""),
     )
     return classify_visual_requirement(
         request_text,
@@ -440,6 +442,31 @@ def _visual_qa_state_for_item(item: dict[str, Any]) -> tuple[dict[str, Any], dic
     config = normalize_visual_qa_config(item.get("visual_qa_config"))
     requirement = normalize_visual_requirement(item.get("visual_qa_requirement"))
     return config, requirement
+
+
+def _promote_visual_qa_requirement_in_item(
+    item: dict[str, Any],
+    requirement: Any,
+) -> bool:
+    """Promote only a prior ``none`` requirement and tighten closeout policy."""
+
+    current = normalize_visual_requirement(item.get("visual_qa_requirement"))
+    promoted = normalize_visual_requirement(requirement)
+    if current["level"] != "none" or promoted["level"] == "none":
+        return False
+    item["visual_qa_requirement"] = promoted
+    item["visual_qa_receipts"] = []
+    config = normalize_visual_qa_config(item.get("visual_qa_config"))
+    closeout = item.get("closeout")
+    if isinstance(closeout, dict) and config["mode"] == "enforce_explicit":
+        policy = closeout.get("policy")
+        if not isinstance(policy, dict):
+            policy = {}
+            closeout["policy"] = policy
+        policy["require_visual_qa"] = True
+        closeout["visual_qa"] = {"status": "pending"}
+        closeout["revision"] = max(0, _positive_int(closeout.get("revision"))) + 1
+    return True
 
 
 def _durable_runtime_breakdown(
@@ -4813,6 +4840,26 @@ class GatewayWorkLedger:
         return dict(item)
 
     @_locked_ledger_mutation
+    def promote_visual_qa_requirement(
+        self,
+        work_id: str,
+        requirement: Any,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> dict[str, Any] | None:
+        """Persist a host-owned post-edit promotion before closeout activates."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
+            return None
+        if not _promote_visual_qa_requirement_in_item(item, requirement):
+            return dict(item)
+        item["updated_at"] = self._now()
+        self._write(data)
+        return dict(item)
+
+    @_locked_ledger_mutation
     def mark_agent_done(
         self,
         work_id: str,
@@ -4825,6 +4872,7 @@ class GatewayWorkLedger:
         project_summary: dict[str, Any] | None = None,
         runtime_breakdown: dict[str, Any] | None = None,
         provider_no_progress: dict[str, Any] | None = None,
+        visual_qa_requirement: dict[str, Any] | None = None,
         visual_qa_receipts: list[dict[str, Any]] | None = None,
         visual_qa_code_mutation_observed: bool | None = None,
         visual_qa_min_receipt_order: int | None = None,
@@ -4855,6 +4903,8 @@ class GatewayWorkLedger:
             item["feature_summary"] = _durable_metadata(feature_summary)
         if project_summary is not None:
             item["project_summary"] = _durable_metadata(project_summary)
+        if visual_qa_requirement is not None:
+            _promote_visual_qa_requirement_in_item(item, visual_qa_requirement)
         visual_config, visual_requirement = _visual_qa_state_for_item(item)
         if runtime_breakdown is not None:
             item["runtime_breakdown"] = _durable_runtime_breakdown(

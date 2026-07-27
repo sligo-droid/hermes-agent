@@ -3,6 +3,7 @@ from agent.visual_qa import (
     classify_visual_requirement,
     normalize_visual_qa_config,
     normalize_visual_requirement,
+    promote_visual_requirement_for_mutations,
     sanitize_visual_receipt,
     visual_receipt_completion,
     visual_requirement_id,
@@ -75,6 +76,38 @@ def test_classifier_recognizes_direct_visual_defects_and_desired_state_requests(
     assert incident["assertions"][0]["kind"] == "orchestrator_contract"
     assert defect_only["level"] == "surface"
     assert desired_state["level"] == "surface"
+
+
+def test_classifier_recognizes_plural_map_implementation_incident():
+    requirement = classify_visual_requirement(
+        "Let's repair this in the local district maps. Also, let's choose a "
+        "non-blue, non-red color scheme.",
+        worker_route="action",
+    )
+
+    assert requirement["level"] == "surface"
+    assert requirement["assertions"][0]["kind"] == "orchestrator_contract"
+
+
+def test_rendered_mutation_fallback_promotes_only_action_turns():
+    promoted = promote_visual_requirement_for_mutations(
+        {"level": "none"},
+        ["dashboard/src/lib/StateDistrictMap.svelte"],
+        actionable=True,
+    )
+
+    assert promoted["level"] == "surface"
+    assert promoted["assertions"][0]["kind"] == "orchestrator_contract"
+    assert promote_visual_requirement_for_mutations(
+        {"level": "none"},
+        ["dashboard/src/lib/StateDistrictMap.svelte"],
+        actionable=False,
+    )["level"] == "none"
+    assert promote_visual_requirement_for_mutations(
+        {"level": "none"},
+        ["dashboard/src/lib/StateDistrictMap.test.ts", "docs/maps.md"],
+        actionable=True,
+    )["level"] == "none"
 
 
 def test_classifier_keeps_visual_defect_review_only_requests_non_actionable():

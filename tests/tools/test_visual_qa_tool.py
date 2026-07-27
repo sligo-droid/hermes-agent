@@ -35,6 +35,11 @@ def test_visual_qa_is_in_stable_direct_action_toolsets():
 
     assert "visual_qa" in _HERMES_CORE_TOOLS
     assert "visual_qa" in TOOLSETS["browser"]["tools"]
+    assert "browser_authenticate" in _HERMES_CORE_TOOLS
+    assert "browser_authenticate" in TOOLSETS["browser"]["tools"]
+    assert "browser_authenticate" in TOOLSETS["coding"]["tools"]
+    assert "browser_authenticate" in TOOLSETS["hermes-acp"]["tools"]
+    assert "browser_authenticate" in TOOLSETS["hermes-api-server"]["tools"]
 
 
 def test_visual_qa_schema_has_no_arbitrary_execution_or_protected_inputs():

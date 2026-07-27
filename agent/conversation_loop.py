@@ -6133,6 +6133,8 @@ def run_conversation(
                     )
                     from agent.visual_qa import (
                         normalize_visual_qa_config,
+                        promote_visual_requirement_for_mutations,
+                        set_active_visual_requirement,
                     )
 
                     verify_setting = getattr(agent, "verify_on_stop", None)
@@ -6149,8 +6151,23 @@ def run_conversation(
                     # but must not withhold a response.  Enforcement remains
                     # restricted to explicitly classified visual work.
                     if visual_config["mode"] == "enforce_explicit":
+                        promoted_requirement = promote_visual_requirement_for_mutations(
+                            getattr(agent, "visual_qa_requirement", None),
+                            getattr(agent, "_turn_file_mutation_paths", set()),
+                            actionable=(
+                                str(getattr(agent, "_runtime_mode", "") or "")
+                                .strip()
+                                .lower()
+                                == "action"
+                            ),
+                        )
+                        agent.visual_qa_requirement = promoted_requirement
+                        set_active_visual_requirement(promoted_requirement)
+                        agent._turn_runtime_stats["visual_qa_level"] = (
+                            promoted_requirement["level"]
+                        )
                         visual_nudge = build_visual_qa_stop_nudge(
-                            requirement=getattr(agent, "visual_qa_requirement", None),
+                            requirement=promoted_requirement,
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             receipts=getattr(agent, "_turn_runtime_stats", {}).get("visual_qa_receipts", []),
                             attempts=getattr(agent, "_visual_qa_followup_turns", 0),

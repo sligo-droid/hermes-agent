@@ -181,6 +181,28 @@ class TestRecordFileMutationResult:
 
         assert agent._turn_file_mutation_paths == {"/tmp/project/a.py"}
 
+    def test_rendered_action_mutation_promotes_visual_requirement_immediately(self):
+        agent = _bare_agent()
+        agent.visual_qa_requirement = {"level": "none"}
+        agent.visual_qa_config = {"mode": "enforce_explicit"}
+        agent._runtime_mode = "action"
+        agent._turn_runtime_stats = {"visual_qa_level": "none"}
+
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": "dashboard/src/App.svelte", "content": "<main />"},
+            json.dumps(
+                {
+                    "bytes_written": 8,
+                    "files_modified": ["/tmp/project/dashboard/src/App.svelte"],
+                }
+            ),
+            is_error=False,
+        )
+
+        assert agent.visual_qa_requirement["level"] == "surface"
+        assert agent._turn_runtime_stats["visual_qa_level"] == "surface"
+
     def test_landed_paths_prefer_resolved_tool_result(self):
         paths = _extract_landed_file_mutation_paths(
             "patch",
