@@ -628,6 +628,154 @@ class CDPSupervisor:
 
         return {"ok": True, "result": value, "result_type": result_type}
 
+    def current_origin(self, *, timeout: float = 10.0) -> Dict[str, Any]:
+        """Return only the active page origin for trusted host-side routing."""
+
+        result = self.evaluate_runtime("location.origin", timeout=timeout)
+        origin = result.get("result") if result.get("ok") else None
+        if not isinstance(origin, str) or not origin:
+            return {"ok": False, "error": "current browser origin is unavailable"}
+        return {"ok": True, "origin": origin}
+
+    def authenticate_form(
+        self,
+        *,
+        username: str,
+        password: str,
+        username_selector: str,
+        password_selector: str,
+        submit_selector: str,
+        success_selector: str,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Fill one trusted login form without exposing credentials to tools.
+
+        Secrets travel only as CDP call arguments over the supervisor's private
+        WebSocket. They never appear in JavaScript source, subprocess arguments,
+        tool output, diagnostics, or durable browser state owned by Hermes.
+        """
+
+        timeout = max(1.0, min(float(timeout or 30.0), 30.0))
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "browser supervisor is unavailable"}
+        with self._state_lock:
+            if not self._active or not self._page_session_id:
+                return {"ok": False, "error": "browser supervisor has no active page"}
+            session_id = self._page_session_id
+
+        success_expression = (
+            "(() => Boolean(document.querySelector("
+            + json.dumps(success_selector, ensure_ascii=True)
+            + ")))()"
+        )
+        readiness_deadline = time.monotonic() + min(timeout, 10.0)
+        while time.monotonic() < readiness_deadline:
+            ready = self.evaluate_runtime(
+                "document.readyState === 'complete'",
+                timeout=min(timeout, 3.0),
+            )
+            if ready.get("ok") and ready.get("result") is True:
+                break
+            time.sleep(0.1)
+        # Framework hydration can finish just after the browser load event.
+        # Match the protected QA smoke's bounded settle before submitting.
+        time.sleep(min(0.5, timeout / 2))
+        already = self.evaluate_runtime(success_expression, timeout=min(timeout, 5.0))
+        if already.get("ok") and already.get("result") is True:
+            return {"ok": True, "authenticated": True, "already_authenticated": True}
+
+        async def _submit() -> Dict[str, Any]:
+            root = await self._cdp(
+                "Runtime.evaluate",
+                {"expression": "globalThis", "returnByValue": False},
+                session_id=session_id,
+                timeout=min(timeout, 10.0),
+            )
+            root_result = root.get("result", {}).get("result", {})
+            object_id = root_result.get("objectId")
+            if not object_id:
+                return {"ok": False, "error": "browser login context is unavailable"}
+
+            async def _focus(selector: str) -> bool:
+                response = await self._cdp(
+                    "Runtime.callFunctionOn",
+                    {
+                        "objectId": object_id,
+                        "functionDeclaration": """function(selector) {
+                          const element = document.querySelector(selector);
+                          if (!element) return false;
+                          element.focus();
+                          if (typeof element.select === 'function') element.select();
+                          return true;
+                        }""",
+                        "arguments": [{"value": selector}],
+                        "returnByValue": True,
+                        "userGesture": True,
+                    },
+                    session_id=session_id,
+                    timeout=min(timeout, 10.0),
+                )
+                return response.get("result", {}).get("result", {}).get("value") is True
+
+            if not await _focus(username_selector):
+                return {"ok": False, "error": "browser login form was not available"}
+            await self._cdp(
+                "Input.insertText",
+                {"text": username},
+                session_id=session_id,
+                timeout=min(timeout, 10.0),
+            )
+            if not await _focus(password_selector):
+                return {"ok": False, "error": "browser login form was not available"}
+            await self._cdp(
+                "Input.insertText",
+                {"text": password},
+                session_id=session_id,
+                timeout=min(timeout, 10.0),
+            )
+            response = await self._cdp(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """function(selector) {
+                      const submit = document.querySelector(selector);
+                      if (!submit) return false;
+                      if (submit.form && typeof submit.form.requestSubmit === 'function') submit.form.requestSubmit(submit);
+                      else submit.click();
+                      return true;
+                    }""",
+                    "arguments": [{"value": submit_selector}],
+                    "returnByValue": True,
+                    "userGesture": True,
+                },
+                session_id=session_id,
+                timeout=min(timeout, 10.0),
+            )
+            if response.get("result", {}).get("result", {}).get("value") is not True:
+                return {"ok": False, "error": "browser login form submission failed"}
+            return {"ok": True}
+
+        from agent.async_utils import safe_schedule_threadsafe
+
+        try:
+            future = safe_schedule_threadsafe(_submit(), loop)
+            if future is None:
+                return {"ok": False, "error": "browser supervisor is unavailable"}
+            submitted = future.result(timeout=min(timeout, 10.0) + 1.0)
+        except Exception:
+            return {"ok": False, "error": "browser login form submission failed"}
+        if not submitted.get("ok"):
+            return submitted
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            visible = self.evaluate_runtime(success_expression, timeout=min(3.0, timeout))
+            if visible.get("ok") and visible.get("result") is True:
+                return {"ok": True, "authenticated": True, "already_authenticated": False}
+            time.sleep(0.25)
+        return {"ok": False, "error": "browser login did not reach the authenticated page"}
+
     def _diagnostic_cursor_token(self, sequence: int) -> str:
         payload = str(max(0, int(sequence))).encode("ascii")
         digest = hmac.new(

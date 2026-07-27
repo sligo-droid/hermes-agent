@@ -3360,14 +3360,86 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         response = _copy_fallback_warning(response, result)
         response = redact_browser_typed_text_for_display(response, text)
         return json.dumps(response, ensure_ascii=False)
-    else:
-        response = {
-            "success": False,
-            "error": result.get("error", f"Failed to type into {ref}")
-        }
-        response = _copy_fallback_warning(response, result)
-        response = redact_browser_typed_text_for_display(response, text)
-        return json.dumps(response, ensure_ascii=False)
+    response = {
+        "success": False,
+        "error": result.get("error", f"Failed to type into {ref}"),
+    }
+    response = _copy_fallback_warning(response, result)
+    response = redact_browser_typed_text_for_display(response, text)
+    return json.dumps(response, ensure_ascii=False)
+
+
+def check_browser_auth_requirements() -> bool:
+    if not check_browser_requirements():
+        return False
+    try:
+        from tools.browser_auth_profiles import configured_browser_auth_profile_names
+
+        return bool(configured_browser_auth_profile_names())
+    except Exception:
+        return False
+
+
+def browser_authenticate(
+    profile: str = "",
+    task_id: Optional[str] = None,
+) -> str:
+    """Authenticate the existing task browser through a protected profile."""
+
+    if _is_camofox_mode():
+        return json.dumps(
+            {"success": False, "error": "Protected browser authentication is unavailable on this backend."}
+        )
+    effective_task_id = _last_session_key(task_id or "default")
+    _ensure_cdp_supervisor(effective_task_id)
+    try:
+        from tools.browser_auth_profiles import (
+            BrowserAuthProfileError,
+            load_browser_auth_credentials,
+            select_browser_auth_profile,
+        )
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
+        if supervisor is None:
+            return json.dumps(
+                {"success": False, "error": "The task browser does not support protected authentication."}
+            )
+        current = supervisor.current_origin()
+        if not current.get("ok"):
+            return json.dumps({"success": False, "error": current.get("error")})
+        selected = select_browser_auth_profile(
+            str(current.get("origin") or ""),
+            requested_name=profile,
+        )
+        username, password = load_browser_auth_credentials(selected)
+        result = supervisor.authenticate_form(
+            username=username,
+            password=password,
+            username_selector=selected.username_selector,
+            password_selector=selected.password_selector,
+            submit_selector=selected.submit_selector,
+            success_selector=selected.success_selector,
+            timeout=selected.timeout_s,
+        )
+        username = password = ""
+        if not result.get("ok"):
+            return json.dumps({"success": False, "error": result.get("error")})
+        return json.dumps(
+            {
+                "success": True,
+                "authenticated": True,
+                "profile": selected.name,
+                "already_authenticated": result.get("already_authenticated") is True,
+            }
+        )
+    except BrowserAuthProfileError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    except Exception:
+        logger.exception("Protected browser authentication failed")
+        return json.dumps(
+            {"success": False, "error": "Protected browser authentication failed safely."}
+        )
 
 
 def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
@@ -5162,6 +5234,39 @@ registry.register(
     handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
+    effect="mutating",
+)
+registry.register(
+    name="browser_authenticate",
+    toolset="browser",
+    schema={
+        "name": "browser_authenticate",
+        "description": (
+            "Authenticate the current task browser with an operator-configured, "
+            "origin-bound read-only QA profile. Navigate to the protected login page "
+            "first, then call this tool before visual_qa. Credentials, cookies, tokens, "
+            "and storage state are never exposed to the model or tool output. Omit "
+            "profile when exactly one configured profile matches the current origin."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "profile": {
+                    "type": "string",
+                    "description": "Optional opaque configured profile name.",
+                    "maxLength": 64,
+                }
+            },
+            "required": [],
+        },
+    },
+    handler=lambda args, **kw: browser_authenticate(
+        profile=args.get("profile", ""),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_auth_requirements,
+    emoji="🔐",
     effect="mutating",
 )
 registry.register(

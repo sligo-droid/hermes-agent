@@ -1331,6 +1331,12 @@ DEFAULT_CONFIG = {
         # website/docs/developer-guide/browser-supervisor.md.
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
+        # Optional operator-owned, secret-safe browser login profiles. Profiles
+        # name an env file under $HERMES_HOME/secrets plus exact origins and
+        # form selectors. The browser_authenticate tool injects credentials
+        # directly over the private CDP supervisor and never exposes values to
+        # the model, subprocess arguments, tool output, or durable state.
+        "auth_profiles": {},
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox
             # so the server maps it to a persistent Firefox profile automatically.

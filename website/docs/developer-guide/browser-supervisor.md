@@ -94,6 +94,42 @@ Policy is per-task; no per-dialog overrides.
 
 ## Agent surface
 
+### Protected QA authentication
+
+`browser_authenticate` prepares the existing task browser for protected visual
+QA without exposing credentials to the agent. The operator configures an
+opaque profile under `browser.auth_profiles`; after navigating to the login
+page, the agent calls the tool with no profile name when exactly one profile
+matches the current origin.
+
+```yaml
+browser:
+  auth_profiles:
+    pid_hermes_qa:
+      origins:
+        - https://pid.sligolabs.com
+        - http://127.0.0.1:5173
+      env_file: pid-qa-readonly.env
+      username_env: PID_QA_USERNAME
+      password_env: PID_QA_PASSWORD
+      username_selector: "#login-user"
+      password_selector: "#login-pass"
+      submit_selector: '#login-overlay button[type="submit"]'
+      success_selector: "#header"
+```
+
+Relative credential paths resolve beneath `$HERMES_HOME/secrets`. The file
+must be a regular file owned by the Hermes user with no group or world access.
+The tool verifies the page's exact origin before loading the credential pair,
+then sends values as private `Runtime.callFunctionOn` arguments over the
+supervisor WebSocket. Values never appear in JavaScript source, subprocess
+arguments, model-visible tool calls/results, screenshots, logs, or durable
+state. The tool is mutating and therefore unavailable during read-only turns.
+
+The profile should use a dedicated least-privilege account such as
+`hermes_qa`; application-specific role checks remain the responsibility of the
+target application's authenticated QA flow.
+
 ### `browser_dialog` tool
 
 ```
@@ -174,10 +210,11 @@ expiry, while the supervisor's long-lived connection keeps a valid session.
 ## File layout
 
 - `tools/browser_supervisor.py` — `CDPSupervisor`, `SupervisorRegistry`, `PendingDialog`, `FrameInfo`
+- `tools/browser_auth_profiles.py` — origin/profile validation and protected env-file loading
 - `tools/browser_dialog_tool.py` — `browser_dialog` tool handler
-- `tools/browser_tool.py` — `browser_navigate` start-hook, `browser_snapshot` merge, `/browser connect` reattach, `_cleanup_browser_session` teardown
+- `tools/browser_tool.py` — navigation/session handlers plus the `browser_authenticate` profile bridge
 - `toolsets.py` — registers `browser_dialog` in `browser`, `hermes-acp`, `hermes-api-server`, and core toolsets (gated on CDP reachability)
-- `hermes_cli/config.py` — `browser.dialog_policy` and `browser.dialog_timeout_s` defaults
+- `hermes_cli/config.py` — browser supervisor and `browser.auth_profiles` defaults
 
 ## Non-goals
 

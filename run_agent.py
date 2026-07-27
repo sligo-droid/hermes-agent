@@ -3008,6 +3008,37 @@ class AIAgent:
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(landed_paths)
+                try:
+                    from agent.visual_qa import (
+                        normalize_visual_qa_config,
+                        promote_visual_requirement_for_mutations,
+                        set_active_visual_requirement,
+                    )
+
+                    visual_config = normalize_visual_qa_config(
+                        getattr(self, "visual_qa_config", None)
+                    )
+                    if visual_config["mode"] == "enforce_explicit":
+                        promoted = promote_visual_requirement_for_mutations(
+                            getattr(self, "visual_qa_requirement", None),
+                            changed,
+                            actionable=(
+                                str(getattr(self, "_runtime_mode", "") or "")
+                                .strip()
+                                .lower()
+                                == "action"
+                            ),
+                        )
+                        self.visual_qa_requirement = promoted
+                        set_active_visual_requirement(promoted)
+                        stats = getattr(self, "_turn_runtime_stats", None)
+                        if isinstance(stats, dict):
+                            stats["visual_qa_level"] = promoted["level"]
+                except Exception:
+                    logger.debug(
+                        "post-edit visual QA promotion failed",
+                        exc_info=True,
+                    )
             try:
                 from agent.verification_evidence import mark_workspace_edited
 

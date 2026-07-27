@@ -1,0 +1,216 @@
+import asyncio
+import json
+import threading
+
+import pytest
+
+from tools import browser_tool
+from tools.browser_auth_profiles import (
+    BrowserAuthProfileError,
+    load_browser_auth_credentials,
+    select_browser_auth_profile,
+)
+from tools.browser_supervisor import CDPSupervisor
+from tools.registry import registry
+
+
+def _profile_config(env_file):
+    return {
+        "browser": {
+            "auth_profiles": {
+                "pid_hermes_qa": {
+                    "origins": ["https://pid.sligolabs.com"],
+                    "env_file": str(env_file),
+                    "username_env": "PID_QA_USERNAME",
+                    "password_env": "PID_QA_PASSWORD",
+                    "username_selector": "#login-user",
+                    "password_selector": "#login-pass",
+                    "submit_selector": '#login-overlay button[type="submit"]',
+                    "success_selector": "#header",
+                }
+            }
+        }
+    }
+
+
+def test_profile_loads_private_hermes_secret_without_exposing_values(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    env_file = secrets / "pid-qa-readonly.env"
+    env_file.write_text(
+        "PID_QA_USERNAME=hermes_qa\nPID_QA_PASSWORD='correct horse battery staple'\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    profile = select_browser_auth_profile(
+        "https://pid.sligolabs.com",
+        config=_profile_config(env_file),
+    )
+    username, password = load_browser_auth_credentials(profile)
+
+    assert profile.name == "pid_hermes_qa"
+    assert username == "hermes_qa"
+    assert password == "correct horse battery staple"
+    assert password not in repr(profile)
+
+
+def test_profile_rejects_non_private_or_outside_secret_files(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    outside = tmp_path / "qa.env"
+    outside.write_text("PID_QA_USERNAME=x\nPID_QA_PASSWORD=y\n", encoding="utf-8")
+    outside.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(BrowserAuthProfileError, match="secrets directory"):
+        select_browser_auth_profile(
+            "https://pid.sligolabs.com",
+            requested_name="pid_hermes_qa",
+            config=_profile_config(outside),
+        )
+
+    inside = secrets / "qa.env"
+    inside.write_text("PID_QA_USERNAME=x\nPID_QA_PASSWORD=y\n", encoding="utf-8")
+    inside.chmod(0o644)
+    with pytest.raises(BrowserAuthProfileError, match="private regular file"):
+        select_browser_auth_profile(
+            "https://pid.sligolabs.com",
+            requested_name="pid_hermes_qa",
+            config=_profile_config(inside),
+        )
+
+
+def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    supervisor = CDPSupervisor(task_id="auth-test", cdp_url="ws://example.test")
+    supervisor._loop = loop
+    supervisor._active = True
+    supervisor._page_session_id = "page-1"
+    submitted = False
+    calls = []
+
+    async def fake_cdp(method, params=None, **kwargs):
+        nonlocal submitted
+        calls.append((method, params))
+        if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
+            return {"result": {"result": {"objectId": "global-1"}}}
+        if method == "Runtime.evaluate":
+            value = (
+                True
+                if params.get("expression") == "document.readyState === 'complete'"
+                else submitted
+            )
+            return {"result": {"result": {"type": "boolean", "value": value}}}
+        if method == "Runtime.callFunctionOn":
+            if "requestSubmit" in params["functionDeclaration"]:
+                submitted = True
+            return {"result": {"result": {"type": "boolean", "value": True}}}
+        if method == "Input.insertText":
+            return {"result": {}}
+        raise AssertionError(method)
+
+    supervisor._cdp = fake_cdp
+    try:
+        result = supervisor.authenticate_form(
+            username="hermes_qa",
+            password="top-secret-password",
+            username_selector="#login-user",
+            password_selector="#login-pass",
+            submit_selector="button[type=submit]",
+            success_selector="#header",
+            timeout=2,
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+    assert result == {
+        "ok": True,
+        "authenticated": True,
+        "already_authenticated": False,
+    }
+    function_sources = [
+        params["functionDeclaration"]
+        for method, params in calls
+        if method == "Runtime.callFunctionOn"
+    ]
+    assert all("hermes_qa" not in source for source in function_sources)
+    assert all("top-secret-password" not in source for source in function_sources)
+    assert [
+        params["text"] for method, params in calls if method == "Input.insertText"
+    ] == ["hermes_qa", "top-secret-password"]
+    assert "hermes_qa" not in json.dumps(result)
+    assert "top-secret-password" not in json.dumps(result)
+
+
+def test_browser_authenticate_returns_only_profile_metadata(monkeypatch):
+    class FakeSupervisor:
+        def current_origin(self):
+            return {"ok": True, "origin": "https://pid.sligolabs.com"}
+
+        def authenticate_form(self, **kwargs):
+            assert kwargs["username"] == "hermes_qa"
+            assert kwargs["password"] == "top-secret-password"
+            return {"ok": True, "authenticated": True, "already_authenticated": False}
+
+    from tools import browser_auth_profiles
+    from tools import browser_supervisor
+
+    profile = type(
+        "Profile",
+        (),
+        {
+            "name": "pid_hermes_qa",
+            "username_selector": "#user",
+            "password_selector": "#pass",
+            "submit_selector": "button",
+            "success_selector": "#header",
+            "timeout_s": 5,
+        },
+    )()
+    monkeypatch.setattr(browser_tool, "_last_session_key", lambda task_id: task_id)
+    monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda task_id: None)
+    monkeypatch.setattr(
+        browser_supervisor.SUPERVISOR_REGISTRY,
+        "get",
+        lambda task_id: FakeSupervisor(),
+    )
+    monkeypatch.setattr(
+        browser_auth_profiles,
+        "select_browser_auth_profile",
+        lambda origin, requested_name="": profile,
+    )
+    monkeypatch.setattr(
+        browser_auth_profiles,
+        "load_browser_auth_credentials",
+        lambda selected: ("hermes_qa", "top-secret-password"),
+    )
+
+    result = json.loads(browser_tool.browser_authenticate(task_id="visual-turn"))
+
+    assert result == {
+        "success": True,
+        "authenticated": True,
+        "profile": "pid_hermes_qa",
+        "already_authenticated": False,
+    }
+    assert "top-secret-password" not in json.dumps(result)
+
+
+def test_browser_authenticate_schema_exposes_only_an_opaque_profile_name():
+    entry = registry.get_entry("browser_authenticate")
+
+    assert entry is not None
+    assert entry.effect == "mutating"
+    parameters = entry.schema["parameters"]
+    assert parameters["additionalProperties"] is False
+    assert set(parameters["properties"]) == {"profile"}
