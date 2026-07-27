@@ -1482,6 +1482,35 @@ class TestAdversarialEdgeCases:
         assert result.retryable is False
         assert result.should_rotate_credential is True
 
+    def test_400_anthropic_third_party_extra_usage_gate(self):
+        """The production OAuth wording must mark the credential exhausted.
+
+        Without this phrase the error fell through as format_error, so a queued
+        Opus follow-up retried the same depleted route instead of making the
+        pool preflight available to bounded visual fallbacks.
+        """
+        e = MockAPIError(
+            "Third-party apps now draw from your extra usage, not your plan limits. "
+            "Add more at claude.ai/settings/usage and keep going.",
+            status_code=400,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": (
+                        "Third-party apps now draw from your extra usage, not your plan "
+                        "limits. Add more at claude.ai/settings/usage and keep going."
+                    ),
+                }
+            },
+        )
+
+        result = classify_api_error(e, provider="anthropic")
+
+        assert result.reason == FailoverReason.billing
+        assert result.should_fallback is True
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""
         class WeirdSuccess(Exception):

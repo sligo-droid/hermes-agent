@@ -543,6 +543,9 @@ def sanitize_assertion_result(value: Any) -> dict[str, Any] | None:
     confidence = str(raw.get("confidence") or "").strip().lower()
     if confidence in {"high", "medium", "low"}:
         result["confidence"] = confidence
+    correction = _bounded_text(raw.get("correction"), 240)
+    if correction and status in {"failed", "uncertain"}:
+        result["correction"] = correction
     return result
 
 

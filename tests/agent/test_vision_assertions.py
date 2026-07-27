@@ -5,10 +5,45 @@ from unittest.mock import patch
 import pytest
 
 from agent.vision_assertions import (
+    _resolve_visual_inspector_runtime,
     evaluate_screenshot_assertions,
     parse_vision_assertion_output,
     run_visual_sweep,
 )
+
+
+def test_visual_inspector_preflights_opus_budget_and_selects_sonnet(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.opus_planner._anthropic_budget_preflight_error",
+        lambda: "Opus extra usage exhausted",
+    )
+
+    def fake_runtime_provider(*, requested, target_model, **kwargs):
+        seen.update(requested=requested, target_model=target_model)
+        return {
+            "provider": requested,
+            "model": target_model,
+            "base_url": "https://api.anthropic.com",
+            "api_key": "test-oauth-token",
+            "api_mode": "anthropic_messages",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_runtime_provider,
+    )
+
+    runtime = _resolve_visual_inspector_runtime({})
+
+    assert seen == {
+        "requested": "openrouter",
+        "target_model": "anthropic/claude-sonnet-5",
+    }
+    assert runtime["model"] == "anthropic/claude-sonnet-5"
+    assert runtime["fallback_used"] is True
+    assert runtime["fallback_reason"] == "opus_budget_exhausted"
 
 
 def test_parse_compact_vision_assertion_output():
@@ -63,7 +98,7 @@ async def test_visual_inspector_route_and_single_attempt_are_forwarded():
         "agent.vision_assertions._resolve_visual_inspector_runtime",
         return_value={
             "provider": "anthropic",
-            "model": "claude-sonnet-5",
+            "model": "claude-opus-5",
             "base_url": "https://inspector.example/v1",
             "api_key": "inspector-credential",
             "api_mode": "anthropic_messages",
@@ -98,7 +133,7 @@ async def test_visual_inspector_route_and_single_attempt_are_forwarded():
     assert result["status"] == "passed"
     assert events == ["start", "request"]
     assert seen["provider"] == "anthropic"
-    assert seen["model"] == "claude-sonnet-5"
+    assert seen["model"] == "claude-opus-5"
     assert seen["base_url"] == "https://inspector.example/v1"
     assert seen["api_key"] == "inspector-credential"
     assert seen["api_mode"] == "anthropic_messages"
@@ -188,7 +223,7 @@ async def test_strict_assertion_routes_once_to_known_vision_backend():
         "agent.vision_assertions._resolve_visual_inspector_runtime",
         return_value={
             "provider": "anthropic",
-            "model": "claude-sonnet-5",
+            "model": "claude-opus-5",
             "base_url": "https://inspector.example/v1",
             "api_key": "inspector-credential",
             "api_mode": "anthropic_messages",
@@ -242,6 +277,29 @@ def test_invalid_or_prose_only_output_is_uncertain(raw):
             "code": "invalid_vision_output",
         }
     ]
+
+
+def test_failed_visual_review_keeps_one_bounded_correction():
+    parsed = parse_vision_assertion_output(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "id": "balanced-layout",
+                        "status": "failed",
+                        "confidence": "high",
+                        "correction": "Reduce the card gutter and align the primary action to the title baseline.",
+                    }
+                ]
+            }
+        ),
+        expected_ids=["balanced-layout"],
+    )
+
+    assert parsed["status"] == "failed"
+    assert parsed["results"][0]["correction"] == (
+        "Reduce the card gutter and align the primary action to the title baseline."
+    )
 
 
 def test_unexpected_or_missing_ids_cannot_pass():

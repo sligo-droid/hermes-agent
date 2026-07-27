@@ -60,11 +60,19 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "opencode_model": "hermes-codex/gpt-5.6-luna",
         "reasoning_effort": "xhigh",
     },
-    # Screenshot-appearance judgement. Medium is the route default: this is a
-    # bounded inspection pass rather than the unbounded critique slot below.
+    # Screenshot-appearance judgement. Opus is used once, after the cheap Luna
+    # evidence sweep, because visual judgement is the premium part of the loop.
     "visual_inspector": {
         "provider": "anthropic",
-        "model": "claude-sonnet-5",
+        "model": "claude-opus-5",
+        "opencode_model": "anthropic/claude-opus-5",
+        "reasoning_effort": "medium",
+    },
+    # Budget-safe rendered review fallback. Select this before the provider
+    # call when the Anthropic pool already reports Opus extra-usage exhaustion.
+    "visual_inspector_fallback": {
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-5",
         "opencode_model": "anthropic/claude-sonnet-5",
         "reasoning_effort": "medium",
     },
@@ -80,6 +88,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
 }
 
 VISUAL_DELEGATION_PURPOSE_TIERS: dict[str, str] = {
+    "visual_advisor": "visual_critique",
     "visual_sweep": "visual_sweep",
     "visual_inspector": "visual_inspector",
     "visual_critique": "visual_critique",

@@ -75,7 +75,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("model_tier", props["tasks"]["items"]["properties"])
         self.assertEqual(
             props["purpose"]["enum"],
-            ["visual_sweep", "visual_inspector", "visual_critique"],
+            ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
         )
         self.assertIn("purpose", props["tasks"]["items"]["properties"])
         self.assertIn("context", props)
@@ -1571,8 +1571,9 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         mock_resolve.side_effect = resolve_provider
         expected = {
+            "visual_advisor": ("anthropic", "claude-opus-5", "medium"),
             "visual_sweep": ("openai-codex", "gpt-5.6-luna", "xhigh"),
-            "visual_inspector": ("anthropic", "claude-sonnet-5", "medium"),
+            "visual_inspector": ("anthropic", "claude-opus-5", "medium"),
             # ``medium`` is stable under the review spillover, so the explicit
             # review purpose passes it through rather than promoting it.
             "visual_critique": ("anthropic", "claude-opus-5", "medium"),
@@ -1583,19 +1584,24 @@ class TestDelegationModelTierRouting(unittest.TestCase):
                 "tools.delegate_tool._load_config", return_value=self._tier_config()
             ), patch("run_agent.AIAgent") as MockAgent:
                 MockAgent.return_value = MagicMock()
+                parent = _make_mock_parent()
+                parent._fallback_chain = [
+                    {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                ]
                 delegate_task(
                     goal="Process the prepared evidence",
                     purpose=purpose,
-                    parent_agent=_make_mock_parent(),
+                    parent_agent=parent,
                 )
 
                 kwargs = MockAgent.call_args.kwargs
                 self.assertEqual(kwargs["provider"], provider)
                 self.assertEqual(kwargs["model"], model)
                 self.assertEqual(kwargs["reasoning_config"]["effort"], effort)
+                self.assertIsNone(kwargs["fallback_model"])
                 self.assertEqual(
                     MockAgent.return_value._runtime_audit_context["model_tier"],
-                    purpose,
+                    "visual_critique" if purpose == "visual_advisor" else purpose,
                 )
 
     def test_exhausted_parent_worker_budget_fails_before_launch(self):
@@ -1737,7 +1743,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], "gpt-5.6-sol")
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
         self.assertEqual(kwargs["provider"], parent.provider)
         self.assertEqual(kwargs["base_url"], parent.base_url)
         self.assertEqual(
@@ -1782,7 +1788,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         ])
         self.assertEqual([call.kwargs["reasoning_config"]["effort"] for call in calls], [
             "medium",
-            "high",
+            "medium",
         ])
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")

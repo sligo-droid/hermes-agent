@@ -188,31 +188,35 @@ def test_explicit_ui_route_overrides_review_keyword_veto():
     assert "negative keyword: review" in decision.advisory_reason
 
 
-def test_visual_keywords_without_route_are_advisory_only():
+def test_visual_keywords_without_route_select_automatic_opus_advisor():
     decision = resolve_ui_work_route(
         _cfg(),
         task="Implement responsive dashboard card visual polish.",
     )
 
-    assert decision.matched is False
-    assert decision.selected_route == "default_coding_worker"
-    assert decision.metadata()["recommended_skills"] == []
+    assert decision.matched is True
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.metadata()["recommended_skills"] == [
+        "taste-skill",
+        "claude-design",
+        "popular-web-designs",
+    ]
     assert decision.selected_provider == ""
     assert decision.selected_model == ""
-    assert decision.route_decision_source == "deterministic_default"
+    assert decision.route_decision_source == "deterministic_explicit_visual"
     assert decision.route_decision_confidence is None
     assert decision.advisory_matched is True
     assert "visual ui work" in decision.advisory_reason
 
 
-def test_command_center_polish_smoke_is_visual_advisory_only_without_route():
+def test_command_center_polish_smoke_selects_automatic_opus_advisor():
     decision = resolve_ui_work_route(
         _cfg(),
         task="Smoke-test UI specialist route on Command Center polish.",
     )
 
-    assert decision.matched is False
-    assert decision.selected_route == "default_coding_worker"
+    assert decision.matched is True
+    assert decision.selected_route == "ui_visual_specialist"
     assert decision.advisory_matched is True
     assert "visual ui work" in decision.advisory_reason
     assert "polish" in decision.advisory_reason
@@ -301,12 +305,27 @@ def test_non_visual_domain_table_chart_or_interface_work_does_not_route(task):
         "Polish Command Center card colors.",
     ],
 )
-def test_visual_table_chart_and_card_work_is_advisory_despite_domain_words(task):
+def test_visual_table_chart_and_card_work_selects_automatic_advisor(task):
     decision = resolve_ui_work_route(_cfg(), task=task)
 
-    assert decision.matched is False
+    assert decision.matched is True
+    assert decision.selected_route == "ui_visual_specialist"
     assert decision.advisory_matched is True
     assert "visual ui work" in decision.advisory_reason
+
+
+def test_route_delegate_task_false_preserves_advisory_only_behavior():
+    cfg = _cfg()
+    cfg["ui_work"]["route_delegate_task"] = False
+
+    decision = resolve_ui_work_route(
+        cfg,
+        task="Implement responsive dashboard card visual polish.",
+    )
+
+    assert decision.matched is False
+    assert decision.selected_route == "default_coding_worker"
+    assert decision.advisory_matched is True
 
 
 def test_pr_review_follow_up_around_page_layout_does_not_route():

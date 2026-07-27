@@ -59,6 +59,7 @@ _MUTATION_RESERVATIONS_LOCK = threading.Lock()
 _MUTATION_RESERVATIONS: dict[str, dict[str, Any]] = {}
 _PARALLEL_WORKER_RESERVATIONS_LOCK = threading.Lock()
 _PARALLEL_WORKER_RESERVATIONS: dict[str, str] = {}
+_UI_VISUAL_ADVISOR_MAX_CHARS = 8_000
 
 
 def _reservation_root(cwd: str) -> str:
@@ -809,6 +810,155 @@ def _context_pack_lines(
             lines.extend(["", f"{label}:", value])
     lines.extend(["", "## End context from orchestrator"])
     return lines
+
+
+def _run_ui_visual_advisor(
+    *,
+    loaded_config: dict[str, Any],
+    ui_route: Any,
+    task: str,
+    context: str,
+    workdir: str,
+    relevant_files: Any,
+    approach: Any,
+    constraints: Any,
+    parent_agent: Any,
+) -> tuple[str, dict[str, Any]]:
+    """Run one cached read-only Opus design consultation for visual work."""
+
+    ui_cfg = loaded_config.get("ui_work") if isinstance(loaded_config, dict) else {}
+    if not isinstance(ui_cfg, dict):
+        ui_cfg = {}
+    if not (
+        bool(ui_cfg.get("route_delegate_task", False))
+        and ui_route is not None
+        and getattr(ui_route, "selected_route", "") == "ui_visual_specialist"
+        and getattr(ui_route, "launch_worker", True)
+    ):
+        return "", {"advisor_invoked": False}
+
+    root = getattr(parent_agent, "_delegate_root_agent", parent_agent)
+    fingerprint_payload = {
+        "task": str(task or ""),
+        "context": str(context or ""),
+        "workdir": str(workdir or ""),
+        "relevant_files": relevant_files if isinstance(relevant_files, list) else [],
+        "approach": str(approach or ""),
+        "constraints": str(constraints or ""),
+        "turn_id": str(
+            getattr(root, "_current_turn_id", "")
+            or getattr(root, "_current_task_id", "")
+            or ""
+        ),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    cache = getattr(root, "_ui_visual_advisor_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            root._ui_visual_advisor_cache = cache
+        except Exception:
+            pass
+    cached = cache.get(fingerprint)
+    if isinstance(cached, dict):
+        metadata = dict(cached.get("metadata") or {})
+        metadata["advisor_cached"] = True
+        return str(cached.get("guidance") or ""), metadata
+
+    file_context = []
+    for item in relevant_files if isinstance(relevant_files, list) else []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        note = str(item.get("note") or "").strip()
+        if path:
+            file_context.append({"path": path[:500], "note": note[:500]})
+        if len(file_context) >= 20:
+            break
+    advisor_context = json.dumps(
+        {
+            "task": str(task or "")[:8_000],
+            "context": str(context or "")[:8_000],
+            "workdir": str(workdir or "")[:2_000],
+            "relevant_files": file_context,
+            "approach": str(approach or "")[:4_000],
+            "constraints": str(constraints or "")[:4_000],
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    metadata: dict[str, Any] = {
+        "advisor_invoked": True,
+        "advisor_cached": False,
+        "advisor_model": "claude-opus-5",
+    }
+    guidance = ""
+    try:
+        from hermes_cli.opus_planner import _anthropic_budget_preflight_error
+
+        budget_error = _anthropic_budget_preflight_error()
+        if budget_error:
+            metadata.update(
+                advisor_status="skipped",
+                advisor_failure_class="opus_budget_exhausted",
+            )
+            cache[fingerprint] = {"guidance": "", "metadata": dict(metadata)}
+            return "", metadata
+
+        from tools.delegate_tool import delegate_task
+
+        raw = delegate_task(
+            goal=(
+                "Act as the visual design director for this implementation task. "
+                "Inspect the relevant repository files read-only and return a concise, "
+                "concrete implementation brief covering hierarchy, composition, spacing, "
+                "typography, color, responsive behavior, interaction states, reuse of the "
+                "existing design system, and specific ways to avoid generic AI-looking UI. "
+                "Do not edit files, launch coding workers, or claim rendered verification."
+            ),
+            context=advisor_context,
+            toolsets=["file"],
+            purpose="visual_advisor",
+            read_only=True,
+            parent_agent=parent_agent,
+        )
+        payload = json.loads(raw)
+        results = payload.get("results") if isinstance(payload, dict) else None
+        entry = results[0] if isinstance(results, list) and results else {}
+        status = str(entry.get("status") or "failed") if isinstance(entry, dict) else "failed"
+        summary = str(entry.get("summary") or "") if isinstance(entry, dict) else ""
+        metadata["advisor_status"] = status
+        if isinstance(entry, dict) and entry.get("model"):
+            metadata["advisor_model"] = str(entry["model"])
+        handoff = entry.get("handoff") if isinstance(entry, dict) else None
+        if isinstance(handoff, dict) and handoff.get("handoff_id"):
+            metadata["advisor_handoff_id"] = str(handoff["handoff_id"])
+        if status == "completed" and summary.strip():
+            guidance = summary.strip()[:_UI_VISUAL_ADVISOR_MAX_CHARS]
+        else:
+            metadata["advisor_failure_class"] = str(
+                entry.get("exit_reason") or "no_completed_guidance"
+            )[:120]
+    except Exception as exc:
+        logger.warning("Opus visual advisor unavailable; continuing with coding worker: %s", exc)
+        metadata.update(
+            advisor_status="failed",
+            advisor_failure_class="route_or_runtime_unavailable",
+        )
+
+    if isinstance(cache, dict):
+        cache[fingerprint] = {"guidance": guidance, "metadata": dict(metadata)}
+        while len(cache) > 20:
+            cache.pop(next(iter(cache)))
+    return guidance, metadata
 
 
 def _resolve_analysis_handoffs(
@@ -2189,6 +2339,18 @@ def _delegate_coding_task_impl(
             },
             ensure_ascii=False,
         )
+    advisor_guidance, advisor_metadata = _run_ui_visual_advisor(
+        loaded_config=loaded_config,
+        ui_route=ui_route,
+        task=task_text,
+        context=context_text,
+        workdir=workdir,
+        relevant_files=relevant_files,
+        approach=approach,
+        constraints=constraints,
+        parent_agent=parent_agent,
+    )
+    ui_route_metadata = {**ui_route_metadata, **advisor_metadata}
     repo_specific_preflight = cwd_fallback_metadata is None
     project_context = _worker_project_context(workdir) if repo_specific_preflight else ""
     skill_context = _parent_skill_context(
@@ -2362,6 +2524,15 @@ def _delegate_coding_task_impl(
         ui_skill_prompt = ""
     if ui_skill_prompt:
         worker_prompt_parts.extend(["", ui_skill_prompt])
+    if advisor_guidance:
+        worker_prompt_parts.extend(
+            [
+                "",
+                "Opus visual advisor guidance (read-only design direction; the coding worker "
+                "still owns implementation and must verify the rendered result):",
+                advisor_guidance,
+            ]
+        )
     if repo_state_notes:
         worker_prompt_parts.extend(["", repo_state_notes])
     worker_prompt_parts.extend(

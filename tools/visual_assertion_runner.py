@@ -367,6 +367,11 @@ async def _run_attempt(
                 results.extend(vision_result.get("results") or [])
     aggregate = aggregate_assertion_results(results)
     aggregate["vision_calls"] = provider_start_count
+    if "vision_result" in locals() and isinstance(vision_result, dict):
+        if vision_result.get("review_model"):
+            aggregate["review_model"] = str(vision_result["review_model"])
+        if vision_result.get("review_fallback"):
+            aggregate["review_fallback"] = str(vision_result["review_fallback"])
     return aggregate
 
 
@@ -710,6 +715,10 @@ async def run_visual_assertions(
         "attempts": attempts[:2],
         "visual_qa_receipt": receipt,
     }
+    if final.get("review_model"):
+        output["review_model"] = str(final["review_model"])
+    if final.get("review_fallback"):
+        output["review_fallback"] = str(final["review_fallback"])
     if latest_artifacts:
         output["screenshot_artifacts"] = latest_artifacts[:4]
     if len(str(output)) > visual_config["max_output_chars"]:
