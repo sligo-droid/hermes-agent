@@ -865,6 +865,7 @@ def test_background_dispatch_returns_handle_and_records_worker_run(monkeypatch, 
     assert event["worker_run"]["background"] is True
     assert event["result"]["scope_check"] == {
         "scope_paths": ["src"],
+        "changed_files": [],
         "out_of_scope_files": [],
         "clean": True,
     }
@@ -1207,6 +1208,7 @@ def test_scope_check_reports_in_scope_changes_as_clean(monkeypatch, tmp_path):
 
     assert result["scope_check"] == {
         "scope_paths": ["src"],
+        "changed_files": ["src/app.py"],
         "out_of_scope_files": [],
         "clean": True,
     }
@@ -1242,6 +1244,7 @@ def test_scope_check_lists_out_of_scope_changes(monkeypatch, tmp_path):
 
     assert result["scope_check"] == {
         "scope_paths": ["src"],
+        "changed_files": ["README.md", "src/app.py"],
         "out_of_scope_files": ["README.md"],
         "clean": False,
     }
@@ -1304,6 +1307,7 @@ def test_parallel_group_returns_pending_isolated_worktree_without_merging(
     }
     assert result["scope_check"] == {
         "scope_paths": ["src"],
+        "changed_files": ["src/app.py", "src/new.py"],
         "out_of_scope_files": [],
         "clean": True,
     }

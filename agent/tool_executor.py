@@ -972,6 +972,52 @@ def _record_visual_qa_edit_order(
         logger.debug("visual QA edit-order accounting failed", exc_info=True)
 
 
+def _record_coding_worker_mutation_paths(
+    agent: Any,
+    function_name: str,
+    function_result: Any,
+) -> None:
+    """Propagate host-inspected worker edits into the parent turn."""
+    if function_name != "delegate_coding_task":
+        return
+    try:
+        from agent.tool_result_classification import coding_worker_mutation_paths
+
+        paths = coding_worker_mutation_paths(function_result)
+        if not paths:
+            return
+        changed = getattr(agent, "_turn_file_mutation_paths", None)
+        if changed is None:
+            return
+        changed.update(paths)
+        from agent.visual_qa import (
+            normalize_visual_qa_config,
+            promote_visual_requirement_for_mutations,
+            set_active_visual_requirement,
+        )
+
+        visual_config = normalize_visual_qa_config(
+            getattr(agent, "visual_qa_config", None)
+        )
+        if visual_config["mode"] != "enforce_explicit":
+            return
+        promoted = promote_visual_requirement_for_mutations(
+            getattr(agent, "visual_qa_requirement", None),
+            changed,
+            actionable=(
+                str(getattr(agent, "_runtime_mode", "") or "").strip().lower()
+                == "action"
+            ),
+        )
+        agent.visual_qa_requirement = promoted
+        set_active_visual_requirement(promoted)
+        stats = getattr(agent, "_turn_runtime_stats", None)
+        if isinstance(stats, dict):
+            stats["visual_qa_level"] = promoted["level"]
+    except Exception:
+        logger.debug("coding-worker mutation accounting failed", exc_info=True)
+
+
 def apply_tool_result_hooks(
     function_name: str,
     function_args: dict,
@@ -1772,6 +1818,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 try:
                     agent._record_file_mutation_result(
                         function_name, result_storage_args, function_result, is_error,
+                    )
+                    _record_coding_worker_mutation_paths(
+                        agent,
+                        function_name,
+                        function_result,
                     )
                     _record_visual_qa_edit_order(
                         agent,
@@ -2601,6 +2652,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 agent._record_file_mutation_result(
                     function_name, storage_args, function_result, _is_error_result,
+                )
+                _record_coding_worker_mutation_paths(
+                    agent,
+                    function_name,
+                    function_result,
                 )
                 _record_visual_qa_edit_order(
                     agent,
