@@ -71,9 +71,18 @@ jobs:
           cache: npm
 
       # --ignore-scripts: eslint only needs TS sources + eslint packages.
-      - uses: ./.github/actions/retry
-        with:
-          command: npm ci --ignore-scripts
+      - name: Install dependencies with retry
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --ignore-scripts; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "::warning::npm ci failed (attempt $attempt); retrying in 10s"
+            sleep 10
+          done
 
       - name: npm run fix in all workspaces
         # continue-on-error: if un-fixable errors exist on main, we still want

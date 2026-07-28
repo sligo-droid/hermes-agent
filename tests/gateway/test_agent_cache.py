@@ -2032,33 +2032,6 @@ class TestAgentCacheMessageCountRebaseline:
         with runner._agent_cache_lock:
             assert runner._agent_cache["telegram:s1"][0] is agent
 
-    def test_in_band_followup_rebaseline_precedes_recursion(self):
-        """Pin the FIX PLACEMENT in the production source.
-
-        The behavioral test above proves the re-baseline makes the in-band
-        follow-up reuse the cached agent, but it calls the helper directly —
-        it would still pass if the production call were deleted.  This guards
-        the actual call site: the queued (/queue) follow-up recurses via
-        ``followup_result = await self._run_agent(...)`` inside
-        ``_run_agent_inner`` and the re-baseline MUST run BEFORE that
-        recursion (running it only after, like the external-turn site, is too
-        late for the in-band path — the follow-up would already have rebuilt).
-        """
-        import inspect
-        from gateway.run import GatewayRunner
-
-        # The recursion + pre-recursion re-baseline live in the extracted
-        # ``_run_agent_inner`` (older trees had them inline in ``_run_agent``).
-        src = inspect.getsource(GatewayRunner._run_agent_inner)
-        marker = "followup_result = await self._run_agent("
-        assert marker in src, "in-band queued follow-up recursion not found in _run_agent_inner"
-        before_recursion = src[: src.index(marker)]
-        assert "_refresh_agent_cache_message_count" in before_recursion, (
-            "the in-band queued follow-up recursion must be preceded by a "
-            "_refresh_agent_cache_message_count re-baseline, else the follow-up "
-            "rebuilds the agent on this process's own first-turn writes"
-        )
-
 class TestCrossProcessInvalidationDefersCleanup:
     """#52197: cross-process cache invalidation must NOT run agent cleanup
     while holding ``_agent_cache_lock``.

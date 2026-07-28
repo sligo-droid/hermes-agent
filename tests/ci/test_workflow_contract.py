@@ -59,6 +59,15 @@ def test_legacy_source_ci_workflows_are_removed():
     assert not (WORKFLOWS / "docs-source-integrity.yml").exists()
 
 
+def test_js_autofix_install_is_self_contained_and_retried():
+    source = (WORKFLOWS / "js-autofix.yml").read_text(encoding="utf-8")
+
+    assert "uses: ./.github/actions/retry" not in source
+    assert "for attempt in 1 2 3" in source
+    assert "npm ci --ignore-scripts" in source
+    assert "sleep 10" in source
+
+
 def test_pr_body_is_a_separate_trusted_base_gate():
     source = (WORKFLOWS / "pr-body-format.yml").read_text(encoding="utf-8")
 
