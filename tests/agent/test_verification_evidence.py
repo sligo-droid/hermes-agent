@@ -971,6 +971,61 @@ def test_authenticated_qa_requires_structured_success_payload():
     assert latest["production_browser"]["status"] == "failure"
 
 
+def test_closed_green_pr_without_merge_supersedes_earlier_pr_query_failure():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    failed = json.dumps(
+        {
+            "output": (
+                "Closed pull request example/repo#1092\n"
+                'Unknown JSON field: "baseRefOid"'
+            ),
+            "exit_code": 1,
+            "error": None,
+        }
+    )
+    repaired_output = """{"base_sha":"1aa02906ca5cd01c377e67c8e404c8add905c210","closed_at":"2026-07-28T12:03:28Z","head_sha":"37e518f6fd949fc794c5299bbd90c3578d4b5a60","html_url":"https://github.com/example/repo/pull/1092","merged":false,"merged_at":null,"number":1092,"state":"closed"}
+Vercel\tpass\t0\thttps://vercel.example\tDeployment has completed
+Vercel Preview Comments\tpass\t0\thttps://vercel.example
+CURRENT_MAIN=1aa02906ca5cd01c377e67c8e404c8add905c210"""
+    repaired = json.dumps(
+        {"output": repaired_output, "exit_code": 0, "error": None}
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "set -e\ngh pr close 1092\n"
+                "gh pr view 1092 --json baseRefOid,statusCheckRollup"
+            )
+        },
+        failed,
+        True,
+    )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "gh api repos/example/repo/pulls/1092 --jq '{state,merged}' "
+                "&& gh pr checks 1092 && printf CURRENT_MAIN="
+            )
+        },
+        repaired,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert latest["pr"]["status"] == "success"
+    assert latest["ci"]["status"] == "success"
+    assert "closed PR verification" in latest["pr"]["check_name"]
+    assert claim_constraints_for_text(
+        "PR checks passed, the PR was closed without merge, and main stayed unchanged.",
+        agent._turn_runtime_stats["verification_evidence"],
+    )["allowed"] is True
+
+
 def test_verify_path_name_alone_is_not_verification_evidence():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     result = json.dumps(

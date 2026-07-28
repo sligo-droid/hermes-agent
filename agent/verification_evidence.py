@@ -134,6 +134,15 @@ _AUTHENTICATED_QA_COMMAND_RE = re.compile(
     r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?qa:auth\b",
     re.IGNORECASE,
 )
+_GITHUB_CLOSED_PR_VERIFY_RE = re.compile(
+    r"\bgh\s+api\s+repos/[^\s]+/pulls/\d+\b",
+    re.IGNORECASE,
+)
+_CURRENT_MAIN_RE = re.compile(r"(?m)^CURRENT_MAIN=([0-9a-f]{40}|[0-9a-f]{64})\s*$")
+_GH_CHECK_LINE_RE = re.compile(
+    r"(?m)^[^\t\n]+\t(pass|fail|pending|skipping|cancelled|timed_out)\t",
+    re.IGNORECASE,
+)
 _BROWSER_AUTH_BOUNDARY_RE = re.compile(
     r'''(?:"title"\s*:\s*"[^"\n]*\b(?:sign[ -]?in|log[ -]?in|login)\b)|'''
     r"(?:<title>[^<\n]*\b(?:sign[ -]?in|log[ -]?in|login)\b)|"
@@ -296,6 +305,76 @@ def _authenticated_qa_evidence(
         }
         for surface in _surfaces_for("browser_authenticated_qa", base_url, detail)
     ]
+
+
+def _closed_pr_without_merge_evidence(
+    command: str,
+    output: str,
+    *,
+    is_error: bool,
+    order: int | None,
+) -> list[dict[str, Any]]:
+    """Classify structured proof that a green PR closed without changing main."""
+    if not _GITHUB_CLOSED_PR_VERIFY_RE.search(command):
+        return []
+    payload = _last_embedded_json_object(output)
+    state = str(payload.get("state") or "").strip().lower()
+    merged = payload.get("merged")
+    merged_at = payload.get("merged_at")
+    base_sha = str(payload.get("base_sha") or "").strip().lower()
+    head_sha = str(payload.get("head_sha") or "").strip().lower()
+    main_match = _CURRENT_MAIN_RE.search(output)
+    current_main = main_match.group(1).lower() if main_match else ""
+    check_states = [match.lower() for match in _GH_CHECK_LINE_RE.findall(output)]
+    pr_success = bool(
+        not is_error
+        and state == "closed"
+        and merged is False
+        and merged_at is None
+        and _SHA_RE.fullmatch(base_sha)
+        and _SHA_RE.fullmatch(head_sha)
+        and current_main == base_sha
+    )
+    checks_success = bool(check_states) and all(
+        state in {"pass", "skipping"} for state in check_states
+    )
+    detail = json.dumps(
+        {
+            "state": state,
+            "merged": merged,
+            "merged_at": merged_at,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+            "current_main": current_main,
+            "check_states": check_states[:20],
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    check_name = _text(f"closed PR verification {payload.get('html_url') or ''}", limit=160)
+    evidence = [
+        {
+            "schema_version": 1,
+            "surface": "pr",
+            "check_name": check_name,
+            "status": "success" if pr_success else "failure",
+            "order": int(order or 0),
+            "detail": detail[:240],
+        }
+    ]
+    if check_states:
+        evidence.append(
+            {
+                "schema_version": 1,
+                "surface": "ci",
+                "check_name": check_name,
+                "status": "success" if checks_success else "failure",
+                "order": int(order or 0),
+                "detail": detail[:240],
+            }
+        )
+    return evidence
 
 
 def _text(value: Any, limit: int = 500) -> str:
@@ -759,6 +838,14 @@ def classify_tool_verification_evidence(
         )
         if authenticated_qa:
             return authenticated_qa
+        closed_pr_evidence = _closed_pr_without_merge_evidence(
+            raw_check_name,
+            full_result_text,
+            is_error=is_error,
+            order=order,
+        )
+        if closed_pr_evidence:
+            return closed_pr_evidence
         # Inspect the complete command. Compound closeout commands often put
         # formatting, staging, or synchronization before the actual tests, so
         # the verification segment may begin after the bounded display label.

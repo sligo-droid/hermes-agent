@@ -94,6 +94,9 @@ _ENFORCED_VISUAL_QA_BLOCK_NOTICE = (
     "⚠️ **Completion blocked.** Enforced visual QA is active, and the work "
     "ledger did not authorize completion."
 )
+_GENERAL_COMPLETION_BLOCK_NOTICE = (
+    "⚠️ **Completion blocked.** The work ledger did not authorize completion."
+)
 
 
 def enforced_visual_qa_block_notice(item: Any) -> str:
@@ -110,8 +113,13 @@ def enforced_visual_qa_block_notice(item: Any) -> str:
     ):
         return ""
 
-    notice = _ENFORCED_VISUAL_QA_BLOCK_NOTICE
     reason = str(gate.get("reason") or item.get("blocked_reason") or "").strip()
+    visual = gate.get("visual_qa") if isinstance(gate.get("visual_qa"), dict) else {}
+    notice = (
+        _ENFORCED_VISUAL_QA_BLOCK_NOTICE
+        if reason.startswith("visual_qa_") or visual.get("enforced") is True
+        else _GENERAL_COMPLETION_BLOCK_NOTICE
+    )
     if reason:
         readable_reason = re.sub(r"\s+", " ", reason.replace("_", " ")).strip()
         if readable_reason:

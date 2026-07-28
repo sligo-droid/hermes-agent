@@ -2177,6 +2177,45 @@ def test_review_intent_with_observed_mutation_keeps_negative_evidence_gate(tmp_p
     assert stored["completion_gate"]["reason"] == "latest_verification_evidence_negative"
 
 
+def test_non_visual_verification_block_uses_generic_completion_notice(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Update only the requested documentation line.")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    assert item["visual_qa_requirement"]["level"] == "none"
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="PR checks passed; the PR was closed and main stayed unchanged.",
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "pr",
+                    "check_name": "gh pr view 1092 --json baseRefOid",
+                    "status": "failure",
+                    "order": 1,
+                    "detail": "Unknown JSON field: baseRefOid",
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["reason"] == "latest_verification_evidence_negative"
+    assert stored["final_response"].startswith(
+        "⚠️ **Completion blocked.** The work ledger did not authorize completion."
+    )
+    assert "Enforced visual QA is active" not in stored["final_response"]
+
+
 def test_uncommitted_changes_still_block_full_lifecycle_repo_work(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Implement the feature")
