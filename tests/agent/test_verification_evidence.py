@@ -480,6 +480,55 @@ def test_visual_receipt_rejects_invalid_assertion_or_stale_requirement():
     ) is None
 
 
+def test_orchestrated_uncertain_runner_receipt_is_persistable():
+    from agent.visual_assertions import (
+        normalize_orchestrated_visual_contract,
+        visual_execution_contract_id,
+    )
+
+    requirement = classify_visual_requirement(
+        "Build a responsive dashboard with a mobile sidebar.",
+        worker_route="action",
+    )
+    args = {
+        "target": {"description": "Dashboard hero", "locator": {"by": "css", "value": ".hero"}},
+        "page": {"state": "already_open", "description": "Authenticated dashboard"},
+        "viewport": {"description": "Desktop viewport"},
+        "state": ["Updated hero is rendered."],
+        "artifacts": [{"kind": "focused", "description": "Dashboard hero"}],
+        "assertions": [
+            {"kind": "text_present", "locator": {"by": "css", "value": ".hero"}, "text": "Updated copy"},
+            {"kind": "screenshot_appearance", "expectation": "The hero is balanced and readable."},
+        ],
+    }
+    contract = normalize_orchestrated_visual_contract(args)
+    receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": visual_execution_contract_id(contract),
+        "coverage_ids": [item["id"] for item in requirement["assertions"]],
+        "assertion_ids": [item["id"] for item in contract["assertions"]],
+        "status": "uncertain",
+        "attempts": 1,
+        "vision_calls": 2,
+        "duration_ms": 1804,
+        "diagnostic_codes": ["text_present", "vision_call_failed"],
+    }
+
+    classified = classify_tool_visual_receipt(
+        "visual_qa",
+        args,
+        {"status": "uncertain", "visual_qa_receipt": receipt},
+        False,
+        order=31,
+        requirement=requirement,
+    )
+
+    assert classified is not None
+    assert classified["status"] == "uncertain"
+    assert classified["vision_calls"] == 2
+    assert classified["order"] == 31
+
+
 def test_later_success_supersedes_earlier_failed_browser_check():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     fail = json.dumps({"output": "modal missing", "exit_code": 1, "error": None})
@@ -943,6 +992,53 @@ def test_authenticated_qa_success_supersedes_expected_login_boundary():
         "Authenticated production QA passed with no console or page errors.",
         agent._turn_runtime_stats["verification_evidence"],
     )["allowed"] is True
+
+
+def test_authenticated_browser_snapshot_supersedes_login_boundary_on_production_url():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    login_result = (
+        '<untrusted_tool_result source="browser_navigate">\n'
+        '{"success":true,"url":"https://pid.sligolabs.com/races/202",'
+        '"title":"Sign In to Races | Agora","snapshot":"Username Password Sign In"}\n'
+        "</untrusted_tool_result>"
+    )
+    large_snapshot = "Race detail " + ("content " * 200)
+    snapshot_result = (
+        '<untrusted_tool_result source="browser_snapshot">\n'
+        + json.dumps(
+            {
+                "success": True,
+                "snapshot": large_snapshot,
+                "frame_tree": {
+                    "top": {
+                        "url": "https://pid.sligolabs.com/races/202",
+                        "origin": "https://pid.sligolabs.com",
+                    }
+                },
+            }
+        )
+        + "\n</untrusted_tool_result>"
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "browser_navigate",
+        {"url": "https://pid.sligolabs.com/races/202"},
+        login_result,
+        False,
+    )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "browser_snapshot",
+        {"full": False},
+        snapshot_result,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert latest["browser"]["status"] == "success"
+    assert latest["production"]["status"] == "success"
+    assert latest["production_browser"]["status"] == "success"
 
 
 def test_authenticated_qa_requires_structured_success_payload():

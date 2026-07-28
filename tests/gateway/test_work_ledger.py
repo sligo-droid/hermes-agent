@@ -517,6 +517,39 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert "private/workspace" not in str(state)
 
 
+def test_resumed_turn_cannot_erase_prior_visual_mutation_boundary(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(
+        message_id="visual-restart-resume",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Restarting before visual QA.",
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=7,
+    )
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Resumed verification turn.",
+        visual_qa_code_mutation_observed=False,
+        visual_qa_min_receipt_order=0,
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["visual_qa_code_mutation_observed"] is True
+    assert stored["visual_qa_min_receipt_order"] == 7
+    assert stored["completion_gate"]["reason"] == "visual_qa_receipt_missing"
+
+
 def test_enforced_visual_qa_requires_a_fresh_post_edit_receipt(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     stale_event = _discord_event(
@@ -574,6 +607,37 @@ def test_enforced_visual_qa_requires_a_fresh_post_edit_receipt(tmp_path):
     assert fresh_stored["completion_gate"]["allowed_to_complete"] is True
     assert fresh_stored["completion_gate"]["visual_qa"]["status"] == "passed"
     assert fresh_stored["final_response"] == "Implemented the dashboard."
+
+
+def test_enforced_visual_qa_reports_uncertain_receipt_instead_of_missing(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(
+        message_id="uncertain-visual-receipt",
+        text="Build a responsive dashboard with a mobile sidebar.",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    assert item is not None
+    requirement = item["visual_qa_requirement"]
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Implemented the dashboard.",
+        visual_qa_receipts=[
+            _visual_receipt(requirement, order=3, status="uncertain")
+        ],
+        visual_qa_code_mutation_observed=True,
+        visual_qa_min_receipt_order=3,
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["visual_qa_receipts"][0]["status"] == "uncertain"
+    assert stored["completion_gate"]["reason"] == "visual_qa_receipt_uncertain"
+    assert "Gate reason: visual qa receipt uncertain." in stored["final_response"]
 
 
 def test_enforced_visual_qa_streamed_block_appends_notice_without_none(tmp_path):
@@ -1529,6 +1593,32 @@ def test_ledger_persists_all_bounded_confirmed_message_ids(tmp_path):
     stored = ledger.get(item["id"])
     assert stored["result_message_id"] == "chunk-1"
     assert stored["confirmed_message_ids"] == ["chunk-1", "chunk-2", "badid"]
+
+
+def test_ledger_accumulates_text_and_media_delivery_message_ids(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="delivery-media-ids")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    assert ledger.mark_response_delivered(
+        item["id"],
+        result_message_id="text-1",
+        confirmed_message_ids=("text-1",),
+    )
+    assert ledger.mark_response_delivered(
+        item["id"],
+        result_message_id="media-1",
+        confirmed_message_ids=("media-1", "media-2"),
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["result_message_id"] == "text-1"
+    assert stored["confirmed_message_ids"] == ["text-1", "media-1", "media-2"]
     assert stored["delivery_outcome"] == "delivered"
 
 

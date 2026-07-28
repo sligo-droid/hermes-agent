@@ -2834,7 +2834,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -2849,6 +2849,7 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        results: list[SendResult] = []
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -2882,8 +2883,23 @@ class BasePlatformAdapter(ABC):
                     )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                results.append(img_result)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                results.append(SendResult(success=False, error=str(img_err), retry_safe=False))
+        confirmed_ids = tuple(
+            message_id
+            for result in results
+            for message_id in get_confirmed_message_ids(result)
+        )
+        failed = next((result for result in results if not result.success), None)
+        return SendResult(
+            success=failed is None,
+            message_id=confirmed_ids[0] if confirmed_ids else None,
+            confirmed_message_ids=confirmed_ids,
+            error=str(failed.error or "") if failed is not None else None,
+            retry_safe=False if confirmed_ids or failed is not None else True,
+        )
 
     async def send_image(
         self,
@@ -5111,13 +5127,17 @@ class BasePlatformAdapter(ABC):
                         # just as the text path above does, so a stale adapter
                         # cannot silently drop its evidence files.
                         delivery_adapter = self._final_delivery_adapter(event.source)
-                        await delivery_adapter.send_multiple_images(
+                        batch_result = await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
-                        _record_delivery(SendResult(success=True))
+                        _record_delivery(
+                            batch_result
+                            if isinstance(batch_result, SendResult)
+                            else SendResult(success=True)
+                        )
                     except Exception as batch_err:
                         _record_delivery(
                             SendResult(
@@ -5162,13 +5182,17 @@ class BasePlatformAdapter(ABC):
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
                         delivery_adapter = self._final_delivery_adapter(event.source)
-                        await delivery_adapter.send_multiple_images(
+                        batch_result = await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
-                        _record_delivery(SendResult(success=True))
+                        _record_delivery(
+                            batch_result
+                            if isinstance(batch_result, SendResult)
+                            else SendResult(success=True)
+                        )
                     except Exception as batch_err:
                         _record_delivery(
                             SendResult(
