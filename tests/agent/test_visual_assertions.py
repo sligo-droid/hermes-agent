@@ -150,6 +150,18 @@ def test_orchestrated_contract_preserves_rich_semantics_only_transiently():
     assert "issue-attention-graph" not in serialized
 
 
+def test_orchestrated_contract_omits_diagnostics_without_host_cursor():
+    raw = _incident_contract()
+    raw["assertions"].append({"kind": "no_new_diagnostics"})
+
+    normalized = normalize_orchestrated_visual_contract(raw)
+
+    assert [item["kind"] for item in normalized["assertions"]] == [
+        "screenshot_appearance",
+        "screenshot_appearance",
+    ]
+
+
 def test_orchestrated_contract_deduplicates_and_bounds_screenshot_artifacts():
     raw = _incident_contract()
     raw["artifacts"] = [

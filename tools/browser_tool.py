@@ -3405,6 +3405,25 @@ def browser_authenticate(
             return json.dumps(
                 {"success": False, "error": "The task browser does not support protected authentication."}
             )
+        # agent-browser can open navigation in a second page target while the
+        # trusted supervisor remains attached to its initial blank page. Use
+        # the CLI-owned session URL to align the supervisor before reading the
+        # origin or injecting credentials.
+        url_result = _run_browser_command(
+            effective_task_id,
+            "eval",
+            ["window.location.href"],
+            timeout=10,
+        )
+        if url_result.get("success"):
+            current_url = (
+                str(url_result.get("data", {}).get("result") or "")
+                .strip()
+                .strip('"')
+                .strip("'")
+            )
+            if current_url:
+                supervisor.select_page(current_url)
         current = supervisor.current_origin()
         if not current.get("ok"):
             return json.dumps({"success": False, "error": current.get("error")})

@@ -31,11 +31,55 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import websockets
 from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
+
+
+def _http_origin(value: Any) -> str:
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return ""
+        host = parsed.hostname.lower()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme.lower()}://{host}{port}"
+    except ValueError:
+        return ""
+
+
+def _preferred_page_target(
+    targets: Any,
+    *,
+    expected_url: str = "",
+) -> Optional[Dict[str, Any]]:
+    source = targets if isinstance(targets, list) else []
+    pages = [
+        item
+        for item in source if isinstance(item, dict)
+        and item.get("type") == "page"
+    ]
+    if not pages:
+        return None
+    expected = str(expected_url or "").strip()
+    expected_origin = _http_origin(expected)
+    if expected:
+        exact = next((item for item in pages if str(item.get("url") or "") == expected), None)
+        if exact is not None:
+            return exact
+    if expected_origin:
+        matching = next(
+            (item for item in pages if _http_origin(item.get("url")) == expected_origin),
+            None,
+        )
+        if matching is not None:
+            return matching
+    return next((item for item in pages if _http_origin(item.get("url"))), pages[0])
 
 
 def _guarded_timeout(execution_guard: Any, timeout: float) -> float:
@@ -352,6 +396,7 @@ class CDPSupervisor:
         self._pending_calls: Dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
+        self._page_target_id: Optional[str] = None
         self._child_sessions: Dict[str, Dict[str, Any]] = {}  # session_id -> info
 
         # Dialog auto-dismiss watchdog handles (per dialog id).
@@ -636,6 +681,29 @@ class CDPSupervisor:
         if not isinstance(origin, str) or not origin:
             return {"ok": False, "error": "current browser origin is unavailable"}
         return {"ok": True, "origin": origin}
+
+    def select_page(self, url: str, *, timeout: float = 10.0) -> bool:
+        """Attach the trusted supervisor to the page matching ``url``."""
+
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return False
+        expected_origin = _http_origin(url)
+        if not expected_origin:
+            return False
+
+        from agent.async_utils import safe_schedule_threadsafe
+
+        future = safe_schedule_threadsafe(
+            self._select_page_target(url),
+            loop,
+        )
+        if future is None:
+            return False
+        try:
+            return bool(future.result(timeout=timeout + 1))
+        except Exception:
+            return False
 
     def authenticate_form(
         self,
@@ -1207,6 +1275,7 @@ class CDPSupervisor:
                 # Reset per-connection session state so stale ids don't hang
                 # around after a reconnect.
                 self._page_session_id = None
+                self._page_target_id = None
                 self._child_sessions.clear()
                 # We deliberately keep `_pending_dialogs` and `_frames` —
                 # they're reconciled as the supervisor resubscribes and
@@ -1269,30 +1338,58 @@ class CDPSupervisor:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
         resp = await self._cdp("Target.getTargets")
         targets = resp.get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        page_target = _preferred_page_target(targets)
         if page_target is None:
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
             target_id = created["result"]["targetId"]
         else:
             target_id = page_target["targetId"]
 
+        await self._attach_page_target(target_id)
+
+    async def _select_page_target(self, url: str) -> bool:
+        response = await self._cdp("Target.getTargets")
+        targets = response.get("result", {}).get("targetInfos", [])
+        target = _preferred_page_target(targets, expected_url=url)
+        if target is None:
+            return False
+        target_id = str(target.get("targetId") or "")
+        if not target_id:
+            return False
+        if target_id == self._page_target_id:
+            return True
+        await self._attach_page_target(target_id)
+        return True
+
+    async def _attach_page_target(self, target_id: str) -> None:
+        previous_session = self._page_session_id
         attach = await self._cdp(
             "Target.attachToTarget",
             {"targetId": target_id, "flatten": True},
         )
-        self._page_session_id = attach["result"]["sessionId"]
-        await self._cdp("Page.enable", session_id=self._page_session_id)
-        await self._cdp("Runtime.enable", session_id=self._page_session_id)
+        new_session = attach["result"]["sessionId"]
+        await self._cdp("Page.enable", session_id=new_session)
+        await self._cdp("Runtime.enable", session_id=new_session)
         await self._cdp(
             "Target.setAutoAttach",
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
-            session_id=self._page_session_id,
+            session_id=new_session,
         )
         # Install the dialog bridge — overrides native alert/confirm/prompt with
         # a synchronous XHR we intercept via Fetch domain. This is how we make
         # dialog response work on Browserbase (whose CDP proxy auto-dismisses
         # real native dialogs before we can call handleJavaScriptDialog).
-        await self._install_dialog_bridge(self._page_session_id)
+        await self._install_dialog_bridge(new_session)
+        self._page_session_id = new_session
+        self._page_target_id = target_id
+        if previous_session and previous_session != new_session:
+            try:
+                await self._cdp(
+                    "Target.detachFromTarget",
+                    {"sessionId": previous_session},
+                )
+            except Exception:
+                pass
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session.

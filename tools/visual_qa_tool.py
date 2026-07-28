@@ -46,7 +46,8 @@ VISUAL_QA_SCHEMA = {
         "with its exact required kind only for a legacy requirement; new orchestrator-owned "
         "contracts receive host-generated opaque assertion IDs. Missing, duplicate, substituted, "
         "unrelated, or incomplete coverage is rejected. Only an explicit passed receipt satisfies an enforced visual gate; "
-        "failed, blocked, uncertain, malformed, and timed-out checks do not."
+        "failed, blocked, uncertain, malformed, and timed-out checks do not. Include "
+        "`no_new_diagnostics` only when a browser tool returned an exact host-issued diagnostic cursor."
     ),
     "parameters": {
         "type": "object",
@@ -132,6 +133,10 @@ VISUAL_QA_SCHEMA = {
                             "type": "string",
                             "pattern": "^dcur_[0-9]+_[0-9a-f]{24}$",
                             "maxLength": 96,
+                            "description": (
+                                "Exact host-issued diagnostic cursor from the active browser. "
+                                "Omit the no_new_diagnostics assertion when no cursor was returned."
+                            ),
                         },
                     },
                     "required": ["kind"],

@@ -359,10 +359,19 @@ def normalize_orchestrated_visual_contract(
 
     assertions: list[dict[str, Any]] = []
     seen_payloads: set[str] = set()
-    for index, raw_value in enumerate(raw_assertions):
+    for raw_value in raw_assertions:
         raw_assertion = raw_value if isinstance(raw_value, dict) else {}
         kind = str(raw_assertion.get("kind") or "").strip().lower()
         candidate = dict(raw_assertion)
+        # A diagnostics assertion is executable only with a host-issued cursor
+        # from the active browser supervisor. Models frequently include this
+        # optional check by habit after repository-native screenshot QA, where
+        # no cursor exists. Omit that unavailable auxiliary assertion instead
+        # of invalidating an otherwise complete appearance contract.
+        if kind == "no_new_diagnostics" and not _DIAGNOSTIC_CURSOR_RE.fullmatch(
+            str(candidate.get("cursor") or "").strip().lower()
+        ):
+            continue
         # Locators on page-wide text and appearance checks are harmless but not
         # consumed by their executors; the target/artifact contract owns capture
         # scope.  The tool schema exposes locator uniformly, so discard it here
@@ -395,7 +404,7 @@ def normalize_orchestrated_visual_contract(
         seen_payloads.add(payload)
         item["id"] = _opaque_contract_id(
             "vassert",
-            {"ordinal": index, "assertion": item},
+            {"ordinal": len(assertions), "assertion": item},
         )
         assertions.append({"id": item.pop("id"), **item})
     if not any(item["kind"] == "screenshot_appearance" for item in assertions):

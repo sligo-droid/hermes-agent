@@ -10,7 +10,7 @@ from tools.browser_auth_profiles import (
     load_browser_auth_credentials,
     select_browser_auth_profile,
 )
-from tools.browser_supervisor import CDPSupervisor
+from tools.browser_supervisor import CDPSupervisor, _preferred_page_target
 from tools.registry import registry
 
 
@@ -31,6 +31,23 @@ def _profile_config(env_file):
             }
         }
     }
+
+
+def test_supervisor_prefers_navigated_page_over_initial_blank_target():
+    targets = [
+        {"targetId": "blank", "type": "page", "url": "about:blank"},
+        {
+            "targetId": "pid",
+            "type": "page",
+            "url": "https://pid.sligolabs.com/login",
+        },
+    ]
+
+    assert _preferred_page_target(targets)["targetId"] == "pid"
+    assert _preferred_page_target(
+        targets,
+        expected_url="https://pid.sligolabs.com/",
+    )["targetId"] == "pid"
 
 
 def test_profile_loads_private_hermes_secret_without_exposing_values(
@@ -154,6 +171,9 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
 
 def test_browser_authenticate_returns_only_profile_metadata(monkeypatch):
     class FakeSupervisor:
+        def select_page(self, url):
+            return True
+
         def current_origin(self):
             return {"ok": True, "origin": "https://pid.sligolabs.com"}
 
@@ -180,6 +200,11 @@ def test_browser_authenticate_returns_only_profile_metadata(monkeypatch):
     monkeypatch.setattr(browser_tool, "_last_session_key", lambda task_id: task_id)
     monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda task_id: None)
     monkeypatch.setattr(
+        browser_tool,
+        "_run_browser_command",
+        lambda *args, **kwargs: {"success": False},
+    )
+    monkeypatch.setattr(
         browser_supervisor.SUPERVISOR_REGISTRY,
         "get",
         lambda task_id: FakeSupervisor(),
@@ -204,6 +229,75 @@ def test_browser_authenticate_returns_only_profile_metadata(monkeypatch):
         "already_authenticated": False,
     }
     assert "top-secret-password" not in json.dumps(result)
+
+
+def test_browser_authenticate_retargets_supervisor_to_navigated_page(monkeypatch):
+    class FakeSupervisor:
+        def __init__(self):
+            self.current = "null"
+            self.selected_urls = []
+
+        def select_page(self, url):
+            self.selected_urls.append(url)
+            self.current = "https://pid.sligolabs.com"
+            return True
+
+        def current_origin(self):
+            return {"ok": True, "origin": self.current}
+
+        def authenticate_form(self, **kwargs):
+            return {"ok": True, "authenticated": True, "already_authenticated": False}
+
+    from tools import browser_auth_profiles
+    from tools import browser_supervisor
+
+    supervisor = FakeSupervisor()
+    profile = type(
+        "Profile",
+        (),
+        {
+            "name": "pid_hermes_qa",
+            "username_selector": "#user",
+            "password_selector": "#pass",
+            "submit_selector": "button",
+            "success_selector": "#header",
+            "timeout_s": 5,
+        },
+    )()
+    monkeypatch.setattr(browser_tool, "_last_session_key", lambda task_id: task_id)
+    monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda task_id: None)
+    monkeypatch.setattr(
+        browser_tool,
+        "_run_browser_command",
+        lambda *args, **kwargs: {
+            "success": True,
+            "data": {"result": '"https://pid.sligolabs.com/"'},
+        },
+    )
+    monkeypatch.setattr(
+        browser_supervisor.SUPERVISOR_REGISTRY,
+        "get",
+        lambda task_id: supervisor,
+    )
+    monkeypatch.setattr(
+        browser_auth_profiles,
+        "select_browser_auth_profile",
+        lambda origin, requested_name="": (
+            profile
+            if origin == "https://pid.sligolabs.com"
+            else (_ for _ in ()).throw(BrowserAuthProfileError("invalid origin"))
+        ),
+    )
+    monkeypatch.setattr(
+        browser_auth_profiles,
+        "load_browser_auth_credentials",
+        lambda selected: ("hermes_qa", "top-secret-password"),
+    )
+
+    result = json.loads(browser_tool.browser_authenticate(task_id="visual-turn"))
+
+    assert result["success"] is True
+    assert supervisor.selected_urls == ["https://pid.sligolabs.com/"]
 
 
 def test_browser_authenticate_schema_exposes_only_an_opaque_profile_name():
