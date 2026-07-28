@@ -870,6 +870,50 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
     return expanded
 
 
+def _resolve_requested_child_toolsets(
+    requested_toolsets: List[str], parent_toolsets: set[str]
+) -> tuple[List[str], List[str]]:
+    """Resolve requested toolsets without silently weakening posture bundles.
+
+    Posture toolsets such as ``coding`` are broader aliases rather than
+    independently configured platform capabilities. Expand them into the
+    concrete toolsets the parent actually owns. Return any requests that could
+    not grant a usable child capability so callers can fail before launch.
+    """
+    import model_tools
+
+    expanded_parent = _expand_parent_toolsets(parent_toolsets)
+    resolved: List[str] = []
+    unavailable: List[str] = []
+
+    for requested in requested_toolsets:
+        name = str(requested or "").strip()
+        if not name:
+            continue
+        if name in expanded_parent:
+            resolved.append(name)
+            continue
+
+        definition = TOOLSETS.get(name)
+        if not definition or not definition.get("posture"):
+            unavailable.append(name)
+            continue
+
+        posture_matches = []
+        for tool_name in definition.get("tools") or ():
+            toolset_name = model_tools.get_toolset_for_tool(tool_name)
+            if toolset_name in expanded_parent:
+                posture_matches.append(toolset_name)
+        posture_matches = _strip_blocked_tools(list(dict.fromkeys(posture_matches)))
+        if posture_matches:
+            resolved.extend(posture_matches)
+        else:
+            unavailable.append(name)
+
+    resolved = _strip_blocked_tools(list(dict.fromkeys(resolved)))
+    return resolved, unavailable
+
+
 def _preserve_parent_mcp_toolsets(
     child_toolsets: List[str], parent_toolsets: set[str]
 ) -> List[str]:
@@ -996,6 +1040,11 @@ def _build_child_system_prompt(
             "raw coding-worker delegation, and other mutation "
             "paths are blocked. Do not claim that you changed files. Read-only "
             "mode propagates to every delegate_task child you create."
+        )
+        parts.append(
+            "\nFor local codebase work, begin with read_file/search_files against "
+            "the provided or discovered workspace path. Do not use browser or public "
+            "dev-server URLs as a substitute for local source inspection."
         )
     elif brokered_coding:
         parts.append(
@@ -1453,15 +1502,15 @@ def _build_child_agent(
 
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
-        # Expand composite toolsets (e.g. hermes-cli) so that individual
-        # toolset names (e.g. web, terminal) are recognised during intersection.
-        expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = [t for t in toolsets if t in expanded_parent]
+        # Posture aliases such as ``coding`` expand to the concrete capabilities
+        # already owned by the parent rather than disappearing at intersection.
+        child_toolsets, _unavailable = _resolve_requested_child_toolsets(
+            toolsets, parent_toolsets
+        )
         if _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
         child_toolsets = _strip_blocked_tools(parent_enabled)
     elif parent_toolsets:
@@ -2315,9 +2364,11 @@ def _run_single_child(
         # when the child's API call or tool-level HTTP request hangs.
         from agent.worker_budget import remaining_nested_worker_budget
 
-        child_timeout = remaining_nested_worker_budget(
-            parent_agent,
-            _get_child_timeout(),
+        requested_timeout = _get_child_timeout()
+        child_timeout = (
+            requested_timeout
+            if _kwargs.get("ignore_parent_deadline")
+            else remaining_nested_worker_budget(parent_agent, requested_timeout)
         )
         if child_timeout <= 0:
             duration = round(time.monotonic() - child_start, 2)
@@ -2876,6 +2927,7 @@ def _execute_background_children(
                 child,
                 parent_agent,
                 parent_task_id=accounting_context.get("parent_task_id"),
+                ignore_parent_deadline=True,
             )
         ]
     else:
@@ -2891,6 +2943,7 @@ def _execute_background_children(
                     child=child,
                     parent_agent=parent_agent,
                     parent_task_id=accounting_context.get("parent_task_id"),
+                    ignore_parent_deadline=True,
                 ): index
                 for index, task, child in children
             }
@@ -3265,6 +3318,40 @@ def delegate_task(
             task.get("model_tier") if "model_tier" in task else model_tier
         )
         task["purpose"] = task.get("purpose") if "purpose" in task else purpose
+        requested_task_toolsets = task.get("toolsets") or toolsets
+        if requested_task_toolsets:
+            if not isinstance(requested_task_toolsets, list):
+                return tool_error(f"Task {i}: toolsets must be an array of names.")
+            parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+            if parent_enabled is not None:
+                parent_toolsets = set(parent_enabled)
+            elif hasattr(parent_agent, "valid_tool_names"):
+                import model_tools
+
+                parent_toolsets = {
+                    toolset_name
+                    for tool_name in parent_agent.valid_tool_names
+                    if (
+                        toolset_name := model_tools.get_toolset_for_tool(tool_name)
+                    )
+                    is not None
+                }
+            else:
+                parent_toolsets = set(DEFAULT_TOOLSETS)
+            resolved_toolsets, unavailable_toolsets = _resolve_requested_child_toolsets(
+                requested_task_toolsets, parent_toolsets
+            )
+            if unavailable_toolsets:
+                return tool_error(
+                    f"Task {i}: requested toolsets are unavailable to the parent: "
+                    f"{', '.join(unavailable_toolsets)}. No child was launched."
+                )
+            if not resolved_toolsets:
+                return tool_error(
+                    f"Task {i}: requested toolsets grant no usable child tools. "
+                    "No child was launched."
+                )
+            task["toolsets"] = resolved_toolsets
         grant_error = _nested_coding_grant_error(
             requested=bool(task["allow_nested_coding"]),
             background=background_requested,
@@ -3275,6 +3362,32 @@ def delegate_task(
         )
         if grant_error:
             return tool_error(f"Task {i}: {grant_error}")
+
+    # A reserved deep review commonly has a larger configured worker budget
+    # than a gateway turn can synchronously hold open. Detach it when async
+    # delivery is available rather than guaranteeing a parent-deadline failure.
+    # Explicit background=false remains synchronous for ordinary delegations.
+    if not background and all(bool(task.get("read_only")) for task in task_list):
+        has_deep_review = any(
+            str(task.get("model_tier") or "").strip().lower() == "deep_review"
+            for task in task_list
+        )
+        if has_deep_review:
+            requested_timeout = _get_child_timeout()
+            remaining_timeout = remaining_nested_worker_budget(
+                parent_agent, requested_timeout
+            )
+            if (
+                remaining_timeout < requested_timeout
+                and not _background_context_error(parent_agent)
+            ):
+                logger.info(
+                    "Auto-detaching read-only deep_review delegation: child timeout "
+                    "%.1fs exceeds remaining parent-turn budget %.1fs",
+                    requested_timeout,
+                    remaining_timeout,
+                )
+                background = True
 
     if background and not all(bool(task.get("read_only")) for task in task_list):
         return tool_error(
