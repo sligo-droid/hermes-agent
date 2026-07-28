@@ -188,6 +188,40 @@ def test_discord_acceptance_applies_repository_visual_override(tmp_path, monkeyp
     ) == {}
 
 
+def test_discord_reacceptance_promotes_stale_shadow_visual_config(tmp_path, monkeypatch):
+    config = {"agent": {"visual_qa": {"mode": "shadow"}}}
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "ledger.json")
+    source = _source(tmp_path)
+    source.project_github_url = "https://github.com/acme/pid"
+    event = MessageEvent(
+        text="Build a responsive dashboard with a mobile sidebar.",
+        source=source,
+        message_id="repo-visual-promotion",
+        discord_runtime_mode="action",
+    )
+    session_key = "agent:main:discord:thread:thread-123"
+
+    first = runner._accept_discord_work_item(event, session_key)
+    assert first["visual_qa_config"]["mode"] == "shadow"
+    config["closeout"] = {
+        "repositories": {
+            "acme/pid": {"visual_qa": {"mode": "enforce_explicit"}}
+        }
+    }
+    replay = MessageEvent(
+        text=event.text,
+        source=source,
+        message_id=event.message_id,
+        discord_runtime_mode="action",
+    )
+    second = runner._accept_discord_work_item(replay, session_key)
+
+    assert second["visual_qa_config"]["mode"] == "enforce_explicit"
+    assert replay.visual_qa_config["mode"] == "enforce_explicit"
+
+
 def test_action_worktree_warmup_config_defaults():
     discord = DEFAULT_CONFIG["discord"]
 

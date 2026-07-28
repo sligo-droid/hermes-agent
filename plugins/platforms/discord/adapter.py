@@ -285,6 +285,7 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
     classify_send_error,
+    get_confirmed_message_ids,
     merge_discord_action_request_metadata,
     cache_image_from_url,
     cache_image_from_bytes,
@@ -6458,6 +6459,25 @@ class DiscordAdapter(BasePlatformAdapter):
             if summary_thread is None:
                 return None
 
+            try:
+                source_messages = await self._feature_summary_source_reaction_messages(
+                    feature_summary,
+                    summary_thread,
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to resolve Discord feature-summary source for %s",
+                    self.name,
+                    item.get("id"),
+                    exc_info=True,
+                )
+                return None
+            if not source_messages:
+                return None
+            for message in source_messages:
+                if not await self._set_message_reaction_state(message, emoji):
+                    return None
+
             summary_message_id = str(feature_summary.get("message_id") or "").strip()
             fetch_summary = getattr(summary_thread, "fetch_message", None)
             if not summary_message_id.isdigit() or not callable(fetch_summary):
@@ -6505,25 +6525,6 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 return None
 
-            try:
-                source_messages = await self._feature_summary_source_reaction_messages(
-                    feature_summary,
-                    summary_thread,
-                    summary_message=summary_message,
-                )
-            except Exception:
-                logger.debug(
-                    "[%s] Failed to resolve Discord feature-summary source for %s",
-                    self.name,
-                    item.get("id"),
-                    exc_info=True,
-                )
-                return None
-            if not source_messages:
-                return None
-            for message in source_messages:
-                if not await self._set_message_reaction_state(message, emoji):
-                    return None
         else:
             message = None
             if thread_id:
@@ -7854,7 +7855,7 @@ class DiscordAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Discord message with multiple attachments.
 
         Discord permits up to 10 file attachments per message. Batches are
@@ -7865,17 +7866,16 @@ class DiscordAdapter(BasePlatformAdapter):
         fall back to the base per-image loop.
         """
         if not self._client:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=True)
 
         try:
             import discord as _discord_mod
             import io as _io
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         try:
             channel = self._client.get_channel(int(chat_id))
@@ -7883,15 +7883,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
-                return
+                return SendResult(success=False, error=f"Channel {chat_id} not found")
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        message_ids: List[str] = []
+        failures: List[str] = []
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -7955,26 +7956,42 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    result = await self._forum_post_file(
                         channel,
                         content=(content or "").strip(),
                         files=files,
                     )
+                    message_ids.extend(get_confirmed_message_ids(result))
+                    if not result.success:
+                        failures.append(str(result.error or "forum image send failed"))
                 else:
-                    await channel.send(content=content, files=files)
+                    sent = await channel.send(content=content, files=files)
+                    message_ids.append(str(sent.id))
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                result = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                message_ids.extend(get_confirmed_message_ids(result))
+                if not result.success:
+                    failures.append(str(result.error or e))
             finally:
                 if aiohttp_session is not None:
                     try:
                         await aiohttp_session.close()
                     except Exception:
                         pass
+        return SendResult(
+            success=not failures,
+            message_id=message_ids[0] if message_ids else None,
+            confirmed_message_ids=tuple(message_ids),
+            error="; ".join(failures) or None,
+            retry_safe=False if message_ids or failures else True,
+        )
 
     async def play_tts(
         self,

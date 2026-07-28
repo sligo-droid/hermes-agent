@@ -821,7 +821,29 @@ def classify_tool_verification_evidence(
     name = str(tool_name or "")
     args = tool_args if isinstance(tool_args, dict) else {}
     data = _json_object(result)
-    full_result_text = str(data.get("output") or data.get("error") or result or "")
+    if name.startswith("browser") and not data:
+        data = _last_embedded_json_object(result)
+    if name.startswith("browser") and data:
+        frame_top = (
+            data.get("frame_tree", {}).get("top", {})
+            if isinstance(data.get("frame_tree"), dict)
+            else {}
+        )
+        full_result_text = json.dumps(
+            {
+                "url": data.get("url") or frame_top.get("url"),
+                "origin": frame_top.get("origin"),
+                "title": data.get("title"),
+                "snapshot": data.get("snapshot"),
+                "analysis": data.get("analysis"),
+                "success": data.get("success"),
+                "ok": data.get("ok"),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    else:
+        full_result_text = str(data.get("output") or data.get("error") or result or "")
     result_text = _text(full_result_text)
     raw_check_name = str(args.get("command") or args.get("url") or args.get("route") or name)
     check_name = _text(raw_check_name, limit=160)

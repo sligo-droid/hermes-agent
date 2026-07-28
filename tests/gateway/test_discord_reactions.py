@@ -1780,6 +1780,63 @@ async def test_expired_work_reconciliation_fetches_thread_origin_without_raw_mes
 
 
 @pytest.mark.asyncio
+async def test_terminal_reconciliation_repairs_op_even_when_summary_is_unavailable(
+    adapter,
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1000",
+        chat_type="thread",
+        thread_id="1000",
+        parent_chat_id="55",
+        guild_id="77",
+        message_id="1000",
+    )
+    event = MessageEvent(
+        text="Implement the dashboard repair",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="1000",
+        feature_summary={
+            "thread_id": "1000",
+            "message_id": "2000",
+            "source_message_id": "1000",
+        },
+        discord_runtime_mode="action",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    assert ledger.mark_agent_done(item["id"], final_response="Done.")
+    assert ledger.mark_completed(item["id"])
+
+    origin_message = SimpleNamespace(
+        id=1000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="⏳", me=True)],
+    )
+    parent = SimpleNamespace(id=55, fetch_message=AsyncMock(return_value=origin_message))
+    thread = _StatusThread(thread_id=1000, name="Build dashboard")
+    thread.parent = parent
+    thread.parent_id = 55
+    thread.fetch_message = AsyncMock(side_effect=LookupError("summary unavailable"))
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+    adapter.gateway_runner = SimpleNamespace(work_ledger=ledger)
+
+    state = await adapter.reconcile_work_ledger_thread_reaction(item)
+
+    assert state is None
+    origin_message.add_reaction.assert_awaited_once_with("✅")
+    assert ledger.get(item["id"])["terminal_reaction_sync_pending"] is True
+
+
+@pytest.mark.asyncio
 async def test_terminal_reconciliation_repairs_summary_embed_and_source_post(
     adapter,
     tmp_path,

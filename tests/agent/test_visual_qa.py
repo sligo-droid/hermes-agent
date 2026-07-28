@@ -45,6 +45,20 @@ def test_classifier_recognizes_explicit_artifact_and_surface_work():
     assert surface["assertions"][0]["kind"] == "orchestrator_contract"
 
 
+def test_visual_receipt_preserves_two_bounded_vision_calls():
+    requirement = classify_visual_requirement(
+        "Build a responsive dashboard with a mobile sidebar.",
+        worker_route="action",
+    )
+    receipt = _receipt(requirement, status="uncertain")
+    receipt["vision_calls"] = 2
+
+    sanitized = sanitize_visual_receipt(receipt, requirement=requirement)
+
+    assert sanitized is not None
+    assert sanitized["vision_calls"] == 2
+
+
 def test_classifier_excludes_review_only_work():
     assert classify_visual_requirement("Review this screenshot and explain the current layout.")["level"] == "none"
     assert classify_visual_requirement("Document the PNG export format.")["level"] == "none"

@@ -433,6 +433,42 @@ caption
 
         assert tags == ["MEDIA:/tmp/qa/context.png"]
 
+    def test_gateway_only_attaches_latest_visual_qa_retry_artifacts(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = []
+        attempts = [
+            ("qa1", ["/tmp/qa/old-focused.png", "/tmp/qa/old-context.png"]),
+            ("qa2", ["/tmp/qa/retry-focused.png", "/tmp/qa/retry-context.png"]),
+            ("qa3", ["/tmp/qa/latest-focused.png"]),
+        ]
+        for call_id, paths in attempts:
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": call_id, "function": {"name": "visual_qa"}}],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(
+                            {
+                                "status": "uncertain",
+                                "screenshot_artifacts": [
+                                    {"kind": "focused" if index == 0 else "context", "screenshot_path": path}
+                                    for index, path in enumerate(paths)
+                                ],
+                            }
+                        ),
+                    },
+                ]
+            )
+
+        tags, _ = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == ["MEDIA:/tmp/qa/latest-focused.png"]
+
     @pytest.mark.asyncio
     async def test_visual_qa_artifacts_batch_through_existing_media_delivery(
         self,

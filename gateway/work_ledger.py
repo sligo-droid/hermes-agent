@@ -4868,6 +4868,30 @@ class GatewayWorkLedger:
         return dict(item)
 
     @_locked_ledger_mutation
+    def promote_visual_qa_config(
+        self,
+        work_id: str,
+        config: Any,
+        *,
+        expected_run_state: Any = _RUN_STATE_UNSET,
+    ) -> dict[str, Any] | None:
+        """Promote a stale durable visual policy without weakening it."""
+
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict) or not _run_state_matches(item, expected_run_state):
+            return None
+        current = normalize_visual_qa_config(item.get("visual_qa_config"))
+        candidate = normalize_visual_qa_config(config)
+        rank = {"off": 0, "shadow": 1, "enforce_explicit": 2}
+        if rank[candidate["mode"]] <= rank[current["mode"]]:
+            return dict(item)
+        item["visual_qa_config"] = candidate
+        item["updated_at"] = self._now()
+        self._write(data)
+        return dict(item)
+
+    @_locked_ledger_mutation
     def mark_agent_done(
         self,
         work_id: str,
@@ -4936,12 +4960,18 @@ class GatewayWorkLedger:
                 limit=visual_config["max_receipts_per_turn"],
             )
         if visual_qa_code_mutation_observed is not None:
-            item["visual_qa_code_mutation_observed"] = bool(visual_qa_code_mutation_observed)
+            item["visual_qa_code_mutation_observed"] = bool(
+                item.get("visual_qa_code_mutation_observed") is True
+                or visual_qa_code_mutation_observed
+            )
         if visual_qa_min_receipt_order is not None:
             min_order = _positive_int(visual_qa_min_receipt_order)
             if min_order:
-                item["visual_qa_min_receipt_order"] = min_order
-            else:
+                item["visual_qa_min_receipt_order"] = max(
+                    min_order,
+                    _positive_int(item.get("visual_qa_min_receipt_order")),
+                )
+            elif not _positive_int(item.get("visual_qa_min_receipt_order")):
                 item.pop("visual_qa_min_receipt_order", None)
         _record_provider_progress(item, f"ledger_status_{item['status']}", status=str(item["status"]))
         gate = classify_delivery_completion(item)
@@ -5049,13 +5079,23 @@ class GatewayWorkLedger:
         item["delivery_outcome"] = "delivered"
         item.pop("delivery_attempt", None)
         item.pop("delivery_uncertain_at", None)
-        confirmed_ids = _bounded_delivery_message_ids(
+        existing_confirmed = _bounded_delivery_message_ids(
+            item.get("confirmed_message_ids"),
+            primary=item.get("result_message_id"),
+        )
+        new_confirmed = _bounded_delivery_message_ids(
             confirmed_message_ids,
             primary=result_message_id,
         )
+        confirmed_ids = _bounded_delivery_message_ids(
+            (*existing_confirmed, *new_confirmed),
+            primary=item.get("result_message_id") or result_message_id,
+        )
         if confirmed_ids:
             item["confirmed_message_ids"] = list(confirmed_ids)
-        primary_ids = _bounded_delivery_message_ids((result_message_id,))
+        primary_ids = _bounded_delivery_message_ids(
+            (item.get("result_message_id") or result_message_id,)
+        )
         message_id = primary_ids[0] if primary_ids else confirmed_ids[0] if confirmed_ids else ""
         if message_id:
             item["result_message_id"] = message_id
