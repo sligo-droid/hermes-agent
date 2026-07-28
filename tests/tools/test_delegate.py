@@ -1539,6 +1539,69 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         self.assertIn("unknown model_tier 'missing'", result["error"])
         MockAgent.assert_not_called()
 
+    def test_deep_review_requires_explicit_human_request(self):
+        parent = _make_mock_parent()
+        parent._human_deep_review_requested = False
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    goal="Audit the architecture",
+                    model_tier="deep_review",
+                    read_only=True,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("requires the human's current message", result["error"])
+        MockAgent.assert_not_called()
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_deep_review_human_request_launches_sol_xhigh(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+        parent = _make_mock_parent()
+        parent._human_deep_review_requested = True
+
+        with patch("tools.delegate_tool._load_config", return_value=self._tier_config()), \
+             patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            delegate_task(
+                goal="Perform the requested deep review",
+                model_tier="deep_review",
+                read_only=True,
+                parent_agent=parent,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+
+    def test_nested_orchestrator_cannot_select_deep_review(self):
+        parent = _make_mock_parent(depth=1)
+        parent._human_deep_review_requested = True
+        cfg = self._tier_config(max_spawn_depth=2)
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+             patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    goal="Delegate another deep review",
+                    model_tier="deep_review",
+                    read_only=True,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("root human turn", result["error"])
+        MockAgent.assert_not_called()
+
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     @patch("tools.delegate_tool._run_single_child")
     def test_visual_purpose_selects_provider_model_and_effort(

@@ -1208,6 +1208,10 @@ def run_conversation(
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
+    human_request_text = _summarize_user_message_for_log(original_user_message).lower()
+    agent._human_deep_review_requested = bool(
+        re.search(r"\bxhigh\b|\bdeep[\s_-]+review\b", human_request_text)
+    )
     messages = _ctx.messages
     conversation_history = _ctx.conversation_history
     active_system_prompt = _ctx.active_system_prompt
