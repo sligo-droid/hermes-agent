@@ -120,6 +120,17 @@ def test_visual_tiers_are_outside_the_steppable_ladder():
         assert resolve_adjacent_model_tier({}, name, -1) is None
 
 
+def test_deep_review_is_reserved_sol_xhigh_outside_the_ladder():
+    tier = resolve_model_tier({}, "deep_review")
+
+    assert tier is not None
+    assert tier.model == "gpt-5.6-sol"
+    assert tier.opencode_model == "hermes-codex/gpt-5.6-sol"
+    assert tier.reasoning_effort == "xhigh"
+    assert "deep_review" not in MODEL_TIER_LADDER
+    assert resolve_adjacent_model_tier({}, "deep_review", 1) is None
+
+
 def test_visual_tier_names_are_reserved_against_user_override():
     tier = resolve_model_tier(
         {
