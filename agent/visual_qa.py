@@ -527,7 +527,7 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
         "assertion_ids": normalized_ids,
         "status": status,
         "attempts": _metric("attempts", 2),
-        "vision_calls": _metric("vision_calls", 1),
+        "vision_calls": _metric("vision_calls", 2),
         "duration_ms": _metric("duration_ms", 60_000),
         "diagnostic_codes": diagnostic_codes,
     }

@@ -249,16 +249,20 @@ class TestDiscordMultiImage:
             paths.append(p)
 
         mock_channel = MagicMock()
-        mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
+        mock_channel.send = AsyncMock(
+            side_effect=[MagicMock(id=101), MagicMock(id=102)]
+        )
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("67890", images))
+        result = _run(adapter.send_multiple_images("67890", images))
 
         assert mock_channel.send.await_count == 2
         sizes = [len(c.kwargs["files"]) for c in mock_channel.send.await_args_list]
         assert sizes == [10, 5]
+        assert result.success is True
+        assert result.confirmed_message_ids == ("101", "102")
 
     def test_empty_noop(self, adapter):
         adapter._client = MagicMock()

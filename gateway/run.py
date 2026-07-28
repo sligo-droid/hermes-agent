@@ -6857,6 +6857,13 @@ class _GatewayRunnerCore(
         )
         if not item:
             return None
+        promoted = ledger.promote_visual_qa_config(
+            str(item.get("id") or ""),
+            visual_qa_config,
+            expected_run_state=item,
+        )
+        if promoted is not None:
+            item = promoted
         event.work_item_id = item.get("id")
         event.defer_work_completion = defer_completion
         event.visual_qa_requirement, event.visual_qa_config = _normalize_gateway_visual_qa_contract(
@@ -8940,6 +8947,24 @@ class _GatewayRunnerCore(
                 logger.warning("Failed to rebuild Discord work item %s: %s", work_id, exc)
                 ledger.mark_expired(work_id)
                 continue
+            repository = _gateway_repository_for_source(getattr(event, "source", None))
+            _, recovered_visual_config = _normalize_gateway_visual_qa_contract(
+                None,
+                _repository_visual_qa_config(_load_gateway_config(), repository),
+            )
+            promoted = ledger.promote_visual_qa_config(
+                work_id,
+                recovered_visual_config,
+                expected_run_state=item,
+            )
+            if promoted is not None:
+                item = promoted
+                event.visual_qa_requirement, event.visual_qa_config = (
+                    _normalize_gateway_visual_qa_contract(
+                        item.get("visual_qa_requirement"),
+                        item.get("visual_qa_config"),
+                    )
+                )
             source = event.source
             adapter = self._adapter_for_source(source)
             if adapter is None:
@@ -39926,6 +39951,22 @@ def _collect_screenshot_evidence_media_tags(
         if msg.get("role") in {"tool", "function"}:
             declared_paths.update(_screenshot_paths_declared_in_content(msg.get("content")))
 
+    latest_visual_qa_call_id = ""
+    for msg in messages:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        call = call_details.get(call_id) or {}
+        if call.get("name") != "visual_qa":
+            continue
+        try:
+            payload = json.loads(str(msg.get("content") or ""))
+        except Exception:
+            payload = None
+        artifacts = payload.get("screenshot_artifacts") if isinstance(payload, dict) else None
+        if isinstance(artifacts, list) and artifacts:
+            latest_visual_qa_call_id = call_id
+
     tags: List[str] = []
     seen_paths: set[str] = set()
     for msg in messages:
@@ -39937,6 +39978,8 @@ def _collect_screenshot_evidence_media_tags(
         if tool_name == "browser_vision":
             paths = _screenshot_paths_declared_in_content(msg.get("content"))
         elif tool_name == "visual_qa":
+            if call_id != latest_visual_qa_call_id:
+                continue
             try:
                 payload = json.loads(str(msg.get("content") or ""))
             except Exception:
