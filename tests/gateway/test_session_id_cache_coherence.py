@@ -1,32 +1,30 @@
-"""Regression tests for #54947 — cross-process guard must not invalidate the
-agent cache when the active ``session_id`` differs from the snapshot's
-``session_id``, even when both share the same ``session_key``.
+"""Compatibility tests for session-aware cache count re-baselining.
 
 Bug
 ---
-The cache key is the gateway ``session_key`` (e.g. ``agent:main:telegram:dm:USER_ID``)
-which groups all DM sessions for that user. Different ``session_id``s (separate
-conversation threads) can share a ``session_key``. When the user switches
-between session_ids, the cached agent is shared, and the cross-process
-coherence guard (``_cached_mc`` vs ``_current_msg_count``) treats different
-sessions' ``message_count`` values as the same counter — invalidating the
-agent on EVERY session switch and busting the per-conversation prompt cache.
+The cache key is the gateway ``session_key`` (for example,
+``agent:main:telegram:dm:USER_ID``), so separate DB session IDs can occupy the
+same cache slot over time. A tuple/session mismatch is reusable only when the
+live agent has already rotated to the incoming session ID. Otherwise the agent
+still owns the old conversation and must be rebuilt, regardless of whether the
+old DB row remains live.
 
 These tests pin the production guard's reuse decision across:
-  L1 — session-id switch must REUSE (not invalidate) the cached agent.
+  L1 — a legitimately rotated agent may be reused across a stale tuple ID.
   L2 — cache tuple records the snapshot's session_id.
   L3 — re-baseline skips the cache entry when session_id differs.
   L4 — same-session_id turns still re-baseline correctly (no regression
        of #45966 / #46237).
   L5 — legacy 2-tuples and pending sentinels are still untouched.
 
-All tests drive the REAL production helper (``_refresh_agent_cache_message_count``)
-against a REAL ``SessionDB`` and exercise the cache-hit guard's logic with the
-REAL cache lock, mirroring the structure used by
-``TestAgentCacheMessageCountRebaseline``.
+The cache-hit ownership decisions themselves are covered through the live
+``GatewayRunner._run_agent`` path in ``test_run_agent_cache_live_path.py``.
+These tests retain focused coverage of the production re-baseline helper and
+legacy tuple compatibility against a real ``SessionDB``.
 """
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,23 +43,21 @@ def _make_runner():
 
 def _guard_would_reuse(runner, session_key, session_id):
     """Mirror the production cache-hit guard's reuse decision exactly
-    AFTER the fix: reuse when the session_id matches the snapshot's
-    session_id, OR when the entry is a legacy 2-tuple / pending sentinel.
+    for focused count-coherence assertions.
 
     Reuse iff any of:
       - cached session_id matches current session_id AND live count matches
         snapshot count (same-process turn OR no foreign write)
-      - cached session_id differs from current session_id (different
-        conversation, snapshot is from a different DB row → meaningless
-        to compare, REUSE without invalidation)
-      - entry is a 2-tuple (legacy opt-out of guard)
-      - either side is None (unknown state → REUSE, fail-safe)
+      - cached session_id differs from current session_id AND the live agent
+        already owns the incoming session (legitimate agent-side rotation)
+      - entry is a 2-tuple (legacy opt-out of the count guard) and live agent
+        ownership does not contradict the incoming session
 
     Invalidate iff:
-      - cached session_id == current session_id AND
-        cached_mc is not None AND live_mc is not None AND
-        live_mc != cached_mc (genuine cross-process write on the SAME
-        session — guard fires, agent rebuilds).
+      - the live agent has a different session_id from the incoming session
+      - a tuple/session mismatch cannot be validated by live agent ownership
+      - cached session_id == current session_id AND cached/live counts differ
+        (genuine cross-process write on the same session).
     """
     try:
         # Mirror the production guard, which reads the sync underlying DB
@@ -75,17 +71,22 @@ def _guard_would_reuse(runner, session_key, session_id):
 
     if cached is None:
         return True  # no entry → cache miss → fresh build (not invalidation)
-    # Legacy 2-tuple opts out of the guard.
+    cached_agent_sid = str(getattr(cached[0], "session_id", "") or "")
+    incoming_sid = str(session_id or "")
+    if cached_agent_sid and incoming_sid and cached_agent_sid != incoming_sid:
+        return False
+
+    # Legacy 2-tuple opts out of the count guard. It has no tuple ownership
+    # snapshot, so only a live agent.session_id can disprove ownership.
     if len(cached) < 3:
         return True
-    # Pending sentinel — treat as a no-op reuse.
     cached_sid = cached[3] if len(cached) > 3 else None
     cached_mc = cached[2]
 
-    # Snapshot belongs to a DIFFERENT session_id → comparison is
-    # meaningless; REUSE without invalidation.
+    # A stale tuple belongs to another DB row. Reuse only when the live agent
+    # has already rotated to and therefore owns the incoming session.
     if cached_sid is not None and session_id is not None and cached_sid != session_id:
-        return True
+        return cached_agent_sid == incoming_sid
 
     # Same session_id: standard cross-process guard.
     invalidate = (
@@ -97,15 +98,10 @@ def _guard_would_reuse(runner, session_key, session_id):
 
 
 class TestSessionIdCacheCoherence:
-    """#54947 — guard must not invalidate the agent cache on session_id switch
-    under the same session_key."""
+    """#54947 — session-aware count coherence compatibility."""
 
-    def test_session_id_switch_reuses_cached_agent(self, tmp_path):
-        """The reported bug: cache built from session A, switch to session B
-        under the same session_key. The guard must REUSE the cached agent
-        (the message_count comparison is meaningless across different
-        session_ids), not rebuild and bust the prompt cache.
-        """
+    def test_rotated_agent_reuses_stale_tuple_for_owned_session(self, tmp_path):
+        """A live agent already rotated to B may adopt a tuple still naming A."""
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "sessions.db")
@@ -118,17 +114,15 @@ class TestSessionIdCacheCoherence:
         # sA count = 3, sB count = 0
         runner = _make_runner()
         runner._session_db = AsyncSessionDB(db)
-        agent = object()
+        agent = SimpleNamespace(session_id="sB")
 
         # Build cache from session A (mc=3, sid=sA).
         with runner._agent_cache_lock:
             runner._agent_cache["telegram:USER1"] = (agent, "sig", 3, "sA")
 
-        # User switches to session B (mc=0, sid=sB) — same session_key.
-        # Guard must NOT invalidate.
+        # The agent has rotated to B, while the tuple still records A.
         assert _guard_would_reuse(runner, "telegram:USER1", "sB") is True, (
-            "BUG: cache was invalidated on session_id switch — "
-            "the #54947 root cause is back."
+            "BUG: cache rejected an agent that already owns the incoming session."
         )
         # The original agent must still be in the cache.
         with runner._agent_cache_lock:
@@ -197,12 +191,8 @@ class TestSessionIdCacheCoherence:
         assert _guard_would_reuse(runner, "telegram:s1", "s1") is False
 
     @pytest.mark.asyncio
-    async def test_refresh_skips_when_session_id_differs(self, tmp_path):
-        """_refresh_agent_cache_message_count must NOT refresh the cached
-        snapshot when the current session_id differs from the one the
-        snapshot belongs to. Otherwise the snapshot gets overwritten with
-        a different session's count, and the next switch back fires the
-        guard (the original bug)."""
+    async def test_refresh_skips_mismatch_without_agent_ownership(self, tmp_path):
+        """A stale tuple cannot adopt a new row without agent ownership proof."""
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "sessions.db")
@@ -217,9 +207,8 @@ class TestSessionIdCacheCoherence:
         with runner._agent_cache_lock:
             runner._agent_cache["telegram:USER1"] = (agent, "sig", 1, "sA")
 
-        # Someone (the call site at line 9540) calls the re-baseline with
-        # the CURRENT session_id — which is sB after a switch. The
-        # snapshot is from sA → must NOT be touched.
+        # The tuple names A and this compatibility fake exposes no live
+        # agent.session_id proving that it has rotated to B.
         await runner._refresh_agent_cache_message_count("telegram:USER1", "sB")
 
         with runner._agent_cache_lock:
