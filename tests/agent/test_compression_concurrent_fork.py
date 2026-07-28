@@ -38,6 +38,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_state import SessionDB
+from agent.context_compressor import ContextCompressor
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str):
@@ -203,8 +204,10 @@ def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     agent.context_compressor.compress.assert_not_called()
 
 
-def test_read_only_compression_fails_closed_without_session_mutation(tmp_path: Path) -> None:
-    """Overflow recovery cannot lock, rotate, or compact a read-only session."""
+def test_read_only_compression_compacts_in_memory_without_session_mutation(
+    tmp_path: Path,
+) -> None:
+    """Read-only compression compacts only the in-memory transcript."""
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "READ_ONLY_COMPRESSION"
     db.create_session(parent_sid, source="discord")
@@ -213,10 +216,87 @@ def test_read_only_compression_fails_closed_without_session_mutation(tmp_path: P
     agent._runtime_mode = "read_only"
     agent._persist_disabled = True
     agent._build_system_prompt = MagicMock(return_value="read-only prompt")
+    agent._memory_manager = MagicMock()
     agent.commit_memory_session = MagicMock(
-        side_effect=AssertionError("read-only compression must not extract memory")
+        side_effect=AssertionError("read-only compression must not extract memory"),
     )
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=AssertionError("read-only compression must not flush history"),
+    )
+    with patch(
+        "agent.context_compressor.get_model_context_length",
+        return_value=100_000,
+    ):
+        compressor = ContextCompressor(
+            model="test/model",
+            threshold_percent=0.85,
+            protect_first_n=2,
+            protect_last_n=2,
+            quiet_mode=True,
+        )
+    compressor._session_db = db
+    compressor._session_id = parent_sid
+    compressor._generate_summary = MagicMock(return_value="Earlier turns summarized.")
+    seen_binding = []
+
+    def _summary_with_binding(*args, **kwargs):
+        seen_binding.append((compressor._session_db, compressor._session_id))
+        return "Earlier turns summarized."
+
+    compressor._generate_summary.side_effect = _summary_with_binding
+    agent.context_compressor = compressor
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    original_row = db.get_session(parent_sid)
+
+    compressed, prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    assert len(compressed) < len(messages)
+    assert prompt == "read-only prompt"
+    assert agent.session_id == parent_sid
+    assert _count_children(db, parent_sid) == 0
+    assert db.get_compression_lock_holder(parent_sid) is None
+    assert db.get_session(parent_sid) == original_row
+    assert seen_binding == [(None, "")]
+    assert compressor._session_db is db
+    assert compressor._session_id == parent_sid
+    agent.commit_memory_session.assert_not_called()
+    agent._flush_messages_to_session_db.assert_not_called()
+    agent._memory_manager.on_pre_compress.assert_not_called()
+
+
+def test_read_only_summary_failure_returns_original_for_emergency_shrink(
+    tmp_path: Path,
+) -> None:
+    """A failed semantic pass must leave the emergency fallback available."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "READ_ONLY_COMPRESSION_FAILURE"
+    db.create_session(parent_sid, source="discord")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    agent._runtime_mode = "read_only"
+    agent._build_system_prompt = MagicMock(return_value="read-only prompt")
+    with patch(
+        "agent.context_compressor.get_model_context_length",
+        return_value=100_000,
+    ):
+        compressor = ContextCompressor(
+            model="test/model",
+            threshold_percent=0.85,
+            protect_first_n=2,
+            protect_last_n=2,
+            abort_on_summary_failure=True,
+            quiet_mode=True,
+        )
+    compressor._session_db = db
+    compressor._session_id = parent_sid
+    compressor._generate_summary = MagicMock(return_value=None)
+    agent.context_compressor = compressor
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    original_messages = [dict(message) for message in messages]
 
     compressed, prompt = agent._compress_context(
         messages,
@@ -225,12 +305,54 @@ def test_read_only_compression_fails_closed_without_session_mutation(tmp_path: P
     )
 
     assert compressed is messages
+    assert compressed == original_messages
     assert prompt == "read-only prompt"
+    assert compressor._last_compress_aborted is True
     assert agent.session_id == parent_sid
     assert _count_children(db, parent_sid) == 0
     assert db.get_compression_lock_holder(parent_sid) is None
-    agent.context_compressor.compress.assert_not_called()
-    agent.commit_memory_session.assert_not_called()
+
+
+def test_read_only_noop_returns_original_and_preserves_compressor_binding(
+    tmp_path: Path,
+) -> None:
+    """A semantic no-op must not consume the emergency-shrink fallback."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "READ_ONLY_COMPRESSION_NOOP"
+    db.create_session(parent_sid, source="discord")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    agent._runtime_mode = "read_only"
+    agent._build_system_prompt = MagicMock(return_value="read-only prompt")
+    compressor = MagicMock()
+    compressor._session_db = db
+    compressor._session_id = parent_sid
+    compressor._last_compress_aborted = False
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    compressor.compress.return_value = messages
+    agent.context_compressor = compressor
+
+    compressed, prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+        focus_topic="observational context",
+        force=True,
+    )
+
+    assert compressed is messages
+    assert prompt == "read-only prompt"
+    compressor.compress.assert_called_once()
+    assert compressor.compress.call_args.kwargs == {
+        "current_tokens": 120_000,
+        "focus_topic": "observational context",
+        "force": True,
+    }
+    assert compressor._session_db is db
+    assert compressor._session_id == parent_sid
+    assert agent.session_id == parent_sid
+    assert _count_children(db, parent_sid) == 0
+    assert db.get_compression_lock_holder(parent_sid) is None
 
 
 def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path: Path) -> None:

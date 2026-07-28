@@ -1014,6 +1014,74 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
     })
 
 
+def _compress_read_only_in_memory(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    approx_tokens: Optional[int],
+    focus_topic: Optional[str],
+    force: bool,
+) -> Tuple[list, str]:
+    """Run semantic compression without crossing a durable-session boundary.
+
+    Read-only turns still need the configured compressor so repeated
+    observational tool results do not grow the prompt indefinitely.  The
+    compressor may be bound to a SessionDB for its normal cooldown/streak
+    bookkeeping, so detach that binding for the duration of this in-memory
+    attempt.  No memory-provider hook or lifecycle callback belongs on this
+    path.
+    """
+    existing_prompt = getattr(agent, "_cached_system_prompt", None)
+    if not existing_prompt:
+        existing_prompt = agent._build_system_prompt(system_message)
+
+    original_messages = copy.deepcopy(messages)
+    compressor = agent.context_compressor
+    detached_state = []
+    for name, replacement in (("_session_db", None), ("_session_id", "")):
+        try:
+            previous = getattr(compressor, name)
+        except AttributeError:
+            continue
+        try:
+            setattr(compressor, name, replacement)
+        except Exception:
+            continue
+        detached_state.append((name, previous))
+
+    try:
+        compress_fn = compressor.compress
+        compress_kwargs = _supported_compression_kwargs(
+            compress_fn,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            force=force,
+            memory_context="",
+        )
+        compressed = compress_fn(messages, **compress_kwargs)
+    finally:
+        for name, previous in reversed(detached_state):
+            try:
+                setattr(compressor, name, previous)
+            except Exception:
+                logger.debug("could not restore read-only compressor state: %s", name)
+
+    # A failed/no-op semantic pass must leave the original context available
+    # to the caller's deterministic emergency-shrink fallback.
+    if (
+        getattr(compressor, "_last_compress_aborted", False) is True
+        or not compressed
+        or compressed == original_messages
+    ):
+        if messages != original_messages:
+            messages[:] = copy.deepcopy(original_messages)
+        return messages, existing_prompt
+
+    _ensure_compressed_has_user_turn(original_messages, compressed)
+    return compressed, existing_prompt
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -1048,21 +1116,22 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
-    # A read-only turn must never rotate, compact, lock, or otherwise mutate
-    # durable session state. Gateway history is bounded before dispatch, and if
-    # a single observational turn still overflows we fail closed (callers may
-    # apply their deterministic in-memory emergency shrink) rather than invoke
-    # a provider/plugin compressor with unknown side effects.
+    # Read-only turns may compact their in-memory transcript, but must never
+    # cross the durable-session compression boundary.
     if str(getattr(agent, "_runtime_mode", "") or "").strip().lower() == "read_only":
-        existing_prompt = getattr(agent, "_cached_system_prompt", None)
-        if not existing_prompt:
-            existing_prompt = agent._build_system_prompt(system_message)
         logger.info(
-            "Skipping durable context compression in read-only runtime "
+            "Running in-memory context compression in read-only runtime "
             "(session=%s)",
             agent.session_id or "none",
         )
-        return messages, existing_prompt
+        return _compress_read_only_in_memory(
+            agent,
+            messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            force=force,
+        )
 
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking
