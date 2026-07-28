@@ -4,7 +4,7 @@ Regression test for false gateway inactivity timeouts firing while the agent
 is legitimately blocked waiting for a user to respond to a dangerous-command
 approval prompt.  Before the fix, ``entry.event.wait(timeout=...)`` blocked
 silently — no ``_touch_activity()`` calls — and the gateway's inactivity
-watchdog (``agent.gateway_timeout``, default 1800s) would kill the agent
+watchdog (``agent.gateway_timeout``, default 3600s) would kill the agent
 while the user was still choosing whether to approve.
 
 The fix polls the event in short slices and fires ``touch_activity_if_due``
@@ -55,6 +55,5 @@ class TestApprovalHeartbeat:
             else:
                 os.environ[k] = v
         _clear_approval_state()
-
 
 

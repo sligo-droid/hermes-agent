@@ -124,8 +124,8 @@ def test_config_max_turns_wins_over_stale_env(hermes_home: Path) -> None:
 def test_config_gateway_timeout_wins_over_stale_env(hermes_home: Path) -> None:
     """Every agent.* bridge key must be config-authoritative, not .env-authoritative."""
     _write_config(hermes_home, agent_cfg={
-        "gateway_timeout": 1800,
-        "gateway_timeout_warning": 900,
+        "gateway_timeout": 3600,
+        "gateway_timeout_warning": 2700,
     })
     _write_env(hermes_home, {
         "HERMES_AGENT_TIMEOUT": "60",
@@ -134,8 +134,8 @@ def test_config_gateway_timeout_wins_over_stale_env(hermes_home: Path) -> None:
 
     env = _run_gateway_import(hermes_home, initial_env={})
 
-    assert env.get("HERMES_AGENT_TIMEOUT") == "1800"
-    assert env.get("HERMES_AGENT_TIMEOUT_WARNING") == "900"
+    assert env.get("HERMES_AGENT_TIMEOUT") == "3600"
+    assert env.get("HERMES_AGENT_TIMEOUT_WARNING") == "2700"
 
 
 def test_config_display_busy_input_mode_wins_over_stale_env(hermes_home: Path) -> None:
