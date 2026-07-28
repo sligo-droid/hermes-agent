@@ -36,6 +36,7 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
     _resolve_delegation_model_tier,
+    _resolve_requested_child_toolsets,
 )
 
 
@@ -233,6 +234,24 @@ class TestStripBlockedTools(unittest.TestCase):
         result = _strip_blocked_tools(["terminal", "file", "web", "browser"])
         self.assertEqual(sorted(result), ["browser", "file", "terminal", "web"])
 
+    def test_coding_posture_expands_to_parent_concrete_capabilities(self):
+        resolved, unavailable = _resolve_requested_child_toolsets(
+            ["coding", "browser", "web"],
+            {"browser", "file", "terminal", "web"},
+        )
+
+        self.assertEqual(unavailable, [])
+        self.assertEqual(set(resolved), {"browser", "file", "terminal", "web"})
+
+    def test_unavailable_explicit_toolset_is_reported(self):
+        resolved, unavailable = _resolve_requested_child_toolsets(
+            ["file", "supabase"],
+            {"file", "browser"},
+        )
+
+        self.assertEqual(resolved, ["file"])
+        self.assertEqual(unavailable, ["supabase"])
+
     def test_empty_input(self):
         result = _strip_blocked_tools([])
         self.assertEqual(result, [])
@@ -375,6 +394,104 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
         result = json.loads(delegate_task(parent_agent=parent))
         self.assertIn("error", result)
+
+    def test_discord_coding_audit_receives_local_inspection_tools(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = [
+            "browser",
+            "delegation",
+            "file",
+            "terminal",
+            "web",
+        ]
+
+        with patch("tools.delegate_tool._run_single_child") as mock_run, patch(
+            "run_agent.AIAgent"
+        ) as MockAgent:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 1,
+                "duration_seconds": 1,
+            }
+            MockAgent.return_value = MagicMock()
+
+            delegate_task(
+                goal="Audit the local repository",
+                toolsets=["coding", "browser", "web"],
+                read_only=True,
+                parent_agent=parent,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertIn("file", kwargs["enabled_toolsets"])
+        self.assertIn("terminal", kwargs["enabled_toolsets"])
+        self.assertIn("browser", kwargs["enabled_toolsets"])
+        self.assertIn("web", kwargs["enabled_toolsets"])
+        self.assertIn("begin with read_file/search_files", kwargs["ephemeral_system_prompt"])
+        import model_tools
+
+        names = {
+            item["function"]["name"]
+            for item in model_tools.get_tool_definitions(
+                enabled_toolsets=kwargs["enabled_toolsets"],
+                disabled_toolsets=kwargs["disabled_toolsets"],
+                quiet_mode=True,
+                runtime_mode="read_only",
+                skip_tool_search_assembly=True,
+            )
+        }
+        self.assertIn("read_file", names)
+        self.assertIn("search_files", names)
+
+    def test_unavailable_explicit_toolset_fails_before_child_launch(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["browser", "file"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    goal="Inspect the database",
+                    toolsets=["file", "supabase"],
+                    read_only=True,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("requested toolsets are unavailable", result["error"])
+        self.assertIn("supabase", result["error"])
+        MockAgent.assert_not_called()
+
+    def test_deep_review_auto_detaches_when_parent_deadline_is_shorter(self):
+        parent = _make_mock_parent()
+        parent._human_deep_review_requested = True
+        parent._nested_worker_deadline_monotonic = time.monotonic() + 30
+        parent.enabled_toolsets = ["delegation", "file"]
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"child_timeout_seconds": 2700},
+        ), patch(
+            "tools.delegate_tool._background_context_error", return_value=""
+        ), patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            return_value={"status": "dispatched", "delegation_id": "deleg-test"},
+        ) as dispatch, patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            result = json.loads(
+                delegate_task(
+                    goal="Perform the requested deep review",
+                    toolsets=["file"],
+                    model_tier="deep_review",
+                    read_only=True,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(result["mode"], "background")
+        dispatch.assert_called_once()
 
     def test_empty_goal(self):
         parent = _make_mock_parent()
@@ -2911,6 +3028,37 @@ class TestChildCredentialLeasing(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         child._credential_pool.acquire_lease.assert_called_once_with("cred-a")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+    def test_background_child_ignores_originating_turn_deadline(self):
+        from tools.delegate_tool import _execute_background_children
+
+        child = MagicMock()
+        parent = _make_mock_parent()
+        accounting = {"parent_task_id": "parent-task"}
+
+        with patch("tools.delegate_tool._run_single_child") as mock_run, patch(
+            "tools.delegate_tool._finalize_detached_results", return_value={}
+        ):
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+            }
+            _execute_background_children(
+                [(0, {"goal": "Audit the repository"}, child)],
+                parent,
+                1,
+                accounting,
+            )
+
+        mock_run.assert_called_once_with(
+            0,
+            "Audit the repository",
+            child,
+            parent,
+            parent_task_id="parent-task",
+            ignore_parent_deadline=True,
+        )
 
 
 class TestDelegateHeartbeat(unittest.TestCase):
