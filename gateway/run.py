@@ -1020,12 +1020,12 @@ def _format_long_running_status_detail(activity: Dict[str, Any]) -> str:
 # In both cases "when did we last do anything on this transcript" is the
 # correct freshness question, so one signal replaces two divergent ones.
 #
-# Default window: 1 hour.  This comfortably covers ``agent.gateway_timeout``
-# (30 min default) plus runtime slack — a legitimate long-running turn that
+# Default window: 2 hours.  This comfortably covers ``agent.gateway_timeout``
+# (60 min default) plus runtime slack — a legitimate long-running turn that
 # gets interrupted near its timeout boundary and is resumed shortly after
 # is still classified fresh.  Override via
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
-_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 2 * 60 * 60
 _STARTUP_RESUME_EVENT_METADATA_KEY = "gateway_startup_resume"
 
 
@@ -16589,7 +16589,7 @@ class _GatewayRunnerCore(
         # wall-clock age alone isn't sufficient.  Evict only when the agent
         # has been *idle* beyond the inactivity threshold (or when the agent
         # object has no activity tracker and wall-clock age is extreme).
-        _raw_stale_timeout = _float_env("HERMES_AGENT_TIMEOUT", 1800)
+        _raw_stale_timeout = _float_env("HERMES_AGENT_TIMEOUT", 3600)
         _stale_ts = self._running_agents_ts.get(_quick_key, 0)
         if _quick_key in self._running_agents and _stale_ts:
             _stale_age = time.time() - _stale_ts
@@ -18661,7 +18661,7 @@ class _GatewayRunnerCore(
                 session_entry.session_id,
                 owner_key=_quick_key,
                 generation=run_generation,
-                timeout=_float_env("HERMES_AGENT_TIMEOUT", 1800),
+                timeout=_float_env("HERMES_AGENT_TIMEOUT", 3600),
             )
             if _lease_token is not None:
                 if not hasattr(self, "_turn_lease_tokens"):
@@ -30783,7 +30783,7 @@ class _GatewayRunnerCore(
                         _cleanup_msg_ids.append(str(mid))
                 _fut.add_done_callback(_track_status_id)
 
-        _nested_worker_timeout_raw = _float_env("HERMES_AGENT_TIMEOUT", 1800)
+        _nested_worker_timeout_raw = _float_env("HERMES_AGENT_TIMEOUT", 3600)
         _nested_worker_deadline = (
             time.monotonic() + _nested_worker_timeout_raw
             if _nested_worker_timeout_raw > 0
@@ -32239,10 +32239,10 @@ class _GatewayRunnerCore(
             #
             # Config: agent.gateway_timeout in config.yaml, or
             # HERMES_AGENT_TIMEOUT env var (env var takes precedence).
-            # Default 1800s (30 min inactivity).  0 = unlimited.
-            _agent_timeout_raw = _float_env("HERMES_AGENT_TIMEOUT", 1800)
+            # Default 3600s (60 min inactivity).  0 = unlimited.
+            _agent_timeout_raw = _float_env("HERMES_AGENT_TIMEOUT", 3600)
             _agent_timeout = _agent_timeout_raw if _agent_timeout_raw > 0 else None
-            _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
+            _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 2700)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
             _executor_task = asyncio.ensure_future(
@@ -37776,10 +37776,10 @@ class _GatewayRunnerCore(
                 #
                 # Config: agent.gateway_timeout in config.yaml, or
                 # HERMES_AGENT_TIMEOUT env var (env var takes precedence).
-                # Default 1800s (30 min inactivity).  0 = unlimited.
-                _agent_timeout_raw = _float_env("HERMES_AGENT_TIMEOUT", 1800)
+                # Default 3600s (60 min inactivity).  0 = unlimited.
+                _agent_timeout_raw = _float_env("HERMES_AGENT_TIMEOUT", 3600)
                 _agent_timeout = _agent_timeout_raw if _agent_timeout_raw > 0 else None
-                _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
+                _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 2700)
                 _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
                 _warning_fired = False
                 _executor_task = asyncio.ensure_future(

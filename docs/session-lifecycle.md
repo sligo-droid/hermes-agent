@@ -622,7 +622,7 @@ When a session expires:
 | `thread_sessions_per_user` | `bool` | `false` | Isolate thread sessions per user |
 | `session_store_max_age_days` | `int` | `0` | Prune sessions older than N days (0=disabled) |
 | `agent.gateway_auto_continue_freshness` | `int` | `3600` | Seconds for resume freshness window |
-| `agent.gateway_timeout` | `int` | `1800` | Agent turn timeout (30 min default) |
+| `agent.gateway_timeout` | `int` | `3600` | Agent turn timeout (60 min default) |
 
 ### Reset Policy (per-platform/type, in config.yaml)
 

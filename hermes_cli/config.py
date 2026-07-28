@@ -1023,7 +1023,7 @@ DEFAULT_CONFIG = {
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
-        "gateway_timeout": 1800,
+        "gateway_timeout": 3600,
         # Graceful drain timeout for gateway stop/restart (seconds).
         # The gateway stops accepting new work, waits for running agents
         # to finish, then interrupts any remaining runs after the timeout.
@@ -1138,7 +1138,7 @@ DEFAULT_CONFIG = {
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
-        "gateway_timeout_warning": 900,
+        "gateway_timeout_warning": 2700,
         # Maximum time (seconds) the gateway will block an agent waiting for
         # a clarify-tool response from the user.  Hit this and the agent
         # unblocks with "[user did not respond within Xm]" so it can adapt
@@ -1169,10 +1169,10 @@ DEFAULT_CONFIG = {
         # an unrelated old task when the user's next message starts new
         # work.  This window is the max age of the last persisted
         # transcript row for which we still inject the continue note.
-        # Default 3600s comfortably covers a long turn (gateway_timeout
-        # default is 1800s) plus runtime slack.  Set to 0 to disable the
+        # Default 7200s comfortably covers a long turn (gateway_timeout
+        # default is 3600s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
-        "gateway_auto_continue_freshness": 3600,
+        "gateway_auto_continue_freshness": 7200,
         # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
         # seconds. When the base stale timeout is at its default (180s) and a
         # local endpoint is detected, this finite ceiling replaces the former
