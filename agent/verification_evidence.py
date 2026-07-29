@@ -155,14 +155,14 @@ _BROWSER_ERROR_PAGE_RE = re.compile(
     r"\b(?:bad gateway|service unavailable|gateway timeout|internal server error)\b",
     re.IGNORECASE,
 )
-_PRODUCTION_RE = re.compile(
-    r"\b(production|prod|deployed?|live)\b|"
+_PRODUCTION_RE = re.compile(r"\b(production|prod|deployed?|live)\b", re.IGNORECASE)
+_EXTERNAL_URL_RE = re.compile(
     r"https?://(?!(?:127(?:\.\d{1,3}){3}|localhost|0\.0\.0\.0|\[::1\])(?::|/|$))",
     re.IGNORECASE,
 )
 _CI_RE = re.compile(r"\b(ci|checks?|status|gh\s+pr\s+checks|test|tests|pytest|vitest)\b", re.IGNORECASE)
 _CI_CLAIM_RE = re.compile(
-    r"\b(?:ci|continuous integration|tests?|pytest|vitest|pr checks?|build checks?)\b",
+    r"\b(?:ci|continuous integration|tests?|pytest|vitest|checks?|pr checks?|build checks?)\b",
     re.IGNORECASE,
 )
 _CI_COMMAND_RE = re.compile(
@@ -197,11 +197,69 @@ _READ_ONLY_INSPECTION_COMMANDS = {
     "tail",
     "wc",
 }
+_NON_VERIFICATION_GIT_COMMANDS = {
+    "add",
+    "branch",
+    "commit",
+    "config",
+    "fetch",
+    "log",
+    "push",
+    "remote",
+    "rev-list",
+    "rev-parse",
+    "show",
+    "status",
+    "tag",
+}
+_GH_PR_CLOSE_SUCCESS_RE = re.compile(r"(?m)^\s*(?:[✓✔]\s+)?Closed pull request\b", re.IGNORECASE)
+_GH_PR_CREATE_RE = re.compile(r"\bgh\s+pr\s+create\b", re.IGNORECASE)
+_GH_PR_CLOSE_RE = re.compile(r"\bgh\s+pr\s+close\b", re.IGNORECASE)
+_GH_PR_MERGE_RE = re.compile(r"\bgh\s+pr\s+merge\b", re.IGNORECASE)
+_GH_PR_STATUS_RE = re.compile(r"\bgh\s+pr\s+status\b", re.IGNORECASE)
+_GITHUB_PR_URL_RE = re.compile(r"https://github\.com/[^\s/]+/[^\s/]+/pull/\d+", re.IGNORECASE)
+_GH_PR_COMMAND_RE = re.compile(r"\bgh\s+pr\s+(?:create|close|view|merge|status)\b", re.IGNORECASE)
+_GH_PR_MUTATION_RE = re.compile(r"\bgh\s+pr\s+(?:create|close|merge)\b", re.IGNORECASE)
+_GH_PR_CHECKS_RE = re.compile(r"\bgh\s+pr\s+checks\b", re.IGNORECASE)
+_GH_CHECK_RUNS_RE = re.compile(r"\bgh\s+api\s+repos/[^\s]+/commits/[^\s]+/check-runs\b", re.IGNORECASE)
+_GH_PULL_API_RE = re.compile(r"\bgh\s+api\s+repos/[^\s]+/pulls/\d+\b", re.IGNORECASE)
+_GH_RUN_RE = re.compile(r"\bgh\s+run\s+(?:list|view|watch)\b", re.IGNORECASE)
+_GH_PR_NUMBER_RE = re.compile(r"\bgh\s+pr\s+(?:checks|close|view|merge)\s+(\d+)\b", re.IGNORECASE)
+_GH_REPO_ARG_RE = re.compile(r"(?:^|\s)--repo(?:=|\s+)([^\s]+)", re.IGNORECASE)
+_GH_PULL_API_PARTS_RE = re.compile(r"\bgh\s+api\s+repos/([^\s]+)/pulls/(\d+)\b", re.IGNORECASE)
+_GH_CHECK_RUNS_PARTS_RE = re.compile(
+    r"\bgh\s+api\s+repos/([^\s]+)/commits/([^\s]+)/check-runs\b",
+    re.IGNORECASE,
+)
+_MAIN_SHA_MARKER_RE = re.compile(
+    r"(?im)^\s*(MAIN_BEFORE|BASE_BEFORE|MAIN_AFTER|BASE_AFTER|MAIN_NOW|CURRENT_MAIN)="
+    r"([0-9a-f]{40}|[0-9a-f]{64})\s*$"
+)
+_EXPLICIT_DEPLOY_COMMAND_RE = re.compile(
+    r"\b(?:vercel|flyctl|railway|render)\b|"
+    r"\bgh\s+api\s+repos/[^\s]+/deployments\b|"
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[^\s;&|]*(?:deploy|release)[^\s;&|]*\b",
+    re.IGNORECASE,
+)
 
-_CLAIM_WORD_RE = re.compile(r"\b(shipped|verified|visible|checked|confirmed|passed|deployed|merged)\b", re.IGNORECASE)
+_CLAIM_WORD_RE = re.compile(
+    r"\b(shipped|verified|visible|checked|confirmed|passed|deployed|merged|closed|unchanged)\b",
+    re.IGNORECASE,
+)
 _NEGATED_CLAIM_RE = re.compile(r"\b(?:not|isn['’]?t|failed|failure|blocked|unverified|not_verified)\b", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _CLAUSE_SPLIT_RE = re.compile(r"\s*(?:;|\b(?:and|but)\b)\s*", re.IGNORECASE)
+_UNMERGED_PR_CLAIM_RE = re.compile(
+    r"\bclosed\b[^.!?\n]{0,80}\b(?:without (?:a )?merge|unmerged)\b|"
+    r"\bclosed\b[^.!?\n]{0,80}\bnot merged\b",
+    re.IGNORECASE,
+)
+_MAIN_UNCHANGED_CLAIM_RE = re.compile(
+    r"\b(?:main|base branch)\b[^.!?\n]{0,100}"
+    r"\b(?:unchanged|did not change|stayed the same|remained the same)\b|"
+    r"\bno changes?\b[^.!?\n]{0,60}\b(?:main|base branch)\b",
+    re.IGNORECASE,
+)
 
 _SURFACE_LABELS = {
     "browser": "browser verification",
@@ -210,6 +268,7 @@ _SURFACE_LABELS = {
     "ci": "CI verification",
     "deployment": "deployment verification",
     "pr": "PR/merge verification",
+    "main_branch": "main branch verification",
     "verification": "verification",
 }
 
@@ -243,6 +302,332 @@ def _last_embedded_json_object(value: Any) -> dict[str, Any]:
             found = candidate
             found_span = end
     return found
+
+
+def _embedded_json_objects(value: Any) -> list[dict[str, Any]]:
+    """Return non-overlapping JSON objects embedded in command output."""
+
+    text = str(value or "")
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
+    index = 0
+    while index < len(text):
+        start = text.find("{", index)
+        if start < 0:
+            break
+        try:
+            candidate, end = decoder.raw_decode(text[start:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            index = start + 1
+            continue
+        if isinstance(candidate, dict):
+            objects.append(candidate)
+        index = start + max(1, end)
+    return objects
+
+
+def _normalized_check_status(status: Any, conclusion: Any = None) -> str:
+    conclusion_text = str(conclusion or "").strip().lower()
+    status_text = str(status or "").strip().lower()
+    value = conclusion_text or status_text
+    if value in {"pass", "passed", "success", "successful", "skipping", "skipped", "neutral"}:
+        return "success"
+    if value in {
+        "fail",
+        "failed",
+        "failure",
+        "cancelled",
+        "canceled",
+        "timed_out",
+        "action_required",
+        "stale",
+        "startup_failure",
+    }:
+        return "failure"
+    if value in {"pending", "queued", "in_progress", "requested", "waiting", "expected"}:
+        return "pending"
+    if status_text == "completed" and not conclusion_text:
+        return "pending"
+    return ""
+
+
+def _github_check_states(output: str) -> dict[str, str]:
+    """Extract latest named GitHub check states from tables or JSON payloads."""
+
+    states: dict[str, str] = {}
+    for line in str(output or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue
+        name = fields[0].strip()
+        state = _normalized_check_status(fields[1])
+        if name and state:
+            states[name] = state
+
+    for payload in _embedded_json_objects(output):
+        candidates: list[Any] = []
+        for key in ("checks", "check_runs", "statusCheckRollup"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+        for raw in candidates:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            state = _normalized_check_status(raw.get("status"), raw.get("conclusion"))
+            if name and state:
+                states[name] = state
+    return states
+
+
+def _github_pr_payload(output: str) -> dict[str, Any]:
+    for payload in reversed(_embedded_json_objects(output)):
+        if any(key in payload for key in ("state", "closed", "merged", "merged_at", "mergedAt")):
+            return payload
+    return {}
+
+
+def _github_evidence_subjects(
+    command: str,
+    payload: dict[str, Any],
+) -> tuple[str, str]:
+    """Return PR and CI subjects so unrelated repairs cannot overwrite failures."""
+
+    repo_match = _GH_REPO_ARG_RE.search(command)
+    repo = repo_match.group(1).strip().lower() if repo_match else ""
+    pr_match = _GH_PR_NUMBER_RE.search(command)
+    pr_number = pr_match.group(1) if pr_match else ""
+    pull_match = _GH_PULL_API_PARTS_RE.search(command)
+    if pull_match:
+        repo = pull_match.group(1).strip().lower()
+        pr_number = pull_match.group(2)
+
+    url = str(payload.get("html_url") or payload.get("url") or "")
+    url_match = re.search(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", url, re.IGNORECASE)
+    if url_match:
+        repo = url_match.group(1).lower()
+        pr_number = url_match.group(2)
+
+    pr_subject = f"github:{repo + ':' if repo else ''}pr:{pr_number}" if pr_number else ""
+    check_match = _GH_CHECK_RUNS_PARTS_RE.search(command)
+    if not check_match:
+        return pr_subject, pr_subject
+
+    check_repo = check_match.group(1).strip().lower()
+    check_sha = check_match.group(2).strip().lower()
+    head_sha = str(payload.get("head_sha") or payload.get("headRefOid") or "").strip().lower()
+    if pr_subject and head_sha and check_sha == head_sha:
+        return pr_subject, pr_subject
+    return pr_subject, f"github:{check_repo}:commit:{check_sha}"
+
+
+def _main_branch_evidence(
+    command: str,
+    output: str,
+    payload: dict[str, Any],
+    *,
+    order: int | None,
+) -> list[dict[str, Any]]:
+    markers = {
+        name.lower(): sha.lower()
+        for name, sha in _MAIN_SHA_MARKER_RE.findall(str(output or ""))
+    }
+    attempted = bool(
+        markers
+        or re.search(r"\b(?:MAIN|BASE)_(?:BEFORE|AFTER|NOW)\b|\bCURRENT_MAIN\b", command)
+        or re.search(r"\bheads/main\b", command)
+    )
+    if not attempted:
+        return []
+
+    before = markers.get("main_before") or markers.get("base_before")
+    after = markers.get("main_after") or markers.get("base_after")
+    current = markers.get("main_now") or markers.get("current_main")
+    base_sha = str(payload.get("base_sha") or "").strip().lower()
+    proven = False
+    equal = False
+    if before and after:
+        proven = True
+        equal = before == after
+    elif current and _SHA_RE.fullmatch(base_sha):
+        proven = True
+        equal = current == base_sha
+
+    if not proven:
+        # A one-sided or failed inspection is not branch-state evidence. Keep
+        # any earlier complete SHA comparison authoritative instead of
+        # replacing it with an inconclusive probe.
+        return []
+    status = "success" if equal else "failure"
+    detail = json.dumps(
+        {
+            "before": before,
+            "after": after,
+            "current": current,
+            "base_sha": base_sha,
+            "proven": proven,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return [
+        {
+            "schema_version": 1,
+            "surface": "main_branch",
+            "check_name": "main branch unchanged",
+            "status": status,
+            "order": int(order or 0),
+            "detail": detail[:240],
+        }
+    ]
+
+
+def _github_lifecycle_evidence(
+    command: str,
+    output: str,
+    *,
+    is_error: bool,
+    order: int | None,
+) -> list[dict[str, Any]]:
+    """Classify typed GitHub lifecycle evidence independently of shell exit."""
+
+    if not any(
+        pattern.search(command)
+        for pattern in (_GH_PR_COMMAND_RE, _GH_PR_CHECKS_RE, _GH_CHECK_RUNS_RE, _GH_PULL_API_RE)
+    ):
+        return []
+
+    evidence: list[dict[str, Any]] = []
+    payload = _github_pr_payload(output)
+    pr_subject, ci_subject = _github_evidence_subjects(command, payload)
+    evidence.extend(
+        _main_branch_evidence(
+            command,
+            output,
+            payload,
+            order=order,
+        )
+    )
+
+    checks_attempted = bool(
+        _GH_PR_CHECKS_RE.search(command)
+        or _GH_CHECK_RUNS_RE.search(command)
+        or _GH_PR_STATUS_RE.search(command)
+    )
+    check_states = _github_check_states(output)
+    if check_states:
+        values = list(check_states.values())
+        status = (
+            "failure"
+            if any(value == "failure" for value in values)
+            else "pending"
+            if any(value == "pending" for value in values)
+            else "success"
+        )
+        evidence.append(
+            {
+                "schema_version": 1,
+                "surface": "ci",
+                "check_name": _text("GitHub checks", limit=160),
+                "status": status,
+                "order": int(order or 0),
+                "subject": ci_subject,
+                "detail": json.dumps(check_states, sort_keys=True, separators=(",", ":"))[:240],
+            }
+        )
+    elif is_error and checks_attempted:
+        evidence.append(
+            {
+                "schema_version": 1,
+                "surface": "ci",
+                "check_name": _text(command, limit=160),
+                "status": "failure",
+                "order": int(order or 0),
+                "subject": ci_subject,
+                "detail": _text(output, limit=240),
+            }
+        )
+
+    state = str(payload.get("state") or "").strip().lower()
+    closed = payload.get("closed") is True or state in {"closed", "merged"}
+    merged = payload.get("merged")
+    merged_at = payload.get("merged_at", payload.get("mergedAt"))
+    merge_commit = payload.get("mergeCommit")
+    close_confirmed = bool(_GH_PR_CLOSE_SUCCESS_RE.search(output))
+    merged_confirmed = merged is True or merged_at is not None or merge_commit is not None
+    merge_fields_present = any(
+        key in payload for key in ("merged", "merged_at", "mergedAt", "mergeCommit")
+    )
+    unmerged_confirmed = merged is False or close_confirmed or (
+        closed and merge_fields_present and merged_at is None and merge_commit is None
+    )
+    pr_evidence_recorded = False
+    if closed or close_confirmed:
+        if _GH_PR_CLOSE_RE.search(command):
+            pr_success = unmerged_confirmed and not merged_confirmed
+        elif _GH_PR_MERGE_RE.search(command):
+            pr_success = merged_confirmed
+        else:
+            pr_success = True
+        evidence.append(
+            {
+                "schema_version": 1,
+                "surface": "pr",
+                "check_name": _text(
+                    f"closed PR verification {payload.get('html_url') or payload.get('url') or ''}",
+                    limit=160,
+                ),
+                "status": "success" if pr_success else "failure",
+                "order": int(order or 0),
+                "subject": pr_subject,
+                "merged_confirmed": merged_confirmed,
+                "unmerged_confirmed": unmerged_confirmed,
+                "detail": json.dumps(
+                    {
+                        "state": state or ("closed" if close_confirmed else ""),
+                        "closed": closed or close_confirmed,
+                        "merged": merged,
+                        "merged_at": merged_at,
+                        "merged_confirmed": merged_confirmed,
+                        "unmerged_confirmed": unmerged_confirmed,
+                        "head_sha": payload.get("head_sha") or payload.get("headRefOid"),
+                        "base_sha": payload.get("base_sha"),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )[:240],
+            }
+        )
+        pr_evidence_recorded = True
+    elif _GH_PR_CREATE_RE.search(command):
+        pr_url = _GITHUB_PR_URL_RE.search(output)
+        if pr_url is not None:
+            evidence.append(
+                {
+                    "schema_version": 1,
+                    "surface": "pr",
+                    "check_name": "PR created",
+                    "status": "success",
+                    "order": int(order or 0),
+                    "subject": pr_subject,
+                    "detail": pr_url.group(0)[:240],
+                }
+            )
+            pr_evidence_recorded = True
+    if is_error and _GH_PR_MUTATION_RE.search(command) and not pr_evidence_recorded:
+        evidence.append(
+            {
+                "schema_version": 1,
+                "surface": "pr",
+                "check_name": _text(command, limit=160),
+                "status": "failure",
+                "order": int(order or 0),
+                "subject": pr_subject,
+                "detail": _text(output, limit=240),
+            }
+        )
+    return evidence
 
 
 def _authenticated_qa_evidence(
@@ -384,25 +769,53 @@ def _text(value: Any, limit: int = 500) -> str:
 
 
 def _surfaces_for(tool_name: str, check_name: str, detail: str) -> list[str]:
+    if tool_name == "terminal":
+        return _terminal_surfaces(check_name)
+
     haystack = f"{tool_name} {check_name} {detail}"
     surfaces: list[str] = []
-    if _CI_COMMAND_RE.search(check_name) or re.search(
-        r"\b(?:ci|checks?|status\s+checks?|gh\s+pr\s+checks)\b",
-        detail,
-        flags=re.IGNORECASE,
-    ):
-        surfaces.append("ci")
-    if _MERGE_RE.search(haystack):
-        surfaces.append("pr")
-    if _DEPLOY_RE.search(haystack):
-        surfaces.append("deployment")
     if tool_name.startswith("browser") or _BROWSER_RE.search(haystack):
         surfaces.append("browser")
-    if _PRODUCTION_RE.search(haystack):
+    if _PRODUCTION_RE.search(haystack) or _EXTERNAL_URL_RE.search(haystack):
         surfaces.append("production")
     if "browser" in surfaces and "production" in surfaces:
         surfaces.append("production_browser")
     return surfaces or ["verification"]
+
+
+def _terminal_surfaces(command: str) -> list[str]:
+    """Return surfaces from command semantics, never incidental output prose."""
+
+    text = str(command or "")
+    lowered = text.lower()
+    if re.search(r"\bgit\b[^\n;&|]*\bdiff\b[^\n;&|]*--check\b", text, re.IGNORECASE):
+        surfaces = ["verification"]
+    else:
+        surfaces = []
+    if (
+        _GH_PR_CHECKS_RE.search(text)
+        or _GH_RUN_RE.search(text)
+        or re.search(r"\b(?:pytest|vitest)\b", text, re.IGNORECASE)
+        or re.search(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[^\s;&|]*(?:test|tests|check|verify|verification)\b", text, re.IGNORECASE)
+        or re.search(r"(?:^|[\s;&|])(?:\./)?(?:scripts/)?(?:test|tests|run_tests)\.sh\b", text, re.IGNORECASE)
+        or re.search(r"\b(?:cargo|go)\s+test\b", text, re.IGNORECASE)
+        or re.search(r"\bgh\s+pr\s+status\b", text, re.IGNORECASE)
+    ):
+        surfaces.append("ci")
+    if _GH_PR_COMMAND_RE.search(text) or _GH_PULL_API_RE.search(text):
+        surfaces.append("pr")
+    if _EXPLICIT_DEPLOY_COMMAND_RE.search(text):
+        surfaces.append("deployment")
+    if _BROWSER_RE.search(text):
+        surfaces.append("browser")
+    if (
+        _PRODUCTION_RE.search(text)
+        and ("browser" in surfaces or "deployment" in surfaces or "--prod" in lowered)
+    ) or ("browser" in surfaces and _EXTERNAL_URL_RE.search(text)):
+        surfaces.append("production")
+    if "browser" in surfaces and "production" in surfaces:
+        surfaces.append("production_browser")
+    return list(dict.fromkeys(surfaces)) or ["verification"]
 
 
 def _normalized_evidence_surfaces(item: dict[str, Any]) -> list[str]:
@@ -445,7 +858,7 @@ def _is_non_verification_git_pathspec_segment(segment: str) -> bool:
 
     if index >= len(parts):
         return False
-    return parts[index] in _NON_VERIFY_GIT_PATHSPEC_COMMANDS
+    return parts[index] in (_NON_VERIFY_GIT_PATHSPEC_COMMANDS | _NON_VERIFICATION_GIT_COMMANDS)
 
 
 def _is_read_only_inspection_segment(segment: str) -> bool:
@@ -860,6 +1273,18 @@ def classify_tool_verification_evidence(
         )
         if authenticated_qa:
             return authenticated_qa
+        github_lifecycle = _github_lifecycle_evidence(
+            raw_check_name,
+            full_result_text,
+            is_error=is_error,
+            order=order,
+        )
+        github_command = any(
+            pattern.search(raw_check_name)
+            for pattern in (_GH_PR_COMMAND_RE, _GH_PR_CHECKS_RE, _GH_CHECK_RUNS_RE, _GH_PULL_API_RE)
+        )
+        if github_lifecycle or github_command:
+            return github_lifecycle
         closed_pr_evidence = _closed_pr_without_merge_evidence(
             raw_check_name,
             full_result_text,
@@ -1005,7 +1430,47 @@ def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
         order = int(item.get("order") or 0)
         for surface in surfaces:
             current = latest.get(surface)
-            if current is None or order >= int(current.get("order") or 0):
+            current_subject = str((current or {}).get("subject") or "")
+            new_subject = str(item.get("subject") or "")
+            current_status = str((current or {}).get("status") or "").lower()
+            new_status = str(item.get("status") or "").lower()
+            same_subject = current_subject == new_subject
+            if not same_subject and current_subject and new_subject:
+                current_pr = re.fullmatch(r"github:(?:(.+):)?pr:(\d+)", current_subject)
+                new_pr = re.fullmatch(r"github:(?:(.+):)?pr:(\d+)", new_subject)
+                same_subject = bool(
+                    current_pr
+                    and new_pr
+                    and current_pr.group(2) == new_pr.group(2)
+                    and (
+                        current_pr.group(1) is None
+                        or new_pr.group(1) is None
+                        or current_pr.group(1) == new_pr.group(1)
+                    )
+                )
+            current_rank = 2 if ":pr:" in current_subject else 1 if ":commit:" in current_subject else 0
+            new_rank = 2 if ":pr:" in new_subject else 1 if ":commit:" in new_subject else 0
+            unrelated_lower_priority_subject = bool(
+                current
+                and current_subject
+                and new_subject
+                and not same_subject
+                and new_rank < current_rank
+            )
+            unrelated_equal_priority_success_cannot_clear_failure = bool(
+                current
+                and current_subject
+                and new_subject
+                and not same_subject
+                and new_rank == current_rank
+                and current_status in {"failure", "timeout", "pending"}
+                and new_status == "success"
+            )
+            if (
+                not unrelated_lower_priority_subject
+                and not unrelated_equal_priority_success_cannot_clear_failure
+                and (current is None or order >= int(current.get("order") or 0))
+            ):
                 normalized_item = dict(item)
                 normalized_item["surface"] = surface
                 latest[surface] = normalized_item
@@ -1284,7 +1749,7 @@ def _surface_claimed(text: str, surface: str) -> bool:
     )
     if not relevant_text.strip():
         return False
-    if surface in {"browser", "production", "production_browser", "ci", "deployment", "pr"}:
+    if surface in {"browser", "production", "production_browser", "ci", "deployment", "pr", "main_branch"}:
         sentences = [part for part in _SENTENCE_SPLIT_RE.split(relevant_text) if part.strip()]
         relevant = [part for part in sentences if _surface_terms_present(part, surface)]
         if not relevant:
@@ -1309,6 +1774,8 @@ def _surface_claimed(text: str, surface: str) -> bool:
         return bool(_DEPLOY_RE.search(relevant_text))
     if surface == "pr":
         return bool(_MERGE_RE.search(relevant_text))
+    if surface == "main_branch":
+        return bool(_MAIN_UNCHANGED_CLAIM_RE.search(relevant_text))
     return bool(_CLAIM_WORD_RE.search(relevant_text))
 
 
@@ -1326,6 +1793,8 @@ def _surface_terms_present(text: str, surface: str) -> bool:
         return bool(_CI_CLAIM_RE.search(text))
     if surface == "pr":
         return bool(_MERGE_RE.search(text))
+    if surface == "main_branch":
+        return bool(_MAIN_UNCHANGED_CLAIM_RE.search(text))
     return True
 
 
@@ -1357,7 +1826,7 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
     blocked = []
     for surface, item in sorted(latest.items()):
         status = str(item.get("status") or "").lower()
-        if status not in {"failure", "timeout"}:
+        if status not in {"failure", "timeout", "pending"}:
             continue
         if _surface_claimed(final_text, surface):
             blocked.append(
@@ -1366,6 +1835,39 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                     "status": status,
                     "check_name": str(item.get("check_name") or "verification"),
                     "detail": str(item.get("detail") or "")[:240],
+                }
+            )
+    if _UNMERGED_PR_CLAIM_RE.search(final_text):
+        item = latest.get("pr") or {}
+        try:
+            detail = json.loads(str(item.get("detail") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            detail = {}
+        if (
+            str(item.get("status") or "").lower() != "success"
+            or item.get("unmerged_confirmed", detail.get("unmerged_confirmed")) is not True
+        ):
+            if not any(entry.get("surface") == "pr" for entry in blocked):
+                blocked.append(
+                    {
+                        "surface": "pr",
+                        "status": str(item.get("status") or "missing"),
+                        "check_name": str(item.get("check_name") or "closed-without-merge proof"),
+                        "detail": str(item.get("detail") or "explicit unmerged proof missing")[:240],
+                    }
+                )
+    if _MAIN_UNCHANGED_CLAIM_RE.search(final_text):
+        item = latest.get("main_branch") or {}
+        if (
+            str(item.get("status") or "").lower() != "success"
+            and not any(entry.get("surface") == "main_branch" for entry in blocked)
+        ):
+            blocked.append(
+                {
+                    "surface": "main_branch",
+                    "status": str(item.get("status") or "missing"),
+                    "check_name": str(item.get("check_name") or "main branch SHA comparison"),
+                    "detail": str(item.get("detail") or "main branch SHA proof missing")[:240],
                 }
             )
     return {

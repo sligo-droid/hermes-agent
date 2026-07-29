@@ -13,6 +13,7 @@ from agent.visual_qa import (
 )
 from agent.verification_evidence import (
     claim_constraints_for_text,
+    classify_tool_verification_evidence,
     classify_tool_visual_receipt,
     classify_verification_command,
     downgrade_final_response_for_evidence,
@@ -1120,6 +1121,648 @@ CURRENT_MAIN=1aa02906ca5cd01c377e67c8e404c8add905c210"""
         "PR checks passed, the PR was closed without merge, and main stayed unchanged.",
         agent._turn_runtime_stats["verification_evidence"],
     )["allowed"] is True
+
+
+def test_docs_diff_check_does_not_claim_ci_or_production_surfaces():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": (
+                "diff --git a/docs/discord-dev-loop-smoke.md b/docs/discord-dev-loop-smoke.md\n"
+                "origin\tgit@github.com:sligo-labs/PID.git (fetch)\n"
+                "origin\tgit@github.com:sligo-labs/PID.git (push)"
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "git diff --check && git diff -- docs/discord-dev-loop-smoke.md "
+                "&& git remote -v && git config user.name"
+            )
+        },
+        result,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert set(latest) == {"verification"}
+    assert latest["verification"]["status"] == "success"
+
+
+def test_git_lifecycle_with_smoke_filename_is_not_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": (
+                "[branch ab9c14a] Update daily dev-loop smoke touch\n"
+                "To github.com:sligo-labs/PID.git\n"
+                " * [new branch] HEAD -> discord-action/pid"
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "git add -- docs/discord-dev-loop-smoke.md && "
+                "git commit -m 'Update daily dev-loop smoke touch' && git push -u origin HEAD"
+            )
+        },
+        result,
+        False,
+    )
+
+    assert agent._turn_runtime_stats.get("verification_evidence", []) == []
+
+
+def test_successful_checks_and_pr_close_survive_auxiliary_query_schema_error():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": (
+                "main_before=196820e67e9e2f2420033ef62aae56c2f5f3b589\n"
+                "Vercel\tpass\t0\thttps://vercel.example\tDeployment has completed\n"
+                "Vercel Preview Comments\tpass\t0\thttps://vercel.example\n"
+                "✓ Closed pull request sligo-labs/PID#1093 (Daily smoke)\n"
+                "main_after=196820e67e9e2f2420033ef62aae56c2f5f3b589\n"
+                'Unknown JSON field: "baseRefOid"'
+            ),
+            "exit_code": 1,
+            "error": None,
+        }
+    )
+    command = (
+        "set -e\n"
+        "BASE_BEFORE=$(gh api repos/sligo-labs/PID/git/ref/heads/main --jq .object.sha)\n"
+        "gh pr checks 1093 --repo sligo-labs/PID\n"
+        "gh pr close 1093 --repo sligo-labs/PID\n"
+        "BASE_AFTER=$(gh api repos/sligo-labs/PID/git/ref/heads/main --jq .object.sha)\n"
+        "gh pr view 1093 --json baseRefOid,statusCheckRollup\n"
+        'test "$BASE_BEFORE" = "$BASE_AFTER"'
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": command},
+        result,
+        True,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert latest["ci"]["status"] == "success"
+    assert latest["pr"]["status"] == "success"
+    assert "deployment" not in latest
+    assert "production" not in latest
+
+
+def test_closed_pr_json_and_named_check_runs_repair_closeout_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": (
+                '{"checks":[{"conclusion":null,"name":null,"status":null},'
+                '{"conclusion":"SUCCESS","name":"Vercel Preview Comments",'
+                '"status":"COMPLETED"}],"closed":true,'
+                '"closedAt":"2026-07-29T12:03:51Z",'
+                '"headRefOid":"ab9c14ac44cbfa49fdf598feea2694bf0d713a40",'
+                '"mergeCommit":null,"mergedAt":null,"number":1093,'
+                '"state":"CLOSED","url":"https://github.com/sligo-labs/PID/pull/1093"}'
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "MAIN_NOW=$(gh api repos/sligo-labs/PID/git/ref/heads/main --jq .object.sha); "
+                "test \"$MAIN_NOW\" = \"196820e67e9e2f2420033ef62aae56c2f5f3b589\"; "
+                "gh pr view 1093 --repo sligo-labs/PID --json state,closed,mergedAt,statusCheckRollup"
+            )
+        },
+        result,
+        False,
+    )
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+    assert latest["ci"]["status"] == "success"
+    assert latest["pr"]["status"] == "success"
+
+
+def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    bad_query = json.dumps(
+        {
+            "output": (
+                "MAIN_BEFORE=196820e67e9e2f2420033ef62aae56c2f5f3b589\n"
+                "Vercel\tpass\t0\thttps://vercel.example\tDeployment has completed\n"
+                "Vercel Preview Comments\tpass\t0\thttps://vercel.example\n"
+                "✓ Closed pull request sligo-labs/PID#1093 (Daily smoke)\n"
+                "MAIN_AFTER=196820e67e9e2f2420033ef62aae56c2f5f3b589\n"
+                'Unknown JSON field: "baseRefOid"'
+            ),
+            "exit_code": 1,
+            "error": None,
+        }
+    )
+    repaired = json.dumps(
+        {
+            "output": (
+                '{"checks":[{"completed_at":"2026-07-29T12:03:34Z",'
+                '"conclusion":"success","name":"Vercel Preview Comments",'
+                '"status":"completed"}],"total_count":1}\n'
+                '{"base_sha":"196820e67e9e2f2420033ef62aae56c2f5f3b589",'
+                '"closed_at":"2026-07-29T12:03:51Z",'
+                '"head_sha":"ab9c14ac44cbfa49fdf598feea2694bf0d713a40",'
+                '"html_url":"https://github.com/sligo-labs/PID/pull/1093",'
+                '"merged":false,"merged_at":null,"state":"closed"}'
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": "gh pr checks 1093 && gh pr close 1093 && gh pr view 1093 --json baseRefOid"},
+        bad_query,
+        True,
+    )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "gh api repos/sligo-labs/PID/commits/ab9c14a/check-runs && "
+                "gh api repos/sligo-labs/PID/pulls/1093"
+            )
+        },
+        repaired,
+        False,
+    )
+    final = (
+        "Commit `ab9c14a` was pushed and PR #1093 checks passed. "
+        "The PR was closed without merge, and main remained unchanged."
+    )
+
+    downgraded, constraints = downgrade_final_response_for_evidence(
+        final,
+        agent._turn_runtime_stats["verification_evidence"],
+    )
+
+    assert constraints["allowed"] is True
+    assert downgraded == final
+
+
+def test_pending_named_github_check_blocks_passed_ci_claim():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr checks 1093 --repo sligo-labs/PID"},
+        json.dumps(
+            {
+                "output": "Vercel\tpending\t0\thttps://vercel.example\tDeploying",
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=3,
+    )
+
+    constraints = claim_constraints_for_text("PR checks passed.", evidence)
+
+    assert latest_evidence_by_surface(evidence)["ci"]["status"] == "pending"
+    assert constraints["allowed"] is False
+
+
+def test_pending_github_check_blocks_generic_multiline_checks_claim():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr checks 1093 --repo sligo-labs/PID"},
+        json.dumps(
+            {
+                "output": "Vercel\tpending\t0\thttps://vercel.example\tDeploying",
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=3,
+    )
+
+    constraints = claim_constraints_for_text(
+        "- **PR:** #1093 opened\n- **Checks:** Vercel passed.", evidence
+    )
+
+    assert constraints["allowed"] is False
+
+
+def test_github_pr_link_is_not_a_production_claim():
+    evidence = [
+        {
+            "surface": "production",
+            "check_name": "production smoke",
+            "status": "failure",
+            "order": 1,
+            "detail": "production unavailable",
+        }
+    ]
+    final = "PR opened: https://github.com/sligo-labs/PID/pull/1093. Checks passed."
+
+    constraints = claim_constraints_for_text(final, evidence)
+
+    assert constraints["allowed"] is True
+
+
+def test_successful_pr_create_body_does_not_manufacture_other_surfaces():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {
+            "command": (
+                "gh pr create --title 'Docs' --body 'Ran git diff --check; "
+                "no production deployment was requested.'"
+            )
+        },
+        json.dumps(
+            {
+                "output": "https://github.com/example/repo/pull/123",
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=4,
+    )
+
+    latest = latest_evidence_by_surface(evidence)
+    assert set(latest) == {"pr"}
+    assert latest["pr"]["status"] == "success"
+
+
+def test_successful_checks_do_not_hide_failed_pr_close():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr checks 123 && gh pr close 123"},
+        json.dumps(
+            {
+                "output": (
+                    "Unit tests\tpass\t0\thttps://github.example/check\n"
+                    "GraphQL: Pull request is already merged"
+                ),
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=5,
+    )
+
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["ci"]["status"] == "success"
+    assert latest["pr"]["status"] == "failure"
+    assert claim_constraints_for_text("Checks passed and the PR was closed.", evidence)[
+        "allowed"
+    ] is False
+
+
+def test_pr_create_url_survives_unrelated_trailing_command_error():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr create --title Docs --body Body; gh pr view --json unsupported"},
+        json.dumps(
+            {
+                "output": (
+                    "https://github.com/example/repo/pull/123\n"
+                    'Unknown JSON field: "unsupported"'
+                ),
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=6,
+    )
+
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["pr"]["status"] == "success"
+
+
+def test_merged_pr_payload_is_successful_merge_evidence():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr merge 123 --merge && gh pr view 123 --json state,mergedAt"},
+        json.dumps(
+            {
+                "output": (
+                    '{"mergeCommit":{"oid":"abc123"},'
+                    '"mergedAt":"2026-07-29T12:00:00Z","state":"MERGED"}'
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=7,
+    )
+
+    assert latest_evidence_by_surface(evidence)["pr"]["status"] == "success"
+
+
+def test_close_command_rejects_payload_showing_pr_was_merged():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr close 123; gh pr view 123 --json state,mergedAt"},
+        json.dumps(
+            {
+                "output": (
+                    '{"mergeCommit":{"oid":"abc123"},'
+                    '"mergedAt":"2026-07-29T12:00:00Z","state":"MERGED"}'
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=8,
+    )
+
+    assert latest_evidence_by_surface(evidence)["pr"]["status"] == "failure"
+
+
+def test_closed_state_alone_cannot_authorize_strong_closeout_claims():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr view 123 --json state"},
+        json.dumps({"output": '{"state":"CLOSED"}', "exit_code": 0, "error": None}),
+        False,
+        order=9,
+    )
+
+    constraints = claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.", evidence
+    )
+
+    assert constraints["allowed"] is False
+    assert {item["surface"] for item in constraints["blocked_surfaces"]} == {
+        "pr",
+        "main_branch",
+    }
+
+
+def test_close_success_does_not_hide_later_checks_failure():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr close 123 && gh pr checks 123"},
+        json.dumps(
+            {
+                "output": (
+                    "✓ Closed pull request example/repo#123\n"
+                    "GraphQL: no checks reported on the branch"
+                ),
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=10,
+    )
+
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["pr"]["status"] == "success"
+    assert latest["ci"]["status"] == "failure"
+
+
+def test_checks_success_does_not_turn_failed_pull_query_into_pr_success():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr checks 123 && gh api repos/example/repo/pulls/123"},
+        json.dumps(
+            {
+                "output": (
+                    "Unit tests\tpass\t0\thttps://github.example/check\n"
+                    "HTTP 500: Internal Server Error"
+                ),
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=11,
+    )
+
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["ci"]["status"] == "success"
+    assert "pr" not in latest
+    assert claim_constraints_for_text("The PR was closed without merge.", evidence)[
+        "allowed"
+    ] is False
+
+
+def test_equal_main_markers_authorize_unchanged_claim_despite_later_error():
+    sha = "196820e67e9e2f2420033ef62aae56c2f5f3b589"
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {
+            "command": (
+                "MAIN_BEFORE=$(gh api repos/example/repo/git/ref/heads/main); "
+                "gh pr close 123; "
+                "MAIN_AFTER=$(gh api repos/example/repo/git/ref/heads/main); "
+                "gh pr view 123 --json unsupported"
+            )
+        },
+        json.dumps(
+            {
+                "output": (
+                    f"MAIN_BEFORE={sha}\n"
+                    "✓ Closed pull request example/repo#123\n"
+                    f"MAIN_AFTER={sha}\n"
+                    'Unknown JSON field: "unsupported"'
+                ),
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=12,
+    )
+
+    constraints = claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.", evidence
+    )
+
+    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "success"
+    assert constraints["allowed"] is True
+
+
+def test_different_main_markers_block_unchanged_claim():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "MAIN_BEFORE=x; gh pr close 123; MAIN_AFTER=y"},
+        json.dumps(
+            {
+                "output": (
+                    "MAIN_BEFORE=196820e67e9e2f2420033ef62aae56c2f5f3b589\n"
+                    "✓ Closed pull request example/repo#123\n"
+                    "MAIN_AFTER=296820e67e9e2f2420033ef62aae56c2f5f3b589"
+                ),
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=13,
+    )
+
+    constraints = claim_constraints_for_text("Main remained unchanged.", evidence)
+
+    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "failure"
+    assert constraints["allowed"] is False
+
+
+def test_unrelated_commit_checks_cannot_clear_pr_check_failure():
+    failed = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr checks 123 --repo example/repo"},
+        json.dumps({"output": "Unit tests\tfail\t0\thttps://example/check", "exit_code": 1}),
+        True,
+        order=14,
+    )
+    repaired_other_commit = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh api repos/example/repo/commits/deadbeef/check-runs"},
+        json.dumps(
+            {
+                "output": (
+                    '{"check_runs":[{"conclusion":"success","name":"Unit tests",'
+                    '"status":"completed"}]}'
+                ),
+                "exit_code": 0,
+            }
+        ),
+        False,
+        order=15,
+    )
+
+    latest = latest_evidence_by_surface(failed + repaired_other_commit)
+
+    assert latest["ci"]["status"] == "failure"
+
+
+def test_unrelated_commit_failure_cannot_replace_pr_check_success():
+    passed = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr checks 123 --repo example/repo"},
+        json.dumps({"output": "Unit tests\tpass\t0\thttps://example/check", "exit_code": 0}),
+        False,
+        order=15,
+    )
+    failed_other_commit = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh api repos/example/repo/commits/deadbeef/check-runs"},
+        json.dumps({"output": "HTTP 500: Internal Server Error", "exit_code": 1}),
+        True,
+        order=16,
+    )
+
+    evidence = passed + failed_other_commit
+    latest = latest_evidence_by_surface(evidence)
+
+    assert latest["ci"]["status"] == "success"
+    assert claim_constraints_for_text(
+        "- **Checks:** PR #123 checks passed.", evidence
+    )["allowed"] is True
+
+
+def test_failed_pr_view_does_not_overwrite_successful_close_receipt():
+    closed = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr close 123"},
+        json.dumps(
+            {"output": "✓ Closed pull request example/repo#123", "exit_code": 0}
+        ),
+        False,
+        order=16,
+    )
+    bad_view = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr view 123 --json unsupported"},
+        json.dumps({"output": 'Unknown JSON field: "unsupported"', "exit_code": 1}),
+        True,
+        order=17,
+    )
+
+    latest = latest_evidence_by_surface(closed + bad_view)
+
+    assert latest["pr"]["status"] == "success"
+
+
+def test_failed_pull_api_query_does_not_trigger_legacy_pr_failure():
+    closed = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr close 123 --repo example/repo"},
+        json.dumps(
+            {"output": "✓ Closed pull request example/repo#123", "exit_code": 0}
+        ),
+        False,
+        order=17,
+    )
+    bad_query = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh api repos/example/repo/pulls/123"},
+        json.dumps({"output": "HTTP 500: Internal Server Error", "exit_code": 1}),
+        True,
+        order=18,
+    )
+
+    latest = latest_evidence_by_surface(closed + bad_query)
+
+    assert bad_query == []
+    assert latest["pr"]["status"] == "success"
+
+
+def test_bad_auxiliary_pr_view_does_not_downgrade_multiline_closeout():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr close 123 && gh pr checks 123"},
+        json.dumps(
+            {
+                "output": (
+                    "Unit tests\tpass\t0\thttps://example/check\n"
+                    "✓ Closed pull request example/repo#123"
+                ),
+                "exit_code": 0,
+            }
+        ),
+        False,
+        order=18,
+    )
+    evidence += classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh pr view 123 --json unsupported"},
+        json.dumps({"output": 'Unknown JSON field: "unsupported"', "exit_code": 1}),
+        True,
+        order=19,
+    )
+    final = "- PR #123 opened\n- Checks passed\n- Closed without merge"
+
+    downgraded, constraints = downgrade_final_response_for_evidence(final, evidence)
+
+    assert constraints["allowed"] is True
+    assert downgraded == final
 
 
 def test_verify_path_name_alone_is_not_verification_evidence():
