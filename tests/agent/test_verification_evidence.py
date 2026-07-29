@@ -47,6 +47,140 @@ def test_terminal_production_browser_timeout_blocks_matching_shipped_claim():
     assert "worker_frontend_smoke" in blocked["production_browser"]["check_name"]
 
 
+def test_successful_http_probe_timeout_setting_is_not_timeout_evidence():
+    command = """python3 - <<'PY'
+import urllib.request
+request = urllib.request.Request(
+    'https://pid-git-public-beta-sligo-labs.vercel.app/',
+    headers={'User-Agent': 'PID-deployment-verifier/1.0'},
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    print('status=', response.status)
+PY"""
+    result = json.dumps(
+        {
+            "output": (
+                "https://pid-git-public-beta-sligo-labs.vercel.app/ "
+                "status= 200 content_type= text/html"
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": command},
+        result,
+        False,
+        order=1,
+    )
+
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["deployment"]["status"] == "success"
+    assert claim_constraints_for_text(
+        "Deployed the public beta successfully.", evidence
+    )["allowed"] is True
+
+
+def test_terminal_timeout_uses_structured_error_when_partial_output_exists():
+    result = json.dumps(
+        {
+            "output": "probe started and produced partial output",
+            "exit_code": 124,
+            "error": "Command timed out after 30 seconds",
+        }
+    )
+
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {
+            "command": (
+                "python -m hermes_cli.worker_frontend_smoke "
+                "--url https://app.example --browser chromium"
+            )
+        },
+        result,
+        True,
+        order=2,
+    )
+
+    assert latest_evidence_by_surface(evidence)["production_browser"]["status"] == "timeout"
+
+
+def test_failed_test_output_timeout_setting_is_failure_not_timeout():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "scripts/run_tests.sh tests/test_timeout_config.py"},
+        json.dumps(
+            {
+                "output": "E assert configured timeout == 60\n1 failed",
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=3,
+    )
+
+    assert latest_evidence_by_surface(evidence)["ci"]["status"] == "failure"
+
+
+def test_unstructured_timed_out_outcome_remains_timeout():
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "scripts/run_tests.sh tests/test_slow_probe.py"},
+        json.dumps(
+            {
+                "output": "[Command timed out after 60s]",
+                "exit_code": 1,
+                "error": None,
+            }
+        ),
+        True,
+        order=4,
+    )
+
+    assert latest_evidence_by_surface(evidence)["ci"]["status"] == "timeout"
+
+
+def test_structured_browser_failure_can_report_timeout_without_wrapper_error():
+    evidence = classify_tool_verification_evidence(
+        "browser_navigate",
+        {"url": "https://app.example/dashboard"},
+        json.dumps(
+            {
+                "success": False,
+                "error": "Navigation timed out after 30 seconds",
+                "url": "https://app.example/dashboard",
+            }
+        ),
+        False,
+        order=3,
+    )
+
+    assert latest_evidence_by_surface(evidence)["production_browser"]["status"] == "timeout"
+
+
+def test_successful_browser_page_timeout_text_is_not_timeout_evidence():
+    evidence = classify_tool_verification_evidence(
+        "browser_navigate",
+        {"url": "https://app.example/settings"},
+        json.dumps(
+            {
+                "success": True,
+                "url": "https://app.example/settings",
+                "title": "Timeout settings",
+                "snapshot": "Request timeout is configured to 30 seconds.",
+            }
+        ),
+        False,
+        order=4,
+    )
+
+    assert latest_evidence_by_surface(evidence)["production_browser"]["status"] == "success"
+
+
 def test_successful_terminal_evidence_binds_host_snapshot_to_mutation_boundary():
     head_sha = "a" * 40
     agent = SimpleNamespace(
