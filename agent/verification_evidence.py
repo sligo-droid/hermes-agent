@@ -177,6 +177,10 @@ _DEPLOY_RE = re.compile(r"\b(deploy|deployed|deployment)\b", re.IGNORECASE)
 _MERGE_RE = re.compile(r"\b(merge|merged|pull|pr)\b", re.IGNORECASE)
 _SUCCESS_RE = re.compile(r"\b(success|passed|pass|ok|complete|completed|visible|found|healthy)\b", re.IGNORECASE)
 _TIMEOUT_RE = re.compile(r"\b(timed?\s*out|timeout|deadline|expired)\b", re.IGNORECASE)
+_EXPLICIT_TIMEOUT_OUTCOME_RE = re.compile(
+    r"\b(?:timed?\s+out|deadline exceeded)\b",
+    re.IGNORECASE,
+)
 _SHELL_SEGMENT_RE = re.compile(r"\s*(?:&&|\|\||[;\n])\s*")
 _UNSAFE_VERIFY_SHELL_RE = re.compile(r"\|\||(?<!&)&(?!&)|(?<!\|)\|(?!\|)|[<>`]|\$\(")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
@@ -768,6 +772,27 @@ def _text(value: Any, limit: int = 500) -> str:
     return str(value).strip()[:limit]
 
 
+def _tool_result_timed_out(
+    data: dict[str, Any],
+    result_text: str,
+    *,
+    failed: bool,
+) -> bool:
+    """Trust execution outcome fields, never timeout words in command source."""
+
+    if not failed:
+        return False
+    try:
+        if int(data.get("exit_code")) == 124:
+            return True
+    except (TypeError, ValueError):
+        pass
+    error_text = str(data.get("error") or "").strip()
+    if error_text:
+        return bool(_TIMEOUT_RE.search(error_text))
+    return bool(_EXPLICIT_TIMEOUT_OUTCOME_RE.search(result_text))
+
+
 def _surfaces_for(tool_name: str, check_name: str, detail: str) -> list[str]:
     if tool_name == "terminal":
         return _terminal_surfaces(check_name)
@@ -1308,15 +1333,16 @@ def classify_tool_verification_evidence(
     elif not name.startswith("browser") and name not in {"webfetch", "web_search"}:
         return []
 
-    timed_out = bool(_TIMEOUT_RE.search(f"{raw_check_name}\n{result_text}"))
+    failed = bool(
+        is_error or data.get("success") is False or data.get("ok") is False
+    )
+    timed_out = _tool_result_timed_out(data, result_text, failed=failed)
     status = "timeout" if timed_out else ("failure" if is_error else "success")
     if not is_error and name != "terminal" and data:
         if data.get("success") is False or data.get("ok") is False:
             status = "timeout" if timed_out else "failure"
         elif data.get("success") is True or data.get("ok") is True:
             status = "success"
-    if status == "success" and result_text and _TIMEOUT_RE.search(result_text):
-        status = "timeout"
     if name.startswith("browser") and status == "success" and (
         _BROWSER_AUTH_BOUNDARY_RE.search(result_text)
         or _BROWSER_ERROR_PAGE_RE.search(result_text)
