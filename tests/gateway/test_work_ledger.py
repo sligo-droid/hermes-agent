@@ -1813,6 +1813,54 @@ def test_explicit_pr_only_request_allows_intentionally_unmerged_final(tmp_path):
     assert ledger.get(item["id"])["status"] == "completed"
 
 
+def test_close_pr_after_green_checks_is_intentional_unmerged_completion(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(
+        text=(
+            "Update the smoke line. Open a PR and let checks run. "
+            "After checks pass, close the PR while leaving main unchanged."
+        )
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "Daily smoke completed. Checks passed. "
+            "PR status: Closed, not merged. Main unchanged before and after closure."
+        ),
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "pr",
+                    "status": "success",
+                    "order": 1,
+                    "unmerged_confirmed": True,
+                    "detail": '{"unmerged_confirmed":true}',
+                },
+                {
+                    "surface": "main_branch",
+                    "status": "success",
+                    "order": 2,
+                    "detail": '{"proven":true}',
+                },
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["delivery_intent"] == "pr_only"
+    assert stored["completion_gate"]["reason"] == "intentional_narrow_scope_terminal"
+
+
 def test_default_repo_project_pr_opened_but_unmerged_is_blocked(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Implement the feature")

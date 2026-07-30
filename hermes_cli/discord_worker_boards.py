@@ -238,6 +238,7 @@ def _request_forbids_merge(text: str) -> bool:
         r"\b(?:pull\s+request|pr)\s+only\b",
         r"\bleave\s+(?:the\s+)?(?:pull\s+request|pr)\s+open\b",
         r"\bkeep\s+(?:the\s+)?(?:pull\s+request|pr)\s+open\b",
+        r"\bclose\s+(?:the\s+)?(?:pull\s+request|pr)\b",
         r"\bopen\s+(?:a\s+)?(?:pull\s+request|pr)\b.{0,80}\b(?:do\s+not|don['’]?t|dont)\s+merge\b",
         r"\b(?:do\s+not|don['’]?t|dont)\s+land\b",
         r"\breview[-\s]?only\b",
