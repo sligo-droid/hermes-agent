@@ -256,6 +256,19 @@ def test_dev_worker_lifecycle_constraints_still_disable_non_amend_pr_lifecycle()
     }
 
 
+def test_close_pr_after_checks_disables_automatic_merge():
+    from hermes_cli import discord_worker_boards as dwb
+
+    policy = dwb.pr_policy_for_request(
+        "Open a PR, wait for checks, then close the PR while leaving main unchanged."
+    )
+
+    assert policy == {
+        "pr_open_policy": dwb.PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
+        "merge_policy": dwb.MERGE_POLICY_NEVER,
+    }
+
+
 def test_old_discord_worker_boards_are_not_status_targets(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
