@@ -13,7 +13,7 @@ def test_gateway_uses_basic_tier_instead_of_global_model_default(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: config)
     assert gateway_run.GatewayRunner._load_reasoning_config() == {
         "enabled": True,
-        "effort": "xhigh",
+        "effort": "max",
     }
 
 
@@ -40,4 +40,4 @@ def test_discord_action_request_uses_configured_routine_tier():
     )
 
     assert tier.name == "intermediate"
-    assert tier.reasoning_effort == "medium"
+    assert tier.reasoning_effort == "low"

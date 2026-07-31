@@ -56,7 +56,7 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "medium",
-        "basic": "xhigh",
+        "basic": "max",
         "intermediate": "low",
         "advanced": "medium",
         "discord_action": "low",
@@ -185,7 +185,7 @@ def test_reserved_builtin_tier_override_is_ignored():
     assert tier is not None
     assert tier.model == "gpt-5.6-luna"
     assert tier.opencode_model == "hermes-codex/gpt-5.6-luna"
-    assert tier.reasoning_effort == "xhigh"
+    assert tier.reasoning_effort == "max"
 
 
 def test_custom_non_reserved_tier_resolves_atomically():
@@ -300,7 +300,7 @@ def test_standalone_coding_worker_uses_its_named_tier():
     assert resolved["complex_build_reasoning_level"] == "high"
 
 
-def test_explicit_maximum_tier_efforts_cap_at_xhigh():
+def test_explicit_maximum_tier_efforts_are_preserved():
     for effort in ("max", "ultra"):
         tier = resolve_model_tier(
             {"model_tiers": {"custom": {"model": "custom/model", "reasoning_effort": effort}}},
@@ -308,4 +308,4 @@ def test_explicit_maximum_tier_efforts_cap_at_xhigh():
         )
 
         assert tier is not None
-        assert tier.reasoning_effort == "xhigh"
+        assert tier.reasoning_effort == effort
