@@ -1626,6 +1626,7 @@ def _run_opencode(
                 timeout=_role_timeout(role),
                 agent=cfg["plan_agent"],
                 reasoning_level=cfg["complex_plan_reasoning_level"],
+                fast_mode=cfg.get("complex_plan_fast_mode", False),
                 title=f"kanban {task_id}",
                 env=_backend_child_env(runtime_env),
                 on_event=on_event,

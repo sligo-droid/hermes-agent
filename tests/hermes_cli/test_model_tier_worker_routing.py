@@ -35,6 +35,9 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
     assert settings["reasoning"] == "high"
     assert settings["reasoning_source"] == "model_tier"
     assert settings["model_tier_source"] == "role"
+    assert settings["fast_mode"] is False
+    assert settings["service_tier"] == "normal"
+    assert settings["service_tier_source"] == "explicit"
     assert "worker_tier" not in settings
     assert "worker_tier_source" not in settings
 
@@ -75,6 +78,26 @@ def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeyp
     assert settings["model"] == "gpt-5.6-sol"
     assert settings["reasoning"] == "medium"
     assert settings["reasoning_source"] == "model_tier"
+
+
+@pytest.mark.parametrize(("tier_name", "fast_mode", "service_tier"), [
+    ("basic", True, "fast"),
+    ("intermediate", False, "normal"),
+])
+def test_named_role_tier_deterministically_controls_service_tier(
+    monkeypatch, tier_name, fast_mode, service_tier
+):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", "fast" if not fast_mode else "normal")
+    settings = workers._role_runtime_settings(
+        "dev",
+        {"roles": {"dev": {"model_tier": tier_name, "service_tier": "auto"}}},
+    )
+
+    assert settings["fast_mode"] is fast_mode
+    assert settings["service_tier"] == service_tier
+    assert settings["service_tier_source"] == "model_tier"
 
 
 def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):

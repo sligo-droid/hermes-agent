@@ -249,6 +249,8 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="low"',
+        "-c",
+        'service_tier="normal"',
     ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -438,12 +440,16 @@ def test_model_tier_and_reasoning_override_codex_runtime(monkeypatch, tmp_path):
             'model="gpt-5.6-sol"',
             "-c",
             'model_reasoning_effort="high"',
+            "-c",
+            'service_tier="normal"',
         ],
         [
             "-c",
             'model="gpt-5.6-sol"',
             "-c",
             'model_reasoning_effort="high"',
+            "-c",
+            'service_tier="normal"',
         ],
     ]
     assert parent.turn_worker_runs == [
@@ -453,6 +459,29 @@ def test_model_tier_and_reasoning_override_codex_runtime(monkeypatch, tmp_path):
             "reasoning": "high",
             "model_tier": "advanced",
         },
+    ]
+
+
+def test_fast_named_tier_sets_codex_service_tier(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = [TurnResult(final_text="Built", thread_id="thread-build")]
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            model_tier="basic",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert FakeSession.instances[0].kwargs["extra_args"][-2:] == [
+        "-c",
+        'service_tier="fast"',
     ]
 
 
@@ -2419,6 +2448,8 @@ def test_ui_work_uses_normal_codex_model_tier(monkeypatch, tmp_path):
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="low"',
+        "-c",
+        'service_tier="normal"',
     ]
     assert "UI specialist skill loading" in FakeSession.instances[0].run_calls[0]["user_input"]
 
@@ -2494,6 +2525,8 @@ def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monk
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="low"',
+        "-c",
+        'service_tier="normal"',
     ]
 
 
@@ -2567,6 +2600,8 @@ def test_legacy_ui_runtime_settings_do_not_change_codex_execution(monkeypatch, t
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="low"',
+        "-c",
+        'service_tier="normal"',
     ]
 
 
@@ -2596,6 +2631,8 @@ def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="low"',
+        "-c",
+        'service_tier="normal"',
     ]
 
 
@@ -3003,12 +3040,16 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="medium"',
+        "-c",
+        'service_tier="normal"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="low"',
+        "-c",
+        'service_tier="normal"',
     ]
     assert "Do not edit repository files" in FakeSession.instances[0].run_calls[0]["user_input"]
     assert "Codex plan to follow:" in FakeSession.instances[1].run_calls[0]["user_input"]
@@ -3049,12 +3090,16 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="high"',
+        "-c",
+        'service_tier="normal"',
     ]
     assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
         'model_reasoning_effort="high"',
+        "-c",
+        'service_tier="normal"',
     ]
 
 

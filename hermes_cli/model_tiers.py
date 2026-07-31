@@ -21,26 +21,30 @@ from hermes_constants import (
 )
 
 
-DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
+DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
     "trivial": {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
         "reasoning_effort": "medium",
+        "fast_mode": True,
     },
     "basic": {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
         "reasoning_effort": "max",
+        "fast_mode": True,
     },
     "intermediate": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "low",
+        "fast_mode": False,
     },
     "advanced": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "medium",
+        "fast_mode": False,
     },
     # Human-requested deep reviews only. Delegation enforces the explicit
     # root-turn authorization; this tier is intentionally outside the ladder.
@@ -48,6 +52,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "high",
+        "fast_mode": False,
     },
     # Route-specific tier for ordinary Discord action orchestration. It is
     # intentionally outside MODEL_TIER_LADDER so worker/delegation stepping
@@ -56,6 +61,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "low",
+        "fast_mode": False,
     },
     # Rendered-UI sweep workers: drive the browser across viewports/routes and
     # collect evidence. The work is navigation and protocol-following, not
@@ -66,6 +72,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
         "reasoning_effort": "xhigh",
+        "fast_mode": False,
     },
     # Screenshot-appearance judgement. Sonnet is used once, after the cheap Luna
     # evidence sweep, because visual judgement is the premium part of the loop.
@@ -74,6 +81,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "model": "claude-sonnet-5",
         "opencode_model": "anthropic/claude-sonnet-5",
         "reasoning_effort": "medium",
+        "fast_mode": False,
     },
     # Unbounded aesthetic critique over already-collected evidence. The
     # strongest available judgement model is worth one call — this is the slot
@@ -83,6 +91,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "model": "claude-opus-5",
         "opencode_model": "anthropic/claude-opus-5",
         "reasoning_effort": "medium",
+        "fast_mode": False,
     },
 }
 
@@ -224,6 +233,7 @@ class ModelTier:
     opencode_model: str
     reasoning_effort: str
     provider: str | None = None
+    fast_mode: bool = False
 
     def reasoning_config(self) -> dict[str, Any] | None:
         """Return the OpenAI-compatible reasoning payload for this tier."""
@@ -320,6 +330,7 @@ def restrict_model_tier_for_task(
         model=tier.model,
         opencode_model=tier.opencode_model,
         reasoning_effort=safe_effort,
+        fast_mode=tier.fast_mode,
     )
 
 
@@ -445,6 +456,9 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
     opencode_model = str(raw_tier.get("opencode_model") or model).strip()
     provider = str(raw_tier.get("provider") or "").strip().lower() or None
     reasoning_effort = normalize_reasoning_effort(raw_tier.get("reasoning_effort"))
+    fast_mode = raw_tier.get("fast_mode", False)
+    if not isinstance(fast_mode, bool):
+        fast_mode = str(fast_mode).strip().lower() in {"1", "true", "yes", "on"}
     if not model or not opencode_model or reasoning_effort not in VALID_REASONING_EFFORTS:
         return None
 
@@ -454,6 +468,7 @@ def resolve_model_tier(config: Mapping[str, Any] | None, name: Any) -> ModelTier
         model=model,
         opencode_model=opencode_model,
         reasoning_effort=reasoning_effort,
+        fast_mode=fast_mode,
     )
 
 

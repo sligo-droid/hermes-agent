@@ -414,7 +414,7 @@ def load_coding_worker_pass_config(
     worker_config: Optional[dict[str, Any]] = None,
     task: Any = "",
     context: Any = "",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     cfg = config
     if cfg is None:
         try:
@@ -430,11 +430,15 @@ def load_coding_worker_pass_config(
         task=task,
         context=context,
     )
-    result: dict[str, str] = {}
+    from hermes_cli.model_tiers import resolve_model_tier
+
+    result: dict[str, Any] = {}
     for pass_name, profile in profiles.items():
         result[f"{pass_name}_reasoning_level"] = profile["reasoning_level"]
         result[f"{pass_name}_model"] = profile["model"]
         result[f"{pass_name}_model_tier"] = profile["model_tier"]
+        tier = resolve_model_tier(cfg, profile["model_tier"])
+        result[f"{pass_name}_fast_mode"] = tier.fast_mode if tier is not None else False
     return result
 
 
@@ -489,6 +493,9 @@ def load_opencode_config(
         "simple_build_model_tier": pass_cfg["simple_build_model_tier"],
         "complex_plan_model_tier": pass_cfg["complex_plan_model_tier"],
         "complex_build_model_tier": pass_cfg["complex_build_model_tier"],
+        "simple_build_fast_mode": pass_cfg.get("simple_build_fast_mode", False),
+        "complex_plan_fast_mode": pass_cfg.get("complex_plan_fast_mode", False),
+        "complex_build_fast_mode": pass_cfg.get("complex_build_fast_mode", False),
         "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),
         "isolated_config": _bool_config(opencode_cfg.get("isolated_config"), True),
         "startup_timeout_seconds": _non_negative_float(
@@ -682,6 +689,7 @@ def run_opencode_task(
             agent=cfg["plan_agent"],
             model=cfg["complex_plan_model"],
             reasoning_level=cfg["complex_plan_reasoning_level"],
+            fast_mode=cfg["complex_plan_fast_mode"],
             title=title,
             env=env,
             on_event=_capture,
@@ -717,6 +725,11 @@ def run_opencode_task(
             if needs_plan
             else cfg["simple_build_reasoning_level"]
         ),
+        fast_mode=(
+            cfg["complex_build_fast_mode"]
+            if needs_plan
+            else cfg["simple_build_fast_mode"]
+        ),
         title=title,
         env=env,
         on_event=_capture,
@@ -751,6 +764,7 @@ def run_opencode_single_pass(
     timeout: float,
     agent: str,
     reasoning_level: str,
+    fast_mode: bool = False,
     title: str = "",
     config: Optional[dict[str, Any]] = None,
     worker_config: Optional[dict[str, Any]] = None,
@@ -778,6 +792,7 @@ def run_opencode_single_pass(
         agent=selected_agent,
         model=cfg["model"],
         reasoning_level=selected_reasoning,
+        fast_mode=fast_mode,
         title=title,
         env=env,
         on_event=_capture,
@@ -865,6 +880,7 @@ def _run_opencode_once(
     agent: str,
     model: str,
     reasoning_level: str,
+    fast_mode: bool,
     title: str,
     env: Optional[dict[str, str]],
     on_event: Callable[[dict[str, Any]], None],
@@ -880,7 +896,7 @@ def _run_opencode_once(
     brief_path = None if inline_brief else _write_brief(prompt, workspace=workdir_path)
     try:
         config_home = (
-            _write_worker_config(model, reasoning_level)
+            _write_worker_config(model, reasoning_level, fast_mode=fast_mode)
             if cfg.get("isolated_config")
             else None
         )
@@ -1562,9 +1578,44 @@ def _worker_provider_config(model: str, reasoning_level: str) -> tuple[str, dict
     return provider_id, provider_cfg
 
 
-def _write_worker_config(model: str, reasoning_level: str = "") -> Path:
-    """Create an isolated OpenCode config with no remote MCP startup work."""
+def _worker_provider_config_for_tier(
+    model: str,
+    reasoning_level: str,
+    *,
+    fast_mode: bool,
+) -> tuple[str, dict[str, Any]]:
     provider_id, provider_cfg = _worker_provider_config(model, reasoning_level)
+    if not reasoning_level:
+        return provider_id, provider_cfg
+    model_id = model.split("/", 1)[1]
+    entry = provider_cfg["models"][model_id]
+    variants = entry.get("variants")
+    if not isinstance(variants, dict) or reasoning_level not in variants:
+        raise ValueError(
+            f"OpenCode provider {provider_id!r} model {model_id!r} cannot represent "
+            f"variant {reasoning_level!r}."
+        )
+    variant = dict(variants[reasoning_level])
+    if fast_mode:
+        variant["service_tier"] = "priority"
+    else:
+        variant.pop("service_tier", None)
+    variants[reasoning_level] = variant
+    return provider_id, provider_cfg
+
+
+def _write_worker_config(
+    model: str,
+    reasoning_level: str = "",
+    *,
+    fast_mode: bool = False,
+) -> Path:
+    """Create an isolated OpenCode config with no remote MCP startup work."""
+    provider_id, provider_cfg = _worker_provider_config_for_tier(
+        model,
+        reasoning_level,
+        fast_mode=fast_mode,
+    )
     root = Path(tempfile.mkdtemp(prefix="hermes-opencode-config-"))
     config_dir = root / "opencode"
     config_dir.mkdir(parents=True, exist_ok=True)

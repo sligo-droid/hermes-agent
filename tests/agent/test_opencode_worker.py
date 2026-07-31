@@ -211,6 +211,41 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     assert not seen_config_home.exists()
 
 
+@pytest.mark.parametrize(("fast_mode", "expected"), [(True, "priority"), (False, None)])
+def test_named_tier_opencode_variant_controls_service_tier(
+    monkeypatch, tmp_path, fast_mode, expected
+):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+    seen_payload = None
+
+    def fake_run(_cmd, **kwargs):
+        nonlocal seen_payload
+        config_path = ow.Path(kwargs["env"]["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
+        seen_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        return _process_result(
+            stdout=json.dumps({"type": "message", "sessionID": "ses-build", "message": "done"})
+            + "\n"
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+    tier = "basic" if fast_mode else "intermediate"
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(model_tier=tier),
+    )
+
+    assert result.error is None
+    model_id = "gpt-5.6-luna" if fast_mode else "gpt-5.6-sol"
+    variants = seen_payload["provider"]["hermes-codex"]["models"][model_id]["variants"]
+    service_tiers = {variant.get("service_tier") for variant in variants.values()}
+    if fast_mode:
+        assert "priority" in service_tiers
+    else:
+        assert service_tiers == {None}
+
+
 def test_configured_hermes_codex_model_is_preserved():
     cfg = ow.load_opencode_config(_cfg(opencode={"model": "hermes-codex/gpt-5.5"}))
 
