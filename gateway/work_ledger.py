@@ -241,6 +241,7 @@ _EXPLICIT_NARROW_SCOPE_PATTERNS = (
     r"\bopen\s+(?:a\s+)?(?:pr|pull\s+request)\b[^\n.]{0,80}\bfor\s+review\b",
     r"\b(?:do\s*not|don't)\s+merge\b",
     r"\bleave\s+(?:it\s+)?unmerged\b",
+    r"\bclose\s+(?:the\s+)?(?:pr|pull\s+request)\b",
     r"\bpr\s+only\b",
     r"\breview\s+only\b",
     r"\bdraft\s+pr\b",
@@ -254,6 +255,7 @@ _INTENTIONAL_UNMERGED_PATTERNS = (
     r"\bintentionally\s+left\s+unmerged\b",
     r"\bleft\s+unmerged\s+per\s+(?:instruction|request)\b",
     r"\bnot\s+merged\s+per\s+(?:instruction|request)\b",
+    r"\bclosed\b[^\n.]{0,80}\bnot\s+merged\b",
     r"\bfor\s+review\b",
     r"\bdraft\s+pr\b",
 )
