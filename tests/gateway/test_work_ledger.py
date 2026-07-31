@@ -493,6 +493,11 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert "bounded inspector—not your prose—decides pass/fail" in prompt
     assert "attach receipt arguments" in prompt
     assert "Generic navigation" in prompt
+    assert "answer the entire accepted request" in prompt
+    assert "Do not turn the response into a visual-QA report" in prompt
+    assert "state only that visual QA passed" in prompt
+    assert "receipt IDs, confidence, assertion details, or visual observations" in prompt
+    assert "screenshot artifacts are attached automatically" in prompt
 
     agent = SimpleNamespace(
         _turn_file_mutation_paths={"/private/workspace/dashboard.tsx"},
