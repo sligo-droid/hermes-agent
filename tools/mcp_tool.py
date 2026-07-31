@@ -4719,6 +4719,43 @@ def _normalize_name_filter(value: Any, label: str) -> set[str]:
     return set()
 
 
+def _normalize_runtime_modes(value: Any, label: str) -> Optional[frozenset[str]]:
+    """Return an exact runtime-mode allowlist, failing closed when configured badly."""
+
+    if value is None:
+        logger.warning(
+            "MCP config %s must not be null; the server will not be exposed to agents",
+            label,
+        )
+        return frozenset()
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        logger.warning(
+            "MCP config %s must be a string or list containing action/read_only; "
+            "the server will not be exposed to agents",
+            label,
+        )
+        return frozenset()
+
+    normalized = {
+        str(item or "").strip().lower().replace("-", "_")
+        for item in items
+    }
+    allowed = {"action", "read_only"}
+    if not normalized or not normalized <= allowed:
+        logger.warning(
+            "MCP config %s contains unsupported runtime modes %r; the server "
+            "will not be exposed to agents",
+            label,
+            sorted(normalized),
+        )
+        return frozenset()
+    return frozenset(normalized)
+
+
 def _parse_boolish(value: Any, default: bool = True) -> bool:
     """Parse a bool-like config value with safe fallback."""
     if value is None:
@@ -4894,6 +4931,14 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         config.get("read_only_tools"),
         f"mcp_servers.{name}.read_only_tools",
     )
+    runtime_modes = (
+        _normalize_runtime_modes(
+            config["runtime_modes"],
+            f"mcp_servers.{name}.runtime_modes",
+        )
+        if "runtime_modes" in config
+        else None
+    )
 
     def _should_register(tool_name: str) -> bool:
         if include_set:
@@ -4935,6 +4980,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             # security boundary. Only an operator-owned exact allowlist may
             # expose an arbitrary MCP operation in Hermes read-only mode.
             effect=("read_only" if mcp_tool.name in read_only_set else "unknown"),
+            runtime_modes=runtime_modes,
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
@@ -4975,6 +5021,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             # These utility handlers are host-owned list/read operations;
             # unlike arbitrary server tools, their semantics are bounded here.
             effect="read_only",
+            runtime_modes=runtime_modes,
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)
@@ -5411,6 +5458,7 @@ def refresh_agent_mcp_tools(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            runtime_mode=getattr(agent, "_runtime_mode", None),
         )
         or []
     )
@@ -5481,6 +5529,12 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         tools_list.append({"type": "function", "function": schema})
         name_set.add(name)
         return True
+
+    # agent_init excludes both extension families from read-only agents. A
+    # later MCP refresh must preserve that exclusion rather than broadening the
+    # live tool surface after construction.
+    if str(getattr(agent, "_runtime_mode", "") or "") == "read_only":
+        return set()
 
     # Memory-provider tools (mem0/honcho/byterover/supermemory/…).
     try:

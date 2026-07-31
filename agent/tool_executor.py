@@ -590,12 +590,20 @@ def _read_only_runtime_block(
         block = registry.read_only_block(underlying_name, underlying_args)
         if block is None:
             return None
-        return f"{block} Escalate to action only if the user's request requires durable change."
+        return (
+            f"{block} If this is observational, report the limitation and continue "
+            "with available evidence; do not escalate merely to gain tool access. "
+            "Escalate only if the user's original request requires durable change."
+        )
 
     block = registry.read_only_block(function_name, function_args or {})
     if block is None:
         return None
-    return f"{block} Escalate to action only if the user's request requires durable change."
+    return (
+        f"{block} If this is observational, report the limitation and continue "
+        "with available evidence; do not escalate merely to gain tool access. "
+        "Escalate only if the user's original request requires durable change."
+    )
 
 
 def _discord_intake_mutation_block(
@@ -1110,6 +1118,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        str(getattr(agent, "_runtime_mode", "") or ""),
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -1120,6 +1129,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
             disabled_toolsets=disabled,
             quiet_mode=True,
             skip_tool_search_assembly=True,
+            runtime_mode=getattr(agent, "_runtime_mode", None),
         ) or []
         names = _ts.scoped_deferrable_names(scoped_defs)
     except Exception:

@@ -18,12 +18,13 @@ def _tool(name):
     return {"type": "function", "function": {"name": name, "description": "", "parameters": {}}}
 
 
-def _agent(tool_names, *, enabled=None, disabled=None):
+def _agent(tool_names, *, enabled=None, disabled=None, runtime_mode="action"):
     a = types.SimpleNamespace()
     a.tools = [_tool(n) for n in tool_names]
     a.valid_tool_names = set(tool_names)
     a.enabled_toolsets = enabled
     a.disabled_toolsets = disabled
+    a._runtime_mode = runtime_mode
     return a
 
 
@@ -96,6 +97,24 @@ def test_refresh_passes_agent_toolset_filters(monkeypatch):
 
     assert seen["enabled_toolsets"] == ["coding", "granola"]
     assert seen["disabled_toolsets"] == ["messaging"]
+    assert seen["runtime_mode"] == "action"
+
+
+def test_refresh_passes_read_only_runtime_mode(monkeypatch):
+    agent = _agent(["a"], runtime_mode="read_only")
+    seen = {}
+
+    import model_tools
+
+    def _capture(**kw):
+        seen.update(kw)
+        return [_tool("a")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _capture)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert seen["runtime_mode"] == "read_only"
 
 
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
@@ -160,6 +179,33 @@ def test_refresh_respects_context_engine_toolset_gate(monkeypatch):
 
     assert "mcp_new_tool" in agent.valid_tool_names  # MCP tool still lands
     assert "lcm_grep" not in agent.valid_tool_names   # gated out (#5544)
+
+
+def test_read_only_refresh_does_not_reinject_extension_tools(monkeypatch):
+    agent = _agent(["read_file"], runtime_mode="read_only")
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": "memory_search", "description": "", "parameters": {}}
+        ]
+    )
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: [
+            {"name": "lcm_grep", "description": "", "parameters": {}}
+        ]
+    )
+    agent._context_engine_tool_names = set()
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("mcp_read_only_observer")],
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert agent.valid_tool_names == {"read_file", "mcp_read_only_observer"}
+    assert agent._context_engine_tool_names == set()
 
 
 def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):

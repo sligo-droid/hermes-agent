@@ -460,7 +460,17 @@ def _compute_tool_definitions(
 
     from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 
-    if normalize_runtime_mode(runtime_mode) is RuntimeMode.READ_ONLY:
+    normalized_runtime_mode = normalize_runtime_mode(runtime_mode)
+    filtered_tools = [
+        tool
+        for tool in filtered_tools
+        if registry.is_exposable_in_runtime(
+            str(tool.get("function", {}).get("name") or ""),
+            normalized_runtime_mode,
+        )
+    ]
+
+    if normalized_runtime_mode is RuntimeMode.READ_ONLY:
         filtered_tools = [
             tool
             for tool in filtered_tools

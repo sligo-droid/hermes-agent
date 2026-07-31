@@ -273,6 +273,7 @@ def test_read_only_concurrent_execution_blocks_unknown_and_mutating_tools():
     by_id = {message["tool_call_id"]: message["content"] for message in messages}
     assert "changes durable state" in by_id["c-click"]
     assert "no registered read-only capability metadata" in by_id["c-unknown"]
+    assert "do not escalate merely to gain tool access" in by_id["c-unknown"]
 
 
 def test_read_only_execution_rechecks_middleware_rewritten_conditional_args(monkeypatch):

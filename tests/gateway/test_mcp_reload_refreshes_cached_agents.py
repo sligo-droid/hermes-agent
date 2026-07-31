@@ -7,7 +7,7 @@ history) for the agent to pick up the new tools.
 
 This test exercises _execute_mcp_reload directly with mocked MCP discovery
 and asserts that every cached agent's `tools` and `valid_tool_names`
-attributes are overwritten with the freshly-discovered tool set.
+attributes are refreshed through the shared runtime-aware rebuild path.
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ def _make_runner_with_cached_agents(num_agents: int = 2):
             valid_tool_names={f"stale_tool_{i}"},
             enabled_toolsets=None,
             disabled_toolsets=None,
+            _runtime_mode="action",
         )
         runner._agent_cache[f"session-{i}"] = (agent, f"sig-{i}")
 
@@ -156,6 +157,7 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     agent, _sig = runner._agent_cache["session-0"]
     agent.enabled_toolsets = ["safe"]
     agent.disabled_toolsets = ["terminal"]
+    agent._runtime_mode = "read_only"
 
     captured_calls = []
 
@@ -174,3 +176,35 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
     assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+    assert captured_calls[0]["runtime_mode"] == "read_only"
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_preserves_post_build_tool_families():
+    runner = _make_runner_with_cached_agents(num_agents=1)
+    agent, _sig = runner._agent_cache["session-0"]
+    agent.tools = [
+        {"type": "function", "function": {"name": "stale_tool_0"}},
+        {"type": "function", "function": {"name": "memory_search"}},
+    ]
+    agent.valid_tool_names = {"stale_tool_0", "memory_search"}
+    agent._memory_manager = SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": "memory_search", "description": "", "parameters": {}}
+        ]
+    )
+    agent.context_compressor = None
+    agent._context_engine_tool_names = set()
+
+    fresh_tool_defs = [
+        {"type": "function", "function": {"name": "fresh_mcp_tool"}}
+    ]
+    with (
+        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.discover_mcp_tools", return_value=["fresh_mcp_tool"]),
+        patch.dict("tools.mcp_tool._servers", {"server": object()}, clear=True),
+        patch("model_tools.get_tool_definitions", return_value=fresh_tool_defs),
+    ):
+        await runner._execute_mcp_reload(_make_event())
+
+    assert agent.valid_tool_names == {"fresh_mcp_tool", "memory_search"}

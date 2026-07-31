@@ -1292,6 +1292,21 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        if str(getattr(agent, "_runtime_mode", "") or "") == "read_only":
+            error = (
+                "Codex app-server is unavailable for read-only turns because "
+                "its subprocess owns mutation-capable tools outside Hermes' "
+                "read-only dispatch boundary."
+            )
+            return {
+                "final_response": error,
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": False,
+                "failed": True,
+                "error": error,
+            }
         _codex_result = agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
