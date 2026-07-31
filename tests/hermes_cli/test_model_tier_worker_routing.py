@@ -113,6 +113,7 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
     scheduled = worker._scheduled_opencode_worker_config()
     assert scheduled == {
         "model_tier": "worker",
+        "service_tier": "normal",
         "opencode": {"model": "custom/dev-worker"},
         "simple_build_reasoning_level": "xhigh",
         "complex_plan_reasoning_level": "xhigh",
@@ -148,6 +149,48 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
         "-c", 'model_reasoning_effort="high"',
         "-c", 'service_tier="normal"',
     ]
+
+
+@pytest.mark.parametrize(
+    ("tier_name", "service_tier", "expected_fast_mode"),
+    [("basic", "normal", False), ("intermediate", "fast", True)],
+)
+def test_scheduled_opencode_preserves_resolved_service_tier(
+    monkeypatch, tier_name, service_tier, expected_fast_mode
+):
+    from agent import opencode_worker
+    from hermes_cli import kanban_codex_worker as worker
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL_TIER", tier_name)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL_TIER_SOURCE", "role")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", service_tier)
+    monkeypatch.setenv("HERMES_OPENCODE_WORKER_MODEL", "hermes-codex/gpt-5.5")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "medium")
+
+    scheduled = worker._scheduled_opencode_worker_config()
+    assert scheduled["service_tier"] == service_tier
+    pass_config = opencode_worker.load_coding_worker_pass_config(
+        {
+            "model_tiers": {
+                "basic": {
+                    "model": "gpt-5.6-luna",
+                    "opencode_model": "hermes-codex/gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                    "fast_mode": True,
+                },
+                "intermediate": {
+                    "model": "gpt-5.6-sol",
+                    "opencode_model": "hermes-codex/gpt-5.6-sol",
+                    "reasoning_effort": "low",
+                    "fast_mode": False,
+                },
+            },
+            "coding_worker": {},
+        },
+        worker_config=scheduled,
+    )
+
+    assert pass_config["simple_build_fast_mode"] is expected_fast_mode
 
 
 def test_bare_opencode_model_is_rejected_before_worker_profile_launch():

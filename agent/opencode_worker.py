@@ -99,6 +99,15 @@ def _bool_config(value: Any, default: bool) -> bool:
     return default
 
 
+def _normalize_service_tier(value: Any) -> str | None:
+    raw = str(value or "").strip().lower()
+    if raw in {"fast", "priority", "on", "true", "1", "yes"}:
+        return "fast"
+    if raw in {"normal", "off", "false", "0", "no"}:
+        return "normal"
+    return None
+
+
 def _direct_opencode_model(value: Any) -> str:
     model = str(value or "").strip()
     if not model:
@@ -432,13 +441,25 @@ def load_coding_worker_pass_config(
     )
     from hermes_cli.model_tiers import resolve_model_tier
 
+    coding_cfg = cfg.get("coding_worker") if isinstance(cfg.get("coding_worker"), dict) else {}
+    worker_cfg = worker_config or {}
+    explicit_service_tier = (
+        worker_cfg.get("service_tier")
+        if "service_tier" in worker_cfg
+        else coding_cfg.get("service_tier")
+    )
+    normalized_service_tier = _normalize_service_tier(explicit_service_tier)
     result: dict[str, Any] = {}
     for pass_name, profile in profiles.items():
         result[f"{pass_name}_reasoning_level"] = profile["reasoning_level"]
         result[f"{pass_name}_model"] = profile["model"]
         result[f"{pass_name}_model_tier"] = profile["model_tier"]
         tier = resolve_model_tier(cfg, profile["model_tier"])
-        result[f"{pass_name}_fast_mode"] = tier.fast_mode if tier is not None else False
+        result[f"{pass_name}_fast_mode"] = (
+            normalized_service_tier == "fast"
+            if normalized_service_tier is not None
+            else bool(tier is not None and tier.fast_mode)
+        )
     return result
 
 
@@ -1596,10 +1617,28 @@ def _worker_provider_config_for_tier(
             f"variant {reasoning_level!r}."
         )
     variant = dict(variants[reasoning_level])
+    for existing_key in ("service_tier", "serviceTier", "speed"):
+        variant.pop(existing_key, None)
     if fast_mode:
-        variant["service_tier"] = "priority"
-    else:
-        variant.pop("service_tier", None)
+        npm = str(provider_cfg.get("npm") or "").strip()
+        if npm == "@ai-sdk/openai-compatible":
+            variant["service_tier"] = "priority"
+        elif npm == "@ai-sdk/openai":
+            variant["serviceTier"] = "priority"
+        elif npm == "@ai-sdk/anthropic":
+            from hermes_cli.models import _is_anthropic_fast_model
+
+            if not _is_anthropic_fast_model(model_id):
+                raise ValueError(
+                    f"OpenCode Anthropic model {model_id!r} does not support "
+                    "fast mode; only the verified Opus 4.6 path accepts speed='fast'."
+                )
+            variant["speed"] = "fast"
+        else:
+            raise ValueError(
+                f"OpenCode provider {provider_id!r} has no verified fast-mode "
+                "variant encoding; configure a supported provider or disable fast_mode."
+            )
     variants[reasoning_level] = variant
     return provider_id, provider_cfg
 
