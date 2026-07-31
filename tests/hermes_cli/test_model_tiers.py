@@ -71,6 +71,15 @@ def test_default_routes_reference_resolvable_tiers():
         "advanced": "gpt-5.6-sol",
         "discord_action": "gpt-5.6-sol",
     }
+    assert {
+        name: resolve_model_tier({"model_tiers": tiers}, name).fast_mode
+        for name in ("trivial", "basic", "intermediate", "advanced")
+    } == {
+        "trivial": True,
+        "basic": True,
+        "intermediate": False,
+        "advanced": False,
+    }
     for role in ("planner", "dev", "foreman", "reviewer"):
         assert "reasoning" not in DEFAULT_CONFIG["kanban"]["discord_worker"]["roles"][role]
 
@@ -258,6 +267,29 @@ def test_implementation_cap_preserves_custom_tier_model():
     assert restricted.name == "feature"
     assert restricted.model == "custom/feature"
     assert restricted.reasoning_effort == "high"
+
+
+def test_task_restriction_preserves_named_tier_fast_mode():
+    config = {
+        "model_tiers": {
+            "fast_review": {
+                "model": "custom/fast",
+                "opencode_model": "custom/fast-worker",
+                "reasoning_effort": "high",
+                "fast_mode": True,
+            }
+        }
+    }
+
+    restricted = restrict_model_tier_for_task(
+        config,
+        resolve_model_tier(config, "fast_review"),
+        "Audit the auth flow",
+    )
+
+    assert restricted is not None
+    assert restricted.fast_mode is True
+    assert restricted.reasoning_effort == "xhigh"
 
 
 def test_coding_worker_has_no_independent_or_deprecated_tier_catalog():

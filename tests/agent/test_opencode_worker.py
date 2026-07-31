@@ -211,6 +211,164 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     assert not seen_config_home.exists()
 
 
+@pytest.mark.parametrize(("fast_mode", "expected"), [(True, "priority"), (False, None)])
+def test_named_tier_opencode_variant_controls_service_tier(
+    monkeypatch, tmp_path, fast_mode, expected
+):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+    seen_payload = None
+
+    def fake_run(_cmd, **kwargs):
+        nonlocal seen_payload
+        config_path = ow.Path(kwargs["env"]["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
+        seen_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        return _process_result(
+            stdout=json.dumps({"type": "message", "sessionID": "ses-build", "message": "done"})
+            + "\n"
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+    tier = "basic" if fast_mode else "intermediate"
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(model_tier=tier),
+    )
+
+    assert result.error is None
+    model_id = "gpt-5.6-luna" if fast_mode else "gpt-5.6-sol"
+    variants = seen_payload["provider"]["hermes-codex"]["models"][model_id]["variants"]
+    service_tiers = {variant.get("service_tier") for variant in variants.values()}
+    if fast_mode:
+        assert "priority" in service_tiers
+    else:
+        assert service_tiers == {None}
+
+
+@pytest.mark.parametrize(
+    ("model", "provider", "expected_key", "expected_value"),
+    [
+        ("hermes-codex/gpt-5.5", "hermes-codex", "service_tier", "priority"),
+        ("openai/gpt-5.5", "openai", "serviceTier", "priority"),
+        ("anthropic/claude-opus-4-6", "anthropic", "speed", "fast"),
+    ],
+)
+def test_fast_mode_uses_verified_opencode_provider_encoding(
+    monkeypatch, model, provider, expected_key, expected_value
+):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda _model: {
+            "npm": {
+                "hermes-codex": "@ai-sdk/openai-compatible",
+                "openai": "@ai-sdk/openai",
+                "anthropic": "@ai-sdk/anthropic",
+            }[provider],
+            "models": {
+                model.split("/", 1)[1]: {
+                    "variants": {"medium": {"reasoningEffort": "medium"}}
+                }
+            },
+        },
+    )
+
+    _, config = ow._worker_provider_config_for_tier(
+        model, "medium", fast_mode=True
+    )
+    variant = config["models"][model.split("/", 1)[1]]["variants"]["medium"]
+
+    assert variant == {"reasoningEffort": "medium", expected_key: expected_value}
+
+
+def test_fast_mode_rejects_unverified_opencode_provider(monkeypatch):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda _model: {
+            "npm": "@ai-sdk/google",
+            "models": {
+                "gemini": {
+                    "variants": {"medium": {"reasoningEffort": "medium"}}
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="no verified fast-mode variant encoding"):
+        ow._worker_provider_config_for_tier("google/gemini", "medium", fast_mode=True)
+
+
+def test_fast_mode_rejects_custom_openai_compatible_provider(monkeypatch):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda _model: {
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {
+                "gpt-5.5": {
+                    "variants": {"medium": {"reasoningEffort": "medium"}}
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="no verified fast-mode variant encoding"):
+        ow._worker_provider_config_for_tier(
+            "custom/gpt-5.5", "medium", fast_mode=True
+        )
+
+
+def test_fast_mode_rejects_unsupported_anthropic_model(monkeypatch):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda _model: {
+            "npm": "@ai-sdk/anthropic",
+            "models": {
+                "claude-sonnet-5": {
+                    "variants": {"medium": {"reasoningEffort": "medium"}}
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="does not support fast mode"):
+        ow._worker_provider_config_for_tier(
+            "anthropic/claude-sonnet-5", "medium", fast_mode=True
+        )
+
+
+def test_normal_mode_removes_all_fast_provider_options(monkeypatch):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda _model: {
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {
+                "gpt-5.5": {
+                    "variants": {
+                        "medium": {
+                            "reasoningEffort": "medium",
+                            "service_tier": "priority",
+                            "serviceTier": "priority",
+                            "speed": "fast",
+                        }
+                    }
+                }
+            },
+        },
+    )
+
+    _, config = ow._worker_provider_config_for_tier(
+        "hermes-codex/gpt-5.5", "medium", fast_mode=False
+    )
+    assert config["models"]["gpt-5.5"]["variants"]["medium"] == {
+        "reasoningEffort": "medium"
+    }
+
+
 def test_configured_hermes_codex_model_is_preserved():
     cfg = ow.load_opencode_config(_cfg(opencode={"model": "hermes-codex/gpt-5.5"}))
 

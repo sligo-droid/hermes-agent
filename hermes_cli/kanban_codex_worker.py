@@ -1626,6 +1626,7 @@ def _run_opencode(
                 timeout=_role_timeout(role),
                 agent=cfg["plan_agent"],
                 reasoning_level=cfg["complex_plan_reasoning_level"],
+                fast_mode=cfg.get("complex_plan_fast_mode", False),
                 title=f"kanban {task_id}",
                 env=_backend_child_env(runtime_env),
                 on_event=on_event,
@@ -1714,9 +1715,17 @@ def _scheduled_opencode_reasoning(default: str) -> str:
 def _scheduled_opencode_worker_config() -> Optional[dict[str, Any]]:
     model_tier = str(os.environ.get("HERMES_CODEX_WORKER_MODEL_TIER") or "").strip()
     opencode_model = str(os.environ.get("HERMES_OPENCODE_WORKER_MODEL") or "").strip()
+    service_tier = str(
+        os.environ.get("HERMES_CODEX_WORKER_SERVICE_TIER") or ""
+    ).strip().lower()
     if model_tier:
         effort = _scheduled_opencode_reasoning("")
         worker_config: dict[str, Any] = {"model_tier": model_tier}
+        if service_tier in {"fast", "normal"}:
+            # The dispatcher has already resolved explicit role/config values
+            # against the named tier. Preserve that result across the
+            # subprocess boundary instead of letting OpenCode re-derive it.
+            worker_config["service_tier"] = service_tier
         if opencode_model:
             worker_config["opencode"] = {"model": opencode_model}
         if effort:
@@ -1729,17 +1738,22 @@ def _scheduled_opencode_worker_config() -> Optional[dict[str, Any]]:
             )
         return worker_config or None
 
-    if os.environ.get("HERMES_CODEX_WORKER_REASONING_SOURCE") != "adaptive":
-        return None
-    if _raw_opencode_pass_configured():
-        return None
-    effort = _scheduled_opencode_reasoning("")
-    if not effort:
-        return None
-    return {
-        "simple_build_reasoning_level": effort,
-        "complex_build_reasoning_level": effort,
-    }
+    worker_config: dict[str, Any] = {}
+    if (
+        os.environ.get("HERMES_CODEX_WORKER_REASONING_SOURCE") == "adaptive"
+        and not _raw_opencode_pass_configured()
+    ):
+        effort = _scheduled_opencode_reasoning("")
+        if effort:
+            worker_config.update(
+                {
+                    "simple_build_reasoning_level": effort,
+                    "complex_build_reasoning_level": effort,
+                }
+            )
+    if service_tier in {"fast", "normal"}:
+        worker_config["service_tier"] = service_tier
+    return worker_config or None
 
 
 def _raw_opencode_pass_configured() -> bool:

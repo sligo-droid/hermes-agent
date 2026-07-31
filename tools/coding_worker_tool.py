@@ -487,16 +487,42 @@ def _redact_recovery_updates(value: Any) -> Any:
     return value
 
 
-def _codex_reasoning_args(reasoning_level: str) -> list[str]:
+def _codex_reasoning_args(
+    reasoning_level: str,
+    *,
+    fast_mode: Optional[bool] = None,
+) -> list[str]:
+    """Return explicit per-pass Codex overrides, including named-tier speed."""
     level = str(reasoning_level or "").strip().lower()
-    if not level:
-        return []
-    return ["-c", f'model_reasoning_effort="{level}"']
+    args = ["-c", f'model_reasoning_effort="{level}"'] if level else []
+    if fast_mode is not None:
+        service_tier = "fast" if fast_mode else "normal"
+        args.extend(["-c", f'service_tier="{service_tier}"'])
+    return args
 
 
 def _codex_model_args(model: str) -> list[str]:
     selected_model = str(model or "").strip()
     return ["-c", f"model={json.dumps(selected_model)}"] if selected_model else []
+
+
+def _worker_pass_fast_mode(
+    config: Any,
+    selected_tier: Any,
+    pass_profiles: Any,
+    pass_name: str,
+) -> Optional[bool]:
+    """Resolve service speed from the selected named tier for one pass."""
+    if selected_tier is not None:
+        return selected_tier.fast_mode
+    if not isinstance(pass_profiles, dict):
+        return None
+    profile = pass_profiles.get(pass_name)
+    tier_name = profile.get("model_tier") if isinstance(profile, dict) else ""
+    if not tier_name:
+        return None
+    tier = resolve_model_tier(config, tier_name)
+    return tier.fast_mode if tier is not None else None
 
 
 def _model_tier_config(
@@ -2926,7 +2952,13 @@ def _delegate_coding_task_impl(
                     extra_args=active_ui_codex_args + _codex_model_args(
                         pass_profiles["complex_plan"]["codex_model"] if pass_profiles else ""
                     ) + _codex_reasoning_args(
-                        pass_cfg["complex_plan_reasoning_level"]
+                        pass_cfg["complex_plan_reasoning_level"],
+                        fast_mode=_worker_pass_fast_mode(
+                            loaded_config,
+                            selected_model_tier,
+                            pass_profiles,
+                            "complex_plan",
+                        ),
                     ),
                     approval_callback=approval_callback,
                     on_event=_touch_codex_activity,
@@ -3070,7 +3102,15 @@ def _delegate_coding_task_impl(
                 extra_args=active_ui_codex_args + _codex_model_args(
                     pass_profiles["complex_build" if needs_plan else "simple_build"]["codex_model"]
                     if pass_profiles else ""
-                ) + _codex_reasoning_args(reasoning_level),
+                ) + _codex_reasoning_args(
+                    reasoning_level,
+                    fast_mode=_worker_pass_fast_mode(
+                        loaded_config,
+                        selected_model_tier,
+                        pass_profiles,
+                        build_pass,
+                    ),
+                ),
                 approval_callback=approval_callback,
                 on_event=_touch_codex_activity,
                 resume_thread_id=(

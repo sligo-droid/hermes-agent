@@ -153,7 +153,7 @@ def _role_runtime_settings(
     role: str,
     cfg: dict[str, Any],
     task: Any = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
     try:
@@ -190,13 +190,24 @@ def _role_runtime_settings(
         from hermes_constants import normalize_reasoning_effort
 
         reasoning = normalize_reasoning_effort(raw_reasoning)
+        if reasoning in {"max", "ultra"}:
+            reasoning = "xhigh"
         if reasoning not in _VALID_REASONING_LEVELS:
             reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
             reasoning_source = "default"
     if role != "reviewer" and reasoning == "xhigh":
         reasoning = "high"
-        reasoning_source = "review_only_cap"
+        if reasoning_source != "model_tier":
+            reasoning_source = "review_only_cap"
 
+    configured_tier = _first_configured_value(
+        role_cfg.get("service_tier"),
+        role_cfg.get("mode"),
+        role_cfg.get("fast"),
+        cfg.get("service_tier"),
+        cfg.get("mode"),
+        cfg.get("fast"),
+    )
     raw_tier = _config_value_with_auto_env(
         "HERMES_CODEX_WORKER_SERVICE_TIER",
         role_cfg.get("service_tier"),
@@ -206,12 +217,18 @@ def _role_runtime_settings(
         cfg.get("mode"),
         cfg.get("fast"),
     )
-    tier_source = "explicit" if raw_tier is not None else "adaptive"
-    tier = (
-        _adaptive_service_tier(role, task)
-        if raw_tier is None or _is_auto(raw_tier)
-        else _normalize_service_tier(raw_tier)
-    )
+    if model_tier is not None and (
+        configured_tier is None or _is_auto(configured_tier)
+    ):
+        tier = "fast" if model_tier.fast_mode else "normal"
+        tier_source = "model_tier"
+    else:
+        tier_source = "explicit" if raw_tier is not None else "adaptive"
+        tier = (
+            _adaptive_service_tier(role, task)
+            if raw_tier is None or _is_auto(raw_tier)
+            else _normalize_service_tier(raw_tier)
+        )
     return {
         "reasoning": reasoning,
         "reasoning_source": reasoning_source,
@@ -219,6 +236,7 @@ def _role_runtime_settings(
         "model_tier_source": "role" if model_tier is not None else "none",
         "model": model_tier.model if model_tier is not None else "",
         "opencode_model": model_tier.opencode_model if model_tier is not None else "",
+        "fast_mode": model_tier.fast_mode if model_tier is not None else tier == "fast",
         "service_tier": tier,
         "service_tier_source": tier_source,
         "mode": tier,
