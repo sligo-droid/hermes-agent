@@ -476,6 +476,7 @@ def test_read_only_prompt_lightly_prefers_direct_work_without_restricting_delega
     assert "read-only delegation remains available" in prompt
     assert "any configured tier that matches the subtask's difficulty" in prompt
     assert "read-only does not limit tier choice" in prompt
+    assert "never escalate merely to gain tool access" in prompt
 
 
 @pytest.mark.parametrize(

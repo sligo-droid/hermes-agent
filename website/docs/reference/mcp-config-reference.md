@@ -34,6 +34,8 @@ mcp_servers:
     timeout: 120
     connect_timeout: 60
     supports_parallel_tool_calls: false
+    runtime_modes: [action, read_only]
+    read_only_tools: []
     tools:
       include: []
       exclude: []
@@ -57,6 +59,8 @@ mcp_servers:
 | `timeout` | number | both | Tool call timeout in seconds (default: `300`) |
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
+| `runtime_modes` | string or list | both | Optional exact agent-runtime exposure allowlist: `action` and/or `read_only`. Missing preserves existing availability; invalid configured values fail closed. This does not attest that a tool is safe. |
+| `read_only_tools` | string or list | both | Operator-owned exact list of server-native tool names that Hermes may execute in `read_only` mode. Server annotations are not trusted. |
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
@@ -70,6 +74,34 @@ mcp_servers:
 | `exclude` | string or list | Blacklist server-native MCP tools |
 | `resources` | bool-like | Enable/disable `list_resources` + `read_resource` |
 | `prompts` | bool-like | Enable/disable `list_prompts` + `get_prompt` |
+
+## Runtime and effect policy
+
+`runtime_modes` and `read_only_tools` are independent controls:
+
+- `runtime_modes` decides which agent runtimes receive a server's tool schemas.
+- `read_only_tools` attests that exact server-native operations are safe to execute in Hermes' read-only runtime.
+
+For example, a provider-enforced read-only database endpoint can be exposed only
+to read-only agents while a separate full-authority endpoint remains action-only:
+
+```yaml
+mcp_servers:
+  database_full:
+    url: "https://example.test/mcp"
+    runtime_modes: [action]
+
+  database_observer:
+    url: "https://example.test/mcp?read_only=true"
+    runtime_modes: [read_only]
+    tools:
+      include: [list_tables, execute_sql]
+    read_only_tools: [list_tables, execute_sql]
+```
+
+Hermes does not infer safety from URLs, server names, or MCP `readOnlyHint`
+annotations. The endpoint must enforce its own read-only boundary; otherwise an
+operator must not classify a broad operation such as arbitrary SQL as read-only.
 
 ## Filtering semantics
 

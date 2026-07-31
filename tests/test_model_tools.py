@@ -83,6 +83,75 @@ class TestHandleFunctionCall:
             "delegate_coding_task",
         }.isdisjoint(names)
 
+    def test_runtime_specific_registry_tools_are_filtered_before_assembly(self):
+        from tools.registry import registry
+
+        action_name = "test_runtime_action_only"
+        read_name = "test_runtime_read_only"
+        toolset = "test-runtime-modes"
+        schema = {"description": "test", "parameters": {"type": "object"}}
+        try:
+            registry.register(
+                name=action_name,
+                toolset=toolset,
+                schema=schema,
+                handler=lambda _args: "{}",
+                effect="unknown",
+                runtime_modes={"action"},
+            )
+            registry.register(
+                name=read_name,
+                toolset=toolset,
+                schema=schema,
+                handler=lambda _args: "{}",
+                effect="read_only",
+                runtime_modes={"read_only"},
+            )
+            registry.register_toolset_alias(toolset, toolset)
+
+            action_defs = get_tool_definitions(
+                enabled_toolsets=[toolset],
+                quiet_mode=False,
+                runtime_mode="action",
+            )
+            read_defs = get_tool_definitions(
+                enabled_toolsets=[toolset],
+                quiet_mode=False,
+                runtime_mode="read_only",
+            )
+        finally:
+            registry.deregister(action_name)
+            registry.deregister(read_name)
+
+        assert {tool["function"]["name"] for tool in action_defs} == {action_name}
+        assert {tool["function"]["name"] for tool in read_defs} == {read_name}
+
+    def test_runtime_specific_tool_dispatch_fails_closed(self):
+        from tools.registry import registry
+
+        name = "test_read_only_runtime_dispatch"
+        try:
+            registry.register(
+                name=name,
+                toolset="test-runtime-dispatch",
+                schema={"description": "test", "parameters": {"type": "object"}},
+                handler=lambda _args, **_kwargs: '{"ok":true}',
+                effect="read_only",
+                runtime_modes={"read_only"},
+            )
+
+            allowed = json.loads(
+                registry.dispatch(name, {}, runtime_mode="read_only")
+            )
+            blocked = json.loads(
+                registry.dispatch(name, {}, runtime_mode="action")
+            )
+        finally:
+            registry.deregister(name)
+
+        assert allowed == {"ok": True}
+        assert "unavailable in action mode" in blocked["error"]
+
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),

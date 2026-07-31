@@ -15,6 +15,20 @@ def _make_mcp_tool(name: str, desc: str = ""):
     return SimpleNamespace(name=name, description=desc, inputSchema=None)
 
 
+@pytest.fixture(autouse=True)
+def _restore_mcp_tool_provenance():
+    """Keep dynamic registration tests from enabling live-agent refresh hooks."""
+
+    from tools import mcp_tool
+
+    with mcp_tool._lock:
+        original = dict(mcp_tool._mcp_tool_server_names)
+    yield
+    with mcp_tool._lock:
+        mcp_tool._mcp_tool_server_names.clear()
+        mcp_tool._mcp_tool_server_names.update(original)
+
+
 class TestRegisterServerTools:
     """Tests for the extracted _register_server_tools helper."""
 
@@ -58,6 +72,107 @@ class TestRegisterServerTools:
             "mcp__my_srv__mutate",
             {},
         )
+
+    def test_runtime_modes_are_independent_from_read_only_effect(self, mock_registry):
+        server = MCPServerTask("observer")
+        server._tools = [
+            _make_mcp_tool("inspect"),
+            _make_mcp_tool("apply_migration"),
+        ]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            registered = _register_server_tools(
+                "observer",
+                server,
+                {
+                    "runtime_modes": ["read_only"],
+                    "tools": {
+                        "include": ["inspect"],
+                        "resources": False,
+                        "prompts": False,
+                    },
+                    "read_only_tools": ["inspect"],
+                },
+            )
+
+        assert registered == ["mcp__observer__inspect"]
+        entry = mock_registry.get_entry("mcp__observer__inspect")
+        assert entry.effect is ToolEffect.READ_ONLY
+        assert entry.runtime_modes == frozenset({"read_only"})
+        assert mock_registry.is_exposable_in_runtime(
+            "mcp__observer__inspect", "read_only"
+        )
+        assert not mock_registry.is_exposable_in_runtime(
+            "mcp__observer__inspect", "action"
+        )
+        assert mock_registry.get_entry("mcp__observer__apply_migration") is None
+
+    def test_missing_runtime_modes_preserves_existing_exposure(self, mock_registry):
+        server = MCPServerTask("legacy")
+        server._tools = [_make_mcp_tool("inspect")]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools("legacy", server, {})
+
+        entry = mock_registry.get_entry("mcp__legacy__inspect")
+        assert entry.runtime_modes is None
+        assert mock_registry.is_exposable_in_runtime(
+            "mcp__legacy__inspect", "read_only"
+        )
+        assert mock_registry.is_exposable_in_runtime(
+            "mcp__legacy__inspect", "action"
+        )
+
+    def test_invalid_runtime_modes_fail_closed(self, mock_registry, caplog):
+        server = MCPServerTask("invalid")
+        server._tools = [_make_mcp_tool("inspect")]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools(
+                "invalid",
+                server,
+                {"runtime_modes": ["read_only", "admin"]},
+            )
+
+        entry = mock_registry.get_entry("mcp__invalid__inspect")
+        assert entry.runtime_modes == frozenset()
+        assert not mock_registry.is_exposable_in_runtime(
+            "mcp__invalid__inspect", "read_only"
+        )
+        assert not mock_registry.is_exposable_in_runtime(
+            "mcp__invalid__inspect", "action"
+        )
+        assert "unsupported runtime modes" in caplog.text
+
+    def test_runtime_modes_apply_to_host_owned_utilities(self, mock_registry):
+        server = MCPServerTask("resources")
+        server._tools = []
+        server.session = MagicMock()
+        server.initialize_result = SimpleNamespace(
+            capabilities=SimpleNamespace(
+                resources=SimpleNamespace(),
+                prompts=None,
+            )
+        )
+
+        with patch("tools.registry.registry", mock_registry):
+            registered = _register_server_tools(
+                "resources",
+                server,
+                {"runtime_modes": ["action"]},
+            )
+
+        assert set(registered) == {
+            "mcp__resources__list_resources",
+            "mcp__resources__read_resource",
+        }
+        for name in registered:
+            entry = mock_registry.get_entry(name)
+            assert entry.effect is ToolEffect.READ_ONLY
+            assert entry.runtime_modes == frozenset({"action"})
 
 
 class TestRefreshTools:

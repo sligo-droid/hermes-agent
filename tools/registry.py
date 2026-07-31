@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from agent.runtime_capabilities import ToolEffect, normalize_tool_effect
 
@@ -93,13 +93,14 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides", "effect",
-        "read_only_check",
+        "read_only_check", "runtime_modes",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None,
-                 effect=ToolEffect.UNKNOWN, read_only_check=None):
+                  max_result_size_chars=None, dynamic_schema_overrides=None,
+                  effect=ToolEffect.UNKNOWN, read_only_check=None,
+                  runtime_modes=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -120,6 +121,7 @@ class ToolEntry:
         self.dynamic_schema_overrides = dynamic_schema_overrides
         self.effect = normalize_tool_effect(effect)
         self.read_only_check = read_only_check
+        self.runtime_modes = runtime_modes
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +385,7 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         effect: ToolEffect | str = ToolEffect.UNKNOWN,
         read_only_check: Callable[[dict], bool | str | None] = None,
+        runtime_modes: Optional[set[str] | frozenset[str]] = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -455,6 +458,9 @@ class ToolRegistry:
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 effect=effect,
                 read_only_check=read_only_check,
+                runtime_modes=(
+                    None if runtime_modes is None else frozenset(runtime_modes)
+                ),
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -511,6 +517,18 @@ class ToolRegistry:
                 )
             )
         )
+
+    def is_exposable_in_runtime(self, name: str, runtime_mode: Any) -> bool:
+        """Whether a tool is available in the requested agent runtime."""
+
+        entry = self.get_entry(name)
+        if entry is None:
+            return False
+        if entry.runtime_modes is None:
+            return True
+        from agent.runtime_capabilities import normalize_runtime_mode
+
+        return normalize_runtime_mode(runtime_mode).value in entry.runtime_modes
 
     def deregister(self, name: str) -> None:
         """Remove a tool from the registry.
@@ -681,10 +699,16 @@ class ToolRegistry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 
-        if normalize_runtime_mode(
+        runtime_mode = normalize_runtime_mode(
             kwargs.get("runtime_mode"),
             default=RuntimeMode.ACTION,
-        ) is RuntimeMode.READ_ONLY:
+        )
+        if not self.is_exposable_in_runtime(name, runtime_mode):
+            return json.dumps(
+                {"error": f"Tool {name} is unavailable in {runtime_mode.value} mode."},
+                ensure_ascii=False,
+            )
+        if runtime_mode is RuntimeMode.READ_ONLY:
             block = self.read_only_block(name, args)
             if block is not None:
                 return json.dumps({"error": block}, ensure_ascii=False)

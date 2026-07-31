@@ -590,12 +590,20 @@ def _read_only_runtime_block(
         block = registry.read_only_block(underlying_name, underlying_args)
         if block is None:
             return None
-        return f"{block} Escalate to action only if the user's request requires durable change."
+        return (
+            f"{block} If this is observational, report the limitation and continue "
+            "with available evidence; do not escalate merely to gain tool access. "
+            "Escalate only if the user's original request requires durable change."
+        )
 
     block = registry.read_only_block(function_name, function_args or {})
     if block is None:
         return None
-    return f"{block} Escalate to action only if the user's request requires durable change."
+    return (
+        f"{block} If this is observational, report the limitation and continue "
+        "with available evidence; do not escalate merely to gain tool access. "
+        "Escalate only if the user's original request requires durable change."
+    )
 
 
 def _discord_intake_mutation_block(

@@ -18,12 +18,13 @@ def _tool(name):
     return {"type": "function", "function": {"name": name, "description": "", "parameters": {}}}
 
 
-def _agent(tool_names, *, enabled=None, disabled=None):
+def _agent(tool_names, *, enabled=None, disabled=None, runtime_mode="action"):
     a = types.SimpleNamespace()
     a.tools = [_tool(n) for n in tool_names]
     a.valid_tool_names = set(tool_names)
     a.enabled_toolsets = enabled
     a.disabled_toolsets = disabled
+    a._runtime_mode = runtime_mode
     return a
 
 
@@ -96,6 +97,24 @@ def test_refresh_passes_agent_toolset_filters(monkeypatch):
 
     assert seen["enabled_toolsets"] == ["coding", "granola"]
     assert seen["disabled_toolsets"] == ["messaging"]
+    assert seen["runtime_mode"] == "action"
+
+
+def test_refresh_passes_read_only_runtime_mode(monkeypatch):
+    agent = _agent(["a"], runtime_mode="read_only")
+    seen = {}
+
+    import model_tools
+
+    def _capture(**kw):
+        seen.update(kw)
+        return [_tool("a")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _capture)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert seen["runtime_mode"] == "read_only"
 
 
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):

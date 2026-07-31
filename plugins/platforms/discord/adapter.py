@@ -188,7 +188,9 @@ _DISCORD_READ_ONLY_PROMPT = (
     "`escalate_to_action` alone. The gateway will end this turn and replay the "
     "original text, media, and context into a fresh ACTION runtime. Explicit "
     "constraints such as 'do not implement', 'plan only', and 'recommend only' "
-    "must remain read-only and must never escalate."
+    "must remain read-only and must never escalate. If an observation capability "
+    "is unavailable, report that limitation and continue with available evidence; "
+    "never escalate merely to gain tool access."
 )
 
 _DISCORD_EXPLICIT_NO_ACTION_PATTERNS = (
