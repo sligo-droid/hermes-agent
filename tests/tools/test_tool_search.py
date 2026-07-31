@@ -512,6 +512,46 @@ class TestRegression_ToolsetScoping:
         assert ok.get("ok") is True
         assert ok.get("tool") == "mcp_inscope_gh_op"
 
+    def test_search_catalog_is_scoped_to_runtime_mode(self):
+        import model_tools
+        from tools.registry import registry
+
+        read_name = "mcp_runtime_read_observer"
+        action_name = "mcp_runtime_action_mutator"
+        schema = _td(read_name, "runtime observer", {})
+        try:
+            registry.register(
+                name=read_name,
+                handler=lambda args, **kw: json.dumps({"ok": True}),
+                schema=schema,
+                toolset="mcp-runtime-search",
+                effect="read_only",
+                runtime_modes={"read_only"},
+            )
+            registry.register(
+                name=action_name,
+                handler=lambda args, **kw: json.dumps({"ok": True}),
+                schema=_td(action_name, "runtime mutator", {}),
+                toolset="mcp-runtime-search",
+                runtime_modes={"action"},
+            )
+
+            result = model_tools.handle_function_call(
+                function_name="tool_search",
+                function_args={"query": "mcp_runtime", "limit": 10},
+                enabled_toolsets=["mcp-runtime-search"],
+                runtime_mode="read_only",
+            )
+        finally:
+            registry.deregister(read_name)
+            registry.deregister(action_name)
+
+        parsed = json.loads(result)
+        hit_names = {match["name"] for match in parsed["matches"]}
+        assert read_name in hit_names
+        assert action_name not in hit_names
+        assert parsed["total_available"] == 1
+
     def test_bridge_dispatch_does_not_pollute_global_resolved_names(self):
         import model_tools
 
@@ -553,3 +593,27 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
+
+    def test_executor_scope_threads_runtime_mode(self, monkeypatch):
+        from agent.tool_executor import _tool_search_scoped_names
+        import model_tools
+
+        seen = {}
+
+        def fake_get_tool_definitions(**kwargs):
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr(model_tools, "get_tool_definitions", fake_get_tool_definitions)
+        agent = type(
+            "Agent",
+            (),
+            {
+                "enabled_toolsets": ["mcp-runtime-search"],
+                "disabled_toolsets": None,
+                "_runtime_mode": "read_only",
+            },
+        )()
+
+        assert _tool_search_scoped_names(agent) == frozenset()
+        assert seen["runtime_mode"] == "read_only"

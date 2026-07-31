@@ -4723,7 +4723,11 @@ def _normalize_runtime_modes(value: Any, label: str) -> Optional[frozenset[str]]
     """Return an exact runtime-mode allowlist, failing closed when configured badly."""
 
     if value is None:
-        return None
+        logger.warning(
+            "MCP config %s must not be null; the server will not be exposed to agents",
+            label,
+        )
+        return frozenset()
     if isinstance(value, str):
         items = [value]
     elif isinstance(value, (list, tuple, set)):
@@ -4927,9 +4931,13 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         config.get("read_only_tools"),
         f"mcp_servers.{name}.read_only_tools",
     )
-    runtime_modes = _normalize_runtime_modes(
-        config.get("runtime_modes"),
-        f"mcp_servers.{name}.runtime_modes",
+    runtime_modes = (
+        _normalize_runtime_modes(
+            config["runtime_modes"],
+            f"mcp_servers.{name}.runtime_modes",
+        )
+        if "runtime_modes" in config
+        else None
     )
 
     def _should_register(tool_name: str) -> bool:
@@ -5521,6 +5529,12 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         tools_list.append({"type": "function", "function": schema})
         name_set.add(name)
         return True
+
+    # agent_init excludes both extension families from read-only agents. A
+    # later MCP refresh must preserve that exclusion rather than broadening the
+    # live tool surface after construction.
+    if str(getattr(agent, "_runtime_mode", "") or "") == "read_only":
+        return set()
 
     # Memory-provider tools (mem0/honcho/byterover/supermemory/…).
     try:

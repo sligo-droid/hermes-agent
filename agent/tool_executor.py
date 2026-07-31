@@ -1118,6 +1118,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        str(getattr(agent, "_runtime_mode", "") or ""),
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -1128,6 +1129,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
             disabled_toolsets=disabled,
             quiet_mode=True,
             skip_tool_search_assembly=True,
+            runtime_mode=getattr(agent, "_runtime_mode", None),
         ) or []
         names = _ts.scoped_deferrable_names(scoped_defs)
     except Exception:

@@ -133,6 +133,26 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_read_only_turn_does_not_start_mutating_codex_runtime(
+        self, monkeypatch, tmp_path
+    ):
+        mutated = tmp_path / "mutated.txt"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            mutated.write_text("mutation escaped read-only mode")
+            return TurnResult(final_text="mutated")
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        agent = _make_codex_agent(runtime_mode="read_only")
+
+        result = agent.run_conversation("write a file")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "unavailable for read-only turns" in result["error"]
+        assert not mutated.exists()
+        assert getattr(agent, "_codex_session", None) is None
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

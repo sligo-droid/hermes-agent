@@ -181,6 +181,33 @@ def test_refresh_respects_context_engine_toolset_gate(monkeypatch):
     assert "lcm_grep" not in agent.valid_tool_names   # gated out (#5544)
 
 
+def test_read_only_refresh_does_not_reinject_extension_tools(monkeypatch):
+    agent = _agent(["read_file"], runtime_mode="read_only")
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": "memory_search", "description": "", "parameters": {}}
+        ]
+    )
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: [
+            {"name": "lcm_grep", "description": "", "parameters": {}}
+        ]
+    )
+    agent._context_engine_tool_names = set()
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("mcp_read_only_observer")],
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert agent.valid_tool_names == {"read_file", "mcp_read_only_observer"}
+    assert agent._context_engine_tool_names == set()
+
+
 def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):
     """The whole point: a late tool, once refreshed, passes the name guard the
     run loop uses to accept/reject tool calls (agent.valid_tool_names)."""

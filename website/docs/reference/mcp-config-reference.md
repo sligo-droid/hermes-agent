@@ -59,7 +59,7 @@ mcp_servers:
 | `timeout` | number | both | Tool call timeout in seconds (default: `300`) |
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
-| `runtime_modes` | string or list | both | Optional exact agent-runtime exposure allowlist: `action` and/or `read_only`. Missing preserves existing availability; invalid configured values fail closed. This does not attest that a tool is safe. |
+| `runtime_modes` | string or list | both | Optional exact agent-runtime exposure allowlist: `action` and/or `read_only`. Missing preserves existing availability; invalid configured values, including explicit `null`, fail closed. This does not attest that a tool is safe. |
 | `read_only_tools` | string or list | both | Operator-owned exact list of server-native tool names that Hermes may execute in `read_only` mode. Server annotations are not trusted. |
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `tools` | mapping | both | Filtering and utility-tool policy |

@@ -147,6 +147,28 @@ class TestRegisterServerTools:
         )
         assert "unsupported runtime modes" in caplog.text
 
+    def test_explicit_null_runtime_modes_fail_closed(self, mock_registry, caplog):
+        server = MCPServerTask("invalid_null")
+        server._tools = [_make_mcp_tool("inspect")]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools(
+                "invalid_null",
+                server,
+                {"runtime_modes": None},
+            )
+
+        entry = mock_registry.get_entry("mcp__invalid_null__inspect")
+        assert entry.runtime_modes == frozenset()
+        assert not mock_registry.is_exposable_in_runtime(
+            "mcp__invalid_null__inspect", "read_only"
+        )
+        assert not mock_registry.is_exposable_in_runtime(
+            "mcp__invalid_null__inspect", "action"
+        )
+        assert "must not be null" in caplog.text
+
     def test_runtime_modes_apply_to_host_owned_utilities(self, mock_registry):
         server = MCPServerTask("resources")
         server._tools = []
