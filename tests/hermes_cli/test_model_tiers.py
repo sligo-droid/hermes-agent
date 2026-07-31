@@ -93,7 +93,7 @@ def test_visual_tiers_resolve_with_intended_models_and_efforts():
         "visual_critique": "claude-opus-5",
     }
     assert {name: tier.reasoning_effort for name, tier in resolved.items()} == {
-        "visual_sweep": "xhigh",
+        "visual_sweep": "medium",
         "visual_inspector": "medium",
         "visual_critique": "medium",
     }
