@@ -1675,7 +1675,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         MockAgent.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
-    def test_deep_review_human_request_launches_sol_xhigh(self, mock_run):
+    def test_deep_review_human_request_launches_sol_high(self, mock_run):
         mock_run.return_value = {
             "task_index": 0,
             "status": "completed",
@@ -1698,7 +1698,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], "gpt-5.6-sol")
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
 
     def test_nested_orchestrator_cannot_select_deep_review(self):
         parent = _make_mock_parent(depth=1)
@@ -1753,7 +1753,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         expected = {
             "visual_advisor": ("anthropic", "claude-opus-5", "medium"),
             "visual_sweep": ("openai-codex", "gpt-5.6-luna", "xhigh"),
-            "visual_inspector": ("anthropic", "claude-opus-5", "medium"),
+            "visual_inspector": ("anthropic", "claude-sonnet-5", "medium"),
             # ``medium`` is stable under the review spillover, so the explicit
             # review purpose passes it through rather than promoting it.
             "visual_critique": ("anthropic", "claude-opus-5", "medium"),

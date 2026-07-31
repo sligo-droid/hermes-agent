@@ -47,7 +47,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "deep_review": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "xhigh",
+        "reasoning_effort": "high",
     },
     # Route-specific tier for ordinary Discord action orchestration. It is
     # intentionally outside MODEL_TIER_LADDER so worker/delegation stepping
@@ -67,12 +67,12 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, str]] = {
         "opencode_model": "hermes-codex/gpt-5.6-luna",
         "reasoning_effort": "xhigh",
     },
-    # Screenshot-appearance judgement. Opus is used once, after the cheap Luna
+    # Screenshot-appearance judgement. Sonnet is used once, after the cheap Luna
     # evidence sweep, because visual judgement is the premium part of the loop.
     "visual_inspector": {
         "provider": "anthropic",
-        "model": "claude-opus-5",
-        "opencode_model": "anthropic/claude-opus-5",
+        "model": "claude-sonnet-5",
+        "opencode_model": "anthropic/claude-sonnet-5",
         "reasoning_effort": "medium",
     },
     # Unbounded aesthetic critique over already-collected evidence. The

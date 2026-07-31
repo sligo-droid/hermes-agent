@@ -89,7 +89,7 @@ def test_visual_tiers_resolve_with_intended_models_and_efforts():
 
     assert {name: tier.model for name, tier in resolved.items()} == {
         "visual_sweep": "gpt-5.6-luna",
-        "visual_inspector": "claude-opus-5",
+        "visual_inspector": "claude-sonnet-5",
         "visual_critique": "claude-opus-5",
     }
     assert {name: tier.reasoning_effort for name, tier in resolved.items()} == {
@@ -104,7 +104,7 @@ def test_visual_tiers_resolve_with_intended_models_and_efforts():
     }
     assert {name: tier.opencode_model for name, tier in resolved.items()} == {
         "visual_sweep": "hermes-codex/gpt-5.6-luna",
-        "visual_inspector": "anthropic/claude-opus-5",
+        "visual_inspector": "anthropic/claude-sonnet-5",
         "visual_critique": "anthropic/claude-opus-5",
     }
 
@@ -120,13 +120,13 @@ def test_visual_tiers_are_outside_the_steppable_ladder():
         assert resolve_adjacent_model_tier({}, name, -1) is None
 
 
-def test_deep_review_is_reserved_sol_xhigh_outside_the_ladder():
+def test_deep_review_is_reserved_sol_high_outside_the_ladder():
     tier = resolve_model_tier({}, "deep_review")
 
     assert tier is not None
     assert tier.model == "gpt-5.6-sol"
     assert tier.opencode_model == "hermes-codex/gpt-5.6-sol"
-    assert tier.reasoning_effort == "xhigh"
+    assert tier.reasoning_effort == "high"
     assert "deep_review" not in MODEL_TIER_LADDER
     assert resolve_adjacent_model_tier({}, "deep_review", 1) is None
 
@@ -146,7 +146,7 @@ def test_visual_tier_names_are_reserved_against_user_override():
     )
 
     assert tier is not None
-    assert tier.model == "claude-opus-5"
+    assert tier.model == "claude-sonnet-5"
     assert tier.reasoning_effort == "medium"
 
 
