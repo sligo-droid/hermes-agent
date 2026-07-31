@@ -1705,9 +1705,9 @@ def _scheduled_opencode_reasoning(default: str) -> str:
     from hermes_constants import normalize_reasoning_effort
 
     effort = normalize_reasoning_effort(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "")
-    if effort in {"max", "ultra"}:
-        return "xhigh"
-    if effort in {"minimal", "low", "medium", "high", "xhigh"}:
+    if effort == "ultra":
+        return "max"
+    if effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
         return effort
     return default
 

@@ -1011,11 +1011,11 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
 
     assert complex_result.error is None
     assert complex_result.run_profile["passes"] == [
-        {"name": "plan", "agent": "plan", "reasoning": "high", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
+        {"name": "plan", "agent": "plan", "reasoning": "max", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
         {"name": "build", "agent": "build", "reasoning": "low", "model": "hermes-codex/gpt-5.6-sol", "model_tier": ""},
     ]
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
-    assert [_option(cmd, "--variant") for cmd in calls] == ["high", "low"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["max", "low"]
 
 
 def test_explicit_pass_tier_and_raw_worker_overrides_take_precedence():
@@ -1076,7 +1076,7 @@ def test_blank_global_tier_uses_pass_tiers_but_off_uses_legacy_raw_values():
     }
 
 
-def test_legacy_max_variant_request_normalizes_to_xhigh(monkeypatch):
+def test_max_variant_request_is_preserved(monkeypatch):
     monkeypatch.setattr(
         ow,
         "_opencode_provider_config_for_model",
@@ -1085,7 +1085,6 @@ def test_legacy_max_variant_request_normalizes_to_xhigh(monkeypatch):
             "models": {
                 "gpt-5.6-sol": {
                     "reasoning": True,
-                    "variants": {"max": {"reasoningEffort": "xhigh"}},
                 }
             },
         },
@@ -1094,10 +1093,42 @@ def test_legacy_max_variant_request_normalizes_to_xhigh(monkeypatch):
     normalized = ow._normalize_reasoning_level("max")
     _, provider = ow._worker_provider_config("hermes-codex/gpt-5.6-sol", normalized)
 
-    assert normalized == "xhigh"
-    assert provider["models"]["gpt-5.6-sol"]["variants"]["xhigh"] == {
-        "reasoningEffort": "xhigh"
+    assert normalized == "max"
+    assert provider["models"]["gpt-5.6-sol"]["variants"]["max"] == {
+        "reasoningEffort": "max"
     }
+
+
+def test_ultra_variant_request_normalizes_to_max():
+    assert ow._normalize_reasoning_level("ultra") == "max"
+
+
+def test_ultra_single_pass_launches_max_variant(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-ultra", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_single_pass(
+        "inspect only",
+        str(tmp_path),
+        timeout=60,
+        agent="build",
+        reasoning_level="ultra",
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert _option(calls[0], "--variant") == "max"
 
 
 def test_unrepresentable_isolated_variant_fails_before_process(monkeypatch, tmp_path):
@@ -1121,7 +1152,7 @@ def test_unrepresentable_isolated_variant_fails_before_process(monkeypatch, tmp_
     )
 
     assert called is False
-    assert "cannot represent variant 'xhigh'" in (result.error or "")
+    assert "cannot represent variant 'max'" in (result.error or "")
 
 
 def test_auth_error_is_classified(monkeypatch, tmp_path):
