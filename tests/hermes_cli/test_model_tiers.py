@@ -327,9 +327,9 @@ def test_standalone_coding_worker_uses_its_named_tier():
     resolved = load_opencode_config(config)
 
     assert resolved["model"] == "custom/feature-worker"
-    assert resolved["simple_build_reasoning_level"] == "high"
-    assert resolved["complex_plan_reasoning_level"] == "high"
-    assert resolved["complex_build_reasoning_level"] == "high"
+    assert resolved["simple_build_reasoning_level"] == "max"
+    assert resolved["complex_plan_reasoning_level"] == "max"
+    assert resolved["complex_build_reasoning_level"] == "max"
 
 
 def test_explicit_maximum_tier_efforts_are_preserved():

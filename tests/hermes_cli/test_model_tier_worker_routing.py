@@ -11,6 +11,7 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
 
     monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
     config = {
+        "backend": "opencode",
         "model_tiers": {
             "worker": {
                 "model": "custom/dev-model",
@@ -32,7 +33,7 @@ def test_role_tier_supplies_model_and_reasoning(monkeypatch):
     assert settings["model_tier"] == "worker"
     assert settings["model"] == "custom/dev-model"
     assert settings["opencode_model"] == "custom/dev-worker"
-    assert settings["reasoning"] == "high"
+    assert settings["reasoning"] == "max"
     assert settings["reasoning_source"] == "model_tier"
     assert settings["model_tier_source"] == "role"
     assert settings["fast_mode"] is False
@@ -47,6 +48,7 @@ def test_reviewer_role_keeps_review_only_advanced_reasoning(monkeypatch):
 
     monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
     config = {
+        "backend": "opencode",
         "model_tiers": {
             "advanced": {
                 "model": "custom/reviewer",
@@ -60,14 +62,14 @@ def test_reviewer_role_keeps_review_only_advanced_reasoning(monkeypatch):
     settings = workers._role_runtime_settings("reviewer", config, {"title": "Review PR"})
 
     assert settings["model_tier"] == "advanced"
-    assert settings["reasoning"] == "xhigh"
+    assert settings["reasoning"] == "medium"
 
 
 def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeypatch):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli.config import DEFAULT_CONFIG
 
-    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "max")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "ultra")
     config = copy.deepcopy(DEFAULT_CONFIG["kanban"]["discord_worker"])
     config["model_tiers"] = copy.deepcopy(DEFAULT_CONFIG["model_tiers"])
     config["roles"]["dev"]["reasoning"] = "minimal"
@@ -76,7 +78,7 @@ def test_default_role_tier_beats_stale_profile_and_environment_reasoning(monkeyp
 
     assert settings["model_tier"] == "intermediate"
     assert settings["model"] == "gpt-5.6-sol"
-    assert settings["reasoning"] == "medium"
+    assert settings["reasoning"] == "low"
     assert settings["reasoning_source"] == "model_tier"
 
 
@@ -115,9 +117,9 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
         "model_tier": "worker",
         "service_tier": "normal",
         "opencode": {"model": "custom/dev-worker"},
-        "simple_build_reasoning_level": "xhigh",
-        "complex_plan_reasoning_level": "xhigh",
-        "complex_build_reasoning_level": "xhigh",
+        "simple_build_reasoning_level": "max",
+        "complex_plan_reasoning_level": "max",
+        "complex_build_reasoning_level": "max",
     }
     profiles = opencode_worker.load_coding_worker_pass_profiles(
         {
@@ -140,15 +142,31 @@ def test_child_worker_applies_tier_to_opencode_and_codex(monkeypatch):
         name: (profile["model_tier"], profile["model"], profile["reasoning_level"])
         for name, profile in profiles.items()
     } == {
-        "simple_build": ("worker", "custom/dev-worker", "high"),
-        "complex_plan": ("worker", "custom/dev-worker", "high"),
-        "complex_build": ("worker", "custom/dev-worker", "high"),
+        "simple_build": ("worker", "custom/dev-worker", "max"),
+        "complex_plan": ("worker", "custom/dev-worker", "max"),
+        "complex_build": ("worker", "custom/dev-worker", "max"),
     }
     assert worker._role_extra_args("dev") == [
         "-c", 'model="custom/dev-model"',
         "-c", 'model_reasoning_effort="high"',
         "-c", 'service_tier="normal"',
     ]
+
+
+def test_scheduled_opencode_normalizes_ultra_to_max(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_MODEL_TIER", "worker")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "ultra")
+
+    scheduled = worker._scheduled_opencode_worker_config()
+
+    assert scheduled == {
+        "model_tier": "worker",
+        "simple_build_reasoning_level": "max",
+        "complex_plan_reasoning_level": "max",
+        "complex_build_reasoning_level": "max",
+    }
 
 
 @pytest.mark.parametrize(

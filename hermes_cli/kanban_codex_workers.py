@@ -51,7 +51,7 @@ _ROLE_DEFAULT_REASONING = {
     "foreman": "xhigh",
     "reviewer": "xhigh",
 }
-_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 _AUTO_RUNTIME = "auto"
 _WORKER_SCRIPT = Path("hermes_cli") / "kanban_codex_worker.py"
 _CONTAINER_WORKER_SCRIPT = "/hermes/hermes_cli/kanban_codex_worker.py"
@@ -154,6 +154,7 @@ def _role_runtime_settings(
     cfg: dict[str, Any],
     task: Any = None,
 ) -> dict[str, Any]:
+    backend = _role_backend(role, _coding_backend(cfg), task)
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
     try:
@@ -190,7 +191,10 @@ def _role_runtime_settings(
         from hermes_constants import normalize_reasoning_effort
 
         reasoning = normalize_reasoning_effort(raw_reasoning)
-        if reasoning in {"max", "ultra"}:
+        if backend == "opencode":
+            if reasoning == "ultra":
+                reasoning = "max"
+        elif reasoning in {"max", "ultra"}:
             reasoning = "xhigh"
         if reasoning not in _VALID_REASONING_LEVELS:
             reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")

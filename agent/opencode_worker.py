@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional
 BACKEND_CODEX = "codex"
 BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
-_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 0.0
 _DEFAULT_OPENCODE_MODEL = "hermes-codex/gpt-5.6-sol"
 _CODING_WORKER_PASS_NAMES = ("simple_build", "complex_plan", "complex_build")
@@ -1709,8 +1709,8 @@ def _normalize_reasoning_level(value: Any) -> str:
     from hermes_constants import normalize_reasoning_effort
 
     raw = normalize_reasoning_effort(value)
-    if raw in {"max", "ultra"}:
-        raw = "xhigh"
+    if raw == "ultra":
+        raw = "max"
     return raw if raw in _VALID_REASONING_LEVELS else ""
 
 
