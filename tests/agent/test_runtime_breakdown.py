@@ -77,6 +77,24 @@ def test_runtime_breakdown_carries_one_sanitized_visual_receipt():
     assert "1 follow-up" in render_runtime_breakdown_text(breakdown)
 
 
+def test_runtime_breakdown_preserves_orchestrator_coverage_for_ledger_validation():
+    receipt = {
+        **_VISUAL_RECEIPT,
+        "assertion_ids": ["vassert_" + ("3" * 24)],
+        "coverage_ids": ["vassert_" + ("4" * 24)],
+        "order": 7,
+    }
+
+    breakdown = build_turn_runtime_breakdown(
+        {
+            "visual_qa_level": "surface",
+            "visual_qa_receipts": [receipt],
+        }
+    )
+
+    assert breakdown["visual_qa_receipts"] == [receipt]
+
+
 def test_runtime_breakdown_reports_missing_explicit_visual_receipt_without_duration():
     breakdown = build_turn_runtime_breakdown(
         {

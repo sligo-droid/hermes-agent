@@ -500,6 +500,22 @@ def sanitize_visual_receipt(receipt: Any, requirement: Any = None) -> dict[str, 
                 return None
     else:
         normalized_coverage_ids = []
+        if coverage_ids is not None:
+            if (
+                not isinstance(coverage_ids, (list, tuple))
+                or not coverage_ids
+                or len(coverage_ids) > _MAX_ASSERTIONS
+            ):
+                return None
+            for item in coverage_ids:
+                coverage_id = str(item or "").strip()
+                if (
+                    not coverage_id.startswith("vassert_")
+                    or not _OPAQUE_REQUIREMENT_RE.fullmatch(coverage_id)
+                    or coverage_id in normalized_coverage_ids
+                ):
+                    return None
+                normalized_coverage_ids.append(coverage_id)
 
     def _metric(name: str, maximum: int) -> int:
         try:

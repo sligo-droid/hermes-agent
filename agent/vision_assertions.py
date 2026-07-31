@@ -124,9 +124,8 @@ def _resolve_visual_inspector_runtime(cfg: Optional[dict[str, Any]]) -> dict[str
     # Opus preflight failures fall back through the already-configured main
     # provider route. In Sligo deployments that is CLIProxyAPI's OpenAI
     # subscription; do not invent an external aggregator dependency here.
-    requested_provider = None if fallback_reason else tier.provider
     runtime = resolve_runtime_provider(
-        requested=requested_provider,
+        requested=None,
         target_model=tier.model,
     )
     return {
@@ -150,7 +149,7 @@ def _resolve_visual_sweep_runtime(cfg: Optional[dict[str, Any]]) -> dict[str, st
     if tier is None or not tier.provider:
         raise RuntimeError("visual_sweep model tier is unavailable")
     runtime = resolve_runtime_provider(
-        requested=tier.provider,
+        requested=None,
         target_model=tier.model,
     )
     return {
@@ -249,10 +248,10 @@ async def evaluate_screenshot_assertions(
     else:
         from agent.auxiliary_client import extract_content_or_reasoning
 
-    # Screenshot assertions are a dedicated visual-inspection phase. Never
-    # inherit the parent/orchestrator route, even when it accepts image input.
-    # The Luna sweep remains the cheap evidence gate; this bounded receipt
-    # evaluator is the single Opus rendered-result review stage.
+    # Screenshot assertions are a dedicated visual-inspection phase. Preserve
+    # the configured main transport and credentials, but never inherit the
+    # parent/orchestrator model. The Luna sweep remains the cheap evidence gate;
+    # this bounded receipt evaluator is the single premium rendered-result stage.
     try:
         inspector = _resolve_visual_inspector_runtime(cfg)
     except Exception:
