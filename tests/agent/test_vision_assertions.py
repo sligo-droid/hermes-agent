@@ -6,6 +6,7 @@ import pytest
 
 from agent.vision_assertions import (
     _resolve_visual_inspector_runtime,
+    _resolve_visual_sweep_runtime,
     evaluate_screenshot_assertions,
     parse_vision_assertion_output,
     run_visual_sweep,
@@ -45,6 +46,42 @@ def test_visual_inspector_preflight_falls_back_through_configured_main_route(mon
     assert runtime["model"] == "gpt-5.6-luna"
     assert runtime["fallback_used"] is True
     assert runtime["fallback_reason"] == "opus_preflight_unavailable"
+
+
+def test_visual_routes_use_configured_main_provider(monkeypatch):
+    seen = []
+
+    monkeypatch.setattr(
+        "hermes_cli.opus_planner._anthropic_budget_preflight_error",
+        lambda: "",
+    )
+
+    def fake_runtime_provider(*, requested, target_model, **kwargs):
+        seen.append((requested, target_model))
+        return {
+            "provider": "custom",
+            "model": "configured-main-default",
+            "base_url": "http://proxy.example/v1",
+            "api_key": "proxy-token",
+            "api_mode": "codex_responses",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_runtime_provider,
+    )
+
+    sweep = _resolve_visual_sweep_runtime({})
+    inspector = _resolve_visual_inspector_runtime({})
+
+    assert seen == [
+        (None, "gpt-5.6-luna"),
+        (None, "claude-sonnet-5"),
+    ]
+    assert sweep["provider"] == "custom"
+    assert sweep["model"] == "gpt-5.6-luna"
+    assert inspector["provider"] == "custom"
+    assert inspector["model"] == "claude-sonnet-5"
 
 
 def test_parse_compact_vision_assertion_output():
