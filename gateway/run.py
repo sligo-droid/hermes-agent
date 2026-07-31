@@ -405,7 +405,11 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         f"mode={mode}; the accepted request has an opaque {requirement.get('level')} requirement. "
         f"{contract_instruction} "
         "Do not attach receipt arguments to terminal/browser/vision calls. Generic navigation, screenshots, "
-        f"or console success do not count. {enforcement}]"
+        f"or console success do not count. {enforcement} After the check, answer the entire accepted request "
+        "from the full turn evidence, including the implementation outcome and relevant verification. Do not "
+        "turn the response into a visual-QA report. If the check passed, state only that visual QA passed; omit "
+        "receipt IDs, confidence, assertion details, or visual observations. The screenshot artifacts are "
+        "attached automatically, so do not add MEDIA tags yourself.]"
     )
 
 

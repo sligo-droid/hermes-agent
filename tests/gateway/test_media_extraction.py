@@ -509,7 +509,15 @@ caption
                 ),
             },
         ]
-        response = _append_auto_media_tags("Visual QA passed.", messages, history_offset=0)
+        response = _append_auto_media_tags(
+            "Implemented the requested dashboard update. Visual QA passed.",
+            messages,
+            history_offset=0,
+        )
+        assert response.startswith(
+            "Implemented the requested dashboard update. Visual QA passed."
+        )
+        assert response.count("MEDIA:") == 2
         event = MessageEvent(
             text="implement this",
             message_type=MessageType.TEXT,
