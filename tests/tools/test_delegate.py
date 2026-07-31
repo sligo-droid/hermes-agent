@@ -1752,7 +1752,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         mock_resolve.side_effect = resolve_provider
         expected = {
             "visual_advisor": ("anthropic", "claude-opus-5", "medium"),
-            "visual_sweep": ("openai-codex", "gpt-5.6-luna", "xhigh"),
+            "visual_sweep": ("openai-codex", "gpt-5.6-luna", "medium"),
             "visual_inspector": ("anthropic", "claude-sonnet-5", "medium"),
             # ``medium`` is stable under the review spillover, so the explicit
             # review purpose passes it through rather than promoting it.

@@ -64,14 +64,14 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
         "fast_mode": False,
     },
     # Rendered-UI sweep workers: drive the browser across viewports/routes and
-    # collect evidence. The work is navigation and protocol-following, not
-    # reasoning, so this pairs the cheapest capable model with high effort.
+    # collect evidence. The work is navigation and protocol-following with
+    # bounded recovery, so medium effort keeps it reliable without overspending.
     # Outside MODEL_TIER_LADDER for the same reason as ``discord_action``.
     "visual_sweep": {
         "provider": "openai-codex",
         "model": "gpt-5.6-luna",
         "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "xhigh",
+        "reasoning_effort": "medium",
         "fast_mode": False,
     },
     # Screenshot-appearance judgement. Sonnet is used once, after the cheap Luna
