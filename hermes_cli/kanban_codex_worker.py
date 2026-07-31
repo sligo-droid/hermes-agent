@@ -1738,20 +1738,22 @@ def _scheduled_opencode_worker_config() -> Optional[dict[str, Any]]:
             )
         return worker_config or None
 
-    if os.environ.get("HERMES_CODEX_WORKER_REASONING_SOURCE") != "adaptive":
-        return None
-    if _raw_opencode_pass_configured():
-        return None
-    effort = _scheduled_opencode_reasoning("")
-    if not effort:
-        return None
-    worker_config = {
-        "simple_build_reasoning_level": effort,
-        "complex_build_reasoning_level": effort,
-    }
+    worker_config: dict[str, Any] = {}
+    if (
+        os.environ.get("HERMES_CODEX_WORKER_REASONING_SOURCE") == "adaptive"
+        and not _raw_opencode_pass_configured()
+    ):
+        effort = _scheduled_opencode_reasoning("")
+        if effort:
+            worker_config.update(
+                {
+                    "simple_build_reasoning_level": effort,
+                    "complex_build_reasoning_level": effort,
+                }
+            )
     if service_tier in {"fast", "normal"}:
         worker_config["service_tier"] = service_tier
-    return worker_config
+    return worker_config or None
 
 
 def _raw_opencode_pass_configured() -> bool:

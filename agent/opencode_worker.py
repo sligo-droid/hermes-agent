@@ -1621,11 +1621,11 @@ def _worker_provider_config_for_tier(
         variant.pop(existing_key, None)
     if fast_mode:
         npm = str(provider_cfg.get("npm") or "").strip()
-        if npm == "@ai-sdk/openai-compatible":
+        if provider_id == "hermes-codex" and npm == "@ai-sdk/openai-compatible":
             variant["service_tier"] = "priority"
-        elif npm == "@ai-sdk/openai":
+        elif provider_id == "openai" and npm == "@ai-sdk/openai":
             variant["serviceTier"] = "priority"
-        elif npm == "@ai-sdk/anthropic":
+        elif provider_id == "anthropic" and npm == "@ai-sdk/anthropic":
             from hermes_cli.models import _is_anthropic_fast_model
 
             if not _is_anthropic_fast_model(model_id):

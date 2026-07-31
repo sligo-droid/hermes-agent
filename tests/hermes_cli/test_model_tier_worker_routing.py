@@ -193,6 +193,52 @@ def test_scheduled_opencode_preserves_resolved_service_tier(
     assert pass_config["simple_build_fast_mode"] is expected_fast_mode
 
 
+@pytest.mark.parametrize(
+    ("service_tier", "child_tier", "expected_fast_mode"),
+    [("fast", "intermediate", True), ("normal", "basic", False)],
+)
+def test_scheduled_opencode_forwards_service_without_model_tier(
+    monkeypatch, service_tier, child_tier, expected_fast_mode
+):
+    from agent import opencode_worker
+    from hermes_cli import kanban_codex_worker as worker
+
+    for name in (
+        "HERMES_CODEX_WORKER_MODEL_TIER",
+        "HERMES_OPENCODE_WORKER_MODEL",
+        "HERMES_CODEX_WORKER_REASONING",
+        "HERMES_CODEX_WORKER_REASONING_SOURCE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", service_tier)
+
+    scheduled = worker._scheduled_opencode_worker_config()
+
+    assert scheduled == {"service_tier": service_tier}
+    pass_config = opencode_worker.load_coding_worker_pass_config(
+        {
+            "model_tiers": {
+                "basic": {
+                    "model": "gpt-5.6-luna",
+                    "opencode_model": "hermes-codex/gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                    "fast_mode": True,
+                },
+                "intermediate": {
+                    "model": "gpt-5.6-sol",
+                    "opencode_model": "hermes-codex/gpt-5.6-sol",
+                    "reasoning_effort": "low",
+                    "fast_mode": False,
+                },
+            },
+            "coding_worker": {"model_tier": child_tier},
+        },
+        worker_config=scheduled,
+    )
+
+    assert pass_config["simple_build_fast_mode"] is expected_fast_mode
+
+
 def test_bare_opencode_model_is_rejected_before_worker_profile_launch():
     from agent.opencode_worker import load_coding_worker_pass_profiles
 

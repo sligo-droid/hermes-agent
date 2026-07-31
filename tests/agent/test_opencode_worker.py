@@ -300,6 +300,26 @@ def test_fast_mode_rejects_unverified_opencode_provider(monkeypatch):
         ow._worker_provider_config_for_tier("google/gemini", "medium", fast_mode=True)
 
 
+def test_fast_mode_rejects_custom_openai_compatible_provider(monkeypatch):
+    monkeypatch.setattr(
+        ow,
+        "_opencode_provider_config_for_model",
+        lambda _model: {
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {
+                "gpt-5.5": {
+                    "variants": {"medium": {"reasoningEffort": "medium"}}
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="no verified fast-mode variant encoding"):
+        ow._worker_provider_config_for_tier(
+            "custom/gpt-5.5", "medium", fast_mode=True
+        )
+
+
 def test_fast_mode_rejects_unsupported_anthropic_model(monkeypatch):
     monkeypatch.setattr(
         ow,
