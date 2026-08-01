@@ -376,9 +376,10 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         contract_instruction = (
             "Using the full accepted request/thread plus the code you inspect, you own the "
             "transient semantic contract. After the relevant edit and after preparing the existing "
-            "browser session, use `browser_authenticate` if a protected login page is visible and "
+            "browser session with one repository-native preview launcher, use `browser_authenticate` "
+            "if a protected login page is visible and "
             "an operator profile is configured; never type or inspect credentials yourself. Then "
-            "call `visual_qa` with: the smallest relevant target/region (and a "
+            "call `visual_qa` once with: the smallest relevant target/region (and a "
             "safe locator when available), the intended or already-open page state, applicable "
             "viewport and state assumptions, and concrete assertions for every requested visual "
             "outcome. Include at least one `screenshot_appearance` assertion. Request up to four "
@@ -386,7 +387,11 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
             "viewports matter; otherwise the tool defaults to focused target plus page context and "
             "reuses those exact captures for inspection. The host assigns "
             "opaque assertion IDs and binds the result to the trusted requirement; the bounded "
-            "inspector—not your prose—decides pass/fail."
+            "inspector—not your prose—decides pass/fail. Assert viewport containment only for an "
+            "individual target that should fit without scrolling; do not require a vertically "
+            "scrolling page or multiple stacked panels to fit in one viewport. If the contract is "
+            "invalid or the prepared browser state was lost, repair the page state or contract and "
+            "retry at most once; do not build ad hoc screenshot scripts or loop on equivalent calls."
         )
     else:
         required = ", ".join(
@@ -406,7 +411,8 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         f"{contract_instruction} "
         "Do not attach receipt arguments to terminal/browser/vision calls. Generic navigation, screenshots, "
         f"or console success do not count. {enforcement} After the check, answer the entire accepted request "
-        "from the full turn evidence, including the implementation outcome and relevant verification. Do not "
+        "from the full turn evidence. Preserve the established completion content: what changed, relevant "
+        "verification, and shipped/PR/deploy state when applicable. Do not "
         "turn the response into a visual-QA report. If the check passed, state only that visual QA passed; omit "
         "receipt IDs, confidence, assertion details, or visual observations. The screenshot artifacts are "
         "attached automatically, so do not add MEDIA tags yourself.]"
@@ -23545,7 +23551,7 @@ class _GatewayRunnerCore(
             # extract_local_files scanned text that still contained MEDIA: tags,
             # producing false-positive bare-path matches with the MEDIA: prefix
             # glued on. This matches the chain order in gateway/platforms/base.py.
-            _, cleaned = adapter.extract_images(cleaned)
+            images, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
 
@@ -23577,9 +23583,9 @@ class _GatewayRunnerCore(
                 else:
                     non_image_local.append(file_path)
 
-            if image_paths:
+            if images or image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images.extend((f"file://{_quote(p)}", "") for p in image_paths)
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -29827,15 +29833,27 @@ class _GatewayRunnerCore(
             agent_result=agent_result,
             cwd=cwd,
         )
+        media_event = MessageEvent(
+            text="",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
         if already_delivered:
+            await self._deliver_media_from_response(response, media_event, adapter)
             if footer_line:
                 await adapter.send(source.chat_id, footer_line, metadata=metadata)
             return
-        await adapter.send(
-            source.chat_id,
-            _append_runtime_footer(response, footer_line),
-            metadata=metadata,
-        )
+        _, cleaned_response = adapter.extract_media(response)
+        _, cleaned_response = adapter.extract_images(cleaned_response)
+        _, cleaned_response = adapter.extract_local_files(cleaned_response)
+        visible_response = _append_runtime_footer(cleaned_response, footer_line)
+        if visible_response:
+            await adapter.send(
+                source.chat_id,
+                visible_response,
+                metadata=metadata,
+            )
+        await self._deliver_media_from_response(response, media_event, adapter)
 
     async def _run_agent(
         self,

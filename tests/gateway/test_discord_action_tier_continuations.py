@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import threading
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -24,6 +25,34 @@ class _CaptureAdapter:
 
     async def handle_message(self, event) -> None:
         self.events.append(event)
+
+    @staticmethod
+    def extract_media(content: str):
+        lines = content.splitlines()
+        media = []
+        cleaned = []
+        for line in lines:
+            if line.startswith("MEDIA:"):
+                media.append((line.removeprefix("MEDIA:"), False))
+            else:
+                cleaned.append(line)
+        return media, "\n".join(cleaned).rstrip()
+
+    @staticmethod
+    def extract_images(content: str):
+        return [], content
+
+    @staticmethod
+    def extract_local_files(content: str):
+        lines = content.splitlines()
+        files = []
+        cleaned = []
+        for line in lines:
+            if line.startswith("/tmp/"):
+                files.append(line)
+            else:
+                cleaned.append(line)
+        return files, "\n".join(cleaned).rstrip()
 
 
 def _discord_source() -> SessionSource:
@@ -65,6 +94,7 @@ def test_direct_question_leaves_pending_followup_for_fresh_event_processing() ->
 @pytest.mark.asyncio
 async def test_queued_response_footer_uses_its_completed_turn_model() -> None:
     runner = object.__new__(gateway_run.GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock()
     adapter = _CaptureAdapter()
 
     await runner._deliver_queued_turn_response(
@@ -87,11 +117,69 @@ async def test_queued_response_footer_uses_its_completed_turn_model() -> None:
 
     expected = "Terra completed the action." + chr(10) * 2 + "gpt-5.6-terra · xhigh"
     assert adapter.sent == [("thread-1", expected, {"thread_id": "thread-1"})]
+    runner._deliver_media_from_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_response_delivers_media_without_leaking_local_paths() -> None:
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock()
+    adapter = _CaptureAdapter()
+
+    await runner._deliver_queued_turn_response(
+        adapter=adapter,
+        source=_discord_source(),
+        response=(
+            "Completed.\n\n"
+            "What changed:\n- Added the Confidence tab.\n\n"
+            "Verification:\n- Visual QA passed.\n"
+            "MEDIA:/tmp/qa/desktop.png\n"
+            "MEDIA:/tmp/qa/mobile.png"
+        ),
+        agent_result={"model": "gpt-5.6-terra", "reasoning_effort": "none"},
+        user_config={"display": {"runtime_footer": {"enabled": False}}},
+        cwd="/tmp/project",
+        metadata={"thread_id": "thread-1"},
+        already_delivered=False,
+    )
+
+    assert adapter.sent == [
+        (
+            "thread-1",
+            "Completed.\n\nWhat changed:\n- Added the Confidence tab.\n\n"
+            "Verification:\n- Visual QA passed.",
+            {"thread_id": "thread-1"},
+        )
+    ]
+    delivered_response = runner._deliver_media_from_response.await_args.args[0]
+    assert delivered_response.endswith("MEDIA:/tmp/qa/mobile.png")
+
+
+@pytest.mark.asyncio
+async def test_queued_response_delivers_bare_local_file_without_empty_text() -> None:
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock()
+    adapter = _CaptureAdapter()
+
+    await runner._deliver_queued_turn_response(
+        adapter=adapter,
+        source=_discord_source(),
+        response="/tmp/qa/desktop.png",
+        agent_result={"model": "gpt-5.6-terra", "reasoning_effort": "none"},
+        user_config={"display": {"runtime_footer": {"enabled": False}}},
+        cwd="/tmp/project",
+        metadata={"thread_id": "thread-1"},
+        already_delivered=False,
+    )
+
+    assert adapter.sent == []
+    runner._deliver_media_from_response.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_streamed_queued_response_sends_its_own_trailing_footer() -> None:
     runner = object.__new__(gateway_run.GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock()
     adapter = _CaptureAdapter()
 
     await runner._deliver_queued_turn_response(
@@ -108,6 +196,7 @@ async def test_streamed_queued_response_sends_its_own_trailing_footer() -> None:
     )
 
     assert adapter.sent == [("thread-1", "gpt-5.6-terra · none", {"thread_id": "thread-1"})]
+    runner._deliver_media_from_response.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

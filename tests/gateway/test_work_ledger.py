@@ -491,9 +491,15 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert "never type or inspect credentials" in prompt
     assert "smallest relevant target/region" in prompt
     assert "bounded inspector—not your prose—decides pass/fail" in prompt
+    assert "one repository-native preview launcher" in prompt
+    assert "call `visual_qa` once" in prompt
+    assert "multiple stacked panels to fit in one viewport" in prompt
+    assert "retry at most once" in prompt
+    assert "do not build ad hoc screenshot scripts" in prompt
     assert "attach receipt arguments" in prompt
     assert "Generic navigation" in prompt
     assert "answer the entire accepted request" in prompt
+    assert "what changed, relevant verification, and shipped/PR/deploy state" in prompt
     assert "Do not turn the response into a visual-QA report" in prompt
     assert "state only that visual QA passed" in prompt
     assert "receipt IDs, confidence, assertion details, or visual observations" in prompt
