@@ -510,13 +510,18 @@ caption
             },
         ]
         response = _append_auto_media_tags(
-            "Implemented the requested dashboard update. Visual QA passed.",
+            "Completed.\n\n"
+            "What changed:\n- Implemented the requested dashboard update.\n\n"
+            "Verification:\n- Focused checks passed.\n- Visual QA passed.\n\n"
+            "Shipped:\n- Deployed to the requested environment.",
             messages,
             history_offset=0,
         )
         assert response.startswith(
-            "Implemented the requested dashboard update. Visual QA passed."
+            "Completed.\n\nWhat changed:\n- Implemented the requested dashboard update."
         )
+        assert "Verification:\n- Focused checks passed.\n- Visual QA passed." in response
+        assert "Shipped:\n- Deployed to the requested environment." in response
         assert response.count("MEDIA:") == 2
         event = MessageEvent(
             text="implement this",
@@ -557,6 +562,53 @@ caption
         assert [
             image[0] for image in adapter.send_multiple_images.await_args.kwargs["images"]
         ] == [f"file://{focused}", f"file://{context}"]
+
+    @pytest.mark.asyncio
+    async def test_post_stream_delivery_preserves_extracted_image_urls(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        event = MessageEvent(
+            text="show the chart",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="thread-1",
+                chat_type="channel",
+                thread_id="thread-1",
+            ),
+        )
+        adapter = SimpleNamespace(
+            name="discord",
+            extract_media=BasePlatformAdapter.extract_media,
+            extract_images=BasePlatformAdapter.extract_images,
+            extract_local_files=BasePlatformAdapter.extract_local_files,
+            send_multiple_images=AsyncMock(),
+            send_voice=AsyncMock(),
+            send_document=AsyncMock(),
+            send_video=AsyncMock(),
+        )
+        runner = SimpleNamespace(
+            _thread_metadata_for_source=lambda _source, _anchor=None: {
+                "thread_id": "thread-1"
+            },
+            _reply_anchor_for_event=lambda _event: None,
+        )
+
+        await GatewayRunner._deliver_media_from_response(
+            runner,
+            "Chart: ![confidence](https://example.com/confidence.png)",
+            event,
+            adapter,
+        )
+
+        adapter.send_multiple_images.assert_awaited_once_with(
+            chat_id="thread-1",
+            images=[("https://example.com/confidence.png", "confidence")],
+            metadata={"thread_id": "thread-1"},
+        )
 
     def test_gateway_appends_missing_screenshot_when_response_has_media(self):
         """One explicit attachment must not suppress other QA screenshots."""
