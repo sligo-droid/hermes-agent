@@ -11,7 +11,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -174,6 +174,65 @@ async def test_queued_response_delivers_bare_local_file_without_empty_text() -> 
 
     assert adapter.sent == []
     runner._deliver_media_from_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_media_only_queued_response_sends_runtime_footer() -> None:
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock()
+    adapter = _CaptureAdapter()
+
+    await runner._deliver_queued_turn_response(
+        adapter=adapter,
+        source=_discord_source(),
+        response="MEDIA:/tmp/qa/desktop.png",
+        agent_result={"model": "gpt-5.6-terra", "reasoning_effort": "xhigh"},
+        user_config={
+            "display": {"runtime_footer": {"enabled": True, "fields": ["model", "reasoning"]}}
+        },
+        cwd="/tmp/project",
+        metadata={"thread_id": "thread-1"},
+        already_delivered=False,
+    )
+
+    assert adapter.sent == [
+        ("thread-1", "gpt-5.6-terra · xhigh", {"thread_id": "thread-1"})
+    ]
+    runner._deliver_media_from_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_queued_image_delivery_preserves_visible_url() -> None:
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock(
+        return_value=SendResult(
+            success=False,
+            error="rate limited",
+            retryable=True,
+            retry_safe=True,
+        )
+    )
+    adapter = _CaptureAdapter()
+    adapter.extract_images = BasePlatformAdapter.extract_images
+
+    await runner._deliver_queued_turn_response(
+        adapter=adapter,
+        source=_discord_source(),
+        response="Chart: ![confidence](https://example.com/confidence.png)",
+        agent_result={"model": "gpt-5.6-terra", "reasoning_effort": "none"},
+        user_config={"display": {"runtime_footer": {"enabled": False}}},
+        cwd="/tmp/project",
+        metadata={"thread_id": "thread-1"},
+        already_delivered=False,
+    )
+
+    assert adapter.sent == [
+        (
+            "thread-1",
+            "Chart: ![confidence](https://example.com/confidence.png)",
+            {"thread_id": "thread-1"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
