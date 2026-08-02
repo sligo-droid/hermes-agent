@@ -610,6 +610,101 @@ caption
             metadata={"thread_id": "thread-1"},
         )
 
+    @pytest.mark.asyncio
+    async def test_post_stream_delivery_deduplicates_explicit_and_bare_local_image(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        image = tmp_path / "result.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (tmp_path,),
+        )
+        event = MessageEvent(
+            text="show the result",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="thread-1",
+                chat_type="channel",
+                thread_id="thread-1",
+            ),
+        )
+        adapter = SimpleNamespace(
+            name="discord",
+            extract_media=BasePlatformAdapter.extract_media,
+            extract_images=BasePlatformAdapter.extract_images,
+            extract_local_files=BasePlatformAdapter.extract_local_files,
+            send_multiple_images=AsyncMock(),
+            send_voice=AsyncMock(),
+            send_document=AsyncMock(),
+            send_video=AsyncMock(),
+        )
+        runner = SimpleNamespace(
+            _thread_metadata_for_source=lambda _source, _anchor=None: None,
+            _reply_anchor_for_event=lambda _event: None,
+        )
+
+        await GatewayRunner._deliver_media_from_response(
+            runner,
+            f"Saved at {image}\nMEDIA:{image}",
+            event,
+            adapter,
+        )
+
+        images = adapter.send_multiple_images.await_args.kwargs["images"]
+        assert images == [(f"file://{image}", "")]
+
+    @pytest.mark.asyncio
+    async def test_document_delivery_deduplicates_explicit_and_bare_local_image(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        image = tmp_path / "result.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
+        event = MessageEvent(
+            text="show the result",
+            message_type=MessageType.TEXT,
+            source=SessionSource(platform=Platform.DISCORD, chat_id="thread-1"),
+        )
+        adapter = SimpleNamespace(
+            name="discord",
+            extract_media=BasePlatformAdapter.extract_media,
+            extract_images=BasePlatformAdapter.extract_images,
+            extract_local_files=BasePlatformAdapter.extract_local_files,
+            send_multiple_images=AsyncMock(),
+            send_voice=AsyncMock(),
+            send_document=AsyncMock(return_value=SimpleNamespace(success=True)),
+            send_video=AsyncMock(),
+        )
+        runner = SimpleNamespace(
+            _thread_metadata_for_source=lambda _source, _anchor=None: None,
+            _reply_anchor_for_event=lambda _event: None,
+        )
+
+        await GatewayRunner._deliver_media_from_response(
+            runner,
+            f"[[as_document]]\nSaved at {image}\nMEDIA:{image}",
+            event,
+            adapter,
+        )
+
+        adapter.send_document.assert_awaited_once()
+
     def test_gateway_appends_missing_screenshot_when_response_has_media(self):
         """One explicit attachment must not suppress other QA screenshots."""
         from gateway.run import _append_auto_media_tags

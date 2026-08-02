@@ -181,6 +181,18 @@ class TestMessageEventGetCommandArgs:
 
 
 class TestExtractImages:
+    def test_remote_image_extraction_is_bounded_and_preserves_overflow_text(self):
+        content = "\n".join(
+            f"![image {index}](https://example.com/{index}.png)"
+            for index in range(25)
+        )
+
+        images, cleaned = BasePlatformAdapter.extract_images(content)
+
+        assert len(images) == 20
+        assert "https://example.com/19.png" not in cleaned
+        assert "![image 20](https://example.com/20.png)" in cleaned
+
     def test_no_images(self):
         images, cleaned = BasePlatformAdapter.extract_images("Just regular text.")
         assert images == []

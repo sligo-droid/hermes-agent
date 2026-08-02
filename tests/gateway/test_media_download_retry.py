@@ -380,7 +380,9 @@ class TestSSRFRedirectGuard:
         """Build a mock httpx response that looks like a redirect."""
         resp = MagicMock()
         resp.is_redirect = True
-        resp.next_request = MagicMock(url=target_url)
+        resp.url = "https://public.example/start"
+        resp.headers = {"location": target_url}
+        resp.next_request = None
         return resp
 
     def _make_client_capturing_hooks(self):

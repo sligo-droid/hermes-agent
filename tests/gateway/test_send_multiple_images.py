@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
 def _run(coro):
@@ -209,7 +209,12 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    _DISCORD_MAX_BATCH_IMAGES,
+    _DISCORD_MAX_REMOTE_IMAGE_BYTES,
+    _download_discord_image,
+)
 
 
 class TestDiscordMultiImage:
@@ -267,6 +272,264 @@ class TestDiscordMultiImage:
     def test_empty_noop(self, adapter):
         adapter._client = MagicMock()
         _run(adapter.send_multiple_images("67890", []))
+
+    def test_failed_remote_download_falls_back_to_visible_url(self, adapter):
+        mock_channel = MagicMock()
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="77"))
+
+        with patch(
+            "plugins.platforms.discord.adapter._download_discord_image",
+            AsyncMock(side_effect=ValueError("blocked redirect")),
+        ):
+            result = _run(
+                adapter.send_multiple_images(
+                    "67890",
+                    [("https://example.com/chart.png", "confidence")],
+                )
+            )
+
+        adapter.send.assert_awaited_once_with(
+            "67890",
+            "confidence: https://example.com/chart.png",
+            metadata=None,
+        )
+        assert result.success is True
+        assert result.confirmed_message_ids == ("77",)
+
+    def test_remote_batch_count_is_bounded(self, adapter):
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(
+            side_effect=[MagicMock(id=1), MagicMock(id=2)]
+        )
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="3"))
+        images = [
+            (f"https://example.com/{index}.png", "")
+            for index in range(_DISCORD_MAX_BATCH_IMAGES + 1)
+        ]
+
+        with patch(
+            "plugins.platforms.discord.adapter._download_discord_image",
+            AsyncMock(return_value=(b"\x89PNG\r\n\x1a\n", "png")),
+        ) as download:
+            result = _run(adapter.send_multiple_images("67890", images))
+
+        assert download.await_count == _DISCORD_MAX_BATCH_IMAGES
+        adapter.send.assert_not_awaited()
+        assert result.success is False
+        assert result.confirmed_message_ids == ("1", "2")
+        assert "exceeds Discord download limit" in result.error
+
+    def test_channel_resolution_fallback_keeps_remote_count_bounded(self, adapter):
+        adapter._client.get_channel = MagicMock(side_effect=RuntimeError("cache failed"))
+        images = [
+            (f"https://example.com/{index}.png", "")
+            for index in range(_DISCORD_MAX_BATCH_IMAGES + 7)
+        ]
+
+        with patch.object(
+            BasePlatformAdapter,
+            "send_multiple_images",
+            AsyncMock(return_value=SendResult(success=True, message_id="1")),
+        ) as fallback:
+            result = _run(adapter.send_multiple_images("67890", images))
+
+        assert len(fallback.await_args.args[1]) == _DISCORD_MAX_BATCH_IMAGES
+        assert result.success is False
+        assert "exceeds Discord download limit" in result.error
+
+    def test_local_images_are_not_limited_by_remote_fetch_budget(self, adapter, tmp_path):
+        paths = []
+        for index in range(_DISCORD_MAX_BATCH_IMAGES + 1):
+            path = tmp_path / f"img_{index}.png"
+            path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            paths.append(path)
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(
+            side_effect=[MagicMock(id=1), MagicMock(id=2), MagicMock(id=3)]
+        )
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        result = _run(
+            adapter.send_multiple_images(
+                "67890",
+                [(f"file://{path}", "") for path in paths],
+            )
+        )
+
+        assert [len(call.kwargs["files"]) for call in mock_channel.send.await_args_list] == [10, 10, 1]
+        assert result.success is True
+
+    def test_chunk_fallback_does_not_repeat_failed_download_url(self, adapter):
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(side_effect=RuntimeError("batch failed"))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="2"))
+
+        with (
+            patch(
+                "plugins.platforms.discord.adapter._download_discord_image",
+                AsyncMock(
+                    side_effect=[
+                        ValueError("bad image"),
+                        (b"\x89PNG\r\n\x1a\n", "png"),
+                    ]
+                ),
+            ),
+            patch.object(
+                BasePlatformAdapter,
+                "send_multiple_images",
+                AsyncMock(return_value=SendResult(success=True, message_id="1")),
+            ) as fallback,
+        ):
+            _run(
+                adapter.send_multiple_images(
+                    "67890",
+                    [
+                        ("https://example.com/bad.png", "bad"),
+                        ("https://example.com/good.png", "good"),
+                    ],
+                )
+            )
+
+        fallback.assert_not_awaited()
+        adapter.send.assert_awaited_once_with(
+            "67890",
+            "bad: https://example.com/bad.png",
+            metadata=None,
+        )
+
+    def test_ambiguous_batch_timeout_is_not_replayed(self, adapter, tmp_path):
+        image = tmp_path / "image.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(side_effect=TimeoutError("send timed out"))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        with patch.object(
+            BasePlatformAdapter,
+            "send_multiple_images",
+            AsyncMock(),
+        ) as fallback:
+            result = _run(
+                adapter.send_multiple_images(
+                    "67890",
+                    [(f"file://{image}", "")],
+                )
+            )
+
+        fallback.assert_not_awaited()
+        assert result.success is False
+        assert result.retry_safe is False
+
+    def test_batch_prefers_thread_metadata(self, adapter, tmp_path):
+        image = tmp_path / "image.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        _run(
+            adapter.send_multiple_images(
+                "100",
+                [(f"file://{image}", "")],
+                metadata={"thread_id": "200"},
+            )
+        )
+
+        adapter._client.get_channel.assert_called_once_with(200)
+
+
+class _ResponseContent:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    async def iter_chunked(self, _size):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _ResponseContext:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _DownloadSession:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.urls = []
+
+    def get(self, url, **kwargs):
+        self.urls.append((url, kwargs))
+        return _ResponseContext(next(self.responses))
+
+
+def _download_response(status, *, headers=None, chunks=()):
+    return MagicMock(
+        status=status,
+        headers=headers or {},
+        content=_ResponseContent(chunks),
+    )
+
+
+def test_discord_image_download_validates_redirect_target():
+    session = _DownloadSession(
+        [_download_response(302, headers={"location": "http://169.254.169.254/latest"})]
+    )
+
+    with patch(
+        "plugins.platforms.discord.adapter.async_is_safe_url",
+        AsyncMock(side_effect=[True, False]),
+    ) as safety:
+        with pytest.raises(ValueError, match="unsafe image URL"):
+            _run(_download_discord_image(session, "https://example.com/chart.png", {}))
+
+    assert safety.await_args_list[1].args == ("http://169.254.169.254/latest",)
+    assert session.urls[0][1]["allow_redirects"] is False
+
+
+def test_discord_image_download_rejects_oversized_stream():
+    session = _DownloadSession(
+        [
+            _download_response(
+                200,
+                chunks=(b"\x89PNG\r\n\x1a\n", b"x" * _DISCORD_MAX_REMOTE_IMAGE_BYTES),
+            )
+        ]
+    )
+
+    with patch(
+        "plugins.platforms.discord.adapter.async_is_safe_url",
+        AsyncMock(return_value=True),
+    ):
+        with pytest.raises(ValueError, match="exceeds Discord download limit"):
+            _run(_download_discord_image(session, "https://example.com/chart.png", {}))
+
+
+def test_discord_image_download_rejects_non_image_bytes():
+    session = _DownloadSession(
+        [_download_response(200, chunks=(b"<html>not an image</html>",))]
+    )
+
+    with patch(
+        "plugins.platforms.discord.adapter.async_is_safe_url",
+        AsyncMock(return_value=True),
+    ):
+        with pytest.raises(ValueError, match="not a supported image"):
+            _run(_download_discord_image(session, "https://example.com/chart.png", {}))
 
 
 # ---------------------------------------------------------------------------

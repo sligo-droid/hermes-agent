@@ -23531,7 +23531,7 @@ class _GatewayRunnerCore(
         that the normal _process_message_background path would have caught.
         """
         from pathlib import Path
-        from urllib.parse import quote as _quote
+        from urllib.parse import quote as _quote, unquote as _unquote
 
         try:
             # Capture [[as_document]] before extract_media strips it, so the
@@ -23540,7 +23540,13 @@ class _GatewayRunnerCore(
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import (
+                BasePlatformAdapter,
+                SendResult,
+                _deduplicate_delivery_paths,
+                get_confirmed_message_ids,
+                should_send_media_as_audio,
+            )
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -23554,6 +23560,11 @@ class _GatewayRunnerCore(
             images, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            media_files, local_files = _deduplicate_delivery_paths(
+                media_files,
+                local_files,
+            )
+            delivery_results = []
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
@@ -23585,59 +23596,98 @@ class _GatewayRunnerCore(
 
             if images or image_paths:
                 try:
-                    images.extend((f"file://{_quote(p)}", "") for p in image_paths)
-                    await adapter.send_multiple_images(
+                    combined_images = list(images)
+                    combined_images.extend((f"file://{_quote(p)}", "") for p in image_paths)
+                    deduplicated_images = []
+                    seen_images = set()
+                    for image_url, alt_text in combined_images:
+                        key = (
+                            f"file://{os.path.realpath(_unquote(image_url[7:]))}"
+                            if image_url.startswith("file://")
+                            else image_url
+                        )
+                        if key in seen_images:
+                            continue
+                        seen_images.add(key)
+                        deduplicated_images.append((image_url, alt_text))
+                    result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
-                        images=images,
+                        images=deduplicated_images,
                         metadata=_thread_meta,
                     )
+                    if isinstance(result, SendResult):
+                        delivery_results.append(result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    delivery_results.append(SendResult(success=False, error=str(e)))
 
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    if isinstance(result, SendResult):
+                        delivery_results.append(result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    delivery_results.append(SendResult(success=False, error=str(e)))
 
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=file_path,
                             metadata=_thread_meta,
                         )
+                    if isinstance(result, SendResult):
+                        delivery_results.append(result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    delivery_results.append(SendResult(success=False, error=str(e)))
+
+            failures = [result for result in delivery_results if not result.success]
+            confirmed_ids = tuple(
+                message_id
+                for result in delivery_results
+                for message_id in get_confirmed_message_ids(result)
+            )
+            return SendResult(
+                success=not failures,
+                message_id=confirmed_ids[0] if confirmed_ids else None,
+                confirmed_message_ids=confirmed_ids,
+                error="; ".join(str(result.error or "media delivery failed") for result in failures) or None,
+                retryable=any(result.retryable for result in failures),
+                retry_safe=all(result.retry_safe is not False for result in failures) if failures else False,
+            )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error=str(e))
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
@@ -29843,9 +29893,16 @@ class _GatewayRunnerCore(
             if footer_line:
                 await adapter.send(source.chat_id, footer_line, metadata=metadata)
             return
-        _, cleaned_response = adapter.extract_media(response)
-        _, cleaned_response = adapter.extract_images(cleaned_response)
+        _, response_without_media = adapter.extract_media(response)
+        _, cleaned_response = adapter.extract_images(response_without_media)
         _, cleaned_response = adapter.extract_local_files(cleaned_response)
+        media_result = await self._deliver_media_from_response(
+            response,
+            media_event,
+            adapter,
+        )
+        if not getattr(media_result, "success", True):
+            _, cleaned_response = adapter.extract_local_files(response_without_media)
         visible_response = _append_runtime_footer(cleaned_response, footer_line)
         if visible_response:
             await adapter.send(
@@ -29853,7 +29910,8 @@ class _GatewayRunnerCore(
                 visible_response,
                 metadata=metadata,
             )
-        await self._deliver_media_from_response(response, media_event, adapter)
+        if not cleaned_response and footer_line:
+            await adapter.send(source.chat_id, footer_line, metadata=metadata)
 
     async def _run_agent(
         self,

@@ -562,13 +562,13 @@ async def _ssrf_redirect_guard(response):
 
     Must be async because httpx.AsyncClient awaits response event hooks.
     """
-    if response.is_redirect and response.next_request:
-        redirect_url = str(response.next_request.url)
-        from tools.url_safety import is_safe_url
-        if not is_safe_url(redirect_url):
-            raise ValueError(
-                f"Blocked redirect to private/internal address: {safe_url_for_log(redirect_url)}"
-            )
+    from tools.url_safety import async_is_safe_url, redirect_target_from_response
+
+    redirect_url = redirect_target_from_response(response)
+    if redirect_url and not await async_is_safe_url(redirect_url):
+        raise ValueError(
+            f"Blocked redirect to private/internal address: {safe_url_for_log(redirect_url)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +617,26 @@ def _looks_like_image(data: bytes) -> bool:
     if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
         return True
     return False
+
+
+def _deduplicate_delivery_paths(media_files, local_files):
+    """Deduplicate canonical local paths, preserving explicit MEDIA precedence."""
+    seen = set()
+    deduplicated_media = []
+    for path, is_voice in media_files:
+        key = os.path.realpath(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated_media.append((path, is_voice))
+    deduplicated_local = []
+    for path in local_files:
+        key = os.path.realpath(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated_local.append(path)
+    return deduplicated_media, deduplicated_local
 
 
 def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
@@ -2960,11 +2980,14 @@ class BasePlatformAdapter(ABC):
             Tuple of (list of (url, alt_text) pairs, cleaned content with image tags removed).
         """
         images = []
+        max_images = 20
         cleaned = content
         
         # Match markdown images: ![alt](url)
         md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
         for match in re.finditer(md_pattern, content):
+            if len(images) >= max_images:
+                break
             alt_text = match.group(1)
             url = match.group(2)
             # Only extract URLs that look like actual images
@@ -2975,6 +2998,8 @@ class BasePlatformAdapter(ABC):
         # Match HTML img tags: <img src="url"> or <img src="url"></img> or <img src="url"/>
         html_pattern = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
         for match in re.finditer(html_pattern, content):
+            if len(images) >= max_images:
+                break
             url = match.group(1)
             images.append((url, ""))
         
@@ -4910,8 +4935,12 @@ class BasePlatformAdapter(ABC):
                     # instead of becoming native uploads.
                     local_files, text_content = self.extract_local_files(text_content)
                     local_files = self.filter_local_delivery_paths(local_files)
-                    if local_files:
-                        logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                media_files, local_files = _deduplicate_delivery_paths(
+                    media_files,
+                    local_files,
+                )
+                if local_files:
+                    logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
                 if not (text_content or images or local_files or media_files):
                     # Recover from the post-extract_media response. Its parser
