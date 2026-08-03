@@ -405,6 +405,12 @@ class CDPSupervisor:
         self._dialog_seq = 0
         self._diagnostic_seq = 0
         self._diagnostic_cursor_secret = secrets.token_bytes(32)
+        # Viewport-changing operations are serialized separately from ordinary
+        # supervisor state. A visual-QA lease may span assertions, screenshots,
+        # fingerprints, and bounded vision work without holding _state_lock.
+        self._viewport_scope_lock = threading.Lock()
+        self._viewport_scope_token: Optional[str] = None
+        self._trusted_viewport_override: Optional[Dict[str, Any]] = None
 
     # ── Public sync API ──────────────────────────────────────────────────────
 
@@ -1105,18 +1111,329 @@ class CDPSupervisor:
         except Exception as exc:
             return {"ok": False, "error": type(exc).__name__}
 
+    def _effective_viewport_state(
+        self,
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        result = self.evaluate_runtime(
+            "(() => ({width: window.innerWidth, height: window.innerHeight, deviceScaleFactor: window.devicePixelRatio || 1, orientation: (screen.orientation ? {type: screen.orientation.type, angle: screen.orientation.angle} : null)}))()",
+            timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+            execution_guard=execution_guard,
+        )
+        value = result.get("result") if result.get("ok") else None
+        if not isinstance(value, dict):
+            return {"ok": False, "code": "viewport_state_unavailable"}
+        try:
+            width = int(value.get("width"))
+            height = int(value.get("height"))
+            device_scale_factor = float(value.get("deviceScaleFactor"))
+        except (TypeError, ValueError):
+            return {"ok": False, "code": "viewport_state_unavailable"}
+        if width <= 0 or height <= 0 or device_scale_factor <= 0:
+            return {"ok": False, "code": "viewport_state_unavailable"}
+        state = {
+            "ok": True,
+            "width": width,
+            "height": height,
+            "deviceScaleFactor": device_scale_factor,
+        }
+        orientation = value.get("orientation")
+        if isinstance(orientation, dict):
+            orientation_type = str(orientation.get("type") or "")
+            try:
+                orientation_angle = int(orientation.get("angle"))
+            except (TypeError, ValueError):
+                orientation_angle = None
+            if orientation_type and orientation_angle is not None:
+                state["screenOrientation"] = {
+                    "type": orientation_type,
+                    "angle": orientation_angle,
+                }
+        return state
+
+    def _set_trusted_viewport_override(
+        self,
+        override: Optional[Dict[str, Any]],
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> bool:
+        if override is None:
+            result = self._page_cdp_call(
+                "Emulation.clearDeviceMetricsOverride",
+                {},
+                timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+                execution_guard=execution_guard,
+            )
+        else:
+            result = self._page_cdp_call(
+                "Emulation.setDeviceMetricsOverride",
+                dict(override),
+                timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+                execution_guard=execution_guard,
+            )
+        if result.get("ok"):
+            self._trusted_viewport_override = dict(override) if override is not None else None
+            return True
+        return False
+
+    def _verify_trusted_viewport(
+        self,
+        expected: Dict[str, Any],
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> bool:
+        actual = self._effective_viewport_state(
+            timeout=timeout,
+            execution_guard=execution_guard,
+        )
+        if not actual.get("ok"):
+            return False
+        matches = (
+            int(actual["width"]) == int(expected["width"])
+            and int(actual["height"]) == int(expected["height"])
+            and abs(
+                float(actual["deviceScaleFactor"])
+                - float(expected.get("deviceScaleFactor", 1))
+            ) < 0.01
+        )
+        expected_orientation = expected.get("screenOrientation")
+        if isinstance(expected_orientation, dict):
+            matches = matches and actual.get("screenOrientation") == expected_orientation
+        return matches
+
+    def _restore_trusted_viewport_state(
+        self,
+        previous: Dict[str, Any],
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Restore and verify prior state while the caller still owns the lease."""
+
+        override = previous.get("override")
+        effective = previous.get("effective")
+        if not isinstance(effective, dict):
+            return {"ok": False, "code": "viewport_restore_unavailable"}
+        restore_override = previous.get("restore_override") is not False
+        try:
+            if restore_override and not self._set_trusted_viewport_override(
+                override if isinstance(override, dict) else None,
+                timeout=timeout,
+            ):
+                return {"ok": False, "code": "viewport_restore_unavailable"}
+        except Exception:
+            return {"ok": False, "code": "viewport_restore_unavailable"}
+        try:
+            verified = self._verify_trusted_viewport(
+                effective,
+                timeout=timeout,
+            )
+        except Exception:
+            verified = False
+        if not verified:
+            return {"ok": False, "code": "viewport_restore_unverified"}
+        return {"ok": True}
+
+    def begin_trusted_viewport_scope(
+        self,
+        viewport: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        """Serialize viewport-sensitive work and optionally apply one viewport."""
+
+        wait_timeout = _guarded_timeout(execution_guard, min(timeout, 10.0))
+        wait_deadline = time.monotonic() + wait_timeout
+        while True:
+            if execution_guard is not None:
+                try:
+                    execution_guard.check()
+                except Exception:
+                    return {"ok": False, "code": "viewport_scope_unavailable"}
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                return {"ok": False, "code": "viewport_scope_unavailable"}
+            if self._viewport_scope_lock.acquire(timeout=min(0.05, remaining)):
+                break
+        if execution_guard is not None:
+            try:
+                execution_guard.check()
+            except Exception:
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": "viewport_scope_unavailable"}
+        token = secrets.token_hex(16)
+        self._viewport_scope_token = token
+        previous: Optional[Dict[str, Any]] = None
+        viewport_mutation_started = False
+        try:
+            previous_effective = self._effective_viewport_state(
+                timeout=timeout,
+                execution_guard=execution_guard,
+            )
+            if not previous_effective.get("ok"):
+                self._viewport_scope_token = None
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": "viewport_state_unavailable"}
+            previous = {
+                "restore_override": viewport is not None,
+                "override": (
+                    dict(self._trusted_viewport_override)
+                    if self._trusted_viewport_override is not None
+                    else None
+                ),
+                "effective": {
+                    key: previous_effective[key]
+                    for key in ("width", "height", "deviceScaleFactor", "screenOrientation")
+                    if key in previous_effective
+                },
+            }
+            if viewport is None:
+                return {"ok": True, "token": token, "previous": previous}
+            try:
+                width = int(viewport.get("width"))
+                height = int(viewport.get("height"))
+            except (AttributeError, TypeError, ValueError):
+                self._viewport_scope_token = None
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": "viewport_apply_unavailable"}
+            if not (200 <= width <= 7680 and 200 <= height <= 4320):
+                self._viewport_scope_token = None
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": "viewport_apply_unavailable"}
+            override = {
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": 1,
+                "mobile": False,
+            }
+            viewport_mutation_started = True
+            if not self._set_trusted_viewport_override(
+                override,
+                timeout=timeout,
+                execution_guard=execution_guard,
+            ):
+                restoration = self._restore_trusted_viewport_state(
+                    previous,
+                    timeout=max(0.01, min(timeout, 10.0)),
+                )
+                code = (
+                    str(restoration.get("code"))
+                    if not restoration.get("ok")
+                    else "viewport_apply_unavailable"
+                )
+                self._viewport_scope_token = None
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": code}
+            if not self._verify_trusted_viewport(
+                override,
+                timeout=timeout,
+                execution_guard=execution_guard,
+            ):
+                restoration = self._restore_trusted_viewport_state(
+                    previous,
+                    timeout=max(0.01, min(timeout, 10.0)),
+                )
+                code = (
+                    str(restoration.get("code"))
+                    if not restoration.get("ok")
+                    else "viewport_apply_unverified"
+                )
+                self._viewport_scope_token = None
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": code}
+            return {"ok": True, "token": token, "previous": previous}
+        except Exception:
+            if self._viewport_scope_token == token:
+                code = "viewport_scope_unavailable"
+                if previous is not None and viewport_mutation_started:
+                    restoration = self._restore_trusted_viewport_state(
+                        previous,
+                        timeout=max(0.01, min(timeout, 10.0)),
+                    )
+                    code = (
+                        str(restoration.get("code"))
+                        if not restoration.get("ok")
+                        else "viewport_apply_unverified"
+                    )
+                self._viewport_scope_token = None
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": code}
+            return {"ok": False, "code": "viewport_scope_unavailable"}
+
+    def reapply_trusted_viewport_scope(
+        self,
+        token: str,
+        viewport: Dict[str, Any],
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        if not token or token != self._viewport_scope_token:
+            return {"ok": False, "code": "viewport_scope_unavailable"}
+        try:
+            override = {
+                "width": int(viewport["width"]),
+                "height": int(viewport["height"]),
+                "deviceScaleFactor": 1,
+                "mobile": False,
+            }
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "code": "viewport_reapply_unavailable"}
+        if not self._set_trusted_viewport_override(
+            override,
+            timeout=timeout,
+            execution_guard=execution_guard,
+        ):
+            return {"ok": False, "code": "viewport_reapply_unavailable"}
+        if not self._verify_trusted_viewport(
+            override,
+            timeout=timeout,
+            execution_guard=execution_guard,
+        ):
+            return {"ok": False, "code": "viewport_reapply_unverified"}
+        return {"ok": True}
+
+    def end_trusted_viewport_scope(
+        self,
+        token: str,
+        previous: Dict[str, Any],
+        *,
+        timeout: float = 10.0,
+        execution_guard: Any = None,
+    ) -> Dict[str, Any]:
+        """Restore the exact tracked pre-scope viewport and release its lease."""
+
+        if not token or token != self._viewport_scope_token:
+            return {"ok": False, "code": "viewport_scope_unavailable"}
+        result = {"ok": True}
+        try:
+            result = self._restore_trusted_viewport_state(
+                previous,
+                timeout=max(0.01, min(timeout, 10.0)),
+            )
+            return result
+        finally:
+            self._viewport_scope_token = None
+            self._viewport_scope_lock.release()
+
     def capture_screenshot_memory(
         self,
         *,
         locator: Optional[Dict[str, Any]] = None,
         viewport: Optional[Dict[str, Any]] = None,
+        viewport_lease: Optional[str] = None,
         timeout: float = 10.0,
         max_bytes: int = 8 * 1024 * 1024,
         execution_guard: Any = None,
     ) -> Dict[str, Any]:
         """Capture PNG bytes, optionally clipped and temporarily viewport-sized."""
 
-        viewport_override = False
+        owned_scope: Optional[Dict[str, Any]] = None
+        nested_previous: Optional[Dict[str, Any]] = None
         if viewport is not None:
             try:
                 width = int(viewport.get("width"))
@@ -1125,21 +1442,59 @@ class CDPSupervisor:
                 return {"ok": False, "error": "invalid trusted viewport"}
             if not (200 <= width <= 7680 and 200 <= height <= 4320):
                 return {"ok": False, "error": "invalid trusted viewport"}
-            override = self._page_cdp_call(
-                "Emulation.setDeviceMetricsOverride",
-                {
-                    "width": width,
-                    "height": height,
-                    "deviceScaleFactor": 1,
-                    "mobile": False,
-                },
-                timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
-                execution_guard=execution_guard,
-            )
-            if not override.get("ok"):
-                return {"ok": False, "error": "trusted viewport unavailable"}
-            viewport_override = True
+            if viewport_lease is None:
+                owned_scope = self.begin_trusted_viewport_scope(
+                    viewport,
+                    timeout=timeout,
+                    execution_guard=execution_guard,
+                )
+                if not owned_scope.get("ok"):
+                    return {"ok": False, "viewport_code": owned_scope.get("code")}
+            else:
+                if viewport_lease != self._viewport_scope_token:
+                    return {"ok": False, "viewport_code": "viewport_scope_unavailable"}
+                effective = self._effective_viewport_state(
+                    timeout=timeout,
+                    execution_guard=execution_guard,
+                )
+                if not effective.get("ok"):
+                    return {"ok": False, "viewport_code": "viewport_state_unavailable"}
+                nested_previous = {
+                    "override": (
+                        dict(self._trusted_viewport_override)
+                        if self._trusted_viewport_override is not None
+                        else None
+                    ),
+                    "effective": {
+                        key: effective[key]
+                        for key in ("width", "height", "deviceScaleFactor", "screenOrientation")
+                        if key in effective
+                    },
+                }
+                applied = self.reapply_trusted_viewport_scope(
+                    viewport_lease,
+                    viewport,
+                    timeout=timeout,
+                    execution_guard=execution_guard,
+                )
+                if not applied.get("ok"):
+                    override = nested_previous.get("override")
+                    effective = nested_previous["effective"]
+                    if not self._set_trusted_viewport_override(
+                        override if isinstance(override, dict) else None,
+                        timeout=max(0.01, min(timeout, 10.0)),
+                    ):
+                        code = "viewport_restore_unavailable"
+                    elif not self._verify_trusted_viewport(
+                        effective,
+                        timeout=max(0.01, min(timeout, 10.0)),
+                    ):
+                        code = "viewport_restore_unverified"
+                    else:
+                        code = applied.get("code")
+                    return {"ok": False, "viewport_code": code}
 
+        response: Dict[str, Any] = {"ok": False, "error": "screenshot unavailable"}
         try:
             params: Dict[str, Any] = {
                 "format": "png",
@@ -1153,42 +1508,64 @@ class CDPSupervisor:
                     execution_guard=execution_guard,
                 )
                 bounds = state.get("bounds") if isinstance(state.get("bounds"), dict) else {}
+                x = y = width = height = 0.0
                 try:
                     x = max(0.0, float(bounds.get("page_x")))
                     y = max(0.0, float(bounds.get("page_y")))
                     width = float(bounds.get("width"))
                     height = float(bounds.get("height"))
                 except (TypeError, ValueError):
-                    return {"ok": False, "error": "target screenshot bounds unavailable"}
+                    response = {"ok": False, "error": "target screenshot bounds unavailable"}
                 if (
-                    state.get("ok") is not True
+                    response.get("error") == "target screenshot bounds unavailable"
+                    or state.get("ok") is not True
                     or state.get("visible") is not True
                     or width <= 0
                     or height <= 0
                     or width > 16_384
                     or height > 16_384
                 ):
-                    return {"ok": False, "error": "target screenshot bounds unavailable"}
-                params["clip"] = {
-                    "x": x,
-                    "y": y,
-                    "width": width,
-                    "height": height,
-                    "scale": 1,
-                }
-            response = self._page_cdp_call(
-                "Page.captureScreenshot",
-                params,
-                timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
-                execution_guard=execution_guard,
-            )
+                    response = {"ok": False, "error": "target screenshot bounds unavailable"}
+                else:
+                    params["clip"] = {
+                        "x": x,
+                        "y": y,
+                        "width": width,
+                        "height": height,
+                        "scale": 1,
+                    }
+            if response.get("error") != "target screenshot bounds unavailable":
+                response = self._page_cdp_call(
+                    "Page.captureScreenshot",
+                    params,
+                    timeout=_guarded_timeout(execution_guard, min(timeout, 10.0)),
+                    execution_guard=execution_guard,
+                )
         finally:
-            if viewport_override:
-                self._page_cdp_call(
-                    "Emulation.clearDeviceMetricsOverride",
-                    {},
+            if owned_scope is not None:
+                restored = self.end_trusted_viewport_scope(
+                    owned_scope["token"],
+                    owned_scope["previous"],
                     timeout=max(0.01, min(timeout, 10.0)),
                 )
+                if not restored.get("ok"):
+                    response = {
+                        "ok": False,
+                        "viewport_code": restored.get("code"),
+                    }
+            elif nested_previous is not None:
+                override = nested_previous.get("override")
+                effective = nested_previous["effective"]
+                if not self._set_trusted_viewport_override(
+                    override if isinstance(override, dict) else None,
+                    timeout=max(0.01, min(timeout, 10.0)),
+                ):
+                    response = {"ok": False, "viewport_code": "viewport_restore_unavailable"}
+                elif not self._verify_trusted_viewport(
+                    effective,
+                    timeout=max(0.01, min(timeout, 10.0)),
+                ):
+                    response = {"ok": False, "viewport_code": "viewport_restore_unverified"}
         if not response.get("ok"):
             return response
         payload = response.get("response") or {}

@@ -1,5 +1,7 @@
 from agent.visual_assertions import (
     aggregate_assertion_results,
+    diagnose_orchestrated_visual_contract,
+    normalize_assertion_result_coverage,
     normalize_orchestrated_visual_contract,
     storage_safe_visual_qa_args,
     validate_visual_assertions,
@@ -109,6 +111,48 @@ def test_aggregate_fails_closed_for_every_non_pass_status():
     assert aggregate_assertion_results([{"id": "a", "status": "failed", "code": "exists_mismatch"}])["status"] == "failed"
     assert aggregate_assertion_results([{"id": "a", "status": "passed", "code": "model_prose"}])["status"] == "uncertain"
     assert aggregate_assertion_results([])["status"] == "uncertain"
+
+
+def test_exact_result_coverage_rejects_missing_duplicate_extra_and_malformed_results():
+    expected = ["a", "b"]
+    valid = [
+        {"id": "b", "status": "passed", "code": "visible_satisfied"},
+        {"id": "a", "status": "failed", "code": "exists_mismatch"},
+    ]
+    normalized = normalize_assertion_result_coverage(valid, expected)
+    assert normalized["valid"] is True
+    assert [item["id"] for item in normalized["results"]] == expected
+
+    invalid_values = [
+        valid[:1],
+        [valid[0], valid[0]],
+        [valid[0], {"id": "extra", "status": "passed", "code": "exists_satisfied"}],
+        [valid[0], {"id": "a", "status": "passed", "code": "model_prose"}],
+        [valid[0], "malformed"],
+    ]
+    for value in invalid_values:
+        result = normalize_assertion_result_coverage(value, expected)
+        assert result == {
+            "valid": False,
+            "results": [
+                {"id": "a", "status": "uncertain", "code": "invalid_assertion_results"},
+                {"id": "b", "status": "uncertain", "code": "invalid_assertion_results"},
+            ],
+        }
+
+
+def test_invalid_contract_diagnostics_are_fixed_and_do_not_echo_input():
+    result = diagnose_orchestrated_visual_contract(
+        {"target": {"description": "PRIVATE TARGET"}, "unexpected": "SECRET VALUE"}
+    )
+
+    assert result["contract"] == {}
+    assert result["reason_code"] == "contract_unknown_fields"
+    assert result["correction"] == (
+        "Use only target, page, viewport, state, artifacts, and assertions."
+    )
+    assert "PRIVATE" not in repr(result)
+    assert "SECRET" not in repr(result)
 
 
 def test_orchestrated_contract_preserves_rich_semantics_only_transiently():

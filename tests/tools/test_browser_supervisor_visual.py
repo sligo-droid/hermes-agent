@@ -1,3 +1,5 @@
+import threading
+import time
 from unittest.mock import patch
 
 from tools.browser_supervisor import CDPSupervisor
@@ -168,7 +170,15 @@ def test_responsive_screenshot_uses_bounded_viewport_and_restores_it():
             return {"ok": True, "response": {"result": {"data": "cG5n"}}}
         return {"ok": True, "response": {"result": {}}}
 
-    with patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
+    with patch.object(
+        supervisor,
+        "_effective_viewport_state",
+        side_effect=[
+            {"ok": True, "width": 1280, "height": 720, "deviceScaleFactor": 1.0},
+            {"ok": True, "width": 390, "height": 844, "deviceScaleFactor": 1.0},
+            {"ok": True, "width": 1280, "height": 720, "deviceScaleFactor": 1.0},
+        ],
+    ), patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
         result = supervisor.capture_screenshot_memory(
             viewport={"width": 390, "height": 844}
         )
@@ -194,6 +204,202 @@ def test_responsive_screenshot_uses_bounded_viewport_and_restores_it():
         ),
         ("Emulation.clearDeviceMetricsOverride", {}),
     ]
+
+
+def test_viewport_scope_restores_exact_preexisting_override_and_verifies_it():
+    supervisor = _supervisor()
+    previous = {
+        "width": 1024,
+        "height": 768,
+        "deviceScaleFactor": 2,
+        "mobile": True,
+        "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+    }
+    supervisor._trusted_viewport_override = dict(previous)
+    calls = []
+
+    def cdp_call(method, params, **_kwargs):
+        calls.append((method, params))
+        return {"ok": True, "response": {"result": {}}}
+
+    with patch.object(
+        supervisor,
+        "_effective_viewport_state",
+        side_effect=[
+            {"ok": True, "width": 1024, "height": 768, "deviceScaleFactor": 2.0},
+            {"ok": True, "width": 390, "height": 844, "deviceScaleFactor": 1.0},
+            {"ok": True, "width": 1024, "height": 768, "deviceScaleFactor": 2.0},
+        ],
+    ), patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
+        scope = supervisor.begin_trusted_viewport_scope({"width": 390, "height": 844})
+        restored = supervisor.end_trusted_viewport_scope(
+            scope["token"], scope["previous"]
+        )
+
+    assert scope["ok"] is True
+    assert restored == {"ok": True}
+    assert calls == [
+        (
+            "Emulation.setDeviceMetricsOverride",
+            {"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": False},
+        ),
+        ("Emulation.setDeviceMetricsOverride", previous),
+    ]
+    assert supervisor._trusted_viewport_override == previous
+
+
+def test_post_apply_verification_exception_reports_failed_restoration():
+    supervisor = _supervisor()
+    previous = {
+        "width": 1024,
+        "height": 768,
+        "deviceScaleFactor": 2,
+        "mobile": True,
+    }
+    requested = {
+        "width": 390,
+        "height": 844,
+        "deviceScaleFactor": 1,
+        "mobile": False,
+    }
+    supervisor._trusted_viewport_override = dict(previous)
+    set_calls = []
+    ownership_during_restore = []
+
+    def set_override(override, **_kwargs):
+        set_calls.append(override)
+        if len(set_calls) == 1:
+            supervisor._trusted_viewport_override = dict(override)
+            return True
+        ownership_during_restore.append(
+            (supervisor._viewport_scope_token is not None, supervisor._viewport_scope_lock.locked())
+        )
+        return False
+
+    with patch.object(
+        supervisor,
+        "_effective_viewport_state",
+        return_value={"ok": True, "width": 1024, "height": 768, "deviceScaleFactor": 2.0},
+    ), patch.object(
+        supervisor,
+        "_set_trusted_viewport_override",
+        side_effect=set_override,
+    ), patch.object(
+        supervisor,
+        "_verify_trusted_viewport",
+        side_effect=RuntimeError("post-apply verification failed"),
+    ):
+        result = supervisor.begin_trusted_viewport_scope({"width": 390, "height": 844})
+
+    assert result == {"ok": False, "code": "viewport_restore_unavailable"}
+    assert set_calls == [requested, previous]
+    assert ownership_during_restore == [(True, True)]
+    assert supervisor._trusted_viewport_override == requested
+    assert supervisor._viewport_scope_token is None
+    assert supervisor._viewport_scope_lock.acquire(timeout=0.1)
+    supervisor._viewport_scope_lock.release()
+
+
+def test_post_apply_verification_exception_reports_unverified_restoration():
+    supervisor = _supervisor()
+    previous = {
+        "width": 1024,
+        "height": 768,
+        "deviceScaleFactor": 2,
+        "mobile": True,
+    }
+    requested = {
+        "width": 390,
+        "height": 844,
+        "deviceScaleFactor": 1,
+        "mobile": False,
+    }
+    supervisor._trusted_viewport_override = dict(previous)
+    set_calls = []
+    verify_calls = 0
+    ownership_during_restore = []
+
+    def set_override(override, **_kwargs):
+        set_calls.append(override)
+        supervisor._trusted_viewport_override = dict(override)
+        return True
+
+    def verify(_expected, **_kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 1:
+            raise RuntimeError("post-apply verification failed")
+        ownership_during_restore.append(
+            (supervisor._viewport_scope_token is not None, supervisor._viewport_scope_lock.locked())
+        )
+        return False
+
+    with patch.object(
+        supervisor,
+        "_effective_viewport_state",
+        return_value={"ok": True, "width": 1024, "height": 768, "deviceScaleFactor": 2.0},
+    ), patch.object(
+        supervisor,
+        "_set_trusted_viewport_override",
+        side_effect=set_override,
+    ), patch.object(supervisor, "_verify_trusted_viewport", side_effect=verify):
+        result = supervisor.begin_trusted_viewport_scope({"width": 390, "height": 844})
+
+    assert result == {"ok": False, "code": "viewport_restore_unverified"}
+    assert set_calls == [requested, previous]
+    assert ownership_during_restore == [(True, True)]
+    assert supervisor._trusted_viewport_override == previous
+    assert supervisor._viewport_scope_token is None
+    assert supervisor._viewport_scope_lock.acquire(timeout=0.1)
+    supervisor._viewport_scope_lock.release()
+
+
+def test_ambient_viewport_scope_serializes_standalone_responsive_capture():
+    supervisor = _supervisor()
+    calls = []
+    capture_started = threading.Event()
+    capture_done = threading.Event()
+
+    def effective(**_kwargs):
+        override = supervisor._trusted_viewport_override
+        if override is not None:
+            return {
+                "ok": True,
+                "width": override["width"],
+                "height": override["height"],
+                "deviceScaleFactor": override["deviceScaleFactor"],
+            }
+        return {"ok": True, "width": 1280, "height": 720, "deviceScaleFactor": 1.0}
+
+    def cdp_call(method, params, **_kwargs):
+        calls.append((method, params))
+        if method == "Page.captureScreenshot":
+            return {"ok": True, "response": {"result": {"data": "cG5n"}}}
+        return {"ok": True, "response": {"result": {}}}
+
+    with patch.object(supervisor, "_effective_viewport_state", side_effect=effective), patch.object(
+        supervisor, "_page_cdp_call", side_effect=cdp_call
+    ):
+        ambient = supervisor.begin_trusted_viewport_scope()
+
+        def capture():
+            capture_started.set()
+            supervisor.capture_screenshot_memory(viewport={"width": 390, "height": 844})
+            capture_done.set()
+
+        worker = threading.Thread(target=capture)
+        worker.start()
+        assert capture_started.wait(timeout=1)
+        time.sleep(0.05)
+        assert capture_done.is_set() is False
+        assert calls == []
+        assert supervisor.end_trusted_viewport_scope(
+            ambient["token"], ambient["previous"]
+        ) == {"ok": True}
+        worker.join(timeout=2)
+
+    assert capture_done.is_set() is True
+    assert any(method == "Page.captureScreenshot" for method, _params in calls)
 
 
 def test_responsive_screenshot_rejects_out_of_bounds_viewport_without_cdp():
