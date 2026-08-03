@@ -56,7 +56,7 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "medium",
-        "basic": "max",
+        "basic": "high",
         "intermediate": "low",
         "advanced": "medium",
         "discord_action": "low",
@@ -66,7 +66,7 @@ def test_default_routes_reference_resolvable_tiers():
         for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
     } == {
         "trivial": "gpt-5.6-luna",
-        "basic": "gpt-5.6-luna",
+        "basic": "gpt-5.6-terra",
         "intermediate": "gpt-5.6-sol",
         "advanced": "gpt-5.6-sol",
         "discord_action": "gpt-5.6-sol",
@@ -116,6 +116,15 @@ def test_visual_tiers_resolve_with_intended_models_and_efforts():
         "visual_inspector": "anthropic/claude-sonnet-5",
         "visual_critique": "anthropic/claude-opus-5",
     }
+    trivial = resolve_model_tier({"model_tiers": tiers}, "trivial")
+    sweep = resolved["visual_sweep"]
+    assert sweep.name == "visual_sweep"
+    assert (sweep.model, sweep.opencode_model, sweep.reasoning_effort, sweep.fast_mode) == (
+        trivial.model,
+        trivial.opencode_model,
+        trivial.reasoning_effort,
+        trivial.fast_mode,
+    )
 
 
 def test_visual_tiers_are_outside_the_steppable_ladder():
@@ -192,9 +201,9 @@ def test_reserved_builtin_tier_override_is_ignored():
     )
 
     assert tier is not None
-    assert tier.model == "gpt-5.6-luna"
-    assert tier.opencode_model == "hermes-codex/gpt-5.6-luna"
-    assert tier.reasoning_effort == "max"
+    assert tier.model == "gpt-5.6-terra"
+    assert tier.opencode_model == "hermes-codex/gpt-5.6-terra"
+    assert tier.reasoning_effort == "high"
 
 
 def test_custom_non_reserved_tier_resolves_atomically():

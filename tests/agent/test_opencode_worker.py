@@ -237,7 +237,7 @@ def test_named_tier_opencode_variant_controls_service_tier(
     )
 
     assert result.error is None
-    model_id = "gpt-5.6-luna" if fast_mode else "gpt-5.6-sol"
+    model_id = "gpt-5.6-terra" if fast_mode else "gpt-5.6-sol"
     variants = seen_payload["provider"]["hermes-codex"]["models"][model_id]["variants"]
     service_tiers = {variant.get("service_tier") for variant in variants.values()}
     if fast_mode:
@@ -1032,7 +1032,7 @@ def test_explicit_pass_tier_and_raw_worker_overrides_take_precedence():
     assert profiles["simple_build"] == {
         "model_tier": "basic",
         "model": "hermes-codex/custom-worker",
-        "codex_model": "gpt-5.6-luna",
+        "codex_model": "gpt-5.6-terra",
         "reasoning_level": "high",
     }
     assert profiles["complex_plan"]["codex_model"] == "gpt-5.6-sol"

@@ -21,17 +21,20 @@ from hermes_constants import (
 )
 
 
+_TRIVIAL_MODEL_TIER: dict[str, Any] = {
+    "model": "gpt-5.6-luna",
+    "opencode_model": "hermes-codex/gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "fast_mode": True,
+}
+
+
 DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
-    "trivial": {
-        "model": "gpt-5.6-luna",
-        "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "medium",
-        "fast_mode": True,
-    },
+    "trivial": dict(_TRIVIAL_MODEL_TIER),
     "basic": {
-        "model": "gpt-5.6-luna",
-        "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "max",
+        "model": "gpt-5.6-terra",
+        "opencode_model": "hermes-codex/gpt-5.6-terra",
+        "reasoning_effort": "high",
         "fast_mode": True,
     },
     "intermediate": {
@@ -63,16 +66,11 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
         "reasoning_effort": "low",
         "fast_mode": False,
     },
-    # Rendered-UI sweep workers: drive the browser across viewports/routes and
-    # collect evidence. The work is navigation and protocol-following with
-    # bounded recovery, so medium effort keeps it reliable without overspending.
-    # Outside MODEL_TIER_LADDER for the same reason as ``discord_action``.
+    # Rendered-UI sweep workers reuse the trivial Luna/medium worker profile,
+    # while keeping their dedicated provider and route identity.
     "visual_sweep": {
+        **_TRIVIAL_MODEL_TIER,
         "provider": "openai-codex",
-        "model": "gpt-5.6-luna",
-        "opencode_model": "hermes-codex/gpt-5.6-luna",
-        "reasoning_effort": "medium",
-        "fast_mode": False,
     },
     # Screenshot-appearance judgement. Sonnet is used once, after the cheap Luna
     # evidence sweep, because visual judgement is the premium part of the loop.
