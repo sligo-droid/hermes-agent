@@ -118,6 +118,7 @@ class ProcessSession:
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
+    origin_work_item_id: str = ""                # Trusted originating Discord action item
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
     # Watch patterns — trigger agent notification when output matches any pattern
@@ -649,6 +650,16 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        watcher_platform: str = "",
+        watcher_chat_id: str = "",
+        watcher_user_id: str = "",
+        watcher_user_name: str = "",
+        watcher_thread_id: str = "",
+        watcher_message_id: str = "",
+        origin_work_item_id: str = "",
+        watcher_interval: int = 0,
+        notify_on_complete: bool = False,
+        watch_patterns: Optional[List[str]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -667,6 +678,16 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            watcher_platform=watcher_platform,
+            watcher_chat_id=watcher_chat_id,
+            watcher_user_id=watcher_user_id,
+            watcher_user_name=watcher_user_name,
+            watcher_thread_id=watcher_thread_id,
+            watcher_message_id=watcher_message_id,
+            origin_work_item_id=origin_work_item_id,
+            watcher_interval=watcher_interval,
+            notify_on_complete=notify_on_complete,
+            watch_patterns=list(watch_patterns or []),
         )
 
         if use_pty:
@@ -690,26 +711,33 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
-                # PTY reader thread
-                reader = threading.Thread(
-                    target=self._pty_reader_loop,
-                    args=(session,),
-                    daemon=True,
-                    name=f"proc-pty-reader-{session.id}",
-                )
-                session._reader_thread = reader
-                reader.start()
-
                 with self._lock:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
-                self._write_checkpoint()
-                return session
+                try:
+                    self._write_checkpoint(raise_on_error=True)
+                    self._register_pending_watcher(session)
+                    # Publish and checkpoint the complete session before any exit
+                    # observer can move it to finished.
+                    reader = threading.Thread(
+                        target=self._pty_reader_loop,
+                        args=(session,),
+                        daemon=True,
+                        name=f"proc-pty-reader-{session.id}",
+                    )
+                    session._reader_thread = reader
+                    reader.start()
+                    return session
+                except Exception:
+                    self._rollback_published_session(session)
+                    raise
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if session._pty is not None:
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -760,7 +788,14 @@ class ProcessRegistry:
             session.child_scope_unit = child_scope.unit
 
         try:
-            # Start output reader thread
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
+            self._write_checkpoint(raise_on_error=True)
+            self._register_pending_watcher(session)
+            # Reader startup is the publication barrier: completion cannot be
+            # observed until the fully initialized session is durable.
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(session,),
@@ -769,30 +804,8 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
             reader.start()
-
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
-            self._write_checkpoint()
         except Exception:
-            # Post-Popen setup failed — kill the orphaned subprocess (and any
-            # descendants spawned via setsid) before re-raising so they do not
-            # leak as untracked background processes.
-            try:
-                if not _IS_WINDOWS:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok — guarded by _IS_WINDOWS check above
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            self._rollback_published_session(session)
             raise
 
         return session
@@ -805,6 +818,16 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        watcher_platform: str = "",
+        watcher_chat_id: str = "",
+        watcher_user_id: str = "",
+        watcher_user_name: str = "",
+        watcher_thread_id: str = "",
+        watcher_message_id: str = "",
+        origin_work_item_id: str = "",
+        watcher_interval: int = 0,
+        notify_on_complete: bool = False,
+        watch_patterns: Optional[List[str]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -826,6 +849,16 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            watcher_platform=watcher_platform,
+            watcher_chat_id=watcher_chat_id,
+            watcher_user_id=watcher_user_id,
+            watcher_user_name=watcher_user_name,
+            watcher_thread_id=watcher_thread_id,
+            watcher_message_id=watcher_message_id,
+            origin_work_item_id=origin_work_item_id,
+            watcher_interval=watcher_interval,
+            notify_on_complete=notify_on_complete,
+            watch_patterns=list(watch_patterns or []),
         )
 
         # Run the command in the sandbox with output capture
@@ -873,25 +906,99 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
-        if not session.exited:
-            # Start a poller thread that periodically reads the log file
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
-
         with self._lock:
             self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
+            self._running[session.id] = session
 
-        if not session.exited:
-            self._write_checkpoint()
+        try:
+            if not session.exited:
+                self._write_checkpoint(raise_on_error=True)
+            self._register_pending_watcher(session)
+            if session.exited:
+                self._move_to_finished(session)
+            else:
+                # Start the poller only after publication and the first complete
+                # checkpoint, matching the local process lifecycle barrier.
+                reader = threading.Thread(
+                    target=self._env_poller_loop,
+                    args=(session, env, log_path, pid_path, exit_path),
+                    daemon=True,
+                    name=f"proc-poller-{session.id}",
+                )
+                session._reader_thread = reader
+                reader.start()
+        except Exception:
+            self._rollback_published_session(session)
+            raise
         return session
+
+    def _register_pending_watcher(self, session: ProcessSession) -> None:
+        """Queue one gateway watcher from immutable spawn-time metadata."""
+        if session.watcher_interval <= 0:
+            return
+        self.pending_watchers.append({
+            "session_id": session.id,
+            "check_interval": session.watcher_interval,
+            "session_key": session.session_key,
+            "platform": session.watcher_platform,
+            "chat_id": session.watcher_chat_id,
+            "user_id": session.watcher_user_id,
+            "user_name": session.watcher_user_name,
+            "thread_id": session.watcher_thread_id,
+            "message_id": session.watcher_message_id,
+            "origin_work_item_id": session.origin_work_item_id,
+            "notify_on_complete": session.notify_on_complete,
+        })
+
+    def _remove_published_session(self, session: ProcessSession) -> None:
+        """Remove failed publication state and rewrite durability best-effort."""
+        with self._lock:
+            self._running.pop(session.id, None)
+            self._finished.pop(session.id, None)
+        self.pending_watchers[:] = [
+            watcher for watcher in self.pending_watchers
+            if watcher.get("session_id") != session.id
+        ]
+        self._write_checkpoint()
+
+    def _rollback_published_session(self, session: ProcessSession) -> None:
+        """Terminate a launched backend and remove all failed publication state."""
+        try:
+            if session.child_scope_unit:
+                self._terminate_child_scope(session.child_scope_unit)
+            if session._pty is not None:
+                try:
+                    session._pty.terminate(force=True)
+                except Exception:
+                    if session.pid:
+                        self._terminate_host_pid(
+                            session.pid, session.host_start_time
+                        )
+            elif session.process is not None:
+                self._terminate_host_pid(
+                    session.process.pid, session.host_start_time
+                )
+                try:
+                    if session.process.poll() is None:
+                        session.process.kill()
+                except Exception:
+                    pass
+                try:
+                    session.process.wait(timeout=5)
+                except Exception:
+                    pass
+            elif session.env_ref is not None and session.pid:
+                session.env_ref.execute(
+                    f"kill {session.pid} 2>/dev/null", timeout=5
+                )
+        except Exception:
+            logger.warning(
+                "Failed to terminate process during spawn rollback: %s",
+                session.id,
+                exc_info=True,
+            )
+        finally:
+            self._remove_published_session(session)
 
     # ----- Reader / Poller Threads -----
 
@@ -1064,6 +1171,7 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
+                "origin_work_item_id": session.origin_work_item_id,
             })
 
     # ----- Query Methods -----
@@ -1871,8 +1979,8 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
+    def _write_checkpoint(self, *, raise_on_error: bool = False):
+        """Write running metadata atomically; initial publication may be strict."""
         try:
             with self._lock:
                 entries = []
@@ -1901,6 +2009,7 @@ class ProcessRegistry:
                             "watcher_user_name": s.watcher_user_name,
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_message_id": s.watcher_message_id,
+                            "origin_work_item_id": s.origin_work_item_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
@@ -1911,6 +2020,8 @@ class ProcessRegistry:
             atomic_json_write(CHECKPOINT_PATH, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            if raise_on_error:
+                raise
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -1965,6 +2076,7 @@ class ProcessRegistry:
                     watcher_user_name=entry.get("watcher_user_name", ""),
                     watcher_thread_id=entry.get("watcher_thread_id", ""),
                     watcher_message_id=entry.get("watcher_message_id", ""),
+                    origin_work_item_id=entry.get("origin_work_item_id", ""),
                     watcher_interval=entry.get("watcher_interval", 0),
                     notify_on_complete=entry.get("notify_on_complete", False),
                     watch_patterns=entry.get("watch_patterns", []),
@@ -1986,6 +2098,7 @@ class ProcessRegistry:
                         "user_name": session.watcher_user_name,
                         "thread_id": session.watcher_thread_id,
                         "message_id": session.watcher_message_id,
+                        "origin_work_item_id": session.origin_work_item_id,
                         "notify_on_complete": session.notify_on_complete,
                     })
 

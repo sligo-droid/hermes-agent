@@ -13,6 +13,8 @@ from gateway.session_context import (
     clear_session_vars,
     _VAR_MAP,
     _UNSET,
+    _bind_trusted_discord_work_item_id,
+    get_trusted_discord_work_item_id,
 )
 
 
@@ -292,6 +294,93 @@ def test_clear_session_vars_clears_session_id_contextvar(monkeypatch):
     clear_session_vars([])
 
     assert get_session_env("HERMES_SESSION_ID") == ""
+
+
+def test_trusted_discord_work_item_has_no_environment_fallback(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_WORK_ITEM_ID", "forged-work")
+
+    assert get_trusted_discord_work_item_id() == ""
+    assert get_session_env("HERMES_SESSION_WORK_ITEM_ID") == "forged-work"
+
+    tokens = set_session_vars()
+    _bind_trusted_discord_work_item_id("work-1")
+    try:
+        assert get_trusted_discord_work_item_id() == "work-1"
+    finally:
+        clear_session_vars(tokens)
+
+    assert get_trusted_discord_work_item_id() == ""
+
+
+def test_set_session_env_explicitly_clears_trusted_owner_for_other_turns():
+    runner = _gateway_runner()
+    discord = SessionContext(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+        ),
+        connected_platforms=[],
+        home_channels={},
+    )
+    telegram = SessionContext(
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+        ),
+        connected_platforms=[],
+        home_channels={},
+    )
+
+    first = runner._set_session_env(
+        discord, trusted_discord_work_item_id="work-1"
+    )
+    assert get_trusted_discord_work_item_id() == "work-1"
+    runner._clear_session_env(first)
+
+    second = runner._set_session_env(telegram, trusted_discord_work_item_id="")
+    try:
+        assert get_trusted_discord_work_item_id() == ""
+    finally:
+        runner._clear_session_env(second)
+
+
+def test_trusted_owner_selector_allows_only_discord_action_work():
+    from agent.runtime_capabilities import RuntimeMode
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    runner = _gateway_runner()
+    discord_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+    )
+    telegram_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+    )
+    event = MessageEvent(
+        text="work",
+        message_type=MessageType.TEXT,
+        source=discord_source,
+        work_item_id="work-1",
+    )
+
+    assert runner._trusted_discord_work_item_id_for_turn(
+        event, discord_source, RuntimeMode.ACTION
+    ) == "work-1"
+    assert runner._trusted_discord_work_item_id_for_turn(
+        event, discord_source, RuntimeMode.READ_ONLY
+    ) == ""
+    assert runner._trusted_discord_work_item_id_for_turn(
+        event, telegram_source, RuntimeMode.ACTION
+    ) == ""
+    event.participates_in_work_lifecycle = False
+    assert runner._trusted_discord_work_item_id_for_turn(
+        event, discord_source, RuntimeMode.ACTION
+    ) == ""
 
 
 def test_set_session_env_includes_session_key():

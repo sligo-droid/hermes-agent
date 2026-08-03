@@ -94,6 +94,12 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 _DISCORD_ACTION_ESCALATION_ALLOWED: ContextVar = ContextVar(
     "HERMES_DISCORD_ACTION_ESCALATION_ALLOWED", default=_UNSET
 )
+# Trusted gateway-only provenance for tools that start detached work.  This is
+# intentionally excluded from _VAR_MAP: it has no os.environ compatibility
+# fallback and must never be copied into a subprocess environment.
+_TRUSTED_DISCORD_WORK_ITEM_ID: ContextVar = ContextVar(
+    "trusted_discord_work_item_id", default=""
+)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -298,6 +304,7 @@ def clear_session_vars(tokens: list) -> None:
         _KANBAN_NOTIFY_PROFILE,
         _SESSION_MESSAGE_ID,
         _DISCORD_ACTION_ESCALATION_ALLOWED,
+        _TRUSTED_DISCORD_WORK_ITEM_ID,
     ):
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
@@ -313,6 +320,7 @@ def reset_session_vars() -> None:
     """Reset session context variables to the unbound sentinel for this context."""
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _TRUSTED_DISCORD_WORK_ITEM_ID.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
@@ -346,6 +354,21 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_trusted_discord_work_item_id() -> str:
+    """Return the gateway-bound Discord action owner for the current task.
+
+    Unlike ``get_session_env()``, this provenance has no process-environment
+    fallback.  Only the gateway turn binder supplies it, and non-action turns
+    explicitly bind an empty value.
+    """
+    return str(_TRUSTED_DISCORD_WORK_ITEM_ID.get() or "")
+
+
+def _bind_trusted_discord_work_item_id(work_item_id: str = "") -> None:
+    """Bind provenance selected by the gateway's trusted turn router."""
+    _TRUSTED_DISCORD_WORK_ITEM_ID.set(str(work_item_id or ""))
 
 
 def declare_stateless_channel() -> None:

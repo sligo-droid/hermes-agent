@@ -469,7 +469,7 @@ def _silent_bg_base_config(tmp_path):
     }
 
 
-def _silent_bg_harness(monkeypatch, tmp_path):
+def _silent_bg_harness(monkeypatch, tmp_path, *, spawn_calls=None):
     """Common test fixture: patch enough of terminal_tool to spawn a fake
     background process and capture the JSON result the agent sees."""
     import tools.terminal_tool as terminal_tool_module
@@ -480,6 +480,8 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     dummy_env = SimpleNamespace(env={})
 
     def fake_spawn_local(**kwargs):
+        if spawn_calls is not None:
+            spawn_calls.append(kwargs)
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
@@ -500,6 +502,82 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     return terminal_tool_module
+
+
+def test_discord_background_spawn_receives_complete_trusted_provenance(
+    monkeypatch, tmp_path,
+):
+    from gateway.session_context import (
+        _bind_trusted_discord_work_item_id,
+        clear_session_vars,
+        set_session_vars,
+    )
+
+    calls = []
+    tt = _silent_bg_harness(monkeypatch, tmp_path, spawn_calls=calls)
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="channel-1",
+        thread_id="thread-1",
+        user_id="user-1",
+        user_name="alice",
+        message_id="message-1",
+    )
+    _bind_trusted_discord_work_item_id("work-1")
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="true",
+                background=True,
+                notify_on_complete=True,
+                watch_patterns=["done"],
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["notify_on_complete"] is True
+    assert result["watch_patterns_ignored"]
+    assert len(calls) == 1
+    metadata = calls[0]
+    assert metadata["watcher_platform"] == "discord"
+    assert metadata["watcher_chat_id"] == "channel-1"
+    assert metadata["watcher_thread_id"] == "thread-1"
+    assert metadata["watcher_message_id"] == "message-1"
+    assert metadata["origin_work_item_id"] == "work-1"
+    assert metadata["notify_on_complete"] is True
+    assert metadata["watch_patterns"] == []
+    assert metadata["watcher_interval"] == 5
+
+
+def test_non_discord_background_spawn_cannot_inherit_trusted_owner(
+    monkeypatch, tmp_path,
+):
+    from gateway.session_context import (
+        _bind_trusted_discord_work_item_id,
+        clear_session_vars,
+        set_session_vars,
+    )
+
+    calls = []
+    tt = _silent_bg_harness(monkeypatch, tmp_path, spawn_calls=calls)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="chat-1",
+    )
+    _bind_trusted_discord_work_item_id("stale-work")
+    try:
+        tt.terminal_tool(
+            command="true", background=True, notify_on_complete=True
+        )
+    finally:
+        clear_session_vars(tokens)
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert calls[0]["origin_work_item_id"] == ""
 
 
 def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):

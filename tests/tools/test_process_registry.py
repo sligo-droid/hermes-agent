@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
@@ -935,12 +936,19 @@ class TestPopenLeakOnSetupFailure:
              patch("os.getpgid", side_effect=ProcessLookupError), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
-                registry.spawn_local("echo hello", cwd="/tmp")
+                registry.spawn_local(
+                    "echo hello",
+                    cwd="/tmp",
+                    watcher_interval=5,
+                    notify_on_complete=True,
+                )
 
         assert killed, "proc.kill() must be called when post-Popen setup raises"
+        assert registry._running == {}
+        assert registry.pending_watchers == []
 
     def test_popen_killed_when_write_checkpoint_fails(self, registry):
-        """If _write_checkpoint raises after Popen, proc must still be killed."""
+        """A real atomic publication failure kills and fully rolls back Popen."""
         killed = []
 
         proc = MagicMock()
@@ -961,15 +969,109 @@ class TestPopenLeakOnSetupFailure:
         # ProcessLookupError fallback so cleanup deterministically calls
         # proc.kill() instead of issuing a real os.killpg against whatever
         # process group happens to own the fake PID on the host.
+        checkpoint_calls = []
+
+        def fail_atomic_write(_path, _entries):
+            checkpoint_calls.append(True)
+            raise OSError("disk full")
+
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", return_value=fake_thread), \
              patch("os.getpgid", side_effect=ProcessLookupError), \
-             patch.object(registry, "_write_checkpoint", side_effect=OSError("disk full")):
+             patch("utils.atomic_json_write", side_effect=fail_atomic_write):
             with pytest.raises(OSError, match="disk full"):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
+        assert checkpoint_calls
         assert killed, "proc.kill() must be called when _write_checkpoint raises"
+        assert registry._running == {}
+        assert registry.pending_watchers == []
+
+    def test_later_checkpoint_write_failure_remains_best_effort(self, registry):
+        session = _make_session()
+        registry._running[session.id] = session
+
+        with patch("utils.atomic_json_write", side_effect=OSError("disk full")):
+            registry._write_checkpoint()
+
+        assert registry._running[session.id] is session
+
+    def test_pty_publication_failure_terminates_without_pipe_fallback(
+        self, registry, monkeypatch,
+    ):
+        pty = MagicMock(pid=7777)
+        pipe_spawn = MagicMock()
+
+        class FakePtyProcess:
+            @staticmethod
+            def spawn(*_args, **_kwargs):
+                return pty
+
+        monkeypatch.setitem(sys.modules, "ptyprocess", SimpleNamespace(PtyProcess=FakePtyProcess))
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry.subprocess.Popen", pipe_spawn)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: 123)
+
+        with patch("utils.atomic_json_write", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+
+        pty.terminate.assert_called_once_with(force=True)
+        pipe_spawn.assert_not_called()
+        assert registry._running == {}
+        assert registry.pending_watchers == []
+
+    def test_remote_publication_failure_kills_backend_and_rolls_back(
+        self, registry,
+    ):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4321\n", "returncode": 0}
+
+        env = FakeEnv()
+        with patch("utils.atomic_json_write", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                registry.spawn_via_env(
+                    env,
+                    "echo hello",
+                    watcher_interval=5,
+                    notify_on_complete=True,
+                )
+
+        assert any(command == "kill 4321 2>/dev/null" for command, _ in env.commands)
+        assert registry._running == {}
+        assert registry.pending_watchers == []
+
+    def test_remote_poller_creation_failure_removes_pending_watcher(
+        self, registry,
+    ):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4321\n", "returncode": 0}
+
+        env = FakeEnv()
+        with patch.object(registry, "_write_checkpoint"), \
+             patch("tools.process_registry.threading.Thread", side_effect=RuntimeError("thread failed")):
+            with pytest.raises(RuntimeError, match="thread failed"):
+                registry.spawn_via_env(
+                    env,
+                    "echo hello",
+                    watcher_interval=5,
+                    notify_on_complete=True,
+                )
+
+        assert any(command == "kill 4321 2>/dev/null" for command, _ in env.commands)
+        assert registry._running == {}
+        assert registry.pending_watchers == []
 
     def test_popen_not_killed_on_success(self, registry):
         """Successful spawn must NOT kill the process."""
@@ -1004,6 +1106,69 @@ class TestPopenLeakOnSetupFailure:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_immediate_exit_is_published_and_checkpointed_before_reader(
+        self, registry, tmp_path, monkeypatch,
+    ):
+        checkpoint = tmp_path / "procs.json"
+        observed = {}
+
+        class ImmediateProcess:
+            pid = 7777
+            returncode = 0
+            stdout = SimpleNamespace(read=lambda _size: "")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                session = self.args[0]
+                observed["registered"] = registry._running.get(session.id) is session
+                observed["checkpoint"] = json.loads(checkpoint.read_text())
+                self.target(*self.args)
+
+        monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", checkpoint)
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry.subprocess.Popen", lambda *_a, **_kw: ImmediateProcess())
+        monkeypatch.setattr("tools.process_registry.threading.Thread", ImmediateThread)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: 123)
+
+        session = registry.spawn_local(
+            "true",
+            cwd=str(tmp_path),
+            session_key="discord-session",
+            watcher_platform="discord",
+            watcher_chat_id="thread-1",
+            watcher_thread_id="thread-1",
+            watcher_message_id="message-1",
+            origin_work_item_id="work-1",
+            watcher_interval=5,
+            notify_on_complete=True,
+        )
+
+        assert observed["registered"] is True
+        first = observed["checkpoint"]
+        assert len(first) == 1
+        assert first[0]["session_id"] == session.id
+        assert first[0]["started_at"] == session.started_at
+        assert first[0]["origin_work_item_id"] == "work-1"
+        assert first[0]["notify_on_complete"] is True
+        assert first[0]["watcher_interval"] == 5
+        assert registry.get(session.id).exited is True
+        event = registry.completion_queue.get_nowait()
+        assert event["session_id"] == session.id
+        assert event["started_at"] == session.started_at
+        assert event["origin_work_item_id"] == "work-1"
+        registry._move_to_finished(session)
+        assert registry.completion_queue.empty()
+
     def test_write_checkpoint(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session()
@@ -1039,6 +1204,7 @@ class TestCheckpoint:
             s.watcher_user_name = "alice"
             s.watcher_thread_id = "42"
             s.watcher_interval = 60
+            s.origin_work_item_id = "work-1"
             registry._running[s.id] = s
             registry._write_checkpoint()
 
@@ -1050,6 +1216,7 @@ class TestCheckpoint:
             assert data[0]["watcher_user_name"] == "alice"
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
+            assert data[0]["origin_work_item_id"] == "work-1"
 
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
@@ -1065,6 +1232,8 @@ class TestCheckpoint:
             "watcher_user_name": "alice",
             "watcher_thread_id": "42",
             "watcher_interval": 60,
+            "origin_work_item_id": "work-1",
+            "notify_on_complete": True,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
@@ -1078,6 +1247,8 @@ class TestCheckpoint:
             assert w["user_name"] == "alice"
             assert w["thread_id"] == "42"
             assert w["check_interval"] == 60
+            assert w["origin_work_item_id"] == "work-1"
+            assert registry.get("proc_live").origin_work_item_id == "work-1"
 
     def test_recover_skips_watcher_when_no_interval(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
