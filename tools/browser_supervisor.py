@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import secrets
 import threading
 import time
@@ -37,6 +38,8 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
+
+_MAX_SCREENSHOT_CLIP_PIXELS = 4096 * 4096
 
 
 def _http_origin(value: Any) -> str:
@@ -1522,11 +1525,14 @@ class CDPSupervisor:
                     or state.get("visible") is not True
                     or width <= 0
                     or height <= 0
+                    or not all(math.isfinite(value) for value in (x, y, width, height))
                     or width > 16_384
                     or height > 16_384
+                    or width * height > _MAX_SCREENSHOT_CLIP_PIXELS
                 ):
                     response = {"ok": False, "error": "target screenshot bounds unavailable"}
                 else:
+                    params["captureBeyondViewport"] = True
                     params["clip"] = {
                         "x": x,
                         "y": y,
