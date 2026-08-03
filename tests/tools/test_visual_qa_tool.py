@@ -71,3 +71,13 @@ def test_visual_qa_schema_has_no_arbitrary_execution_or_protected_inputs():
             "token",
         }
     )
+
+
+def test_visual_qa_description_distinguishes_containment_from_scroll_overflow():
+    from tools.visual_qa_tool import VISUAL_QA_SCHEMA
+
+    description = VISUAL_QA_SCHEMA["description"]
+    assert "fit fully inside all four viewport edges" in description
+    assert "do not use it for full pages" in description
+    assert "Use `no_horizontal_overflow`" in description
+    assert "vertical scrolling is allowed" in description

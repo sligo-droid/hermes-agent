@@ -15,6 +15,8 @@ from typing import Any, Awaitable, Callable, Optional
 from agent.execution_guard import CooperativeExecutionGuard, ExecutionGuardExpired
 from agent.visual_assertions import (
     aggregate_assertion_results,
+    diagnose_orchestrated_visual_contract,
+    normalize_assertion_result_coverage,
     validate_visual_execution_contract,
     visual_assertion_contract_id,
     visual_execution_contract_id,
@@ -226,6 +228,8 @@ async def _run_attempt(
     screenshot_artifacts: list[dict[str, Any]],
     artifact_paths: list[Path],
     artifact_sink: list[dict[str, str]],
+    viewport_lease: str = "",
+    governing_viewport: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     deterministic = [item for item in assertions if item["kind"] != "screenshot_appearance"]
     appearance = [item for item in assertions if item["kind"] == "screenshot_appearance"]
@@ -237,6 +241,39 @@ async def _run_attempt(
         )
         for item in deterministic
     ]
+    deterministic_coverage = normalize_assertion_result_coverage(
+        results,
+        [item["id"] for item in deterministic],
+    ) if deterministic else {"valid": True, "results": []}
+    results = deterministic_coverage["results"]
+    deterministic_blocker = next(
+        (item for item in results if item["status"] == "blocked"),
+        None,
+    )
+    if deterministic and not deterministic_coverage["valid"]:
+        results.extend(
+            {
+                "id": item["id"],
+                "status": "uncertain",
+                "code": "invalid_assertion_results",
+            }
+            for item in appearance
+        )
+        aggregate = aggregate_assertion_results(results)
+        aggregate["vision_calls"] = 0
+        return aggregate
+    if deterministic_blocker is not None:
+        results.extend(
+            {
+                "id": item["id"],
+                "status": "blocked",
+                "code": deterministic_blocker["code"],
+            }
+            for item in appearance
+        )
+        aggregate = aggregate_assertion_results(results)
+        aggregate["vision_calls"] = 0
+        return aggregate
     provider_start_count = 0
 
     def _mark_provider_started() -> None:
@@ -276,12 +313,52 @@ async def _run_attempt(
                         "width": viewport["width"],
                         "height": viewport["height"],
                     }
+                if viewport_lease and _declares_keyword(
+                    supervisor.capture_screenshot_memory,
+                    "viewport_lease",
+                ):
+                    screenshot_kwargs["viewport_lease"] = viewport_lease
                 screenshot = await _thread_call(
                     supervisor.capture_screenshot_memory,
                     execution_guard=execution_guard,
                     **screenshot_kwargs,
                 )
+                if viewport_lease and governing_viewport is not None:
+                    reapplied = await _thread_call(
+                        supervisor.reapply_trusted_viewport_scope,
+                        viewport_lease,
+                        governing_viewport,
+                        execution_guard=execution_guard,
+                    )
+                    if not reapplied.get("ok"):
+                        code = str(reapplied.get("code") or "viewport_reapply_unavailable")
+                        lifecycle_results = [
+                            {
+                                "id": item["id"],
+                                "status": "blocked",
+                                "code": code,
+                            }
+                            for item in assertions
+                        ]
+                        aggregate = aggregate_assertion_results(lifecycle_results)
+                        aggregate["vision_calls"] = provider_start_count
+                        aggregate["code"] = code
+                        return aggregate
                 if not screenshot.get("ok"):
+                    viewport_code = str(screenshot.get("viewport_code") or "")
+                    if viewport_code:
+                        lifecycle_results = [
+                            {
+                                "id": item["id"],
+                                "status": "blocked",
+                                "code": viewport_code,
+                            }
+                            for item in assertions
+                        ]
+                        aggregate = aggregate_assertion_results(lifecycle_results)
+                        aggregate["vision_calls"] = provider_start_count
+                        aggregate["code"] = viewport_code
+                        return aggregate
                     capture_failed = True
                     continue
                 raw = screenshot.pop("image_bytes", b"")
@@ -364,8 +441,17 @@ async def _run_attempt(
                     **evaluator_kwargs,
                 )
                 images = []
-                results.extend(vision_result.get("results") or [])
-    aggregate = aggregate_assertion_results(results)
+                appearance_coverage = normalize_assertion_result_coverage(
+                    vision_result.get("results"),
+                    [item["id"] for item in appearance],
+                    invalid_code="invalid_vision_output",
+                )
+                results.extend(appearance_coverage["results"])
+    combined = normalize_assertion_result_coverage(
+        results,
+        [item["id"] for item in assertions],
+    )
+    aggregate = aggregate_assertion_results(combined["results"])
     aggregate["vision_calls"] = provider_start_count
     if "vision_result" in locals() and isinstance(vision_result, dict):
         if vision_result.get("review_model"):
@@ -407,18 +493,34 @@ async def run_visual_assertions(
         if isinstance(contract, dict)
         else {"assertions": assertions}
     )
-    normalized_contract = validate_visual_execution_contract(
-        normalized_requirement,
-        raw_contract,
-        max_assertions=visual_config["max_assertions"],
-    )
-    normalized_assertions = normalized_contract.get("assertions") or []
-    if normalized_requirement["level"] == "none" or not normalized_assertions:
-        return {"status": "uncertain", "code": "invalid_visual_contract", "attempts": []}
-    requirement_id = visual_requirement_id(normalized_requirement)
     orchestrated_contract = visual_requirement_uses_orchestrator_contract(
         normalized_requirement
     )
+    contract_diagnostic = (
+        diagnose_orchestrated_visual_contract(
+            raw_contract,
+            max_assertions=visual_config["max_assertions"],
+        )
+        if orchestrated_contract
+        else None
+    )
+    normalized_contract = (
+        contract_diagnostic["contract"]
+        if contract_diagnostic is not None
+        else validate_visual_execution_contract(
+            normalized_requirement,
+            raw_contract,
+            max_assertions=visual_config["max_assertions"],
+        )
+    )
+    normalized_assertions = normalized_contract.get("assertions") or []
+    if normalized_requirement["level"] == "none" or not normalized_assertions:
+        output = {"status": "uncertain", "code": "invalid_visual_contract", "attempts": []}
+        if contract_diagnostic is not None:
+            output["reason_code"] = contract_diagnostic["reason_code"]
+            output["correction"] = contract_diagnostic["correction"]
+        return output
+    requirement_id = visual_requirement_id(normalized_requirement)
     contract_id = (
         visual_execution_contract_id(normalized_contract)
         if orchestrated_contract
@@ -466,10 +568,15 @@ async def run_visual_assertions(
         attempts_count: int = 0,
         vision_count: int = 0,
         results: Any = None,
+        lifecycle_codes: Any = None,
     ) -> dict[str, Any]:
         codes = []
         for item in results if isinstance(results, list) else []:
             code = str(item.get("code") or "") if isinstance(item, dict) else ""
+            if code and code not in codes:
+                codes.append(code)
+        for code in lifecycle_codes if isinstance(lifecycle_codes, list) else []:
+            code = str(code or "")
             if code and code not in codes:
                 codes.append(code)
         receipt = {
@@ -579,127 +686,197 @@ async def run_visual_assertions(
     vision_calls = 0
     final: dict[str, Any] = {"status": "uncertain", "results": []}
     latest_artifacts: list[dict[str, str]] = []
-    for attempt_index in range(visual_config["max_attempts"]):
-        remaining = _remaining()
-        if remaining <= 0:
-            execution_guard.cancel()
-            final = {"status": "uncertain", "results": [], "code": "total_timeout"}
-            break
-        mutation_before = trusted_visual_mutation_token(task_id)
-        try:
-            fingerprint_before = await asyncio.wait_for(
-                _thread_call(
-                    supervisor.trusted_state_fingerprint,
-                    locators,
-                    execution_guard=execution_guard,
-                ),
-                timeout=remaining,
+    governing_viewport = normalized_contract.get("viewport")
+    if not (
+        isinstance(governing_viewport, dict)
+        and {"width", "height"}.issubset(governing_viewport)
+    ):
+        governing_viewport = None
+    viewport_scope: Optional[dict[str, Any]] = None
+    lifecycle_codes: list[str] = []
+    if governing_viewport is not None:
+        if not all(
+            hasattr(supervisor, name)
+            for name in (
+                "begin_trusted_viewport_scope",
+                "reapply_trusted_viewport_scope",
+                "end_trusted_viewport_scope",
             )
-        except TimeoutError:
-            execution_guard.cancel()
-            final = {"status": "uncertain", "results": [], "code": "total_timeout"}
-            break
-        except asyncio.CancelledError:
-            execution_guard.cancel()
-            raise
-        started = time.monotonic()
-        attempt_timeout = min(visual_config["attempt_timeout_s"], _remaining())
-        attempt_guard = CooperativeExecutionGuard(
-            min(deadline, time.monotonic() + attempt_timeout)
-        )
-        required_vision_calls = 2 if vision_sweeper is not None else 1
-        vision_allowed = (
-            vision_calls + required_vision_calls
-            <= visual_config["max_vision_calls"]
-        )
-        attempt_vision_calls = 0
-
-        def _provider_started() -> None:
-            nonlocal vision_calls, attempt_vision_calls
-            execution_guard.check()
-            attempt_guard.check()
-            if vision_calls >= visual_config["max_vision_calls"]:
-                raise ExecutionGuardExpired("vision provider budget exhausted")
-            vision_calls += 1
-            attempt_vision_calls += 1
-
-        try:
-            final = await asyncio.wait_for(
-                _run_attempt(
-                    supervisor,
-                    normalized_assertions,
-                    vision_evaluator=vision_evaluator,
-                    vision_sweeper=vision_sweeper,
-                    provider=provider,
-                    model=model,
-                    base_url=base_url,
-                    api_key=api_key,
-                    api_mode=api_mode,
-                    cfg=config if isinstance(config, dict) else None,
-                    vision_timeout_s=attempt_timeout,
-                    vision_allowed=vision_allowed,
-                    execution_guard=attempt_guard,
-                    on_provider_start=_provider_started,
-                    execution_context=execution_context,
-                    target_locator=target_locator,
-                    screenshot_artifacts=screenshot_artifacts,
-                    artifact_paths=artifact_paths,
-                    artifact_sink=latest_artifacts,
-                ),
-                timeout=attempt_timeout,
-            )
-        except TimeoutError:
-            attempt_guard.cancel()
-            final = {
-                "status": "uncertain",
-                "results": [
-                    {"id": item["id"], "status": "uncertain", "code": "attempt_timeout"}
-                    for item in normalized_assertions
-                ],
-                "vision_calls": attempt_vision_calls,
+        ):
+            viewport_scope = {"ok": False, "code": "viewport_scope_unavailable"}
+        else:
+            try:
+                viewport_scope = await asyncio.wait_for(
+                    _thread_call(
+                        supervisor.begin_trusted_viewport_scope,
+                        governing_viewport,
+                        execution_guard=execution_guard,
+                    ),
+                    timeout=_remaining(),
+                )
+            except TimeoutError:
+                viewport_scope = {"ok": False, "code": "viewport_scope_unavailable"}
+        if not viewport_scope.get("ok"):
+            code = str(viewport_scope.get("code") or "viewport_scope_unavailable")
+            results = [
+                {"id": item["id"], "status": "blocked", "code": code}
+                for item in normalized_assertions
+            ]
+            receipt = _receipt("blocked", results=results, lifecycle_codes=[code])
+            return {
+                "status": "blocked",
+                "code": code,
+                "results": results,
+                "attempts": [],
+                "visual_qa_receipt": receipt,
             }
-        except asyncio.CancelledError:
-            attempt_guard.cancel()
-            execution_guard.cancel()
-            raise
-        duration = min(time.monotonic() - started, visual_config["attempt_timeout_s"])
-        attempts.append(
-            {
-                "attempt": attempt_index + 1,
-                "status": final.get("status") or "uncertain",
-                "duration_s": round(max(0.0, duration), 3),
-                "vision_calls": attempt_vision_calls,
-            }
-        )
-        if final.get("status") == "passed" or attempt_index + 1 >= visual_config["max_attempts"]:
-            break
-        remaining = _remaining()
-        if remaining <= 0:
-            execution_guard.cancel()
-            final["status"] = "uncertain"
-            final["code"] = "total_timeout"
-            break
-        try:
-            fingerprint_after = await asyncio.wait_for(
-                _thread_call(
-                    supervisor.trusted_state_fingerprint,
-                    locators,
-                    execution_guard=execution_guard,
-                ),
-                timeout=remaining,
+
+    try:
+        for attempt_index in range(visual_config["max_attempts"]):
+            remaining = _remaining()
+            if remaining <= 0:
+                execution_guard.cancel()
+                final = {"status": "uncertain", "results": [], "code": "total_timeout"}
+                break
+            mutation_before = trusted_visual_mutation_token(task_id)
+            try:
+                fingerprint_before = await asyncio.wait_for(
+                    _thread_call(
+                        supervisor.trusted_state_fingerprint,
+                        locators,
+                        execution_guard=execution_guard,
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                execution_guard.cancel()
+                final = {"status": "uncertain", "results": [], "code": "total_timeout"}
+                break
+            except asyncio.CancelledError:
+                execution_guard.cancel()
+                raise
+            started = time.monotonic()
+            attempt_timeout = min(visual_config["attempt_timeout_s"], _remaining())
+            attempt_guard = CooperativeExecutionGuard(
+                min(deadline, time.monotonic() + attempt_timeout)
             )
-        except TimeoutError:
-            execution_guard.cancel()
-            final["status"] = "uncertain"
-            final["code"] = "total_timeout"
-            break
-        except asyncio.CancelledError:
-            execution_guard.cancel()
-            raise
-        mutation_after = trusted_visual_mutation_token(task_id)
-        trusted_mutation_changed = mutation_after != mutation_before
-        if not trusted_mutation_changed and fingerprint_after == fingerprint_before:
-            break
+            required_vision_calls = 2 if vision_sweeper is not None else 1
+            vision_allowed = (
+                vision_calls + required_vision_calls
+                <= visual_config["max_vision_calls"]
+            )
+            attempt_vision_calls = 0
+
+            def _provider_started() -> None:
+                nonlocal vision_calls, attempt_vision_calls
+                execution_guard.check()
+                attempt_guard.check()
+                if vision_calls >= visual_config["max_vision_calls"]:
+                    raise ExecutionGuardExpired("vision provider budget exhausted")
+                vision_calls += 1
+                attempt_vision_calls += 1
+
+            try:
+                final = await asyncio.wait_for(
+                    _run_attempt(
+                        supervisor,
+                        normalized_assertions,
+                        vision_evaluator=vision_evaluator,
+                        vision_sweeper=vision_sweeper,
+                        provider=provider,
+                        model=model,
+                        base_url=base_url,
+                        api_key=api_key,
+                        api_mode=api_mode,
+                        cfg=config if isinstance(config, dict) else None,
+                        vision_timeout_s=attempt_timeout,
+                        vision_allowed=vision_allowed,
+                        execution_guard=attempt_guard,
+                        on_provider_start=_provider_started,
+                        execution_context=execution_context,
+                        target_locator=target_locator,
+                        screenshot_artifacts=screenshot_artifacts,
+                        artifact_paths=artifact_paths,
+                        artifact_sink=latest_artifacts,
+                        viewport_lease=(
+                            str(viewport_scope.get("token") or "")
+                            if viewport_scope is not None
+                            else ""
+                        ),
+                        governing_viewport=governing_viewport,
+                    ),
+                    timeout=attempt_timeout,
+                )
+            except TimeoutError:
+                attempt_guard.cancel()
+                final = {
+                    "status": "uncertain",
+                    "results": [
+                        {"id": item["id"], "status": "uncertain", "code": "attempt_timeout"}
+                        for item in normalized_assertions
+                    ],
+                    "vision_calls": attempt_vision_calls,
+                }
+            except asyncio.CancelledError:
+                attempt_guard.cancel()
+                execution_guard.cancel()
+                raise
+            duration = min(time.monotonic() - started, visual_config["attempt_timeout_s"])
+            attempts.append(
+                {
+                    "attempt": attempt_index + 1,
+                    "status": final.get("status") or "uncertain",
+                    "duration_s": round(max(0.0, duration), 3),
+                    "vision_calls": attempt_vision_calls,
+                }
+            )
+            if final.get("status") == "passed" or attempt_index + 1 >= visual_config["max_attempts"]:
+                break
+            remaining = _remaining()
+            if remaining <= 0:
+                execution_guard.cancel()
+                final["status"] = "uncertain"
+                final["code"] = "total_timeout"
+                break
+            try:
+                fingerprint_after = await asyncio.wait_for(
+                    _thread_call(
+                        supervisor.trusted_state_fingerprint,
+                        locators,
+                        execution_guard=execution_guard,
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                execution_guard.cancel()
+                final["status"] = "uncertain"
+                final["code"] = "total_timeout"
+                break
+            except asyncio.CancelledError:
+                execution_guard.cancel()
+                raise
+            mutation_after = trusted_visual_mutation_token(task_id)
+            trusted_mutation_changed = mutation_after != mutation_before
+            if not trusted_mutation_changed and fingerprint_after == fingerprint_before:
+                break
+    finally:
+        if viewport_scope is not None and viewport_scope.get("ok"):
+            try:
+                restored = await asyncio.shield(
+                    _thread_call(
+                        supervisor.end_trusted_viewport_scope,
+                        viewport_scope["token"],
+                        viewport_scope["previous"],
+                    )
+                )
+            except Exception:
+                restored = {"ok": False, "code": "viewport_restore_unavailable"}
+            if not restored.get("ok"):
+                code = str(restored.get("code") or "viewport_restore_unavailable")
+                lifecycle_codes.append(code)
+                if final.get("status") == "passed":
+                    final["status"] = "uncertain"
+                final["code"] = code
 
     status = str(final.get("status") or "uncertain")
     receipt = _receipt(
@@ -707,6 +884,7 @@ async def run_visual_assertions(
         attempts_count=len(attempts),
         vision_count=vision_calls,
         results=final.get("results"),
+        lifecycle_codes=lifecycle_codes,
     )
     output = {
         "status": status,

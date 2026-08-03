@@ -57,6 +57,21 @@ _MAX_STATE_DESCRIPTION = 160
 _MAX_STATE_ITEMS = 4
 _MAX_SCREENSHOT_ARTIFACTS = 4
 
+_CONTRACT_CORRECTIONS = {
+    "contract_not_object": "Provide one visual contract object.",
+    "contract_unknown_fields": "Use only target, page, viewport, state, artifacts, and assertions.",
+    "contract_missing_fields": "Provide target, page, viewport, state, and at least one assertion.",
+    "contract_invalid_target": "Provide a bounded target description and an optional trusted locator.",
+    "contract_invalid_page": "Provide an already_open or prepared page with a bounded description.",
+    "contract_invalid_viewport": "Provide viewport.description and either both bounded width and height or neither.",
+    "contract_invalid_state": "Provide one to four distinct bounded state assumptions.",
+    "contract_invalid_artifacts": "Provide one to four valid, distinct screenshot artifact specifications.",
+    "contract_assertion_limit": "Provide no more than the configured bounded assertion count.",
+    "contract_invalid_assertion": "Use only supported assertion fields with all required values.",
+    "contract_duplicate_assertion": "Remove duplicate assertions from the visual contract.",
+    "contract_missing_appearance": "Include at least one bounded screenshot_appearance assertion.",
+}
+
 
 def _bounded_text(value: Any, limit: int) -> str:
     text = " ".join(str(value or "").split())
@@ -316,46 +331,55 @@ def _assertion_allowed_fields(kind: str) -> set[str]:
     return common
 
 
-def normalize_orchestrated_visual_contract(
+def diagnose_orchestrated_visual_contract(
     value: Any,
     *,
     max_assertions: int = 6,
 ) -> dict[str, Any]:
-    """Normalize one transient semantic contract and assign opaque assertion IDs."""
+    """Return a normalized contract or one bounded host-authored correction."""
 
-    raw = value if isinstance(value, dict) else {}
+    def invalid(reason_code: str) -> dict[str, Any]:
+        return {
+            "contract": {},
+            "reason_code": reason_code,
+            "correction": _CONTRACT_CORRECTIONS[reason_code],
+        }
+
+    if not isinstance(value, dict):
+        return invalid("contract_not_object")
+    raw = value
     if set(raw) - {"target", "page", "viewport", "state", "artifacts", "assertions"}:
-        return {}
+        return invalid("contract_unknown_fields")
+    if not {"target", "page", "viewport", "state", "assertions"}.issubset(raw):
+        return invalid("contract_missing_fields")
     target = _normalize_contract_target(raw.get("target"))
+    if target is None:
+        return invalid("contract_invalid_target")
     page = _normalize_contract_page(raw.get("page"))
+    if page is None:
+        return invalid("contract_invalid_page")
     viewport = _normalize_contract_viewport(raw.get("viewport"))
+    if viewport is None:
+        return invalid("contract_invalid_viewport")
     state = _normalize_contract_state(raw.get("state"))
-    artifacts = (
-        _normalize_contract_artifacts(
-            raw.get("artifacts"),
-            target=target,
-            viewport=viewport,
-        )
-        if target is not None and viewport is not None
-        else []
+    if not state:
+        return invalid("contract_invalid_state")
+    artifacts = _normalize_contract_artifacts(
+        raw.get("artifacts"),
+        target=target,
+        viewport=viewport,
     )
+    if not artifacts:
+        return invalid("contract_invalid_artifacts")
     raw_assertions = raw.get("assertions")
-    if (
-        target is None
-        or page is None
-        or viewport is None
-        or not state
-        or not artifacts
-        or not isinstance(raw_assertions, list)
-        or not raw_assertions
-    ):
-        return {}
+    if not isinstance(raw_assertions, list) or not raw_assertions:
+        return invalid("contract_missing_fields")
     try:
         limit = max(1, min(int(max_assertions), 6))
     except (TypeError, ValueError):
         limit = 6
     if len(raw_assertions) > limit:
-        return {}
+        return invalid("contract_assertion_limit")
 
     assertions: list[dict[str, Any]] = []
     seen_payloads: set[str] = set()
@@ -386,11 +410,11 @@ def normalize_orchestrated_visual_contract(
             # appearance assertion.  It carries no execution authority here.
             candidate.pop("policy", None)
         if set(candidate) - _assertion_allowed_fields(kind):
-            return {}
+            return invalid("contract_invalid_assertion")
         candidate["id"] = "contract-slot"
         validated = validate_visual_assertions([candidate], max_assertions=1)
         if len(validated) != 1:
-            return {}
+            return invalid("contract_invalid_assertion")
         item = dict(validated[0])
         item.pop("id", None)
         payload = json.dumps(
@@ -400,7 +424,7 @@ def normalize_orchestrated_visual_contract(
             separators=(",", ":"),
         )
         if payload in seen_payloads:
-            return {}
+            return invalid("contract_duplicate_assertion")
         seen_payloads.add(payload)
         item["id"] = _opaque_contract_id(
             "vassert",
@@ -408,15 +432,32 @@ def normalize_orchestrated_visual_contract(
         )
         assertions.append({"id": item.pop("id"), **item})
     if not any(item["kind"] == "screenshot_appearance" for item in assertions):
-        return {}
+        return invalid("contract_missing_appearance")
     return {
-        "target": target,
-        "page": page,
-        "viewport": viewport,
-        "state": state,
-        "artifacts": artifacts,
-        "assertions": assertions,
+        "contract": {
+            "target": target,
+            "page": page,
+            "viewport": viewport,
+            "state": state,
+            "artifacts": artifacts,
+            "assertions": assertions,
+        },
+        "reason_code": "",
+        "correction": "",
     }
+
+
+def normalize_orchestrated_visual_contract(
+    value: Any,
+    *,
+    max_assertions: int = 6,
+) -> dict[str, Any]:
+    """Normalize one transient semantic contract and assign opaque assertion IDs."""
+
+    return diagnose_orchestrated_visual_contract(
+        value,
+        max_assertions=max_assertions,
+    )["contract"]
 
 
 def validate_visual_execution_contract(
@@ -596,10 +637,61 @@ def aggregate_assertion_results(value: Any) -> dict[str, Any]:
     return {"status": status, "results": results[:6]}
 
 
+def normalize_assertion_result_coverage(
+    value: Any,
+    expected_ids: Any,
+    *,
+    invalid_code: str = "invalid_assertion_results",
+) -> dict[str, Any]:
+    """Require exactly one valid result for every expected host assertion ID."""
+
+    expected = [str(item or "") for item in expected_ids if str(item or "")][:6]
+
+    def invalid() -> dict[str, Any]:
+        return {
+            "valid": False,
+            "results": [
+                {"id": assertion_id, "status": "uncertain", "code": invalid_code}
+                for assertion_id in expected
+            ],
+        }
+
+    if (
+        not expected
+        or len(expected) != len(set(expected))
+        or not isinstance(value, list)
+        or len(value) != len(expected)
+    ):
+        return invalid()
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw in value:
+        if not isinstance(raw, dict):
+            return invalid()
+        assertion_id = str(raw.get("id") or "").strip()
+        status = str(raw.get("status") or "").strip().lower()
+        code = str(raw.get("code") or "").strip().lower()
+        if (
+            assertion_id not in expected
+            or assertion_id in normalized
+            or status not in VISUAL_QA_STATUSES
+            or code not in ASSERTION_RESULT_CODES
+        ):
+            return invalid()
+        result = sanitize_assertion_result(raw)
+        if result is None:
+            return invalid()
+        normalized[assertion_id] = result
+    if set(normalized) != set(expected):
+        return invalid()
+    return {"valid": True, "results": [normalized[item] for item in expected]}
+
+
 __all__ = [
     "ASSERTION_KINDS",
     "ASSERTION_RESULT_CODES",
     "aggregate_assertion_results",
+    "diagnose_orchestrated_visual_contract",
+    "normalize_assertion_result_coverage",
     "normalize_orchestrated_visual_contract",
     "sanitize_assertion_result",
     "storage_safe_visual_qa_args",

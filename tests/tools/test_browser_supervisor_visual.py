@@ -168,7 +168,15 @@ def test_responsive_screenshot_uses_bounded_viewport_and_restores_it():
             return {"ok": True, "response": {"result": {"data": "cG5n"}}}
         return {"ok": True, "response": {"result": {}}}
 
-    with patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
+    with patch.object(
+        supervisor,
+        "_effective_viewport_state",
+        side_effect=[
+            {"ok": True, "width": 1280, "height": 720, "deviceScaleFactor": 1.0},
+            {"ok": True, "width": 390, "height": 844, "deviceScaleFactor": 1.0},
+            {"ok": True, "width": 1280, "height": 720, "deviceScaleFactor": 1.0},
+        ],
+    ), patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
         result = supervisor.capture_screenshot_memory(
             viewport={"width": 390, "height": 844}
         )
@@ -194,6 +202,48 @@ def test_responsive_screenshot_uses_bounded_viewport_and_restores_it():
         ),
         ("Emulation.clearDeviceMetricsOverride", {}),
     ]
+
+
+def test_viewport_scope_restores_exact_preexisting_override_and_verifies_it():
+    supervisor = _supervisor()
+    previous = {
+        "width": 1024,
+        "height": 768,
+        "deviceScaleFactor": 2,
+        "mobile": True,
+        "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+    }
+    supervisor._trusted_viewport_override = dict(previous)
+    calls = []
+
+    def cdp_call(method, params, **_kwargs):
+        calls.append((method, params))
+        return {"ok": True, "response": {"result": {}}}
+
+    with patch.object(
+        supervisor,
+        "_effective_viewport_state",
+        side_effect=[
+            {"ok": True, "width": 1024, "height": 768, "deviceScaleFactor": 2.0},
+            {"ok": True, "width": 390, "height": 844, "deviceScaleFactor": 1.0},
+            {"ok": True, "width": 1024, "height": 768, "deviceScaleFactor": 2.0},
+        ],
+    ), patch.object(supervisor, "_page_cdp_call", side_effect=cdp_call):
+        scope = supervisor.begin_trusted_viewport_scope({"width": 390, "height": 844})
+        restored = supervisor.end_trusted_viewport_scope(
+            scope["token"], scope["previous"]
+        )
+
+    assert scope["ok"] is True
+    assert restored == {"ok": True}
+    assert calls == [
+        (
+            "Emulation.setDeviceMetricsOverride",
+            {"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": False},
+        ),
+        ("Emulation.setDeviceMetricsOverride", previous),
+    ]
+    assert supervisor._trusted_viewport_override == previous
 
 
 def test_responsive_screenshot_rejects_out_of_bounds_viewport_without_cdp():

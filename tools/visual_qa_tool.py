@@ -47,7 +47,11 @@ VISUAL_QA_SCHEMA = {
         "contracts receive host-generated opaque assertion IDs. Missing, duplicate, substituted, "
         "unrelated, or incomplete coverage is rejected. Only an explicit passed receipt satisfies an enforced visual gate; "
         "failed, blocked, uncertain, malformed, and timed-out checks do not. Include "
-        "`no_new_diagnostics` only when a browser tool returned an exact host-issued diagnostic cursor."
+        "`no_new_diagnostics` only when a browser tool returned an exact host-issued diagnostic cursor. "
+        "Use `viewport_contained` only when the selected control or region must fit fully inside "
+        "all four viewport edges; do not use it for full pages, long columns, document roots, or "
+        "intentionally vertical scroll surfaces. Use `no_horizontal_overflow` on the selected "
+        "page root or container when vertical scrolling is allowed but horizontal scrolling is not."
     ),
     "parameters": {
         "type": "object",

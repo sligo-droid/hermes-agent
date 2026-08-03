@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,6 +106,20 @@ async def test_incident_contract_is_orchestrator_supplied_and_target_scoped():
 
     class IncidentSupervisor(FakeSupervisor):
         capture_calls = None
+
+        def begin_trusted_viewport_scope(self, viewport):
+            self.viewport = dict(viewport)
+            return {"ok": True, "token": "lease", "previous": {}}
+
+        def reapply_trusted_viewport_scope(self, token, viewport):
+            assert token == "lease"
+            self.viewport = dict(viewport)
+            return {"ok": True}
+
+        def end_trusted_viewport_scope(self, token, previous):
+            assert token == "lease"
+            assert previous == {}
+            return {"ok": True}
 
         def capture_screenshot_memory(self, *, locator=None, viewport=None):
             if self.capture_calls is None:
@@ -276,11 +291,13 @@ async def test_orchestrated_requirement_rejects_assertions_without_semantic_cont
         supervisor=FakeSupervisor(contained=True),
     )
 
-    assert result == {
-        "status": "uncertain",
-        "code": "invalid_visual_contract",
-        "attempts": [],
-    }
+    assert result["status"] == "uncertain"
+    assert result["code"] == "invalid_visual_contract"
+    assert result["reason_code"] == "contract_missing_fields"
+    assert result["correction"] == (
+        "Provide target, page, viewport, state, and at least one assertion."
+    )
+    assert result["attempts"] == []
 
 
 @pytest.mark.asyncio
@@ -749,6 +766,248 @@ def test_task_cleanup_discards_trusted_mutation_generation(monkeypatch):
     browser_tool.cleanup_browser(task_id)
 
     assert trusted_visual_mutation_token(task_id) == 0
+
+
+def _mixed_contract():
+    return {
+        "target": {
+            "description": "mobile toolbar",
+            "locator": {"by": "test_id", "value": "mobile-toolbar"},
+        },
+        "page": {"state": "already_open", "description": "mobile page"},
+        "viewport": {"description": "mobile viewport"},
+        "state": ["toolbar rendered"],
+        "assertions": [
+            {
+                "kind": "viewport_contained",
+                "locator": {"by": "test_id", "value": "mobile-toolbar"},
+            },
+            {"kind": "screenshot_appearance", "expectation": "Toolbar is visually balanced."},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "appearance_results",
+    [
+        [],
+        [{"id": "wrong", "status": "passed", "code": "appearance_satisfied"}],
+        [
+            {"id": "duplicate", "status": "passed", "code": "appearance_satisfied"},
+            {"id": "duplicate", "status": "passed", "code": "appearance_satisfied"},
+        ],
+        ["malformed"],
+    ],
+)
+async def test_custom_evaluator_cannot_bypass_exact_appearance_coverage(appearance_results):
+    requirement = classify_visual_requirement(
+        "Make the mobile toolbar fit and look balanced.", worker_route="action"
+    )
+
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self, **_kwargs):
+            return {"ok": True, "image_bytes": b"png"}
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return {"status": "passed", "results": appearance_results}
+
+    result = await run_visual_assertions(
+        task_id="invalid-custom-coverage",
+        requirement=requirement,
+        contract=_mixed_contract(),
+        supervisor=ScreenshotSupervisor(contained=True),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "uncertain"
+    assert {item["status"] for item in result["results"]} == {"passed", "uncertain"}
+    assert "invalid_vision_output" in result["visual_qa_receipt"]["diagnostic_codes"]
+
+
+@pytest.mark.asyncio
+async def test_passing_vision_cannot_override_deterministic_failure():
+    requirement = classify_visual_requirement(
+        "Make the mobile toolbar fit and look balanced.", worker_route="action"
+    )
+
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self, **_kwargs):
+            return {"ok": True, "image_bytes": b"png"}
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(_images, assertions, *, on_provider_start, **_kwargs):
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {"id": item["id"], "status": "passed", "code": "appearance_satisfied"}
+                for item in assertions
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="deterministic-precedence",
+        requirement=requirement,
+        contract=_mixed_contract(),
+        supervisor=ScreenshotSupervisor(contained=False),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "failed"
+    assert "viewport_contained_mismatch" in result["visual_qa_receipt"]["diagnostic_codes"]
+
+
+@pytest.mark.asyncio
+async def test_viewport_apply_failure_is_blocked_before_assertions_or_vision():
+    requirement = classify_visual_requirement(
+        "Make the mobile toolbar visually balanced.", worker_route="action"
+    )
+    contract = _mixed_contract()
+    contract["viewport"].update({"width": 390, "height": 844})
+    calls = []
+
+    class ScopeFailureSupervisor(FakeSupervisor):
+        def begin_trusted_viewport_scope(self, _viewport):
+            return {"ok": False, "code": "viewport_apply_unverified"}
+
+        def reapply_trusted_viewport_scope(self, _token, _viewport):
+            raise AssertionError("reapply must not run after scope failure")
+
+        def end_trusted_viewport_scope(self, _token, _previous):
+            raise AssertionError("restore must not run after scope failure")
+
+        def trusted_element_state(self, _locator):
+            calls.append("deterministic")
+            return super().trusted_element_state(_locator)
+
+    async def evaluator(*_args, **_kwargs):
+        calls.append("vision")
+        return {"status": "passed", "results": []}
+
+    result = await run_visual_assertions(
+        task_id="viewport-apply-failure",
+        requirement=requirement,
+        contract=contract,
+        supervisor=ScopeFailureSupervisor(contained=True),
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["code"] == "viewport_apply_unverified"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_restore_failure_downgrades_passing_run():
+    requirement = classify_visual_requirement(
+        "Make the dashboard chart visually balanced.", worker_route="action"
+    )
+    contract = {
+        "target": {"description": "dashboard chart"},
+        "page": {"state": "already_open", "description": "dashboard page"},
+        "viewport": {"description": "mobile viewport", "width": 390, "height": 844},
+        "state": ["chart loaded"],
+        "assertions": [
+            {"kind": "screenshot_appearance", "expectation": "Chart is visually balanced."}
+        ],
+    }
+
+    class RestoreFailureSupervisor(FakeSupervisor):
+        def begin_trusted_viewport_scope(self, _viewport):
+            return {"ok": True, "token": "lease", "previous": {}}
+
+        def reapply_trusted_viewport_scope(self, _token, _viewport):
+            return {"ok": True}
+
+        def end_trusted_viewport_scope(self, _token, _previous):
+            return {"ok": False, "code": "viewport_restore_unverified"}
+
+        def capture_screenshot_memory(self, **_kwargs):
+            return {"ok": True, "image_bytes": b"png"}
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(_images, assertions, *, on_provider_start, **_kwargs):
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {"id": item["id"], "status": "passed", "code": "appearance_satisfied"}
+                for item in assertions
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="restore-failure",
+        requirement=requirement,
+        contract=contract,
+        supervisor=RestoreFailureSupervisor(),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "uncertain"
+    assert result["code"] == "viewport_restore_unverified"
+    assert "viewport_restore_unverified" in result["visual_qa_receipt"]["diagnostic_codes"]
+
+
+def test_supervisor_viewport_scope_serializes_concurrent_callers():
+    from tools.browser_supervisor import CDPSupervisor
+
+    supervisor = CDPSupervisor("scope-test", "ws://127.0.0.1/test")
+    events = []
+    first_acquired = threading.Event()
+    release_first = threading.Event()
+
+    def state(**_kwargs):
+        return {"ok": True, "width": 1280, "height": 720, "deviceScaleFactor": 1.0}
+
+    supervisor._effective_viewport_state = state
+    supervisor._set_trusted_viewport_override = lambda *_args, **_kwargs: True
+    supervisor._verify_trusted_viewport = lambda *_args, **_kwargs: True
+
+    def worker(name, wait=False):
+        scope = supervisor.begin_trusted_viewport_scope()
+        events.append(f"{name}:acquire")
+        if wait:
+            first_acquired.set()
+            release_first.wait(timeout=2)
+        events.append(f"{name}:restore")
+        supervisor.end_trusted_viewport_scope(scope["token"], scope["previous"])
+        events.append(f"{name}:release")
+
+    first = threading.Thread(target=worker, args=("a", True))
+    second = threading.Thread(target=worker, args=("b",))
+    first.start()
+    assert first_acquired.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    assert events == ["a:acquire"]
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert events == [
+        "a:acquire",
+        "a:restore",
+        "a:release",
+        "b:acquire",
+        "b:restore",
+        "b:release",
+    ]
 
 
 @pytest.mark.asyncio
