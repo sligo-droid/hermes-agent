@@ -2,6 +2,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 from tools.browser_supervisor import CDPSupervisor
 
 
@@ -111,7 +113,7 @@ def test_state_fingerprint_contains_no_locator_material():
     assert "protected-selector" not in fingerprint
 
 
-def test_target_screenshot_uses_only_host_authored_locator_clip():
+def test_target_screenshot_captures_host_authored_locator_beyond_viewport():
     supervisor = _supervisor()
     with patch.object(
         supervisor,
@@ -148,7 +150,7 @@ def test_target_screenshot_uses_only_host_authored_locator_clip():
         {
             "format": "png",
             "fromSurface": True,
-            "captureBeyondViewport": False,
+            "captureBeyondViewport": True,
             "clip": {
                 "x": 20.0,
                 "y": 40.0,
@@ -158,6 +160,28 @@ def test_target_screenshot_uses_only_host_authored_locator_clip():
             },
         },
     )
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        {"page_x": 0, "page_y": 0, "width": 5000, "height": 5000},
+        {"page_x": float("inf"), "page_y": 0, "width": 640, "height": 360},
+    ],
+)
+def test_target_screenshot_rejects_unsafe_locator_clip(bounds):
+    supervisor = _supervisor()
+    with patch.object(
+        supervisor,
+        "trusted_element_state",
+        return_value={"ok": True, "visible": True, "bounds": bounds},
+    ), patch.object(supervisor, "_page_cdp_call") as cdp_call:
+        result = supervisor.capture_screenshot_memory(
+            locator={"by": "test_id", "value": "issue-attention-graph"}
+        )
+
+    assert result == {"ok": False, "error": "target screenshot bounds unavailable"}
+    cdp_call.assert_not_called()
 
 
 def test_responsive_screenshot_uses_bounded_viewport_and_restores_it():
