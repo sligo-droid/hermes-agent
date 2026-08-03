@@ -715,23 +715,29 @@ class ProcessRegistry:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
-                self._write_checkpoint()
-                self._register_pending_watcher(session)
-                # Publish and checkpoint the complete session before any exit
-                # observer can move it to finished.
-                reader = threading.Thread(
-                    target=self._pty_reader_loop,
-                    args=(session,),
-                    daemon=True,
-                    name=f"proc-pty-reader-{session.id}",
-                )
-                session._reader_thread = reader
-                reader.start()
-                return session
+                try:
+                    self._write_checkpoint(raise_on_error=True)
+                    self._register_pending_watcher(session)
+                    # Publish and checkpoint the complete session before any exit
+                    # observer can move it to finished.
+                    reader = threading.Thread(
+                        target=self._pty_reader_loop,
+                        args=(session,),
+                        daemon=True,
+                        name=f"proc-pty-reader-{session.id}",
+                    )
+                    session._reader_thread = reader
+                    reader.start()
+                    return session
+                except Exception:
+                    self._rollback_published_session(session)
+                    raise
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if session._pty is not None:
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -786,7 +792,7 @@ class ProcessRegistry:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
-            self._write_checkpoint()
+            self._write_checkpoint(raise_on_error=True)
             self._register_pending_watcher(session)
             # Reader startup is the publication barrier: completion cannot be
             # observed until the fully initialized session is durable.
@@ -799,30 +805,7 @@ class ProcessRegistry:
             session._reader_thread = reader
             reader.start()
         except Exception:
-            # Post-Popen setup failed — kill the orphaned subprocess (and any
-            # descendants spawned via setsid) before re-raising so they do not
-            # leak as untracked background processes.
-            try:
-                if not _IS_WINDOWS:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok — guarded by _IS_WINDOWS check above
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-            with self._lock:
-                self._running.pop(session.id, None)
-            self.pending_watchers[:] = [
-                watcher for watcher in self.pending_watchers
-                if watcher.get("session_id") != session.id
-            ]
-            self._write_checkpoint()
+            self._rollback_published_session(session)
             raise
 
         return session
@@ -927,22 +910,26 @@ class ProcessRegistry:
             self._prune_if_needed()
             self._running[session.id] = session
 
-        if not session.exited:
-            self._write_checkpoint()
-        self._register_pending_watcher(session)
-        if session.exited:
-            self._move_to_finished(session)
-        else:
-            # Start the poller only after publication and the first complete
-            # checkpoint, matching the local process lifecycle barrier.
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
+        try:
+            if not session.exited:
+                self._write_checkpoint(raise_on_error=True)
+            self._register_pending_watcher(session)
+            if session.exited:
+                self._move_to_finished(session)
+            else:
+                # Start the poller only after publication and the first complete
+                # checkpoint, matching the local process lifecycle barrier.
+                reader = threading.Thread(
+                    target=self._env_poller_loop,
+                    args=(session, env, log_path, pid_path, exit_path),
+                    daemon=True,
+                    name=f"proc-poller-{session.id}",
+                )
+                session._reader_thread = reader
+                reader.start()
+        except Exception:
+            self._rollback_published_session(session)
+            raise
         return session
 
     def _register_pending_watcher(self, session: ProcessSession) -> None:
@@ -962,6 +949,56 @@ class ProcessRegistry:
             "origin_work_item_id": session.origin_work_item_id,
             "notify_on_complete": session.notify_on_complete,
         })
+
+    def _remove_published_session(self, session: ProcessSession) -> None:
+        """Remove failed publication state and rewrite durability best-effort."""
+        with self._lock:
+            self._running.pop(session.id, None)
+            self._finished.pop(session.id, None)
+        self.pending_watchers[:] = [
+            watcher for watcher in self.pending_watchers
+            if watcher.get("session_id") != session.id
+        ]
+        self._write_checkpoint()
+
+    def _rollback_published_session(self, session: ProcessSession) -> None:
+        """Terminate a launched backend and remove all failed publication state."""
+        try:
+            if session.child_scope_unit:
+                self._terminate_child_scope(session.child_scope_unit)
+            if session._pty is not None:
+                try:
+                    session._pty.terminate(force=True)
+                except Exception:
+                    if session.pid:
+                        self._terminate_host_pid(
+                            session.pid, session.host_start_time
+                        )
+            elif session.process is not None:
+                self._terminate_host_pid(
+                    session.process.pid, session.host_start_time
+                )
+                try:
+                    if session.process.poll() is None:
+                        session.process.kill()
+                except Exception:
+                    pass
+                try:
+                    session.process.wait(timeout=5)
+                except Exception:
+                    pass
+            elif session.env_ref is not None and session.pid:
+                session.env_ref.execute(
+                    f"kill {session.pid} 2>/dev/null", timeout=5
+                )
+        except Exception:
+            logger.warning(
+                "Failed to terminate process during spawn rollback: %s",
+                session.id,
+                exc_info=True,
+            )
+        finally:
+            self._remove_published_session(session)
 
     # ----- Reader / Poller Threads -----
 
@@ -1942,8 +1979,8 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
+    def _write_checkpoint(self, *, raise_on_error: bool = False):
+        """Write running metadata atomically; initial publication may be strict."""
         try:
             with self._lock:
                 entries = []
@@ -1983,6 +2020,8 @@ class ProcessRegistry:
             atomic_json_write(CHECKPOINT_PATH, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            if raise_on_error:
+                raise
 
     def recover_from_checkpoint(self) -> int:
         """

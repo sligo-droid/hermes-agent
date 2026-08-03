@@ -27699,7 +27699,7 @@ class _GatewayRunnerCore(
                         origin_work_item_id,
                         exc_info=True,
                     )
-                    return None
+                    return False
                 if not isinstance(origin_item, dict):
                     logger.info(
                         "Dropping terminal-process completion with missing tagged "

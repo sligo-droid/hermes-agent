@@ -936,12 +936,19 @@ class TestPopenLeakOnSetupFailure:
              patch("os.getpgid", side_effect=ProcessLookupError), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
-                registry.spawn_local("echo hello", cwd="/tmp")
+                registry.spawn_local(
+                    "echo hello",
+                    cwd="/tmp",
+                    watcher_interval=5,
+                    notify_on_complete=True,
+                )
 
         assert killed, "proc.kill() must be called when post-Popen setup raises"
+        assert registry._running == {}
+        assert registry.pending_watchers == []
 
     def test_popen_killed_when_write_checkpoint_fails(self, registry):
-        """If _write_checkpoint raises after Popen, proc must still be killed."""
+        """A real atomic publication failure kills and fully rolls back Popen."""
         killed = []
 
         proc = MagicMock()
@@ -962,15 +969,109 @@ class TestPopenLeakOnSetupFailure:
         # ProcessLookupError fallback so cleanup deterministically calls
         # proc.kill() instead of issuing a real os.killpg against whatever
         # process group happens to own the fake PID on the host.
+        checkpoint_calls = []
+
+        def fail_atomic_write(_path, _entries):
+            checkpoint_calls.append(True)
+            raise OSError("disk full")
+
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", return_value=fake_thread), \
              patch("os.getpgid", side_effect=ProcessLookupError), \
-             patch.object(registry, "_write_checkpoint", side_effect=OSError("disk full")):
+             patch("utils.atomic_json_write", side_effect=fail_atomic_write):
             with pytest.raises(OSError, match="disk full"):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
+        assert checkpoint_calls
         assert killed, "proc.kill() must be called when _write_checkpoint raises"
+        assert registry._running == {}
+        assert registry.pending_watchers == []
+
+    def test_later_checkpoint_write_failure_remains_best_effort(self, registry):
+        session = _make_session()
+        registry._running[session.id] = session
+
+        with patch("utils.atomic_json_write", side_effect=OSError("disk full")):
+            registry._write_checkpoint()
+
+        assert registry._running[session.id] is session
+
+    def test_pty_publication_failure_terminates_without_pipe_fallback(
+        self, registry, monkeypatch,
+    ):
+        pty = MagicMock(pid=7777)
+        pipe_spawn = MagicMock()
+
+        class FakePtyProcess:
+            @staticmethod
+            def spawn(*_args, **_kwargs):
+                return pty
+
+        monkeypatch.setitem(sys.modules, "ptyprocess", SimpleNamespace(PtyProcess=FakePtyProcess))
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry.subprocess.Popen", pipe_spawn)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: 123)
+
+        with patch("utils.atomic_json_write", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+
+        pty.terminate.assert_called_once_with(force=True)
+        pipe_spawn.assert_not_called()
+        assert registry._running == {}
+        assert registry.pending_watchers == []
+
+    def test_remote_publication_failure_kills_backend_and_rolls_back(
+        self, registry,
+    ):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4321\n", "returncode": 0}
+
+        env = FakeEnv()
+        with patch("utils.atomic_json_write", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                registry.spawn_via_env(
+                    env,
+                    "echo hello",
+                    watcher_interval=5,
+                    notify_on_complete=True,
+                )
+
+        assert any(command == "kill 4321 2>/dev/null" for command, _ in env.commands)
+        assert registry._running == {}
+        assert registry.pending_watchers == []
+
+    def test_remote_poller_creation_failure_removes_pending_watcher(
+        self, registry,
+    ):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4321\n", "returncode": 0}
+
+        env = FakeEnv()
+        with patch.object(registry, "_write_checkpoint"), \
+             patch("tools.process_registry.threading.Thread", side_effect=RuntimeError("thread failed")):
+            with pytest.raises(RuntimeError, match="thread failed"):
+                registry.spawn_via_env(
+                    env,
+                    "echo hello",
+                    watcher_interval=5,
+                    notify_on_complete=True,
+                )
+
+        assert any(command == "kill 4321 2>/dev/null" for command, _ in env.commands)
+        assert registry._running == {}
+        assert registry.pending_watchers == []
 
     def test_popen_not_killed_on_success(self, registry):
         """Successful spawn must NOT kill the process."""

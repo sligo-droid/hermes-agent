@@ -464,6 +464,39 @@ async def test_tagged_process_completion_missing_w1_never_falls_back_to_w2():
 
 
 @pytest.mark.asyncio
+async def test_tagged_process_owner_lookup_exception_is_retryable():
+    from gateway.session import SessionSource
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._completion_suppressed_by_explicit_stop = lambda _evt: False
+    runner._build_process_event_source = lambda _evt: source
+    runner._adapter_for_source = lambda _source: adapter
+    runner._ledger = lambda: SimpleNamespace(
+        get=lambda _work_id: (_ for _ in ()).throw(OSError("database busy"))
+    )
+
+    delivered = await runner._inject_process_completion(
+        "[IMPORTANT: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-1",
+            "session_key": "shared-session",
+            "origin_work_item_id": "work-1",
+        },
+    )
+
+    assert delivered is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_legacy_untagged_process_completion_keeps_session_fallback():
     from gateway.session import SessionSource
 
