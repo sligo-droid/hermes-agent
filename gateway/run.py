@@ -413,7 +413,8 @@ def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any
         f"or console success do not count. {enforcement} After the check, answer the entire accepted request "
         "from the full turn evidence. Preserve the established completion content: what changed, relevant "
         "verification, and shipped/PR/deploy state when applicable. Do not "
-        "turn the response into a visual-QA report. If the check passed, state only that visual QA passed; omit "
+        "turn the response into a visual-QA report. When mentioning a passed check, use only the phrase "
+        "`Visual QA passed`; omit "
         "receipt IDs, confidence, assertion details, or visual observations. The screenshot artifacts are "
         "attached automatically, so do not add MEDIA tags yourself.]"
     )

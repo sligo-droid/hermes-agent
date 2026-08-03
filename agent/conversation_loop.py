@@ -263,6 +263,90 @@ def _closeout_finalize_api_kwargs(agent: Any, api_kwargs: Any) -> Any:
         bounded.update(agent._max_tokens_param(limit))
     return bounded
 
+
+def _repair_visual_qa_response(
+    agent: Any,
+    api_messages: list,
+    candidate: str,
+    nudge: str,
+) -> tuple[str, Any, float]:
+    """Try one private no-tool response repair, falling back to the draft."""
+    repair_messages = list(api_messages)
+    repair_messages.append({"role": "assistant", "content": candidate})
+    repair_messages.append({"role": "user", "content": nudge})
+    started_at = time.time()
+    previous_stream_delta = getattr(agent, "stream_delta_callback", None)
+    previous_stream_callback = getattr(agent, "_stream_callback", None)
+    previous_reasoning_callback = getattr(agent, "reasoning_callback", None)
+    previous_interim_callback = getattr(agent, "interim_assistant_callback", None)
+    previous_tool_progress = getattr(agent, "tool_progress_callback", None)
+    try:
+        api_kwargs = agent._build_api_kwargs(repair_messages)
+        api_kwargs.pop("tools", None)
+        api_kwargs.pop("toolConfig", None)
+        api_kwargs.pop("parallel_tool_calls", None)
+        api_kwargs.pop("thinking", None)
+        api_kwargs.pop("output_config", None)
+        if str(getattr(agent, "api_mode", "")) == "chat_completions":
+            api_kwargs["tool_choice"] = "none"
+        else:
+            api_kwargs.pop("tool_choice", None)
+        limit = 768
+        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            if key in api_kwargs:
+                api_kwargs[key] = min(limit, max(1, int(api_kwargs[key])))
+                break
+        else:
+            if str(getattr(agent, "api_mode", "")) == "bedrock_converse":
+                inference_config = dict(api_kwargs.get("inferenceConfig") or {})
+                inference_config["maxTokens"] = min(
+                    limit,
+                    max(1, int(inference_config.get("maxTokens") or limit)),
+                )
+                api_kwargs["inferenceConfig"] = inference_config
+            elif str(getattr(agent, "api_mode", "")) == "codex_responses":
+                api_kwargs["max_output_tokens"] = limit
+            else:
+                api_kwargs.update(agent._max_tokens_param(limit))
+        agent.stream_delta_callback = None
+        agent._stream_callback = None
+        agent.reasoning_callback = None
+        agent.interim_assistant_callback = None
+        agent.tool_progress_callback = None
+        response = agent._interruptible_api_call(api_kwargs)
+        raw_usage = getattr(response, "usage", None)
+        normalized = agent._get_transport().normalize_response(response)
+        if (
+            normalized.finish_reason != "stop"
+            or normalized.tool_calls
+        ):
+            return (
+                candidate,
+                raw_usage if raw_usage is not None else normalized.usage,
+                time.time() - started_at,
+            )
+        repaired = agent._strip_think_blocks(normalized.content or "").strip()
+        if repaired:
+            from agent.redact import redact_sensitive_text
+
+            repaired = redact_sensitive_text(repaired)
+        return (
+            repaired or candidate,
+            raw_usage if raw_usage is not None else normalized.usage,
+            time.time() - started_at,
+        )
+    except InterruptedError:
+        raise
+    except Exception:
+        logger.debug("visual response repair failed open", exc_info=True)
+        return candidate, None, time.time() - started_at
+    finally:
+        agent.stream_delta_callback = previous_stream_delta
+        agent._stream_callback = previous_stream_callback
+        agent.reasoning_callback = previous_reasoning_callback
+        agent.interim_assistant_callback = previous_interim_callback
+        agent.tool_progress_callback = previous_tool_progress
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1232,6 +1316,7 @@ def run_conversation(
     agent._turn_mutation_boundary = 0
     agent._visual_qa_last_edit_order = 0
     agent._visual_qa_followup_turns = 0
+    agent._visual_qa_response_nudges = 0
     _reset_closeout_turn_state(agent)
     try:
         from agent.visual_qa import normalize_visual_requirement, set_active_visual_requirement
@@ -2079,7 +2164,29 @@ def run_conversation(
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
-                if getattr(agent, "_disable_streaming", False):
+                buffer_visual_response = False
+                try:
+                    from agent.visual_qa import should_buffer_visual_qa_response
+
+                    buffer_visual_response = should_buffer_visual_qa_response(
+                        requirement=getattr(agent, "visual_qa_requirement", None),
+                        receipts=getattr(agent, "_turn_runtime_stats", {}).get(
+                            "visual_qa_receipts", []
+                        ),
+                        original_request=original_user_message,
+                        platform=getattr(agent, "platform", ""),
+                        runtime_mode=getattr(agent, "_runtime_mode", ""),
+                        config=getattr(agent, "visual_qa_config", None),
+                        changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                        last_edit_order=getattr(agent, "_visual_qa_last_edit_order", 0),
+                        attempts=getattr(agent, "_visual_qa_response_nudges", 0),
+                    )
+                except Exception:
+                    pass
+                if (
+                    getattr(agent, "_disable_streaming", False)
+                    or buffer_visual_response
+                ):
                     _use_streaming = False
                 # CopilotACPClient communicates via subprocess stdio and
                 # returns a plain SimpleNamespace — not an iterable
@@ -2121,11 +2228,29 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    previous_stream_delta = getattr(agent, "stream_delta_callback", None)
+                    previous_stream_callback = getattr(agent, "_stream_callback", None)
+                    previous_reasoning_callback = getattr(agent, "reasoning_callback", None)
+                    previous_interim_callback = getattr(agent, "interim_assistant_callback", None)
+                    previous_tool_progress = getattr(agent, "tool_progress_callback", None)
+                    try:
+                        if buffer_visual_response:
+                            agent.stream_delta_callback = None
+                            agent._stream_callback = None
+                            agent.reasoning_callback = None
+                            agent.interim_assistant_callback = None
+                            agent.tool_progress_callback = None
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        return agent._interruptible_api_call(next_api_kwargs)
+                    finally:
+                        agent.stream_delta_callback = previous_stream_delta
+                        agent._stream_callback = previous_stream_callback
+                        agent.reasoning_callback = previous_reasoning_callback
+                        agent.interim_assistant_callback = previous_interim_callback
+                        agent.tool_progress_callback = previous_tool_progress
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -5087,7 +5212,11 @@ def run_conversation(
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
+            if (
+                assistant_message.content
+                and agent.tool_progress_callback
+                and not buffer_visual_response
+            ):
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
@@ -5199,7 +5328,8 @@ def run_conversation(
                                 last_msg[_key] = interim_msg[_key]
                     else:
                         messages.append(interim_msg)
-                        agent._emit_interim_assistant_message(interim_msg)
+                        if not buffer_visual_response:
+                            agent._emit_interim_assistant_message(interim_msg)
 
                 if agent._codex_incomplete_retries < 3:
                     # When the interim message has nothing the Responses
@@ -5574,7 +5704,7 @@ def run_conversation(
                     and previous_interim_visible == current_interim_visible
                 )
                 messages.append(assistant_msg)
-                if not duplicate_previous_interim:
+                if not duplicate_previous_interim and not buffer_visual_response:
                     agent._emit_interim_assistant_message(assistant_msg)
 
                 # Mixed batch: error-result the invalid calls and strip them
@@ -6099,7 +6229,8 @@ def run_conversation(
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
                     messages.append(interim_msg)
-                    agent._emit_interim_assistant_message(interim_msg)
+                    if not buffer_visual_response:
+                        agent._emit_interim_assistant_message(interim_msg)
 
                     continue_msg = {
                         "role": "user",
@@ -6151,6 +6282,7 @@ def run_conversation(
                         verify_on_stop_enabled,
                     )
                     from agent.visual_qa import (
+                        build_visual_qa_response_nudge,
                         normalize_visual_qa_config,
                         promote_visual_requirement_for_mutations,
                         set_active_visual_requirement,
@@ -6165,7 +6297,9 @@ def run_conversation(
                     visual_config = normalize_visual_qa_config(
                         getattr(agent, "visual_qa_config", None)
                     )
+                    _verify_nudge = None
                     visual_nudge = None
+                    visual_response_nudge = None
                     # Shadow mode records/report gaps at the gateway boundary
                     # but must not withhold a response.  Enforcement remains
                     # restricted to explicitly classified visual work.
@@ -6201,19 +6335,160 @@ def run_conversation(
                                 time.perf_counter() - _turn_runtime_started_at
                             ),
                         )
-                    elif verify_on_stop_enabled(verify_config):
+                    elif visual_config["mode"] == "enforce_explicit":
+                        visual_response_nudge = build_visual_qa_response_nudge(
+                            requirement=getattr(agent, "visual_qa_requirement", None),
+                            receipts=getattr(agent, "_turn_runtime_stats", {}).get(
+                                "visual_qa_receipts", []
+                            ),
+                            final_response=final_response,
+                            original_request=original_user_message,
+                            platform=getattr(agent, "platform", ""),
+                            runtime_mode=getattr(agent, "_runtime_mode", ""),
+                            config=visual_config,
+                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                            last_edit_order=getattr(agent, "_visual_qa_last_edit_order", 0),
+                            attempts=getattr(agent, "_visual_qa_response_nudges", 0),
+                        )
+                        _verify_nudge = visual_response_nudge
+                    if not _verify_nudge and verify_on_stop_enabled(verify_config):
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
                         )
-                    else:
-                        _verify_nudge = None
                 except Exception:
                     logger.debug("verification stop-loop check failed", exc_info=True)
                     _verify_nudge = None
                 if _closeout_finalization_active(agent):
+                    visual_response_nudge = None
                     _verify_nudge = None
+
+                if visual_response_nudge:
+                    agent._visual_qa_response_nudges = (
+                        getattr(agent, "_visual_qa_response_nudges", 0) + 1
+                    )
+                    if (
+                        api_call_count < agent.max_iterations
+                        and agent.iteration_budget.consume()
+                    ):
+                        api_call_count += 1
+                        agent._api_call_count = api_call_count
+                        try:
+                            final_response, repair_usage, repair_duration = _repair_visual_qa_response(
+                                agent,
+                                api_messages,
+                                final_response,
+                                visual_response_nudge,
+                            )
+                        except InterruptedError:
+                            interrupted = True
+                            final_response = None
+                            _turn_exit_reason = "interrupted_by_user"
+                            break
+                        for key in (
+                            "reasoning",
+                            "reasoning_content",
+                            "reasoning_details",
+                            "codex_reasoning_items",
+                            "codex_message_items",
+                        ):
+                            final_msg.pop(key, None)
+                        canonical_repair_usage = (
+                            normalize_usage(
+                                repair_usage,
+                                provider=agent.provider,
+                                api_mode=agent.api_mode,
+                            )
+                            if repair_usage
+                            else None
+                        )
+                        _record_turn_api_runtime(
+                            agent,
+                            repair_duration,
+                            canonical_repair_usage,
+                            int(
+                                getattr(canonical_repair_usage, "prompt_tokens", 0)
+                                or 0
+                            ),
+                        )
+                        agent.session_api_calls += 1
+                        if canonical_repair_usage:
+                            agent.context_compressor.update_from_response({
+                                "prompt_tokens": canonical_repair_usage.prompt_tokens,
+                                "completion_tokens": canonical_repair_usage.output_tokens,
+                                "total_tokens": canonical_repair_usage.total_tokens,
+                                "input_tokens": canonical_repair_usage.input_tokens,
+                                "output_tokens": canonical_repair_usage.output_tokens,
+                                "cache_read_tokens": canonical_repair_usage.cache_read_tokens,
+                                "cache_write_tokens": canonical_repair_usage.cache_write_tokens,
+                                "reasoning_tokens": canonical_repair_usage.reasoning_tokens,
+                            })
+                            agent.session_prompt_tokens += canonical_repair_usage.prompt_tokens
+                            agent.session_completion_tokens += canonical_repair_usage.output_tokens
+                            agent.session_total_tokens += canonical_repair_usage.total_tokens
+                            agent.session_input_tokens += canonical_repair_usage.input_tokens
+                            agent.session_output_tokens += canonical_repair_usage.output_tokens
+                            agent.session_cache_read_tokens += canonical_repair_usage.cache_read_tokens
+                            agent.session_cache_write_tokens += canonical_repair_usage.cache_write_tokens
+                            agent.session_reasoning_tokens += canonical_repair_usage.reasoning_tokens
+                            repair_cost = estimate_usage_cost(
+                                agent.model,
+                                canonical_repair_usage,
+                                provider=agent.provider,
+                                base_url=agent.base_url,
+                                api_key=getattr(agent, "api_key", ""),
+                            )
+                            if repair_cost.amount_usd is not None:
+                                agent.session_estimated_cost_usd += float(
+                                    repair_cost.amount_usd
+                                )
+                            agent.session_cost_status = repair_cost.status
+                            agent.session_cost_source = repair_cost.source
+                            if (
+                                agent._session_db
+                                and agent.session_id
+                                and not getattr(agent, "_persist_disabled", False)
+                            ):
+                                try:
+                                    if not agent._session_db_created:
+                                        agent._ensure_db_session()
+                                    agent._session_db.update_token_counts(
+                                        agent.session_id,
+                                        input_tokens=canonical_repair_usage.input_tokens,
+                                        output_tokens=canonical_repair_usage.output_tokens,
+                                        cache_read_tokens=canonical_repair_usage.cache_read_tokens,
+                                        cache_write_tokens=canonical_repair_usage.cache_write_tokens,
+                                        reasoning_tokens=canonical_repair_usage.reasoning_tokens,
+                                        estimated_cost_usd=float(repair_cost.amount_usd)
+                                        if repair_cost.amount_usd is not None
+                                        else None,
+                                        cost_status=repair_cost.status,
+                                        cost_source=repair_cost.source,
+                                        billing_provider=agent.provider,
+                                        billing_base_url=agent.base_url,
+                                        billing_mode="subscription_included"
+                                        if repair_cost.status == "included"
+                                        else None,
+                                        model=agent.model,
+                                        api_call_count=1,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "visual response repair usage persistence failed",
+                                        exc_info=True,
+                                    )
+                    final_msg["content"] = final_response
+                    visual_response_nudge = None
+                    _verify_nudge = (
+                        build_verify_on_stop_nudge(
+                            session_id=getattr(agent, "session_id", None),
+                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                            attempts=getattr(agent, "_verification_stop_nudges", 0),
+                        )
+                        if verify_on_stop_enabled(verify_config)
+                        else None
+                    )
 
                 if _verify_nudge:
                     agent._verification_stop_nudges = (

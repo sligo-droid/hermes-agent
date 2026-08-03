@@ -501,7 +501,7 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert "answer the entire accepted request" in prompt
     assert "what changed, relevant verification, and shipped/PR/deploy state" in prompt
     assert "Do not turn the response into a visual-QA report" in prompt
-    assert "state only that visual QA passed" in prompt
+    assert "use only the phrase `Visual QA passed`" in prompt
     assert "receipt IDs, confidence, assertion details, or visual observations" in prompt
     assert "screenshot artifacts are attached automatically" in prompt
 
