@@ -1205,6 +1205,38 @@ class CDPSupervisor:
             matches = matches and actual.get("screenOrientation") == expected_orientation
         return matches
 
+    def _restore_trusted_viewport_state(
+        self,
+        previous: Dict[str, Any],
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Restore and verify prior state while the caller still owns the lease."""
+
+        override = previous.get("override")
+        effective = previous.get("effective")
+        if not isinstance(effective, dict):
+            return {"ok": False, "code": "viewport_restore_unavailable"}
+        restore_override = previous.get("restore_override") is not False
+        try:
+            if restore_override and not self._set_trusted_viewport_override(
+                override if isinstance(override, dict) else None,
+                timeout=timeout,
+            ):
+                return {"ok": False, "code": "viewport_restore_unavailable"}
+        except Exception:
+            return {"ok": False, "code": "viewport_restore_unavailable"}
+        try:
+            verified = self._verify_trusted_viewport(
+                effective,
+                timeout=timeout,
+            )
+        except Exception:
+            verified = False
+        if not verified:
+            return {"ok": False, "code": "viewport_restore_unverified"}
+        return {"ok": True}
+
     def begin_trusted_viewport_scope(
         self,
         viewport: Optional[Dict[str, Any]] = None,
@@ -1236,6 +1268,7 @@ class CDPSupervisor:
         token = secrets.token_hex(16)
         self._viewport_scope_token = token
         previous: Optional[Dict[str, Any]] = None
+        viewport_mutation_started = False
         try:
             previous_effective = self._effective_viewport_state(
                 timeout=timeout,
@@ -1277,26 +1310,21 @@ class CDPSupervisor:
                 "deviceScaleFactor": 1,
                 "mobile": False,
             }
+            viewport_mutation_started = True
             if not self._set_trusted_viewport_override(
                 override,
                 timeout=timeout,
                 execution_guard=execution_guard,
             ):
-                restored = self._set_trusted_viewport_override(
-                    previous["override"],
-                    timeout=timeout,
-                    execution_guard=execution_guard,
+                restoration = self._restore_trusted_viewport_state(
+                    previous,
+                    timeout=max(0.01, min(timeout, 10.0)),
                 )
-                if not restored:
-                    code = "viewport_restore_unavailable"
-                elif not self._verify_trusted_viewport(
-                    previous["effective"],
-                    timeout=timeout,
-                    execution_guard=execution_guard,
-                ):
-                    code = "viewport_restore_unverified"
-                else:
-                    code = "viewport_apply_unavailable"
+                code = (
+                    str(restoration.get("code"))
+                    if not restoration.get("ok")
+                    else "viewport_apply_unavailable"
+                )
                 self._viewport_scope_token = None
                 self._viewport_scope_lock.release()
                 return {"ok": False, "code": code}
@@ -1305,35 +1333,35 @@ class CDPSupervisor:
                 timeout=timeout,
                 execution_guard=execution_guard,
             ):
-                restored = self._set_trusted_viewport_override(
-                    previous["override"],
-                    timeout=timeout,
-                    execution_guard=execution_guard,
+                restoration = self._restore_trusted_viewport_state(
+                    previous,
+                    timeout=max(0.01, min(timeout, 10.0)),
                 )
-                if not restored:
-                    code = "viewport_restore_unavailable"
-                elif not self._verify_trusted_viewport(
-                    previous["effective"],
-                    timeout=timeout,
-                    execution_guard=execution_guard,
-                ):
-                    code = "viewport_restore_unverified"
-                else:
-                    code = "viewport_apply_unverified"
+                code = (
+                    str(restoration.get("code"))
+                    if not restoration.get("ok")
+                    else "viewport_apply_unverified"
+                )
                 self._viewport_scope_token = None
                 self._viewport_scope_lock.release()
                 return {"ok": False, "code": code}
             return {"ok": True, "token": token, "previous": previous}
         except Exception:
             if self._viewport_scope_token == token:
-                if previous is not None:
-                    override = previous.get("override")
-                    self._set_trusted_viewport_override(
-                        override if isinstance(override, dict) else None,
+                code = "viewport_scope_unavailable"
+                if previous is not None and viewport_mutation_started:
+                    restoration = self._restore_trusted_viewport_state(
+                        previous,
                         timeout=max(0.01, min(timeout, 10.0)),
+                    )
+                    code = (
+                        str(restoration.get("code"))
+                        if not restoration.get("ok")
+                        else "viewport_apply_unverified"
                     )
                 self._viewport_scope_token = None
                 self._viewport_scope_lock.release()
+                return {"ok": False, "code": code}
             return {"ok": False, "code": "viewport_scope_unavailable"}
 
     def reapply_trusted_viewport_scope(
@@ -1383,23 +1411,10 @@ class CDPSupervisor:
             return {"ok": False, "code": "viewport_scope_unavailable"}
         result = {"ok": True}
         try:
-            override = previous.get("override")
-            effective = previous.get("effective")
-            if not isinstance(effective, dict):
-                return {"ok": False, "code": "viewport_restore_unavailable"}
-            restore_override = previous.get("restore_override") is not False
-            if restore_override and not self._set_trusted_viewport_override(
-                override if isinstance(override, dict) else None,
-                timeout=timeout,
-                execution_guard=execution_guard,
-            ):
-                result = {"ok": False, "code": "viewport_restore_unavailable"}
-            elif not self._verify_trusted_viewport(
-                effective,
-                timeout=timeout,
-                execution_guard=execution_guard,
-            ):
-                result = {"ok": False, "code": "viewport_restore_unverified"}
+            result = self._restore_trusted_viewport_state(
+                previous,
+                timeout=max(0.01, min(timeout, 10.0)),
+            )
             return result
         finally:
             self._viewport_scope_token = None
