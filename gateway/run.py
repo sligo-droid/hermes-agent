@@ -32067,6 +32067,7 @@ class _GatewayRunnerCore(
                 and not getattr(agent, "_action_escalation_requested", None)
             ):
                 try:
+                    from agent.agent_init import _synchronous_session_db
                     from agent.title_generator import maybe_auto_title
                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []
                     # In Gateway mode, auto-title failures must NOT be
@@ -32163,7 +32164,7 @@ class _GatewayRunnerCore(
                     if source.platform == Platform.DISCORD and isinstance(feature_summary, dict):
                         title_seed_message = str(feature_summary.get("initial_request") or "").strip() or message
                     maybe_auto_title(
-                        self._session_db,
+                        _synchronous_session_db(self._session_db),
                         effective_session_id,
                         title_seed_message,
                         final_response,

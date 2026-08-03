@@ -259,7 +259,10 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
 async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
-    runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
+    from hermes_state import AsyncSessionDB
+
+    raw_session_db = MagicMock()
+    runner._session_db = AsyncSessionDB(raw_session_db)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
@@ -293,6 +296,7 @@ async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, 
         )
 
     mock_title.assert_called_once()
+    assert mock_title.call_args.args[0] is raw_session_db
     callback = mock_title.call_args.kwargs["title_callback"]
     with patch.object(runner, "_schedule_discord_semantic_thread_rename") as mock_schedule:
         callback("Semantic Session Title")
