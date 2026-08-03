@@ -616,11 +616,104 @@ def build_visual_qa_followup_nudge(
     )
 
 
+_QA_ONLY_REQUEST_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:"
+    r"(?:only|just)\s+(?:tell|report|answer|give|say)(?:\s+me)?\s+"
+    r"(?:(?:the\s+)?visual[ -]?qa\s+result|(?:whether|if)\s+"
+    r"(?:visual[ -]?qa\s+(?:passed|failed)|it\s+(?:passed|failed)(?:\s+visual[ -]?qa)?))"
+    r"|(?:respond|tell\s+me|answer|report)\s+only(?:\s+with)?\s+(?:whether|if)\s+"
+    r"(?:visual[ -]?qa\s+(?:passed|failed)|it\s+(?:passed|failed)(?:\s+visual[ -]?qa)?)"
+    r"|visual[ -]?qa\s+(?:answer|response|result)\s+only"
+    r")(?:\s+or\s+(?:passed|failed))?(?:\s+for\s+this\s+change)?[.!?]*\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_QA_ONLY_RESPONSE_RE = re.compile(
+    r"^\s*visual[ -]?qa\s*:?[ ]*passed[.!]?"
+    r"(?:\s+(?:the\s+)?[\w -]{1,80}\s+(?:is|was)\s+"
+    r"(?:shipped(?:\s+and\s+live)?|live|complete|completed|done|deployed|released)[.!]?)?\s*$",
+    re.IGNORECASE,
+)
+def should_buffer_visual_qa_response(
+    *,
+    requirement: Any,
+    receipts: Any,
+    original_request: Any,
+    platform: Any,
+    runtime_mode: Any,
+    config: Any,
+    changed_paths: Iterable[Any],
+    last_edit_order: int,
+    attempts: int = 0,
+) -> bool:
+    """Return whether a final visual response may need private repair."""
+
+    normalized = normalize_visual_requirement(requirement)
+    visual_config = normalize_visual_qa_config(config)
+    if (
+        str(platform or "").strip().lower() != "discord"
+        or str(runtime_mode or "").strip().lower() != "action"
+        or visual_config["mode"] != "enforce_explicit"
+        or normalized["level"] not in {"surface", "artifact"}
+        or attempts >= 1
+        or not any(str(path).strip() for path in changed_paths or [])
+        or int(last_edit_order or 0) <= 0
+    ):
+        return False
+    request_text = str(original_request or "")
+    if _QA_ONLY_REQUEST_RE.fullmatch(request_text):
+        return False
+    completion = visual_receipt_completion(
+        normalized,
+        receipts,
+        min_order=int(last_edit_order or 0) + 1,
+    )
+    return completion["status"] == "passed"
+
+
+def build_visual_qa_response_nudge(
+    *,
+    requirement: Any,
+    receipts: Any,
+    final_response: Any,
+    original_request: Any,
+    platform: Any,
+    runtime_mode: Any,
+    config: Any,
+    changed_paths: Iterable[Any],
+    last_edit_order: int,
+    attempts: int = 0,
+) -> str | None:
+    """Return one retry nudge for the known visual-QA-only closeout collapse."""
+
+    if not should_buffer_visual_qa_response(
+        requirement=requirement,
+        receipts=receipts,
+        original_request=original_request,
+        platform=platform,
+        runtime_mode=runtime_mode,
+        config=config,
+        changed_paths=changed_paths,
+        last_edit_order=last_edit_order,
+        attempts=attempts,
+    ):
+        return None
+    if not _QA_ONLY_RESPONSE_RE.fullmatch(str(final_response or "")):
+        return None
+    return (
+        "[System: Your draft only reports the visual-QA result. Return one complete response to "
+        "the original request from the evidence already recorded in this turn. Summarize the "
+        "implemented changes and relevant verification or delivery outcome. Mention visual QA only "
+        "as `Visual QA passed`; do not include receipt details or visual observations. Do not call "
+        "more tools.]"
+    )
+
+
 __all__ = [
     "VISUAL_QA_LEVELS",
     "VISUAL_QA_MODES",
     "VISUAL_QA_STATUSES",
     "build_visual_qa_followup_nudge",
+    "build_visual_qa_response_nudge",
     "classify_visual_requirement",
     "get_active_visual_requirement",
     "normalize_visual_qa_config",
@@ -628,6 +721,7 @@ __all__ = [
     "promote_visual_requirement_for_mutations",
     "sanitize_visual_receipt",
     "set_active_visual_requirement",
+    "should_buffer_visual_qa_response",
     "visual_receipt_completion",
     "visual_requirement_id",
     "visual_requirement_uses_orchestrator_contract",
