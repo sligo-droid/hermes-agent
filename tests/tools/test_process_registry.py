@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
@@ -1004,6 +1005,69 @@ class TestPopenLeakOnSetupFailure:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_immediate_exit_is_published_and_checkpointed_before_reader(
+        self, registry, tmp_path, monkeypatch,
+    ):
+        checkpoint = tmp_path / "procs.json"
+        observed = {}
+
+        class ImmediateProcess:
+            pid = 7777
+            returncode = 0
+            stdout = SimpleNamespace(read=lambda _size: "")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                session = self.args[0]
+                observed["registered"] = registry._running.get(session.id) is session
+                observed["checkpoint"] = json.loads(checkpoint.read_text())
+                self.target(*self.args)
+
+        monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", checkpoint)
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry.subprocess.Popen", lambda *_a, **_kw: ImmediateProcess())
+        monkeypatch.setattr("tools.process_registry.threading.Thread", ImmediateThread)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: 123)
+
+        session = registry.spawn_local(
+            "true",
+            cwd=str(tmp_path),
+            session_key="discord-session",
+            watcher_platform="discord",
+            watcher_chat_id="thread-1",
+            watcher_thread_id="thread-1",
+            watcher_message_id="message-1",
+            origin_work_item_id="work-1",
+            watcher_interval=5,
+            notify_on_complete=True,
+        )
+
+        assert observed["registered"] is True
+        first = observed["checkpoint"]
+        assert len(first) == 1
+        assert first[0]["session_id"] == session.id
+        assert first[0]["started_at"] == session.started_at
+        assert first[0]["origin_work_item_id"] == "work-1"
+        assert first[0]["notify_on_complete"] is True
+        assert first[0]["watcher_interval"] == 5
+        assert registry.get(session.id).exited is True
+        event = registry.completion_queue.get_nowait()
+        assert event["session_id"] == session.id
+        assert event["started_at"] == session.started_at
+        assert event["origin_work_item_id"] == "work-1"
+        registry._move_to_finished(session)
+        assert registry.completion_queue.empty()
+
     def test_write_checkpoint(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session()
@@ -1039,6 +1103,7 @@ class TestCheckpoint:
             s.watcher_user_name = "alice"
             s.watcher_thread_id = "42"
             s.watcher_interval = 60
+            s.origin_work_item_id = "work-1"
             registry._running[s.id] = s
             registry._write_checkpoint()
 
@@ -1050,6 +1115,7 @@ class TestCheckpoint:
             assert data[0]["watcher_user_name"] == "alice"
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
+            assert data[0]["origin_work_item_id"] == "work-1"
 
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
@@ -1065,6 +1131,8 @@ class TestCheckpoint:
             "watcher_user_name": "alice",
             "watcher_thread_id": "42",
             "watcher_interval": 60,
+            "origin_work_item_id": "work-1",
+            "notify_on_complete": True,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
@@ -1078,6 +1146,8 @@ class TestCheckpoint:
             assert w["user_name"] == "alice"
             assert w["thread_id"] == "42"
             assert w["check_interval"] == 60
+            assert w["origin_work_item_id"] == "work-1"
+            assert registry.get("proc_live").origin_work_item_id == "work-1"
 
     def test_recover_skips_watcher_when_no_interval(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"

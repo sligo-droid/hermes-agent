@@ -18563,6 +18563,12 @@ class _GatewayRunnerCore(
                     source.platform == Platform.DISCORD
                     and discord_runtime_mode is RuntimeMode.READ_ONLY
                 )
+            if "trusted_discord_work_item_id" in _set_env_sig.parameters:
+                _set_env_kwargs["trusted_discord_work_item_id"] = (
+                    self._trusted_discord_work_item_id_for_turn(
+                        event, source, discord_runtime_mode
+                    )
+                )
             # Some focused tests replace _set_session_env with a minimal
             # one-arg stub; only pass kwargs its signature accepts.
             _session_env_tokens = _set_env(context, **_set_env_kwargs)
@@ -27176,6 +27182,7 @@ class _GatewayRunnerCore(
         *,
         session_cwd: str = "",
         discord_action_escalation_allowed: bool = False,
+        trusted_discord_work_item_id: str = "",
     ) -> list:
         """Set session context variables for the current async task.
 
@@ -27185,8 +27192,11 @@ class _GatewayRunnerCore(
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
-        from gateway.session_context import set_session_vars
-        return set_session_vars(
+        from gateway.session_context import (
+            _bind_trusted_discord_work_item_id,
+            set_session_vars,
+        )
+        tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
@@ -27217,6 +27227,23 @@ class _GatewayRunnerCore(
                 "1" if discord_action_escalation_allowed else ""
             ),
         )
+        _bind_trusted_discord_work_item_id(trusted_discord_work_item_id)
+        return tokens
+
+    @staticmethod
+    def _trusted_discord_work_item_id_for_turn(
+        event: MessageEvent,
+        source: SessionSource,
+        runtime_mode: RuntimeMode,
+    ) -> str:
+        """Return trusted terminal provenance only for Discord action work."""
+        if (
+            source.platform != Platform.DISCORD
+            or runtime_mode is not RuntimeMode.ACTION
+            or not getattr(event, "participates_in_work_lifecycle", True)
+        ):
+            return ""
+        return str(getattr(event, "work_item_id", "") or "")
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -27660,10 +27687,31 @@ class _GatewayRunnerCore(
         )
         synth_event.background_process_completion = True
         if source.platform == Platform.DISCORD:
+            origin_work_item_id = str(
+                evt.get("origin_work_item_id") or ""
+            ).strip()
+            if origin_work_item_id:
+                try:
+                    origin_item = self._ledger().get(origin_work_item_id)
+                except Exception:
+                    logger.debug(
+                        "Could not resolve tagged Discord process owner %s",
+                        origin_work_item_id,
+                        exc_info=True,
+                    )
+                    return None
+                if not isinstance(origin_item, dict):
+                    logger.info(
+                        "Dropping terminal-process completion with missing tagged "
+                        "Discord owner: %s",
+                        origin_work_item_id,
+                    )
+                    return None
+                synth_event.work_item_id = origin_work_item_id
             self._hydrate_discord_continuation_event_from_work_item(
                 synth_event,
                 str(evt.get("session_key") or ""),
-                allow_session_fallback=True,
+                allow_session_fallback=not bool(origin_work_item_id),
             )
         if isinstance(adapter, BasePlatformAdapter):
             synth_event.processing_completion_future = (
@@ -28274,6 +28322,9 @@ class _GatewayRunnerCore(
                         "user_id": user_id,
                         "user_name": user_name,
                         "message_id": message_id,
+                        "origin_work_item_id": str(
+                            watcher.get("origin_work_item_id") or ""
+                        ),
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
                         "exit_code": session.exit_code,

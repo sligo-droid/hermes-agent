@@ -314,6 +314,205 @@ def test_stale_discord_process_completion_only_drops_after_final_delivery(
 
 
 @pytest.mark.asyncio
+async def test_tagged_process_completion_hydrates_exact_w1_not_newer_w2():
+    from gateway.platforms.base import MessageType
+    from gateway.session import SessionSource
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    items = {
+        "work-1": {
+            "id": "work-1",
+            "status": "agent_running",
+            "platform": "discord",
+            "discord_runtime_mode": "action",
+        },
+        "work-2": {
+            "id": "work-2",
+            "status": "agent_running",
+            "platform": "discord",
+            "discord_runtime_mode": "action",
+        },
+    }
+    lookups = []
+    ledger = SimpleNamespace(
+        get=lambda work_id: lookups.append(work_id) or items.get(work_id),
+        id_for_event=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("tagged completion must not use session fallback")
+        ),
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._completion_suppressed_by_explicit_stop = lambda _evt: False
+    runner._build_process_event_source = lambda _evt: source
+    runner._adapter_for_source = lambda _source: adapter
+    runner._ledger = lambda: ledger
+
+    delivered = await runner._inject_process_completion(
+        "[IMPORTANT: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-1",
+            "session_key": "shared-session",
+            "origin_work_item_id": "work-1",
+        },
+    )
+
+    assert delivered is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type is MessageType.TEXT
+    assert event.work_item_id == "work-1"
+    assert "work-2" not in lookups
+
+
+@pytest.mark.asyncio
+async def test_delivered_tagged_w1_is_stale_without_consulting_active_w2():
+    from gateway.session import SessionSource
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    items = {
+        "work-1": {
+            "id": "work-1",
+            "status": "response_delivered",
+            "platform": "discord",
+            "discord_runtime_mode": "action",
+        },
+        "work-2": {
+            "id": "work-2",
+            "status": "agent_running",
+            "platform": "discord",
+            "discord_runtime_mode": "action",
+        },
+    }
+    lookups = []
+    ledger = SimpleNamespace(
+        get=lambda work_id: lookups.append(work_id) or items.get(work_id),
+        id_for_event=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("tagged completion must not use session fallback")
+        ),
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._completion_suppressed_by_explicit_stop = lambda _evt: False
+    runner._build_process_event_source = lambda _evt: source
+    runner._adapter_for_source = lambda _source: adapter
+    runner._ledger = lambda: ledger
+
+    assert await runner._inject_process_completion(
+        "[IMPORTANT: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-1",
+            "session_key": "shared-session",
+            "origin_work_item_id": "work-1",
+        },
+    ) is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.work_item_id == "work-1"
+    assert runner._is_stale_discord_process_completion(
+        event, "shared-session"
+    ) is True
+    assert "work-2" not in lookups
+
+
+@pytest.mark.asyncio
+async def test_tagged_process_completion_missing_w1_never_falls_back_to_w2():
+    from gateway.session import SessionSource
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    lookups = []
+    ledger = SimpleNamespace(
+        get=lambda work_id: lookups.append(work_id) or None,
+        id_for_event=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("missing tagged owner must not use session fallback")
+        ),
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._completion_suppressed_by_explicit_stop = lambda _evt: False
+    runner._build_process_event_source = lambda _evt: source
+    runner._adapter_for_source = lambda _source: adapter
+    runner._ledger = lambda: ledger
+
+    delivered = await runner._inject_process_completion(
+        "[IMPORTANT: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-1",
+            "session_key": "shared-session",
+            "origin_work_item_id": "work-missing",
+        },
+    )
+
+    assert delivered is None
+    assert lookups == ["work-missing"]
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_untagged_process_completion_keeps_session_fallback():
+    from gateway.session import SessionSource
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    fallback = []
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._completion_suppressed_by_explicit_stop = lambda _evt: False
+    runner._build_process_event_source = lambda _evt: source
+    runner._adapter_for_source = lambda _source: adapter
+    runner._hydrate_discord_continuation_event_from_work_item = (
+        lambda _event, _session_key, *, allow_session_fallback: fallback.append(
+            allow_session_fallback
+        )
+    )
+
+    delivered = await runner._inject_process_completion(
+        "[IMPORTANT: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-legacy",
+            "session_key": "shared-session",
+        },
+    )
+
+    assert delivered is True
+    assert fallback == [True]
+
+
+def test_process_completion_dedupe_identity_ignores_work_item_provenance():
+    base = {
+        "type": "completion",
+        "session_id": "proc-1",
+        "started_at": 123.5,
+    }
+
+    assert GatewayRunner._completion_delivery_identity(
+        {**base, "origin_work_item_id": "work-1"}
+    ) == GatewayRunner._completion_delivery_identity(
+        {**base, "origin_work_item_id": "work-2"}
+    )
+
+
+@pytest.mark.asyncio
 async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
     """thread_id from watcher dict is forwarded as metadata to adapter.send()."""
     import tools.process_registry as pr_module
