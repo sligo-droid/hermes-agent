@@ -8,6 +8,7 @@ import pytest
 
 from agent.visual_qa import classify_visual_requirement, normalize_visual_requirement
 from tools.visual_assertion_runner import (
+    _acquire_viewport_scope,
     record_trusted_visual_mutation,
     run_visual_assertions,
     trusted_visual_mutation_token,
@@ -44,6 +45,31 @@ class FakeSupervisor:
         self.fingerprints = iter(fingerprints)
         self.contained = contained
         self.state_calls = 0
+        self.viewport_scope = threading.Lock()
+        self.viewport_token = ""
+
+    def begin_trusted_viewport_scope(self, _viewport=None, *, execution_guard=None):
+        while not self.viewport_scope.acquire(timeout=0.01):
+            if execution_guard is not None:
+                execution_guard.check()
+        if execution_guard is not None:
+            try:
+                execution_guard.check()
+            except Exception:
+                self.viewport_scope.release()
+                raise
+        self.viewport_token = f"lease-{id(self)}"
+        return {"ok": True, "token": self.viewport_token, "previous": {}}
+
+    def reapply_trusted_viewport_scope(self, token, _viewport):
+        return {"ok": token == self.viewport_token}
+
+    def end_trusted_viewport_scope(self, token, _previous):
+        if token != self.viewport_token:
+            return {"ok": False, "code": "viewport_scope_unavailable"}
+        self.viewport_token = ""
+        self.viewport_scope.release()
+        return {"ok": True}
 
     def snapshot(self):
         return SimpleNamespace(active=True)
@@ -106,20 +132,6 @@ async def test_incident_contract_is_orchestrator_supplied_and_target_scoped():
 
     class IncidentSupervisor(FakeSupervisor):
         capture_calls = None
-
-        def begin_trusted_viewport_scope(self, viewport):
-            self.viewport = dict(viewport)
-            return {"ok": True, "token": "lease", "previous": {}}
-
-        def reapply_trusted_viewport_scope(self, token, viewport):
-            assert token == "lease"
-            self.viewport = dict(viewport)
-            return {"ok": True}
-
-        def end_trusted_viewport_scope(self, token, previous):
-            assert token == "lease"
-            assert previous == {}
-            return {"ok": True}
 
         def capture_screenshot_memory(self, *, locator=None, viewport=None):
             if self.capture_calls is None:
@@ -878,7 +890,7 @@ async def test_viewport_apply_failure_is_blocked_before_assertions_or_vision():
     calls = []
 
     class ScopeFailureSupervisor(FakeSupervisor):
-        def begin_trusted_viewport_scope(self, _viewport):
+        def begin_trusted_viewport_scope(self, _viewport, *, execution_guard=None):
             return {"ok": False, "code": "viewport_apply_unverified"}
 
         def reapply_trusted_viewport_scope(self, _token, _viewport):
@@ -924,13 +936,18 @@ async def test_restore_failure_downgrades_passing_run():
     }
 
     class RestoreFailureSupervisor(FakeSupervisor):
-        def begin_trusted_viewport_scope(self, _viewport):
-            return {"ok": True, "token": "lease", "previous": {}}
+        def begin_trusted_viewport_scope(self, _viewport, *, execution_guard=None):
+            return super().begin_trusted_viewport_scope(
+                _viewport,
+                execution_guard=execution_guard,
+            )
 
         def reapply_trusted_viewport_scope(self, _token, _viewport):
             return {"ok": True}
 
         def end_trusted_viewport_scope(self, _token, _previous):
+            self.viewport_token = ""
+            self.viewport_scope.release()
             return {"ok": False, "code": "viewport_restore_unverified"}
 
         def capture_screenshot_memory(self, **_kwargs):
@@ -1008,6 +1025,172 @@ def test_supervisor_viewport_scope_serializes_concurrent_callers():
         "b:restore",
         "b:release",
     ]
+
+
+@pytest.mark.asyncio
+async def test_viewport_scope_timeout_leaves_no_late_orphan_state():
+    from agent.execution_guard import CooperativeExecutionGuard
+    from tools.browser_supervisor import CDPSupervisor
+
+    supervisor = CDPSupervisor("timeout-scope", "ws://127.0.0.1/test")
+    supervisor._effective_viewport_state = lambda **_kwargs: {
+        "ok": True,
+        "width": 1280,
+        "height": 720,
+        "deviceScaleFactor": 1.0,
+    }
+    mutations = []
+    supervisor._set_trusted_viewport_override = (
+        lambda override, **_kwargs: mutations.append(override) or True
+    )
+    supervisor._verify_trusted_viewport = lambda *_args, **_kwargs: True
+    assert supervisor._viewport_scope_lock.acquire(timeout=0.1)
+    guard = CooperativeExecutionGuard(time.monotonic() + 0.05)
+
+    result = await _acquire_viewport_scope(
+        supervisor,
+        {"width": 390, "height": 844},
+        deadline=time.monotonic() + 0.05,
+        execution_guard=guard,
+    )
+    supervisor._viewport_scope_lock.release()
+    await asyncio.sleep(0.1)
+
+    assert result == {"ok": False, "code": "viewport_scope_unavailable"}
+    assert supervisor._viewport_scope_token is None
+    assert supervisor._trusted_viewport_override is None
+    assert mutations == []
+    assert supervisor._viewport_scope_lock.acquire(timeout=0.1)
+    supervisor._viewport_scope_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_viewport_scope_cancellation_leaves_no_late_orphan_state():
+    from agent.execution_guard import CooperativeExecutionGuard
+    from tools.browser_supervisor import CDPSupervisor
+
+    supervisor = CDPSupervisor("cancel-scope", "ws://127.0.0.1/test")
+    supervisor._effective_viewport_state = lambda **_kwargs: {
+        "ok": True,
+        "width": 1280,
+        "height": 720,
+        "deviceScaleFactor": 1.0,
+    }
+    mutations = []
+    supervisor._set_trusted_viewport_override = (
+        lambda override, **_kwargs: mutations.append(override) or True
+    )
+    supervisor._verify_trusted_viewport = lambda *_args, **_kwargs: True
+    assert supervisor._viewport_scope_lock.acquire(timeout=0.1)
+    guard = CooperativeExecutionGuard(time.monotonic() + 2)
+    acquisition = asyncio.create_task(
+        _acquire_viewport_scope(
+            supervisor,
+            {"width": 390, "height": 844},
+            deadline=time.monotonic() + 2,
+            execution_guard=guard,
+        )
+    )
+    await asyncio.sleep(0.05)
+    acquisition.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition
+    supervisor._viewport_scope_lock.release()
+    await asyncio.sleep(0.1)
+
+    assert supervisor._viewport_scope_token is None
+    assert supervisor._trusted_viewport_override is None
+    assert mutations == []
+    assert supervisor._viewport_scope_lock.acquire(timeout=0.1)
+    supervisor._viewport_scope_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_ambient_visual_qa_serializes_against_concrete_visual_qa():
+    requirement = classify_visual_requirement(
+        "Make the dashboard chart visually balanced.", worker_route="action"
+    )
+    ambient_contract = {
+        "target": {"description": "dashboard chart"},
+        "page": {"state": "already_open", "description": "dashboard page"},
+        "viewport": {"description": "current desktop viewport"},
+        "state": ["chart loaded"],
+        "assertions": [
+            {"kind": "screenshot_appearance", "expectation": "Chart is visually balanced."}
+        ],
+    }
+    concrete_contract = {
+        **ambient_contract,
+        "viewport": {"description": "mobile viewport", "width": 390, "height": 844},
+    }
+    events = []
+    first_capture = threading.Event()
+    release_first = threading.Event()
+
+    class SerializedSupervisor(FakeSupervisor):
+        def begin_trusted_viewport_scope(self, viewport=None, *, execution_guard=None):
+            result = super().begin_trusted_viewport_scope(
+                viewport,
+                execution_guard=execution_guard,
+            )
+            events.append("ambient:acquire" if viewport is None else "concrete:acquire")
+            return result
+
+        def end_trusted_viewport_scope(self, token, previous):
+            events.append("release")
+            return super().end_trusted_viewport_scope(token, previous)
+
+        def capture_screenshot_memory(self, **_kwargs):
+            if not first_capture.is_set():
+                first_capture.set()
+                release_first.wait(timeout=2)
+            return {"ok": True, "image_bytes": b"png"}
+
+    supervisor = SerializedSupervisor(contained=True)
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(_images, assertions, *, on_provider_start, **_kwargs):
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {"id": item["id"], "status": "passed", "code": "appearance_satisfied"}
+                for item in assertions
+            ],
+        }
+
+    ambient = asyncio.create_task(
+        run_visual_assertions(
+            task_id="ambient-serialized",
+            requirement=requirement,
+            contract=ambient_contract,
+            supervisor=supervisor,
+            vision_sweeper=sweeper,
+            vision_evaluator=evaluator,
+        )
+    )
+    assert await asyncio.to_thread(first_capture.wait, 2)
+    concrete = asyncio.create_task(
+        run_visual_assertions(
+            task_id="concrete-serialized",
+            requirement=requirement,
+            contract=concrete_contract,
+            supervisor=supervisor,
+            vision_sweeper=sweeper,
+            vision_evaluator=evaluator,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert events == ["ambient:acquire"]
+    release_first.set()
+    ambient_result, concrete_result = await asyncio.gather(ambient, concrete)
+
+    assert ambient_result["status"] == "passed"
+    assert concrete_result["status"] == "passed"
+    assert events == ["ambient:acquire", "release", "concrete:acquire", "release"]
 
 
 @pytest.mark.asyncio

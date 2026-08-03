@@ -1215,10 +1215,27 @@ class CDPSupervisor:
         """Serialize viewport-sensitive work and optionally apply one viewport."""
 
         wait_timeout = _guarded_timeout(execution_guard, min(timeout, 10.0))
-        if not self._viewport_scope_lock.acquire(timeout=wait_timeout):
-            return {"ok": False, "code": "viewport_scope_unavailable"}
+        wait_deadline = time.monotonic() + wait_timeout
+        while True:
+            if execution_guard is not None:
+                try:
+                    execution_guard.check()
+                except Exception:
+                    return {"ok": False, "code": "viewport_scope_unavailable"}
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                return {"ok": False, "code": "viewport_scope_unavailable"}
+            if self._viewport_scope_lock.acquire(timeout=min(0.05, remaining)):
+                break
+        if execution_guard is not None:
+            try:
+                execution_guard.check()
+            except Exception:
+                self._viewport_scope_lock.release()
+                return {"ok": False, "code": "viewport_scope_unavailable"}
         token = secrets.token_hex(16)
         self._viewport_scope_token = token
+        previous: Optional[Dict[str, Any]] = None
         try:
             previous_effective = self._effective_viewport_state(
                 timeout=timeout,
@@ -1229,6 +1246,7 @@ class CDPSupervisor:
                 self._viewport_scope_lock.release()
                 return {"ok": False, "code": "viewport_state_unavailable"}
             previous = {
+                "restore_override": viewport is not None,
                 "override": (
                     dict(self._trusted_viewport_override)
                     if self._trusted_viewport_override is not None
@@ -1308,6 +1326,12 @@ class CDPSupervisor:
             return {"ok": True, "token": token, "previous": previous}
         except Exception:
             if self._viewport_scope_token == token:
+                if previous is not None:
+                    override = previous.get("override")
+                    self._set_trusted_viewport_override(
+                        override if isinstance(override, dict) else None,
+                        timeout=max(0.01, min(timeout, 10.0)),
+                    )
                 self._viewport_scope_token = None
                 self._viewport_scope_lock.release()
             return {"ok": False, "code": "viewport_scope_unavailable"}
@@ -1363,7 +1387,8 @@ class CDPSupervisor:
             effective = previous.get("effective")
             if not isinstance(effective, dict):
                 return {"ok": False, "code": "viewport_restore_unavailable"}
-            if not self._set_trusted_viewport_override(
+            restore_override = previous.get("restore_override") is not False
+            if restore_override and not self._set_trusted_viewport_override(
                 override if isinstance(override, dict) else None,
                 timeout=timeout,
                 execution_guard=execution_guard,

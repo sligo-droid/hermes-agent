@@ -1,3 +1,5 @@
+import threading
+import time
 from unittest.mock import patch
 
 from tools.browser_supervisor import CDPSupervisor
@@ -244,6 +246,54 @@ def test_viewport_scope_restores_exact_preexisting_override_and_verifies_it():
         ("Emulation.setDeviceMetricsOverride", previous),
     ]
     assert supervisor._trusted_viewport_override == previous
+
+
+def test_ambient_viewport_scope_serializes_standalone_responsive_capture():
+    supervisor = _supervisor()
+    calls = []
+    capture_started = threading.Event()
+    capture_done = threading.Event()
+
+    def effective(**_kwargs):
+        override = supervisor._trusted_viewport_override
+        if override is not None:
+            return {
+                "ok": True,
+                "width": override["width"],
+                "height": override["height"],
+                "deviceScaleFactor": override["deviceScaleFactor"],
+            }
+        return {"ok": True, "width": 1280, "height": 720, "deviceScaleFactor": 1.0}
+
+    def cdp_call(method, params, **_kwargs):
+        calls.append((method, params))
+        if method == "Page.captureScreenshot":
+            return {"ok": True, "response": {"result": {"data": "cG5n"}}}
+        return {"ok": True, "response": {"result": {}}}
+
+    with patch.object(supervisor, "_effective_viewport_state", side_effect=effective), patch.object(
+        supervisor, "_page_cdp_call", side_effect=cdp_call
+    ):
+        ambient = supervisor.begin_trusted_viewport_scope()
+
+        def capture():
+            capture_started.set()
+            supervisor.capture_screenshot_memory(viewport={"width": 390, "height": 844})
+            capture_done.set()
+
+        worker = threading.Thread(target=capture)
+        worker.start()
+        assert capture_started.wait(timeout=1)
+        time.sleep(0.05)
+        assert capture_done.is_set() is False
+        assert calls == []
+        assert supervisor.end_trusted_viewport_scope(
+            ambient["token"], ambient["previous"]
+        ) == {"ok": True}
+        worker.join(timeout=2)
+
+    assert capture_done.is_set() is True
+    assert any(method == "Page.captureScreenshot" for method, _params in calls)
 
 
 def test_responsive_screenshot_rejects_out_of_bounds_viewport_without_cdp():

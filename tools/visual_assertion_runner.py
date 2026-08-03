@@ -126,6 +126,56 @@ async def _thread_call(
     return await asyncio.to_thread(_invoke)
 
 
+async def _acquire_viewport_scope(
+    supervisor: Any,
+    viewport: Optional[dict[str, Any]],
+    *,
+    deadline: float,
+    execution_guard: CooperativeExecutionGuard,
+) -> dict[str, Any]:
+    """Acquire a sync lease without leaving an abandoned thread-owned scope."""
+
+    acquisition_guard = CooperativeExecutionGuard(deadline)
+    worker = asyncio.create_task(
+        _thread_call(
+            supervisor.begin_trusted_viewport_scope,
+            viewport,
+            execution_guard=acquisition_guard,
+        )
+    )
+
+    async def _finish_abandoned() -> None:
+        acquisition_guard.cancel()
+        try:
+            result = await asyncio.shield(worker)
+        except Exception:
+            return
+        if isinstance(result, dict) and result.get("ok"):
+            try:
+                await asyncio.shield(
+                    _thread_call(
+                        supervisor.end_trusted_viewport_scope,
+                        result["token"],
+                        result["previous"],
+                    )
+                )
+            except Exception:
+                return
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(worker),
+            timeout=max(0.01, deadline - time.monotonic()),
+        )
+    except TimeoutError:
+        await _finish_abandoned()
+        return {"ok": False, "code": "viewport_scope_unavailable"}
+    except asyncio.CancelledError:
+        execution_guard.cancel()
+        await _finish_abandoned()
+        raise
+
+
 async def _deterministic_result(
     supervisor: Any,
     assertion: dict[str, Any],
@@ -694,42 +744,41 @@ async def run_visual_assertions(
         governing_viewport = None
     viewport_scope: Optional[dict[str, Any]] = None
     lifecycle_codes: list[str] = []
-    if governing_viewport is not None:
-        if not all(
-            hasattr(supervisor, name)
-            for name in (
-                "begin_trusted_viewport_scope",
-                "reapply_trusted_viewport_scope",
-                "end_trusted_viewport_scope",
+    if not all(
+        hasattr(supervisor, name)
+        for name in (
+            "begin_trusted_viewport_scope",
+            "end_trusted_viewport_scope",
+        )
+    ) or (
+        governing_viewport is not None
+        and not hasattr(supervisor, "reapply_trusted_viewport_scope")
+    ):
+        viewport_scope = {"ok": False, "code": "viewport_scope_unavailable"}
+    else:
+        try:
+            viewport_scope = await _acquire_viewport_scope(
+                supervisor,
+                governing_viewport,
+                deadline=deadline,
+                execution_guard=execution_guard,
             )
-        ):
-            viewport_scope = {"ok": False, "code": "viewport_scope_unavailable"}
-        else:
-            try:
-                viewport_scope = await asyncio.wait_for(
-                    _thread_call(
-                        supervisor.begin_trusted_viewport_scope,
-                        governing_viewport,
-                        execution_guard=execution_guard,
-                    ),
-                    timeout=_remaining(),
-                )
-            except TimeoutError:
-                viewport_scope = {"ok": False, "code": "viewport_scope_unavailable"}
-        if not viewport_scope.get("ok"):
-            code = str(viewport_scope.get("code") or "viewport_scope_unavailable")
-            results = [
-                {"id": item["id"], "status": "blocked", "code": code}
-                for item in normalized_assertions
-            ]
-            receipt = _receipt("blocked", results=results, lifecycle_codes=[code])
-            return {
-                "status": "blocked",
-                "code": code,
-                "results": results,
-                "attempts": [],
-                "visual_qa_receipt": receipt,
-            }
+        except asyncio.CancelledError:
+            raise
+    if not viewport_scope.get("ok"):
+        code = str(viewport_scope.get("code") or "viewport_scope_unavailable")
+        results = [
+            {"id": item["id"], "status": "blocked", "code": code}
+            for item in normalized_assertions
+        ]
+        receipt = _receipt("blocked", results=results, lifecycle_codes=[code])
+        return {
+            "status": "blocked",
+            "code": code,
+            "results": results,
+            "attempts": [],
+            "visual_qa_receipt": receipt,
+        }
 
     try:
         for attempt_index in range(visual_config["max_attempts"]):
