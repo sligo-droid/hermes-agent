@@ -189,6 +189,16 @@ def reset_project_inspection_candidates(token: Token) -> None:
     _PROJECT_INSPECTION_CANDIDATES.reset(token)
 
 
+def bind_discord_action_escalation_allowed(allowed: bool) -> Token:
+    """Bind the Discord action-handoff capability for one agent turn."""
+    return _DISCORD_ACTION_ESCALATION_ALLOWED.set("1" if allowed else "")
+
+
+def reset_discord_action_escalation_allowed(token: Token) -> None:
+    """Restore the action-handoff capability from before the agent turn."""
+    _DISCORD_ACTION_ESCALATION_ALLOWED.reset(token)
+
+
 def set_session_vars(
     platform: str = "",
     source: str = "",

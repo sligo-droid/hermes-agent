@@ -740,6 +740,32 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class QueuedDiscordEscalationProbeAgent:
+    """Probe the escalation capability on a queued read-only follow-up."""
+
+    calls = 0
+    escalation_result = None
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 2:
+            import json
+
+            from tools.action_escalation_tool import escalate_to_action
+
+            type(self).escalation_result = json.loads(
+                escalate_to_action(reason="queued follow-up needs action")
+            )
+        return {
+            "final_response": f"done-{type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -791,6 +817,8 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    discord_runtime_mode=None,
+    pending_discord_runtime_mode=None,
 ):
     if config_data:
         import yaml
@@ -829,6 +857,7 @@ async def _run_with_agent(
             message_id="queued-1",
             internal=pending_internal,
             metadata=dict(pending_metadata or {}),
+            discord_runtime_mode=pending_discord_runtime_mode,
         )
 
     result = await runner._run_agent(
@@ -838,6 +867,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        discord_runtime_mode=discord_runtime_mode,
     )
     return adapter, result
 
@@ -1209,6 +1239,44 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
     assert QueuedFailedEmptyAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_queued_discord_read_only_followup_can_escalate_after_action_turn(
+    monkeypatch, tmp_path,
+):
+    """Every queued read-only Discord turn gets a fresh action handoff capability."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    QueuedDiscordEscalationProbeAgent.calls = 0
+    QueuedDiscordEscalationProbeAgent.escalation_result = None
+    tokens = set_session_vars(
+        platform="discord",
+        discord_action_escalation_allowed="",
+    )
+    try:
+        _adapter, result = await _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            QueuedDiscordEscalationProbeAgent,
+            session_id="sess-queued-discord-escalation",
+            pending_text="Proceed with the operational step",
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+            thread_id="thread-1",
+            discord_runtime_mode="action",
+            pending_discord_runtime_mode="read_only",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["final_response"] == "done-2"
+    assert QueuedDiscordEscalationProbeAgent.escalation_result == {
+        "success": True,
+        "action_escalation_requested": True,
+        "reason": "queued follow-up needs action",
+    }
 
 
 @pytest.mark.asyncio
