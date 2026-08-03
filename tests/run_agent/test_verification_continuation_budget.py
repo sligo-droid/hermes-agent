@@ -3,9 +3,16 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from run_agent import AIAgent
+from agent.visual_qa import (
+    classify_visual_requirement,
+    normalize_visual_requirement,
+    visual_requirement_id,
+)
+from agent.transports.types import NormalizedResponse
 
 
 def _response(content="composed report"):
@@ -15,6 +22,46 @@ def _response(content="composed report"):
         model="test/model",
         usage=None,
     )
+
+
+def _tool_response(name="terminal"):
+    call = SimpleNamespace(
+        id="call_repair",
+        type="function",
+        function=SimpleNamespace(name=name, arguments="{}"),
+    )
+    message = SimpleNamespace(content="", tool_calls=[call])
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+        model="test/model",
+        usage=None,
+    )
+
+
+def _content_filter_response():
+    message = SimpleNamespace(content="", tool_calls=None, refusal="blocked")
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="content_filter")],
+        model="test/model",
+        usage=None,
+    )
+
+
+def _visual_receipt(requirement, *, order=2):
+    normalized = normalize_visual_requirement(requirement)
+    coverage_ids = [item["id"] for item in normalized["assertions"]]
+    return {
+        "requirement_id": visual_requirement_id(normalized),
+        "contract_id": "vac_" + ("a" * 24),
+        "assertion_ids": ["vassert_" + ("c" * 24)],
+        "coverage_ids": coverage_ids,
+        "status": "passed",
+        "attempts": 1,
+        "vision_calls": 2,
+        "duration_ms": 25,
+        "diagnostic_codes": ["appearance_satisfied"],
+        "order": order,
+    }
 
 
 @pytest.fixture
@@ -217,6 +264,564 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
         "verified final report",
     ]
     agent._handle_max_iterations.assert_not_called()
+
+
+def test_visual_qa_only_response_gets_one_private_closeout_retry(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        _response(
+            "Split the financial and public charts, added July component breakdowns, "
+            "and removed the old month-over-month chart. Visual QA passed."
+        ),
+    ])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"].startswith("Split the financial and public charts")
+    assert [message.get("content") for message in result["messages"]] == [
+        "Split the confidence charts and add component breakdowns.",
+        result["final_response"],
+    ]
+    assert agent._visual_qa_response_nudges == 1
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_visual_qa_only_response_survives_when_retry_budget_is_exhausted(
+    agent,
+    monkeypatch,
+):
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return _response("Visual QA passed. The Confidence view is shipped and live.")
+
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"] == (
+        "Visual QA passed. The Confidence view is shipped and live."
+    )
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert [message.get("content") for message in result["messages"]].count(
+        result["final_response"]
+    ) == 1
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_visual_qa_response_retry_fails_open_on_provider_error(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    agent._api_max_retries = 1
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        httpx.ConnectError("connection reset"),
+    ])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        result = next(answers)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"] == (
+        "Visual QA passed. The Confidence view is shipped and live."
+    )
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert [message.get("content") for message in result["messages"]].count(
+        result["final_response"]
+    ) == 1
+
+
+def test_visual_qa_response_retry_fails_open_on_nonretryable_error(
+    agent,
+    monkeypatch,
+):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+
+    class AuthError(Exception):
+        status_code = 401
+
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        AuthError("invalid API key"),
+    ])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        result = next(answers)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"].startswith("Visual QA passed")
+    assert result["completed"] is True
+    assert result["failed"] is False
+
+
+def test_visual_qa_response_retry_blocks_tool_calls(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        _tool_response(),
+    ])
+
+    def model_call(api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        if api_kwargs.get("tool_choice") == "none":
+            assert "tools" not in api_kwargs
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch.object(agent, "_execute_tool_calls") as execute,
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"].startswith("Visual QA passed")
+    assert result["completed"] is True
+    execute.assert_not_called()
+
+
+def test_visual_qa_response_retry_fails_open_on_content_filter(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        _content_filter_response(),
+    ])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"].startswith("Visual QA passed")
+    assert result["completed"] is True
+    assert result["failed"] is False
+
+
+def test_visual_qa_response_repair_normalizes_codex_without_streaming(
+    agent,
+    monkeypatch,
+):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    agent.api_mode = "codex_responses"
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    streamed = []
+    interim = []
+    progress = []
+    agent.stream_delta_callback = streamed.append
+    agent.interim_assistant_callback = lambda text, **_kwargs: interim.append(text)
+    agent.tool_progress_callback = lambda *args: progress.append(args)
+    answers = iter([object(), object()])
+    agent._interruptible_api_call = MagicMock(side_effect=lambda _kwargs: next(answers))
+    transport = MagicMock()
+    transport.preflight_kwargs.side_effect = lambda kwargs, **_unused: kwargs
+    transport.normalize_response.side_effect = [
+        NormalizedResponse(
+            content="Visual QA passed. The Confidence view is shipped and live.",
+            tool_calls=None,
+            finish_reason="stop",
+        ),
+        NormalizedResponse(
+            content="Implemented the requested confidence chart changes. Visual QA passed.",
+            tool_calls=None,
+            finish_reason="stop",
+        ),
+    ]
+    agent._get_transport = MagicMock(return_value=transport)
+
+    def should_buffer(**_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return True
+
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    with (
+        patch("agent.visual_qa.should_buffer_visual_qa_response", side_effect=should_buffer),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"].startswith("Implemented the requested")
+    assert streamed == []
+    assert interim == []
+    assert progress == []
+    assert agent._interruptible_api_call.call_count == 2
+
+
+def test_visual_qa_response_repair_propagates_interrupt(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        InterruptedError(),
+    ])
+
+    def model_call(_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        result = next(answers)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["interrupted"] is True
+    assert result["completed"] is False
+
+
+def test_visual_qa_draft_is_buffered_before_discord_stream_delivery(
+    agent,
+    monkeypatch,
+):
+    agent.max_iterations = 3
+    agent.iteration_budget.max_total = 3
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    streamed = []
+    agent.stream_delta_callback = streamed.append
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        _response("Implemented the requested confidence chart changes. Visual QA passed."),
+    ])
+    def model_call(_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return next(answers)
+
+    agent._interruptible_api_call = MagicMock(side_effect=model_call)
+    agent._interruptible_streaming_api_call = MagicMock()
+
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    with (
+        patch(
+            "agent.visual_qa.should_buffer_visual_qa_response",
+            return_value=True,
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"].startswith("Implemented the requested")
+    agent._interruptible_streaming_api_call.assert_not_called()
+    assert agent._interruptible_api_call.call_count == 2
+    assert streamed == []
+
+
+def test_visual_response_retry_does_not_consume_verification_attempts(
+    agent,
+    monkeypatch,
+):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        _response("Implemented the requested confidence chart changes. Visual QA passed."),
+    ])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    verify_attempts = []
+
+    def verification_nudge(**kwargs):
+        verify_attempts.append(kwargs["attempts"])
+        return None
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=verification_nudge,
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"].startswith("Implemented the requested")
+    assert verify_attempts == [0]
+
+
+def test_successful_visual_repair_does_not_leak_fallback_into_pre_verify(
+    agent,
+    monkeypatch,
+):
+    agent.max_iterations = 3
+    agent.iteration_budget.max_total = 3
+    agent._api_max_retries = 1
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+    answers = iter([
+        _response("Visual QA passed. The Confidence view is shipped and live."),
+        _response("Implemented the requested confidence chart changes. Visual QA passed."),
+        httpx.ConnectError("connection reset"),
+    ])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        result = next(answers)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    pre_verify = iter(["run final verification", None])
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=True),
+        patch("hermes_cli.plugins.invoke_hook", side_effect=lambda *_a, **_k: []),
+        patch(
+            "agent.conversation_loop._get_pre_verify_continue_message",
+            side_effect=lambda **_kwargs: next(pre_verify),
+        ),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["final_response"].startswith("API call failed")
+
+
+def test_visual_response_retry_is_disabled_during_closeout_finalization(
+    agent,
+    monkeypatch,
+):
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+
+    def model_call(_api_kwargs):
+        agent._accepted_closeout_receipt = {"status": "passed"}
+        agent._turn_file_mutation_paths = {"dashboard/src/routes/confidence/+page.svelte"}
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return _response("Visual QA passed. The Confidence view is shipped and live.")
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"] == (
+        "Visual QA passed. The Confidence view is shipped and live."
+    )
+    assert result["completed"] is True
+    assert agent._visual_qa_response_nudges == 0
 
 
 def test_multiple_verification_retries_hide_candidates_until_verified(agent, monkeypatch):

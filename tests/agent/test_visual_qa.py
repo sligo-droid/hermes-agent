@@ -1,4 +1,5 @@
 from agent.visual_qa import (
+    build_visual_qa_response_nudge,
     build_visual_qa_followup_nudge,
     classify_visual_requirement,
     normalize_visual_qa_config,
@@ -297,6 +298,175 @@ def test_visual_followup_directs_model_to_dedicated_tool():
     assert nudge is not None
     assert "call the `visual_qa` tool" in nudge
     assert "attach `visual_qa_receipt`" not in nudge
+
+
+def test_visual_response_nudge_rejects_only_the_known_qa_only_collapse():
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    receipt = _receipt(requirement, order=8)
+
+    nudge = build_visual_qa_response_nudge(
+        requirement=requirement,
+        receipts=[receipt],
+        final_response="Visual QA passed. The Confidence view is shipped and live.",
+        original_request="Split the confidence charts and add component breakdowns.",
+        platform="discord",
+        runtime_mode="action",
+        config={"mode": "enforce_explicit"},
+        changed_paths=["dashboard/src/routes/confidence/+page.svelte"],
+        last_edit_order=7,
+    )
+
+    assert nudge is not None
+    assert "complete response to the original request" in nudge
+    assert "Do not call more tools" in nudge
+
+
+def test_visual_response_nudge_allows_concise_concrete_closeouts():
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    receipt = _receipt(requirement, order=8)
+    common = {
+        "requirement": requirement,
+        "receipts": [receipt],
+        "original_request": "Split the confidence charts and add component breakdowns.",
+        "platform": "discord",
+        "runtime_mode": "action",
+        "config": {"mode": "enforce_explicit"},
+        "changed_paths": ["dashboard/src/routes/confidence/+page.svelte"],
+        "last_edit_order": 7,
+    }
+
+    assert build_visual_qa_response_nudge(
+        final_response=(
+            "Split the financial and public charts, added component breakdowns, "
+            "and removed the old change chart. Visual QA passed."
+        ),
+        **common,
+    ) is None
+    assert build_visual_qa_response_nudge(
+        final_response="Made the requested button blue. Visual QA passed.",
+        **common,
+    ) is None
+
+
+def test_visual_response_nudge_respects_explicit_qa_only_requests():
+    requirement = classify_visual_requirement(
+        "Make the dashboard responsive.",
+        worker_route="action",
+    )
+
+    assert build_visual_qa_response_nudge(
+        requirement=requirement,
+        receipts=[_receipt(requirement, order=8)],
+        final_response="Visual QA passed.",
+        original_request="Only tell me whether visual QA passed or failed.",
+        platform="discord",
+        runtime_mode="action",
+        config={"mode": "enforce_explicit"},
+        changed_paths=["dashboard/src/app.tsx"],
+        last_edit_order=7,
+    ) is None
+
+    for request in (
+        "Only report the visual QA result.",
+        "Just give me the visual QA result.",
+        "Report only whether it passed visual QA.",
+        "Please respond only with whether visual QA passed.",
+        "Tell me only whether visual QA passed.",
+        "Only say whether visual QA passed.",
+        "Answer only whether visual QA passed.",
+        "Only tell me whether visual QA passed for this change.",
+    ):
+        assert build_visual_qa_response_nudge(
+            requirement=requirement,
+            receipts=[_receipt(requirement, order=8)],
+            final_response="Visual QA: passed.",
+            original_request=request,
+            platform="discord",
+            runtime_mode="action",
+            config={"mode": "enforce_explicit"},
+            changed_paths=["dashboard/src/app.tsx"],
+            last_edit_order=7,
+        ) is None
+
+
+def test_visual_response_nudge_does_not_exempt_ordinary_only_language():
+    requirement = classify_visual_requirement(
+        "Only change the dashboard colors and run visual QA.",
+        worker_route="action",
+    )
+
+    assert build_visual_qa_response_nudge(
+        requirement=requirement,
+        receipts=[_receipt(requirement, order=8)],
+        final_response="Visual QA passed. The dashboard is shipped and live.",
+        original_request="Only change the dashboard colors and run visual QA.",
+        platform="discord",
+        runtime_mode="action",
+        config={"mode": "enforce_explicit"},
+        changed_paths=["dashboard/src/app.tsx"],
+        last_edit_order=7,
+    ) is not None
+
+
+def test_visual_response_nudge_does_not_exempt_wait_until_qa_language():
+    requirement = classify_visual_requirement(
+        "Change the dashboard colors and run visual QA.",
+        worker_route="action",
+    )
+
+    assert build_visual_qa_response_nudge(
+        requirement=requirement,
+        receipts=[_receipt(requirement, order=8)],
+        final_response="Visual QA passed. The dashboard is shipped and live.",
+        original_request=(
+            "Only respond after visual QA passes, and include a full summary of what changed."
+        ),
+        platform="discord",
+        runtime_mode="action",
+        config={"mode": "enforce_explicit"},
+        changed_paths=["dashboard/src/app.tsx"],
+        last_edit_order=7,
+    ) is not None
+
+
+def test_visual_response_nudge_does_not_exempt_qa_status_plus_summary_requests():
+    requirement = classify_visual_requirement(
+        "Change the dashboard colors and run visual QA.",
+        worker_route="action",
+    )
+
+    for request in (
+        "Only report if visual QA passed, and include a full summary of what changed.",
+        "Just tell me if visual QA passed before you send the complete implementation summary.",
+        "Only tell me whether visual QA passed and list the changes you made.",
+        "Only report whether visual QA passed, then describe the implementation.",
+        "Just tell me if visual QA passed and include the files changed.",
+        "Only answer whether visual QA passed and provide the delivery status.",
+        "Only tell me whether visual QA passed and explain what you changed.",
+        "Just say if visual QA passed, along with the changes you made.",
+        "Only report whether visual QA passed and give me the implementation details.",
+        "Only tell me whether visual QA passed and what you did.",
+        "Only tell me whether visual QA passed and which files you changed.",
+        "Only tell me whether visual QA passed plus the verification results.",
+        "Only tell me whether visual QA passed and whether it was deployed.",
+    ):
+        assert build_visual_qa_response_nudge(
+            requirement=requirement,
+            receipts=[_receipt(requirement, order=8)],
+            final_response="Visual QA passed. The dashboard is shipped and live.",
+            original_request=request,
+            platform="discord",
+            runtime_mode="action",
+            config={"mode": "enforce_explicit"},
+            changed_paths=["dashboard/src/app.tsx"],
+            last_edit_order=7,
+        ) is not None
 
 
 def test_config_invalid_values_fall_back_to_bounded_shadow_mode():
