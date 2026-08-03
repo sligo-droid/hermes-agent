@@ -31878,6 +31878,15 @@ class _GatewayRunnerCore(
                 if _srn:
                     message = _srn + "\n\n" + message
 
+            from gateway.session_context import (
+                bind_discord_action_escalation_allowed,
+                reset_discord_action_escalation_allowed,
+            )
+
+            _escalation_token = bind_discord_action_escalation_allowed(
+                source.platform == _GATEWAY_PLATFORM.DISCORD
+                and turn_runtime_mode is RuntimeMode.READ_ONLY
+            )
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
@@ -31944,6 +31953,7 @@ class _GatewayRunnerCore(
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+                reset_discord_action_escalation_allowed(_escalation_token)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
@@ -33016,7 +33026,10 @@ class _GatewayRunnerCore(
                 next_session_key = session_key
                 next_runtime_mode = turn_runtime_mode
                 next_legacy_action_intent = None
-                next_action_escalation_allowed = False
+                next_action_escalation_allowed = bool(
+                    getattr(next_source, "platform", None) == Platform.DISCORD
+                    and next_runtime_mode is RuntimeMode.READ_ONLY
+                )
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     next_runtime_mode = (
@@ -33030,11 +33043,8 @@ class _GatewayRunnerCore(
                         None,
                     )
                     next_action_escalation_allowed = bool(
-                        getattr(
-                            pending_event,
-                            "discord_action_escalation_allowed",
-                            False,
-                        )
+                        getattr(next_source, "platform", None) == Platform.DISCORD
+                        and next_runtime_mode is RuntimeMode.READ_ONLY
                     )
                     self._hydrate_discord_continuation_event_from_work_item(
                         pending_event,
