@@ -923,6 +923,16 @@ class TestPromptBuilderConstants:
         assert "api_server" in PLATFORM_HINTS
         assert "webui" in PLATFORM_HINTS
 
+    def test_discord_hint_uses_clear_barbell_style(self):
+        hint = PLATFORM_HINTS["discord"].lower()
+
+        assert "asd-ste100-inspired simplified technical english" in hint
+        assert "active voice" in hint
+        assert "20 words or fewer" in hint
+        assert "every response must also include" in hint
+        assert "wit, flair, or personality" in hint
+        assert "separate from instructions" in hint
+
     def test_cli_hint_does_not_suggest_media_tags(self):
         # Regression: MEDIA:/path tags are intercepted only by messaging
         # gateway platforms. On the CLI they render as literal text and
