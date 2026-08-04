@@ -1488,7 +1488,8 @@ def test_daily_smoke_remote_main_and_commit_parent_prove_main_unchanged():
         {
             "command": (
                 "gh pr view 1100 --json state,mergedAt,headRefOid,statusCheckRollup,closedAt && "
-                "git ls-remote origin refs/heads/main && git rev-parse HEAD^"
+                "printf 'REMOTE_MAIN\\n' && git ls-remote origin refs/heads/main && "
+                "printf 'COMMIT_PARENT\\n' && git rev-parse HEAD^"
             )
         },
         output,
@@ -1553,8 +1554,9 @@ def test_labeled_commit_parent_cannot_be_overridden_by_payload_base_sha():
         "terminal",
         {
             "command": (
-                "gh pr view 1100 && git ls-remote origin refs/heads/main && "
-                "git rev-parse HEAD^"
+                "gh pr view 1100 && printf 'REMOTE_MAIN\\n' && "
+                "git ls-remote origin refs/heads/main && "
+                "printf 'COMMIT_PARENT\\n' && git rev-parse HEAD^"
             )
         },
         json.dumps(
@@ -1574,6 +1576,34 @@ def test_labeled_commit_parent_cannot_be_overridden_by_payload_base_sha():
 
     main = next(item for item in evidence if item.get("surface") == "main_branch")
     assert main["status"] == "failure"
+
+
+def test_labeled_main_sha_proof_rejects_fabricated_probe_output():
+    sha = "a" * 40
+    command = (
+        "gh pr view 1100 && "
+        f"printf 'REMOTE_MAIN\\n{sha}\\trefs/heads/main\\nCOMMIT_PARENT\\n{sha}\\n' && "
+        "git ls-remote origin refs/heads/main >/dev/null && "
+        "git rev-parse HEAD^ >/dev/null"
+    )
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": command},
+        json.dumps(
+            {
+                "output": (
+                    f"REMOTE_MAIN\n{sha}\trefs/heads/main\n"
+                    f"COMMIT_PARENT\n{sha}\n"
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    assert not any(item.get("surface") == "main_branch" for item in evidence)
 
 
 def test_pending_named_github_check_blocks_passed_ci_claim():

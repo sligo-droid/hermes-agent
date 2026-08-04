@@ -420,6 +420,112 @@ class TestPlatformReconnectWatcher:
         reconcile_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_terminal_reaction_replays_newer_state_after_inflight_sync(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def reconcile(_item, state):
+            if not started.is_set():
+                started.set()
+                await release.wait()
+                return "running"
+            return state
+
+        reconcile_mock = AsyncMock(side_effect=reconcile)
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=reconcile_mock
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+
+        assert runner._schedule_discord_terminal_reaction(item)
+        await started.wait()
+        completion = asyncio.create_task(
+            runner._reconcile_discord_terminal_reaction(item, "done")
+        )
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await completion == "done"
+        await asyncio.gather(*tuple(runner._background_tasks))
+        assert [call.args[1] for call in reconcile_mock.await_args_list] == [None, "done"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_replays_on_replacement_adapter(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fail_old(_item, _state):
+            started.set()
+            await release.wait()
+            raise RuntimeError("adapter disconnected")
+
+        old_reconcile = AsyncMock(side_effect=fail_old)
+        new_reconcile = AsyncMock(return_value="done")
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=old_reconcile
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        assert runner._schedule_discord_terminal_reaction(item)
+        await started.wait()
+        runner.adapters[Platform.DISCORD] = SimpleNamespace(
+            reconcile_work_ledger_thread_reaction=new_reconcile
+        )
+        assert not runner._schedule_discord_terminal_reaction(item)
+        release.set()
+
+        await asyncio.gather(*tuple(runner._background_tasks))
+        old_reconcile.assert_awaited_once()
+        new_reconcile.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_reconnect_passes_is_reconnect_true(self):
         """The watcher must connect with is_reconnect=True so adapters preserve
         their server-side update queue across an outage (#46621). Without this,

@@ -9072,21 +9072,64 @@ class _GatewayRunnerCore(
     ) -> str | None:
         """Serialize one durable Discord reaction repair across lifecycle paths."""
 
-        tasks = self.__dict__.setdefault("_discord_terminal_reaction_tasks", {})
+        task, _created = self._request_discord_terminal_reaction(item, state)
+        return await asyncio.shield(task)
+
+    def _request_discord_terminal_reaction(
+        self,
+        item: Dict[str, Any],
+        state: str | None,
+    ) -> tuple[asyncio.Task, bool]:
+        requests = self.__dict__.setdefault("_discord_terminal_reaction_requests", {})
         key = self._discord_terminal_reaction_task_key(item)
-        current = asyncio.current_task()
-        existing = tasks.get(key)
-        if existing is not None and existing is not current and not existing.done():
-            return await asyncio.shield(existing)
-        task = asyncio.create_task(
-            self._run_discord_terminal_reaction(item, state)
-        )
-        tasks[key] = task
         try:
-            return await task
+            event = self._ledger().event_from_item(item)
+            adapter = self._discord_terminal_reaction_adapter(event.source)
+        except Exception:
+            adapter = None
+        token = (str(item.get("id") or ""), state, id(adapter))
+        existing = requests.get(key)
+        if isinstance(existing, dict):
+            task = existing.get("task")
+            if isinstance(task, asyncio.Task) and not task.done():
+                if existing.get("token") != token:
+                    existing["item"] = item
+                    existing["state"] = state
+                    existing["token"] = token
+                    existing["version"] = int(existing.get("version") or 0) + 1
+                return task, False
+
+        request = {
+            "item": item,
+            "state": state,
+            "token": token,
+            "version": 1,
+        }
+        task = asyncio.create_task(
+            self._drain_discord_terminal_reaction(key, request)
+        )
+        request["task"] = task
+        requests[key] = request
+        return task, True
+
+    async def _drain_discord_terminal_reaction(
+        self,
+        key: tuple[str, str, str, str],
+        request: Dict[str, Any],
+    ) -> str | None:
+        requests = self.__dict__.setdefault("_discord_terminal_reaction_requests", {})
+        result = None
+        try:
+            while True:
+                version = int(request.get("version") or 0)
+                item = request.get("item")
+                state = request.get("state")
+                result = await self._run_discord_terminal_reaction(item, state)
+                if int(request.get("version") or 0) == version:
+                    return result
         finally:
-            if tasks.get(key) is task:
-                tasks.pop(key, None)
+            if requests.get(key) is request:
+                requests.pop(key, None)
 
     async def _run_discord_terminal_reaction(
         self,
@@ -9109,22 +9152,13 @@ class _GatewayRunnerCore(
             return None
 
     def _schedule_discord_terminal_reaction(self, item: Dict[str, Any]) -> bool:
-        tasks = self.__dict__.setdefault("_discord_terminal_reaction_tasks", {})
-        key = self._discord_terminal_reaction_task_key(item)
-        existing = tasks.get(key)
-        if existing is not None and not existing.done():
+        task, created = self._request_discord_terminal_reaction(item, None)
+        if not created:
             return False
-
-        task = asyncio.create_task(
-            self._run_discord_terminal_reaction(item, None)
-        )
-        tasks[key] = task
         self._background_tasks.add(task)
 
         def _cleanup(done: asyncio.Task) -> None:
             self._background_tasks.discard(done)
-            if tasks.get(key) is done:
-                tasks.pop(key, None)
 
         task.add_done_callback(_cleanup)
         return True

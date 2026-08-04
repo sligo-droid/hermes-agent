@@ -248,12 +248,11 @@ _COMMIT_PARENT_BLOCK_RE = re.compile(
     r"^\s*([0-9a-f]{40}|[0-9a-f]{64})\s*$"
 )
 _LABELED_MAIN_SHA_RE = re.compile(r"(?im)^\s*(REMOTE_MAIN|COMMIT_PARENT)\s*$")
-_REMOTE_MAIN_PROBE_RE = re.compile(
-    r"\bgit\s+ls-remote\b[^\n;&|]*\brefs/heads/main\b",
-    re.IGNORECASE,
-)
-_COMMIT_PARENT_PROBE_RE = re.compile(
-    r"\bgit\s+rev-parse\s+[^\s;&|]+\^(?=\s|$)",
+_LABELED_MAIN_PROBE_RE = re.compile(
+    r"(?:^|&&)\s*printf\s+(['\"])REMOTE_MAIN\\n\1\s*&&\s*"
+    r"git\s+ls-remote\s+origin\s+refs/heads/main\s*&&\s*"
+    r"printf\s+(['\"])COMMIT_PARENT\\n\2\s*&&\s*"
+    r"git\s+rev-parse\s+HEAD\^\s*$",
     re.IGNORECASE,
 )
 _EXPLICIT_DEPLOY_COMMAND_RE = re.compile(
@@ -463,8 +462,7 @@ def _main_branch_evidence(
         and labeled_names.count("commit_parent") == 1
         and len(remote_main_matches) == 1
         and len(commit_parent_matches) == 1
-        and _REMOTE_MAIN_PROBE_RE.search(command)
-        and _COMMIT_PARENT_PROBE_RE.search(command)
+        and _LABELED_MAIN_PROBE_RE.search(command)
     )
     attempted = bool(
         markers
