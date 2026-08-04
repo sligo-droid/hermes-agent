@@ -7312,16 +7312,15 @@ class DiscordAdapter(BasePlatformAdapter):
             # after only attempting the event's raw-message reaction.
             reconcile = self.reconcile_work_ledger_thread_reaction
             runner = getattr(self, "gateway_runner", None)
-            adapters = getattr(runner, "adapters", None)
-            if isinstance(adapters, dict):
-                current_adapter = adapters.get(Platform.DISCORD)
+            adapter_for_source = getattr(runner, "_adapter_for_source", None)
+            if callable(adapter_for_source):
+                current_adapter = adapter_for_source(event.source)
                 current_reconcile = getattr(
-                    current_adapter,
-                    "reconcile_work_ledger_thread_reaction",
-                    None,
+                    current_adapter, "reconcile_work_ledger_thread_reaction", None
                 )
-                if callable(current_reconcile):
-                    reconcile = current_reconcile
+                if not callable(current_reconcile):
+                    return
+                reconcile = current_reconcile
             await reconcile(work_item, ledger_state)
             return
         action_lifecycle = self._action_lifecycle_enabled(event)

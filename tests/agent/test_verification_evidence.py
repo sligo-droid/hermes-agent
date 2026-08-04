@@ -4,6 +4,8 @@ import json
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from agent import conversation_loop, tool_executor
 from agent.visual_assertions import visual_assertion_contract_id
 from agent.visual_qa import (
@@ -1502,6 +1504,46 @@ def test_daily_smoke_remote_main_and_commit_parent_prove_main_unchanged():
     assert constraints["allowed"] is True
     assert constraints["latest_by_surface"]["main_branch"]["status"] == "success"
     assert downgraded == final
+
+
+@pytest.mark.parametrize(
+    ("command", "blocks"),
+    [
+        (
+            "gh pr view 1100",
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
+            "COMMIT_PARENT\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\n",
+        ),
+        (
+            "git ls-remote origin refs/heads/main && git rev-parse HEAD^",
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\n"
+            "COMMIT_PARENT\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n",
+        ),
+        (
+            "git ls-remote origin refs/heads/main && git rev-parse HEAD^",
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
+            "COMMIT_PARENT\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\n",
+        ),
+    ],
+)
+def test_labeled_main_sha_proof_rejects_ambiguous_shapes(command, blocks):
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": command},
+        json.dumps({"output": blocks, "exit_code": 0, "error": None}),
+        False,
+        order=1,
+    )
+
+    assert not any(item.get("surface") == "main_branch" for item in evidence)
 
 
 def test_pending_named_github_check_blocks_passed_ci_claim():

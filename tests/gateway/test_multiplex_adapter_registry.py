@@ -3,7 +3,7 @@ import logging
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -196,6 +196,8 @@ def _secondary_recovery_runner(*, running=True):
     runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
     runner._adapter_disconnect_timeout_secs = lambda: 0
     runner._sync_voice_mode_state_to_adapter = lambda adapter: None
+    runner._install_background_worker_reaction_gate = MagicMock()
+    runner._schedule_pending_discord_terminal_reactions = MagicMock()
     return runner
 
 
@@ -256,6 +258,13 @@ class TestSecondaryProfileFatalRecovery:
         assert len(tasks) == 1
         await tasks[0]
         assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
+        runner._install_background_worker_reaction_gate.assert_called_once_with(
+            replacement
+        )
+        runner._schedule_pending_discord_terminal_reactions.assert_called_once_with(
+            platform=Platform.DISCORD,
+            profile_name="reviewer",
+        )
         assert scoped_homes
         assert all(path == Path("/profiles/reviewer") for path in scoped_homes)
 

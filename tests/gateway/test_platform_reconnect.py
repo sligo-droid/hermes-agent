@@ -2,13 +2,21 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource, build_session_key
+from gateway.work_ledger import GatewayWorkLedger
 
 
 class StubAdapter(BasePlatformAdapter):
@@ -256,8 +264,62 @@ class TestPlatformReconnectWatcher:
                 await run_one_iteration()
 
         runner._schedule_pending_discord_terminal_reactions.assert_called_once_with(
-            platform=Platform.DISCORD
+            platform=Platform.DISCORD,
+            profile_name="default",
         )
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_scheduler_is_profile_scoped(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        primary_reconcile = AsyncMock(return_value="done")
+        reviewer_reconcile = AsyncMock(return_value="done")
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=primary_reconcile
+            )
+        }
+        runner._profile_adapters = {
+            "reviewer": {
+                Platform.DISCORD: SimpleNamespace(
+                    reconcile_work_ledger_thread_reaction=reviewer_reconcile
+                )
+            }
+        }
+
+        for message_id, profile in (("1000", None), ("2000", "reviewer")):
+            source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id=message_id,
+                chat_type="thread",
+                thread_id=message_id,
+                message_id=message_id,
+                profile=profile,
+            )
+            event = MessageEvent(
+                text="complete work",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=message_id,
+            )
+            item = runner.work_ledger.accept_event(
+                event,
+                session_key=build_session_key(source),
+                freshness_seconds=60,
+            )
+            assert item is not None
+            assert runner.work_ledger.mark_completed(item["id"])
+
+        scheduled = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="reviewer",
+        )
+        await asyncio.gather(*tuple(runner._background_tasks))
+
+        assert scheduled == 1
+        reviewer_reconcile.assert_awaited_once()
+        primary_reconcile.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reconnect_passes_is_reconnect_true(self):

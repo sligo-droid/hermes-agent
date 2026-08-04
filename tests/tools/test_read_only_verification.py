@@ -55,6 +55,24 @@ def test_read_only_verification_parser_allows_git_diff_check():
     assert error is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./git diff --check",
+        "bin/git diff --check",
+        "../../git diff --check",
+        "/usr/bin/git diff --check",
+        "git diff --check HEAD",
+        "git diff HEAD --check",
+    ],
+)
+def test_read_only_verification_parser_rejects_git_diff_check_variants(command):
+    argv, error = parse_read_only_verification_command(command)
+
+    assert argv is None
+    assert error
+
+
 def test_read_only_terminal_policy_is_shell_free_and_process_only():
     assert read_only_terminal_check({"command": "ps aux"}) is True
     assert read_only_terminal_check({"command": "ps -eo pid,ppid,stat,etime,comm,args"}) is True

@@ -9006,6 +9006,7 @@ class _GatewayRunnerCore(
         self,
         *,
         platform: Platform | None = None,
+        profile_name: str | None = None,
     ) -> int:
         """Retry durable terminal reactions against the currently connected adapter."""
 
@@ -9013,6 +9014,14 @@ class _GatewayRunnerCore(
         scheduled = 0
         for item in ledger.pending_terminal_reaction_items():
             work_id = str(item.get("id") or "")
+            item_profile = str(
+                (item.get("source") if isinstance(item.get("source"), dict) else {}).get(
+                    "profile"
+                )
+                or "default"
+            )
+            if profile_name is not None and item_profile != profile_name:
+                continue
             try:
                 event = ledger.event_from_item(item)
             except Exception as exc:
@@ -14921,7 +14930,8 @@ class _GatewayRunnerCore(
                         if platform is Platform.DISCORD:
                             try:
                                 self._schedule_pending_discord_terminal_reactions(
-                                    platform=platform
+                                    platform=platform,
+                                    profile_name="default",
                                 )
                             except Exception:
                                 logger.debug(
@@ -15805,7 +15815,13 @@ class _GatewayRunnerCore(
                         profile_map = self._profile_adapters.setdefault(profile_name, {})
                         if platform not in profile_map:
                             profile_map[platform] = adapter
+                            self._install_background_worker_reaction_gate(adapter)
                             self._sync_voice_mode_state_to_adapter(adapter)
+                            if platform is Platform.DISCORD:
+                                self._schedule_pending_discord_terminal_reactions(
+                                    platform=platform,
+                                    profile_name=profile_name,
+                                )
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,

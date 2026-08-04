@@ -239,9 +239,22 @@ _MAIN_SHA_MARKER_RE = re.compile(
     r"(?im)^\s*(MAIN_BEFORE|BASE_BEFORE|MAIN_AFTER|BASE_AFTER|MAIN_NOW|CURRENT_MAIN)="
     r"([0-9a-f]{40}|[0-9a-f]{64})\s*$"
 )
-_LABELED_SHA_BLOCK_RE = re.compile(
-    r"(?im)^\s*(REMOTE_MAIN|COMMIT_PARENT)\s*$\s*"
-    r"^\s*([0-9a-f]{40}|[0-9a-f]{64})(?:\s+refs/heads/main)?\s*$"
+_REMOTE_MAIN_BLOCK_RE = re.compile(
+    r"(?im)^\s*REMOTE_MAIN\s*$\s*"
+    r"^\s*([0-9a-f]{40}|[0-9a-f]{64})\s+refs/heads/main\s*$"
+)
+_COMMIT_PARENT_BLOCK_RE = re.compile(
+    r"(?im)^\s*COMMIT_PARENT\s*$\s*"
+    r"^\s*([0-9a-f]{40}|[0-9a-f]{64})\s*$"
+)
+_LABELED_MAIN_SHA_RE = re.compile(r"(?im)^\s*(REMOTE_MAIN|COMMIT_PARENT)\s*$")
+_REMOTE_MAIN_PROBE_RE = re.compile(
+    r"\bgit\s+ls-remote\b[^\n;&|]*\brefs/heads/main\b",
+    re.IGNORECASE,
+)
+_COMMIT_PARENT_PROBE_RE = re.compile(
+    r"\bgit\s+rev-parse\s+[^\s;&|]+\^(?=\s|$)",
+    re.IGNORECASE,
 )
 _EXPLICIT_DEPLOY_COMMAND_RE = re.compile(
     r"\b(?:vercel|flyctl|railway|render)\b|"
@@ -440,13 +453,22 @@ def _main_branch_evidence(
         name.lower(): sha.lower()
         for name, sha in _MAIN_SHA_MARKER_RE.findall(str(output or ""))
     }
-    labeled = {
-        name.lower(): sha.lower()
-        for name, sha in _LABELED_SHA_BLOCK_RE.findall(str(output or ""))
-    }
+    output_text = str(output or "")
+    remote_main_matches = _REMOTE_MAIN_BLOCK_RE.findall(output_text)
+    commit_parent_matches = _COMMIT_PARENT_BLOCK_RE.findall(output_text)
+    labeled_names = [name.lower() for name in _LABELED_MAIN_SHA_RE.findall(output_text)]
+    labeled_attempted = bool(labeled_names)
+    labeled_valid = bool(
+        labeled_names.count("remote_main") == 1
+        and labeled_names.count("commit_parent") == 1
+        and len(remote_main_matches) == 1
+        and len(commit_parent_matches) == 1
+        and _REMOTE_MAIN_PROBE_RE.search(command)
+        and _COMMIT_PARENT_PROBE_RE.search(command)
+    )
     attempted = bool(
         markers
-        or labeled
+        or labeled_attempted
         or re.search(r"\b(?:MAIN|BASE)_(?:BEFORE|AFTER|NOW)\b|\bCURRENT_MAIN\b", command)
         or re.search(r"\bheads/main\b", command)
     )
@@ -458,10 +480,12 @@ def _main_branch_evidence(
     current = (
         markers.get("main_now")
         or markers.get("current_main")
-        or labeled.get("remote_main")
+        or (remote_main_matches[0].lower() if labeled_valid else "")
     )
     base_sha = str(
-        payload.get("base_sha") or labeled.get("commit_parent") or ""
+        payload.get("base_sha")
+        or (commit_parent_matches[0].lower() if labeled_valid else "")
+        or ""
     ).strip().lower()
     proven = False
     equal = False

@@ -1939,6 +1939,7 @@ async def test_replaced_adapter_uses_current_connection_for_terminal_reconciliat
         parent_chat_id="55",
         guild_id="77",
         message_id="1000",
+        profile="reviewer",
     )
     event = MessageEvent(
         text="Implement the dashboard repair",
@@ -1956,13 +1957,29 @@ async def test_replaced_adapter_uses_current_connection_for_terminal_reconciliat
     assert ledger.mark_completed(item["id"])
     event.work_item_id = item["id"]
 
+    primary_adapter = SimpleNamespace(
+        reconcile_work_ledger_thread_reaction=AsyncMock(
+            side_effect=AssertionError("primary adapter must not reconcile")
+        )
+    )
+    async def reconcile_current(persisted_item, _state):
+        ledger.mark_discord_thread_reaction_synced(persisted_item)
+        return "done"
+
     current_adapter = SimpleNamespace(
-        reconcile_work_ledger_thread_reaction=AsyncMock(return_value="done")
+        reconcile_work_ledger_thread_reaction=AsyncMock(
+            side_effect=reconcile_current
+        )
     )
-    adapter.gateway_runner = SimpleNamespace(
+    runner = SimpleNamespace(
         work_ledger=ledger,
-        adapters={Platform.DISCORD: current_adapter},
+        adapters={Platform.DISCORD: primary_adapter},
+        _profile_adapters={"reviewer": {Platform.DISCORD: current_adapter}},
     )
+    runner._adapter_for_source = lambda source: runner._profile_adapters[
+        source.profile
+    ][source.platform]
+    adapter.gateway_runner = runner
     adapter.reconcile_work_ledger_thread_reaction = AsyncMock(
         side_effect=AssertionError("disconnected adapter must not reconcile")
     )
@@ -1973,6 +1990,8 @@ async def test_replaced_adapter_uses_current_connection_for_terminal_reconciliat
     persisted_item, state = current_adapter.reconcile_work_ledger_thread_reaction.await_args.args
     assert persisted_item["id"] == item["id"]
     assert state == "done"
+    primary_adapter.reconcile_work_ledger_thread_reaction.assert_not_awaited()
+    assert ledger.pending_terminal_reaction_items() == []
 
 
 @pytest.mark.asyncio
