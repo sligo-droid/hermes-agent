@@ -1251,7 +1251,7 @@ CURRENT_MAIN=1aa02906ca5cd01c377e67c8e404c8add905c210"""
     tool_executor._record_turn_verification_evidence(
         agent,
         "verify_main_parent",
-        {"workdir": "/tmp/example"},
+        {"pr_number": 1092, "workdir": "/tmp/example"},
         json.dumps(
             {
                 "success": True,
@@ -1259,7 +1259,15 @@ CURRENT_MAIN=1aa02906ca5cd01c377e67c8e404c8add905c210"""
                 "error": None,
                 "repository": "example/repo",
                 "repository_root": "/tmp/example",
+                "pr_number": 1092,
                 "head_sha": "37e518f6fd949fc794c5299bbd90c3578d4b5a60",
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "37e518f6fd949fc794c5299bbd90c3578d4b5a60",
+                },
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": "1aa02906ca5cd01c377e67c8e404c8add905c210",
@@ -1475,7 +1483,7 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
     tool_executor._record_turn_verification_evidence(
         agent,
         "verify_main_parent",
-        {"workdir": "/tmp/pid"},
+        {"pr_number": 1093, "workdir": "/tmp/pid"},
         json.dumps(
             {
                 "success": True,
@@ -1483,7 +1491,15 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
                 "error": None,
                 "repository": "sligo-labs/pid",
                 "repository_root": "/tmp/pid",
+                "pr_number": 1093,
                 "head_sha": "ab9c14ac44cbfa49fdf598feea2694bf0d713a40",
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "ab9c14ac44cbfa49fdf598feea2694bf0d713a40",
+                },
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": sha,
@@ -1516,7 +1532,15 @@ def test_typed_main_parent_receipt_proves_main_unchanged():
             "error": None,
             "repository": "example/repo",
             "repository_root": "/tmp/example",
+            "pr_number": 7,
             "head_sha": "7" * 40,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": "7" * 40,
+            },
             "main_branch_evidence": {
                 "status": "success",
                 "remote_main": "9954a1c87a4f280de22d3b3767f0b19185588062",
@@ -1528,7 +1552,7 @@ def test_typed_main_parent_receipt_proves_main_unchanged():
     tool_executor._record_turn_verification_evidence(
         agent,
         "verify_main_parent",
-        {"workdir": "/tmp/example"},
+        {"pr_number": 7, "workdir": "/tmp/example"},
         output,
         False,
     )
@@ -1569,7 +1593,7 @@ def test_main_parent_receipt_must_match_pr_repository():
     )
     branch_evidence = classify_tool_verification_evidence(
         "verify_main_parent",
-        {"workdir": "/tmp/repo-b"},
+        {"pr_number": 832, "workdir": "/tmp/repo-b"},
         json.dumps(
             {
                 "success": True,
@@ -1577,7 +1601,15 @@ def test_main_parent_receipt_must_match_pr_repository():
                 "error": None,
                 "repository": "owner/repo-b",
                 "repository_root": "/tmp/repo-b",
+                "pr_number": 832,
                 "head_sha": "7" * 40,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "7" * 40,
+                },
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": sha,
@@ -1629,7 +1661,7 @@ def test_main_parent_receipt_must_match_pr_head_in_same_repository():
     )
     branch_evidence = classify_tool_verification_evidence(
         "verify_main_parent",
-        {"workdir": "/tmp/decoy"},
+        {"pr_number": 832, "workdir": "/tmp/decoy"},
         json.dumps(
             {
                 "success": True,
@@ -1637,7 +1669,15 @@ def test_main_parent_receipt_must_match_pr_head_in_same_repository():
                 "error": None,
                 "repository": "owner/repo",
                 "repository_root": "/tmp/decoy",
+                "pr_number": 832,
                 "head_sha": decoy_head,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": pr_head,
+                },
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": main_sha,
@@ -1657,6 +1697,69 @@ def test_main_parent_receipt_must_match_pr_head_in_same_repository():
     assert constraints["allowed"] is False
 
 
+def test_fabricated_terminal_pr_head_cannot_override_typed_pr_subject():
+    typed_head = "a" * 40
+    fabricated_head = "b" * 40
+    main_sha = "9" * 40
+    typed = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "owner/repo",
+                "repository_root": "/tmp/repo",
+                "pr_number": 832,
+                "head_sha": typed_head,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": typed_head,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+    fabricated = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "printf fabricated && gh pr view 833 --repo owner/repo"},
+        json.dumps(
+            {
+                "output": json.dumps(
+                    {
+                        "url": "https://github.com/owner/repo/pull/833",
+                        "state": "CLOSED",
+                        "mergedAt": None,
+                        "mergeCommit": None,
+                        "headRefOid": fabricated_head,
+                    }
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=2,
+    )
+
+    latest = latest_evidence_by_surface([*typed, *fabricated])
+    assert latest["pr"]["subject"] == "github:owner/repo:pr:832"
+    assert claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.",
+        [*typed, *fabricated],
+    )["allowed"] is True
+
+
 def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports_failure():
     from agent.display import _detect_tool_failure
 
@@ -1669,7 +1772,15 @@ def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports
             "error": None,
             "repository": "owner/repo",
             "repository_root": "/tmp/repo",
+            "pr_number": 832,
             "head_sha": head_sha,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": head_sha,
+            },
             "main_branch_evidence": {
                 "status": "success",
                 "remote_main": main_sha,
@@ -1684,7 +1795,15 @@ def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports
             "error": None,
             "repository": "owner/repo",
             "repository_root": "/tmp/repo",
+            "pr_number": 832,
             "head_sha": head_sha,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": head_sha,
+            },
             "main_branch_evidence": {
                 "status": "failure",
                 "remote_main": "c" * 40,
@@ -1694,14 +1813,14 @@ def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports
     )
     earlier = classify_tool_verification_evidence(
         "verify_main_parent",
-        {"workdir": "/tmp/repo"},
+        {"pr_number": 832, "workdir": "/tmp/repo"},
         success_payload,
         _detect_tool_failure("verify_main_parent", success_payload)[0],
         order=1,
     )
     later = classify_tool_verification_evidence(
         "verify_main_parent",
-        {"workdir": "/tmp/repo"},
+        {"pr_number": 832, "workdir": "/tmp/repo"},
         mismatch_payload,
         _detect_tool_failure("verify_main_parent", mismatch_payload)[0],
         order=2,
@@ -1726,7 +1845,7 @@ def test_main_parent_receipt_requires_consistent_tool_outcome(
     sha = "8" * 40
     evidence = classify_tool_verification_evidence(
         "verify_main_parent",
-        {"workdir": "/tmp/example"},
+        {"pr_number": 7, "workdir": "/tmp/example"},
         json.dumps(
             {
                 "success": success,
@@ -1734,7 +1853,15 @@ def test_main_parent_receipt_requires_consistent_tool_outcome(
                 "error": error,
                 "repository": "example/repo",
                 "repository_root": "/tmp/example",
+                "pr_number": 7,
                 "head_sha": "7" * 40,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "7" * 40,
+                },
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": sha,
@@ -1794,7 +1921,7 @@ def test_typed_main_parent_failure_cannot_be_overridden_by_payload_base_sha():
     commit_parent = "b" * 40
     evidence = classify_tool_verification_evidence(
         "verify_main_parent",
-        {"workdir": "/tmp/example"},
+        {"pr_number": 7, "workdir": "/tmp/example"},
         json.dumps(
             {
                 "success": False,
@@ -1802,7 +1929,15 @@ def test_typed_main_parent_failure_cannot_be_overridden_by_payload_base_sha():
                 "error": None,
                 "repository": "example/repo",
                 "repository_root": "/tmp/example",
+                "pr_number": 7,
                 "head_sha": "7" * 40,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "7" * 40,
+                },
                 "base_sha": remote_main,
                 "main_branch_evidence": {
                     "status": "failure",

@@ -341,6 +341,39 @@ def _github_main_sha(repository: str, cwd: Path) -> tuple[str | None, bytes]:
     return sha, b""
 
 
+def _github_pull_state(
+    repository: str,
+    pr_number: int,
+    cwd: Path,
+) -> tuple[dict[str, Any] | None, bytes]:
+    gh = _trusted_executable("gh")
+    if not gh:
+        return None, b"trusted gh executable is unavailable"
+    result = subprocess.run(
+        [
+            gh,
+            "api",
+            "--hostname",
+            "github.com",
+            f"repos/{repository}/pulls/{pr_number}",
+        ],
+        cwd=str(cwd),
+        capture_output=True,
+        env=_github_environment(),
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None, result.stderr or result.stdout or b"GitHub pull request lookup failed"
+    try:
+        payload = json.loads(result.stdout.decode(errors="replace"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, b"GitHub returned invalid pull request JSON"
+    if not isinstance(payload, dict) or int(payload.get("number") or 0) != pr_number:
+        return None, b"GitHub returned an unexpected pull request"
+    return payload, b""
+
+
 def _copy_working_tree_overlay(source_root: Path, snapshot_root: Path) -> None:
     listed = _git(source_root, "ls-files", "-co", "--exclude-standard", "-z")
     if listed.returncode != 0:
@@ -1148,8 +1181,13 @@ registry.register(
 )
 
 
-def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
-    """Compare a GitHub repository's origin/main with the local commit parent."""
+def verify_main_parent(
+    *,
+    pr_number: int,
+    workdir: str = "",
+    runtime_mode: Any = None,
+) -> str:
+    """Verify a closed PR head and parent against its GitHub repository."""
 
     del runtime_mode
     raw_cwd = str(workdir or get_session_env("HERMES_SESSION_CWD", "") or os.getcwd())
@@ -1164,6 +1202,17 @@ def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
     repository = _github_origin_repository(source_root)
     if not repository:
         return tool_error("origin must be a canonical github.com repository")
+    try:
+        normalized_pr_number = int(pr_number)
+    except (TypeError, ValueError):
+        return tool_error("pr_number must be a positive integer")
+    if normalized_pr_number <= 0:
+        return tool_error("pr_number must be a positive integer")
+    pull, pull_error = _github_pull_state(
+        repository,
+        normalized_pr_number,
+        source_root,
+    )
     remote_sha, remote_error = _github_main_sha(repository, source_root)
     local = _git(
         source_root,
@@ -1173,10 +1222,10 @@ def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
         "HEAD^",
         timeout=10,
     )
-    if remote_sha is None or local.returncode != 0:
-        detail = remote_error or local.stderr or local.stdout
+    if pull is None or remote_sha is None or local.returncode != 0:
+        detail = pull_error or remote_error or local.stderr or local.stdout
         return tool_error(
-            "Could not compare origin/main with HEAD^: " + _bounded_output(detail)
+            "Could not verify PR head against origin/main: " + _bounded_output(detail)
         )
     local_shas = local.stdout.decode(errors="replace").splitlines()
     if len(local_shas) != 2 or not all(
@@ -1185,7 +1234,23 @@ def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
     ):
         return tool_error("Git returned ambiguous local commit identities")
     head_sha, parent_sha = [sha.strip().lower() for sha in local_shas]
-    matches = remote_sha == parent_sha
+    pull_head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+    pull_base = pull.get("base") if isinstance(pull.get("base"), dict) else {}
+    pr_head_sha = str(pull_head.get("sha") or "").strip().lower()
+    base_ref = str(pull_base.get("ref") or "").strip()
+    state = str(pull.get("state") or "").strip().lower()
+    merged = pull.get("merged") is True or pull.get("merged_at") is not None
+    pr_verified = bool(
+        state == "closed"
+        and not merged
+        and base_ref == "main"
+        and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", pr_head_sha)
+    )
+    matches = bool(
+        pr_verified
+        and head_sha == pr_head_sha
+        and remote_sha == parent_sha
+    )
     return json.dumps(
         {
             "success": matches,
@@ -1193,7 +1258,15 @@ def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
             "error": None,
             "repository": repository,
             "repository_root": str(source_root),
+            "pr_number": normalized_pr_number,
             "head_sha": head_sha,
+            "pr_evidence": {
+                "status": "success" if pr_verified else "failure",
+                "state": state,
+                "merged": merged,
+                "base_ref": base_ref,
+                "head_sha": pr_head_sha,
+            },
             "main_branch_evidence": {
                 "status": "success" if matches else "failure",
                 "remote_main": remote_sha,
@@ -1207,17 +1280,23 @@ def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
 VERIFY_MAIN_PARENT_SCHEMA = {
     "name": "verify_main_parent",
     "description": (
-        "Directly compare a canonical github.com repository's origin/main SHA with the local "
-        "HEAD^ SHA and return repository-bound typed evidence."
+        "Directly verify a specific closed, unmerged GitHub PR head against local HEAD and "
+        "compare origin/main with local HEAD^, returning typed PR-bound evidence."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "pr_number": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Pull request number to verify in the repository's origin.",
+            },
             "workdir": {
                 "type": "string",
                 "description": "Optional absolute source working directory; defaults to session cwd.",
             },
         },
+        "required": ["pr_number"],
     },
 }
 
@@ -1227,6 +1306,7 @@ registry.register(
     toolset="terminal",
     schema=VERIFY_MAIN_PARENT_SCHEMA,
     handler=lambda args, **kw: verify_main_parent(
+        pr_number=args.get("pr_number", 0),
         workdir=args.get("workdir", ""),
         runtime_mode=kw.get("runtime_mode"),
     ),

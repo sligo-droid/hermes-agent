@@ -258,7 +258,22 @@ def test_read_only_verify_main_parent_returns_typed_evidence(tmp_path, monkeypat
         "_github_main_sha",
         lambda _repository, _cwd: (base_sha, b""),
     )
-    payload = json.loads(verify_main_parent(workdir=str(repo)))
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_pull_state",
+        lambda _repository, _number, _cwd: (
+            {
+                "number": 7,
+                "state": "closed",
+                "merged": False,
+                "merged_at": None,
+                "head": {"sha": _git(repo, "rev-parse", "HEAD").stdout.strip()},
+                "base": {"ref": "main"},
+            },
+            b"",
+        ),
+    )
+    payload = json.loads(verify_main_parent(pr_number=7, workdir=str(repo)))
 
     assert payload["success"] is True
     assert payload["repository"] == "example/repo"
@@ -293,7 +308,22 @@ def test_read_only_verify_main_parent_reports_mismatch(tmp_path, monkeypatch):
         "_github_main_sha",
         lambda _repository, _cwd: (remote_sha, b""),
     )
-    payload = json.loads(verify_main_parent(workdir=str(repo)))
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_pull_state",
+        lambda _repository, _number, _cwd: (
+            {
+                "number": 7,
+                "state": "closed",
+                "merged": False,
+                "merged_at": None,
+                "head": {"sha": _git(repo, "rev-parse", "HEAD").stdout.strip()},
+                "base": {"ref": "main"},
+            },
+            b"",
+        ),
+    )
+    payload = json.loads(verify_main_parent(pr_number=7, workdir=str(repo)))
 
     assert payload["success"] is False
     assert payload["exit_code"] == 1

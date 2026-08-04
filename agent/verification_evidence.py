@@ -1218,51 +1218,91 @@ def classify_tool_verification_evidence(
 
     if name == "verify_main_parent":
         receipt = data.get("main_branch_evidence")
+        pr_receipt = data.get("pr_evidence")
         if (
             data.get("error") is None
             and isinstance(data.get("success"), bool)
             and data.get("exit_code") in {0, 1}
             and isinstance(receipt, dict)
+            and isinstance(pr_receipt, dict)
         ):
             repository = str(data.get("repository") or "").lower()
             repository_root = str(data.get("repository_root") or "")
+            try:
+                pr_number = int(data.get("pr_number") or 0)
+            except (TypeError, ValueError):
+                pr_number = 0
             head_sha = str(data.get("head_sha") or "").lower()
+            pr_head_sha = str(pr_receipt.get("head_sha") or "").lower()
+            pr_status = str(pr_receipt.get("status") or "")
             remote_main = str(receipt.get("remote_main") or "").lower()
             commit_parent = str(receipt.get("commit_parent") or "").lower()
             status = str(receipt.get("status") or "")
             if (
                 re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", repository)
                 and repository_root
+                and pr_number > 0
+                and pr_status in {"success", "failure"}
                 and status in {"success", "failure"}
                 and _SHA_RE.fullmatch(head_sha)
+                and _SHA_RE.fullmatch(pr_head_sha)
                 and _SHA_RE.fullmatch(remote_main)
                 and _SHA_RE.fullmatch(commit_parent)
-                and (status == "success") == (remote_main == commit_parent)
-                and data.get("success") == (status == "success")
-                and data.get("exit_code") == (0 if status == "success" else 1)
-                and (status == "failure" or not is_error)
+                and (status == "success") == (
+                    remote_main == commit_parent and head_sha == pr_head_sha
+                )
+                and data.get("success") == (
+                    status == "success" and pr_status == "success"
+                )
+                and data.get("exit_code") == (
+                    0 if status == "success" and pr_status == "success" else 1
+                )
+                and (status == "failure" or pr_status == "failure" or not is_error)
             ):
-                return [{
-                    "schema_version": 1,
-                    "surface": "main_branch",
-                    "check_name": "origin/main equals HEAD^",
-                    "status": status,
-                    "order": int(order or 0),
-                    "subject": f"github:{repository}:branch:main",
-                    "head_sha": head_sha,
-                    "detail": json.dumps(
-                        {
-                            "repository": repository,
-                            "repository_root": repository_root,
-                            "head_sha": head_sha,
-                            "remote_main": remote_main,
-                            "commit_parent": commit_parent,
-                            "proven": True,
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )[:240],
-                }]
+                subject = f"github:{repository}:pr:{pr_number}"
+                pr_verified = bool(
+                    pr_status == "success"
+                    and str(pr_receipt.get("state") or "") == "closed"
+                    and pr_receipt.get("merged") is False
+                    and str(pr_receipt.get("base_ref") or "") == "main"
+                )
+                return [
+                    {
+                        "schema_version": 1,
+                        "surface": "pr",
+                        "check_name": f"typed closed PR verification {repository}#{pr_number}",
+                        "status": "success" if pr_verified else "failure",
+                        "order": int(order or 0),
+                        "subject": subject,
+                        "head_sha": pr_head_sha,
+                        "merged_confirmed": pr_receipt.get("merged") is True,
+                        "unmerged_confirmed": pr_verified,
+                        "detail": json.dumps(pr_receipt, sort_keys=True, separators=(",", ":"))[:240],
+                    },
+                    {
+                        "schema_version": 1,
+                        "surface": "main_branch",
+                        "check_name": "typed PR head and origin/main parent comparison",
+                        "status": status,
+                        "order": int(order or 0),
+                        "subject": subject,
+                        "head_sha": head_sha,
+                        "detail": json.dumps(
+                            {
+                                "repository": repository,
+                                "repository_root": repository_root,
+                                "pr_number": pr_number,
+                                "head_sha": head_sha,
+                                "pr_head_sha": pr_head_sha,
+                                "remote_main": remote_main,
+                                "commit_parent": commit_parent,
+                                "proven": True,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )[:240],
+                    },
+                ]
         return []
 
     if name == "terminal" and _PROTECTED_CHECKOUT_GUARDRAIL_RE.search(result_text):
@@ -1471,9 +1511,18 @@ def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
                 and current_status in {"failure", "timeout", "pending"}
                 and new_status == "success"
             )
+            unrelated_equal_priority_subject_is_not_a_repair = bool(
+                surface in {"pr", "main_branch"}
+                and current
+                and current_subject
+                and new_subject
+                and not same_subject
+                and new_rank == current_rank
+            )
             if (
                 not unrelated_lower_priority_subject
                 and not unrelated_equal_priority_success_cannot_clear_failure
+                and not unrelated_equal_priority_subject_is_not_a_repair
                 and (current is None or order >= int(current.get("order") or 0))
             ):
                 normalized_item = dict(item)
@@ -1866,7 +1915,7 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
         pr_item = latest.get("pr") or {}
         branch_subject = str(item.get("subject") or "")
         pr_subject = str(pr_item.get("subject") or "")
-        branch_match = re.fullmatch(r"github:(.+):branch:main", branch_subject)
+        branch_match = re.fullmatch(r"github:(.+):pr:(\d+)", branch_subject)
         pr_match = re.fullmatch(r"github:(?:(.+):)?pr:\d+", pr_subject)
         branch_head_sha = str(item.get("head_sha") or "").lower()
         pr_head_sha = str(pr_item.get("head_sha") or "").lower()
@@ -1883,6 +1932,7 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                 and pr_match
                 and pr_match.group(1)
                 and branch_match.group(1) == pr_match.group(1)
+                and branch_subject == pr_subject
                 and _SHA_RE.fullmatch(branch_head_sha)
                 and branch_head_sha == pr_head_sha
             )
