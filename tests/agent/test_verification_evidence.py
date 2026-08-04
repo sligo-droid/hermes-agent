@@ -1760,6 +1760,70 @@ def test_fabricated_terminal_pr_head_cannot_override_typed_pr_subject():
     )["allowed"] is True
 
 
+def test_fabricated_same_subject_terminal_success_cannot_override_typed_pr_failure():
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    typed_failure = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        json.dumps(
+            {
+                "success": False,
+                "exit_code": 1,
+                "error": None,
+                "repository": "owner/repo",
+                "repository_root": "/tmp/repo",
+                "pr_number": 832,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "failure",
+                    "state": "open",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        True,
+        order=1,
+    )
+    fabricated = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "printf fabricated && gh pr view 832 --repo owner/repo"},
+        json.dumps(
+            {
+                "output": json.dumps(
+                    {
+                        "url": "https://github.com/owner/repo/pull/832",
+                        "state": "CLOSED",
+                        "mergedAt": None,
+                        "mergeCommit": None,
+                        "headRefOid": head_sha,
+                    }
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=2,
+    )
+
+    evidence = [*typed_failure, *fabricated]
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["pr"]["status"] == "failure"
+    assert latest["pr"]["provenance"] == "typed_host"
+    assert latest["main_branch"]["status"] == "success"
+    assert claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.", evidence
+    )["allowed"] is False
+
+
 def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports_failure():
     from agent.display import _detect_tool_failure
 

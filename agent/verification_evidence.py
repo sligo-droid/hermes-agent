@@ -1274,6 +1274,8 @@ def classify_tool_verification_evidence(
                         "status": "success" if pr_verified else "failure",
                         "order": int(order or 0),
                         "subject": subject,
+                        "provenance": "typed_host",
+                        "trust_rank": 2,
                         "head_sha": pr_head_sha,
                         "merged_confirmed": pr_receipt.get("merged") is True,
                         "unmerged_confirmed": pr_verified,
@@ -1286,6 +1288,8 @@ def classify_tool_verification_evidence(
                         "status": status,
                         "order": int(order or 0),
                         "subject": subject,
+                        "provenance": "typed_host",
+                        "trust_rank": 2,
                         "head_sha": head_sha,
                         "detail": json.dumps(
                             {
@@ -1479,6 +1483,8 @@ def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
             new_subject = str(item.get("subject") or "")
             current_status = str((current or {}).get("status") or "").lower()
             new_status = str(item.get("status") or "").lower()
+            current_trust = int((current or {}).get("trust_rank") or 0)
+            new_trust = int(item.get("trust_rank") or 0)
             same_subject = current_subject == new_subject
             if not same_subject and current_subject and new_subject:
                 current_pr = re.fullmatch(r"github:(?:(.+):)?pr:(\d+)", current_subject)
@@ -1519,10 +1525,18 @@ def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
                 and not same_subject
                 and new_rank == current_rank
             )
+            lower_trust_cannot_replace = bool(
+                current
+                and current_subject
+                and new_subject
+                and same_subject
+                and new_trust < current_trust
+            )
             if (
                 not unrelated_lower_priority_subject
                 and not unrelated_equal_priority_success_cannot_clear_failure
                 and not unrelated_equal_priority_subject_is_not_a_repair
+                and not lower_trust_cannot_replace
                 and (current is None or order >= int(current.get("order") or 0))
             ):
                 normalized_item = dict(item)
