@@ -1824,6 +1824,56 @@ def test_fabricated_same_subject_terminal_success_cannot_override_typed_pr_failu
     )["allowed"] is False
 
 
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "PR #832 was closed without merge and main remained unchanged.",
+        "owner/repo PR #832 was closed without merge and main remained unchanged.",
+        "https://github.com/owner/repo/pull/832 was closed without merge and main remained unchanged.",
+    ],
+)
+def test_typed_closeout_evidence_must_match_explicit_pr_claim(claim):
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 999, "workdir": "/tmp/other"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "other/project",
+                "repository_root": "/tmp/other",
+                "pr_number": 999,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    constraints = claim_constraints_for_text(claim, evidence)
+
+    assert constraints["allowed"] is False
+    assert {item["surface"] for item in constraints["blocked_surfaces"]} == {
+        "pr",
+        "main_branch",
+    }
+
+
 def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports_failure():
     from agent.display import _detect_tool_failure
 

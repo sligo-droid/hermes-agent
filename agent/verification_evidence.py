@@ -260,6 +260,12 @@ _MAIN_UNCHANGED_CLAIM_RE = re.compile(
     r"\bno changes?\b[^.!?\n]{0,60}\b(?:main|base branch)\b",
     re.IGNORECASE,
 )
+_EXPLICIT_PR_CLAIM_RE = re.compile(
+    r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\s+|#))?"
+    r"(?:PR|pull request)\s*#?(?P<number>\d+)|"
+    r"(?P<url>https://github\.com/(?P<url_repo>[^/\s]+/[^/\s]+)/pull/(?P<url_number>\d+))",
+    re.IGNORECASE,
+)
 
 _SURFACE_LABELS = {
     "browser": "browser verification",
@@ -1892,6 +1898,14 @@ def _surface_downgraded(text: str, surface: str, item: dict[str, Any]) -> bool:
 def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]:
     latest = latest_evidence_by_surface(evidence)
     blocked = []
+    explicit_pr_subjects = set()
+    for match in _EXPLICIT_PR_CLAIM_RE.finditer(str(final_text or "")):
+        repository = str(match.group("repo") or match.group("url_repo") or "").lower()
+        number = str(match.group("number") or match.group("url_number") or "")
+        if number:
+            explicit_pr_subjects.add(
+                f"github:{repository + ':' if repository else ''}pr:{number}"
+            )
     for surface, item in sorted(latest.items()):
         status = str(item.get("status") or "").lower()
         if status not in {"failure", "timeout", "pending"}:
@@ -1907,6 +1921,18 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
             )
     if _UNMERGED_PR_CLAIM_RE.search(final_text):
         item = latest.get("pr") or {}
+        evidence_subject = str(item.get("subject") or "")
+        subject_matches_claim = bool(
+            not explicit_pr_subjects
+            or any(
+                claimed == evidence_subject
+                or (
+                    claimed.startswith("github:pr:")
+                    and evidence_subject.endswith(claimed.removeprefix("github:"))
+                )
+                for claimed in explicit_pr_subjects
+            )
+        )
         try:
             detail = json.loads(str(item.get("detail") or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -1914,6 +1940,7 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
         if (
             str(item.get("status") or "").lower() != "success"
             or item.get("unmerged_confirmed", detail.get("unmerged_confirmed")) is not True
+            or not subject_matches_claim
         ):
             if not any(entry.get("surface") == "pr" for entry in blocked):
                 blocked.append(
@@ -1921,7 +1948,11 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                         "surface": "pr",
                         "status": str(item.get("status") or "missing"),
                         "check_name": str(item.get("check_name") or "closed-without-merge proof"),
-                        "detail": str(item.get("detail") or "explicit unmerged proof missing")[:240],
+                        "detail": str(
+                            "PR evidence target does not match the explicit claim"
+                            if not subject_matches_claim
+                            else item.get("detail") or "explicit unmerged proof missing"
+                        )[:240],
                     }
                 )
     if _MAIN_UNCHANGED_CLAIM_RE.search(final_text):
@@ -1951,10 +1982,22 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                 and branch_head_sha == pr_head_sha
             )
         )
+        explicit_target_matches = bool(
+            not explicit_pr_subjects
+            or any(
+                claimed == branch_subject
+                or (
+                    claimed.startswith("github:pr:")
+                    and branch_subject.endswith(claimed.removeprefix("github:"))
+                )
+                for claimed in explicit_pr_subjects
+            )
+        )
         if (
             (
                 str(item.get("status") or "").lower() != "success"
                 or not repository_matches
+                or not explicit_target_matches
             )
             and not any(entry.get("surface") == "main_branch" for entry in blocked)
         ):
@@ -1966,7 +2009,9 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                     "detail": str(
                         item.get("detail")
                         or (
-                            "main branch proof does not match the PR repository and head"
+                            "main branch proof does not match the explicitly claimed PR"
+                            if not explicit_target_matches
+                            else "main branch proof does not match the PR repository and head"
                             if not repository_matches
                             else "main branch SHA proof missing"
                         )
