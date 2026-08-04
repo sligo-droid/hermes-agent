@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "source_id": "client-knowledge",
+  "project_key": "pid",
+  "queries": [
+    "PID Monday status report",
+    "canonical synthesized PID knowledge",
+    "reporting trajectory"
+  ],
+  "required_slugs": [
+    "projects/pid/project",
+    "projects/pid/decisions/project-knowledge-boundary",
+    "projects/pid/trajectories/reporting",
+    "projects/pid/requirements/reporting-cadence"
+  ],
+  "forbidden_visible_text": "ORANGE-NEBULA-7319"
+}

@@ -824,6 +824,19 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _get_denied_child_toolsets() -> List[str]:
+    """Configured toolsets that every delegated child must lose.
+
+    The default is empty to preserve legacy inheritance. Restrictions are
+    applied through ``disabled_toolsets`` so they survive composite expansion
+    and later registry/MCP refreshes.
+    """
+    raw = _load_config().get("denied_toolsets")
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -1555,6 +1568,7 @@ def _build_child_agent(
             inherited_disabled
             + _blocked_toolsets_for_role(effective_role)
             + sorted(disabled_for_child)
+            + _get_denied_child_toolsets()
         )
     )
 

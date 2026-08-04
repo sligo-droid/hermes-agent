@@ -1349,6 +1349,34 @@ class TestBuildSystemPrompt:
 
         assert QMD_MCP_GUIDANCE not in prompt
 
+    def test_client_knowledge_guidance_when_tool_loaded(self):
+        from agent.prompt_builder import CLIENT_KNOWLEDGE_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("client_knowledge_search", "client_knowledge_get"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert CLIENT_KNOWLEDGE_GUIDANCE in prompt
+
+    def test_no_client_knowledge_guidance_without_tool(self, agent):
+        from agent.prompt_builder import CLIENT_KNOWLEDGE_GUIDANCE
+
+        assert CLIENT_KNOWLEDGE_GUIDANCE not in agent._build_system_prompt()
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""

@@ -1,0 +1,8 @@
+name: client-knowledge-gbrain
+version: 1.0.0
+description: "Project-scoped, read-only GBrain client knowledge retrieval."
+author: Sligo Labs
+kind: standalone
+provides_tools:
+  - client_knowledge_search
+  - client_knowledge_get
