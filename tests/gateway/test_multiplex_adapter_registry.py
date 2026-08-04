@@ -3,7 +3,7 @@ import logging
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -196,6 +196,8 @@ def _secondary_recovery_runner(*, running=True):
     runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
     runner._adapter_disconnect_timeout_secs = lambda: 0
     runner._sync_voice_mode_state_to_adapter = lambda adapter: None
+    runner._install_background_worker_reaction_gate = MagicMock()
+    runner._schedule_pending_discord_terminal_reactions = MagicMock()
     return runner
 
 
@@ -225,6 +227,52 @@ def _install_secondary_reconnect_context(monkeypatch, runner, adapter, scoped_ho
 
 
 class TestSecondaryProfileFatalRecovery:
+    @pytest.mark.asyncio
+    async def test_cold_start_uses_profile_scoped_adapter_configuration(
+        self, monkeypatch
+    ):
+        runner = _secondary_recovery_runner()
+        adapter = _SecondaryRecoveryAdapter()
+        seen_auth = object()
+        runner._make_adapter_auth_check = MagicMock(return_value=seen_auth)
+        runner._handle_profile_adapter_fatal_error = AsyncMock()
+
+        async def connect(candidate, platform, *, is_reconnect=False):
+            assert candidate is adapter
+            assert platform is Platform.DISCORD
+            assert is_reconnect is False
+            return True
+
+        runner._connect_adapter_with_timeout = connect
+        runner._create_adapter = lambda _platform, _config: adapter
+        profile_cfg = GatewayConfig(
+            multiplex_profiles=True,
+            platforms={
+                Platform.DISCORD: PlatformConfig(enabled=True, token="profile-token")
+            },
+        )
+
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config",
+            lambda: profile_cfg,
+        )
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", Path("/profiles/reviewer"), {}
+        )
+
+        assert connected == 1
+        runner._make_adapter_auth_check.assert_called_once_with(
+            Platform.DISCORD,
+            profile_name="reviewer",
+        )
+        assert adapter.authorization_check is seen_auth
+        await adapter.fatal_error_handler(adapter)
+        runner._handle_profile_adapter_fatal_error.assert_awaited_once_with(
+            "reviewer",
+            Platform.DISCORD,
+            adapter,
+        )
+
     @pytest.mark.asyncio
     async def test_retryable_secondary_fatal_reconnects_with_its_profile_scope(
         self, monkeypatch
@@ -256,6 +304,13 @@ class TestSecondaryProfileFatalRecovery:
         assert len(tasks) == 1
         await tasks[0]
         assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
+        runner._install_background_worker_reaction_gate.assert_called_once_with(
+            replacement
+        )
+        runner._schedule_pending_discord_terminal_reactions.assert_called_once_with(
+            platform=Platform.DISCORD,
+            profile_name="reviewer",
+        )
         assert scoped_homes
         assert all(path == Path("/profiles/reviewer") for path in scoped_homes)
 

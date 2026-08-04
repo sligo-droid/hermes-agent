@@ -235,10 +235,6 @@ _GH_CHECK_RUNS_PARTS_RE = re.compile(
     r"\bgh\s+api\s+repos/([^\s]+)/commits/([^\s]+)/check-runs\b",
     re.IGNORECASE,
 )
-_MAIN_SHA_MARKER_RE = re.compile(
-    r"(?im)^\s*(MAIN_BEFORE|BASE_BEFORE|MAIN_AFTER|BASE_AFTER|MAIN_NOW|CURRENT_MAIN)="
-    r"([0-9a-f]{40}|[0-9a-f]{64})\s*$"
-)
 _EXPLICIT_DEPLOY_COMMAND_RE = re.compile(
     r"\b(?:vercel|flyctl|railway|render)\b|"
     r"\bgh\s+api\s+repos/[^\s]+/deployments\b|"
@@ -262,6 +258,12 @@ _MAIN_UNCHANGED_CLAIM_RE = re.compile(
     r"\b(?:main|base branch)\b[^.!?\n]{0,100}"
     r"\b(?:unchanged|did not change|stayed the same|remained the same)\b|"
     r"\bno changes?\b[^.!?\n]{0,60}\b(?:main|base branch)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_PR_CLAIM_RE = re.compile(
+    r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\s+|#))?"
+    r"(?:PR|pull request)\s*#?(?P<number>\d+)|"
+    r"(?P<url>https://github\.com/(?P<url_repo>[^/\s]+/[^/\s]+)/pull/(?P<url_number>\d+))",
     re.IGNORECASE,
 )
 
@@ -425,67 +427,6 @@ def _github_evidence_subjects(
     return pr_subject, f"github:{check_repo}:commit:{check_sha}"
 
 
-def _main_branch_evidence(
-    command: str,
-    output: str,
-    payload: dict[str, Any],
-    *,
-    order: int | None,
-) -> list[dict[str, Any]]:
-    markers = {
-        name.lower(): sha.lower()
-        for name, sha in _MAIN_SHA_MARKER_RE.findall(str(output or ""))
-    }
-    attempted = bool(
-        markers
-        or re.search(r"\b(?:MAIN|BASE)_(?:BEFORE|AFTER|NOW)\b|\bCURRENT_MAIN\b", command)
-        or re.search(r"\bheads/main\b", command)
-    )
-    if not attempted:
-        return []
-
-    before = markers.get("main_before") or markers.get("base_before")
-    after = markers.get("main_after") or markers.get("base_after")
-    current = markers.get("main_now") or markers.get("current_main")
-    base_sha = str(payload.get("base_sha") or "").strip().lower()
-    proven = False
-    equal = False
-    if before and after:
-        proven = True
-        equal = before == after
-    elif current and _SHA_RE.fullmatch(base_sha):
-        proven = True
-        equal = current == base_sha
-
-    if not proven:
-        # A one-sided or failed inspection is not branch-state evidence. Keep
-        # any earlier complete SHA comparison authoritative instead of
-        # replacing it with an inconclusive probe.
-        return []
-    status = "success" if equal else "failure"
-    detail = json.dumps(
-        {
-            "before": before,
-            "after": after,
-            "current": current,
-            "base_sha": base_sha,
-            "proven": proven,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return [
-        {
-            "schema_version": 1,
-            "surface": "main_branch",
-            "check_name": "main branch unchanged",
-            "status": status,
-            "order": int(order or 0),
-            "detail": detail[:240],
-        }
-    ]
-
-
 def _github_lifecycle_evidence(
     command: str,
     output: str,
@@ -504,14 +445,6 @@ def _github_lifecycle_evidence(
     evidence: list[dict[str, Any]] = []
     payload = _github_pr_payload(output)
     pr_subject, ci_subject = _github_evidence_subjects(command, payload)
-    evidence.extend(
-        _main_branch_evidence(
-            command,
-            output,
-            payload,
-            order=order,
-        )
-    )
 
     checks_attempted = bool(
         _GH_PR_CHECKS_RE.search(command)
@@ -584,6 +517,9 @@ def _github_lifecycle_evidence(
                 "status": "success" if pr_success else "failure",
                 "order": int(order or 0),
                 "subject": pr_subject,
+                "head_sha": str(
+                    payload.get("head_sha") or payload.get("headRefOid") or ""
+                ).strip().lower(),
                 "merged_confirmed": merged_confirmed,
                 "unmerged_confirmed": unmerged_confirmed,
                 "detail": json.dumps(
@@ -1286,6 +1222,99 @@ def classify_tool_verification_evidence(
     raw_check_name = str(args.get("command") or args.get("url") or args.get("route") or name)
     check_name = _text(raw_check_name, limit=160)
 
+    if name == "verify_main_parent":
+        receipt = data.get("main_branch_evidence")
+        pr_receipt = data.get("pr_evidence")
+        if (
+            data.get("error") is None
+            and isinstance(data.get("success"), bool)
+            and data.get("exit_code") in {0, 1}
+            and isinstance(receipt, dict)
+            and isinstance(pr_receipt, dict)
+        ):
+            repository = str(data.get("repository") or "").lower()
+            repository_root = str(data.get("repository_root") or "")
+            try:
+                pr_number = int(data.get("pr_number") or 0)
+            except (TypeError, ValueError):
+                pr_number = 0
+            head_sha = str(data.get("head_sha") or "").lower()
+            pr_head_sha = str(pr_receipt.get("head_sha") or "").lower()
+            pr_status = str(pr_receipt.get("status") or "")
+            remote_main = str(receipt.get("remote_main") or "").lower()
+            commit_parent = str(receipt.get("commit_parent") or "").lower()
+            status = str(receipt.get("status") or "")
+            if (
+                re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", repository)
+                and repository_root
+                and pr_number > 0
+                and pr_status in {"success", "failure"}
+                and status in {"success", "failure"}
+                and _SHA_RE.fullmatch(head_sha)
+                and _SHA_RE.fullmatch(pr_head_sha)
+                and _SHA_RE.fullmatch(remote_main)
+                and _SHA_RE.fullmatch(commit_parent)
+                and (status == "success") == (
+                    remote_main == commit_parent and head_sha == pr_head_sha
+                )
+                and data.get("success") == (
+                    status == "success" and pr_status == "success"
+                )
+                and data.get("exit_code") == (
+                    0 if status == "success" and pr_status == "success" else 1
+                )
+                and (status == "failure" or pr_status == "failure" or not is_error)
+            ):
+                subject = f"github:{repository}:pr:{pr_number}"
+                pr_verified = bool(
+                    pr_status == "success"
+                    and str(pr_receipt.get("state") or "") == "closed"
+                    and pr_receipt.get("merged") is False
+                    and str(pr_receipt.get("base_ref") or "") == "main"
+                )
+                return [
+                    {
+                        "schema_version": 1,
+                        "surface": "pr",
+                        "check_name": f"typed closed PR verification {repository}#{pr_number}",
+                        "status": "success" if pr_verified else "failure",
+                        "order": int(order or 0),
+                        "subject": subject,
+                        "provenance": "typed_host",
+                        "trust_rank": 2,
+                        "head_sha": pr_head_sha,
+                        "merged_confirmed": pr_receipt.get("merged") is True,
+                        "unmerged_confirmed": pr_verified,
+                        "detail": json.dumps(pr_receipt, sort_keys=True, separators=(",", ":"))[:240],
+                    },
+                    {
+                        "schema_version": 1,
+                        "surface": "main_branch",
+                        "check_name": "typed PR head and origin/main parent comparison",
+                        "status": status,
+                        "order": int(order or 0),
+                        "subject": subject,
+                        "provenance": "typed_host",
+                        "trust_rank": 2,
+                        "head_sha": head_sha,
+                        "detail": json.dumps(
+                            {
+                                "repository": repository,
+                                "repository_root": repository_root,
+                                "pr_number": pr_number,
+                                "head_sha": head_sha,
+                                "pr_head_sha": pr_head_sha,
+                                "remote_main": remote_main,
+                                "commit_parent": commit_parent,
+                                "proven": True,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )[:240],
+                    },
+                ]
+        return []
+
     if name == "terminal" and _PROTECTED_CHECKOUT_GUARDRAIL_RE.search(result_text):
         return []
 
@@ -1460,6 +1489,8 @@ def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
             new_subject = str(item.get("subject") or "")
             current_status = str((current or {}).get("status") or "").lower()
             new_status = str(item.get("status") or "").lower()
+            current_trust = int((current or {}).get("trust_rank") or 0)
+            new_trust = int(item.get("trust_rank") or 0)
             same_subject = current_subject == new_subject
             if not same_subject and current_subject and new_subject:
                 current_pr = re.fullmatch(r"github:(?:(.+):)?pr:(\d+)", current_subject)
@@ -1492,9 +1523,26 @@ def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
                 and current_status in {"failure", "timeout", "pending"}
                 and new_status == "success"
             )
+            unrelated_equal_priority_subject_is_not_a_repair = bool(
+                surface in {"pr", "main_branch"}
+                and current
+                and current_subject
+                and new_subject
+                and not same_subject
+                and new_rank == current_rank
+            )
+            lower_trust_cannot_replace = bool(
+                current
+                and current_subject
+                and new_subject
+                and same_subject
+                and new_trust < current_trust
+            )
             if (
                 not unrelated_lower_priority_subject
                 and not unrelated_equal_priority_success_cannot_clear_failure
+                and not unrelated_equal_priority_subject_is_not_a_repair
+                and not lower_trust_cannot_replace
                 and (current is None or order >= int(current.get("order") or 0))
             ):
                 normalized_item = dict(item)
@@ -1850,6 +1898,23 @@ def _surface_downgraded(text: str, surface: str, item: dict[str, Any]) -> bool:
 def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]:
     latest = latest_evidence_by_surface(evidence)
     blocked = []
+    explicit_pr_subjects = set()
+    claim_sentences = [
+        sentence
+        for sentence in _SENTENCE_SPLIT_RE.split(str(final_text or ""))
+        if _UNMERGED_PR_CLAIM_RE.search(sentence)
+        or _MAIN_UNCHANGED_CLAIM_RE.search(sentence)
+    ]
+    for sentence in claim_sentences:
+        for match in _EXPLICIT_PR_CLAIM_RE.finditer(sentence):
+            repository = str(
+                match.group("repo") or match.group("url_repo") or ""
+            ).lower()
+            number = str(match.group("number") or match.group("url_number") or "")
+            if number:
+                explicit_pr_subjects.add(
+                    f"github:{repository + ':' if repository else ''}pr:{number}"
+                )
     for surface, item in sorted(latest.items()):
         status = str(item.get("status") or "").lower()
         if status not in {"failure", "timeout", "pending"}:
@@ -1865,6 +1930,18 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
             )
     if _UNMERGED_PR_CLAIM_RE.search(final_text):
         item = latest.get("pr") or {}
+        evidence_subject = str(item.get("subject") or "")
+        subject_matches_claim = bool(
+            not explicit_pr_subjects
+            or all(
+                claimed == evidence_subject
+                or (
+                    claimed.startswith("github:pr:")
+                    and evidence_subject.endswith(claimed.removeprefix("github:"))
+                )
+                for claimed in explicit_pr_subjects
+            )
+        )
         try:
             detail = json.loads(str(item.get("detail") or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -1872,6 +1949,7 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
         if (
             str(item.get("status") or "").lower() != "success"
             or item.get("unmerged_confirmed", detail.get("unmerged_confirmed")) is not True
+            or not subject_matches_claim
         ):
             if not any(entry.get("surface") == "pr" for entry in blocked):
                 blocked.append(
@@ -1879,13 +1957,57 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                         "surface": "pr",
                         "status": str(item.get("status") or "missing"),
                         "check_name": str(item.get("check_name") or "closed-without-merge proof"),
-                        "detail": str(item.get("detail") or "explicit unmerged proof missing")[:240],
+                        "detail": str(
+                            "PR evidence target does not match the explicit claim"
+                            if not subject_matches_claim
+                            else item.get("detail") or "explicit unmerged proof missing"
+                        )[:240],
                     }
                 )
     if _MAIN_UNCHANGED_CLAIM_RE.search(final_text):
         item = latest.get("main_branch") or {}
+        pr_item = latest.get("pr") or {}
+        branch_subject = str(item.get("subject") or "")
+        pr_subject = str(pr_item.get("subject") or "")
+        branch_match = re.fullmatch(r"github:(.+):pr:(\d+)", branch_subject)
+        pr_match = re.fullmatch(r"github:(?:(.+):)?pr:\d+", pr_subject)
+        branch_head_sha = str(item.get("head_sha") or "").lower()
+        pr_head_sha = str(pr_item.get("head_sha") or "").lower()
+        if not pr_head_sha:
+            try:
+                pr_detail = json.loads(str(pr_item.get("detail") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pr_detail = {}
+            pr_head_sha = str(pr_detail.get("head_sha") or "").lower()
+        repository_matches = bool(
+            not pr_subject
+            or (
+                branch_match
+                and pr_match
+                and pr_match.group(1)
+                and branch_match.group(1) == pr_match.group(1)
+                and branch_subject == pr_subject
+                and _SHA_RE.fullmatch(branch_head_sha)
+                and branch_head_sha == pr_head_sha
+            )
+        )
+        explicit_target_matches = bool(
+            not explicit_pr_subjects
+            or all(
+                claimed == branch_subject
+                or (
+                    claimed.startswith("github:pr:")
+                    and branch_subject.endswith(claimed.removeprefix("github:"))
+                )
+                for claimed in explicit_pr_subjects
+            )
+        )
         if (
-            str(item.get("status") or "").lower() != "success"
+            (
+                str(item.get("status") or "").lower() != "success"
+                or not repository_matches
+                or not explicit_target_matches
+            )
             and not any(entry.get("surface") == "main_branch" for entry in blocked)
         ):
             blocked.append(
@@ -1893,7 +2015,16 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                     "surface": "main_branch",
                     "status": str(item.get("status") or "missing"),
                     "check_name": str(item.get("check_name") or "main branch SHA comparison"),
-                    "detail": str(item.get("detail") or "main branch SHA proof missing")[:240],
+                    "detail": str(
+                        item.get("detail")
+                        or (
+                            "main branch proof does not match the explicitly claimed PR"
+                            if not explicit_target_matches
+                            else "main branch proof does not match the PR repository and head"
+                            if not repository_matches
+                            else "main branch SHA proof missing"
+                        )
+                    )[:240],
                 }
             )
     return {

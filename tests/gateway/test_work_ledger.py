@@ -1037,6 +1037,30 @@ def test_completion_marks_terminal_reaction_for_later_discord_sync(tmp_path):
     ]
 
 
+def test_terminal_reaction_identity_is_profile_scoped(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    items = []
+    for message_id, profile in (("first", None), ("second", "reviewer")):
+        event = _discord_event(message_id=message_id)
+        event.source.profile = profile
+        item = ledger.accept_event(
+            event,
+            session_key=build_session_key(event.source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert ledger.mark_completed(item["id"])
+        items.append(item)
+
+    pending = ledger.pending_terminal_reaction_items()
+    assert {item["id"] for item in pending} == {item["id"] for item in items}
+
+    assert ledger.mark_discord_thread_reaction_synced(items[1])
+    assert [item["id"] for item in ledger.pending_terminal_reaction_items()] == [
+        items[0]["id"]
+    ]
+
+
 def test_run_state_cas_finalizes_only_unchanged_active_run(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     event = _discord_event(message_id="run-state-success")

@@ -2,13 +2,21 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource, build_session_key
+from gateway.work_ledger import GatewayWorkLedger
 
 
 class StubAdapter(BasePlatformAdapter):
@@ -187,6 +195,7 @@ class TestPlatformReconnectWatcher:
         """Watcher should reconnect a failed platform when connect() succeeds."""
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._schedule_pending_discord_terminal_reactions = MagicMock()
 
         platform_config = PlatformConfig(enabled=True, token="test")
         runner._failed_platforms[Platform.TELEGRAM] = {
@@ -220,6 +229,486 @@ class TestPlatformReconnectWatcher:
 
         assert Platform.TELEGRAM not in runner._failed_platforms
         assert Platform.TELEGRAM in runner.adapters
+        runner._schedule_pending_discord_terminal_reactions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discord_reconnect_retries_pending_terminal_reactions(self):
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._schedule_pending_discord_terminal_reactions = MagicMock(return_value=1)
+        runner._failed_platforms[Platform.DISCORD] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+        }
+
+        succeed_adapter = StubAdapter(platform=Platform.DISCORD, succeed=True)
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=succeed_adapter):
+            with patch("gateway.run.build_channel_directory", create=True):
+                async def run_one_iteration():
+                    runner._running = True
+                    call_count = 0
+
+                    async def fake_sleep(_seconds):
+                        nonlocal call_count
+                        call_count += 1
+                        if call_count > 1:
+                            runner._running = False
+                        await real_sleep(0)
+
+                    with patch("asyncio.sleep", side_effect=fake_sleep):
+                        await runner._platform_reconnect_watcher()
+
+                await run_one_iteration()
+
+        runner._schedule_pending_discord_terminal_reactions.assert_called_once_with(
+            platform=Platform.DISCORD,
+            profile_name="default",
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_scheduler_is_profile_scoped(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        primary_reconcile = AsyncMock(return_value="done")
+        reviewer_reconcile = AsyncMock(return_value="done")
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=primary_reconcile
+            )
+        }
+        runner._profile_adapters = {
+            "reviewer": {
+                Platform.DISCORD: SimpleNamespace(
+                    reconcile_work_ledger_thread_reaction=reviewer_reconcile
+                )
+            }
+        }
+
+        for message_id, profile in (("1000", None), ("2000", "reviewer")):
+            source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="1000",
+                chat_type="thread",
+                thread_id="1000",
+                message_id=message_id,
+                profile=profile,
+            )
+            event = MessageEvent(
+                text="complete work",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=message_id,
+            )
+            item = runner.work_ledger.accept_event(
+                event,
+                session_key=build_session_key(source),
+                freshness_seconds=60,
+            )
+            assert item is not None
+            assert runner.work_ledger.mark_completed(item["id"])
+
+        scheduled = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="reviewer",
+        )
+        await asyncio.gather(*tuple(runner._background_tasks))
+
+        assert scheduled == 1
+        reviewer_reconcile.assert_awaited_once()
+        primary_reconcile.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_scheduler_does_not_fallback_to_primary_profile(
+        self, tmp_path
+    ):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        primary_reconcile = AsyncMock(return_value="done")
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=primary_reconcile
+            )
+        }
+        runner._profile_adapters = {}
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+            profile="reviewer",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        scheduled = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="reviewer",
+        )
+
+        assert scheduled == 0
+        assert runner._background_tasks == set()
+        primary_reconcile.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_scheduler_deduplicates_inflight_work(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        release = asyncio.Event()
+
+        async def reconcile(_item, _state, *, acknowledge=True):
+            assert acknowledge is False
+            await release.wait()
+            return "done"
+
+        reconcile_mock = AsyncMock(side_effect=reconcile)
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=reconcile_mock
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        first = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="default",
+        )
+        second = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="default",
+        )
+
+        assert first == 1
+        assert second == 0
+        release.set()
+        await asyncio.gather(*tuple(runner._background_tasks))
+        reconcile_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_replays_newer_state_after_inflight_sync(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def reconcile(_item, state, *, acknowledge=True):
+            assert acknowledge is False
+            if not started.is_set():
+                started.set()
+                await release.wait()
+                return "running"
+            return state
+
+        reconcile_mock = AsyncMock(side_effect=reconcile)
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=reconcile_mock
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+
+        assert runner._schedule_discord_terminal_reaction(item)
+        await started.wait()
+        completion = asyncio.create_task(
+            runner._reconcile_discord_terminal_reaction(item, "done")
+        )
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await completion == "done"
+        await asyncio.gather(*tuple(runner._background_tasks))
+        assert [call.args[1] for call in reconcile_mock.await_args_list] == [None, "done"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_replays_on_replacement_adapter(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fail_old(_item, _state, *, acknowledge=True):
+            assert acknowledge is False
+            started.set()
+            await release.wait()
+            raise RuntimeError("adapter disconnected")
+
+        old_reconcile = AsyncMock(side_effect=fail_old)
+        async def reconcile_new(_item, _state, *, acknowledge=True):
+            assert acknowledge is False
+            return "done"
+
+        new_reconcile = AsyncMock(side_effect=reconcile_new)
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=old_reconcile
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        assert runner._schedule_discord_terminal_reaction(item)
+        await started.wait()
+        runner.adapters[Platform.DISCORD] = SimpleNamespace(
+            reconcile_work_ledger_thread_reaction=new_reconcile
+        )
+        assert not runner._schedule_discord_terminal_reaction(item)
+        release.set()
+
+        await asyncio.gather(*tuple(runner._background_tasks))
+        old_reconcile.assert_awaited_once()
+        new_reconcile.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_superseded_success_does_not_acknowledge_failed_newer_state(
+        self, tmp_path
+    ):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def reconcile(_item, state, *, acknowledge=True):
+            assert acknowledge is False
+            if state is None:
+                started.set()
+                await release.wait()
+                return "running"
+            return None
+
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=AsyncMock(
+                    side_effect=reconcile
+                )
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        assert runner._schedule_discord_terminal_reaction(item)
+        await started.wait()
+        completion = asyncio.create_task(
+            runner._reconcile_discord_terminal_reaction(item, "done")
+        )
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await completion is None
+        await asyncio.gather(*tuple(runner._background_tasks))
+        assert [pending["id"] for pending in runner.work_ledger.pending_terminal_reaction_items()] == [
+            item["id"]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_old_adapter_success_does_not_acknowledge_failed_replacement(
+        self, tmp_path
+    ):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def reconcile_old(_item, _state, *, acknowledge=True):
+            assert acknowledge is False
+            started.set()
+            await release.wait()
+            return "done"
+
+        async def reconcile_new(_item, _state, *, acknowledge=True):
+            assert acknowledge is False
+            return None
+
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=AsyncMock(
+                    side_effect=reconcile_old
+                )
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        assert runner._schedule_discord_terminal_reaction(item)
+        await started.wait()
+        runner.adapters[Platform.DISCORD] = SimpleNamespace(
+            reconcile_work_ledger_thread_reaction=AsyncMock(
+                side_effect=reconcile_new
+            )
+        )
+        assert not runner._schedule_discord_terminal_reaction(item)
+        release.set()
+
+        await asyncio.gather(*tuple(runner._background_tasks))
+        assert [pending["id"] for pending in runner.work_ledger.pending_terminal_reaction_items()] == [
+            item["id"]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_direct_terminal_reaction_drain_is_runner_owned(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def reconcile(_item, _state, *, acknowledge=True):
+            assert acknowledge is False
+            started.set()
+            await release.wait()
+            return "done"
+
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=AsyncMock(
+                    side_effect=reconcile
+                )
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+
+        caller = asyncio.create_task(
+            runner._reconcile_discord_terminal_reaction(item, "done")
+        )
+        await started.wait()
+        assert len(runner._background_tasks) == 1
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        drain = next(iter(runner._background_tasks))
+        drain.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+        assert runner._background_tasks == set()
 
     @pytest.mark.asyncio
     async def test_reconnect_passes_is_reconnect_true(self):

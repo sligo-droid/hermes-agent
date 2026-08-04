@@ -6479,6 +6479,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         item: Dict[str, Any],
         state: Optional[str] = None,
+        *,
+        acknowledge: bool = True,
     ) -> Optional[str]:
         """Repair every persisted terminal visual for a Discord work item.
 
@@ -6604,7 +6606,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 return None
             if not await self._set_message_reaction_state(message, emoji):
                 return None
-        ledger.mark_discord_thread_reaction_synced(item)
+        if acknowledge:
+            ledger.mark_discord_thread_reaction_synced(item)
         return resolved_state
 
     async def _mark_feature_summary_running(self, event: MessageEvent) -> None:
@@ -7310,7 +7313,16 @@ class DiscordAdapter(BasePlatformAdapter):
             # The persisted terminal reconciliation covers both the summary
             # embed and its OP.  Do not fall through and clear its retry marker
             # after only attempting the event's raw-message reaction.
-            await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
+            runner = getattr(self, "gateway_runner", None)
+            reconcile_current = getattr(
+                runner, "_reconcile_discord_terminal_reaction", None
+            )
+            if callable(reconcile_current):
+                await reconcile_current(work_item, ledger_state)
+            else:
+                await self.reconcile_work_ledger_thread_reaction(
+                    work_item, ledger_state
+                )
             return
         action_lifecycle = self._action_lifecycle_enabled(event)
         is_premium_event = action_lifecycle and (self._is_fable_event(event) or self._is_opus_event(event))

@@ -8996,8 +8996,32 @@ class _GatewayRunnerCore(
             task.add_done_callback(self._background_tasks.discard)
             scheduled += 1
 
+        self._schedule_pending_discord_terminal_reactions()
+
+        if scheduled:
+            logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
+        return scheduled
+
+    def _schedule_pending_discord_terminal_reactions(
+        self,
+        *,
+        platform: Platform | None = None,
+        profile_name: str | None = None,
+    ) -> int:
+        """Retry durable terminal reactions against the currently connected adapter."""
+
+        ledger = self._ledger()
+        scheduled = 0
         for item in ledger.pending_terminal_reaction_items():
             work_id = str(item.get("id") or "")
+            item_profile = str(
+                (item.get("source") if isinstance(item.get("source"), dict) else {}).get(
+                    "profile"
+                )
+                or "default"
+            )
+            if profile_name is not None and item_profile != profile_name:
+                continue
             try:
                 event = ledger.event_from_item(item)
             except Exception as exc:
@@ -9007,31 +9031,137 @@ class _GatewayRunnerCore(
                     exc,
                 )
                 continue
-            adapter = self._adapter_for_source(event.source)
+            if platform is not None and event.source.platform is not platform:
+                continue
+            adapter = self._discord_terminal_reaction_adapter(event.source)
             reconcile = getattr(adapter, "reconcile_work_ledger_thread_reaction", None)
             if not callable(reconcile):
                 continue
+            if self._schedule_discord_terminal_reaction(item):
+                scheduled += 1
 
-            async def _reconcile(
-                persisted_item: Dict[str, Any] = item,
-                callback: Any = reconcile,
-            ) -> None:
-                try:
-                    await callback(persisted_item)
-                except Exception:
-                    logger.warning(
-                        "Discord terminal reaction reconciliation failed for %s",
-                        persisted_item.get("id"),
-                        exc_info=True,
-                    )
-
-            task = asyncio.create_task(_reconcile())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-
-        if scheduled:
-            logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
         return scheduled
+
+    @staticmethod
+    def _discord_terminal_reaction_task_key(item: Dict[str, Any]) -> tuple[str, str, str, str]:
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        return (
+            str(source.get("profile") or "default"),
+            str(source.get("guild_id") or ""),
+            str(source.get("parent_chat_id") or ""),
+            str(source.get("thread_id") or source.get("chat_id") or ""),
+        )
+
+    def _discord_terminal_reaction_adapter(
+        self,
+        source: SessionSource,
+    ) -> BasePlatformAdapter | None:
+        """Return the exact profile adapter without cross-profile fallback."""
+
+        profile = str(getattr(source, "profile", None) or "default")
+        if profile != "default":
+            return getattr(self, "_profile_adapters", {}).get(profile, {}).get(
+                source.platform
+            )
+        return getattr(self, "adapters", {}).get(source.platform)
+
+    async def _reconcile_discord_terminal_reaction(
+        self,
+        item: Dict[str, Any],
+        state: str | None = None,
+    ) -> str | None:
+        """Serialize one durable Discord reaction repair across lifecycle paths."""
+
+        task, _created = self._request_discord_terminal_reaction(item, state)
+        return await asyncio.shield(task)
+
+    def _request_discord_terminal_reaction(
+        self,
+        item: Dict[str, Any],
+        state: str | None,
+    ) -> tuple[asyncio.Task, bool]:
+        requests = self.__dict__.setdefault("_discord_terminal_reaction_requests", {})
+        key = self._discord_terminal_reaction_task_key(item)
+        try:
+            event = self._ledger().event_from_item(item)
+            adapter = self._discord_terminal_reaction_adapter(event.source)
+        except Exception:
+            adapter = None
+        token = (str(item.get("id") or ""), state, id(adapter))
+        existing = requests.get(key)
+        if isinstance(existing, dict):
+            task = existing.get("task")
+            if isinstance(task, asyncio.Task) and not task.done():
+                if existing.get("token") != token:
+                    existing["item"] = item
+                    existing["state"] = state
+                    existing["token"] = token
+                    existing["version"] = int(existing.get("version") or 0) + 1
+                return task, False
+
+        request = {
+            "item": item,
+            "state": state,
+            "token": token,
+            "version": 1,
+        }
+        task = asyncio.create_task(
+            self._drain_discord_terminal_reaction(key, request)
+        )
+        request["task"] = task
+        requests[key] = request
+        self._background_tasks.add(task)
+
+        def _cleanup(done: asyncio.Task) -> None:
+            self._background_tasks.discard(done)
+
+        task.add_done_callback(_cleanup)
+        return task, True
+
+    async def _drain_discord_terminal_reaction(
+        self,
+        key: tuple[str, str, str, str],
+        request: Dict[str, Any],
+    ) -> str | None:
+        requests = self.__dict__.setdefault("_discord_terminal_reaction_requests", {})
+        result = None
+        try:
+            while True:
+                version = int(request.get("version") or 0)
+                item = request.get("item")
+                state = request.get("state")
+                result = await self._run_discord_terminal_reaction(item, state)
+                if int(request.get("version") or 0) == version:
+                    if result is not None:
+                        self._ledger().mark_discord_thread_reaction_synced(item)
+                    return result
+        finally:
+            if requests.get(key) is request:
+                requests.pop(key, None)
+
+    async def _run_discord_terminal_reaction(
+        self,
+        item: Dict[str, Any],
+        state: str | None,
+    ) -> str | None:
+        try:
+            event = self._ledger().event_from_item(item)
+            adapter = self._discord_terminal_reaction_adapter(event.source)
+            reconcile = getattr(adapter, "reconcile_work_ledger_thread_reaction", None)
+            if not callable(reconcile):
+                return None
+            return await reconcile(item, state, acknowledge=False)
+        except Exception:
+            logger.warning(
+                "Discord terminal reaction reconciliation failed for %s",
+                item.get("id"),
+                exc_info=True,
+            )
+            return None
+
+    def _schedule_discord_terminal_reaction(self, item: Dict[str, Any]) -> bool:
+        task, created = self._request_discord_terminal_reaction(item, None)
+        return created
 
     def _schedule_terminal_delivery_retry(self, work_id: str, *, attempt: int) -> bool:
         """Schedule one bounded, deduplicated retry without invoking a model."""
@@ -14902,6 +15032,17 @@ class _GatewayRunnerCore(
                                 platform.value,
                                 exc_info=True,
                             )
+                        if platform is Platform.DISCORD:
+                            try:
+                                self._schedule_pending_discord_terminal_reactions(
+                                    platform=platform,
+                                    profile_name="default",
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "terminal reaction reschedule after Discord reconnect failed",
+                                    exc_info=True,
+                                )
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
                         self._update_platform_runtime_status(
@@ -15700,12 +15841,7 @@ class _GatewayRunnerCore(
                     continue
                 claimed[(platform, fp)] = profile_name
 
-            adapter.set_message_handler(self._make_profile_message_handler(profile_name))
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter._busy_text_mode = self._busy_text_mode
+            self._configure_profile_adapter(adapter, profile_name, platform)
 
             try:
                 with _profile_runtime_scope(profile_home):
@@ -15779,7 +15915,13 @@ class _GatewayRunnerCore(
                         profile_map = self._profile_adapters.setdefault(profile_name, {})
                         if platform not in profile_map:
                             profile_map[platform] = adapter
+                            self._install_background_worker_reaction_gate(adapter)
                             self._sync_voice_mode_state_to_adapter(adapter)
+                            if platform is Platform.DISCORD:
+                                self._schedule_pending_discord_terminal_reactions(
+                                    platform=platform,
+                                    profile_name=profile_name,
+                                )
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,

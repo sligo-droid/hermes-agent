@@ -17,8 +17,12 @@ from tools.read_only_verification_tool import (
     _with_verification_cgroup,
     _prepared_dependency_roots,
     _verification_environment,
+    _github_origin_repository,
+    _github_main_sha,
+    _trusted_executable,
     parse_read_only_verification_command,
     read_only_verify,
+    verify_main_parent,
 )
 from tools.git_inspection_tool import git_inspect
 
@@ -44,6 +48,142 @@ def _observation_workspace_boundary(tmp_path, monkeypatch):
 )
 def test_read_only_verification_parser_rejects_shell_and_unbounded_commands(command):
     argv, error = parse_read_only_verification_command(command)
+    assert argv is None
+    assert error
+
+
+def test_read_only_verification_parser_allows_git_diff_check():
+    argv, error = parse_read_only_verification_command("git diff --check")
+
+    assert argv == ["git", "diff", "--check"]
+    assert error is None
+
+
+def test_read_only_verification_parser_rejects_main_parent_pseudo_command():
+    argv, error = parse_read_only_verification_command("verify-main-parent")
+
+    assert argv is None
+    assert error
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./verify-main-parent",
+        "verify-main-parent extra",
+        "verify-main-parent && git status",
+    ],
+)
+def test_read_only_verification_parser_rejects_main_parent_probe_variants(command):
+    argv, error = parse_read_only_verification_command(command)
+
+    assert argv is None
+    assert error
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("https://github.com/example/repo.git", "example/repo"),
+        ("git@github.com:example/repo.git", "example/repo"),
+        ("ssh://git@github.com/example/repo", "example/repo"),
+    ],
+)
+def test_github_origin_repository_accepts_canonical_github_origins(
+    tmp_path, origin, expected
+):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "remote", "add", "origin", origin)
+
+    assert _github_origin_repository(repo) == expected
+
+
+def test_github_origin_repository_rejects_repository_transport_overrides(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "remote", "add", "origin", "file:///tmp/fake.git")
+    _git(repo, "config", "url.https://github.com/example/repo.git.insteadOf", "file:///tmp/fake.git")
+
+    assert _github_origin_repository(repo) is None
+
+
+def test_github_origin_repository_ignores_inherited_git_dir(tmp_path, monkeypatch):
+    victim = tmp_path / "victim"
+    spoof = tmp_path / "spoof"
+    _init_repo(victim)
+    _init_repo(spoof)
+    _git(victim, "remote", "add", "origin", "https://github.com/owner/victim.git")
+    _git(spoof, "remote", "add", "origin", "https://github.com/owner/spoof.git")
+    monkeypatch.setenv("GIT_DIR", str(spoof / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(spoof))
+
+    assert _github_origin_repository(victim) == "owner/victim"
+
+
+def test_trusted_executable_ignores_ambient_path(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "gh"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    assert _trusted_executable("gh") != str(fake)
+
+
+def test_github_main_sha_forces_github_host_and_sanitized_environment(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout=b"a" * 40 + b"\n", stderr=b"")
+
+    monkeypatch.setattr(
+        verification_tool,
+        "_trusted_executable",
+        lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(verification_tool.subprocess, "run", fake_run)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("GH_HOST", "evil.example")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh-config"))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "spoof.git"))
+
+    sha, error = _github_main_sha("owner/repo", tmp_path)
+
+    assert sha == "a" * 40
+    assert error == b""
+    assert captured["argv"][:5] == [
+        "/usr/bin/gh",
+        "api",
+        "--hostname",
+        "github.com",
+        "repos/owner/repo/git/ref/heads/main",
+    ]
+    assert captured["env"]["PATH"] == os.defpath
+    assert "GH_HOST" not in captured["env"]
+    assert "GH_CONFIG_DIR" not in captured["env"]
+    assert "GIT_DIR" not in captured["env"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./git diff --check",
+        "bin/git diff --check",
+        "../../git diff --check",
+        "/usr/bin/git diff --check",
+        "git diff --check HEAD",
+        "git diff HEAD --check",
+    ],
+)
+def test_read_only_verification_parser_rejects_git_diff_check_variants(command):
+    argv, error = parse_read_only_verification_command(command)
+
     assert argv is None
     assert error
 
@@ -99,6 +239,100 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "init")
     _git(repo, "config", "user.email", "tests@example.com")
     _git(repo, "config", "user.name", "Hermes Tests")
+
+
+def test_read_only_verify_main_parent_returns_typed_evidence(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "remote", "add", "origin", "git@github.com:example/repo.git")
+    (repo / "file.txt").write_text("branch\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "branch")
+
+    base_sha = _git(repo, "rev-parse", "HEAD^").stdout.strip()
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_main_sha",
+        lambda _repository, _cwd: (base_sha, b""),
+    )
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_pull_state",
+        lambda _repository, _number, _cwd: (
+            {
+                "number": 7,
+                "state": "closed",
+                "merged": False,
+                "merged_at": None,
+                "head": {"sha": _git(repo, "rev-parse", "HEAD").stdout.strip()},
+                "base": {"ref": "main"},
+            },
+            b"",
+        ),
+    )
+    payload = json.loads(verify_main_parent(pr_number=7, workdir=str(repo)))
+
+    assert payload["success"] is True
+    assert payload["repository"] == "example/repo"
+    assert payload["repository_root"] == str(repo)
+    assert payload["head_sha"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert payload["main_branch_evidence"] == {
+        "status": "success",
+        "remote_main": base_sha,
+        "commit_parent": base_sha,
+    }
+
+
+def test_read_only_verify_main_parent_reports_mismatch(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "remote", "add", "origin", "https://github.com/example/repo.git")
+    _git(repo, "checkout", "-b", "topic")
+    _git(repo, "checkout", "main")
+    (repo / "file.txt").write_text("remote advanced\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "remote advanced")
+    _git(repo, "checkout", "topic")
+    (repo / "file.txt").write_text("branch\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "branch")
+
+    remote_sha = _git(repo, "rev-parse", "main").stdout.strip()
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_main_sha",
+        lambda _repository, _cwd: (remote_sha, b""),
+    )
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_pull_state",
+        lambda _repository, _number, _cwd: (
+            {
+                "number": 7,
+                "state": "closed",
+                "merged": False,
+                "merged_at": None,
+                "head": {"sha": _git(repo, "rev-parse", "HEAD").stdout.strip()},
+                "base": {"ref": "main"},
+            },
+            b"",
+        ),
+    )
+    payload = json.loads(verify_main_parent(pr_number=7, workdir=str(repo)))
+
+    assert payload["success"] is False
+    assert payload["exit_code"] == 1
+    assert payload["head_sha"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert payload["main_branch_evidence"]["status"] == "failure"
+    assert (
+        payload["main_branch_evidence"]["remote_main"]
+        != payload["main_branch_evidence"]["commit_parent"]
+    )
 
 
 def test_read_only_verify_uses_disposable_snapshot_and_cleans_artifacts(

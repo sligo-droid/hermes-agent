@@ -4,6 +4,8 @@ import json
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from agent import conversation_loop, tool_executor
 from agent.visual_assertions import visual_assertion_contract_id
 from agent.visual_qa import (
@@ -1246,6 +1248,35 @@ CURRENT_MAIN=1aa02906ca5cd01c377e67c8e404c8add905c210"""
         repaired,
         False,
     )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "verify_main_parent",
+        {"pr_number": 1092, "workdir": "/tmp/example"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "example/repo",
+                "repository_root": "/tmp/example",
+                "pr_number": 1092,
+                "head_sha": "37e518f6fd949fc794c5299bbd90c3578d4b5a60",
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "37e518f6fd949fc794c5299bbd90c3578d4b5a60",
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": "1aa02906ca5cd01c377e67c8e404c8add905c210",
+                    "commit_parent": "1aa02906ca5cd01c377e67c8e404c8add905c210",
+                },
+            }
+        ),
+        False,
+    )
 
     latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
     assert latest["pr"]["status"] == "success"
@@ -1448,6 +1479,36 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
         repaired,
         False,
     )
+    sha = "196820e67e9e2f2420033ef62aae56c2f5f3b589"
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "verify_main_parent",
+        {"pr_number": 1093, "workdir": "/tmp/pid"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "sligo-labs/pid",
+                "repository_root": "/tmp/pid",
+                "pr_number": 1093,
+                "head_sha": "ab9c14ac44cbfa49fdf598feea2694bf0d713a40",
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "ab9c14ac44cbfa49fdf598feea2694bf0d713a40",
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": sha,
+                    "commit_parent": sha,
+                },
+            }
+        ),
+        False,
+    )
     final = (
         "Commit `ab9c14a` was pushed and PR #1093 checks passed. "
         "The PR was closed without merge, and main remained unchanged."
@@ -1460,6 +1521,756 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
 
     assert constraints["allowed"] is True
     assert downgraded == final
+
+
+def test_typed_main_parent_receipt_proves_main_unchanged():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    output = json.dumps(
+        {
+            "success": True,
+            "exit_code": 0,
+            "error": None,
+            "repository": "example/repo",
+            "repository_root": "/tmp/example",
+            "pr_number": 7,
+            "head_sha": "7" * 40,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": "7" * 40,
+            },
+            "main_branch_evidence": {
+                "status": "success",
+                "remote_main": "9954a1c87a4f280de22d3b3767f0b19185588062",
+                "commit_parent": "9954a1c87a4f280de22d3b3767f0b19185588062",
+            },
+        }
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "verify_main_parent",
+        {"pr_number": 7, "workdir": "/tmp/example"},
+        output,
+        False,
+    )
+    final = "Main remained unchanged."
+
+    downgraded, constraints = downgrade_final_response_for_evidence(
+        final,
+        agent._turn_runtime_stats["verification_evidence"],
+    )
+
+    assert constraints["allowed"] is True
+    assert constraints["latest_by_surface"]["main_branch"]["status"] == "success"
+    assert downgraded == final
+
+
+def test_main_parent_receipt_must_match_pr_repository():
+    sha = "9" * 40
+    pr_evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh api repos/owner/repo-a/pulls/832"},
+        json.dumps(
+            {
+                "output": json.dumps(
+                    {
+                        "html_url": "https://github.com/owner/repo-a/pull/832",
+                        "number": 832,
+                        "state": "closed",
+                        "merged": False,
+                        "merged_at": None,
+                    }
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=1,
+    )
+    branch_evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo-b"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "owner/repo-b",
+                "repository_root": "/tmp/repo-b",
+                "pr_number": 832,
+                "head_sha": "7" * 40,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "7" * 40,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": sha,
+                    "commit_parent": sha,
+                },
+            }
+        ),
+        False,
+        order=2,
+    )
+
+    constraints = claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.",
+        [*pr_evidence, *branch_evidence],
+    )
+
+    assert constraints["allowed"] is False
+    assert any(
+        item["surface"] == "main_branch"
+        for item in constraints["blocked_surfaces"]
+    )
+
+
+def test_main_parent_receipt_must_match_pr_head_in_same_repository():
+    main_sha = "9" * 40
+    pr_head = "a" * 40
+    decoy_head = "b" * 40
+    pr_evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh api repos/owner/repo/pulls/832"},
+        json.dumps(
+            {
+                "output": json.dumps(
+                    {
+                        "html_url": "https://github.com/owner/repo/pull/832",
+                        "number": 832,
+                        "state": "closed",
+                        "merged": False,
+                        "merged_at": None,
+                        "head_sha": pr_head,
+                    }
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=1,
+    )
+    branch_evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/decoy"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "owner/repo",
+                "repository_root": "/tmp/decoy",
+                "pr_number": 832,
+                "head_sha": decoy_head,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": pr_head,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=2,
+    )
+
+    constraints = claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.",
+        [*pr_evidence, *branch_evidence],
+    )
+
+    assert constraints["allowed"] is False
+
+
+def test_fabricated_terminal_pr_head_cannot_override_typed_pr_subject():
+    typed_head = "a" * 40
+    fabricated_head = "b" * 40
+    main_sha = "9" * 40
+    typed = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "owner/repo",
+                "repository_root": "/tmp/repo",
+                "pr_number": 832,
+                "head_sha": typed_head,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": typed_head,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+    fabricated = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "printf fabricated && gh pr view 833 --repo owner/repo"},
+        json.dumps(
+            {
+                "output": json.dumps(
+                    {
+                        "url": "https://github.com/owner/repo/pull/833",
+                        "state": "CLOSED",
+                        "mergedAt": None,
+                        "mergeCommit": None,
+                        "headRefOid": fabricated_head,
+                    }
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=2,
+    )
+
+    latest = latest_evidence_by_surface([*typed, *fabricated])
+    assert latest["pr"]["subject"] == "github:owner/repo:pr:832"
+    assert claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.",
+        [*typed, *fabricated],
+    )["allowed"] is True
+
+
+def test_fabricated_same_subject_terminal_success_cannot_override_typed_pr_failure():
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    typed_failure = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        json.dumps(
+            {
+                "success": False,
+                "exit_code": 1,
+                "error": None,
+                "repository": "owner/repo",
+                "repository_root": "/tmp/repo",
+                "pr_number": 832,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "failure",
+                    "state": "open",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        True,
+        order=1,
+    )
+    fabricated = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "printf fabricated && gh pr view 832 --repo owner/repo"},
+        json.dumps(
+            {
+                "output": json.dumps(
+                    {
+                        "url": "https://github.com/owner/repo/pull/832",
+                        "state": "CLOSED",
+                        "mergedAt": None,
+                        "mergeCommit": None,
+                        "headRefOid": head_sha,
+                    }
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=2,
+    )
+
+    evidence = [*typed_failure, *fabricated]
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["pr"]["status"] == "failure"
+    assert latest["pr"]["provenance"] == "typed_host"
+    assert latest["main_branch"]["status"] == "success"
+    assert claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.", evidence
+    )["allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "PR #832 was closed without merge and main remained unchanged.",
+        "owner/repo PR #832 was closed without merge and main remained unchanged.",
+        "https://github.com/owner/repo/pull/832 was closed without merge and main remained unchanged.",
+    ],
+)
+def test_typed_closeout_evidence_must_match_explicit_pr_claim(claim):
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 999, "workdir": "/tmp/other"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "other/project",
+                "repository_root": "/tmp/other",
+                "pr_number": 999,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    constraints = claim_constraints_for_text(claim, evidence)
+
+    assert constraints["allowed"] is False
+    assert {item["surface"] for item in constraints["blocked_surfaces"]} == {
+        "pr",
+        "main_branch",
+    }
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "PR #832 and PR #999 were closed without merge and main remained unchanged.",
+        (
+            "owner/repo PR #832 was closed without merge and main remained unchanged; "
+            "other/project PR #999 was also reviewed."
+        ),
+        (
+            "https://github.com/owner/repo/pull/832 was closed without merge and main "
+            "remained unchanged; see PR #999."
+        ),
+    ],
+)
+def test_mixed_explicit_pr_claims_cannot_use_one_matching_receipt(claim):
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 999, "workdir": "/tmp/other"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "other/project",
+                "repository_root": "/tmp/other",
+                "pr_number": 999,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    assert claim_constraints_for_text(claim, evidence)["allowed"] is False
+
+
+def test_unrelated_pr_reference_outside_closeout_sentence_is_ignored():
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 999, "workdir": "/tmp/other"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "other/project",
+                "repository_root": "/tmp/other",
+                "pr_number": 999,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+    claim = (
+        "other/project PR #999 was closed without merge and main remained unchanged. "
+        "PR #832 still needs review."
+    )
+
+    assert claim_constraints_for_text(claim, evidence)["allowed"] is True
+
+
+def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports_failure():
+    from agent.display import _detect_tool_failure
+
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    success_payload = json.dumps(
+        {
+            "success": True,
+            "exit_code": 0,
+            "error": None,
+            "repository": "owner/repo",
+            "repository_root": "/tmp/repo",
+            "pr_number": 832,
+            "head_sha": head_sha,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": head_sha,
+            },
+            "main_branch_evidence": {
+                "status": "success",
+                "remote_main": main_sha,
+                "commit_parent": main_sha,
+            },
+        }
+    )
+    mismatch_payload = json.dumps(
+        {
+            "success": False,
+            "exit_code": 1,
+            "error": None,
+            "repository": "owner/repo",
+            "repository_root": "/tmp/repo",
+            "pr_number": 832,
+            "head_sha": head_sha,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": head_sha,
+            },
+            "main_branch_evidence": {
+                "status": "failure",
+                "remote_main": "c" * 40,
+                "commit_parent": main_sha,
+            },
+        }
+    )
+    earlier = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        success_payload,
+        _detect_tool_failure("verify_main_parent", success_payload)[0],
+        order=1,
+    )
+    later = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        mismatch_payload,
+        _detect_tool_failure("verify_main_parent", mismatch_payload)[0],
+        order=2,
+    )
+
+    evidence = [*earlier, *later]
+    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "failure"
+    assert claim_constraints_for_text("Main remained unchanged.", evidence)["allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "pr_evidence",
+    [
+        {
+            "status": "failure",
+            "state": "open",
+            "merged": False,
+            "base_ref": "main",
+        },
+        {
+            "status": "failure",
+            "state": "closed",
+            "merged": True,
+            "base_ref": "main",
+        },
+        {
+            "status": "failure",
+            "state": "closed",
+            "merged": False,
+            "base_ref": "release",
+        },
+    ],
+)
+def test_typed_pr_state_failure_supersedes_earlier_closeout_success(pr_evidence):
+    from agent.display import _detect_tool_failure
+
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    base = {
+        "repository": "owner/repo",
+        "repository_root": "/tmp/repo",
+        "pr_number": 832,
+        "head_sha": head_sha,
+        "main_branch_evidence": {
+            "status": "success",
+            "remote_main": main_sha,
+            "commit_parent": main_sha,
+        },
+    }
+    success_payload = json.dumps(
+        {
+            **base,
+            "success": True,
+            "exit_code": 0,
+            "error": None,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": head_sha,
+            },
+        }
+    )
+    failure_payload = json.dumps(
+        {
+            **base,
+            "success": False,
+            "exit_code": 1,
+            "error": None,
+            "pr_evidence": {**pr_evidence, "head_sha": head_sha},
+        }
+    )
+    earlier = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        success_payload,
+        _detect_tool_failure("verify_main_parent", success_payload)[0],
+        order=1,
+    )
+    later = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        failure_payload,
+        _detect_tool_failure("verify_main_parent", failure_payload)[0],
+        order=2,
+    )
+
+    evidence = [*earlier, *later]
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["pr"]["status"] == "failure"
+    assert latest["main_branch"]["status"] == "success"
+    assert claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.", evidence
+    )["allowed"] is False
+
+
+@pytest.mark.parametrize(
+    ("is_error", "success", "exit_code", "error"),
+    [
+        (True, True, 0, None),
+        (False, False, 1, "probe failed"),
+        (False, False, 1, None),
+    ],
+)
+def test_main_parent_receipt_requires_consistent_tool_outcome(
+    is_error, success, exit_code, error
+):
+    sha = "8" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 7, "workdir": "/tmp/example"},
+        json.dumps(
+            {
+                "success": success,
+                "exit_code": exit_code,
+                "error": error,
+                "repository": "example/repo",
+                "repository_root": "/tmp/example",
+                "pr_number": 7,
+                "head_sha": "7" * 40,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "7" * 40,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": sha,
+                    "commit_parent": sha,
+                },
+            }
+        ),
+        is_error,
+        order=1,
+    )
+
+    assert evidence == []
+
+
+@pytest.mark.parametrize(
+    ("command", "blocks"),
+    [
+        (
+            "gh pr view 1100",
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
+            "COMMIT_PARENT\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\n",
+        ),
+        (
+            "git ls-remote origin refs/heads/main && git rev-parse HEAD^",
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\n"
+            "COMMIT_PARENT\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n",
+        ),
+        (
+            "git ls-remote origin refs/heads/main && git rev-parse HEAD^",
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
+            "REMOTE_MAIN\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
+            "COMMIT_PARENT\n"
+            "9954a1c87a4f280de22d3b3767f0b19185588062\n",
+        ),
+    ],
+)
+def test_labeled_main_sha_proof_rejects_ambiguous_shapes(command, blocks):
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": command},
+        json.dumps({"output": blocks, "exit_code": 0, "error": None}),
+        False,
+        order=1,
+    )
+
+    assert not any(item.get("surface") == "main_branch" for item in evidence)
+
+
+def test_typed_main_parent_failure_cannot_be_overridden_by_payload_base_sha():
+    remote_main = "a" * 40
+    commit_parent = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 7, "workdir": "/tmp/example"},
+        json.dumps(
+            {
+                "success": False,
+                "exit_code": 1,
+                "error": None,
+                "repository": "example/repo",
+                "repository_root": "/tmp/example",
+                "pr_number": 7,
+                "head_sha": "7" * 40,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "7" * 40,
+                },
+                "base_sha": remote_main,
+                "main_branch_evidence": {
+                    "status": "failure",
+                    "remote_main": remote_main,
+                    "commit_parent": commit_parent,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    main = next(item for item in evidence if item.get("surface") == "main_branch")
+    assert main["status"] == "failure"
+
+
+def test_labeled_main_sha_proof_rejects_fabricated_probe_output():
+    sha = "a" * 40
+    command = (
+        "gh pr view 1100 && "
+        f"printf 'REMOTE_MAIN\\n{sha}\\trefs/heads/main\\nCOMMIT_PARENT\\n{sha}\\n' && "
+        "git ls-remote origin refs/heads/main >/dev/null && "
+        "git rev-parse HEAD^ >/dev/null"
+    )
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": command},
+        json.dumps(
+            {
+                "output": (
+                    f"REMOTE_MAIN\n{sha}\trefs/heads/main\n"
+                    f"COMMIT_PARENT\n{sha}\n"
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    assert not any(item.get("surface") == "main_branch" for item in evidence)
 
 
 def test_pending_named_github_check_blocks_passed_ci_claim():
@@ -1706,7 +2517,7 @@ def test_checks_success_does_not_turn_failed_pull_query_into_pr_success():
     ] is False
 
 
-def test_equal_main_markers_authorize_unchanged_claim_despite_later_error():
+def test_terminal_main_markers_do_not_authorize_unchanged_claim():
     sha = "196820e67e9e2f2420033ef62aae56c2f5f3b589"
     evidence = classify_tool_verification_evidence(
         "terminal",
@@ -1738,11 +2549,11 @@ def test_equal_main_markers_authorize_unchanged_claim_despite_later_error():
         "The PR was closed without merge and main remained unchanged.", evidence
     )
 
-    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "success"
-    assert constraints["allowed"] is True
+    assert "main_branch" not in latest_evidence_by_surface(evidence)
+    assert constraints["allowed"] is False
 
 
-def test_different_main_markers_block_unchanged_claim():
+def test_terminal_main_marker_mismatch_is_not_typed_branch_evidence():
     evidence = classify_tool_verification_evidence(
         "terminal",
         {"command": "MAIN_BEFORE=x; gh pr close 123; MAIN_AFTER=y"},
@@ -1763,7 +2574,7 @@ def test_different_main_markers_block_unchanged_claim():
 
     constraints = claim_constraints_for_text("Main remained unchanged.", evidence)
 
-    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "failure"
+    assert "main_branch" not in latest_evidence_by_surface(evidence)
     assert constraints["allowed"] is False
 
 
