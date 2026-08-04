@@ -1832,6 +1832,93 @@ def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports
 
 
 @pytest.mark.parametrize(
+    "pr_evidence",
+    [
+        {
+            "status": "failure",
+            "state": "open",
+            "merged": False,
+            "base_ref": "main",
+        },
+        {
+            "status": "failure",
+            "state": "closed",
+            "merged": True,
+            "base_ref": "main",
+        },
+        {
+            "status": "failure",
+            "state": "closed",
+            "merged": False,
+            "base_ref": "release",
+        },
+    ],
+)
+def test_typed_pr_state_failure_supersedes_earlier_closeout_success(pr_evidence):
+    from agent.display import _detect_tool_failure
+
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    base = {
+        "repository": "owner/repo",
+        "repository_root": "/tmp/repo",
+        "pr_number": 832,
+        "head_sha": head_sha,
+        "main_branch_evidence": {
+            "status": "success",
+            "remote_main": main_sha,
+            "commit_parent": main_sha,
+        },
+    }
+    success_payload = json.dumps(
+        {
+            **base,
+            "success": True,
+            "exit_code": 0,
+            "error": None,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": head_sha,
+            },
+        }
+    )
+    failure_payload = json.dumps(
+        {
+            **base,
+            "success": False,
+            "exit_code": 1,
+            "error": None,
+            "pr_evidence": {**pr_evidence, "head_sha": head_sha},
+        }
+    )
+    earlier = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        success_payload,
+        _detect_tool_failure("verify_main_parent", success_payload)[0],
+        order=1,
+    )
+    later = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 832, "workdir": "/tmp/repo"},
+        failure_payload,
+        _detect_tool_failure("verify_main_parent", failure_payload)[0],
+        order=2,
+    )
+
+    evidence = [*earlier, *later]
+    latest = latest_evidence_by_surface(evidence)
+    assert latest["pr"]["status"] == "failure"
+    assert latest["main_branch"]["status"] == "success"
+    assert claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.", evidence
+    )["allowed"] is False
+
+
+@pytest.mark.parametrize(
     ("is_error", "success", "exit_code", "error"),
     [
         (True, True, 0, None),

@@ -1246,11 +1246,11 @@ def verify_main_parent(
         and base_ref == "main"
         and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", pr_head_sha)
     )
-    matches = bool(
-        pr_verified
-        and head_sha == pr_head_sha
+    branch_matches = bool(
+        head_sha == pr_head_sha
         and remote_sha == parent_sha
     )
+    matches = pr_verified and branch_matches
     return json.dumps(
         {
             "success": matches,
@@ -1268,7 +1268,7 @@ def verify_main_parent(
                 "head_sha": pr_head_sha,
             },
             "main_branch_evidence": {
-                "status": "success" if matches else "failure",
+                "status": "success" if branch_matches else "failure",
                 "remote_main": remote_sha,
                 "commit_parent": parent_sha,
             },
