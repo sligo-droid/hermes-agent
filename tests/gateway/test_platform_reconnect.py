@@ -291,9 +291,9 @@ class TestPlatformReconnectWatcher:
         for message_id, profile in (("1000", None), ("2000", "reviewer")):
             source = SessionSource(
                 platform=Platform.DISCORD,
-                chat_id=message_id,
+                chat_id="1000",
                 chat_type="thread",
-                thread_id=message_id,
+                thread_id="1000",
                 message_id=message_id,
                 profile=profile,
             )
@@ -320,6 +320,104 @@ class TestPlatformReconnectWatcher:
         assert scheduled == 1
         reviewer_reconcile.assert_awaited_once()
         primary_reconcile.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_scheduler_does_not_fallback_to_primary_profile(
+        self, tmp_path
+    ):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        primary_reconcile = AsyncMock(return_value="done")
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=primary_reconcile
+            )
+        }
+        runner._profile_adapters = {}
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+            profile="reviewer",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        scheduled = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="reviewer",
+        )
+
+        assert scheduled == 0
+        assert runner._background_tasks == set()
+        primary_reconcile.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_scheduler_deduplicates_inflight_work(self, tmp_path):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        release = asyncio.Event()
+
+        async def reconcile(_item, _state):
+            await release.wait()
+            return "done"
+
+        reconcile_mock = AsyncMock(side_effect=reconcile)
+        runner.adapters = {
+            Platform.DISCORD: SimpleNamespace(
+                reconcile_work_ledger_thread_reaction=reconcile_mock
+            )
+        }
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1000",
+            chat_type="thread",
+            thread_id="1000",
+            message_id="1000",
+        )
+        event = MessageEvent(
+            text="complete work",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1000",
+        )
+        item = runner.work_ledger.accept_event(
+            event,
+            session_key=build_session_key(source),
+            freshness_seconds=60,
+        )
+        assert item is not None
+        assert runner.work_ledger.mark_completed(item["id"])
+
+        first = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="default",
+        )
+        second = runner._schedule_pending_discord_terminal_reactions(
+            platform=Platform.DISCORD,
+            profile_name="default",
+        )
+
+        assert first == 1
+        assert second == 0
+        release.set()
+        await asyncio.gather(*tuple(runner._background_tasks))
+        reconcile_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reconnect_passes_is_reconnect_true(self):

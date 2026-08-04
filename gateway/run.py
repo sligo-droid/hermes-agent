@@ -9033,30 +9033,101 @@ class _GatewayRunnerCore(
                 continue
             if platform is not None and event.source.platform is not platform:
                 continue
-            adapter = self._adapter_for_source(event.source)
+            adapter = self._discord_terminal_reaction_adapter(event.source)
             reconcile = getattr(adapter, "reconcile_work_ledger_thread_reaction", None)
             if not callable(reconcile):
                 continue
-
-            async def _reconcile(
-                persisted_item: Dict[str, Any] = item,
-                callback: Any = reconcile,
-            ) -> None:
-                try:
-                    await callback(persisted_item)
-                except Exception:
-                    logger.warning(
-                        "Discord terminal reaction reconciliation failed for %s",
-                        persisted_item.get("id"),
-                        exc_info=True,
-                    )
-
-            task = asyncio.create_task(_reconcile())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            scheduled += 1
+            if self._schedule_discord_terminal_reaction(item):
+                scheduled += 1
 
         return scheduled
+
+    @staticmethod
+    def _discord_terminal_reaction_task_key(item: Dict[str, Any]) -> tuple[str, str, str, str]:
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        return (
+            str(source.get("profile") or "default"),
+            str(source.get("guild_id") or ""),
+            str(source.get("parent_chat_id") or ""),
+            str(source.get("thread_id") or source.get("chat_id") or ""),
+        )
+
+    def _discord_terminal_reaction_adapter(
+        self,
+        source: SessionSource,
+    ) -> BasePlatformAdapter | None:
+        """Return the exact profile adapter without cross-profile fallback."""
+
+        profile = str(getattr(source, "profile", None) or "default")
+        if profile != "default":
+            return getattr(self, "_profile_adapters", {}).get(profile, {}).get(
+                source.platform
+            )
+        return getattr(self, "adapters", {}).get(source.platform)
+
+    async def _reconcile_discord_terminal_reaction(
+        self,
+        item: Dict[str, Any],
+        state: str | None = None,
+    ) -> str | None:
+        """Serialize one durable Discord reaction repair across lifecycle paths."""
+
+        tasks = self.__dict__.setdefault("_discord_terminal_reaction_tasks", {})
+        key = self._discord_terminal_reaction_task_key(item)
+        current = asyncio.current_task()
+        existing = tasks.get(key)
+        if existing is not None and existing is not current and not existing.done():
+            return await asyncio.shield(existing)
+        task = asyncio.create_task(
+            self._run_discord_terminal_reaction(item, state)
+        )
+        tasks[key] = task
+        try:
+            return await task
+        finally:
+            if tasks.get(key) is task:
+                tasks.pop(key, None)
+
+    async def _run_discord_terminal_reaction(
+        self,
+        item: Dict[str, Any],
+        state: str | None,
+    ) -> str | None:
+        try:
+            event = self._ledger().event_from_item(item)
+            adapter = self._discord_terminal_reaction_adapter(event.source)
+            reconcile = getattr(adapter, "reconcile_work_ledger_thread_reaction", None)
+            if not callable(reconcile):
+                return None
+            return await reconcile(item, state)
+        except Exception:
+            logger.warning(
+                "Discord terminal reaction reconciliation failed for %s",
+                item.get("id"),
+                exc_info=True,
+            )
+            return None
+
+    def _schedule_discord_terminal_reaction(self, item: Dict[str, Any]) -> bool:
+        tasks = self.__dict__.setdefault("_discord_terminal_reaction_tasks", {})
+        key = self._discord_terminal_reaction_task_key(item)
+        existing = tasks.get(key)
+        if existing is not None and not existing.done():
+            return False
+
+        task = asyncio.create_task(
+            self._run_discord_terminal_reaction(item, None)
+        )
+        tasks[key] = task
+        self._background_tasks.add(task)
+
+        def _cleanup(done: asyncio.Task) -> None:
+            self._background_tasks.discard(done)
+            if tasks.get(key) is done:
+                tasks.pop(key, None)
+
+        task.add_done_callback(_cleanup)
+        return True
 
     def _schedule_terminal_delivery_retry(self, work_id: str, *, attempt: int) -> bool:
         """Schedule one bounded, deduplicated retry without invoking a model."""
@@ -15736,12 +15807,7 @@ class _GatewayRunnerCore(
                     continue
                 claimed[(platform, fp)] = profile_name
 
-            adapter.set_message_handler(self._make_profile_message_handler(profile_name))
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter._busy_text_mode = self._busy_text_mode
+            self._configure_profile_adapter(adapter, profile_name, platform)
 
             try:
                 with _profile_runtime_scope(profile_home):

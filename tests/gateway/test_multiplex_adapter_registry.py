@@ -228,6 +228,52 @@ def _install_secondary_reconnect_context(monkeypatch, runner, adapter, scoped_ho
 
 class TestSecondaryProfileFatalRecovery:
     @pytest.mark.asyncio
+    async def test_cold_start_uses_profile_scoped_adapter_configuration(
+        self, monkeypatch
+    ):
+        runner = _secondary_recovery_runner()
+        adapter = _SecondaryRecoveryAdapter()
+        seen_auth = object()
+        runner._make_adapter_auth_check = MagicMock(return_value=seen_auth)
+        runner._handle_profile_adapter_fatal_error = AsyncMock()
+
+        async def connect(candidate, platform, *, is_reconnect=False):
+            assert candidate is adapter
+            assert platform is Platform.DISCORD
+            assert is_reconnect is False
+            return True
+
+        runner._connect_adapter_with_timeout = connect
+        runner._create_adapter = lambda _platform, _config: adapter
+        profile_cfg = GatewayConfig(
+            multiplex_profiles=True,
+            platforms={
+                Platform.DISCORD: PlatformConfig(enabled=True, token="profile-token")
+            },
+        )
+
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config",
+            lambda: profile_cfg,
+        )
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", Path("/profiles/reviewer"), {}
+        )
+
+        assert connected == 1
+        runner._make_adapter_auth_check.assert_called_once_with(
+            Platform.DISCORD,
+            profile_name="reviewer",
+        )
+        assert adapter.authorization_check is seen_auth
+        await adapter.fatal_error_handler(adapter)
+        runner._handle_profile_adapter_fatal_error.assert_awaited_once_with(
+            "reviewer",
+            Platform.DISCORD,
+            adapter,
+        )
+
+    @pytest.mark.asyncio
     async def test_retryable_secondary_fatal_reconnects_with_its_profile_scope(
         self, monkeypatch
     ):

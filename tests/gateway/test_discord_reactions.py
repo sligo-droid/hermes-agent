@@ -1976,9 +1976,17 @@ async def test_replaced_adapter_uses_current_connection_for_terminal_reconciliat
         adapters={Platform.DISCORD: primary_adapter},
         _profile_adapters={"reviewer": {Platform.DISCORD: current_adapter}},
     )
-    runner._adapter_for_source = lambda source: runner._profile_adapters[
-        source.profile
-    ][source.platform]
+    async def reconcile_via_runner(persisted_item, state):
+        selected = runner._profile_adapters[
+            persisted_item["source"]["profile"]
+        ][Platform.DISCORD]
+        return await selected.reconcile_work_ledger_thread_reaction(
+            persisted_item, state
+        )
+
+    runner._reconcile_discord_terminal_reaction = AsyncMock(
+        side_effect=reconcile_via_runner
+    )
     adapter.gateway_runner = runner
     adapter.reconcile_work_ledger_thread_reaction = AsyncMock(
         side_effect=AssertionError("disconnected adapter must not reconcile")
@@ -1986,10 +1994,11 @@ async def test_replaced_adapter_uses_current_connection_for_terminal_reconciliat
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    current_adapter.reconcile_work_ledger_thread_reaction.assert_awaited_once()
-    persisted_item, state = current_adapter.reconcile_work_ledger_thread_reaction.await_args.args
+    runner._reconcile_discord_terminal_reaction.assert_awaited_once()
+    persisted_item, state = runner._reconcile_discord_terminal_reaction.await_args.args
     assert persisted_item["id"] == item["id"]
     assert state == "done"
+    current_adapter.reconcile_work_ledger_thread_reaction.assert_awaited_once()
     primary_adapter.reconcile_work_ledger_thread_reaction.assert_not_awaited()
     assert ledger.pending_terminal_reaction_items() == []
 

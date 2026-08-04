@@ -477,16 +477,12 @@ def _main_branch_evidence(
 
     before = markers.get("main_before") or markers.get("base_before")
     after = markers.get("main_after") or markers.get("base_after")
-    current = (
-        markers.get("main_now")
-        or markers.get("current_main")
-        or (remote_main_matches[0].lower() if labeled_valid else "")
-    )
-    base_sha = str(
-        payload.get("base_sha")
-        or (commit_parent_matches[0].lower() if labeled_valid else "")
-        or ""
-    ).strip().lower()
+    if labeled_attempted:
+        current = remote_main_matches[0].lower() if labeled_valid else ""
+        base_sha = commit_parent_matches[0].lower() if labeled_valid else ""
+    else:
+        current = markers.get("main_now") or markers.get("current_main")
+        base_sha = str(payload.get("base_sha") or "").strip().lower()
     proven = False
     equal = False
     if before and after:

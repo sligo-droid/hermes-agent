@@ -187,7 +187,7 @@ def _bounded_delivery_message_ids(
     return tuple(normalized)
 
 
-def _discord_thread_key(item: Any) -> tuple[str, str, str] | None:
+def _discord_thread_key(item: Any) -> tuple[str, str, str, str] | None:
     """Return the durable Discord thread identity for a work item."""
 
     if not isinstance(item, dict) or str(item.get("platform") or "") != "discord":
@@ -199,6 +199,7 @@ def _discord_thread_key(item: Any) -> tuple[str, str, str] | None:
     if not thread_id:
         return None
     return (
+        str(source.get("profile") or "default").strip(),
         str(source.get("guild_id") or "").strip(),
         str(source.get("parent_chat_id") or "").strip(),
         thread_id,
@@ -5327,7 +5328,7 @@ class GatewayWorkLedger:
     def pending_terminal_reaction_items(self) -> list[dict[str, Any]]:
         """Return one representative item for every pending Discord thread sync."""
 
-        representatives: dict[tuple[str, str, str], dict[str, Any]] = {}
+        representatives: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for item in self._read().get("items", {}).values():
             if not isinstance(item, dict) or item.get("terminal_reaction_sync_pending") is not True:
                 continue

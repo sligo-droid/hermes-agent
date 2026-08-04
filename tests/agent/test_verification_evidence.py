@@ -1546,6 +1546,36 @@ def test_labeled_main_sha_proof_rejects_ambiguous_shapes(command, blocks):
     assert not any(item.get("surface") == "main_branch" for item in evidence)
 
 
+def test_labeled_commit_parent_cannot_be_overridden_by_payload_base_sha():
+    remote_main = "a" * 40
+    commit_parent = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "terminal",
+        {
+            "command": (
+                "gh pr view 1100 && git ls-remote origin refs/heads/main && "
+                "git rev-parse HEAD^"
+            )
+        },
+        json.dumps(
+            {
+                "output": (
+                    f'{{"base_sha":"{remote_main}","state":"closed"}}\n'
+                    f"REMOTE_MAIN\n{remote_main}\trefs/heads/main\n"
+                    f"COMMIT_PARENT\n{commit_parent}\n"
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    main = next(item for item in evidence if item.get("surface") == "main_branch")
+    assert main["status"] == "failure"
+
+
 def test_pending_named_github_check_blocks_passed_ci_claim():
     evidence = classify_tool_verification_evidence(
         "terminal",
