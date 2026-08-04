@@ -36,6 +36,7 @@ from gateway.session_context import (
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
+    get_trusted_project_key,
     reset_session_vars,
     set_session_vars,
 )
@@ -176,6 +177,16 @@ def test_reset_session_vars_restores_unset_not_empty():
     reset_session_vars()
     for name, var in _VAR_MAP.items():
         assert var.get() is _UNSET, f"{name} is {var.get()!r}, expected _UNSET"
+
+
+def test_trusted_project_key_has_no_environment_fallback(monkeypatch):
+    monkeypatch.setenv("HERMES_PROJECT_KEY", "forged-project")
+    reset_session_vars()
+
+    assert get_trusted_project_key() == ""
+
+    set_session_vars(project_key="pid")
+    assert get_trusted_project_key() == "pid"
 
 
 # ---------------------------------------------------------------------------

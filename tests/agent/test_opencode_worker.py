@@ -211,6 +211,20 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     assert not seen_config_home.exists()
 
 
+def test_opencode_process_env_strips_client_knowledge_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("GBRAIN_HOME", "/private/client-knowledge/gbrain")
+    monkeypatch.setenv("HERMES_CLIENT_KNOWLEDGE_SOURCE", "/private/client-knowledge/source")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-propagate")
+
+    env = ow._opencode_process_env(tmp_path)
+
+    assert env is not None
+    assert env.get("XDG_CONFIG_HOME") == str(tmp_path)
+    assert "GBRAIN_HOME" not in env
+    assert "HERMES_CLIENT_KNOWLEDGE_SOURCE" not in env
+    assert "OPENAI_API_KEY" not in env
+
+
 @pytest.mark.parametrize(("fast_mode", "expected"), [(True, "priority"), (False, None)])
 def test_named_tier_opencode_variant_controls_service_tier(
     monkeypatch, tmp_path, fast_mode, expected

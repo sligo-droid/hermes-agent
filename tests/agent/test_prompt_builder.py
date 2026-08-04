@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from agent.prompt_builder import (
+    CLIENT_KNOWLEDGE_GUIDANCE,
     CLARIFYING_QUESTION_GUIDANCE,
     _scan_context_content,
     _truncate_content,
@@ -56,6 +57,13 @@ class TestGuidanceConstants:
         assert "first-pass retrieval layer" in QMD_MCP_GUIDANCE
         assert "before using read_file on local docs" in QMD_MCP_GUIDANCE
         assert "source/code inspection" in QMD_MCP_GUIDANCE
+
+    def test_client_knowledge_guidance_is_explicit_project_scoped_and_on_demand(self):
+        text = CLIENT_KNOWLEDGE_GUIDANCE
+        assert "client_knowledge_search" in text
+        assert "mapped project key" in text
+        assert "Cite" in text
+        assert "do not run an automatic query" in text
 
     def test_clarifying_question_guidance_is_balanced(self):
         text = CLARIFYING_QUESTION_GUIDANCE.lower()

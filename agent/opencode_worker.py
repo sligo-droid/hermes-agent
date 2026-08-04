@@ -1693,6 +1693,11 @@ def _opencode_process_env(
         process_env.update(extra_env)
     if config_home is not None:
         process_env["XDG_CONFIG_HOME"] = str(config_home)
+    # Client knowledge is an orchestrator capability. Coding workers receive
+    # selected prose in their brief, never a path/config bridge to the brain.
+    for key in list(process_env):
+        if key == "GBRAIN_HOME" or key.startswith("HERMES_CLIENT_KNOWLEDGE_"):
+            process_env.pop(key, None)
     return process_env
 
 

@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    CLIENT_KNOWLEDGE_GUIDANCE,
     CLARIFYING_QUESTION_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -231,6 +232,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(CLARIFYING_QUESTION_GUIDANCE)
     if any(name.startswith("mcp_qmd_") for name in agent.valid_tool_names):
         tool_guidance.append(QMD_MCP_GUIDANCE)
+    if any(name.startswith("client_knowledge_") for name in agent.valid_tool_names):
+        tool_guidance.append(CLIENT_KNOWLEDGE_GUIDANCE)
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
     elif _is_kanban_worker:

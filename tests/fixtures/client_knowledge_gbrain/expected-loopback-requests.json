@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "model": "anthropic:claude-haiku-4-5-20251001",
+  "expected_request_count": 1,
+  "requests": [
+    {
+      "ordinal": 1,
+      "method": "POST",
+      "path": "/v1/messages",
+      "required_header_names": [
+        "anthropic-version",
+        "content-type",
+        "x-api-key"
+      ],
+      "forbidden_header_names": [
+        "authorization"
+      ],
+      "body_sha256": "f18ac369de2665d5bf52eabbec0ad064f7271c3f6c5195dd644584e3b342912d",
+      "model": "claude-haiku-4-5-20251001"
+    }
+  ]
+}
