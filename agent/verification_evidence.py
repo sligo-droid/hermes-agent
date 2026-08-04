@@ -1899,13 +1899,22 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
     latest = latest_evidence_by_surface(evidence)
     blocked = []
     explicit_pr_subjects = set()
-    for match in _EXPLICIT_PR_CLAIM_RE.finditer(str(final_text or "")):
-        repository = str(match.group("repo") or match.group("url_repo") or "").lower()
-        number = str(match.group("number") or match.group("url_number") or "")
-        if number:
-            explicit_pr_subjects.add(
-                f"github:{repository + ':' if repository else ''}pr:{number}"
-            )
+    claim_sentences = [
+        sentence
+        for sentence in _SENTENCE_SPLIT_RE.split(str(final_text or ""))
+        if _UNMERGED_PR_CLAIM_RE.search(sentence)
+        or _MAIN_UNCHANGED_CLAIM_RE.search(sentence)
+    ]
+    for sentence in claim_sentences:
+        for match in _EXPLICIT_PR_CLAIM_RE.finditer(sentence):
+            repository = str(
+                match.group("repo") or match.group("url_repo") or ""
+            ).lower()
+            number = str(match.group("number") or match.group("url_number") or "")
+            if number:
+                explicit_pr_subjects.add(
+                    f"github:{repository + ':' if repository else ''}pr:{number}"
+                )
     for surface, item in sorted(latest.items()):
         status = str(item.get("status") or "").lower()
         if status not in {"failure", "timeout", "pending"}:
@@ -1924,7 +1933,7 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
         evidence_subject = str(item.get("subject") or "")
         subject_matches_claim = bool(
             not explicit_pr_subjects
-            or any(
+            or all(
                 claimed == evidence_subject
                 or (
                     claimed.startswith("github:pr:")
@@ -1984,7 +1993,7 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
         )
         explicit_target_matches = bool(
             not explicit_pr_subjects
-            or any(
+            or all(
                 claimed == branch_subject
                 or (
                     claimed.startswith("github:pr:")

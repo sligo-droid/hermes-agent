@@ -1874,6 +1874,96 @@ def test_typed_closeout_evidence_must_match_explicit_pr_claim(claim):
     }
 
 
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "PR #832 and PR #999 were closed without merge and main remained unchanged.",
+        (
+            "owner/repo PR #832 was closed without merge and main remained unchanged; "
+            "other/project PR #999 was also reviewed."
+        ),
+        (
+            "https://github.com/owner/repo/pull/832 was closed without merge and main "
+            "remained unchanged; see PR #999."
+        ),
+    ],
+)
+def test_mixed_explicit_pr_claims_cannot_use_one_matching_receipt(claim):
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 999, "workdir": "/tmp/other"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "other/project",
+                "repository_root": "/tmp/other",
+                "pr_number": 999,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+
+    assert claim_constraints_for_text(claim, evidence)["allowed"] is False
+
+
+def test_unrelated_pr_reference_outside_closeout_sentence_is_ignored():
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 999, "workdir": "/tmp/other"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "other/project",
+                "repository_root": "/tmp/other",
+                "pr_number": 999,
+                "head_sha": head_sha,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": head_sha,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=1,
+    )
+    claim = (
+        "other/project PR #999 was closed without merge and main remained unchanged. "
+        "PR #832 still needs review."
+    )
+
+    assert claim_constraints_for_text(claim, evidence)["allowed"] is True
+
+
 def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports_failure():
     from agent.display import _detect_tool_failure
 
