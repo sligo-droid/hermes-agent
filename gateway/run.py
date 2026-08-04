@@ -8996,6 +8996,21 @@ class _GatewayRunnerCore(
             task.add_done_callback(self._background_tasks.discard)
             scheduled += 1
 
+        self._schedule_pending_discord_terminal_reactions()
+
+        if scheduled:
+            logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
+        return scheduled
+
+    def _schedule_pending_discord_terminal_reactions(
+        self,
+        *,
+        platform: Platform | None = None,
+    ) -> int:
+        """Retry durable terminal reactions against the currently connected adapter."""
+
+        ledger = self._ledger()
+        scheduled = 0
         for item in ledger.pending_terminal_reaction_items():
             work_id = str(item.get("id") or "")
             try:
@@ -9006,6 +9021,8 @@ class _GatewayRunnerCore(
                     work_id,
                     exc,
                 )
+                continue
+            if platform is not None and event.source.platform is not platform:
                 continue
             adapter = self._adapter_for_source(event.source)
             reconcile = getattr(adapter, "reconcile_work_ledger_thread_reaction", None)
@@ -9028,9 +9045,8 @@ class _GatewayRunnerCore(
             task = asyncio.create_task(_reconcile())
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            scheduled += 1
 
-        if scheduled:
-            logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
         return scheduled
 
     def _schedule_terminal_delivery_retry(self, work_id: str, *, attempt: int) -> bool:
@@ -14902,6 +14918,16 @@ class _GatewayRunnerCore(
                                 platform.value,
                                 exc_info=True,
                             )
+                        if platform is Platform.DISCORD:
+                            try:
+                                self._schedule_pending_discord_terminal_reactions(
+                                    platform=platform
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "terminal reaction reschedule after Discord reconnect failed",
+                                    exc_info=True,
+                                )
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
                         self._update_platform_runtime_status(

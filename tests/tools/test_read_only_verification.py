@@ -48,6 +48,13 @@ def test_read_only_verification_parser_rejects_shell_and_unbounded_commands(comm
     assert error
 
 
+def test_read_only_verification_parser_allows_git_diff_check():
+    argv, error = parse_read_only_verification_command("git diff --check")
+
+    assert argv == ["git", "diff", "--check"]
+    assert error is None
+
+
 def test_read_only_terminal_policy_is_shell_free_and_process_only():
     assert read_only_terminal_check({"command": "ps aux"}) is True
     assert read_only_terminal_check({"command": "ps -eo pid,ppid,stat,etime,comm,args"}) is True

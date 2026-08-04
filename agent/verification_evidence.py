@@ -239,6 +239,10 @@ _MAIN_SHA_MARKER_RE = re.compile(
     r"(?im)^\s*(MAIN_BEFORE|BASE_BEFORE|MAIN_AFTER|BASE_AFTER|MAIN_NOW|CURRENT_MAIN)="
     r"([0-9a-f]{40}|[0-9a-f]{64})\s*$"
 )
+_LABELED_SHA_BLOCK_RE = re.compile(
+    r"(?im)^\s*(REMOTE_MAIN|COMMIT_PARENT)\s*$\s*"
+    r"^\s*([0-9a-f]{40}|[0-9a-f]{64})(?:\s+refs/heads/main)?\s*$"
+)
 _EXPLICIT_DEPLOY_COMMAND_RE = re.compile(
     r"\b(?:vercel|flyctl|railway|render)\b|"
     r"\bgh\s+api\s+repos/[^\s]+/deployments\b|"
@@ -436,8 +440,13 @@ def _main_branch_evidence(
         name.lower(): sha.lower()
         for name, sha in _MAIN_SHA_MARKER_RE.findall(str(output or ""))
     }
+    labeled = {
+        name.lower(): sha.lower()
+        for name, sha in _LABELED_SHA_BLOCK_RE.findall(str(output or ""))
+    }
     attempted = bool(
         markers
+        or labeled
         or re.search(r"\b(?:MAIN|BASE)_(?:BEFORE|AFTER|NOW)\b|\bCURRENT_MAIN\b", command)
         or re.search(r"\bheads/main\b", command)
     )
@@ -446,8 +455,14 @@ def _main_branch_evidence(
 
     before = markers.get("main_before") or markers.get("base_before")
     after = markers.get("main_after") or markers.get("base_after")
-    current = markers.get("main_now") or markers.get("current_main")
-    base_sha = str(payload.get("base_sha") or "").strip().lower()
+    current = (
+        markers.get("main_now")
+        or markers.get("current_main")
+        or labeled.get("remote_main")
+    )
+    base_sha = str(
+        payload.get("base_sha") or labeled.get("commit_parent") or ""
+    ).strip().lower()
     proven = False
     equal = False
     if before and after:

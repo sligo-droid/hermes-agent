@@ -187,6 +187,7 @@ class TestPlatformReconnectWatcher:
         """Watcher should reconnect a failed platform when connect() succeeds."""
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._schedule_pending_discord_terminal_reactions = MagicMock()
 
         platform_config = PlatformConfig(enabled=True, token="test")
         runner._failed_platforms[Platform.TELEGRAM] = {
@@ -220,6 +221,43 @@ class TestPlatformReconnectWatcher:
 
         assert Platform.TELEGRAM not in runner._failed_platforms
         assert Platform.TELEGRAM in runner.adapters
+        runner._schedule_pending_discord_terminal_reactions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discord_reconnect_retries_pending_terminal_reactions(self):
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._schedule_pending_discord_terminal_reactions = MagicMock(return_value=1)
+        runner._failed_platforms[Platform.DISCORD] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+        }
+
+        succeed_adapter = StubAdapter(platform=Platform.DISCORD, succeed=True)
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=succeed_adapter):
+            with patch("gateway.run.build_channel_directory", create=True):
+                async def run_one_iteration():
+                    runner._running = True
+                    call_count = 0
+
+                    async def fake_sleep(_seconds):
+                        nonlocal call_count
+                        call_count += 1
+                        if call_count > 1:
+                            runner._running = False
+                        await real_sleep(0)
+
+                    with patch("asyncio.sleep", side_effect=fake_sleep):
+                        await runner._platform_reconnect_watcher()
+
+                await run_one_iteration()
+
+        runner._schedule_pending_discord_terminal_reactions.assert_called_once_with(
+            platform=Platform.DISCORD
+        )
 
     @pytest.mark.asyncio
     async def test_reconnect_passes_is_reconnect_true(self):

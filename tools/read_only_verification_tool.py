@@ -211,6 +211,8 @@ def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None
         allowed = True
     elif base in {"python", "python3"}:
         allowed = len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]
+    elif base == "git":
+        allowed = argv[1:] == ["diff", "--check"]
     elif base in {"npm", "pnpm"}:
         tail = argv[1:]
         if tail and tail[0] == "run":

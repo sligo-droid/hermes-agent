@@ -1926,6 +1926,56 @@ async def test_terminal_reconciliation_repairs_summary_embed_and_source_post(
 
 
 @pytest.mark.asyncio
+async def test_replaced_adapter_uses_current_connection_for_terminal_reconciliation(
+    adapter,
+    tmp_path,
+):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1000",
+        chat_type="thread",
+        thread_id="1000",
+        parent_chat_id="55",
+        guild_id="77",
+        message_id="1000",
+    )
+    event = MessageEvent(
+        text="Implement the dashboard repair",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="1000",
+        discord_runtime_mode="action",
+    )
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+    assert ledger.mark_completed(item["id"])
+    event.work_item_id = item["id"]
+
+    current_adapter = SimpleNamespace(
+        reconcile_work_ledger_thread_reaction=AsyncMock(return_value="done")
+    )
+    adapter.gateway_runner = SimpleNamespace(
+        work_ledger=ledger,
+        adapters={Platform.DISCORD: current_adapter},
+    )
+    adapter.reconcile_work_ledger_thread_reaction = AsyncMock(
+        side_effect=AssertionError("disconnected adapter must not reconcile")
+    )
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    current_adapter.reconcile_work_ledger_thread_reaction.assert_awaited_once()
+    persisted_item, state = current_adapter.reconcile_work_ledger_thread_reaction.await_args.args
+    assert persisted_item["id"] == item["id"]
+    assert state == "done"
+
+
+@pytest.mark.asyncio
 async def test_terminal_reconciliation_keeps_retry_marker_when_summary_sync_fails(
     adapter,
     tmp_path,

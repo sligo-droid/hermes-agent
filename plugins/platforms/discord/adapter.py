@@ -7310,7 +7310,19 @@ class DiscordAdapter(BasePlatformAdapter):
             # The persisted terminal reconciliation covers both the summary
             # embed and its OP.  Do not fall through and clear its retry marker
             # after only attempting the event's raw-message reaction.
-            await self.reconcile_work_ledger_thread_reaction(work_item, ledger_state)
+            reconcile = self.reconcile_work_ledger_thread_reaction
+            runner = getattr(self, "gateway_runner", None)
+            adapters = getattr(runner, "adapters", None)
+            if isinstance(adapters, dict):
+                current_adapter = adapters.get(Platform.DISCORD)
+                current_reconcile = getattr(
+                    current_adapter,
+                    "reconcile_work_ledger_thread_reaction",
+                    None,
+                )
+                if callable(current_reconcile):
+                    reconcile = current_reconcile
+            await reconcile(work_item, ledger_state)
             return
         action_lifecycle = self._action_lifecycle_enabled(event)
         is_premium_event = action_lifecycle and (self._is_fable_event(event) or self._is_opus_event(event))

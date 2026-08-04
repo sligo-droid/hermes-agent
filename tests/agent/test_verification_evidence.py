@@ -1462,6 +1462,48 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
     assert downgraded == final
 
 
+def test_daily_smoke_remote_main_and_commit_parent_prove_main_unchanged():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    output = json.dumps(
+        {
+            "output": (
+                'PR_EVIDENCE\n{"baseRefName":"main","closedAt":"2026-08-04T12:03:45Z",'
+                '"headRefOid":"3c79214f6dbefbb5b636e0f74b375f37cb0a4073",'
+                '"mergedAt":null,"state":"CLOSED","statusCheckRollup":[]}\n'
+                "REMOTE_MAIN\n"
+                "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
+                "COMMIT_PARENT\n"
+                "9954a1c87a4f280de22d3b3767f0b19185588062\n"
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {
+            "command": (
+                "gh pr view 1100 --json state,mergedAt,headRefOid,statusCheckRollup,closedAt && "
+                "git ls-remote origin refs/heads/main && git rev-parse HEAD^"
+            )
+        },
+        output,
+        False,
+    )
+    final = "The PR was closed without merge, and main remained unchanged."
+
+    downgraded, constraints = downgrade_final_response_for_evidence(
+        final,
+        agent._turn_runtime_stats["verification_evidence"],
+    )
+
+    assert constraints["allowed"] is True
+    assert constraints["latest_by_surface"]["main_branch"]["status"] == "success"
+    assert downgraded == final
+
+
 def test_pending_named_github_check_blocks_passed_ci_claim():
     evidence = classify_tool_verification_evidence(
         "terminal",
