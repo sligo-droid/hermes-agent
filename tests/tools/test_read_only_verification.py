@@ -263,6 +263,7 @@ def test_read_only_verify_main_parent_returns_typed_evidence(tmp_path, monkeypat
     assert payload["success"] is True
     assert payload["repository"] == "example/repo"
     assert payload["repository_root"] == str(repo)
+    assert payload["head_sha"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
     assert payload["main_branch_evidence"] == {
         "status": "success",
         "remote_main": base_sha,
@@ -296,6 +297,7 @@ def test_read_only_verify_main_parent_reports_mismatch(tmp_path, monkeypatch):
 
     assert payload["success"] is False
     assert payload["exit_code"] == 1
+    assert payload["head_sha"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
     assert payload["main_branch_evidence"]["status"] == "failure"
     assert (
         payload["main_branch_evidence"]["remote_main"]

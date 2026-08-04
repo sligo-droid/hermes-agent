@@ -1259,6 +1259,7 @@ CURRENT_MAIN=1aa02906ca5cd01c377e67c8e404c8add905c210"""
                 "error": None,
                 "repository": "example/repo",
                 "repository_root": "/tmp/example",
+                "head_sha": "37e518f6fd949fc794c5299bbd90c3578d4b5a60",
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": "1aa02906ca5cd01c377e67c8e404c8add905c210",
@@ -1482,6 +1483,7 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
                 "error": None,
                 "repository": "sligo-labs/pid",
                 "repository_root": "/tmp/pid",
+                "head_sha": "ab9c14ac44cbfa49fdf598feea2694bf0d713a40",
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": sha,
@@ -1514,6 +1516,7 @@ def test_typed_main_parent_receipt_proves_main_unchanged():
             "error": None,
             "repository": "example/repo",
             "repository_root": "/tmp/example",
+            "head_sha": "7" * 40,
             "main_branch_evidence": {
                 "status": "success",
                 "remote_main": "9954a1c87a4f280de22d3b3767f0b19185588062",
@@ -1574,6 +1577,7 @@ def test_main_parent_receipt_must_match_pr_repository():
                 "error": None,
                 "repository": "owner/repo-b",
                 "repository_root": "/tmp/repo-b",
+                "head_sha": "7" * 40,
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": sha,
@@ -1595,6 +1599,117 @@ def test_main_parent_receipt_must_match_pr_repository():
         item["surface"] == "main_branch"
         for item in constraints["blocked_surfaces"]
     )
+
+
+def test_main_parent_receipt_must_match_pr_head_in_same_repository():
+    main_sha = "9" * 40
+    pr_head = "a" * 40
+    decoy_head = "b" * 40
+    pr_evidence = classify_tool_verification_evidence(
+        "terminal",
+        {"command": "gh api repos/owner/repo/pulls/832"},
+        json.dumps(
+            {
+                "output": json.dumps(
+                    {
+                        "html_url": "https://github.com/owner/repo/pull/832",
+                        "number": 832,
+                        "state": "closed",
+                        "merged": False,
+                        "merged_at": None,
+                        "head_sha": pr_head,
+                    }
+                ),
+                "exit_code": 0,
+                "error": None,
+            }
+        ),
+        False,
+        order=1,
+    )
+    branch_evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"workdir": "/tmp/decoy"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "owner/repo",
+                "repository_root": "/tmp/decoy",
+                "head_sha": decoy_head,
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": main_sha,
+                    "commit_parent": main_sha,
+                },
+            }
+        ),
+        False,
+        order=2,
+    )
+
+    constraints = claim_constraints_for_text(
+        "The PR was closed without merge and main remained unchanged.",
+        [*pr_evidence, *branch_evidence],
+    )
+
+    assert constraints["allowed"] is False
+
+
+def test_typed_main_parent_mismatch_supersedes_earlier_success_when_tool_reports_failure():
+    from agent.display import _detect_tool_failure
+
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    success_payload = json.dumps(
+        {
+            "success": True,
+            "exit_code": 0,
+            "error": None,
+            "repository": "owner/repo",
+            "repository_root": "/tmp/repo",
+            "head_sha": head_sha,
+            "main_branch_evidence": {
+                "status": "success",
+                "remote_main": main_sha,
+                "commit_parent": main_sha,
+            },
+        }
+    )
+    mismatch_payload = json.dumps(
+        {
+            "success": False,
+            "exit_code": 1,
+            "error": None,
+            "repository": "owner/repo",
+            "repository_root": "/tmp/repo",
+            "head_sha": head_sha,
+            "main_branch_evidence": {
+                "status": "failure",
+                "remote_main": "c" * 40,
+                "commit_parent": main_sha,
+            },
+        }
+    )
+    earlier = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"workdir": "/tmp/repo"},
+        success_payload,
+        _detect_tool_failure("verify_main_parent", success_payload)[0],
+        order=1,
+    )
+    later = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"workdir": "/tmp/repo"},
+        mismatch_payload,
+        _detect_tool_failure("verify_main_parent", mismatch_payload)[0],
+        order=2,
+    )
+
+    evidence = [*earlier, *later]
+    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "failure"
+    assert claim_constraints_for_text("Main remained unchanged.", evidence)["allowed"] is False
 
 
 @pytest.mark.parametrize(
@@ -1619,6 +1734,7 @@ def test_main_parent_receipt_requires_consistent_tool_outcome(
                 "error": error,
                 "repository": "example/repo",
                 "repository_root": "/tmp/example",
+                "head_sha": "7" * 40,
                 "main_branch_evidence": {
                     "status": "success",
                     "remote_main": sha,
@@ -1686,6 +1802,7 @@ def test_typed_main_parent_failure_cannot_be_overridden_by_payload_base_sha():
                 "error": None,
                 "repository": "example/repo",
                 "repository_root": "/tmp/example",
+                "head_sha": "7" * 40,
                 "base_sha": remote_main,
                 "main_branch_evidence": {
                     "status": "failure",

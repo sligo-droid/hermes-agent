@@ -1165,21 +1165,26 @@ def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
     if not repository:
         return tool_error("origin must be a canonical github.com repository")
     remote_sha, remote_error = _github_main_sha(repository, source_root)
-    parent = _git(
+    local = _git(
         source_root,
         "--no-replace-objects",
         "rev-parse",
+        "HEAD",
         "HEAD^",
         timeout=10,
     )
-    if remote_sha is None or parent.returncode != 0:
-        detail = remote_error or parent.stderr or parent.stdout
+    if remote_sha is None or local.returncode != 0:
+        detail = remote_error or local.stderr or local.stdout
         return tool_error(
             "Could not compare origin/main with HEAD^: " + _bounded_output(detail)
         )
-    parent_sha = parent.stdout.decode(errors="replace").strip().lower()
-    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", parent_sha):
-        return tool_error("Git returned an ambiguous commit parent")
+    local_shas = local.stdout.decode(errors="replace").splitlines()
+    if len(local_shas) != 2 or not all(
+        re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha.strip().lower())
+        for sha in local_shas
+    ):
+        return tool_error("Git returned ambiguous local commit identities")
+    head_sha, parent_sha = [sha.strip().lower() for sha in local_shas]
     matches = remote_sha == parent_sha
     return json.dumps(
         {
@@ -1188,6 +1193,7 @@ def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
             "error": None,
             "repository": repository,
             "repository_root": str(source_root),
+            "head_sha": head_sha,
             "main_branch_evidence": {
                 "status": "success" if matches else "failure",
                 "remote_main": remote_sha,
