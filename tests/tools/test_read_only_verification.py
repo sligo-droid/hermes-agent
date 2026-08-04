@@ -17,6 +17,7 @@ from tools.read_only_verification_tool import (
     _with_verification_cgroup,
     _prepared_dependency_roots,
     _verification_environment,
+    _github_origin_repository,
     parse_read_only_verification_command,
     read_only_verify,
 )
@@ -53,6 +54,55 @@ def test_read_only_verification_parser_allows_git_diff_check():
 
     assert argv == ["git", "diff", "--check"]
     assert error is None
+
+
+def test_read_only_verification_parser_allows_exact_main_parent_probe():
+    argv, error = parse_read_only_verification_command("verify-main-parent")
+
+    assert argv == ["verify-main-parent"]
+    assert error is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./verify-main-parent",
+        "verify-main-parent extra",
+        "verify-main-parent && git status",
+    ],
+)
+def test_read_only_verification_parser_rejects_main_parent_probe_variants(command):
+    argv, error = parse_read_only_verification_command(command)
+
+    assert argv is None
+    assert error
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("https://github.com/example/repo.git", "example/repo"),
+        ("git@github.com:example/repo.git", "example/repo"),
+        ("ssh://git@github.com/example/repo", "example/repo"),
+    ],
+)
+def test_github_origin_repository_accepts_canonical_github_origins(
+    tmp_path, origin, expected
+):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "remote", "add", "origin", origin)
+
+    assert _github_origin_repository(repo) == expected
+
+
+def test_github_origin_repository_rejects_repository_transport_overrides(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "remote", "add", "origin", "file:///tmp/fake.git")
+    _git(repo, "config", "url.https://github.com/example/repo.git.insteadOf", "file:///tmp/fake.git")
+
+    assert _github_origin_repository(repo) is None
 
 
 @pytest.mark.parametrize(
@@ -124,6 +174,67 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "init")
     _git(repo, "config", "user.email", "tests@example.com")
     _git(repo, "config", "user.name", "Hermes Tests")
+
+
+def test_read_only_verify_main_parent_returns_typed_evidence(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "remote", "add", "origin", "git@github.com:example/repo.git")
+    (repo / "file.txt").write_text("branch\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "branch")
+
+    base_sha = _git(repo, "rev-parse", "HEAD^").stdout.strip()
+    monkeypatch.setattr(verification_tool, "_github_main_sha", lambda _cwd: (base_sha, b""))
+    payload = json.loads(
+        read_only_verify(command="verify-main-parent", workdir=str(repo))
+    )
+
+    assert payload["success"] is True
+    assert payload["command"] == ["verify-main-parent"]
+    assert payload["main_branch_evidence"] == {
+        "status": "success",
+        "remote_main": base_sha,
+        "commit_parent": base_sha,
+    }
+
+
+def test_read_only_verify_main_parent_reports_mismatch(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "remote", "add", "origin", "https://github.com/example/repo.git")
+    _git(repo, "checkout", "-b", "topic")
+    _git(repo, "checkout", "main")
+    (repo / "file.txt").write_text("remote advanced\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "remote advanced")
+    _git(repo, "checkout", "topic")
+    (repo / "file.txt").write_text("branch\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "branch")
+
+    remote_sha = _git(repo, "rev-parse", "main").stdout.strip()
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_main_sha",
+        lambda _cwd: (remote_sha, b""),
+    )
+    payload = json.loads(
+        read_only_verify(command="verify-main-parent", workdir=str(repo))
+    )
+
+    assert payload["success"] is False
+    assert payload["exit_code"] == 1
+    assert payload["main_branch_evidence"]["status"] == "failure"
+    assert (
+        payload["main_branch_evidence"]["remote_main"]
+        != payload["main_branch_evidence"]["commit_parent"]
+    )
 
 
 def test_read_only_verify_uses_disposable_snapshot_and_cleans_artifacts(

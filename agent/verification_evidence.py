@@ -235,26 +235,6 @@ _GH_CHECK_RUNS_PARTS_RE = re.compile(
     r"\bgh\s+api\s+repos/([^\s]+)/commits/([^\s]+)/check-runs\b",
     re.IGNORECASE,
 )
-_MAIN_SHA_MARKER_RE = re.compile(
-    r"(?im)^\s*(MAIN_BEFORE|BASE_BEFORE|MAIN_AFTER|BASE_AFTER|MAIN_NOW|CURRENT_MAIN)="
-    r"([0-9a-f]{40}|[0-9a-f]{64})\s*$"
-)
-_REMOTE_MAIN_BLOCK_RE = re.compile(
-    r"(?im)^\s*REMOTE_MAIN\s*$\s*"
-    r"^\s*([0-9a-f]{40}|[0-9a-f]{64})\s+refs/heads/main\s*$"
-)
-_COMMIT_PARENT_BLOCK_RE = re.compile(
-    r"(?im)^\s*COMMIT_PARENT\s*$\s*"
-    r"^\s*([0-9a-f]{40}|[0-9a-f]{64})\s*$"
-)
-_LABELED_MAIN_SHA_RE = re.compile(r"(?im)^\s*(REMOTE_MAIN|COMMIT_PARENT)\s*$")
-_LABELED_MAIN_PROBE_RE = re.compile(
-    r"(?:^|&&)\s*printf\s+(['\"])REMOTE_MAIN\\n\1\s*&&\s*"
-    r"git\s+ls-remote\s+origin\s+refs/heads/main\s*&&\s*"
-    r"printf\s+(['\"])COMMIT_PARENT\\n\2\s*&&\s*"
-    r"git\s+rev-parse\s+HEAD\^\s*$",
-    re.IGNORECASE,
-)
 _EXPLICIT_DEPLOY_COMMAND_RE = re.compile(
     r"\b(?:vercel|flyctl|railway|render)\b|"
     r"\bgh\s+api\s+repos/[^\s]+/deployments\b|"
@@ -441,84 +421,6 @@ def _github_evidence_subjects(
     return pr_subject, f"github:{check_repo}:commit:{check_sha}"
 
 
-def _main_branch_evidence(
-    command: str,
-    output: str,
-    payload: dict[str, Any],
-    *,
-    order: int | None,
-) -> list[dict[str, Any]]:
-    markers = {
-        name.lower(): sha.lower()
-        for name, sha in _MAIN_SHA_MARKER_RE.findall(str(output or ""))
-    }
-    output_text = str(output or "")
-    remote_main_matches = _REMOTE_MAIN_BLOCK_RE.findall(output_text)
-    commit_parent_matches = _COMMIT_PARENT_BLOCK_RE.findall(output_text)
-    labeled_names = [name.lower() for name in _LABELED_MAIN_SHA_RE.findall(output_text)]
-    labeled_attempted = bool(labeled_names)
-    labeled_valid = bool(
-        labeled_names.count("remote_main") == 1
-        and labeled_names.count("commit_parent") == 1
-        and len(remote_main_matches) == 1
-        and len(commit_parent_matches) == 1
-        and _LABELED_MAIN_PROBE_RE.search(command)
-    )
-    attempted = bool(
-        markers
-        or labeled_attempted
-        or re.search(r"\b(?:MAIN|BASE)_(?:BEFORE|AFTER|NOW)\b|\bCURRENT_MAIN\b", command)
-        or re.search(r"\bheads/main\b", command)
-    )
-    if not attempted:
-        return []
-
-    before = markers.get("main_before") or markers.get("base_before")
-    after = markers.get("main_after") or markers.get("base_after")
-    if labeled_attempted:
-        current = remote_main_matches[0].lower() if labeled_valid else ""
-        base_sha = commit_parent_matches[0].lower() if labeled_valid else ""
-    else:
-        current = markers.get("main_now") or markers.get("current_main")
-        base_sha = str(payload.get("base_sha") or "").strip().lower()
-    proven = False
-    equal = False
-    if before and after:
-        proven = True
-        equal = before == after
-    elif current and _SHA_RE.fullmatch(base_sha):
-        proven = True
-        equal = current == base_sha
-
-    if not proven:
-        # A one-sided or failed inspection is not branch-state evidence. Keep
-        # any earlier complete SHA comparison authoritative instead of
-        # replacing it with an inconclusive probe.
-        return []
-    status = "success" if equal else "failure"
-    detail = json.dumps(
-        {
-            "before": before,
-            "after": after,
-            "current": current,
-            "base_sha": base_sha,
-            "proven": proven,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return [
-        {
-            "schema_version": 1,
-            "surface": "main_branch",
-            "check_name": "main branch unchanged",
-            "status": status,
-            "order": int(order or 0),
-            "detail": detail[:240],
-        }
-    ]
-
-
 def _github_lifecycle_evidence(
     command: str,
     output: str,
@@ -537,14 +439,6 @@ def _github_lifecycle_evidence(
     evidence: list[dict[str, Any]] = []
     payload = _github_pr_payload(output)
     pr_subject, ci_subject = _github_evidence_subjects(command, payload)
-    evidence.extend(
-        _main_branch_evidence(
-            command,
-            output,
-            payload,
-            order=order,
-        )
-    )
 
     checks_attempted = bool(
         _GH_PR_CHECKS_RE.search(command)
@@ -1318,6 +1212,40 @@ def classify_tool_verification_evidence(
     result_text = _text(full_result_text)
     raw_check_name = str(args.get("command") or args.get("url") or args.get("route") or name)
     check_name = _text(raw_check_name, limit=160)
+
+    if name == "read_only_verify":
+        receipt = data.get("main_branch_evidence")
+        if (
+            args.get("command") == "verify-main-parent"
+            and data.get("command") == ["verify-main-parent"]
+            and isinstance(receipt, dict)
+        ):
+            remote_main = str(receipt.get("remote_main") or "").lower()
+            commit_parent = str(receipt.get("commit_parent") or "").lower()
+            status = str(receipt.get("status") or "")
+            if (
+                status in {"success", "failure"}
+                and _SHA_RE.fullmatch(remote_main)
+                and _SHA_RE.fullmatch(commit_parent)
+                and (status == "success") == (remote_main == commit_parent)
+            ):
+                return [{
+                    "schema_version": 1,
+                    "surface": "main_branch",
+                    "check_name": "origin/main equals HEAD^",
+                    "status": status,
+                    "order": int(order or 0),
+                    "detail": json.dumps(
+                        {
+                            "remote_main": remote_main,
+                            "commit_parent": commit_parent,
+                            "proven": True,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )[:240],
+                }]
+        return []
 
     if name == "terminal" and _PROTECTED_CHECKOUT_GUARDRAIL_RE.search(result_text):
         return []

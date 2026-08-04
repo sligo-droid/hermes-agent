@@ -9110,6 +9110,12 @@ class _GatewayRunnerCore(
         )
         request["task"] = task
         requests[key] = request
+        self._background_tasks.add(task)
+
+        def _cleanup(done: asyncio.Task) -> None:
+            self._background_tasks.discard(done)
+
+        task.add_done_callback(_cleanup)
         return task, True
 
     async def _drain_discord_terminal_reaction(
@@ -9126,6 +9132,8 @@ class _GatewayRunnerCore(
                 state = request.get("state")
                 result = await self._run_discord_terminal_reaction(item, state)
                 if int(request.get("version") or 0) == version:
+                    if result is not None:
+                        self._ledger().mark_discord_thread_reaction_synced(item)
                     return result
         finally:
             if requests.get(key) is request:
@@ -9142,7 +9150,7 @@ class _GatewayRunnerCore(
             reconcile = getattr(adapter, "reconcile_work_ledger_thread_reaction", None)
             if not callable(reconcile):
                 return None
-            return await reconcile(item, state)
+            return await reconcile(item, state, acknowledge=False)
         except Exception:
             logger.warning(
                 "Discord terminal reaction reconciliation failed for %s",
@@ -9153,15 +9161,7 @@ class _GatewayRunnerCore(
 
     def _schedule_discord_terminal_reaction(self, item: Dict[str, Any]) -> bool:
         task, created = self._request_discord_terminal_reaction(item, None)
-        if not created:
-            return False
-        self._background_tasks.add(task)
-
-        def _cleanup(done: asyncio.Task) -> None:
-            self._background_tasks.discard(done)
-
-        task.add_done_callback(_cleanup)
-        return True
+        return created
 
     def _schedule_terminal_delivery_retry(self, work_id: str, *, attempt: int) -> bool:
         """Schedule one bounded, deduplicated retry without invoking a model."""

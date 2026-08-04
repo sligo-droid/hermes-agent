@@ -1248,6 +1248,22 @@ CURRENT_MAIN=1aa02906ca5cd01c377e67c8e404c8add905c210"""
         repaired,
         False,
     )
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "read_only_verify",
+        {"command": "verify-main-parent"},
+        json.dumps(
+            {
+                "command": ["verify-main-parent"],
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": "1aa02906ca5cd01c377e67c8e404c8add905c210",
+                    "commit_parent": "1aa02906ca5cd01c377e67c8e404c8add905c210",
+                },
+            }
+        ),
+        False,
+    )
 
     latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
     assert latest["pr"]["status"] == "success"
@@ -1450,6 +1466,23 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
         repaired,
         False,
     )
+    sha = "196820e67e9e2f2420033ef62aae56c2f5f3b589"
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "read_only_verify",
+        {"command": "verify-main-parent"},
+        json.dumps(
+            {
+                "command": ["verify-main-parent"],
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": sha,
+                    "commit_parent": sha,
+                },
+            }
+        ),
+        False,
+    )
     final = (
         "Commit `ab9c14a` was pushed and PR #1093 checks passed. "
         "The PR was closed without merge, and main remained unchanged."
@@ -1464,38 +1497,27 @@ def test_daily_smoke_closeout_response_is_not_falsely_downgraded():
     assert downgraded == final
 
 
-def test_daily_smoke_remote_main_and_commit_parent_prove_main_unchanged():
+def test_typed_main_parent_receipt_proves_main_unchanged():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     output = json.dumps(
         {
-            "output": (
-                'PR_EVIDENCE\n{"baseRefName":"main","closedAt":"2026-08-04T12:03:45Z",'
-                '"headRefOid":"3c79214f6dbefbb5b636e0f74b375f37cb0a4073",'
-                '"mergedAt":null,"state":"CLOSED","statusCheckRollup":[]}\n'
-                "REMOTE_MAIN\n"
-                "9954a1c87a4f280de22d3b3767f0b19185588062\trefs/heads/main\n"
-                "COMMIT_PARENT\n"
-                "9954a1c87a4f280de22d3b3767f0b19185588062\n"
-            ),
-            "exit_code": 0,
-            "error": None,
+            "command": ["verify-main-parent"],
+            "main_branch_evidence": {
+                "status": "success",
+                "remote_main": "9954a1c87a4f280de22d3b3767f0b19185588062",
+                "commit_parent": "9954a1c87a4f280de22d3b3767f0b19185588062",
+            },
         }
     )
 
     tool_executor._record_turn_verification_evidence(
         agent,
-        "terminal",
-        {
-            "command": (
-                "gh pr view 1100 --json state,mergedAt,headRefOid,statusCheckRollup,closedAt && "
-                "printf 'REMOTE_MAIN\\n' && git ls-remote origin refs/heads/main && "
-                "printf 'COMMIT_PARENT\\n' && git rev-parse HEAD^"
-            )
-        },
+        "read_only_verify",
+        {"command": "verify-main-parent"},
         output,
         False,
     )
-    final = "The PR was closed without merge, and main remained unchanged."
+    final = "Main remained unchanged."
 
     downgraded, constraints = downgrade_final_response_for_evidence(
         final,
@@ -1547,27 +1569,21 @@ def test_labeled_main_sha_proof_rejects_ambiguous_shapes(command, blocks):
     assert not any(item.get("surface") == "main_branch" for item in evidence)
 
 
-def test_labeled_commit_parent_cannot_be_overridden_by_payload_base_sha():
+def test_typed_main_parent_failure_cannot_be_overridden_by_payload_base_sha():
     remote_main = "a" * 40
     commit_parent = "b" * 40
     evidence = classify_tool_verification_evidence(
-        "terminal",
-        {
-            "command": (
-                "gh pr view 1100 && printf 'REMOTE_MAIN\\n' && "
-                "git ls-remote origin refs/heads/main && "
-                "printf 'COMMIT_PARENT\\n' && git rev-parse HEAD^"
-            )
-        },
+        "read_only_verify",
+        {"command": "verify-main-parent"},
         json.dumps(
             {
-                "output": (
-                    f'{{"base_sha":"{remote_main}","state":"closed"}}\n'
-                    f"REMOTE_MAIN\n{remote_main}\trefs/heads/main\n"
-                    f"COMMIT_PARENT\n{commit_parent}\n"
-                ),
-                "exit_code": 0,
-                "error": None,
+                "command": ["verify-main-parent"],
+                "base_sha": remote_main,
+                "main_branch_evidence": {
+                    "status": "failure",
+                    "remote_main": remote_main,
+                    "commit_parent": commit_parent,
+                },
             }
         ),
         False,
@@ -1850,7 +1866,7 @@ def test_checks_success_does_not_turn_failed_pull_query_into_pr_success():
     ] is False
 
 
-def test_equal_main_markers_authorize_unchanged_claim_despite_later_error():
+def test_terminal_main_markers_do_not_authorize_unchanged_claim():
     sha = "196820e67e9e2f2420033ef62aae56c2f5f3b589"
     evidence = classify_tool_verification_evidence(
         "terminal",
@@ -1882,11 +1898,11 @@ def test_equal_main_markers_authorize_unchanged_claim_despite_later_error():
         "The PR was closed without merge and main remained unchanged.", evidence
     )
 
-    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "success"
-    assert constraints["allowed"] is True
+    assert "main_branch" not in latest_evidence_by_surface(evidence)
+    assert constraints["allowed"] is False
 
 
-def test_different_main_markers_block_unchanged_claim():
+def test_terminal_main_marker_mismatch_is_not_typed_branch_evidence():
     evidence = classify_tool_verification_evidence(
         "terminal",
         {"command": "MAIN_BEFORE=x; gh pr close 123; MAIN_AFTER=y"},
@@ -1907,7 +1923,7 @@ def test_different_main_markers_block_unchanged_claim():
 
     constraints = claim_constraints_for_text("Main remained unchanged.", evidence)
 
-    assert latest_evidence_by_surface(evidence)["main_branch"]["status"] == "failure"
+    assert "main_branch" not in latest_evidence_by_surface(evidence)
     assert constraints["allowed"] is False
 
 

@@ -6479,6 +6479,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         item: Dict[str, Any],
         state: Optional[str] = None,
+        *,
+        acknowledge: bool = True,
     ) -> Optional[str]:
         """Repair every persisted terminal visual for a Discord work item.
 
@@ -6604,7 +6606,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 return None
             if not await self._set_message_reaction_state(message, emoji):
                 return None
-        ledger.mark_discord_thread_reaction_synced(item)
+        if acknowledge:
+            ledger.mark_discord_thread_reaction_synced(item)
         return resolved_state
 
     async def _mark_feature_summary_running(self, event: MessageEvent) -> None:

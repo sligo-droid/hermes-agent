@@ -37,6 +37,14 @@ _PACKAGE_JSON_LIMIT = 1_000_000
 _PNPM_PACKAGE_MANAGER_RE = re.compile(
     r"^pnpm@(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+\S+)?$"
 )
+_GITHUB_HTTPS_ORIGIN_RE = re.compile(
+    r"^https://github\.com/(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+_GITHUB_SSH_ORIGIN_RE = re.compile(
+    r"^(?:ssh://)?git@github\.com(?::|/)(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
 _JAVASCRIPT_LOCK_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock")
 _WRITABLE_NODE_CACHE_DIRS = (".vite", ".vite-temp")
 _SANDBOX_RESERVED_MOUNT_PREFIXES = tuple(
@@ -213,6 +221,8 @@ def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None
         allowed = len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]
     elif argv == ["git", "diff", "--check"]:
         allowed = True
+    elif argv == ["verify-main-parent"]:
+        allowed = True
     elif base in {"npm", "pnpm"}:
         tail = argv[1:]
         if tail and tail[0] == "run":
@@ -221,7 +231,8 @@ def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None
     if not allowed:
         return None, (
             "only repository test wrappers, pytest, and npm/pnpm test, lint, "
-            "type-check, verification, or build scripts are allowed"
+            "type-check, verification, or build scripts, plus the exact "
+            "verify-main-parent probe, are allowed"
         )
     return argv, None
 
@@ -243,6 +254,42 @@ def _git(cwd: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProces
         timeout=timeout,
         check=False,
     )
+
+
+def _github_origin_repository(cwd: Path) -> str | None:
+    remote = _git(cwd, "config", "--local", "--get", "remote.origin.url", timeout=10)
+    if remote.returncode != 0:
+        return None
+    origin = remote.stdout.decode(errors="replace").strip()
+    for pattern in (_GITHUB_HTTPS_ORIGIN_RE, _GITHUB_SSH_ORIGIN_RE):
+        match = pattern.fullmatch(origin)
+        if match:
+            return match.group("repo").removesuffix(".git")
+    return None
+
+
+def _github_main_sha(cwd: Path) -> tuple[str | None, bytes]:
+    repository = _github_origin_repository(cwd)
+    gh = shutil.which("gh")
+    if not repository or not gh:
+        return None, b"origin must be a github.com repository and gh must be installed"
+    result = subprocess.run(
+        [
+            gh,
+            "api",
+            f"repos/{repository}/git/ref/heads/main",
+            "--jq",
+            ".object.sha",
+        ],
+        cwd=str(cwd),
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    sha = result.stdout.decode(errors="replace").strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+        return None, result.stderr or result.stdout or b"GitHub returned an invalid main SHA"
+    return sha, b""
 
 
 def _copy_working_tree_overlay(source_root: Path, snapshot_root: Path) -> None:
@@ -806,6 +853,43 @@ def read_only_verify(
     except ValueError:
         return tool_error("verification workdir is outside its Git root")
 
+    if argv == ["verify-main-parent"]:
+        remote_sha, remote_error = _github_main_sha(source_root)
+        parent = _git(
+            source_root,
+            "--no-replace-objects",
+            "rev-parse",
+            "HEAD^",
+            timeout=10,
+        )
+        if remote_sha is None or parent.returncode != 0:
+            detail = remote_error or parent.stderr or parent.stdout
+            return tool_error(
+                "Could not compare origin/main with HEAD^: " + _bounded_output(detail)
+            )
+        parent_sha = parent.stdout.decode(errors="replace").strip().lower()
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", parent_sha):
+            return tool_error("Git returned an ambiguous main-branch comparison")
+        matches = remote_sha == parent_sha
+        return json.dumps(
+            {
+                "success": matches,
+                "command": argv,
+                "exit_code": 0 if matches else 1,
+                "output": (
+                    f"origin/main={remote_sha}\n"
+                    f"HEAD^={parent_sha}\n"
+                ),
+                "error": None,
+                "main_branch_evidence": {
+                    "status": "success" if matches else "failure",
+                    "remote_main": remote_sha,
+                    "commit_parent": parent_sha,
+                },
+            },
+            ensure_ascii=False,
+        )
+
     pnpm_runtime: Path | None = None
     if Path(argv[0]).name.lower() == "pnpm":
         pnpm_version, manifest, pin_error = _pnpm_package_manager_pin(
@@ -1010,14 +1094,19 @@ READ_ONLY_VERIFY_SCHEMA = {
         "Run a recognized test, lint, type-check, verification, or build command in a "
         "temporary Git snapshot. Only prepared dependencies and system runtimes are mounted "
         "read-only; network access is disabled, credentials are removed, and temporary "
-        "artifacts are deleted."
+        "artifacts are deleted. The exact command `verify-main-parent` instead performs a "
+        "direct read-only GitHub API comparison of origin/main with HEAD^ and returns typed "
+        "evidence."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "A single recognized verification command without shell operators.",
+                "description": (
+                    "A single recognized verification command without shell operators, or the "
+                    "exact branch probe `verify-main-parent`."
+                ),
             },
             "workdir": {
                 "type": "string",
