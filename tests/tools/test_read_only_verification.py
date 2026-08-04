@@ -18,8 +18,11 @@ from tools.read_only_verification_tool import (
     _prepared_dependency_roots,
     _verification_environment,
     _github_origin_repository,
+    _github_main_sha,
+    _trusted_executable,
     parse_read_only_verification_command,
     read_only_verify,
+    verify_main_parent,
 )
 from tools.git_inspection_tool import git_inspect
 
@@ -56,11 +59,11 @@ def test_read_only_verification_parser_allows_git_diff_check():
     assert error is None
 
 
-def test_read_only_verification_parser_allows_exact_main_parent_probe():
+def test_read_only_verification_parser_rejects_main_parent_pseudo_command():
     argv, error = parse_read_only_verification_command("verify-main-parent")
 
-    assert argv == ["verify-main-parent"]
-    assert error is None
+    assert argv is None
+    assert error
 
 
 @pytest.mark.parametrize(
@@ -103,6 +106,68 @@ def test_github_origin_repository_rejects_repository_transport_overrides(tmp_pat
     _git(repo, "config", "url.https://github.com/example/repo.git.insteadOf", "file:///tmp/fake.git")
 
     assert _github_origin_repository(repo) is None
+
+
+def test_github_origin_repository_ignores_inherited_git_dir(tmp_path, monkeypatch):
+    victim = tmp_path / "victim"
+    spoof = tmp_path / "spoof"
+    _init_repo(victim)
+    _init_repo(spoof)
+    _git(victim, "remote", "add", "origin", "https://github.com/owner/victim.git")
+    _git(spoof, "remote", "add", "origin", "https://github.com/owner/spoof.git")
+    monkeypatch.setenv("GIT_DIR", str(spoof / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(spoof))
+
+    assert _github_origin_repository(victim) == "owner/victim"
+
+
+def test_trusted_executable_ignores_ambient_path(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "gh"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    assert _trusted_executable("gh") != str(fake)
+
+
+def test_github_main_sha_forces_github_host_and_sanitized_environment(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout=b"a" * 40 + b"\n", stderr=b"")
+
+    monkeypatch.setattr(
+        verification_tool,
+        "_trusted_executable",
+        lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(verification_tool.subprocess, "run", fake_run)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("GH_HOST", "evil.example")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh-config"))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "spoof.git"))
+
+    sha, error = _github_main_sha("owner/repo", tmp_path)
+
+    assert sha == "a" * 40
+    assert error == b""
+    assert captured["argv"][:5] == [
+        "/usr/bin/gh",
+        "api",
+        "--hostname",
+        "github.com",
+        "repos/owner/repo/git/ref/heads/main",
+    ]
+    assert captured["env"]["PATH"] == os.defpath
+    assert "GH_HOST" not in captured["env"]
+    assert "GH_CONFIG_DIR" not in captured["env"]
+    assert "GIT_DIR" not in captured["env"]
 
 
 @pytest.mark.parametrize(
@@ -188,13 +253,16 @@ def test_read_only_verify_main_parent_returns_typed_evidence(tmp_path, monkeypat
     _git(repo, "commit", "-am", "branch")
 
     base_sha = _git(repo, "rev-parse", "HEAD^").stdout.strip()
-    monkeypatch.setattr(verification_tool, "_github_main_sha", lambda _cwd: (base_sha, b""))
-    payload = json.loads(
-        read_only_verify(command="verify-main-parent", workdir=str(repo))
+    monkeypatch.setattr(
+        verification_tool,
+        "_github_main_sha",
+        lambda _repository, _cwd: (base_sha, b""),
     )
+    payload = json.loads(verify_main_parent(workdir=str(repo)))
 
     assert payload["success"] is True
-    assert payload["command"] == ["verify-main-parent"]
+    assert payload["repository"] == "example/repo"
+    assert payload["repository_root"] == str(repo)
     assert payload["main_branch_evidence"] == {
         "status": "success",
         "remote_main": base_sha,
@@ -222,11 +290,9 @@ def test_read_only_verify_main_parent_reports_mismatch(tmp_path, monkeypatch):
     monkeypatch.setattr(
         verification_tool,
         "_github_main_sha",
-        lambda _cwd: (remote_sha, b""),
+        lambda _repository, _cwd: (remote_sha, b""),
     )
-    payload = json.loads(
-        read_only_verify(command="verify-main-parent", workdir=str(repo))
-    )
+    payload = json.loads(verify_main_parent(workdir=str(repo)))
 
     assert payload["success"] is False
     assert payload["exit_code"] == 1

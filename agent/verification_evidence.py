@@ -1213,21 +1213,29 @@ def classify_tool_verification_evidence(
     raw_check_name = str(args.get("command") or args.get("url") or args.get("route") or name)
     check_name = _text(raw_check_name, limit=160)
 
-    if name == "read_only_verify":
+    if name == "verify_main_parent":
         receipt = data.get("main_branch_evidence")
         if (
-            args.get("command") == "verify-main-parent"
-            and data.get("command") == ["verify-main-parent"]
+            not is_error
+            and data.get("error") is None
+            and isinstance(data.get("success"), bool)
+            and data.get("exit_code") in {0, 1}
             and isinstance(receipt, dict)
         ):
+            repository = str(data.get("repository") or "").lower()
+            repository_root = str(data.get("repository_root") or "")
             remote_main = str(receipt.get("remote_main") or "").lower()
             commit_parent = str(receipt.get("commit_parent") or "").lower()
             status = str(receipt.get("status") or "")
             if (
-                status in {"success", "failure"}
+                re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", repository)
+                and repository_root
+                and status in {"success", "failure"}
                 and _SHA_RE.fullmatch(remote_main)
                 and _SHA_RE.fullmatch(commit_parent)
                 and (status == "success") == (remote_main == commit_parent)
+                and data.get("success") == (status == "success")
+                and data.get("exit_code") == (0 if status == "success" else 1)
             ):
                 return [{
                     "schema_version": 1,
@@ -1235,8 +1243,11 @@ def classify_tool_verification_evidence(
                     "check_name": "origin/main equals HEAD^",
                     "status": status,
                     "order": int(order or 0),
+                    "subject": f"github:{repository}:branch:main",
                     "detail": json.dumps(
                         {
+                            "repository": repository,
+                            "repository_root": repository_root,
                             "remote_main": remote_main,
                             "commit_parent": commit_parent,
                             "proven": True,
@@ -1845,8 +1856,25 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                 )
     if _MAIN_UNCHANGED_CLAIM_RE.search(final_text):
         item = latest.get("main_branch") or {}
+        pr_item = latest.get("pr") or {}
+        branch_subject = str(item.get("subject") or "")
+        pr_subject = str(pr_item.get("subject") or "")
+        branch_match = re.fullmatch(r"github:(.+):branch:main", branch_subject)
+        pr_match = re.fullmatch(r"github:(?:(.+):)?pr:\d+", pr_subject)
+        repository_matches = bool(
+            not pr_subject
+            or (
+                branch_match
+                and pr_match
+                and pr_match.group(1)
+                and branch_match.group(1) == pr_match.group(1)
+            )
+        )
         if (
-            str(item.get("status") or "").lower() != "success"
+            (
+                str(item.get("status") or "").lower() != "success"
+                or not repository_matches
+            )
             and not any(entry.get("surface") == "main_branch" for entry in blocked)
         ):
             blocked.append(
@@ -1854,7 +1882,14 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
                     "surface": "main_branch",
                     "status": str(item.get("status") or "missing"),
                     "check_name": str(item.get("check_name") or "main branch SHA comparison"),
-                    "detail": str(item.get("detail") or "main branch SHA proof missing")[:240],
+                    "detail": str(
+                        item.get("detail")
+                        or (
+                            "main branch proof repository does not match PR repository"
+                            if not repository_matches
+                            else "main branch SHA proof missing"
+                        )
+                    )[:240],
                 }
             )
     return {

@@ -38,11 +38,13 @@ _PNPM_PACKAGE_MANAGER_RE = re.compile(
     r"^pnpm@(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+\S+)?$"
 )
 _GITHUB_HTTPS_ORIGIN_RE = re.compile(
-    r"^https://github\.com/(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+    r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/"
+    r"(?P<name>[A-Za-z0-9_.-]+?)(?:\.git)?/?$",
     re.IGNORECASE,
 )
 _GITHUB_SSH_ORIGIN_RE = re.compile(
-    r"^(?:ssh://)?git@github\.com(?::|/)(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+    r"^(?:ssh://)?git@github\.com(?::|/)(?P<owner>[A-Za-z0-9_.-]+)/"
+    r"(?P<name>[A-Za-z0-9_.-]+?)(?:\.git)?/?$",
     re.IGNORECASE,
 )
 _JAVASCRIPT_LOCK_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock")
@@ -81,11 +83,15 @@ _VERIFICATION_ENV_ALLOWLIST = frozenset(
 
 def check_read_only_verification_requirements() -> bool:
     return bool(
-        shutil.which("git")
+        _trusted_executable("git")
         and shutil.which("bwrap")
         and shutil.which("systemd-run")
         and (_CGROUP_V2_ROOT / "cgroup.controllers").is_file()
     )
+
+
+def check_main_parent_verification_requirements() -> bool:
+    return bool(_trusted_executable("git") and _trusted_executable("gh"))
 
 
 def _cgroup_v2_limiter_available(*, probe: bool = True) -> bool:
@@ -221,8 +227,6 @@ def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None
         allowed = len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]
     elif argv == ["git", "diff", "--check"]:
         allowed = True
-    elif argv == ["verify-main-parent"]:
-        allowed = True
     elif base in {"npm", "pnpm"}:
         tail = argv[1:]
         if tail and tail[0] == "run":
@@ -231,16 +235,33 @@ def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None
     if not allowed:
         return None, (
             "only repository test wrappers, pytest, and npm/pnpm test, lint, "
-            "type-check, verification, or build scripts, plus the exact "
-            "verify-main-parent probe, are allowed"
+            "type-check, verification, or build scripts are allowed"
         )
     return argv, None
 
 
+def _trusted_executable(name: str) -> str | None:
+    return shutil.which(name, path=os.defpath)
+
+
+def _git_environment() -> dict[str, str]:
+    return {
+        "PATH": os.defpath,
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
 def _git(cwd: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess[bytes]:
+    executable = _trusted_executable("git")
+    if not executable:
+        raise RuntimeError("trusted Git executable is unavailable")
     return subprocess.run(
         [
-            "git",
+            executable,
             "-c",
             "core.fsmonitor=false",
             "-c",
@@ -251,6 +272,7 @@ def _git(cwd: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProces
         ],
         cwd=str(cwd),
         capture_output=True,
+        env=_git_environment(),
         timeout=timeout,
         check=False,
     )
@@ -264,25 +286,52 @@ def _github_origin_repository(cwd: Path) -> str | None:
     for pattern in (_GITHUB_HTTPS_ORIGIN_RE, _GITHUB_SSH_ORIGIN_RE):
         match = pattern.fullmatch(origin)
         if match:
-            return match.group("repo").removesuffix(".git")
+            owner = match.group("owner")
+            name = match.group("name").removesuffix(".git")
+            if owner not in {".", ".."} and name not in {"", ".", ".."}:
+                return f"{owner}/{name}".lower()
     return None
 
 
-def _github_main_sha(cwd: Path) -> tuple[str | None, bytes]:
-    repository = _github_origin_repository(cwd)
-    gh = shutil.which("gh")
-    if not repository or not gh:
-        return None, b"origin must be a github.com repository and gh must be installed"
+def _github_environment() -> dict[str, str]:
+    env = {
+        "PATH": os.defpath,
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "GH_PROMPT_DISABLED": "1",
+    }
+    for key in (
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+    ):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+def _github_main_sha(repository: str, cwd: Path) -> tuple[str | None, bytes]:
+    gh = _trusted_executable("gh")
+    if not gh:
+        return None, b"trusted gh executable is unavailable"
     result = subprocess.run(
         [
             gh,
             "api",
+            "--hostname",
+            "github.com",
             f"repos/{repository}/git/ref/heads/main",
             "--jq",
             ".object.sha",
         ],
         cwd=str(cwd),
         capture_output=True,
+        env=_github_environment(),
         timeout=30,
         check=False,
     )
@@ -853,43 +902,6 @@ def read_only_verify(
     except ValueError:
         return tool_error("verification workdir is outside its Git root")
 
-    if argv == ["verify-main-parent"]:
-        remote_sha, remote_error = _github_main_sha(source_root)
-        parent = _git(
-            source_root,
-            "--no-replace-objects",
-            "rev-parse",
-            "HEAD^",
-            timeout=10,
-        )
-        if remote_sha is None or parent.returncode != 0:
-            detail = remote_error or parent.stderr or parent.stdout
-            return tool_error(
-                "Could not compare origin/main with HEAD^: " + _bounded_output(detail)
-            )
-        parent_sha = parent.stdout.decode(errors="replace").strip().lower()
-        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", parent_sha):
-            return tool_error("Git returned an ambiguous main-branch comparison")
-        matches = remote_sha == parent_sha
-        return json.dumps(
-            {
-                "success": matches,
-                "command": argv,
-                "exit_code": 0 if matches else 1,
-                "output": (
-                    f"origin/main={remote_sha}\n"
-                    f"HEAD^={parent_sha}\n"
-                ),
-                "error": None,
-                "main_branch_evidence": {
-                    "status": "success" if matches else "failure",
-                    "remote_main": remote_sha,
-                    "commit_parent": parent_sha,
-                },
-            },
-            ensure_ascii=False,
-        )
-
     pnpm_runtime: Path | None = None
     if Path(argv[0]).name.lower() == "pnpm":
         pnpm_version, manifest, pin_error = _pnpm_package_manager_pin(
@@ -1094,19 +1106,14 @@ READ_ONLY_VERIFY_SCHEMA = {
         "Run a recognized test, lint, type-check, verification, or build command in a "
         "temporary Git snapshot. Only prepared dependencies and system runtimes are mounted "
         "read-only; network access is disabled, credentials are removed, and temporary "
-        "artifacts are deleted. The exact command `verify-main-parent` instead performs a "
-        "direct read-only GitHub API comparison of origin/main with HEAD^ and returns typed "
-        "evidence."
+        "artifacts are deleted."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": (
-                    "A single recognized verification command without shell operators, or the "
-                    "exact branch probe `verify-main-parent`."
-                ),
+                "description": "A single recognized verification command without shell operators.",
             },
             "workdir": {
                 "type": "string",
@@ -1138,4 +1145,87 @@ registry.register(
     effect=ToolEffect.READ_ONLY,
     emoji="🧪",
     max_result_size_chars=_OUTPUT_LIMIT,
+)
+
+
+def verify_main_parent(*, workdir: str = "", runtime_mode: Any = None) -> str:
+    """Compare a GitHub repository's origin/main with the local commit parent."""
+
+    del runtime_mode
+    raw_cwd = str(workdir or get_session_env("HERMES_SESSION_CWD", "") or os.getcwd())
+    source_cwd = Path(raw_cwd).expanduser().resolve(strict=False)
+    try:
+        root_result = _git(source_cwd, "rev-parse", "--show-toplevel", timeout=10)
+    except Exception as exc:
+        return tool_error(f"verify_main_parent failed closed: {type(exc).__name__}: {exc}")
+    if root_result.returncode != 0:
+        return tool_error("verify_main_parent requires a Git working tree")
+    source_root = Path(root_result.stdout.decode(errors="replace").strip()).resolve()
+    repository = _github_origin_repository(source_root)
+    if not repository:
+        return tool_error("origin must be a canonical github.com repository")
+    remote_sha, remote_error = _github_main_sha(repository, source_root)
+    parent = _git(
+        source_root,
+        "--no-replace-objects",
+        "rev-parse",
+        "HEAD^",
+        timeout=10,
+    )
+    if remote_sha is None or parent.returncode != 0:
+        detail = remote_error or parent.stderr or parent.stdout
+        return tool_error(
+            "Could not compare origin/main with HEAD^: " + _bounded_output(detail)
+        )
+    parent_sha = parent.stdout.decode(errors="replace").strip().lower()
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", parent_sha):
+        return tool_error("Git returned an ambiguous commit parent")
+    matches = remote_sha == parent_sha
+    return json.dumps(
+        {
+            "success": matches,
+            "exit_code": 0 if matches else 1,
+            "error": None,
+            "repository": repository,
+            "repository_root": str(source_root),
+            "main_branch_evidence": {
+                "status": "success" if matches else "failure",
+                "remote_main": remote_sha,
+                "commit_parent": parent_sha,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+VERIFY_MAIN_PARENT_SCHEMA = {
+    "name": "verify_main_parent",
+    "description": (
+        "Directly compare a canonical github.com repository's origin/main SHA with the local "
+        "HEAD^ SHA and return repository-bound typed evidence."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workdir": {
+                "type": "string",
+                "description": "Optional absolute source working directory; defaults to session cwd.",
+            },
+        },
+    },
+}
+
+
+registry.register(
+    name="verify_main_parent",
+    toolset="terminal",
+    schema=VERIFY_MAIN_PARENT_SCHEMA,
+    handler=lambda args, **kw: verify_main_parent(
+        workdir=args.get("workdir", ""),
+        runtime_mode=kw.get("runtime_mode"),
+    ),
+    check_fn=check_main_parent_verification_requirements,
+    effect=ToolEffect.READ_ONLY,
+    emoji="🔎",
+    max_result_size_chars=10_000,
 )

@@ -32,7 +32,7 @@ _HERMES_CORE_TOOLS = [
     # Web
     "web_search", "web_extract",
     # Terminal + process management
-    "terminal", "process", "read_only_verify", "git_inspect", "project_observe",
+    "terminal", "process", "read_only_verify", "verify_main_parent", "git_inspect", "project_observe",
     # Trusted, post-merge-only fast-forward for protected canonical checkouts.
     # The handler rejects delegated and dispatcher-scoped workers.
     "sync_canonical_checkout",
