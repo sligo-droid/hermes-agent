@@ -2617,6 +2617,33 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def send_final_with_local_attachments(
+        self,
+        chat_id: str,
+        content: str,
+        file_paths: List[str],
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Optionally send final text and local files as one platform message.
+
+        Adapters return ``None`` when they do not support atomic text/file
+        delivery or when the specific payload cannot be combined safely.
+        """
+        return None
+
+    async def attach_local_files_to_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        file_paths: List[str],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Optionally add local files to an already-delivered final message."""
+        return None
+
     async def delete_message(
         self,
         chat_id: str,
@@ -5044,6 +5071,55 @@ class BasePlatformAdapter(ABC):
                             os.remove(_tts_path)
                         except OSError:
                             pass
+
+                # Platforms such as Discord can carry the final text and its
+                # local evidence files in one message. Prefer that atomic path
+                # before the generic text-then-attachment sequence so the
+                # attachments belong to the actual response, not a follow-up.
+                _combined_attachment_paths: list[str] = []
+                if text_content and not _tts_path and not _tts_caption_delivered:
+                    for media_path, is_voice in media_files:
+                        _ext = Path(media_path).suffix.lower()
+                        if not should_send_media_as_audio(
+                            self.platform,
+                            _ext,
+                            is_voice=is_voice,
+                        ):
+                            _combined_attachment_paths.append(media_path)
+                    _combined_attachment_paths.extend(local_files)
+
+                if _combined_attachment_paths:
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    combined_result = await delivery_adapter.send_final_with_local_attachments(
+                        chat_id=event.source.chat_id,
+                        content=text_content,
+                        file_paths=_combined_attachment_paths,
+                        reply_to=_reply_anchor_for_event(event),
+                        metadata=_final_thread_metadata,
+                    )
+                    if combined_result is not None:
+                        _record_delivery(combined_result)
+                        if combined_result.success:
+                            combined_set = set(_combined_attachment_paths)
+                            text_content = ""
+                            media_files = [
+                                item for item in media_files if item[0] not in combined_set
+                            ]
+                            local_files = [
+                                path for path in local_files if path not in combined_set
+                            ]
+                        elif combined_result.retry_safe is False:
+                            # The platform cannot prove that the atomic send had
+                            # no side effect (for example, a timeout after upload).
+                            # Avoid a duplicate text response and attachment set.
+                            combined_set = set(_combined_attachment_paths)
+                            text_content = ""
+                            media_files = [
+                                item for item in media_files if item[0] not in combined_set
+                            ]
+                            local_files = [
+                                path for path in local_files if path not in combined_set
+                            ]
 
                 # Send the text portion. A reconnect may have replaced this
                 # adapter while its in-flight handler was still producing a

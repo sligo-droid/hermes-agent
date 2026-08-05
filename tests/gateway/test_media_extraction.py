@@ -663,6 +663,59 @@ caption
         assert images == [(f"file://{image}", "")]
 
     @pytest.mark.asyncio
+    async def test_post_stream_delivery_attaches_local_images_to_final_message(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        image = tmp_path / "result.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
+        event = MessageEvent(
+            text="show the result",
+            message_type=MessageType.TEXT,
+            source=SessionSource(platform=Platform.DISCORD, chat_id="thread-1"),
+        )
+        adapter = SimpleNamespace(
+            name="discord",
+            extract_media=BasePlatformAdapter.extract_media,
+            extract_images=BasePlatformAdapter.extract_images,
+            extract_local_files=BasePlatformAdapter.extract_local_files,
+            attach_local_files_to_message=AsyncMock(
+                return_value=SendResult(success=True, message_id="final-1")
+            ),
+            send_multiple_images=AsyncMock(),
+            send_voice=AsyncMock(),
+            send_document=AsyncMock(),
+            send_video=AsyncMock(),
+        )
+        runner = SimpleNamespace(
+            _thread_metadata_for_source=lambda _source, _anchor=None: None,
+            _reply_anchor_for_event=lambda _event: None,
+        )
+
+        await GatewayRunner._deliver_media_from_response(
+            runner,
+            f"Done.\nMEDIA:{image}",
+            event,
+            adapter,
+            message_id="final-1",
+        )
+
+        adapter.attach_local_files_to_message.assert_awaited_once_with(
+            chat_id="thread-1",
+            message_id="final-1",
+            file_paths=[str(image)],
+            metadata=None,
+        )
+        adapter.send_multiple_images.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_document_delivery_deduplicates_explicit_and_bare_local_image(
         self,
         tmp_path,

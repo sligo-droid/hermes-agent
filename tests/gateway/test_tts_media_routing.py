@@ -36,6 +36,15 @@ class _MediaRoutingAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "dm"}
 
 
+class _CombinedDiscordAdapter(_MediaRoutingAdapter):
+    def __init__(self):
+        BasePlatformAdapter.__init__(
+            self,
+            PlatformConfig(enabled=True, token="test"),
+            Platform.DISCORD,
+        )
+
+
 def _event(thread_id=None):
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -120,6 +129,38 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
         metadata={"notify": True},
     )
     adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_base_adapter_sends_discord_text_with_local_attachments_once(tmp_path, monkeypatch):
+    adapter = _CombinedDiscordAdapter()
+    event = _event()
+    event.source.platform = Platform.DISCORD
+    image = _allowed_media_path(tmp_path, monkeypatch, "evidence.png")
+    adapter._message_handler = AsyncMock(
+        return_value=f"Visual QA passed.\n\nMEDIA:{image}"
+    )
+    adapter.send_final_with_local_attachments = AsyncMock(
+        return_value=SendResult(success=True, message_id="final")
+    )
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="text")
+    )
+    adapter.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="images")
+    )
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.send_final_with_local_attachments.assert_awaited_once_with(
+        chat_id="chat-1",
+        content="Visual QA passed.",
+        file_paths=[str(image)],
+        reply_to="msg-1",
+        metadata={"notify": True},
+    )
+    adapter._send_with_retry.assert_not_awaited()
+    adapter.send_multiple_images.assert_not_awaited()
 
 
 def _fake_runner(thread_meta):
