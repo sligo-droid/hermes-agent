@@ -405,6 +405,11 @@ async def test_resolves_hybrid_supervisor_by_effective_session_key(monkeypatch):
     monkeypatch.setattr(browser_tool, "_last_session_key", lambda _task: "task::local")
     monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda key: seen.append(key))
     monkeypatch.setattr(
+        browser_tool,
+        "_align_cdp_supervisor_to_current_page",
+        lambda key, **_kwargs: seen.append(f"align:{key}"),
+    )
+    monkeypatch.setattr(
         browser_supervisor.SUPERVISOR_REGISTRY,
         "get",
         lambda key: supervisor if key == "task::local" else None,
@@ -417,7 +422,7 @@ async def test_resolves_hybrid_supervisor_by_effective_session_key(monkeypatch):
     )
 
     assert result["status"] == "passed"
-    assert seen == ["task::local"]
+    assert seen == ["task::local", "align:task::local"]
 
 
 @pytest.mark.asyncio

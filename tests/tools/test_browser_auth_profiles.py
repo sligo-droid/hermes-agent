@@ -369,3 +369,41 @@ def test_browser_authenticate_schema_exposes_only_an_opaque_profile_name():
     parameters = entry.schema["parameters"]
     assert parameters["additionalProperties"] is False
     assert set(parameters["properties"]) == {"profile"}
+
+
+def test_successful_navigation_refreshes_and_aligns_cdp_supervisor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "check_website_access", lambda _url: None)
+    monkeypatch.setattr(browser_tool, "_get_session_info", lambda _key: {"_first_nav": False})
+    monkeypatch.setattr(
+        browser_tool,
+        "_run_browser_command",
+        lambda _task, command, _args, **_kwargs: (
+            {"success": True, "data": {"url": "https://app.example.test/", "title": "App"}}
+            if command == "open"
+            else {"success": False}
+        ),
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_ensure_cdp_supervisor",
+        lambda key: calls.append(("ensure", key)),
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_align_cdp_supervisor_to_current_page",
+        lambda key: calls.append(("align", key)) or True,
+    )
+    monkeypatch.setattr(browser_tool, "_should_probe_plain_json", lambda *_args: False)
+
+    result = json.loads(
+        browser_tool.browser_navigate(
+            "https://app.example.test/",
+            task_id="visual-turn",
+        )
+    )
+
+    assert result["success"] is True
+    assert calls == [("ensure", "visual-turn"), ("align", "visual-turn")]
