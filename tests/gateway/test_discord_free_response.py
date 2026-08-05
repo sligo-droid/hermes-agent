@@ -137,7 +137,7 @@ def adapter(monkeypatch):
 
 def test_discord_action_request_heuristic_counts_non_product_work(adapter):
     assert adapter._heuristic_action_request_intent("run the entire pipeline from scratch") is True
-    assert adapter._heuristic_action_request_intent("can you rerun the scraper?") is None
+    assert adapter._heuristic_action_request_intent("can you rerun the scraper?") is True
     assert adapter._heuristic_action_request_intent("why did the scraper fail?") is False
 
 

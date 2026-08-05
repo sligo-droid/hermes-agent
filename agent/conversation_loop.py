@@ -20,7 +20,6 @@ import json
 import logging
 import os
 import random
-import re
 import ssl
 import threading
 import time
@@ -97,19 +96,11 @@ from agent.conversation_compression import (
 
 logger = logging.getLogger(__name__)
 
-_ELEVATED_REVIEW_REASONING_REQUEST_RE = re.compile(
-    r"\bxhigh\b"
-    r"|\bdeep[\s_-]+review\b"
-    r"|\b(?:higher|more|extra)\s+(?:reasoning(?:\s+effort)?|thinking)\b"
-    r"|\b(?:reason|think)\s+(?:harder|more\s+deeply)\b"
-)
-
-
 def _human_requested_elevated_review_reasoning(message: Any) -> bool:
     """Return whether the current human turn authorizes the deep-review tier."""
-    return bool(
-        _ELEVATED_REVIEW_REASONING_REQUEST_RE.search(str(message or "").lower())
-    )
+    from hermes_cli.model_tiers import human_requested_elevated_reasoning
+
+    return human_requested_elevated_reasoning(message)
 
 
 # Stable prefix used by gateway/TUI/ACP surfaces to recognize provider-wait

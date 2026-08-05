@@ -20,13 +20,16 @@ running lower-authority agent.
 
 Discord has one explicit per-turn capability: `read_only` or `action`.
 
-1. Ordinary Discord messages default to `read_only`. This runtime can answer
-   from context or actively observe through proven read-only file/search,
-   history/log, browser navigation/snapshot/vision, API, process-inspection,
-   disposable verification, and read-only delegation capabilities.
-2. Deterministic high-confidence mutation and operational requests enter the
-   existing `action` runtime directly. Ambiguous mutation language starts
-   read-only and may call `escalate_to_action`.
+1. Recognized informational and observational Discord messages use
+   `read_only`. This runtime can answer from context or actively observe through
+   proven read-only file/search, history/log, browser navigation/snapshot/vision,
+   API, process-inspection, disposable verification, and read-only delegation
+   capabilities.
+2. Deterministic mutation and operational requests enter the existing `action`
+   runtime directly. After explicit read-only constraints, observational task
+   shapes, greetings, and informational questions are recognized, unresolved
+   ambiguity also prefers `action`. Occasional false-positive action routing is
+   accepted to avoid the latency of a read-only turn followed by replay.
 3. Audits, research, verification, plans, and recommendations remain read-only
    even when they require tools. Explicit constraints such as "do not
    implement," "plan only," "recommend only," and "tell me what you would do"
@@ -75,21 +78,27 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
     operational observability and delivery metadata, not user or project
     mutation. Read-only children still cannot write project files, persist
     conversation memory, or request service changes through their transport.
-11. Discord read-only turns use the configured `discord_action` model tier and
-    reasoning profile for consistent observation quality and latency. This is a
-    model-route choice only: `discord_action_runtime` remains the separate
-    authority for mutable worktrees, action prompts, zero tool delay,
-    verification-on-stop, and action lifecycle behavior. Read-only orchestration
-    should usually handle small, tightly coupled observations directly to retain
-    context and reduce latency, but may delegate whenever parallelism, independent
-    verification, context isolation, or deeper reasoning adds value. Any configured
-    delegation tier remains available; omitted tiers inherit the route-tier parent
-    (Sol/medium by default) while preserving read-only enforcement.
+11. Discord read-only turns use the dedicated `discord_read_only` Sol/low model
+    tier. This is a model-route choice only: `discord_action_runtime` remains the
+    separate authority for mutable worktrees, action prompts, zero tool delay,
+    verification-on-stop, and action lifecycle behavior. The deterministic intake
+    classifier intentionally biases unresolved requests toward the action runtime;
+    read-only is reserved for recognized informational or observational work and
+    explicit no-action constraints. If read-only observation nevertheless reveals
+    that mutation is required, `escalate_to_action` ends the turn and the gateway
+    replays the original request through `discord_action` Sol/medium with its
+    isolated worktree and lifecycle policy. Explicit human requests for higher
+    reasoning select `deep_review` Sol/high for that turn; ordinary risk wording
+    does not automatically promote the route. Read-only orchestration should
+    usually handle small, tightly coupled observations directly to retain context
+    and reduce latency, but may delegate whenever parallelism, independent
+    verification, context isolation, or deeper reasoning adds value.
 
 ## Consequences
 
-- Answers and active observation share one default runtime, eliminating the
-  question-to-action double hop for non-mutating work.
+- Recognized answers and active observation use the low-latency read-only
+  runtime, while unresolved requests prefer direct action routing and avoid an
+  extra replay in the common likely-mutation case.
 - Clear mutations retain their direct fast path and all existing action
   isolation, verification, lifecycle, and closeout semantics.
 - Explicit non-implementation constraints remain safe in long-running action

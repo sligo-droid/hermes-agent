@@ -220,7 +220,8 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "recommended default" in init["ephemeral_system_prompt"]
     assert "state the assumption and continue" in init["ephemeral_system_prompt"]
     assert "Explicit visual UI work must use delegate_coding_task" in init["ephemeral_system_prompt"]
-    assert "small non-visual frontend-only" in init["ephemeral_system_prompt"]
+    assert "small non-visual frontend-only edit" in init["ephemeral_system_prompt"]
+    assert "do it inline in the current agent turn" in init["ephemeral_system_prompt"]
     assert "phase timing line" not in init["ephemeral_system_prompt"]
     assert "contradictory done/not-verified" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
@@ -293,7 +294,7 @@ async def test_invalid_routine_tier_preserves_legacy_action_fallback(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_existing_action_thread_direct_question_uses_discord_action_tier_without_action_semantics(monkeypatch):
+async def test_existing_action_thread_direct_question_uses_read_only_tier(monkeypatch):
     _patch_agent_runtime(monkeypatch)
     runner = _make_runner()
     feature_summary = {
@@ -324,7 +325,7 @@ async def test_existing_action_thread_direct_question_uses_discord_action_tier_w
     assert "Discord action-request thread guidance" not in init["ephemeral_system_prompt"]
     assert "Answer this current direct question in place." in init["ephemeral_system_prompt"]
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
-    assert audit["model_tier"] == "discord_action"
+    assert audit["model_tier"] == "discord_read_only"
     assert audit["model_tier_source"] == "route"
     assert audit["runtime_route"] == "discord_read_only"
     assert audit["reasoning_source"] == "model_tier"
@@ -332,7 +333,7 @@ async def test_existing_action_thread_direct_question_uses_discord_action_tier_w
 
 
 @pytest.mark.asyncio
-async def test_bare_discord_read_only_turn_uses_discord_action_tier(monkeypatch):
+async def test_bare_discord_read_only_turn_uses_discord_read_only_tier(monkeypatch):
     _patch_agent_runtime(monkeypatch)
     runner = _make_runner()
     captured_cache_keys = []
@@ -371,13 +372,41 @@ async def test_bare_discord_read_only_turn_uses_discord_action_tier(monkeypatch)
     assert "tool_delay" not in init
     assert "verify_on_stop" not in init
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
-    assert audit["model_tier"] == "discord_action"
+    assert audit["model_tier"] == "discord_read_only"
     assert audit["model_tier_source"] == "route"
     assert audit["runtime_route"] == "discord_read_only"
-    assert captured_cache_keys[0]["gateway.discord_action_model_route"] is True
-    assert captured_cache_keys[0]["gateway.discord_action_model_tier"] == "discord_action"
+    assert captured_cache_keys[0]["gateway.discord_model_route"] is True
+    assert captured_cache_keys[0]["gateway.discord_model_tier"] == "discord_read_only"
     assert captured_cache_keys[0]["gateway.discord_action_request_fast_path"] is False
     assert captured_cache_keys[0]["gateway.discord_feature_request_fast_path"] is False
+
+
+@pytest.mark.parametrize("intent", [False, True])
+@pytest.mark.asyncio
+async def test_explicit_higher_reasoning_uses_deep_review_tier(monkeypatch, intent):
+    _patch_agent_runtime(monkeypatch)
+    runner = _make_runner()
+
+    result = await _run_discord_agent(
+        runner,
+        {"initial_request": "Review this", "message_id": "300", "kanban_board": None}
+        if intent
+        else None,
+        intent=intent,
+        message="Use high reasoning for this turn.",
+    )
+
+    assert result["reasoning_effort"] == "high"
+    assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": "high",
+    }
+    audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
+    assert audit["model_tier"] == "deep_review"
+    assert audit["runtime_route"] == (
+        "discord_action_request" if intent else "discord_read_only"
+    )
 
 
 @pytest.mark.asyncio

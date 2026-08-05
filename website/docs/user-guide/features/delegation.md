@@ -39,7 +39,7 @@ work. Goal/context keywords do not select a tier. A per-task batch value
 overrides the top-level batch default; omission inherits the parent runtime
 model and reasoning.
 
-`deep_review` is a reserved Sol/`xhigh` special case. It is available only on
+`deep_review` is a reserved Sol/`high` special case. It is available only on
 the root turn when the user's current message explicitly asks for a deep review
 or higher reasoning; nested agents and ordinary tier selection cannot use it.
 

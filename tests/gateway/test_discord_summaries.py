@@ -520,7 +520,7 @@ def test_classifier_authority_keeps_escalation_available_on_read_only_turns(adap
         "Could this be improved?",
         gateway_run.RuntimeMode.READ_ONLY,
     )
-    assert reason == "ambiguous_read_only"
+    assert reason == "classified_read_only"
     assert allowed is True
 
     later_reason, later_allowed = adapter._discord_runtime_authority(

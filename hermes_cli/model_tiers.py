@@ -28,13 +28,29 @@ _TRIVIAL_MODEL_TIER: dict[str, Any] = {
     "fast_mode": True,
 }
 
+_ELEVATED_REASONING_REQUEST_RE = re.compile(
+    r"\b(?:please\s+)?(?:do|perform|run|request|want|need)\s+(?:a\s+)?deep[\s_-]+review\b"
+    r"|\b(?:please\s+)?(?:use|apply|enable|select)\s+(?:high|higher|xhigh)"
+    r"(?:\s+(?:reasoning(?:\s+effort)?|thinking))?\b"
+    r"|\b(?:please\s+)?(?:set|switch)\s+(?:the\s+)?"
+    r"(?:reasoning(?:\s+effort)?|thinking)\s+(?:to\s+)?(?:high|higher|xhigh)\b"
+    r"|\b(?:please\s+)?(?:use|apply|give(?:\s+(?:this|it))?|want|need|request)\s+"
+    r"(?:more|extra|higher)\s+(?:reasoning(?:\s+effort)?|thinking)\b"
+    r"|\b(?:please\s+)?(?:reason|think)\s+(?:harder|more\s+deeply)\b"
+)
+
+_ELEVATED_REASONING_NEGATION_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|without)\s+"
+    r"(?:use|apply|enable|select|set|switch|give|perform|run|think|reason)\b"
+)
+
 
 DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
     "trivial": dict(_TRIVIAL_MODEL_TIER),
     "basic": {
         "model": "gpt-5.6-terra",
         "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
         "fast_mode": True,
     },
     "intermediate": {
@@ -46,25 +62,34 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
     "advanced": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
         "fast_mode": False,
     },
-    # Human-requested deep reviews or higher-reasoning passes only. Delegation
-    # enforces the explicit root-turn authorization; this tier is intentionally
-    # outside the ladder.
+    # Human-requested deep reviews or higher-reasoning turns only. Gateway and
+    # delegation routing require explicit language from the current human turn;
+    # this tier is intentionally outside the ordinary ladder.
     "deep_review": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "xhigh",
+        "reasoning_effort": "high",
         "fast_mode": False,
     },
     # Route-specific tier for ordinary Discord action orchestration. It is
     # intentionally outside MODEL_TIER_LADDER so worker/delegation stepping
-    # continues to treat ``advanced`` as the shared Sol/high ceiling.
+    # continues to treat ``advanced`` as the shared Sol/medium ceiling.
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
         "reasoning_effort": "medium",
+        "fast_mode": False,
+    },
+    # Discord observation starts at Sol/low. If the model discovers that the
+    # request needs mutation, the escalation control tool stops this turn and
+    # the gateway replays the original request through ``discord_action``.
+    "discord_read_only": {
+        "model": "gpt-5.6-sol",
+        "opencode_model": "hermes-codex/gpt-5.6-sol",
+        "reasoning_effort": "low",
         "fast_mode": False,
     },
     # Rendered-UI sweep workers reuse the trivial Luna/medium worker profile,
@@ -237,6 +262,14 @@ class ModelTier:
     def reasoning_config(self) -> dict[str, Any] | None:
         """Return the OpenAI-compatible reasoning payload for this tier."""
         return parse_reasoning_effort(self.reasoning_effort)
+
+
+def human_requested_elevated_reasoning(message: Any) -> bool:
+    """Return whether the current human turn explicitly requests Sol/high."""
+    text = str(message or "").lower()
+    return not _ELEVATED_REASONING_NEGATION_RE.search(text) and bool(
+        _ELEVATED_REASONING_REQUEST_RE.search(text)
+    )
 
 
 def _normalized_name(value: Any) -> str:

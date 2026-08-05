@@ -134,27 +134,47 @@ def test_explanation_status_and_short_factual_questions_remain_intake(adapter, m
 @pytest.mark.parametrize(
     "message",
     [
-        "fix the login bug?",
-        "can you rerun the scraper?",
-        "should we retry the deploy?",
         "update: the deploy finished",
         "run completed successfully",
         "make is reporting a failure",
         "support is investigating the incident",
         "change was approved yesterday",
-        "how do I run the pipeline?",
         "yes do that",
-        "thanks, can you update the docs?",
-        "we need to fix the flaky test",
-        "okay, run the entire pipeline?",
     ],
 )
 def test_heuristic_defers_ambiguous_messages(adapter, message):
     assert adapter._heuristic_action_request_intent(message) is None
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "fix the login bug?",
+        "can you rerun the scraper?",
+        "thanks, can you update the docs?",
+        "we need to fix the flaky test",
+        "okay, run the entire pipeline?",
+        "can you get the tests passing?",
+    ],
+)
+def test_heuristic_aggressively_routes_mutation_requests(adapter, message):
+    assert adapter._heuristic_action_request_intent(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "should we retry the deploy?",
+        "how do I run the pipeline?",
+        "Could this parser be improved?",
+    ],
+)
+def test_informational_action_questions_remain_read_only(adapter, message):
+    assert adapter._heuristic_action_request_intent(message) is False
+
+
 @pytest.mark.asyncio
-async def test_ambiguous_message_defaults_to_question_without_llm(
+async def test_ambiguous_message_defaults_to_action_without_llm(
     adapter,
 ):
     with patch("agent.auxiliary_client.call_llm") as call_llm:
@@ -166,7 +186,7 @@ async def test_ambiguous_message_defaults_to_question_without_llm(
             ],
         )
 
-    assert result is False
+    assert result is True
     call_llm.assert_not_called()
 
 
@@ -177,13 +197,9 @@ def test_feature_triage_timeout_defaults_to_five_seconds(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_question_shaped_action_ask_starts_in_safe_intake(adapter):
-    # Polite mutable asks remain intentionally conservative: unlike explicit
-    # observational task verbs, "get ... passing" can describe either advice
-    # or execution. Intake can answer or transactionally escalate without
-    # provisioning mutable action state from the heuristic alone.
+async def test_question_shaped_action_ask_routes_directly_to_action(adapter):
     result = await adapter._classify_discord_action_request(
         "can you get the tests passing?"
     )
 
-    assert result is False
+    assert result is True

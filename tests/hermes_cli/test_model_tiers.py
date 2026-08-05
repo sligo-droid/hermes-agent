@@ -20,6 +20,7 @@ def test_default_routes_reference_resolvable_tiers():
         "gateway": DEFAULT_CONFIG["gateway"]["model_tier"],
         "cron": DEFAULT_CONFIG["cron"]["model_tier"],
         "discord_action_request": DEFAULT_CONFIG["discord"]["action_request_model_tier"],
+        "discord_read_only": DEFAULT_CONFIG["discord"]["read_only_model_tier"],
         "coding_worker_simple_build": DEFAULT_CONFIG["coding_worker"]["simple_build_model_tier"],
         "coding_worker_complex_plan": DEFAULT_CONFIG["coding_worker"]["complex_plan_model_tier"],
         "coding_worker_complex_build": DEFAULT_CONFIG["coding_worker"]["complex_build_model_tier"],
@@ -33,6 +34,7 @@ def test_default_routes_reference_resolvable_tiers():
         "gateway": "basic",
         "cron": "trivial",
         "discord_action_request": "discord_action",
+        "discord_read_only": "discord_read_only",
         "coding_worker_simple_build": "intermediate",
         "coding_worker_complex_plan": "advanced",
         "coding_worker_complex_build": "intermediate",
@@ -53,23 +55,39 @@ def test_default_routes_reference_resolvable_tiers():
 
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).reasoning_effort
-        for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
+        for name in (
+            "trivial",
+            "basic",
+            "intermediate",
+            "advanced",
+            "discord_action",
+            "discord_read_only",
+        )
     } == {
         "trivial": "medium",
-        "basic": "high",
+        "basic": "medium",
         "intermediate": "low",
-        "advanced": "high",
+        "advanced": "medium",
         "discord_action": "medium",
+        "discord_read_only": "low",
     }
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).model
-        for name in ("trivial", "basic", "intermediate", "advanced", "discord_action")
+        for name in (
+            "trivial",
+            "basic",
+            "intermediate",
+            "advanced",
+            "discord_action",
+            "discord_read_only",
+        )
     } == {
         "trivial": "gpt-5.6-luna",
         "basic": "gpt-5.6-terra",
         "intermediate": "gpt-5.6-sol",
         "advanced": "gpt-5.6-sol",
         "discord_action": "gpt-5.6-sol",
+        "discord_read_only": "gpt-5.6-sol",
     }
     assert {
         name: resolve_model_tier({"model_tiers": tiers}, name).fast_mode
@@ -138,13 +156,13 @@ def test_visual_tiers_are_outside_the_steppable_ladder():
         assert resolve_adjacent_model_tier({}, name, -1) is None
 
 
-def test_deep_review_is_reserved_sol_xhigh_outside_the_ladder():
+def test_deep_review_is_reserved_sol_high_outside_the_ladder():
     tier = resolve_model_tier({}, "deep_review")
 
     assert tier is not None
     assert tier.model == "gpt-5.6-sol"
     assert tier.opencode_model == "hermes-codex/gpt-5.6-sol"
-    assert tier.reasoning_effort == "xhigh"
+    assert tier.reasoning_effort == "high"
     assert "deep_review" not in MODEL_TIER_LADDER
     assert resolve_adjacent_model_tier({}, "deep_review", 1) is None
 
@@ -193,7 +211,7 @@ def test_reserved_builtin_tier_override_is_ignored():
                 "basic": {
                     "model": "gpt-5.6-terra",
                     "opencode_model": "hermes-codex/gpt-5.6-terra",
-                    "reasoning_effort": "high",
+                    "reasoning_effort": "xhigh",
                 }
             }
         },
@@ -203,7 +221,7 @@ def test_reserved_builtin_tier_override_is_ignored():
     assert tier is not None
     assert tier.model == "gpt-5.6-terra"
     assert tier.opencode_model == "hermes-codex/gpt-5.6-terra"
-    assert tier.reasoning_effort == "high"
+    assert tier.reasoning_effort == "medium"
 
 
 def test_custom_non_reserved_tier_resolves_atomically():

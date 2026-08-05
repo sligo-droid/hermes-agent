@@ -10,6 +10,7 @@ from agent.conversation_loop import _human_requested_elevated_review_reasoning
     [
         "Please do a deep review.",
         "Use xhigh for this.",
+        "Use high reasoning for this.",
         "Use higher reasoning for this review.",
         "Give this more reasoning effort.",
         "Think harder about the failure path.",
@@ -24,8 +25,10 @@ def test_explicit_elevated_reasoning_requests_authorize_deep_review(message):
     "message",
     [
         "Review this change.",
-        "Use high reasoning for this.",
+        "Explain the high-level reasoning in this review.",
         "Explain the reasoning in the review.",
+        "Explain how high reasoning differs from medium.",
+        "Do not use high reasoning for this.",
     ],
 )
 def test_ordinary_review_language_does_not_authorize_deep_review(message):

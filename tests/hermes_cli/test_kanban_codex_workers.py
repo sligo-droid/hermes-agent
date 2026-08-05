@@ -2906,7 +2906,7 @@ def test_role_worker_logs_named_tier_and_runtime_sources(monkeypatch, tmp_path):
     assert log is not None
     assert (
         "[kanban dispatcher] scheduled Codex role worker: "
-        "role=planner reasoning=high mode=fast "
+        "role=planner reasoning=medium mode=fast "
         "model=gpt-5.6-sol tier=advanced tier_source=role "
         "reasoning_source=model_tier service_tier=fast "
         "service_tier_source=explicit"
