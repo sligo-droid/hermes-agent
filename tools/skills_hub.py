@@ -31,9 +31,11 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from skill_catalog_policy import (
+    RETIRED_SKILL_MARKER,
     atomic_write_skills_index,
     filter_skill_records,
     is_retired_skill_record,
+    is_retired_skill_text,
     sanitize_skills_index,
 )
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -226,7 +228,93 @@ def _skill_bundle_allowed(
     if bundle is None:
         return False
     metadata_record = _policy_record_for_meta(meta) if meta is not None else None
-    return not is_retired_skill_record(_policy_record_for_bundle(bundle, metadata_record))
+    if is_retired_skill_record(_policy_record_for_bundle(bundle, metadata_record)):
+        return False
+    return _bundle_contents_allowed(bundle)
+
+
+_BUNDLE_SCAN_MAX_TOTAL_BYTES = 2 * 1024 * 1024
+_BUNDLE_SCAN_MAX_FILE_BYTES = 512 * 1024
+_BUNDLE_TEXT_SUFFIXES = frozenset(
+    {
+        ".md", ".markdown", ".txt", ".json", ".jsonc", ".yaml", ".yml",
+        ".toml", ".ini", ".cfg", ".conf", ".rst", ".csv", ".xml",
+        ".html", ".htm", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+        ".py", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".env",
+    }
+)
+_BUNDLE_TEXT_NAMES = frozenset(
+    {"skill.md", "readme", "readme.md", "license", "manifest", "dockerfile"}
+)
+
+
+def _bundle_text_content(rel_path: str, content: Union[str, bytes]) -> Optional[str]:
+    """Return bounded UTF-8 text for policy scanning, or None for binary data."""
+    name = PurePosixPath(rel_path).name.lower()
+    suffix = PurePosixPath(rel_path).suffix.lower()
+    must_be_text = name == "skill.md"
+    text_candidate = must_be_text or name in _BUNDLE_TEXT_NAMES or suffix in _BUNDLE_TEXT_SUFFIXES
+    if isinstance(content, str):
+        encoded = content.encode("utf-8")
+        if len(encoded) > _BUNDLE_SCAN_MAX_FILE_BYTES:
+            raise ValueError(f"Skill bundle text file exceeds policy scan limit: {rel_path}")
+        return content
+    if len(content) > _BUNDLE_SCAN_MAX_FILE_BYTES:
+        if text_candidate:
+            raise ValueError(f"Skill bundle text file exceeds policy scan limit: {rel_path}")
+        return None
+    if b"\x00" in content:
+        return None
+    try:
+        return content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        if must_be_text or text_candidate:
+            raise ValueError(f"Skill bundle text file is not valid UTF-8: {rel_path}")
+        return None
+
+
+def _bundle_contents_allowed(bundle: SkillBundle) -> bool:
+    """Fail closed across bundle paths and every bounded text-bearing file."""
+    total = 0
+    skill_md_count = 0
+    for raw_path, content in bundle.files.items():
+        try:
+            rel_path = _validate_bundle_rel_path(raw_path)
+        except ValueError:
+            return False
+        path_record = {
+            "name": bundle.name,
+            "identifier": bundle.identifier,
+            "source": bundle.source,
+            "path": rel_path,
+        }
+        if is_retired_skill_record(path_record):
+            return False
+        size = len(content.encode("utf-8")) if isinstance(content, str) else len(content)
+        total += size
+        if total > _BUNDLE_SCAN_MAX_TOTAL_BYTES:
+            return False
+        try:
+            text = _bundle_text_content(rel_path, content)
+        except ValueError:
+            return False
+        if PurePosixPath(rel_path).name.lower() == "skill.md":
+            skill_md_count += 1
+        if text is None or RETIRED_SKILL_MARKER not in text.lower():
+            continue
+        frontmatter = GitHubSource._parse_frontmatter_quick(text) if rel_path.lower().endswith("skill.md") else {}
+        record = {
+            "name": str(frontmatter.get("name") or bundle.name),
+            "description": str(frontmatter.get("description") or ""),
+            "author": frontmatter.get("author", ""),
+            "metadata": frontmatter.get("metadata", {}),
+            "source": bundle.source,
+            "identifier": bundle.identifier,
+            "path": rel_path,
+        }
+        if is_retired_skill_record(record) or is_retired_skill_text(text):
+            return False
+    return skill_md_count > 0
 
 
 def _guard_skill_source(source: "SkillSource") -> "SkillSource":
@@ -246,6 +334,8 @@ def _guard_skill_source(source: "SkillSource") -> "SkillSource":
 
     def guarded_fetch(self, identifier: str):
         meta = guarded_inspect(self, identifier)
+        if meta is None:
+            return None
         bundle = raw_fetch(identifier)
         return bundle if _skill_bundle_allowed(bundle, meta) else None
 

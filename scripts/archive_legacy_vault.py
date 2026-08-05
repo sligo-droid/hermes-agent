@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -28,7 +29,7 @@ from typing import Any, Callable, Iterable
 
 MARKER = "obsidian"
 CONFIRMATION = "RETIRE-OBSIDIAN-POST-MERGE"
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
 RECEIPT_DIR_MODE = 0o700
 RECEIPT_FILE_MODE = 0o600
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -46,12 +47,20 @@ GMAIL_UNITS = (
 )
 GATEWAY_UNIT = "hermes-gateway.service"
 QMD_SKILLS_REFRESH_UNIT = "qmd-skills-refresh.service"
-VAULT_RECEIPT_FILES = (
+GATEWAY_DRAIN_TIMEOUT_SECONDS = 120.0
+GATEWAY_DRAIN_POLL_SECONDS = 0.25
+GATEWAY_RESTART_TIMEOUT_SECONDS = 30.0
+GATEWAY_OWNED_WORKER_RE = re.compile(
+    r"(?:^|[/\s])(?:run_agent\.py|hermes(?:_cli)?\s+kanban|kanban_codex_worker|delegate_tool\.py)(?:\s|$)"
+)
+ARCHIVE_RECEIPT_FILES = (
     "MANIFEST.json",
     "SHA256SUMS",
     "FILE_METADATA.tsv",
     "VERIFICATION_RECEIPT.json",
 )
+JOURNAL_FILE = "TRANSACTION.jsonl"
+RESTORE_JOURNAL_FILE = "RESTORE.jsonl"
 
 
 class StopCutover(RuntimeError):
@@ -190,6 +199,95 @@ def atomic_write_json(path: Path, data: Any, mode: int = RECEIPT_FILE_MODE) -> N
     )
 
 
+class TransactionJournal:
+    """Append-only, fsynced, hash-chained write-ahead transaction journal."""
+
+    def __init__(self, path: Path, *, fault: Callable[[str], None] | None = None) -> None:
+        self.path = path
+        self.fault = fault or (lambda _label: None)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            atomic_write_bytes(self.path, b"", RECEIPT_FILE_MODE)
+        os.chmod(self.path, RECEIPT_FILE_MODE)
+        self.records = self.read_records(self.path)
+        self.head = self.records[-1]["hash"] if self.records else "0" * 64
+        self.next_seq = len(self.records) + 1
+
+    @staticmethod
+    def read_records(path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        previous = "0" * 64
+        for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise StopCutover(f"malformed transaction journal at line {line_number}") from exc
+            if not isinstance(record, dict):
+                raise StopCutover(f"malformed transaction journal at line {line_number}")
+            claimed = str(record.get("hash", ""))
+            unsigned = {key: value for key, value in record.items() if key != "hash"}
+            if record.get("previous_hash") != previous:
+                raise StopCutover(f"transaction journal chain break at line {line_number}")
+            calculated = sha256_bytes(
+                json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            )
+            if claimed != calculated:
+                raise StopCutover(f"transaction journal hash mismatch at line {line_number}")
+            if record.get("seq") != line_number or record.get("phase") not in {"intent", "complete", "seal"}:
+                raise StopCutover(f"malformed transaction journal at line {line_number}")
+            if not isinstance(record.get("action"), str) or not isinstance(record.get("data"), dict):
+                raise StopCutover(f"malformed transaction journal at line {line_number}")
+            if not isinstance(record.get("op_id"), str) or not record["op_id"]:
+                raise StopCutover(f"malformed transaction journal at line {line_number}")
+            records.append(record)
+            previous = claimed
+        return records
+
+    def append(self, phase: str, action: str, data: dict[str, Any], *, op_id: str = "") -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "seq": self.next_seq,
+            "phase": phase,
+            "action": action,
+            "op_id": op_id or f"op-{self.next_seq:06d}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": data,
+            "previous_hash": self.head,
+        }
+        record["hash"] = sha256_bytes(
+            json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        )
+        payload = (json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+        with self.path.open("ab", buffering=0) as handle:
+            handle.write(payload)
+            os.fsync(handle.fileno())
+        fsync_path(self.path.parent)
+        self.records.append(record)
+        self.head = record["hash"]
+        self.next_seq += 1
+        self.fault(f"journal-{action}-{phase}")
+        return record
+
+    def intent(self, action: str, data: dict[str, Any]) -> dict[str, Any]:
+        return self.append("intent", action, data)
+
+    def complete(self, intent: dict[str, Any], data: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.append("complete", intent["action"], data or {}, op_id=intent["op_id"])
+
+    def after_mutation(self, action: str) -> None:
+        self.fault(f"{action}-mutation")
+
+    def seal(self, data: dict[str, Any]) -> dict[str, Any]:
+        return self.append("seal", "transaction_seal", data)
+
+    def completed_ids(self) -> set[str]:
+        return {record["op_id"] for record in self.records if record.get("phase") == "complete"}
+
+    def intents(self) -> list[dict[str, Any]]:
+        return [record for record in self.records if record.get("phase") == "intent"]
+
+
 def restore_metadata(path: Path, before: os.stat_result) -> None:
     os.chmod(path, stat.S_IMODE(before.st_mode), follow_symlinks=False)
     try:
@@ -226,6 +324,19 @@ def _contains_marker(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_marker(child) for child in value)
     return MARKER in str(value).lower()
+
+
+def _validate_archive_rel_path(raw: str) -> str:
+    if not isinstance(raw, str) or not raw or raw == ".":
+        raise ValueError("invalid archive relative path")
+    if any(character in raw for character in ("\t", "\r", "\n")):
+        raise ValueError("archive relative path contains an unsupported control character")
+    path = PurePosixPath(raw)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("unsafe archive relative path")
+    if path.as_posix() != raw:
+        raise ValueError("non-canonical archive relative path")
+    return path.as_posix()
 
 
 def scrub_current_memory_text(text: str) -> str:
@@ -412,12 +523,12 @@ class HonchoBackend:
             page += 1
         return conclusions
 
-    def scrub(self, config_path: Path, host: str) -> dict[str, Any]:
+    def scrub(self, config_path: Path, host: str, journal: TransactionJournal) -> dict[str, Any]:
         from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client, reset_honcho_client
 
         config = HonchoClientConfig.from_global_config(host=host, config_path=config_path)
         if not config.enabled:
-            return {"host": host, "changed_cards": [], "deleted_conclusions": [], "remaining_search_hits": 0}
+            return {"host": host, "changed_cards": [], "corrective_conclusions": [], "remaining_search_hits": 0}
         reset_honcho_client()
         client = get_honcho_client(config)
         peers: list[str] = []
@@ -430,7 +541,7 @@ class HonchoBackend:
                 break
             page += 1
         changed_cards: list[dict[str, Any]] = []
-        deleted: list[dict[str, Any]] = []
+        corrections: list[dict[str, Any]] = []
         context_scopes: list[dict[str, Any]] = []
         for observer_id in peers:
             observer = client.peer(observer_id)
@@ -438,7 +549,14 @@ class HonchoBackend:
                 card = list(observer.get_card(target=target_id) or [])
                 clean_card = [fact for fact in card if MARKER not in str(fact).lower()]
                 if clean_card != card:
+                    intent = journal.intent("honcho_card_set", {
+                        "config_path": str(config_path), "host": host,
+                        "observer": observer_id, "target": target_id,
+                        "before": card, "after": clean_card,
+                    })
                     observer.set_card(clean_card, target=target_id)
+                    journal.after_mutation("honcho_card_set")
+                    journal.complete(intent, {"applied": True})
                     changed_cards.append({
                         "observer": observer_id,
                         "target": target_id,
@@ -446,19 +564,38 @@ class HonchoBackend:
                         "after": clean_card,
                     })
                 scope = observer.conclusions_of(target_id)
+                matched_ids: list[str] = []
                 for conclusion in self._all_conclusions(scope):
                     if MARKER in str(getattr(conclusion, "content", "")).lower():
-                        conclusion_id = str(getattr(conclusion, "id", ""))
-                        if not conclusion_id:
-                            raise StopCutover("Honcho conclusion lacks an id; refusing partial cleanup")
-                        deleted.append({
-                            "observer": observer_id,
-                            "target": target_id,
-                            "id": conclusion_id,
-                            "content": str(getattr(conclusion, "content", "")),
-                            "session_id": str(getattr(conclusion, "session_id", "")),
-                        })
-                        scope.delete(conclusion_id)
+                        matched_ids.append(str(getattr(conclusion, "id", "")))
+                if matched_ids:
+                    correction_token = uuid.uuid4().hex
+                    correction_text = (
+                        "The previously recorded Obsidian-based note-system guidance is retired and "
+                        "must not be used as a current capability or source of truth. "
+                        f"[cutover-correction:{correction_token}]"
+                    )
+                    intent = journal.intent("honcho_correction_create", {
+                        "config_path": str(config_path), "host": host,
+                        "observer": observer_id, "target": target_id,
+                        "matched_conclusion_ids": matched_ids,
+                        "content": correction_text,
+                        "correction_token": correction_token,
+                        "limitations": (
+                            "Original conclusions are preserved because the SDK cannot restore exact "
+                            "server IDs, timestamps, or reasoning metadata."
+                        ),
+                    })
+                    created = scope.create([{"content": correction_text, "session_id": None}])
+                    created_items = list(getattr(created, "items", created) or [])
+                    created_ids = [str(getattr(item, "id", "")) for item in created_items if getattr(item, "id", None)]
+                    journal.after_mutation("honcho_correction_create")
+                    journal.complete(intent, {"created_ids": created_ids})
+                    corrections.append({
+                        "observer": observer_id, "target": target_id,
+                        "content": correction_text, "created_ids": created_ids,
+                        "matched_conclusion_ids": matched_ids,
+                    })
                 context = observer.context(target=target_id, search_query=MARKER, search_top_k=20)
                 context_scopes.append({
                     "observer": observer_id,
@@ -470,14 +607,21 @@ class HonchoBackend:
         return {
             "host": host,
             "changed_cards": changed_cards,
-            "deleted_conclusions": deleted,
+            "corrective_conclusions": corrections,
+            "deleted_conclusions": [],
             "context_scopes": context_scopes,
             "remaining_search_hits": remaining,
             "messages_preserved": True,
             "sessions_preserved": True,
         }
 
-    def restore(self, config_path: Path, host: str, snapshot: dict[str, Any]) -> None:
+    def restore(
+        self,
+        config_path: Path,
+        host: str,
+        snapshot: dict[str, Any],
+        journal: TransactionJournal | None = None,
+    ) -> None:
         from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client, reset_honcho_client
 
         config = HonchoClientConfig.from_global_config(host=host, config_path=config_path)
@@ -488,17 +632,67 @@ class HonchoBackend:
         for changed in snapshot.get("changed_cards", []):
             observer = client.peer(changed["observer"])
             current = list(observer.get_card(target=changed["target"]) or [])
+            if current == changed["before"]:
+                continue
             if current != changed["after"]:
                 raise StopCutover("concurrent Honcho card drift; refusing restore")
+            intent = journal.intent("restore_honcho_card", {
+                "config_path": str(config_path), "host": host,
+                "observer": changed["observer"], "target": changed["target"],
+                "before": current, "after": changed["before"],
+            }) if journal else None
             observer.set_card(changed["before"], target=changed["target"])
-        grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
-        for conclusion in snapshot.get("deleted_conclusions", []):
-            grouped.setdefault((conclusion["observer"], conclusion["target"]), []).append({
-                "content": conclusion["content"],
-                "session_id": conclusion.get("session_id") or None,
-            })
-        for (observer_id, target_id), conclusions in grouped.items():
-            client.peer(observer_id).conclusions_of(target_id).create(conclusions)
+            if journal and intent:
+                journal.complete(intent, {"applied": True})
+        for correction in snapshot.get("corrective_conclusions", []):
+            scope = client.peer(correction["observer"]).conclusions_of(correction["target"])
+            created_ids = [value for value in correction.get("created_ids", []) if value]
+            existing = self._all_conclusions(scope)
+            existing_by_id = {
+                str(getattr(item, "id", "")): item for item in existing if getattr(item, "id", None)
+            }
+            if created_ids:
+                for conclusion_id in created_ids:
+                    if conclusion_id not in existing_by_id:
+                        continue
+                    intent = journal.intent("restore_honcho_correction_delete", {
+                        "config_path": str(config_path), "host": host,
+                        "observer": correction["observer"], "target": correction["target"],
+                        "id": conclusion_id,
+                    }) if journal else None
+                    scope.delete(conclusion_id)
+                    if journal and intent:
+                        journal.complete(intent, {"deleted": True})
+            else:
+                exact_matches = [
+                    conclusion_id for conclusion_id, item in existing_by_id.items()
+                    if str(getattr(item, "content", "")) == correction.get("content")
+                ]
+                if exact_matches:
+                    for conclusion_id in exact_matches:
+                        intent = journal.intent("restore_honcho_correction_delete", {
+                            "config_path": str(config_path), "host": host,
+                            "observer": correction["observer"], "target": correction["target"],
+                            "id": conclusion_id,
+                        }) if journal else None
+                        scope.delete(conclusion_id)
+                        if journal and intent:
+                            journal.complete(intent, {"deleted": True})
+                    continue
+                if not correction.get("completed"):
+                    continue
+                text = "Rollback correction: the prior retirement correction was reverted; review current policy before relying on historical note-system conclusions."
+                intent = journal.intent("restore_honcho_compensation_create", {
+                    "config_path": str(config_path), "host": host,
+                    "observer": correction["observer"], "target": correction["target"],
+                    "content": text,
+                }) if journal else None
+                scope.create([{
+                    "content": text,
+                    "session_id": None,
+                }])
+                if journal and intent:
+                    journal.complete(intent, {"created": True})
 
     def assert_unchanged(self, config_path: Path, host: str, snapshot: dict[str, Any]) -> None:
         """Fail if receipt-owned Honcho cards/conclusions have drifted."""
@@ -511,14 +705,10 @@ class HonchoBackend:
         client = get_honcho_client(config)
         for changed in snapshot.get("changed_cards", []):
             current = list(client.peer(changed["observer"]).get_card(target=changed["target"]) or [])
-            if current != changed["after"]:
+            if current not in (changed["before"], changed["after"]):
                 raise StopCutover("concurrent Honcho card drift; refusing restore")
-        for deleted in snapshot.get("deleted_conclusions", []):
-            items = self._all_conclusions(
-                client.peer(deleted["observer"]).conclusions_of(deleted["target"])
-            )
-            if any(str(item.id) == deleted["id"] for item in items):
-                raise StopCutover("concurrent Honcho conclusion drift; refusing restore")
+        # Original conclusions are intentionally untouched. Cutover-created
+        # correction IDs are owned by this receipt and may be compensated.
 
 
 class CutoverController:
@@ -535,10 +725,97 @@ class CutoverController:
         self.honcho = honcho or HonchoBackend()
         self.now = now
         self.fault_after_step = fault_after_step
+        self._journal: TransactionJournal | None = None
 
     def _fault(self, step: str) -> None:
         if self.fault_after_step == step:
             raise RuntimeError(f"injected crash after {step}")
+
+    def _require_journal(self) -> TransactionJournal:
+        if self._journal is None:
+            raise StopCutover("transaction journal is not initialized")
+        return self._journal
+
+    def _journaled_file_rewrite(
+        self,
+        path: Path,
+        data: bytes,
+        *,
+        receipt_dir: Path,
+        kind: str,
+    ) -> dict[str, Any]:
+        before_exists = path.exists() or path.is_symlink()
+        before = file_fingerprint(path) if before_exists else None
+        backup = receipt_dir / "files-backup" / sha256_bytes(str(path).encode())[:20]
+        intent = self._require_journal().intent("file_rewrite", {
+            "path": str(path), "backup": str(backup) if before_exists else "",
+            "before": before, "kind": kind, "after_sha256": sha256_bytes(data),
+        })
+        if before_exists:
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(backup, path.read_bytes(), RECEIPT_FILE_MODE)
+        if before_exists:
+            atomic_rewrite_preserving_metadata(path, data)
+        else:
+            atomic_write_bytes(path, data, RECEIPT_FILE_MODE)
+        after = file_fingerprint(path)
+        self._fault(f"{kind}-mutation")
+        self._require_journal().complete(intent, {"after": after})
+        self._fault(kind)
+        return {"path": str(path), "backup": str(backup) if before_exists else "", "before": before, "after": after, "kind": kind}
+
+    def _journaled_delete(self, path: Path, *, receipt_dir: Path, kind: str) -> dict[str, Any]:
+        if not path.exists() and not path.is_symlink():
+            return {"path": str(path), "before": None, "after": None, "kind": kind}
+        before = file_fingerprint(path)
+        backup = receipt_dir / "files-backup" / sha256_bytes(str(path).encode())[:20]
+        intent = self._require_journal().intent("file_delete", {
+            "path": str(path), "backup": str(backup), "before": before, "kind": kind,
+        })
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(backup, path.read_bytes(), RECEIPT_FILE_MODE)
+        path.unlink()
+        fsync_path(path.parent)
+        self._fault(f"{kind}-mutation")
+        self._require_journal().complete(intent, {"absent": True})
+        self._fault(kind)
+        return {"path": str(path), "backup": str(backup), "before": before, "after": None, "kind": kind}
+
+    def _journaled_rename(self, source: Path, destination: Path, *, kind: str) -> dict[str, Any]:
+        before = tree_manifest(source) if source.is_dir() and not source.is_symlink() else file_fingerprint(source)
+        intent = self._require_journal().intent("rename", {
+            "source": str(source), "destination": str(destination), "before": before, "kind": kind,
+        })
+        os.rename(source, destination)
+        fsync_path(source.parent)
+        fsync_path(destination.parent)
+        after = tree_manifest(destination) if destination.is_dir() and not destination.is_symlink() else file_fingerprint(destination)
+        self._fault(f"{kind}-mutation")
+        self._require_journal().complete(intent, {"after": after})
+        self._fault(kind)
+        return {"source": str(source), "backup": str(destination), "before": before, "after": after, "kind": kind}
+
+    def _journaled_systemctl(self, args: list[str], unit: str, *, before: dict[str, str]) -> str:
+        intent = self._require_journal().intent("systemctl", {
+            "args": args, "unit": unit, "before": before,
+        })
+        output = self.runner.systemctl(*args, check=True)
+        after = {
+            "active": self.runner.systemctl("is-active", unit, check=False),
+            "enabled": self.runner.systemctl("is-enabled", unit, check=False),
+        }
+        self._fault(f"systemctl-{unit}-{args[0]}-mutation")
+        self._require_journal().complete(intent, {"after": after})
+        self._fault(f"systemctl-{unit}-{args[0]}")
+        return output
+
+    def _journaled_command(self, action: str, args: list[str], *, rollback: dict[str, Any]) -> str:
+        intent = self._require_journal().intent(action, {"args": args, "rollback": rollback})
+        result = self.runner.run(args, timeout=900, check=True)
+        self._fault(f"{action}-mutation")
+        self._require_journal().complete(intent, {"returncode": result.returncode})
+        self._fault(action)
+        return result.stdout.strip()
 
     def _receipt_dir(self, receipt_id: str) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", receipt_id):
@@ -565,14 +842,8 @@ class CutoverController:
             if not isinstance(hosts, dict):
                 raise StopCutover(f"Honcho hosts map must be an object: {config_path}")
             selectable = set(str(host) for host in hosts)
-            if config_path == self.paths.home / "honcho.json":
-                selectable.add("hermes")
-                selectable.update(f"hermes_{profile.name}" for profile in self.paths.profile_homes)
-            for profile in self.paths.profile_homes:
-                if config_path == profile / "honcho.json":
-                    selectable.add(f"hermes_{profile.name}")
             default_host = str(raw.get("defaultHost", "")).strip()
-            if default_host:
+            if default_host and not hosts:
                 selectable.add(default_host)
             if not selectable:
                 selectable.add("hermes")
@@ -593,43 +864,15 @@ class CutoverController:
         return inventory
 
     def _ensure_unknown_hosts_closed(self, receipt_dir: Path) -> list[dict[str, Any]]:
-        changed: list[dict[str, Any]] = []
-        for config_path in self._config_paths():
-            raw = safe_json(config_path, default={})
-            hosts = raw.get("hosts") or {}
-            required_hosts: set[str] = set()
-            if config_path == self.paths.home / "honcho.json":
-                required_hosts.add("hermes")
-                required_hosts.update(f"hermes_{profile.name}" for profile in self.paths.profile_homes)
-            for profile in self.paths.profile_homes:
-                if config_path == profile / "honcho.json":
-                    required_hosts.add(f"hermes_{profile.name}")
-            new_hosts = dict(hosts) if isinstance(hosts, dict) else {}
-            if not new_hosts:
-                # A flat config can auto-select arbitrary HERMES_HONCHO_HOST
-                # values. Materialize the default host membership to close it.
-                new_hosts[str(raw.get("defaultHost") or "hermes")] = {}
-            for required_host in required_hosts:
-                new_hosts.setdefault(required_host, {})
-            if new_hosts != hosts:
-                raw["hosts"] = new_hosts
-                backup = receipt_dir / "files-backup" / sha256_bytes(str(config_path).encode())[:12]
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_bytes(backup, config_path.read_bytes(), RECEIPT_FILE_MODE)
-                before = file_fingerprint(config_path)
-                atomic_rewrite_preserving_metadata(
-                    config_path,
-                    (json.dumps(raw, indent=2, sort_keys=True) + "\n").encode(),
-                )
-                changed.append({
-                    "path": str(config_path),
-                    "backup": str(backup),
-                    "before": before,
-                    "after": file_fingerprint(config_path),
-                })
-        return changed
+        # Membership is operator-owned. Discovery must never shadow a legacy
+        # dot alias, re-enable a disabled alias, or make an unknown profile
+        # selectable by adding an empty block.
+        del receipt_dir
+        return []
 
     def _repo_gate(self, expected_merge_sha: str) -> dict[str, Any]:
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected_merge_sha):
+            raise StopCutover("expected merged removal SHA must be a full immutable commit hash")
         head = self.runner.git(self.paths.canonical_repo, "rev-parse", "HEAD")
         status = self.runner.git(self.paths.canonical_repo, "status", "--porcelain")
         # git merge-base emits no stdout; use a direct run for its exit status.
@@ -671,39 +914,199 @@ class CutoverController:
         if result.returncode == 0 and len(result.stdout.splitlines()) > 1:
             raise StopCutover("a live process still has the legacy vault open")
 
-    def _gateway_idle_gate(self) -> dict[str, Any]:
-        active_turns = 0
-        development_workers: list[str] = []
+    def _gateway_pid_record(self) -> dict[str, Any]:
+        pid_path = self.paths.home / "gateway.pid"
+        if pid_path.is_symlink() or not pid_path.is_file():
+            raise StopCutover("gateway PID file is missing or unsafe")
+        try:
+            raw = pid_path.read_text(encoding="utf-8").strip()
+            parsed = json.loads(raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StopCutover("gateway PID file is malformed") from exc
+        if isinstance(parsed, bool):
+            raise StopCutover("gateway PID file is malformed")
+        record = parsed if isinstance(parsed, dict) else {"pid": parsed}
+        try:
+            pid = int(record.get("pid"))
+        except (TypeError, ValueError) as exc:
+            raise StopCutover("gateway PID file is malformed") from exc
+        if pid <= 0:
+            raise StopCutover("gateway PID file is malformed")
+        return {**record, "pid": pid}
+
+    def _gateway_runtime_state(self, *, allow_draining: bool = False) -> dict[str, Any]:
         state_path = self.paths.home / "gateway_state.json"
-        if state_path.exists():
-            state = safe_json(state_path, default={})
-            active_turns += int(state.get("active_turns", 0) or 0) if isinstance(state, dict) else 0
-        processes_path = self.paths.home / "processes.json"
-        if processes_path.exists():
-            processes = safe_json(processes_path, default={})
-            if _contains_marker(processes):
-                # This is structural detection only; never include process command content.
-                development_workers.append("retired-marker-process")
-        units = self.runner.systemctl(
-            "list-units", "--state=running", "--no-legend", "--plain", check=False
-        )
-        for line in units.splitlines():
-            unit = line.split(None, 1)[0] if line.strip() else ""
-            if any(token in unit for token in ("hermes-kanban-worker", "claw-dev@", "paseo-agent")):
-                development_workers.append(unit)
-        process_result = self.runner.run(
-            ["pgrep", "-af", "(?:opencode|codex|claude|paseo.*agent)"],
+        if state_path.is_symlink() or not state_path.is_file():
+            raise StopCutover("gateway runtime status is missing or unsafe")
+        state = safe_json(state_path)
+        if not isinstance(state, dict):
+            raise StopCutover("gateway runtime status must be an object")
+        if "active_agents" not in state:
+            raise StopCutover("gateway active_agents status is malformed")
+        raw = state["active_agents"]
+        if isinstance(raw, bool):
+            raise StopCutover("gateway active_agents status is malformed")
+        try:
+            active_agents = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise StopCutover("gateway active_agents status is malformed") from exc
+        if active_agents < 0:
+            raise StopCutover("gateway active_agents status is malformed")
+        gateway_state = state.get("gateway_state")
+        allowed_states = {"running", "draining"} if allow_draining else {"running"}
+        if gateway_state not in allowed_states:
+            raise StopCutover(f"gateway runtime state is not drainable: {gateway_state!r}")
+        pid_record = self._gateway_pid_record()
+        try:
+            state_pid = int(state.get("pid"))
+        except (TypeError, ValueError) as exc:
+            raise StopCutover("gateway runtime PID identity is malformed") from exc
+        if state_pid != pid_record["pid"]:
+            raise StopCutover("gateway runtime status does not match the PID file")
+        state_start = state.get("start_time")
+        pid_start = pid_record.get("start_time")
+        if state_start is not None and pid_start is not None and state_start != pid_start:
+            raise StopCutover("gateway runtime status has stale process identity")
+        return {
+            "active_agents": active_agents,
+            "gateway_state": gateway_state,
+            "pid": state_pid,
+            "start_time": state_start,
+        }
+
+    def _gateway_owned_workers(self) -> list[dict[str, Any]]:
+        gateway_pid = self._gateway_pid_record()["pid"]
+        result = self.runner.run(
+            ["ps", "--no-headers", "--ppid", str(gateway_pid), "-o", "pid=,args="],
+            timeout=30,
             check=False,
         )
-        for line in process_result.stdout.splitlines():
-            pid_text = line.split(None, 1)[0] if line.strip() else ""
-            if pid_text.isdigit() and int(pid_text) not in {os.getpid(), os.getppid()}:
-                development_workers.append("development-process")
-        if active_turns or development_workers:
+        if result.returncode not in {0, 1}:
+            raise StopCutover(f"gateway-owned process inspection failed: exit {result.returncode}")
+        workers: list[dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            if GATEWAY_OWNED_WORKER_RE.search(parts[1]):
+                workers.append({"pid": int(parts[0]), "kind": "gateway-owned-worker"})
+        return workers
+
+    def _gateway_idle_gate(self) -> dict[str, Any]:
+        if self.runner.systemctl("is-active", GATEWAY_UNIT, check=False) != "active":
+            raise StopCutover("gateway service is not active")
+        state = self._gateway_runtime_state()
+        workers = self._gateway_owned_workers()
+        if state["active_agents"] or workers:
             raise StopCutover(
-                f"gateway/development work is active (turns={active_turns}, workers={len(development_workers)})"
+                f"gateway work is active (active_agents={state['active_agents']}, owned_workers={len(workers)})"
             )
-        return {"active_turns": active_turns, "development_workers": []}
+        return {**state, "owned_workers": []}
+
+    def _drain_and_restart_gateway(self, source: Path) -> dict[str, Any]:
+        from gateway.drain_control import current_instantiation_epoch
+
+        marker = self.paths.home / ".drain_request.json"
+        marker_before = None
+        marker_backup = ""
+        if marker.exists() or marker.is_symlink():
+            marker_before = file_fingerprint(marker)
+            backup = self._require_journal().path.parent / "files-backup" / "drain-marker-before"
+            marker_backup = str(backup)
+        payload = {
+            "action": "drain",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "principal": "retired-knowledge-cutover",
+            "epoch": current_instantiation_epoch(),
+            "suppress_notification": False,
+        }
+        intent = self._require_journal().intent("gateway_drain_marker_write", {
+            "path": str(marker), "before": marker_before, "backup": marker_backup,
+            "payload": payload,
+        })
+        if marker_before:
+            backup = Path(marker_backup)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(backup, marker.read_bytes(), RECEIPT_FILE_MODE)
+        atomic_write_json(marker, payload)
+        self._fault("gateway-drain-marker-mutation")
+        self._require_journal().complete(intent, {"after": file_fingerprint(marker)})
+        self._fault("gateway-drain-marker")
+
+        deadline = time.monotonic() + GATEWAY_DRAIN_TIMEOUT_SECONDS
+        samples = 0
+        drained_state: dict[str, Any] | None = None
+        while True:
+            state = self._gateway_runtime_state(allow_draining=True)
+            workers = self._gateway_owned_workers()
+            samples += 1
+            if state["active_agents"] == 0 and not workers:
+                drained_state = state
+                break
+            if time.monotonic() >= deadline:
+                raise StopCutover("gateway drain timed out before owned work became idle")
+            time.sleep(GATEWAY_DRAIN_POLL_SECONDS)
+
+        before = {
+            "active": self.runner.systemctl("is-active", GATEWAY_UNIT, check=False),
+            "enabled": self.runner.systemctl("is-enabled", GATEWAY_UNIT, check=False),
+        }
+        self._journaled_systemctl(["restart", GATEWAY_UNIT], GATEWAY_UNIT, before=before)
+        if self.runner.systemctl("is-active", GATEWAY_UNIT, check=False) != "active":
+            raise StopCutover("gateway did not become active after restart")
+        restart_deadline = time.monotonic() + GATEWAY_RESTART_TIMEOUT_SECONDS
+        restarted_state: dict[str, Any] | None = None
+        while True:
+            try:
+                candidate = self._gateway_runtime_state(allow_draining=True)
+            except StopCutover:
+                candidate = None
+            if candidate and drained_state and (
+                candidate["pid"] != drained_state["pid"]
+                or candidate.get("start_time") != drained_state.get("start_time")
+            ):
+                restarted_state = candidate
+                break
+            if time.monotonic() >= restart_deadline:
+                raise StopCutover("restarted gateway process identity did not become observable")
+            time.sleep(GATEWAY_DRAIN_POLL_SECONDS)
+        if source.exists() or source.is_symlink():
+            raise StopCutover("gateway runtime recreated the retired vault path after restart")
+        clear_intent = self._require_journal().intent("gateway_drain_marker_clear", {
+            "path": str(marker), "before": file_fingerprint(marker),
+        })
+        marker.unlink(missing_ok=True)
+        fsync_path(marker.parent)
+        self._fault("gateway-drain-marker-clear-mutation")
+        self._require_journal().complete(clear_intent, {"absent": True})
+        running_deadline = time.monotonic() + GATEWAY_RESTART_TIMEOUT_SECONDS
+        while True:
+            try:
+                running_state = self._gateway_runtime_state()
+            except StopCutover:
+                running_state = None
+            if running_state and restarted_state and (
+                running_state["pid"] == restarted_state["pid"]
+                and running_state.get("start_time") == restarted_state.get("start_time")
+            ):
+                break
+            if time.monotonic() >= running_deadline:
+                raise StopCutover("restarted gateway did not return to running after drain clear")
+            time.sleep(GATEWAY_DRAIN_POLL_SECONDS)
+        if source.exists() or source.is_symlink():
+            raise StopCutover("gateway runtime recreated the retired vault path after returning to running")
+        return {
+            "restarted": True,
+            "active": True,
+            "drain_samples": samples,
+            "source_absent": True,
+            "before_identity": {
+                "pid": drained_state["pid"], "start_time": drained_state.get("start_time"),
+            },
+            "after_identity": {
+                "pid": running_state["pid"], "start_time": running_state.get("start_time"),
+            },
+        }
 
     def _vault_destination(self, stamp: str) -> Path:
         return self.paths.archive_root / f"obsidian-vault-{stamp}" / "vault"
@@ -728,61 +1131,109 @@ class CutoverController:
         destination = self._vault_destination(stamp)
         if destination.exists() or destination.parent.exists():
             raise StopCutover(f"archive destination already exists: {destination.parent}")
+        run_dir = destination.parent
+        if run_dir == source or source.is_relative_to(run_dir) or run_dir.is_relative_to(source):
+            raise StopCutover("archive layout collides with the vault source")
+        reserved = {"vault", *ARCHIVE_RECEIPT_FILES, JOURNAL_FILE, RESTORE_JOURNAL_FILE}
+        if len(reserved) != 7 or destination.name != "vault":
+            raise StopCutover("archive reserved-path layout is ambiguous")
+        manifest = tree_manifest(source)
+        for entry in manifest["entries"]:
+            if entry["path"] == ".":
+                continue
+            try:
+                _validate_archive_rel_path(entry["path"])
+            except ValueError as exc:
+                raise StopCutover(f"vault contains an unsupported archive path: {entry['path']!r}") from exc
         return {
             "source": str(source),
             "destination": str(destination),
+            "run_dir": str(run_dir),
             "device": source_device,
-            "manifest": tree_manifest(source),
+            "source_identity": file_fingerprint(source),
+            "manifest": manifest,
         }
 
-    def _write_vault_receipts(self, vault: Path, before: dict[str, Any], after: dict[str, Any]) -> None:
-        manifest = {"version": RECEIPT_VERSION, "before": before, "after": after}
-        atomic_write_json(vault / "MANIFEST.json", manifest)
+    def _journaled_artifact_write(self, path: Path, data: bytes, *, action: str) -> dict[str, Any]:
+        intent = self._require_journal().intent(action, {
+            "path": str(path), "before": None, "sha256": sha256_bytes(data), "size": len(data),
+        })
+        atomic_write_bytes(path, data, RECEIPT_FILE_MODE)
+        after = file_fingerprint(path)
+        self._fault(f"{action}-mutation")
+        self._require_journal().complete(intent, {"after": after})
+        self._fault(action)
+        return {"path": str(path), "sha256": after["sha256"], "size": after["size"]}
+
+    def _write_vault_receipts(self, run_dir: Path, vault: Path, payload: dict[str, Any]) -> dict[str, Any]:
+        manifest = {"version": RECEIPT_VERSION, "payload": payload}
+        manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
         sums = []
         metadata = ["path\tkind\tsize\tmode\tuid\tgid\tmtime_ns\tsha256"]
-        for entry in after["entries"]:
-            if entry["kind"] == "file" and entry["path"] not in VAULT_RECEIPT_FILES:
+        for entry in payload["entries"]:
+            if entry["kind"] == "file":
                 sums.append(f"{entry['sha256']}  {entry['path']}")
             metadata.append(
                 "\t".join(str(entry[key]) for key in ("path", "kind", "size", "mode", "uid", "gid", "mtime_ns", "sha256"))
             )
-        atomic_write_bytes(vault / "SHA256SUMS", ("\n".join(sums) + "\n").encode(), RECEIPT_FILE_MODE)
-        atomic_write_bytes(vault / "FILE_METADATA.tsv", ("\n".join(metadata) + "\n").encode(), RECEIPT_FILE_MODE)
+        sums_bytes = ("\n".join(sums) + "\n").encode()
+        metadata_bytes = ("\n".join(metadata) + "\n").encode()
+        self._journaled_artifact_write(run_dir / "MANIFEST.json", manifest_bytes, action="archive_manifest_write")
+        self._journaled_artifact_write(run_dir / "SHA256SUMS", sums_bytes, action="archive_sums_write")
+        self._journaled_artifact_write(run_dir / "FILE_METADATA.tsv", metadata_bytes, action="archive_metadata_write")
         fsync_tree(vault)
-        final = tree_manifest(vault)
-        atomic_write_json(vault / "VERIFICATION_RECEIPT.json", {
+        outer = {
             "version": RECEIPT_VERSION,
+            "receipt_id": self._require_journal().path.parent.name,
             "verified_at": datetime.now(timezone.utc).isoformat(),
-            "payload_tree_hash": after["tree_hash"],
-            "final_tree_hash": final["tree_hash"],
-            "counts": after["counts"],
+            "payload_manifest_sha256": sha256_bytes(manifest_bytes),
+            "payload_tree_hash": payload["tree_hash"],
+            "sha256sums_sha256": sha256_bytes(sums_bytes),
+            "metadata_tsv_sha256": sha256_bytes(metadata_bytes),
+            "archive_path": str(vault),
+            "archive_device": vault.stat().st_dev,
+            "source_path": payload["root"],
+            "source_identity": payload["entries"][0],
+            "counts": payload["counts"],
+        }
+        intent = self._require_journal().intent("archive_outer_receipt_write", {
+            "path": str(run_dir / "VERIFICATION_RECEIPT.json"), "outer": outer,
         })
+        outer["journal_anchor"] = intent["hash"]
+        outer_bytes = (json.dumps(outer, indent=2, sort_keys=True) + "\n").encode()
+        atomic_write_bytes(run_dir / "VERIFICATION_RECEIPT.json", outer_bytes, RECEIPT_FILE_MODE)
+        self._fault("archive_outer_receipt_write-mutation")
+        self._require_journal().complete(intent, {"after": file_fingerprint(run_dir / "VERIFICATION_RECEIPT.json")})
+        self._fault("archive_outer_receipt_write")
         fsync_tree(vault)
-        for directory in (vault.parent, vault.parent.parent, vault.parent.parent.parent):
+        for artifact in ARCHIVE_RECEIPT_FILES:
+            fsync_path(run_dir / artifact)
+        for directory in (run_dir, run_dir.parent, run_dir.parent.parent):
             if directory.is_dir():
                 fsync_path(directory)
+        return outer
 
     def _archive_vault(self, vault_plan: dict[str, Any]) -> dict[str, Any]:
         source = Path(vault_plan["source"])
         destination = Path(vault_plan["destination"])
         self._vault_open_handle_gate(source)
-        destination.parent.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(destination.parent.parent, 0o700)
-        if source.stat().st_dev != destination.parent.parent.stat().st_dev:
+        run_dir = Path(vault_plan["run_dir"])
+        run_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(run_dir.parent, 0o700)
+        if source.stat().st_dev != run_dir.parent.stat().st_dev:
             raise StopCutover("device changed after preflight")
-        destination.parent.mkdir(mode=0o700)
+        run_dir.mkdir(mode=0o700)
+        fsync_path(run_dir.parent)
         before = tree_manifest(source)
         if before["tree_hash"] != vault_plan["manifest"]["tree_hash"]:
             raise StopCutover("vault changed after preflight")
-        os.rename(source, destination)
-        fsync_path(source.parent)
-        fsync_path(destination.parent)
+        self._journaled_rename(source, destination, kind="vault-rename")
         try:
-            self._fault("vault-rename")
             after = tree_manifest(destination)
             if before["tree_hash"] != after["tree_hash"]:
                 raise StopCutover("vault changed during atomic rename")
-            self._write_vault_receipts(destination, before, after)
+            archive_payload = {**after, "root": str(source)}
+            outer = self._write_vault_receipts(run_dir, destination, archive_payload)
         except BaseException:
             if not source.exists() and destination.exists():
                 os.rename(destination, source)
@@ -795,6 +1246,8 @@ class CutoverController:
             "destination": str(destination),
             "tree_hash": before["tree_hash"],
             "counts": before["counts"],
+            "run_dir": str(run_dir),
+            "outer_receipt": outer,
         }
 
     def _skill_roots(self) -> list[Path]:
@@ -818,9 +1271,6 @@ class CutoverController:
         backup_root.mkdir(mode=0o700)
         removed_names_by_root: dict[str, set[str]] = {}
         moved: list[dict[str, str]] = []
-        journal_path = receipt_dir / "SKILLS_JOURNAL.json"
-        journal: dict[str, Any] = {"moved": moved, "changed_files": []}
-        atomic_write_json(journal_path, journal)
         for item in planned:
             root = Path(item["root"])
             source = Path(item["path"])
@@ -829,9 +1279,9 @@ class CutoverController:
             relative = source.relative_to(root)
             backup = backup_root / sha256_bytes(str(root).encode())[:12] / relative
             backup.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(source, backup)
-            moved.append({"source": str(source), "backup": str(backup), "root": str(root), "name": item["name"]})
-            atomic_write_json(journal_path, journal)
+            move = self._journaled_rename(source, backup, kind="skill-rename")
+            move.update({"root": str(root), "name": item["name"]})
+            moved.append(move)
             removed_names_by_root.setdefault(str(root), set()).add(item["name"])
         self._fault("skills-moved")
         changed_files: list[dict[str, Any]] = []
@@ -860,32 +1310,21 @@ class CutoverController:
                         parsed = _remove_names_from_mapping(parsed, names)
                     after_bytes = (json.dumps(parsed, indent=2, sort_keys=True) + "\n").encode()
                 if after_bytes != before_bytes:
-                    backup = receipt_dir / "files-backup" / sha256_bytes(str(path).encode())[:12]
-                    backup.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_bytes(backup, before_bytes, RECEIPT_FILE_MODE)
-                    atomic_rewrite_preserving_metadata(path, after_bytes)
-                    changed_files.append({
-                        "path": str(path), "backup": str(backup), "before": before, "after": file_fingerprint(path),
-                    })
-                    journal["changed_files"] = changed_files
-                    atomic_write_json(journal_path, journal)
+                    changed_files.append(self._journaled_file_rewrite(
+                        path, after_bytes, receipt_dir=receipt_dir, kind="skill-config-edit"
+                    ))
             snapshot = root.parent / ".skills_prompt_snapshot.json"
             if snapshot.exists():
-                before = file_fingerprint(snapshot)
-                backup = receipt_dir / "files-backup" / sha256_bytes(str(snapshot).encode())[:12]
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_bytes(backup, snapshot.read_bytes(), RECEIPT_FILE_MODE)
-                snapshot.unlink()
-                changed_files.append({"path": str(snapshot), "backup": str(backup), "before": before, "after": None})
-                journal["changed_files"] = changed_files
-                atomic_write_json(journal_path, journal)
+                changed_files.append(self._journaled_delete(
+                    snapshot, receipt_dir=receipt_dir, kind="skill-snapshot-delete"
+                ))
             for cache in (root / ".hub/index-cache", root / "index-cache"):
                 if cache.exists():
                     backup = backup_root / sha256_bytes(str(root).encode())[:12] / cache.relative_to(root)
                     backup.parent.mkdir(parents=True, exist_ok=True)
-                    os.rename(cache, backup)
-                    moved.append({"source": str(cache), "backup": str(backup), "root": str(root), "name": "index-cache"})
-                    atomic_write_json(journal_path, journal)
+                    move = self._journaled_rename(cache, backup, kind="skill-cache-rename")
+                    move.update({"root": str(root), "name": "index-cache"})
+                    moved.append(move)
         return {"moved": moved, "changed_files": changed_files}
 
     def _apply_memory_env(self, receipt_dir: Path) -> dict[str, Any]:
@@ -900,24 +1339,20 @@ class CutoverController:
                 after_text = scrub_current_memory_text(before_bytes.decode("utf-8", errors="strict"))
                 after_bytes = after_text.encode()
                 if after_bytes != before_bytes:
-                    backup = receipt_dir / "files-backup" / sha256_bytes(str(path).encode())[:12]
-                    backup.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_bytes(backup, before_bytes, RECEIPT_FILE_MODE)
-                    before = file_fingerprint(path)
-                    atomic_rewrite_preserving_metadata(path, after_bytes)
-                    changed.append({"path": str(path), "backup": str(backup), "before": before, "after": file_fingerprint(path), "kind": "memory"})
+                    changed.append(self._journaled_file_rewrite(
+                        path, after_bytes, receipt_dir=receipt_dir, kind="memory-edit"
+                    ))
             for env_path in (home / ".env", home / "gmail-intake.env"):
                 if not env_path.exists():
                     continue
                 before_bytes = env_path.read_bytes()
                 after_text, removed_names = scrub_env_text(before_bytes.decode("utf-8", errors="strict"))
                 if removed_names:
-                    backup = receipt_dir / "files-backup" / sha256_bytes(str(env_path).encode())[:12]
-                    backup.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_bytes(backup, before_bytes, RECEIPT_FILE_MODE)
-                    before = file_fingerprint(env_path)
-                    atomic_rewrite_preserving_metadata(env_path, after_text.encode())
-                    changed.append({"path": str(env_path), "backup": str(backup), "before": before, "after": file_fingerprint(env_path), "kind": "environment", "removed_names": removed_names})
+                    item = self._journaled_file_rewrite(
+                        env_path, after_text.encode(), receipt_dir=receipt_dir, kind="environment-edit"
+                    )
+                    item["removed_names"] = removed_names
+                    changed.append(item)
         return {"changed_files": changed}
 
     def _neutralize_invoke_agent(self, receipt_dir: Path) -> dict[str, Any]:
@@ -936,21 +1371,27 @@ class CutoverController:
             changed_text = re.sub(pattern, replacement, changed_text)
         if changed_text == text:
             raise StopCutover("legacy Gmail collector exists but invoke-agent seam could not be neutralized")
-        backup = receipt_dir / "files-backup" / sha256_bytes(str(script).encode())[:12]
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_bytes(backup, before_bytes, RECEIPT_FILE_MODE)
-        before = file_fingerprint(script)
-        atomic_rewrite_preserving_metadata(script, changed_text.encode())
-        return {"changed_files": [{"path": str(script), "backup": str(backup), "before": before, "after": file_fingerprint(script), "kind": "invoke-agent"}]}
+        return {"changed_files": [self._journaled_file_rewrite(
+            script, changed_text.encode(), receipt_dir=receipt_dir, kind="invoke-agent-edit"
+        )]}
 
     def _stop_legacy_gmail(self) -> dict[str, Any]:
         before = {unit: {
             "active": self.runner.systemctl("is-active", unit, check=False),
             "enabled": self.runner.systemctl("is-enabled", unit, check=False),
         } for unit in GMAIL_UNITS}
-        self.runner.systemctl("disable", "--now", "gmail-intake-pubsub.service", check=False)
-        self.runner.systemctl("disable", "--now", "gmail-intake-watch-renew.timer", check=False)
-        self.runner.systemctl("stop", "gmail-intake-watch-renew.service", check=False)
+        self._journaled_systemctl(
+            ["disable", "--now", "gmail-intake-pubsub.service"],
+            "gmail-intake-pubsub.service", before=before["gmail-intake-pubsub.service"],
+        )
+        self._journaled_systemctl(
+            ["disable", "--now", "gmail-intake-watch-renew.timer"],
+            "gmail-intake-watch-renew.timer", before=before["gmail-intake-watch-renew.timer"],
+        )
+        self._journaled_systemctl(
+            ["stop", "gmail-intake-watch-renew.service"],
+            "gmail-intake-watch-renew.service", before=before["gmail-intake-watch-renew.service"],
+        )
         after = {unit: {
             "active": self.runner.systemctl("is-active", unit, check=False),
             "enabled": self.runner.systemctl("is-enabled", unit, check=False),
@@ -962,16 +1403,26 @@ class CutoverController:
     def _qmd_refresh(self) -> dict[str, Any]:
         # Prefer the host's established generator/service. Fallback targets only
         # the skills index and never invokes or modifies pid-docs.
-        service_result = self.runner.systemctl("start", QMD_SKILLS_REFRESH_UNIT, check=False)
+        qmd_before = {
+            "active": self.runner.systemctl("is-active", QMD_SKILLS_REFRESH_UNIT, check=False),
+            "enabled": self.runner.systemctl("is-enabled", QMD_SKILLS_REFRESH_UNIT, check=False),
+        }
+        service_result = self._journaled_systemctl(
+            ["start", QMD_SKILLS_REFRESH_UNIT], QMD_SKILLS_REFRESH_UNIT, before=qmd_before
+        )
         status = self.runner.systemctl("is-failed", QMD_SKILLS_REFRESH_UNIT, check=False)
         fallback = False
         if status == "failed":
             fallback = True
             generator = Path.home() / ".local/bin/qmd-skills-catalog"
             if generator.exists():
-                self.runner.run([str(generator)], timeout=300)
-            self.runner.qmd("--index", "skills", "update")
-            self.runner.qmd("--index", "skills", "embed", "--max-docs-per-batch", "50", "--max-batch-mb", "2")
+                self._journaled_command("qmd_generator", [str(generator)], rollback={"kind": "refresh-only"})
+            self._journaled_command("qmd_update", ["qmd", "--index", "skills", "update"], rollback={"kind": "refresh-only"})
+            self._journaled_command(
+                "qmd_embed",
+                ["qmd", "--index", "skills", "embed", "--max-docs-per-batch", "50", "--max-batch-mb", "2"],
+                rollback={"kind": "refresh-only"},
+            )
         qmd_status = self.runner.qmd("--index", "skills", "status")
         if MARKER in qmd_status.lower():
             raise StopCutover("QMD skills status still names the retired system")
@@ -1014,7 +1465,12 @@ class CutoverController:
         os.chmod(self.paths.receipt_root, RECEIPT_DIR_MODE)
         receipt_dir.mkdir(parents=True, mode=RECEIPT_DIR_MODE)
         os.chmod(receipt_dir, RECEIPT_DIR_MODE)
-        atomic_write_json(receipt_dir / "PRECHECK.json", plan)
+        self._journal = TransactionJournal(receipt_dir / JOURNAL_FILE, fault=self._fault)
+        self._journaled_artifact_write(
+            receipt_dir / "PRECHECK.json",
+            (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode(),
+            action="precheck_write",
+        )
         receipt: dict[str, Any] = {
             "version": RECEIPT_VERSION,
             "receipt_id": receipt_id,
@@ -1024,7 +1480,11 @@ class CutoverController:
             "plan": plan,
             "steps": {},
         }
-        atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
+        self._journaled_artifact_write(
+            receipt_dir / "RECEIPT.json",
+            (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode(),
+            action="receipt_initial_write",
+        )
         try:
             receipt["steps"]["host_allowlist"] = self._ensure_unknown_hosts_closed(receipt_dir)
             receipt["steps"]["honcho"] = []
@@ -1032,21 +1492,14 @@ class CutoverController:
                 if not host["selected"]:
                     continue
                 receipt["steps"]["honcho"].append(
-                    self.honcho.scrub(Path(host["config_path"]), host["host"])
+                    self.honcho.scrub(Path(host["config_path"]), host["host"], self._require_journal())
                 )
-                atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
             receipt["steps"]["gmail"] = self._stop_legacy_gmail()
             receipt["steps"]["invoke_agent"] = self._neutralize_invoke_agent(receipt_dir)
             receipt["steps"]["skills"] = self._apply_skill_reconcile(receipt_dir, plan["skill_plan"])
             receipt["steps"]["memory_env"] = self._apply_memory_env(receipt_dir)
             self._fault("host-files")
             receipt["steps"]["qmd"] = self._qmd_refresh()
-            # Recheck idle immediately before the only gateway restart.
-            self._gateway_idle_gate()
-            self.runner.systemctl("restart", GATEWAY_UNIT)
-            if self.runner.systemctl("is-active", GATEWAY_UNIT, check=False) != "active":
-                raise StopCutover("gateway did not become active after restart")
-            receipt["steps"]["gateway"] = {"restarted": True, "active": True}
             if len(receipt["steps"]["honcho"]) != sum(
                 1 for host in plan["host_inventory"] if host["selected"]
             ):
@@ -1058,26 +1511,51 @@ class CutoverController:
                 "counts": plan["vault"]["manifest"]["counts"],
                 "state": "pending",
             }
-            atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
             receipt["steps"]["vault"] = self._archive_vault(plan["vault"])
             self._fault("vault-archived")
+            receipt["steps"]["gateway"] = self._drain_and_restart_gateway(
+                Path(plan["vault"]["source"])
+            )
             receipt["state"] = "applied"
             receipt["completed_at"] = datetime.now(timezone.utc).isoformat()
-            atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
-            verification = self.verify(receipt_id)
+            self._journaled_artifact_write(
+                receipt_dir / "RECEIPT.json",
+                (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode(),
+                action="receipt_applied_write",
+            )
+            verification = self.verify(receipt_id, seal=False)
             receipt["state"] = "verified"
             receipt["verification"] = verification
-            atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
+            self._journaled_artifact_write(
+                receipt_dir / "RECEIPT.json",
+                (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode(),
+                action="receipt_verified_write",
+            )
+            self._require_journal().seal({
+                "receipt_id": receipt_id,
+                "state": "verified",
+                "vault_tree_hash": verification["vault_tree_hash"],
+            })
             return {"receipt_id": receipt_id, "receipt_dir": str(receipt_dir), "state": "verified"}
         except BaseException as exc:
             receipt["state"] = "failed"
             receipt["failure_class"] = type(exc).__name__
-            atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
+            try:
+                self._journaled_artifact_write(
+                    receipt_dir / "RECEIPT.json",
+                    (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode(),
+                    action="receipt_failed_write",
+                )
+            except BaseException:
+                pass
             try:
                 self.restore(receipt_id, automatic=True)
             except BaseException as restore_exc:
                 receipt["rollback_failure_class"] = type(restore_exc).__name__
-                atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
+                try:
+                    atomic_write_json(receipt_dir / "ROLLBACK_FAILURE.json", receipt)
+                except BaseException:
+                    pass
             raise
 
     def _load_receipt(self, receipt_id: str) -> tuple[Path, dict[str, Any]]:
@@ -1087,8 +1565,186 @@ class CutoverController:
             raise StopCutover("receipt is malformed")
         return receipt_dir, receipt
 
-    def verify(self, receipt_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _parse_metadata_tsv(path: Path) -> list[dict[str, Any]]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise StopCutover("archive metadata table is unreadable") from exc
+        expected_header = "path\tkind\tsize\tmode\tuid\tgid\tmtime_ns\tsha256"
+        if not lines or lines[0] != expected_header:
+            raise StopCutover("archive metadata table header is malformed")
+        rows: list[dict[str, Any]] = []
+        for line_number, line in enumerate(lines[1:], 2):
+            parts = line.split("\t")
+            if len(parts) != 8:
+                raise StopCutover(f"archive metadata table is malformed at line {line_number}")
+            raw_path, kind, size, mode, uid, gid, mtime_ns, digest = parts
+            try:
+                safe_path = "." if raw_path == "." else _validate_archive_rel_path(raw_path)
+                rows.append({
+                    "path": safe_path, "kind": kind, "size": int(size), "mode": int(mode),
+                    "uid": int(uid), "gid": int(gid), "mtime_ns": int(mtime_ns), "sha256": digest,
+                })
+            except (ValueError, TypeError) as exc:
+                raise StopCutover(f"archive metadata table is malformed at line {line_number}") from exc
+        return rows
+
+    @staticmethod
+    def _parse_sha256sums(path: Path) -> dict[str, str]:
+        result: dict[str, str] = {}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise StopCutover("archive SHA256SUMS is unreadable") from exc
+        for line_number, line in enumerate(lines, 1):
+            if not line:
+                continue
+            if "  " not in line:
+                raise StopCutover(f"archive SHA256SUMS is malformed at line {line_number}")
+            digest, raw_path = line.split("  ", 1)
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise StopCutover(f"archive SHA256SUMS is malformed at line {line_number}")
+            safe_path = _validate_archive_rel_path(raw_path)
+            if safe_path in result:
+                raise StopCutover("archive SHA256SUMS contains a duplicate path")
+            result[safe_path] = digest
+        return result
+
+    def _verify_archive_artifacts(self, run_dir: Path, destination: Path) -> dict[str, Any]:
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            raise StopCutover("archive run directory is missing or unsafe")
+        if destination != run_dir / "vault":
+            raise StopCutover("archive payload path does not match reserved layout")
+        for filename in ARCHIVE_RECEIPT_FILES:
+            path = run_dir / filename
+            if path.is_symlink() or not path.is_file():
+                raise StopCutover(f"archive receipt missing or unsafe: {filename}")
+        outer = safe_json(run_dir / "VERIFICATION_RECEIPT.json")
+        manifest_path = run_dir / "MANIFEST.json"
+        sums_path = run_dir / "SHA256SUMS"
+        metadata_path = run_dir / "FILE_METADATA.tsv"
+        if sha256_file(manifest_path) != outer.get("payload_manifest_sha256"):
+            raise StopCutover("archive manifest hash does not match outer receipt")
+        if sha256_file(sums_path) != outer.get("sha256sums_sha256"):
+            raise StopCutover("archive SHA256SUMS hash does not match outer receipt")
+        if sha256_file(metadata_path) != outer.get("metadata_tsv_sha256"):
+            raise StopCutover("archive metadata hash does not match outer receipt")
+        if str(destination) != outer.get("archive_path") or destination.stat().st_dev != outer.get("archive_device"):
+            raise StopCutover("archive path/device does not match outer receipt")
+        journal_path = self._receipt_dir(str(outer.get("receipt_id", ""))) / JOURNAL_FILE if outer.get("receipt_id") else None
+        # The archive run can be verified from a copied receipt root; bind the
+        # actual transaction journal supplied by the active receipt directory.
+        if journal_path is None or not journal_path.exists():
+            journal_path = self._require_journal().path if self._journal else None
+        if journal_path is None or not journal_path.exists():
+            raise StopCutover("transaction journal is missing")
+        journal_records = TransactionJournal.read_records(journal_path)
+        anchor = outer.get("journal_anchor")
+        anchors = [record for record in journal_records if record.get("hash") == anchor]
+        if len(anchors) != 1:
+            raise StopCutover("outer receipt journal anchor is missing from transaction chain")
+        anchor_record = anchors[0]
+        if (
+            anchor_record.get("phase") != "intent"
+            or anchor_record.get("action") != "archive_outer_receipt_write"
+            or anchor_record.get("data", {}).get("path") != str(run_dir / "VERIFICATION_RECEIPT.json")
+        ):
+            raise StopCutover("outer receipt journal anchor does not identify its write intent")
+        expected_outer = anchor_record.get("data", {}).get("outer")
+        if (
+            not isinstance(expected_outer, dict)
+            or set(outer) != {*expected_outer, "journal_anchor"}
+            or any(outer.get(key) != value for key, value in expected_outer.items())
+        ):
+            raise StopCutover("outer receipt fields do not match the journaled write intent")
+        manifest = safe_json(manifest_path)
+        payload = manifest.get("payload") if isinstance(manifest, dict) else None
+        if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+            raise StopCutover("archive manifest is malformed")
+        if payload.get("tree_hash") != outer.get("payload_tree_hash"):
+            raise StopCutover("archive tree hash does not match outer receipt")
+        metadata_rows = self._parse_metadata_tsv(metadata_path)
+        if metadata_rows != payload["entries"]:
+            raise StopCutover("archive metadata table does not match manifest")
+        sums = self._parse_sha256sums(sums_path)
+        expected_sums = {
+            entry["path"]: entry["sha256"] for entry in payload["entries"]
+            if entry["kind"] == "file"
+        }
+        if sums != expected_sums:
+            raise StopCutover("archive SHA256SUMS does not match manifest")
+        actual = tree_manifest(destination)
+        if actual["tree_hash"] != payload.get("tree_hash") or actual["entries"] != payload["entries"]:
+            raise StopCutover("archive payload does not match authenticated manifest")
+        if payload.get("entries", [{}])[0] != outer.get("source_identity"):
+            raise StopCutover("archive source identity does not match outer receipt")
+        return {"outer": outer, "payload": payload, "journal_head": journal_records[-1]["hash"] if journal_records else "0" * 64}
+
+    @staticmethod
+    def _completion_for(journal: TransactionJournal, op_id: str) -> dict[str, Any] | None:
+        return next(
+            (record for record in journal.records if record.get("phase") == "complete" and record.get("op_id") == op_id),
+            None,
+        )
+
+    @staticmethod
+    def _fingerprint_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+        return all(value is None or actual.get(key) == value for key, value in expected.items())
+
+    @staticmethod
+    def _tree_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+        return (
+            actual.get("tree_hash") == expected.get("tree_hash")
+            and actual.get("entries") == expected.get("entries")
+            and actual.get("counts") == expected.get("counts")
+        )
+
+    @staticmethod
+    def _honcho_snapshots_from_journal(journal: TransactionJournal) -> list[dict[str, Any]]:
+        completed = journal.completed_ids()
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for intent in journal.intents():
+            action = intent["action"]
+            if action not in {"honcho_card_set", "honcho_correction_create"}:
+                continue
+            data = intent["data"]
+            key = (str(data.get("config_path", "")), str(data.get("host", "")))
+            snapshot = grouped.setdefault(key, {
+                "config_path": key[0], "host": key[1],
+                "changed_cards": [], "corrective_conclusions": [],
+            })
+            completion = CutoverController._completion_for(journal, intent["op_id"])
+            if action == "honcho_card_set":
+                snapshot["changed_cards"].append({
+                    "observer": data["observer"], "target": data["target"],
+                    "before": data["before"], "after": data["after"],
+                    "completed": intent["op_id"] in completed,
+                })
+            else:
+                snapshot["corrective_conclusions"].append({
+                    "observer": data["observer"], "target": data["target"],
+                    "content": data["content"],
+                    "created_ids": list((completion or {}).get("data", {}).get("created_ids", [])),
+                    "completed": intent["op_id"] in completed,
+                })
+        return list(grouped.values())
+
+    def _require_transaction_seal(self, journal: TransactionJournal, receipt_id: str) -> dict[str, Any]:
+        if not journal.records or journal.records[-1].get("phase") != "seal":
+            raise StopCutover("transaction journal is not sealed at its final record")
+        seal = journal.records[-1]
+        if (
+            seal.get("action") != "transaction_seal"
+            or seal.get("data", {}).get("receipt_id") != receipt_id
+            or seal.get("data", {}).get("state") != "verified"
+        ):
+            raise StopCutover("transaction journal final seal is malformed")
+        return seal
+
+    def verify(self, receipt_id: str, *, seal: bool = True) -> dict[str, Any]:
         receipt_dir, receipt = self._load_receipt(receipt_id)
+        self._journal = TransactionJournal(receipt_dir / JOURNAL_FILE, fault=self._fault)
         if receipt.get("state") not in {"applied", "verified"}:
             raise StopCutover(f"receipt state is not verifiable: {receipt.get('state')}")
         vault = receipt.get("steps", {}).get("vault", {})
@@ -1098,23 +1754,9 @@ class CutoverController:
             raise StopCutover("vault source was recreated")
         if not destination.is_dir() or destination.is_symlink():
             raise StopCutover("archive destination is missing or unsafe")
-        for filename in VAULT_RECEIPT_FILES:
-            if not (destination / filename).is_file():
-                raise StopCutover(f"archive receipt missing: {filename}")
-        manifest = safe_json(destination / "MANIFEST.json")
-        payload = dict(manifest["after"])
-        # The four receipt files were added after the payload manifest. Verify
-        # each payload entry directly and then the verification receipt hash.
-        for entry in payload["entries"]:
-            path = destination if entry["path"] == "." else destination / PurePosixPath(entry["path"])
-            actual = file_fingerprint(path)
-            keys = ("kind",) if entry["path"] == "." else ("kind", "sha256", "size", "mode", "uid", "gid", "mtime_ns")
-            for key in keys:
-                if actual[key] != entry[key]:
-                    raise StopCutover(f"archive verification drift at {entry['path']} ({key})")
-        verification_receipt = safe_json(destination / "VERIFICATION_RECEIPT.json")
-        if verification_receipt.get("payload_tree_hash") != payload.get("tree_hash"):
-            raise StopCutover("archive verification receipt does not match payload manifest")
+        run_dir = Path(vault.get("run_dir", destination.parent))
+        authenticated = self._verify_archive_artifacts(run_dir, destination)
+        payload = authenticated["payload"]
         gmail = {
             unit: self.runner.systemctl("is-active", unit, check=False)
             for unit in GMAIL_UNITS
@@ -1123,11 +1765,10 @@ class CutoverController:
             raise StopCutover("legacy Gmail collector remains active")
         if self.runner.systemctl("is-active", GATEWAY_UNIT, check=False) != "active":
             raise StopCutover("gateway is not active")
-        # Controlled structural interaction: load repo state and skill plan;
-        # neither may recreate the vault path.
-        self._plan_skill_reconcile()
-        if source.exists() or source.is_symlink():
-            raise StopCutover("controlled verification recreated the vault")
+        if not receipt.get("steps", {}).get("gateway", {}).get("source_absent"):
+            raise StopCutover("gateway runtime recreation check was not recorded")
+        if receipt.get("state") == "verified":
+            self._require_transaction_seal(self._require_journal(), receipt_id)
         verification = {
             "verified_at": datetime.now(timezone.utc).isoformat(),
             "receipt_dir": str(receipt_dir),
@@ -1136,114 +1777,324 @@ class CutoverController:
             "gateway_active": True,
             "source_absent": True,
             "pid_docs_touched": False,
+            "journal_head": authenticated["journal_head"],
         }
-        atomic_write_json(receipt_dir / "VERIFY.json", verification)
+        self._journaled_artifact_write(
+            receipt_dir / "VERIFY.json",
+            (json.dumps(verification, indent=2, sort_keys=True) + "\n").encode(),
+            action="verify_receipt_write",
+        )
+        if seal:
+            self._require_journal().seal({
+                "receipt_id": receipt_id,
+                "state": "verified",
+                "vault_tree_hash": payload["tree_hash"],
+            })
         return verification
 
     def restore(self, receipt_id: str, automatic: bool = False) -> dict[str, Any]:
         receipt_dir, receipt = self._load_receipt(receipt_id)
         if receipt.get("state") == "restored":
             return {"receipt_id": receipt_id, "state": "restored", "idempotent": True}
-        steps = receipt.get("steps", {})
-        journal_path = receipt_dir / "SKILLS_JOURNAL.json"
-        if "skills" not in steps and journal_path.exists():
-            steps["skills"] = safe_json(journal_path, default={})
-        for honcho_snapshot in steps.get("honcho", []):
-            matching = next(
-                host for host in receipt.get("plan", {}).get("host_inventory", [])
-                if host.get("host") == honcho_snapshot.get("host") and host.get("selected")
-            )
-            self.honcho.assert_unchanged(Path(matching["config_path"]), matching["host"], honcho_snapshot)
-        # Fail closed before overwriting any file changed after apply.
-        changed_files = []
-        for section in ("skills", "memory_env", "invoke_agent"):
-            changed_files.extend(steps.get(section, {}).get("changed_files", []))
-        changed_files.extend(steps.get("host_allowlist", []))
-        for item in changed_files:
-            path = Path(item["path"])
-            after = item.get("after")
-            if after is None:
-                if path.exists() or path.is_symlink():
-                    raise StopCutover(f"concurrent drift at deleted path: {path}")
-            elif not path.exists() or file_fingerprint(path) != after:
+        apply_journal = TransactionJournal(receipt_dir / JOURNAL_FILE, fault=self._fault)
+        if not automatic and receipt.get("state") in {"applied", "verified"}:
+            self._require_transaction_seal(apply_journal, receipt_id)
+        restore_journal = TransactionJournal(receipt_dir / RESTORE_JOURNAL_FILE, fault=self._fault)
+        self._journal = restore_journal
+        completed = apply_journal.completed_ids()
+        intents = apply_journal.intents()
+        mutation_states: dict[str, str] = {}
+        honcho_snapshots = self._honcho_snapshots_from_journal(apply_journal)
+        drain_clear_intents = [intent for intent in intents if intent["action"] == "gateway_drain_marker_clear"]
+        qmd_refresh_intents = [
+            intent for intent in intents
+            if intent["action"] in {"qmd_generator", "qmd_update", "qmd_embed"}
+        ]
+        archive_artifact_actions = {
+            "archive_manifest_write", "archive_sums_write", "archive_metadata_write",
+            "archive_outer_receipt_write",
+        }
+
+        # Classify every owned local mutation before any rollback write. An
+        # incomplete intent may mean either "not started" or "mutated before
+        # completion was journaled"; only exact pre/post states are accepted.
+        for intent in intents:
+            data = intent["data"]
+            action = intent["action"]
+            if action in {"file_rewrite", "file_delete"}:
+                path = Path(data["path"])
+                before = data.get("before")
+                exists = path.exists() or path.is_symlink()
+                actual = file_fingerprint(path) if exists else None
+                if isinstance(before, dict) and actual == before:
+                    mutation_states[intent["op_id"]] = "pre"
+                    continue
+                completion = self._completion_for(apply_journal, intent["op_id"])
+                after = (completion or {}).get("data", {}).get("after")
+                if action == "file_delete" and not exists:
+                    mutation_states[intent["op_id"]] = "post"
+                    continue
+                if isinstance(after, dict) and actual == after:
+                    mutation_states[intent["op_id"]] = "post"
+                    continue
+                if action == "file_rewrite" and isinstance(actual, dict):
+                    expected = {
+                        "kind": "file", "sha256": data.get("after_sha256"),
+                        "mode": before.get("mode") if isinstance(before, dict) else RECEIPT_FILE_MODE,
+                        "uid": before.get("uid") if isinstance(before, dict) else None,
+                        "gid": before.get("gid") if isinstance(before, dict) else None,
+                    }
+                    if self._fingerprint_matches(actual, expected):
+                        mutation_states[intent["op_id"]] = "post"
+                        continue
+                if before is None and not exists:
+                    mutation_states[intent["op_id"]] = "pre"
+                    continue
                 raise StopCutover(f"concurrent drift at changed path: {path}")
-        vault = steps.get("vault", {})
-        source = Path(vault.get("source", "")) if vault else None
-        destination = Path(vault.get("destination", "")) if vault else None
-        if destination and destination.exists():
-            if source.exists() or source.is_symlink():
-                raise StopCutover("cannot restore vault: source path already exists")
-            self.verify(receipt_id) if receipt.get("state") in {"applied", "verified"} else None
-            os.rename(destination, source)
-            fsync_path(source.parent)
-            manifest_data = safe_json(source / "MANIFEST.json", default={})
-            original_root = next(
-                (
-                    entry
-                    for entry in manifest_data.get("before", {}).get("entries", [])
-                    if entry.get("path") == "."
-                ),
-                None,
-            )
-            # Receipts live inside the archived vault and are not part of the
-            # original payload. Remove only those exact generated files.
-            for filename in VAULT_RECEIPT_FILES:
-                (source / filename).unlink(missing_ok=True)
-            if original_root:
-                os.chmod(source, int(original_root["mode"]))
-                try:
-                    os.chown(source, int(original_root["uid"]), int(original_root["gid"]))
-                except PermissionError:
-                    pass
-                os.utime(source, ns=(int(original_root["mtime_ns"]), int(original_root["mtime_ns"])))
-            restored_manifest = tree_manifest(source)
-            expected_hash = vault.get("tree_hash")
-            if expected_hash and restored_manifest["tree_hash"] != expected_hash:
-                raise StopCutover("restored vault does not match original tree hash")
-        for item in reversed(changed_files):
-            path = Path(item["path"])
-            backup_text = item.get("backup")
-            if not backup_text:
+            elif action == "rename":
+                source = Path(data["source"])
+                destination = Path(data["destination"])
+                source_exists = source.exists() or source.is_symlink()
+                destination_exists = destination.exists() or destination.is_symlink()
+                if source_exists and not destination_exists:
+                    current = tree_manifest(source) if source.is_dir() and not source.is_symlink() else file_fingerprint(source)
+                    before = data.get("before")
+                    matches = (
+                        self._tree_matches(current, before)
+                        if isinstance(current, dict) and "tree_hash" in current and isinstance(before, dict)
+                        else current == before
+                    )
+                    if not matches:
+                        raise StopCutover(f"concurrent drift at renamed path: {source}")
+                    mutation_states[intent["op_id"]] = "pre"
+                elif destination_exists and not source_exists:
+                    current = tree_manifest(destination) if destination.is_dir() and not destination.is_symlink() else file_fingerprint(destination)
+                    completion = self._completion_for(apply_journal, intent["op_id"])
+                    expected = (completion or {}).get("data", {}).get("after", data.get("before"))
+                    matches = (
+                        self._tree_matches(current, expected)
+                        if isinstance(current, dict) and "tree_hash" in current and isinstance(expected, dict)
+                        else current == expected
+                    )
+                    if not matches:
+                        raise StopCutover(f"concurrent drift at renamed path: {source}")
+                    mutation_states[intent["op_id"]] = "post"
+                else:
+                    raise StopCutover(f"concurrent drift at renamed path: {source}")
+            elif action == "gateway_drain_marker_write":
+                marker = Path(data["path"])
+                before = data.get("before")
+                exists = marker.exists() or marker.is_symlink()
+                actual = file_fingerprint(marker) if exists else None
+                if actual == before:
+                    mutation_states[intent["op_id"]] = "pre"
+                else:
+                    completion = self._completion_for(apply_journal, intent["op_id"])
+                    after = (completion or {}).get("data", {}).get("after")
+                    payload_hash = sha256_bytes(
+                        (json.dumps(data.get("payload", {}), indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+                    )
+                    cleared_after_write = any(
+                        clear["data"].get("path") == str(marker)
+                        and not exists
+                        for clear in drain_clear_intents
+                    )
+                    if cleared_after_write or (
+                        isinstance(actual, dict)
+                        and (
+                            actual == after
+                            or (actual.get("kind") == "file" and actual.get("sha256") == payload_hash)
+                        )
+                    ):
+                        mutation_states[intent["op_id"]] = "post"
+                    else:
+                        raise StopCutover(f"concurrent drift at drain marker: {marker}")
+            elif action == "systemctl":
+                unit = data["unit"]
+                current = {
+                    "active": self.runner.systemctl("is-active", unit, check=False),
+                    "enabled": self.runner.systemctl("is-enabled", unit, check=False),
+                }
+                before = data.get("before", {})
+                completion = self._completion_for(apply_journal, intent["op_id"])
+                after = (completion or {}).get("data", {}).get("after")
+                if current == before:
+                    mutation_states[intent["op_id"]] = "pre"
+                elif isinstance(after, dict) and current == after:
+                    mutation_states[intent["op_id"]] = "post"
+                else:
+                    args = data.get("args", [])
+                    operation = args[0] if args else ""
+                    expected = dict(before)
+                    if operation == "disable":
+                        expected["enabled"] = "disabled"
+                        if "--now" in args:
+                            expected["active"] = "inactive"
+                    elif operation == "stop":
+                        expected["active"] = "inactive"
+                    elif operation in {"start", "restart"}:
+                        expected["active"] = "active"
+                    elif operation == "enable":
+                        expected["enabled"] = "enabled"
+                    if current == expected:
+                        mutation_states[intent["op_id"]] = "post"
+                    else:
+                        raise StopCutover(f"concurrent drift at systemd unit: {unit}")
+            elif action in archive_artifact_actions:
+                path = Path(data["path"])
+                if not path.exists() and not path.is_symlink():
+                    mutation_states[intent["op_id"]] = "pre"
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    raise StopCutover(f"concurrent drift at archive artifact: {path}")
+                if action == "archive_outer_receipt_write":
+                    expected = dict(data.get("outer", {}))
+                    expected["journal_anchor"] = intent["hash"]
+                    expected_bytes = (json.dumps(expected, indent=2, sort_keys=True) + "\n").encode()
+                    expected_sha = sha256_bytes(expected_bytes)
+                else:
+                    expected_sha = data.get("sha256")
+                if sha256_file(path) != expected_sha:
+                    raise StopCutover(f"concurrent drift at archive artifact: {path}")
+                mutation_states[intent["op_id"]] = "post"
+            elif action in {
+                "precheck_write", "receipt_initial_write", "receipt_applied_write",
+                "receipt_verified_write", "receipt_failed_write", "verify_receipt_write",
+            }:
+                # Durable receipt artifacts are transaction evidence, not host
+                # state. Restore deliberately preserves them.
                 continue
-            backup = Path(backup_text)
-            before = item["before"]
-            if not backup.is_file():
-                raise StopCutover(f"restore backup missing: {backup}")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(path, backup.read_bytes(), int(before["mode"]))
-            os.chmod(path, int(before["mode"]), follow_symlinks=False)
-            try:
-                os.chown(path, int(before["uid"]), int(before["gid"]), follow_symlinks=False)
-            except PermissionError:
-                pass
-            os.utime(path, ns=(int(before["mtime_ns"]), int(before["mtime_ns"])), follow_symlinks=False)
-        for moved in reversed(steps.get("skills", {}).get("moved", [])):
-            source_path = Path(moved["source"])
-            backup = Path(moved["backup"])
-            if source_path.exists() or source_path.is_symlink():
-                raise StopCutover(f"concurrent drift at removed skill path: {source_path}")
-            if backup.exists():
-                source_path.parent.mkdir(parents=True, exist_ok=True)
-                os.rename(backup, source_path)
-        for honcho_snapshot in reversed(steps.get("honcho", [])):
-            matching = next(
-                host for host in receipt.get("plan", {}).get("host_inventory", [])
-                if host.get("host") == honcho_snapshot.get("host") and host.get("selected")
-            )
-            self.honcho.restore(Path(matching["config_path"]), matching["host"], honcho_snapshot)
-        gmail_before = steps.get("gmail", {}).get("before", {})
-        for unit, state in gmail_before.items():
-            if state.get("enabled") == "enabled":
-                self.runner.systemctl("enable", unit, check=False)
-            if state.get("active") == "active":
-                self.runner.systemctl("start", unit, check=False)
-        if steps.get("gateway", {}).get("restarted"):
-            self.runner.systemctl("restart", GATEWAY_UNIT, check=False)
+
+        # Remote drift must be rejected before local rollback begins.
+        for snapshot in honcho_snapshots:
+            self.honcho.assert_unchanged(Path(snapshot["config_path"]), snapshot["host"], snapshot)
+
+        # Authenticate the archive before moving it back. Artifacts remain in
+        # run_dir; no payload filename is ever deleted or interpreted as control.
+        vault_intent = next((i for i in reversed(intents) if i["action"] == "rename" and i["data"].get("kind") == "vault-rename"), None)
+        restored_vault_hash = ""
+        if vault_intent and mutation_states.get(vault_intent["op_id"]) == "post":
+            source = Path(vault_intent["data"]["source"])
+            destination = Path(vault_intent["data"]["destination"])
+            if destination.exists():
+                if source.exists() or source.is_symlink():
+                    raise StopCutover("cannot restore vault: source path already exists")
+                outer_path = destination.parent / "VERIFICATION_RECEIPT.json"
+                if outer_path.is_file():
+                    authenticated = self._verify_archive_artifacts(destination.parent, destination)
+                    expected_payload = authenticated["payload"]
+                else:
+                    expected_payload = vault_intent["data"].get("before")
+                    if not automatic or not isinstance(expected_payload, dict):
+                        raise StopCutover("authenticated archive receipt is missing")
+                    actual_incomplete = tree_manifest(destination)
+                    if (
+                        actual_incomplete.get("tree_hash") != expected_payload.get("tree_hash")
+                        or actual_incomplete.get("entries") != expected_payload.get("entries")
+                    ):
+                        raise StopCutover("incomplete archive payload does not match journaled pre-state")
+                restore_intent = restore_journal.intent("restore_vault_rename", {
+                    "source": str(destination), "destination": str(source),
+                    "expected_tree_hash": expected_payload["tree_hash"],
+                })
+                os.rename(destination, source)
+                fsync_path(destination.parent)
+                fsync_path(source.parent)
+                restored = tree_manifest(source)
+                if restored["tree_hash"] != expected_payload["tree_hash"]:
+                    raise StopCutover("restored vault does not match authenticated payload")
+                restore_journal.complete(restore_intent, {"restored_tree_hash": restored["tree_hash"]})
+                restored_vault_hash = restored["tree_hash"]
+
+        # Reverse every non-vault local mutation from intent pre-state, even if
+        # the apply mutation threw before a completion record could be written.
+        for intent in reversed(intents):
+            data = intent["data"]
+            action = intent["action"]
+            if action == "rename" and data.get("kind") != "vault-rename":
+                source = Path(data["source"])
+                destination = Path(data["destination"])
+                if mutation_states.get(intent["op_id"]) == "post":
+                    rollback = restore_journal.intent("restore_rename", {"source": str(destination), "destination": str(source)})
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    os.rename(destination, source)
+                    fsync_path(source.parent)
+                    restore_journal.complete(rollback, {"restored": True})
+            elif action in {"file_rewrite", "file_delete"} and mutation_states.get(intent["op_id"]) == "post":
+                path = Path(data["path"])
+                before = data["before"]
+                rollback = restore_journal.intent("restore_file", {"path": str(path), "before": before})
+                if before is None:
+                    path.unlink(missing_ok=True)
+                    fsync_path(path.parent)
+                    restore_journal.complete(rollback, {"absent": True})
+                else:
+                    backup = Path(data["backup"])
+                    if not backup.is_file():
+                        raise StopCutover(f"restore backup missing: {backup}")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_bytes(path, backup.read_bytes(), int(before["mode"]))
+                    os.chmod(path, int(before["mode"]), follow_symlinks=False)
+                    try:
+                        os.chown(path, int(before["uid"]), int(before["gid"]), follow_symlinks=False)
+                    except PermissionError:
+                        pass
+                    os.utime(path, ns=(int(before["mtime_ns"]), int(before["mtime_ns"])), follow_symlinks=False)
+                    restored = file_fingerprint(path)
+                    if restored != before:
+                        raise StopCutover(f"restored file metadata does not match pre-state: {path}")
+                    restore_journal.complete(rollback, {"after": restored})
+            elif action == "systemctl" and mutation_states.get(intent["op_id"]) == "post":
+                unit = data["unit"]
+                state = data["before"]
+                operation = data.get("args", [""])[0]
+                if operation == "disable" and state.get("enabled") == "enabled":
+                    rollback = restore_journal.intent("restore_systemctl_enable", {"unit": unit})
+                    self.runner.systemctl("enable", unit, check=True)
+                    restore_journal.complete(rollback, {"enabled": state.get("enabled")})
+                active_action = "start" if state.get("active") == "active" else "stop"
+                rollback = restore_journal.intent(f"restore_systemctl_{active_action}", {"unit": unit})
+                self.runner.systemctl(active_action, unit, check=True)
+                restore_journal.complete(rollback, {"active": state.get("active")})
+            elif action == "gateway_drain_marker_write" and mutation_states.get(intent["op_id"]) == "post":
+                marker = Path(data["path"])
+                rollback = restore_journal.intent("restore_drain_marker", {"path": str(marker), "before": data.get("before")})
+                if data.get("before") and data.get("backup"):
+                    atomic_write_bytes(marker, Path(data["backup"]).read_bytes(), int(data["before"]["mode"]))
+                else:
+                    marker.unlink(missing_ok=True)
+                    fsync_path(marker.parent)
+                restore_journal.complete(rollback, {"restored": True})
+            elif action in archive_artifact_actions and mutation_states.get(intent["op_id"]) == "post":
+                path = Path(data["path"])
+                rollback = restore_journal.intent("restore_archive_artifact_delete", {"path": str(path)})
+                path.unlink()
+                fsync_path(path.parent)
+                restore_journal.complete(rollback, {"absent": True})
+
+        # QMD refreshes are derived state rather than byte-restorable state.
+        # Re-run the exact targeted refresh sequence only after skill/config
+        # rollback has restored the pre-cutover source corpus.
+        for intent in qmd_refresh_intents:
+            args = list(intent["data"].get("args", []))
+            if not args:
+                raise StopCutover("QMD rollback command is missing")
+            rollback = restore_journal.intent("restore_qmd_refresh", {"args": args})
+            result = self.runner.run(args, timeout=900, check=True)
+            restore_journal.complete(rollback, {"returncode": result.returncode})
+
+        # Remote rollback is reconstructed from write-ahead intents, not the
+        # late aggregate receipt, so post-mutation/pre-completion crashes remain
+        # recoverable.
+        for snapshot in reversed(honcho_snapshots):
+            self.honcho.restore(Path(snapshot["config_path"]), snapshot["host"], snapshot, restore_journal)
+
         receipt["state"] = "restored"
         receipt["restored_at"] = datetime.now(timezone.utc).isoformat()
         receipt["automatic_restore"] = automatic
+        receipt["restore_journal_head"] = restore_journal.head
         atomic_write_json(receipt_dir / "RECEIPT.json", receipt)
-        return {"receipt_id": receipt_id, "state": "restored"}
+        return {"receipt_id": receipt_id, "state": "restored", "vault_tree_hash": restored_vault_hash}
 
 
 def discover_profile_homes(home: Path) -> list[Path]:

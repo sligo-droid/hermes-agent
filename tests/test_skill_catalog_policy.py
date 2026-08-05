@@ -5,6 +5,7 @@ from skill_catalog_policy import (
     atomic_write_skills_index,
     filter_skill_records,
     is_retired_skill_record,
+    is_retired_skill_text,
     sanitize_skills_index,
 )
 
@@ -51,6 +52,10 @@ def test_attribution_and_geological_controls_remain_allowed():
 
     assert not is_retired_skill_record(contributor)
     assert not is_retired_skill_record(geology)
+    assert is_retired_skill_record({
+        "name": "plain-markdown",
+        "author": "Obsidian Blackbird; use Obsidian vault sync",
+    })
 
 
 def test_ambiguous_or_malformed_records_fail_closed():
@@ -58,6 +63,19 @@ def test_ambiguous_or_malformed_records_fail_closed():
     assert is_retired_skill_record({})
     assert is_retired_skill_record({"description": "Obsidian compatible"})
     assert is_retired_skill_record({"author": "Obsidian Blackbird", "repo": "org/obsidian-tools"})
+    assert is_retired_skill_record({"name": "clean", "metadata": {"obsidian": False}})
+    assert is_retired_skill_record({
+        "name": "clean",
+        "contributors": [{"name": "Obsidian Blackbird", "repo": "org/obsidian-tools"}],
+    })
+
+
+def test_bounded_text_policy_allows_only_attribution_or_natural_meaning():
+    assert not is_retired_skill_text("Author: Obsidian Blackbird")
+    assert not is_retired_skill_text("A guide to obsidian volcanic glass and igneous rock.")
+    assert is_retired_skill_text("Save notes to Obsidian.")
+    assert is_retired_skill_text("Author: Obsidian Blackbird\nRepository: org/obsidian-tools")
+    assert is_retired_skill_text("Author: Obsidian Blackbird; use Obsidian vault sync")
 
 
 def test_sanitize_fails_closed_for_malformed_index():
@@ -65,17 +83,24 @@ def test_sanitize_fails_closed_for_malformed_index():
     assert sanitize_skills_index({"skills": "not-a-list"}) is None
 
 
-def test_real_snapshot_contains_zero_installable_capability_records():
+def test_committed_catalog_fixture_filters_every_installable_capability_record():
     snapshot = json.loads(
-        (Path(__file__).resolve().parents[1] / "website/static/api/skills-index.json").read_text()
+        (Path(__file__).resolve().parent / "fixtures/skills-index-policy.json").read_text()
     )
     sanitized = sanitize_skills_index(snapshot)
     assert sanitized is not None
+    assert [record["name"] for record in sanitized["skills"]] == [
+        "plain-markdown",
+        "volcanic-rock-field-guide",
+    ]
     assert all(not is_retired_skill_record(record) for record in sanitized["skills"])
     assert all(
         "obsidian" not in json.dumps(record, ensure_ascii=False).lower()
         or record.get("author") == "Obsidian Blackbird"
-        or "geolog" in str(record.get("description", "")).lower()
+        or any(
+            term in str(record.get("description", "")).lower()
+            for term in ("geolog", "igneous", "volcanic glass")
+        )
         for record in sanitized["skills"]
     )
 

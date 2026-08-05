@@ -2823,3 +2823,74 @@ def test_install_boundary_rejects_retired_bundle(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="retired integration policy"):
         hub.install_from_quarantine(quarantine, bundle.name, "", bundle, scan)
     assert quarantine.exists()
+
+
+def test_guarded_fetch_never_calls_raw_fetch_when_inspect_is_rejected():
+    import tools.skills_hub as hub
+
+    class Source(hub.SkillSource):
+        def __init__(self):
+            self.fetch_calls = 0
+
+        def source_id(self):
+            return "direct-test"
+
+        def search(self, query, limit=10):
+            return []
+
+        def inspect(self, identifier):
+            return SkillMeta(
+                name="clean",
+                description="Save notes to Obsidian.",
+                source="direct-test",
+                identifier=identifier,
+                trust_level="community",
+            )
+
+        def fetch(self, identifier):
+            self.fetch_calls += 1
+            return SkillBundle("clean", {"SKILL.md": "---\nname: clean\n---\n"}, "direct-test", identifier, "community")
+
+    source = Source()
+    hub._guard_skill_source(source)
+    assert source.fetch("clean") is None
+    assert source.fetch_calls == 0
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"SKILL.md": "---\nname: clean\n---\nSave notes to Obsidian."},
+        {"SKILL.md": "---\nname: clean\n---\n", "references/guide.md": "Use Obsidian sync."},
+        {"SKILL.md": "---\nname: clean\n---\n", "references/guide": "Use Obsidian sync."},
+        {"SKILL.md": "---\nname: clean\n---\n", "config/obsidian.json": "{}"},
+        {"SKILL.md": "---\nname: clean\nmetadata:\n  obsidian: false\n---\n"},
+        {"SKILL.md": "---\nname: clean\ncontributors:\n  - name: Obsidian Blackbird\n    repo: org/obsidian-tools\n---\n"},
+        {"SKILL.md": "---\nname: clean\n---\n", "references/huge.md": b"x" * (512 * 1024 + 1)},
+        {"SKILL.md": b"\xff\xfe"},
+        {"README.md": "No canonical skill entrypoint."},
+        {"SKILL.md": "---\nname: clean\n---\n", "assets/large.bin": b"x" * (2 * 1024 * 1024)},
+    ],
+)
+def test_bundle_policy_rejects_adversarial_contents(files):
+    import tools.skills_hub as hub
+
+    bundle = SkillBundle("clean", files, "github", "org/repo/clean", "community")
+    assert not hub._skill_bundle_allowed(bundle)
+
+
+def test_bundle_policy_allows_binary_and_narrow_attribution_controls():
+    import tools.skills_hub as hub
+
+    bundle = SkillBundle(
+        "clean",
+        {
+            "SKILL.md": "---\nname: clean\nauthor: Obsidian Blackbird\n---\nAuthor: Obsidian Blackbird\n",
+            "assets/logo.png": b"\x89PNG\x00obsidian-binary",
+            "references/geology.md": "Obsidian volcanic glass is an igneous rock.",
+        },
+        "github",
+        "org/repo/clean",
+        "community",
+    )
+    assert hub._skill_bundle_allowed(bundle)

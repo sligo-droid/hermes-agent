@@ -46,6 +46,11 @@ _CAPABILITY_TERMS = re.compile(
     r"write|zettelkasten)\b",
     re.IGNORECASE,
 )
+_ATTRIBUTION_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:author|authors|contributor|contributors|maintainer|maintainers|"
+    r"created\s+by|credit|credits)\s*[:\-]\s*[^\n]*obsidian[^\n]*$",
+    re.IGNORECASE,
+)
 
 
 def _marker_occurrences(value: Any, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str]]:
@@ -53,7 +58,12 @@ def _marker_occurrences(value: Any, path: tuple[str, ...] = ()) -> list[tuple[tu
     found: list[tuple[tuple[str, ...], str]] = []
     if isinstance(value, dict):
         for key, child in value.items():
-            found.extend(_marker_occurrences(child, (*path, str(key).lower())))
+            key_text = str(key)
+            key_path = (*path, key_text.lower())
+            if RETIRED_SKILL_MARKER in key_text.lower():
+                # Marker-bearing keys are executable metadata, never attribution.
+                found.append(((*path, "<key>"), key_text))
+            found.extend(_marker_occurrences(child, key_path))
     elif isinstance(value, (list, tuple, set)):
         for index, child in enumerate(value):
             found.extend(_marker_occurrences(child, (*path, str(index))))
@@ -64,8 +74,20 @@ def _marker_occurrences(value: Any, path: tuple[str, ...] = ()) -> list[tuple[tu
     return found
 
 
-def _is_attribution_occurrence(path: tuple[str, ...]) -> bool:
-    return bool(path) and any(part in _ATTRIBUTION_FIELDS for part in path)
+def _is_attribution_occurrence(path: tuple[str, ...], text: str) -> bool:
+    if not path:
+        return False
+    for index, part in enumerate(path):
+        if part not in _ATTRIBUTION_FIELDS:
+            continue
+        # Attribution may be a scalar or a list of scalar names. Nested source,
+        # repository, path, or arbitrary metadata beneath an attribution object
+        # is provenance and must remain blocked.
+        return (
+            all(suffix.isdigit() for suffix in path[index + 1 :])
+            and not _CAPABILITY_TERMS.search(text)
+        )
+    return False
 
 
 def _is_natural_meaning_record(record: dict[str, Any], occurrences: list[tuple[tuple[str, ...], str]]) -> bool:
@@ -106,11 +128,27 @@ def is_retired_skill_record(record: Any) -> bool:
     occurrences = _marker_occurrences(record)
     if not occurrences:
         return False
-    if all(_is_attribution_occurrence(path) for path, _ in occurrences):
+    if all(_is_attribution_occurrence(path, text) for path, text in occurrences):
         return False
     if _is_natural_meaning_record(record, occurrences):
         return False
     return True
+
+
+def is_retired_skill_text(text: Any) -> bool:
+    """Return whether bounded skill/support text advertises the retired capability."""
+    if not isinstance(text, str):
+        return True
+    marker_lines = [line for line in text.splitlines() if RETIRED_SKILL_MARKER in line.lower()]
+    if not marker_lines:
+        return False
+    for line in marker_lines:
+        if _ATTRIBUTION_LINE.match(line) and not _CAPABILITY_TERMS.search(line):
+            continue
+        if _NATURAL_MEANING_TERMS.search(line) and not _CAPABILITY_TERMS.search(line):
+            continue
+        return True
+    return False
 
 
 def filter_skill_records(records: Iterable[Any]) -> list[Any]:
