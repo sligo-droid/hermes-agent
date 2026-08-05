@@ -1243,6 +1243,9 @@ class TestGetHonchoClientBaseUrlDoublePrefixFix:
     """Regression tests for #20688 — Honcho SDK double-prefixing of /v3 for
     self-hosted instances where base_url already contains a version path."""
 
+    def setup_method(self):
+        reset_honcho_client()
+
     def teardown_method(self):
         reset_honcho_client()
 

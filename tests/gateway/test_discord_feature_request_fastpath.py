@@ -159,14 +159,14 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     )
 
     assert result["final_response"] == "ok"
-    assert result["reasoning_effort"] == "low"
+    assert result["reasoning_effort"] == "medium"
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
     assert init["verify_on_stop"] is True
     assert init["enabled_toolsets"] == ["core"]
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "low"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
     cached_agent = runner._agent_cache["agent:main:discord:thread:thread-1"][0]
     audit = cached_agent._runtime_audit_context
     assert audit["model_tier"] == "discord_action"
@@ -219,8 +219,8 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "at most one concise question" in init["ephemeral_system_prompt"]
     assert "recommended default" in init["ephemeral_system_prompt"]
     assert "state the assumption and continue" in init["ephemeral_system_prompt"]
-    assert "Simple UI fast lane" in init["ephemeral_system_prompt"]
-    assert "instead of spawning a coding worker" in init["ephemeral_system_prompt"]
+    assert "Explicit visual UI work must use delegate_coding_task" in init["ephemeral_system_prompt"]
+    assert "small non-visual frontend-only" in init["ephemeral_system_prompt"]
     assert "phase timing line" not in init["ephemeral_system_prompt"]
     assert "contradictory done/not-verified" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
@@ -247,11 +247,11 @@ async def test_discord_action_request_uses_routine_tier_regardless_of_keywords(
         intent=True,
     )
 
-    assert result["reasoning_effort"] == "low"
+    assert result["reasoning_effort"] == "medium"
     assert _CapturingAgent.last_init["model"] == "gpt-5.6-sol"
     assert _CapturingAgent.last_init["reasoning_config"] == {
         "enabled": True,
-        "effort": "low",
+        "effort": "medium",
     }
     audit = runner._agent_cache["agent:main:discord:thread:thread-1"][0]._runtime_audit_context
     assert audit["model_tier"] == "discord_action"
@@ -313,10 +313,10 @@ async def test_existing_action_thread_direct_question_uses_discord_action_tier_w
         channel_prompt="Answer this current direct question in place.",
     )
 
-    assert result["reasoning_effort"] == "low"
+    assert result["reasoning_effort"] == "medium"
     init = _CapturingAgent.last_init
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "low"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
     assert "tool_delay" not in init
     assert "verify_on_stop" not in init
     assert init["runtime_mode"] == "read_only"
@@ -363,10 +363,10 @@ async def test_bare_discord_read_only_turn_uses_discord_action_tier(monkeypatch)
         escalation_allowed=False,
     )
 
-    assert result["reasoning_effort"] == "low"
+    assert result["reasoning_effort"] == "medium"
     init = _CapturingAgent.last_init
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "low"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
     assert init["runtime_mode"] == "read_only"
     assert "tool_delay" not in init
     assert "verify_on_stop" not in init
