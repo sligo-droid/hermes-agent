@@ -179,7 +179,7 @@ _DISCORD_READ_ONLY_PROMPT = (
     "directly is often faster and preserves your full context. Delegate when "
     "parallelism, independent verification, context isolation, or deeper reasoning "
     "adds value; read-only delegation remains available for broader or reasoning-heavy "
-    "work. Omit delegate_task's model_tier to inherit this route tier (Sol/medium by "
+    "work. Omit delegate_task's model_tier to inherit this route tier (Sol/low by "
     "default), or choose any configured tier that matches the subtask's difficulty; "
     "read-only does not limit tier choice. Durable changes are structurally blocked: do "
     "not edit source/config, install packages, commit/push/open or merge PRs, "
@@ -3895,9 +3895,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         question_starts = (
             "what ", "why ", "when ", "where ", "who ", "whose ", "which ",
-            "how ", "can you explain", "can you tell", "do you know",
-            "is there", "are there", "does ", "do ", "did ", "should ",
-            "would ", "could you explain", "what's", "whats",
+            "how ", "can ", "could ", "would ", "will ", "is ", "are ",
+            "does ", "do ", "did ", "should ", "what's", "whats",
         )
         feature_verbs = (
             "build", "create", "add", "implement", "fix", "repair", "change", "update",
@@ -3918,7 +3917,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "delete ", "refactor ", "wire ", "integrate ", "set up ",
             "turn on ", "enable ", "disable ", "replace ", "migrate ",
             "simplify ", "clean up ", "rerun ", "re-run ", "execute ",
-            "regenerate ",
+            "regenerate ", "get ",
         )
         direct_starts = (
             "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
@@ -3967,7 +3966,7 @@ class DiscordAdapter(BasePlatformAdapter):
         observational_task_verb = (
             r"(?:review|audit|inspect|investigate|research|analy[sz]e|assess|"
             r"evaluate|test|verify|validate|diagnose|trace|reproduce|survey|"
-            r"inventory|compare|plan|look\s+(?:through|into|over)|check)"
+            r"inventory|compare|confirm|plan|look\s+(?:through|into|over)|check)"
         )
         observational_deliverable = (
             r"(?:review|audit|inspection|investigation|analysis|assessment|"
@@ -4070,22 +4069,14 @@ class DiscordAdapter(BasePlatformAdapter):
             for candidate in intent_candidates
             for prefix in direct_starts
         )
-        if direct_message and not any(
-            feature_verb_pattern.search(candidate) for candidate in intent_candidates
-        ):
-            return False
-        if any(
-            candidate.startswith(question_starts)
-            and candidate.endswith("?")
-            and not feature_verb_pattern.search(candidate)
-            for candidate in intent_candidates
-        ):
-            return False
-
         pipeline_action = any(
             phrase in candidate
             for candidate in intent_candidates
             for phrase in pipeline_action_phrases
+        )
+        informational_question = any(
+            candidate.startswith(question_starts) and candidate.endswith("?")
+            for candidate in intent_candidates
         )
         precise_imperative = any(
             candidate.startswith(imperative_starts)
@@ -4103,8 +4094,33 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             for candidate in intent_candidates
         )
-        if (pipeline_action or precise_imperative) and not cleaned.endswith("?"):
+        declared_action_need = any(
+            re.match(
+                r"^(?:i|we)\s+(?:need|want|would\s+like)\s+"
+                r"(?:you\s+to\s+|to\s+)?(?:build|create|add|implement|fix|repair|"
+                r"change|update|remove|delete|ship|deploy|make|refactor|wire|"
+                r"integrate|set\s+up|enable|disable|support|replace|migrate|"
+                r"simplify|clean\s+up|run|rerun|re-run|execute|regenerate|get)\b",
+                candidate,
+            )
+            for candidate in intent_candidates
+        )
+        # Prefer action for concrete mutation requests even when phrased as a
+        # question. The polite-request normalization makes "can you fix ...?"
+        # an imperative candidate, while advice questions such as "should we
+        # deploy?" continue to the informational-question check below.
+        if (
+            precise_imperative
+            or declared_action_need
+            or (pipeline_action and not informational_question)
+        ):
             return True
+        if direct_message and not any(
+            feature_verb_pattern.search(candidate) for candidate in intent_candidates
+        ):
+            return False
+        if informational_question:
+            return False
         return None
 
     def _explicit_no_action_constraint_reason(self, text: str) -> Optional[str]:
@@ -4243,10 +4259,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return RuntimeMode.READ_ONLY
         if heuristic is True or force_action:
             return RuntimeMode.ACTION
-        # Ambiguity is intentionally read-only by default. The ordinary agent
-        # gets the full context and can request a transactional gateway replay
-        # only when durable state actually needs to change.
-        return RuntimeMode.READ_ONLY
+        # Unresolved ambiguity prefers the action runtime. Explicit read-only
+        # constraints, observational task shapes, greetings, and informational
+        # questions have already returned READ_ONLY above. This bias avoids a
+        # second model call for likely work requests while keeping the safe
+        # replay path available when read-only observation discovers mutation.
+        return RuntimeMode.ACTION
 
     async def _classify_discord_action_request(
         self,
