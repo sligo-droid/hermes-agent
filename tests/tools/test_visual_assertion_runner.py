@@ -467,6 +467,11 @@ async def test_missing_browser_is_blocked_and_receipt_contains_no_protected_data
     )
 
     assert result["status"] == "blocked"
+    assert result["code"] == "browser_supervisor_unavailable"
+    assert result["correction"] == (
+        "Reinitialize the task browser with browser_navigate, restore required "
+        "authentication and page state, then retry visual_qa once."
+    )
     receipt = result["visual_qa_receipt"]
     assert receipt["status"] == "blocked"
     assert set(receipt) == {
