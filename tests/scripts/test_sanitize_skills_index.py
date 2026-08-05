@@ -32,6 +32,31 @@ def test_sanitizer_filters_and_writes_destination_atomically(tmp_path):
     assert data["skill_count"] == 1
 
 
+def test_sanitizer_filters_description_only_capabilities_and_malformed_records(tmp_path):
+    source = tmp_path / "download.json"
+    destination = tmp_path / "public" / "skills-index.json"
+    source.write_text(json.dumps({"skills": [
+        {"name": "clean", "description": "Portable Markdown"},
+        {"name": "daily-recap", "description": "Save the recap to Obsidian"},
+        {"description": "missing identity"},
+    ]}))
+
+    result = subprocess.run(
+        [
+            sys.executable, str(SCRIPT), "--input", str(source),
+            "--output", str(destination),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(destination.read_text())["skills"] == [
+        {"name": "clean", "description": "Portable Markdown"}
+    ]
+
+
 def test_sanitizer_fails_closed_without_overwriting_destination(tmp_path):
     source = tmp_path / "invalid.json"
     destination = tmp_path / "skills-index.json"

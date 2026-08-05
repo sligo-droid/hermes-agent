@@ -1797,6 +1797,24 @@ class TestHermesIndexSearch:
         assert any(h.name == "cuda" for h in hits)
         assert hits[0].name == "cuda"
 
+    def test_description_only_retired_capability_cannot_search_inspect_or_fetch(self):
+        skill = {
+            "name": "daily-recap",
+            "description": "Generate a recap and save it to Obsidian.",
+            "source": "github",
+            "identifier": "example/skills/daily-recap",
+            "repo": "example/skills",
+            "path": "daily-recap",
+            "tags": [],
+        }
+        src = _make_index_source([skill])
+        src._github = MagicMock()
+
+        assert src.search("daily-recap") == []
+        assert src.inspect(skill["identifier"]) is None
+        assert src.fetch(skill["identifier"]) is None
+        src._github.fetch.assert_not_called()
+
 
 class TestProviderFilter:
     def test_filter_results_by_provider_narrows_exactly(self):
@@ -2727,6 +2745,40 @@ class TestLoadHermesIndex:
         assert [entry["name"] for entry in data["skills"]] == ["notes"]
         assert json.loads(cache_file.read_text()) == data
 
+    def test_stale_cache_filters_description_only_capability(self, monkeypatch, tmp_path):
+        import os
+        import tools.skills_hub as hub
+
+        cache_file = self._isolate_cache(monkeypatch, tmp_path)
+        cache_file.write_text(json.dumps({"skills": [
+            {"name": "clean", "description": "Portable Markdown."},
+            {"name": "auto-research", "description": "Publish research into Obsidian."},
+        ]}))
+        old = time.time() - (hub.HERMES_INDEX_TTL + 100)
+        os.utime(cache_file, (old, old))
+        monkeypatch.setattr(hub.httpx, "get", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("offline")))
+
+        data = hub._load_hermes_index()
+
+        assert [entry["name"] for entry in data["skills"]] == ["clean"]
+        assert json.loads(cache_file.read_text()) == data
+
+    def test_clean_download_filters_before_cache_write(self, monkeypatch, tmp_path):
+        import tools.skills_hub as hub
+
+        cache_file = self._isolate_cache(monkeypatch, tmp_path)
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"skills": [
+            {"name": "clean", "description": "Portable Markdown."},
+            {"name": "knowledge-importer", "description": "Import documents into Obsidian."},
+        ]}
+        monkeypatch.setattr(hub.httpx, "get", lambda *a, **k: response)
+
+        data = hub._load_hermes_index()
+
+        assert [entry["name"] for entry in data["skills"]] == ["clean"]
+        assert json.loads(cache_file.read_text()) == data
+
     def test_index_source_rejects_retired_injected_entry(self):
         import tools.skills_hub as hub
 
@@ -2742,3 +2794,32 @@ class TestLoadHermesIndex:
         assert source.search(retired_name) == []
         assert source.inspect(f"skills-sh/example/{retired_name}") is None
         assert source.fetch(f"skills-sh/example/{retired_name}") is None
+
+
+def test_install_boundary_rejects_retired_bundle(tmp_path, monkeypatch):
+    import tools.skills_hub as hub
+
+    skills_dir = tmp_path / "skills"
+    quarantine = skills_dir / ".hub" / "quarantine" / "smart-auto-note"
+    quarantine.mkdir(parents=True)
+    (quarantine / "SKILL.md").write_text(
+        "---\nname: smart-auto-note\ndescription: Write notes into Obsidian.\n---\n"
+    )
+    monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(hub, "HUB_DIR", skills_dir / ".hub")
+    monkeypatch.setattr(hub, "QUARANTINE_DIR", skills_dir / ".hub" / "quarantine")
+    monkeypatch.setattr(hub, "LOCK_FILE", skills_dir / ".hub" / "lock.json")
+    monkeypatch.setattr(hub, "AUDIT_LOG", skills_dir / ".hub" / "audit.log")
+
+    bundle = SkillBundle(
+        name="smart-auto-note",
+        files={"SKILL.md": (quarantine / "SKILL.md").read_text()},
+        source="github",
+        identifier="example/skills/smart-auto-note",
+        trust_level="community",
+    )
+    scan = MagicMock(verdict="safe")
+
+    with pytest.raises(ValueError, match="retired integration policy"):
+        hub.install_from_quarantine(quarantine, bundle.name, "", bundle, scan)
+    assert quarantine.exists()

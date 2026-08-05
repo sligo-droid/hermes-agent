@@ -1,115 +1,183 @@
 # Retired Knowledge Host Cutover
 
-This is a **post-merge operator runbook** for retiring the legacy desktop-note
-integration from a host. Do not run it from a feature branch, worktree, CI job,
-or active development session. The code change does not mutate host state.
+This is the **post-merge** operator runbook for the executable cutover in
+`scripts/archive_legacy_vault.py`. The helper is dry-run by default and never
+prints secrets, memory content, message content, or vault filenames. Do not run
+`apply` from this PR branch. Independent review, merge, and canonical checkout
+fast-forward are mandatory first.
 
-## Preconditions and stop conditions
+## Safety model
 
-Proceed only after the removal PR is merged and the canonical checkout is at
-the verified merge SHA. Record that SHA, the operator, UTC start time, active
-Hermes profiles, gateway unit names, vault path, QMD collection name, and
-archive root in the change ticket.
+The helper has four modes:
 
-Stop immediately if any path or service name is uncertain, the vault contains
-symlinks, the archive is on the same path as the vault, the Honcho config has
-unexpected hosts, QMD reports another collection backed by the same vault, or
-the gateway cannot be cleanly stopped and restarted.
+| Mode | Mutation | Purpose |
+| --- | --- | --- |
+| `preflight` | none | Inventory every selectable Honcho host/scope, planned skill removals, service gates, and the vault tree hash. |
+| `apply` | yes | Execute the all-host cutover transaction. Requires the exact confirmation string and merged SHA. |
+| `verify` | receipt only | Re-verify services, archive receipts/hashes/metadata, source absence, and controlled non-recreation. |
+| `restore` | yes | Restore only receipt-owned changes; stop on concurrent drift rather than overwrite. |
 
-## 1. Audit only
+The durable receipt root defaults to:
 
-Do not print Honcho secrets. Inspect only keys and non-secret routing fields:
-
-```bash
-git -C /path/to/canonical-hermes status --short
-git -C /path/to/canonical-hermes rev-parse HEAD
-hermes gateway status
-qmd collection list
-python scripts/archive_legacy_vault.py \
-  --source /absolute/path/to/legacy-vault \
-  --archive-root /absolute/path/to/operator-archives
+```text
+$HERMES_HOME/retired-note-cutover-receipts/
 ```
 
-Inspect each active profile's `$HERMES_HOME/honcho.json` and confirm that its
-resolved `hosts` map contains the intended `hermes` or `hermes_<profile>` key.
-An empty object is valid membership and inherits root fields. Unknown profile
-hosts must remain disabled. Back up every edited config with restrictive
-permissions before changing it.
+It is created with mode `0700`; receipt and backup files use `0600`.
 
-## 2. Disable legacy QMD ingestion
+## STOP gates
 
-Use the installed QMD version's documented collection-removal command to remove
-only the collection whose configured source path exactly equals the legacy
-vault. Do not delete the QMD database or unrelated collections. Then run:
+Stop without improvising when the helper reports `state: STOP`. Important gates
+include:
 
-```bash
-qmd collection list
-qmd status
-```
+- canonical checkout dirty or missing the reviewed merge SHA;
+- active gateway turns or development/kanban workers;
+- malformed or unsafe Honcho/config/registry paths;
+- incomplete selectable-host or observer/target receipts;
+- archive destination on another device;
+- vault source absent, already a symlink, changed since preflight, or recreated;
+- unsupported vault filesystem objects;
+- legacy Gmail collector/renewal service still active;
+- gateway not healthy after its one controlled restart;
+- QMD skills refresh failure after targeted fallback;
+- archive metadata/hash/fsync failure;
+- restore-time concurrent drift.
 
-Stop if the retired collection remains, another collection points at the same
-path, or QMD reports an unhealthy index. Preserve the before/after command
-output in the ticket.
+Never substitute `rm -rf`, cross-device copy/delete, an unverified tarball, or a
+manual config overwrite.
 
-## 3. Archive the vault
+## 1. Independent review and merge
 
-Review the dry-run JSON from step 1, including source, destination, file count,
-and byte count. Then execute exactly once:
+Before touching the host:
 
-```bash
-python scripts/archive_legacy_vault.py \
-  --source /absolute/path/to/legacy-vault \
-  --archive-root /absolute/path/to/operator-archives \
-  --execute
-```
+1. Obtain independent review of the removal PR and this helper.
+2. Merge the PR normally.
+3. Fast-forward the clean canonical checkout to the verified merge SHA.
+4. Record the merge SHA in the change ticket.
+5. Confirm no development worker, active agent turn, or gateway migration is in
+   flight.
 
-The helper atomically renames the source to a same-filesystem staging path,
-copies it to a timestamped destination, verifies every file's size and SHA-256
-digest, writes `.hermes-archive-manifest.json`, and only then removes staging.
-It restores the original path if copying or verification fails. Stop if it
-exits non-zero. Never substitute `rm -rf` or an unverified move.
-
-## 4. Confirm Honcho host boundaries
-
-For every active profile, confirm the appropriate host key is present under
-`hosts`. Keep common connectivity and defaults at the root only when intended;
-host fields override root fields. Preserve explicit `enabled: false` blocks.
-Legacy `hermes.<profile>` aliases remain supported but should not be newly
-introduced.
-
-Run the profile's normal Honcho status/health command and verify:
-
-- configured empty blocks inherit the intended root workspace/connectivity;
-- explicitly disabled hosts remain disabled;
-- an unlisted synthetic profile host is rejected;
-- no retired-vault or QMD path appears in the effective configuration.
-
-## 5. Restart and smoke-test the gateway
-
-Restart only now, after confirming no development worker is active:
+## 2. Preflight (safe to run repeatedly)
 
 ```bash
-hermes gateway restart
-hermes gateway status
+python scripts/archive_legacy_vault.py preflight
 ```
 
-For profile-specific services, run the same commands with the profile selector
-used on that host. Verify the service reaches healthy/active state, Discord or
-other configured messaging transport can receive and answer a test message,
-Honcho recall succeeds for an allowed host, and logs show no retired integration
-or vault path. Record exact unit names and timestamps.
+Review the structural JSON summary. It reports counts and hashes, not file
+content or names. Confirm:
 
-## 6. Rollback
+- every enabled/selectable Honcho host is included, including profile-derived
+  hosts such as `hermes_uiux`;
+- expected observer/target scope count is non-zero for enabled workspaces;
+- planned skill removals cover dedicated retired packages and only
+  retired-sourced `json-canvas`/`defuddle` copies;
+- archive source/destination are correct and share a device;
+- `qmd_index` is `skills` and `pid_docs_touched` is false.
 
-If the smoke test fails, stop the gateway, restore the backed-up Honcho config,
-restore the vault from the verified archive to its original path, recreate only
-the previously recorded QMD collection, and restart. Do not roll back by
-checking out the feature branch or by deleting the archive. Capture failure
-logs and leave the host in its last known-good state.
+Preflight does not create a receipt directory or archive root.
+
+## 3. Apply (post-merge only)
+
+Use the exact reviewed merge SHA:
+
+```bash
+python scripts/archive_legacy_vault.py apply \
+  --expected-merge-sha <MERGE_SHA> \
+  --confirm RETIRE-OBSIDIAN-POST-MERGE
+```
+
+The transaction:
+
+1. Re-runs preflight and merge/idle gates.
+2. Creates a restricted durable receipt.
+3. Materializes a Honcho host allowlist when a legacy flat config could select
+   unknown hosts.
+4. Inventories every selected Honcho workspace/peer observer-target pair,
+   removes retired facts from cards/conclusions, records context/search status,
+   and preserves messages and sessions.
+5. Stops/disables `gmail-intake-pubsub.service` and
+   `gmail-intake-watch-renew.timer`, stops a running renewal service, verifies
+   no collector unit remains active, and neutralizes legacy `invoke-agent`
+   branches without redirecting them to future intake.
+6. Atomically moves retired skill directories into the receipt and reconciles
+   `.hub/lock.json`, `.bundled_manifest`, `.usage.json`, taps/index caches, and
+   prompt snapshots for both default and profile homes.
+7. Removes current retired-system memory paragraphs and only `OBSIDIAN_*`
+   environment assignments, preserving file mode/ownership atomically.
+8. Regenerates/refreshes the QMD `skills` catalog/index. If the established
+   refresh service fails, it uses a targeted `--index skills` rebuild/embed
+   fallback. It does not invoke or modify `pid-docs`.
+9. Rechecks idle state, restarts the gateway exactly once, and verifies it is
+   active.
+10. Only after the complete all-host receipt, atomically renames
+    `$HERMES_HOME/obsidian-vault` on the same filesystem to:
+
+    ```text
+    ~/archives/hermes-retired-note-system/obsidian-vault-<UTC>/vault
+    ```
+
+11. Writes and fsyncs `MANIFEST.json`, `SHA256SUMS`, `FILE_METADATA.tsv`, and
+    `VERIFICATION_RECEIPT.json`. The manifest includes files, directories,
+    symlinks, SHA-256 data, modes, uid/gid, mtimes, counts, and tree hash.
+12. Runs verification and marks the receipt `verified`.
+
+Any exception attempts receipt-driven rollback. A rollback failure is itself
+recorded and is a hard operator STOP.
+
+## 4. Verify
+
+Use the receipt ID printed by apply:
+
+```bash
+python scripts/archive_legacy_vault.py verify --receipt-id <RECEIPT_ID>
+```
+
+Verification proves:
+
+- the original vault path is absent and is not a symlink;
+- every original archive payload entry still matches type, SHA-256, size,
+  mode, uid/gid, and mtime;
+- all four archive receipt files exist and bind to the payload tree hash;
+- Gmail collector/renewal units are inactive;
+- the gateway is active;
+- a controlled structural interaction does not recreate the vault;
+- `pid-docs` was not touched.
+
+## 5. Restore
+
+Restore only when the receipt remains authoritative:
+
+```bash
+python scripts/archive_legacy_vault.py restore --receipt-id <RECEIPT_ID>
+```
+
+Restore first compares every receipt-owned post-apply fingerprint. If a person,
+service, or concurrent process changed a target, it stops rather than overwrite.
+When safe, it:
+
+- atomically moves the verified vault back and removes only the four generated
+  archive receipt files;
+- restores file modes, ownership, mtimes, registries, caches, prompt snapshot,
+  current memory/env files, and invoke-agent source from backups;
+- restores moved skill directories;
+- restores Honcho cards/conclusions where the receipt permits and fails closed
+  on card drift;
+- restores prior Gmail unit enabled/active state;
+- restarts the gateway if apply had restarted it.
+
+Messages, sessions, credentials, Gmail intake state, and vault content are never
+deleted by the transaction.
 
 ## Acceptance evidence
 
-The cutover is complete only when the ticket contains the merge SHA, dry-run and
-execute summaries, archive manifest path, QMD before/after status, redacted
-Honcho host membership audit, gateway status, transport smoke result, Honcho
-recall result, and explicit confirmation that rollback was not required.
+The ticket must contain:
+
+- reviewed merge SHA and canonical HEAD;
+- preflight summary;
+- receipt ID/path and `verified` state;
+- selected Honcho host/scope counts and mutation counts (not content);
+- Gmail unit before/after states;
+- skill-registry/QMD/gateway verification;
+- archive payload counts/tree hash and all four receipt paths;
+- explicit confirmation that source absence survived controlled interaction;
+- either “restore not required” or the restore receipt/result.

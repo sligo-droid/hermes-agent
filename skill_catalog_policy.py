@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,34 +22,95 @@ _IDENTITY_FIELDS = (
     "install_command",
     "integration",
 )
-_ADVERTISING_TERMS = ("skill", "integration", "vault", "note", "plugin")
+_ATTRIBUTION_FIELDS = frozenset(
+    {
+        "author",
+        "authors",
+        "contributor",
+        "contributors",
+        "maintainer",
+        "maintainers",
+        "owner_name",
+    }
+)
+_NATURAL_MEANING_TERMS = re.compile(
+    r"\b(?:volcanic\s+glass|igneous|geolog(?:y|ic|ical)?|mineral(?:ogy)?|"
+    r"gem(?:stone)?|rock|lava|mahogany\s+obsidian|snowflake\s+obsidian|"
+    r"obsidian\s+(?:black|color|colour|palette|pigment|shade))\b",
+    re.IGNORECASE,
+)
+_CAPABILITY_TERMS = re.compile(
+    r"\b(?:agent|api|app|automation|backup|capture|cli|convert|export|file|"
+    r"import|index|ingest|integration|knowledge|markdown|memory|note|plugin|"
+    r"publish|query|read|save|search|skill|sync|task|template|tool|vault|wiki|"
+    r"write|zettelkasten)\b",
+    re.IGNORECASE,
+)
+
+
+def _marker_occurrences(value: Any, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str]]:
+    """Return paths and scalar text containing the retired product marker."""
+    found: list[tuple[tuple[str, ...], str]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            found.extend(_marker_occurrences(child, (*path, str(key).lower())))
+    elif isinstance(value, (list, tuple, set)):
+        for index, child in enumerate(value):
+            found.extend(_marker_occurrences(child, (*path, str(index))))
+    elif value is not None:
+        text = str(value)
+        if RETIRED_SKILL_MARKER in text.lower():
+            found.append((path, text))
+    return found
+
+
+def _is_attribution_occurrence(path: tuple[str, ...]) -> bool:
+    return bool(path) and any(part in _ATTRIBUTION_FIELDS for part in path)
+
+
+def _is_natural_meaning_record(record: dict[str, Any], occurrences: list[tuple[tuple[str, ...], str]]) -> bool:
+    """Recognize only narrow geological/color uses, never digital capabilities."""
+    if not occurrences:
+        return False
+    # URLs, repository/path identity, install commands, and integrations are
+    # executable provenance. A marker there is never merely a color/mineral.
+    identity_fields = set(_IDENTITY_FIELDS) | {"url", "repo_url", "github_url", "source"}
+    if any(any(part in identity_fields for part in path) for path, _ in occurrences):
+        return False
+    prose = " ".join(
+        str(record.get(field, "")) for field in ("name", "description", "summary", "category")
+    )
+    prose += " " + " ".join(text for _, text in occurrences)
+    return bool(_NATURAL_MEANING_TERMS.search(prose)) and not bool(
+        _CAPABILITY_TERMS.search(prose)
+    )
 
 
 def is_retired_skill_record(record: Any) -> bool:
-    """Return whether a skill record advertises the retired integration."""
+    """Return whether a record is unsafe for live skill discovery.
+
+    The catalog is untrusted capability metadata. Malformed records and every
+    product occurrence are rejected unless all occurrences are narrowly proven
+    to be contributor attribution or a non-digital geological/color meaning.
+    This intentionally fails closed instead of maintaining a changing denylist
+    of skill names.
+    """
     if not isinstance(record, dict):
-        return False
-
-    def contains_marker(value: Any) -> bool:
-        return RETIRED_SKILL_MARKER in str(value).lower()
-
-    if any(contains_marker(record.get(field, "")) for field in _IDENTITY_FIELDS):
         return True
-    if any(contains_marker(tag) for tag in record.get("tags", []) if isinstance(tag, str)):
-        return True
-
-    description = str(record.get("description", "")).lower()
-    if RETIRED_SKILL_MARKER in description and any(
-        term in description for term in _ADVERTISING_TERMS
+    if not any(
+        isinstance(record.get(field), str) and record[field].strip()
+        for field in ("name", "identifier")
     ):
         return True
 
-    for extra in (record.get("extra"), record.get("metadata")):
-        if isinstance(extra, dict) and any(
-            contains_marker(extra.get(field, "")) for field in _IDENTITY_FIELDS
-        ):
-            return True
-    return False
+    occurrences = _marker_occurrences(record)
+    if not occurrences:
+        return False
+    if all(_is_attribution_occurrence(path) for path, _ in occurrences):
+        return False
+    if _is_natural_meaning_record(record, occurrences):
+        return False
+    return True
 
 
 def filter_skill_records(records: Iterable[Any]) -> list[Any]:

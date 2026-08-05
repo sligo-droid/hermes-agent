@@ -1,8 +1,10 @@
 import json
+from pathlib import Path
 
 from skill_catalog_policy import (
     atomic_write_skills_index,
     filter_skill_records,
+    is_retired_skill_record,
     sanitize_skills_index,
 )
 
@@ -15,17 +17,67 @@ def test_filter_targets_skill_records_not_unrelated_text():
     ]
 
     assert filter_skill_records(records) == [records[0]]
-    assert filter_skill_records([{"author": "Obsidian Blackbird"}]) == [
-        {"author": "Obsidian Blackbird"}
+    assert filter_skill_records([{"name": "markdown", "author": "Obsidian Blackbird"}]) == [
+        {"name": "markdown", "author": "Obsidian Blackbird"}
     ]
-    assert filter_skill_records([{"description": "black obsidian geology"}]) == [
-        {"description": "black obsidian geology"}
+    assert filter_skill_records([{"name": "geology", "description": "black obsidian geology"}]) == [
+        {"name": "geology", "description": "black obsidian geology"}
     ]
+
+
+def test_description_only_capabilities_are_rejected_without_name_denylist():
+    records = [
+        {"name": "daily-recap", "description": "Save the daily recap to Obsidian."},
+        {"name": "auto-research", "description": "Research sources and publish briefings in Obsidian."},
+        {"name": "cross-platform-memory-hub", "description": "Unified Obsidian-based memory for coding agents."},
+        {"name": "knowledge-importer", "description": "Convert documents and save them to an Obsidian knowledge base."},
+        {"name": "vault-sync-engine", "description": "Synchronize an Obsidian vault between devices."},
+        {"name": "smart-auto-note", "description": "Automatically classify and write Obsidian notes."},
+    ]
+
+    assert filter_skill_records(records) == []
+
+
+def test_attribution_and_geological_controls_remain_allowed():
+    contributor = {
+        "name": "plain-markdown",
+        "description": "Write portable Markdown.",
+        "author": "Obsidian Blackbird",
+    }
+    geology = {
+        "name": "volcanic-rock-field-guide",
+        "description": "Identify obsidian volcanic glass and other igneous rocks.",
+    }
+
+    assert not is_retired_skill_record(contributor)
+    assert not is_retired_skill_record(geology)
+
+
+def test_ambiguous_or_malformed_records_fail_closed():
+    assert is_retired_skill_record("not-a-record")
+    assert is_retired_skill_record({})
+    assert is_retired_skill_record({"description": "Obsidian compatible"})
+    assert is_retired_skill_record({"author": "Obsidian Blackbird", "repo": "org/obsidian-tools"})
 
 
 def test_sanitize_fails_closed_for_malformed_index():
     assert sanitize_skills_index(None) is None
     assert sanitize_skills_index({"skills": "not-a-list"}) is None
+
+
+def test_real_snapshot_contains_zero_installable_capability_records():
+    snapshot = json.loads(
+        (Path(__file__).resolve().parents[1] / "website/static/api/skills-index.json").read_text()
+    )
+    sanitized = sanitize_skills_index(snapshot)
+    assert sanitized is not None
+    assert all(not is_retired_skill_record(record) for record in sanitized["skills"])
+    assert all(
+        "obsidian" not in json.dumps(record, ensure_ascii=False).lower()
+        or record.get("author") == "Obsidian Blackbird"
+        or "geolog" in str(record.get("description", "")).lower()
+        for record in sanitized["skills"]
+    )
 
 
 def test_atomic_write_replaces_existing_index(tmp_path):
