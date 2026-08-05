@@ -137,19 +137,6 @@ def _resolve_source_meta_and_bundle(identifier: str, sources):
                     meta = None
             break
 
-    from skill_catalog_policy import is_retired_skill_record
-
-    records = [
-        getattr(meta, "__dict__", meta),
-        {
-            "name": getattr(bundle, "name", ""),
-            "identifier": getattr(bundle, "identifier", ""),
-            "source": getattr(bundle, "source", ""),
-            "metadata": getattr(bundle, "metadata", {}),
-        } if bundle is not None else None,
-    ]
-    if any(record is not None and is_retired_skill_record(record) for record in records):
-        return None, None, None
     return meta, bundle, matched_source
 
 

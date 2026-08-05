@@ -23,7 +23,6 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
 
 # Allow importing from repo root
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,25 +44,9 @@ from tools.skills_hub import (
     SkillMeta,
 )
 import httpx
-from skill_catalog_policy import atomic_write_skills_index, filter_skill_records, sanitize_skills_index
 
 OUTPUT_PATH = os.path.join(REPO_ROOT, "website", "static", "api", "skills-index.json")
 INDEX_VERSION = 1
-
-
-def _filter_retired_skills(skills: list[dict]) -> list[dict]:
-    return filter_skill_records(skills)
-
-
-def sanitize_existing_index() -> None:
-    """Remove retired entries from the existing index without a network crawl."""
-    with open(OUTPUT_PATH, encoding="utf-8") as f:
-        index = json.load(f)
-    sanitized = sanitize_skills_index(index)
-    if sanitized is None:
-        raise ValueError("Existing skills index is malformed")
-    atomic_write_skills_index(Path(OUTPUT_PATH), sanitized)
-    print(f"Removed {len(index['skills']) - len(sanitized['skills'])} retired entries from {OUTPUT_PATH}")
 
 
 def _meta_to_dict(meta: SkillMeta) -> dict:
@@ -336,7 +319,7 @@ def main():
         key = skill["identifier"]
         if key not in seen:
             seen[key] = skill
-    deduped = _filter_retired_skills(list(seen.values()))
+    deduped = list(seen.values())
 
     # Sort
     source_order = {"official": 0, "skills-sh": 1, "skills.sh": 1,
@@ -429,7 +412,9 @@ def main():
         "skill_count": len(deduped),
         "skills": deduped,
     }
-    atomic_write_skills_index(Path(OUTPUT_PATH), index)
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
     file_size = os.path.getsize(OUTPUT_PATH)
     print(f"\nDone! {len(deduped)} skills indexed in "
           f"{time.time() - overall_start:.0f}s")
@@ -437,7 +422,4 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--sanitize-existing" in sys.argv[1:]:
-        sanitize_existing_index()
-    else:
-        main()
+    main()

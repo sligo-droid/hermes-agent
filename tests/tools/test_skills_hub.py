@@ -1797,24 +1797,6 @@ class TestHermesIndexSearch:
         assert any(h.name == "cuda" for h in hits)
         assert hits[0].name == "cuda"
 
-    def test_description_only_retired_capability_cannot_search_inspect_or_fetch(self):
-        skill = {
-            "name": "daily-recap",
-            "description": "Generate a recap and save it to Obsidian.",
-            "source": "github",
-            "identifier": "example/skills/daily-recap",
-            "repo": "example/skills",
-            "path": "daily-recap",
-            "tags": [],
-        }
-        src = _make_index_source([skill])
-        src._github = MagicMock()
-
-        assert src.search("daily-recap") == []
-        assert src.inspect(skill["identifier"]) is None
-        assert src.fetch(skill["identifier"]) is None
-        src._github.fetch.assert_not_called()
-
 
 class TestProviderFilter:
     def test_filter_results_by_provider_narrows_exactly(self):
@@ -2674,7 +2656,7 @@ class TestLoadHermesIndex:
         monkeypatch.setattr(hub.httpx, "get", fake_get)
 
         data = hub._load_hermes_index()
-        assert data == {"skills": [{"name": "x"}], "skill_count": 1}
+        assert data == {"skills": [{"name": "x"}]}
 
         accept = captured["headers"].get("Accept-Encoding", "")
         assert "br" not in [tok.strip() for tok in accept.split(",")], (
@@ -2702,7 +2684,7 @@ class TestLoadHermesIndex:
         monkeypatch.setattr(hub.httpx, "get", fake_get)
 
         data = hub._load_hermes_index()
-        assert data == {"skills": [{"name": "recovered"}], "skill_count": 1}
+        assert data == {"skills": [{"name": "recovered"}]}
         assert len(attempts) == 2, "should retry once after a DecodingError"
         # The retry must be uncompressed (identity) so a Brotli-ignoring proxy
         # can't fail the same way twice.
@@ -2728,173 +2710,4 @@ class TestLoadHermesIndex:
         monkeypatch.setattr(hub.httpx, "get", fake_get)
 
         data = hub._load_hermes_index()
-        assert data == {"skills": [{"name": "stale"}], "skill_count": 1}
-
-    def test_recent_cache_is_sanitized_before_use(self, monkeypatch, tmp_path):
-        import tools.skills_hub as hub
-
-        cache_file = self._isolate_cache(monkeypatch, tmp_path)
-        retired_name = "obsi" + "dian"
-        cache_file.write_text(json.dumps({"skills": [
-            {"name": "notes", "identifier": "github/example/notes"},
-            {"name": retired_name, "identifier": f"github/example/{retired_name}"},
-        ]}))
-
-        data = hub._load_hermes_index()
-
-        assert [entry["name"] for entry in data["skills"]] == ["notes"]
-        assert json.loads(cache_file.read_text()) == data
-
-    def test_stale_cache_filters_description_only_capability(self, monkeypatch, tmp_path):
-        import os
-        import tools.skills_hub as hub
-
-        cache_file = self._isolate_cache(monkeypatch, tmp_path)
-        cache_file.write_text(json.dumps({"skills": [
-            {"name": "clean", "description": "Portable Markdown."},
-            {"name": "auto-research", "description": "Publish research into Obsidian."},
-        ]}))
-        old = time.time() - (hub.HERMES_INDEX_TTL + 100)
-        os.utime(cache_file, (old, old))
-        monkeypatch.setattr(hub.httpx, "get", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("offline")))
-
-        data = hub._load_hermes_index()
-
-        assert [entry["name"] for entry in data["skills"]] == ["clean"]
-        assert json.loads(cache_file.read_text()) == data
-
-    def test_clean_download_filters_before_cache_write(self, monkeypatch, tmp_path):
-        import tools.skills_hub as hub
-
-        cache_file = self._isolate_cache(monkeypatch, tmp_path)
-        response = MagicMock(status_code=200)
-        response.json.return_value = {"skills": [
-            {"name": "clean", "description": "Portable Markdown."},
-            {"name": "knowledge-importer", "description": "Import documents into Obsidian."},
-        ]}
-        monkeypatch.setattr(hub.httpx, "get", lambda *a, **k: response)
-
-        data = hub._load_hermes_index()
-
-        assert [entry["name"] for entry in data["skills"]] == ["clean"]
-        assert json.loads(cache_file.read_text()) == data
-
-    def test_index_source_rejects_retired_injected_entry(self):
-        import tools.skills_hub as hub
-
-        retired_name = "obsi" + "dian"
-        source = hub.HermesIndexSource(auth=MagicMock())
-        source._loaded = True
-        source._index = {"skills": [{
-            "name": retired_name,
-            "identifier": f"skills-sh/example/{retired_name}",
-            "resolved_github_id": f"example/skills/{retired_name}",
-        }]}
-
-        assert source.search(retired_name) == []
-        assert source.inspect(f"skills-sh/example/{retired_name}") is None
-        assert source.fetch(f"skills-sh/example/{retired_name}") is None
-
-
-def test_install_boundary_rejects_retired_bundle(tmp_path, monkeypatch):
-    import tools.skills_hub as hub
-
-    skills_dir = tmp_path / "skills"
-    quarantine = skills_dir / ".hub" / "quarantine" / "smart-auto-note"
-    quarantine.mkdir(parents=True)
-    (quarantine / "SKILL.md").write_text(
-        "---\nname: smart-auto-note\ndescription: Write notes into Obsidian.\n---\n"
-    )
-    monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
-    monkeypatch.setattr(hub, "HUB_DIR", skills_dir / ".hub")
-    monkeypatch.setattr(hub, "QUARANTINE_DIR", skills_dir / ".hub" / "quarantine")
-    monkeypatch.setattr(hub, "LOCK_FILE", skills_dir / ".hub" / "lock.json")
-    monkeypatch.setattr(hub, "AUDIT_LOG", skills_dir / ".hub" / "audit.log")
-
-    bundle = SkillBundle(
-        name="smart-auto-note",
-        files={"SKILL.md": (quarantine / "SKILL.md").read_text()},
-        source="github",
-        identifier="example/skills/smart-auto-note",
-        trust_level="community",
-    )
-    scan = MagicMock(verdict="safe")
-
-    with pytest.raises(ValueError, match="retired integration policy"):
-        hub.install_from_quarantine(quarantine, bundle.name, "", bundle, scan)
-    assert quarantine.exists()
-
-
-def test_guarded_fetch_never_calls_raw_fetch_when_inspect_is_rejected():
-    import tools.skills_hub as hub
-
-    class Source(hub.SkillSource):
-        def __init__(self):
-            self.fetch_calls = 0
-
-        def source_id(self):
-            return "direct-test"
-
-        def search(self, query, limit=10):
-            return []
-
-        def inspect(self, identifier):
-            return SkillMeta(
-                name="clean",
-                description="Save notes to Obsidian.",
-                source="direct-test",
-                identifier=identifier,
-                trust_level="community",
-            )
-
-        def fetch(self, identifier):
-            self.fetch_calls += 1
-            return SkillBundle("clean", {"SKILL.md": "---\nname: clean\n---\n"}, "direct-test", identifier, "community")
-
-    source = Source()
-    hub._guard_skill_source(source)
-    assert source.fetch("clean") is None
-    assert source.fetch_calls == 0
-
-
-@pytest.mark.parametrize(
-    "files",
-    [
-        {"SKILL.md": "---\nname: clean\n---\nSave notes to Obsidian."},
-        {"SKILL.md": "---\nname: clean\n---\n", "references/guide.md": "Use Obsidian sync."},
-        {"SKILL.md": "---\nname: clean\n---\n", "references/guide": "Use Obsidian sync."},
-        {"SKILL.md": "---\nname: clean\n---\n", "config/obsidian.json": "{}"},
-        {"SKILL.md": "---\nname: clean\nmetadata:\n  obsidian: false\n---\n"},
-        {"SKILL.md": "---\nname: clean\ncontributors:\n  - name: Obsidian Blackbird\n    repo: org/obsidian-tools\n---\n"},
-        {"SKILL.md": "---\nname: clean\n---\n", "references/guide.txt": b"safe\x00hidden"},
-        {"SKILL.md": "---\nname: clean\n---\n", "scripts/run": b"\xff\xfe"},
-        {"SKILL.md": "---\nname: clean\n---\n", "config/settings": b"safe\x00hidden"},
-        {"SKILL.md": "---\nname: clean\n---\n", "references/huge.md": b"x" * (512 * 1024 + 1)},
-        {"SKILL.md": b"\xff\xfe"},
-        {"README.md": "No canonical skill entrypoint."},
-        {"SKILL.md": "---\nname: clean\n---\n", "assets/large.bin": b"x" * (2 * 1024 * 1024)},
-    ],
-)
-def test_bundle_policy_rejects_adversarial_contents(files):
-    import tools.skills_hub as hub
-
-    bundle = SkillBundle("clean", files, "github", "org/repo/clean", "community")
-    assert not hub._skill_bundle_allowed(bundle)
-
-
-def test_bundle_policy_allows_binary_and_narrow_attribution_controls():
-    import tools.skills_hub as hub
-
-    bundle = SkillBundle(
-        "clean",
-        {
-            "SKILL.md": "---\nname: clean\nauthor: Obsidian Blackbird\n---\nAuthor: Obsidian Blackbird\n",
-            "assets/logo.png": b"\x89PNG\x00obsidian-binary",
-            "assets/font.woff2": b"wOF2\x00\xff\xfe",
-            "references/geology.md": "Obsidian volcanic glass is an igneous rock.",
-        },
-        "github",
-        "org/repo/clean",
-        "community",
-    )
-    assert hub._skill_bundle_allowed(bundle)
+        assert data == {"skills": [{"name": "stale"}]}

@@ -97,14 +97,3 @@ def test_healthy_crawl_writes_index_with_all_sources(tmp_path, monkeypatch):
     # Every GitHub-API-backed source that vanished in the regression is present.
     assert {"github", "claude-marketplace", "well-known"} <= sources
     assert data["skill_count"] == len(data["skills"])
-
-
-def test_retired_product_entries_are_excluded():
-    retired_name = "obsi" + "dian"
-    skills = [
-        {"name": "notes", "description": "Plain Markdown notes"},
-        {"name": "retired-notes", "description": f"{retired_name} vault integration"},
-        {"name": "canvas", "repo": f"kepano/{retired_name}-skills"},
-    ]
-
-    assert build_mod._filter_retired_skills(skills) == [skills[0]]
