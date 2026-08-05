@@ -2932,6 +2932,57 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             ["web", "browser"],
         )
 
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"denied_toolsets": ["client_knowledge"]},
+    )
+    def test_build_child_agent_denies_configured_toolset_after_inheritance(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["web", "client_knowledge"]
+        parent.disabled_toolsets = []
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Use bounded project context",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertIn("client_knowledge", kwargs["disabled_toolsets"])
+        self.assertTrue(kwargs["skip_memory"])
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"denied_toolsets": ["client_knowledge"]},
+    )
+    def test_explicit_child_request_cannot_reenable_denied_toolset(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["web", "client_knowledge"]
+        parent.disabled_toolsets = []
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Try to browse client knowledge",
+                context=None,
+                toolsets=["client_knowledge"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertIn("client_knowledge", kwargs["disabled_toolsets"])
+
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_build_child_agent_hides_canonical_sync_from_child_schema(self, mock_cfg):
         """Composite inherited toolsets must not advertise canonical sync to workers."""

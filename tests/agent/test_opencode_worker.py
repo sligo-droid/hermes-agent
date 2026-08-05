@@ -211,6 +211,20 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     assert not seen_config_home.exists()
 
 
+def test_opencode_process_env_strips_client_knowledge_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("GBRAIN_HOME", "/private/client-knowledge/gbrain")
+    monkeypatch.setenv("HERMES_CLIENT_KNOWLEDGE_SOURCE", "/private/client-knowledge/source")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-propagate")
+
+    env = ow._opencode_process_env(tmp_path)
+
+    assert env is not None
+    assert env.get("XDG_CONFIG_HOME") == str(tmp_path)
+    assert "GBRAIN_HOME" not in env
+    assert "HERMES_CLIENT_KNOWLEDGE_SOURCE" not in env
+    assert "OPENAI_API_KEY" not in env
+
+
 @pytest.mark.parametrize(("fast_mode", "expected"), [(True, "priority"), (False, None)])
 def test_named_tier_opencode_variant_controls_service_tier(
     monkeypatch, tmp_path, fast_mode, expected
@@ -539,21 +553,38 @@ def test_invalid_opencode_json_warns_with_path_and_json_remains_strict(monkeypat
     assert "Ignoring invalid OpenCode config" in message
 
 
-def test_isolated_config_can_be_disabled(monkeypatch, tmp_path):
-    process_envs = []
+def test_disabled_isolated_config_rejects_ambient_gbrain_mcp(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "gbrain": {
+                        "type": "local",
+                        "command": ["gbrain", "mcp"],
+                        "enabled": True,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
-
-    def fake_run(_cmd, **kwargs):
-        process_envs.append(kwargs.get("env"))
-        return _process_result(
-            stdout=json.dumps(
-                {"type": "message", "sessionID": "ses-build", "message": "done"}
-            )
-            + "\n",
-        )
-
-    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+    monkeypatch.setattr(
+        ow,
+        "_run_opencode_process",
+        lambda *_args, **_kwargs: pytest.fail("unsafe OpenCode worker was started"),
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("GBRAIN_HOME", "/private/client-knowledge/gbrain")
+    monkeypatch.setenv(
+        "HERMES_CLIENT_KNOWLEDGE_SOURCE",
+        "/private/client-knowledge/source",
+    )
 
     result = ow.run_opencode_task(
         "fix typo in README",
@@ -562,8 +593,25 @@ def test_isolated_config_can_be_disabled(monkeypatch, tmp_path):
         config=_cfg(opencode={"isolated_config": False}),
     )
 
-    assert result.error is None
-    assert process_envs == [None]
+    assert result.error is not None
+    assert "require isolated_config=true" in result.error
+
+
+def test_opencode_process_env_sanitizes_without_config_override(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/host-agent.sock")
+    monkeypatch.setenv("GBRAIN_HOME", "/private/client-knowledge/gbrain")
+    monkeypatch.setenv(
+        "HERMES_CLIENT_KNOWLEDGE_SOURCE",
+        "/private/client-knowledge/source",
+    )
+
+    env = ow._opencode_process_env(None)
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["SSH_AUTH_SOCK"] == "/tmp/host-agent.sock"
+    assert "GBRAIN_HOME" not in env
+    assert "HERMES_CLIENT_KNOWLEDGE_SOURCE" not in env
 
 
 def test_worker_brief_is_workspace_scoped_and_cleaned(monkeypatch, tmp_path):
@@ -593,7 +641,7 @@ def test_worker_brief_is_workspace_scoped_and_cleaned(monkeypatch, tmp_path):
         "fix typo in README",
         str(tmp_path),
         timeout=60,
-        config=_cfg(model_tier="disabled", opencode={"model": "openai/gpt-5.5", "isolated_config": False}),
+        config=_cfg(model_tier="disabled", opencode={"model": "openai/gpt-5.5"}),
     )
 
     assert result.error is None
@@ -627,7 +675,7 @@ def test_worker_prompt_includes_dirty_repo_preflight(monkeypatch, tmp_path):
         "fix typo in README",
         str(tmp_path),
         timeout=60,
-        config=_cfg(model_tier="disabled", opencode={"model": "openai/gpt-5.5", "isolated_config": False}),
+        config=_cfg(model_tier="disabled", opencode={"model": "openai/gpt-5.5"}),
     )
 
     assert result.error is None

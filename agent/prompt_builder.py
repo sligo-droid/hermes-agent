@@ -188,6 +188,14 @@ QMD_MCP_GUIDANCE = (
     "useful result."
 )
 
+CLIENT_KNOWLEDGE_GUIDANCE = (
+    "For a mapped client project's history, requirements, decisions, risks, or product/project "
+    "decisions, use client_knowledge_search before answering, then open the exact relevant pages "
+    "with client_knowledge_get when full context matters. Cite the returned gbrain:projects/... "
+    "references. Search only the mapped project key. If retrieval is empty or stale, say so and "
+    "do not guess. Retrieval is explicit and on demand; do not run an automatic query before every turn."
+)
+
 
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "

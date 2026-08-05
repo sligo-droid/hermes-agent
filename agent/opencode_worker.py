@@ -910,6 +910,13 @@ def _run_opencode_once(
     ok, binary_or_error = check_opencode_binary({"coding_worker": {"opencode": cfg}})
     if not ok:
         return OpenCodeRunResult(error=binary_or_error)
+    if not cfg.get("isolated_config"):
+        return OpenCodeRunResult(
+            error=(
+                "OpenCode coding workers require isolated_config=true so ambient "
+                "OpenCode plugins and MCP servers cannot start."
+            )
+        )
 
     workdir_path = Path(workspace).expanduser().resolve()
     workdir = str(workdir_path)
@@ -1677,9 +1684,7 @@ def _opencode_process_env(
     config_home: Optional[Path],
     *,
     env: Optional[dict[str, str]] = None,
-) -> Optional[dict[str, str]]:
-    if env is None and config_home is None:
-        return None
+) -> dict[str, str]:
     extra_env = env or {}
     try:
         from tools.environments.local import _sanitize_subprocess_env
@@ -1693,6 +1698,11 @@ def _opencode_process_env(
         process_env.update(extra_env)
     if config_home is not None:
         process_env["XDG_CONFIG_HOME"] = str(config_home)
+    # Client knowledge is an orchestrator capability. Coding workers receive
+    # selected prose in their brief, never a path/config bridge to the brain.
+    for key in list(process_env):
+        if key == "GBRAIN_HOME" or key.startswith("HERMES_CLIENT_KNOWLEDGE_"):
+            process_env.pop(key, None)
     return process_env
 
 

@@ -376,6 +376,19 @@ def get_trusted_discord_work_item_id() -> str:
     return str(_TRUSTED_DISCORD_WORK_ITEM_ID.get() or "")
 
 
+def get_trusted_project_key() -> str:
+    """Return the task-local project mapping without an environment fallback.
+
+    Gateway turns bind ``_PROJECT_KEY`` through :func:`set_session_vars`. A
+    process-level ``HERMES_PROJECT_KEY`` is intentionally ignored here so
+    authorization-sensitive tools cannot be retargeted by inherited env.
+    """
+    value = _PROJECT_KEY.get()
+    if value is _UNSET:
+        return ""
+    return str(value or "")
+
+
 def _bind_trusted_discord_work_item_id(work_item_id: str = "") -> None:
     """Bind provenance selected by the gateway's trusted turn router."""
     _TRUSTED_DISCORD_WORK_ITEM_ID.set(str(work_item_id or ""))

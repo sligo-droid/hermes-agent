@@ -2343,6 +2343,10 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Toolsets that are always subtracted from delegated children after
+        # inheritance/composite expansion. Client knowledge is orchestrator-
+        # only; existing toolsets preserve their legacy inheritance semantics.
+        "denied_toolsets": ["client_knowledge"],
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
@@ -2387,6 +2391,21 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+    },
+
+    # Opt-in canonical client-knowledge retrieval. The bundled standalone
+    # plugin must also be enabled explicitly. No executable/home defaults are
+    # provided: operators must point at an isolated, pinned GBrain install.
+    "client_knowledge": {
+        "gbrain": {
+            "executable": "",
+            "args": [],
+            "home": "",
+            "checkout": "",
+            "source_id": "client-knowledge",
+            "timeout_seconds": 30,
+            "max_context_chars": 8000,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

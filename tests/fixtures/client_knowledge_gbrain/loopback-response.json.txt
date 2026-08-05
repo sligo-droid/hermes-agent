@@ -1,0 +1,1 @@
+{"answer":"PID requires a concise Monday status report with citations [projects/pid/requirements/reporting-cadence]. Its delivery model values concise, cited status communication [projects/pid/project].","citations":[{"page_slug":"projects/pid/requirements/reporting-cadence","row_num":null},{"page_slug":"projects/pid/project","row_num":null}],"gaps":[]}
