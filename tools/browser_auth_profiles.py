@@ -60,6 +60,29 @@ def configured_browser_auth_profile_names(config: Any = None) -> tuple[str, ...]
     )
 
 
+def matching_browser_auth_profile_names(
+    origin: str,
+    *,
+    config: Any = None,
+) -> tuple[str, ...]:
+    """Return valid opaque profile names configured for an exact origin."""
+
+    normalized_origin = _normalize_origin(origin)
+    profiles = _browser_config(config).get("auth_profiles")
+    if not isinstance(profiles, dict):
+        return ()
+    matches: list[str] = []
+    for raw_name, raw in profiles.items():
+        name = str(raw_name or "").strip()
+        try:
+            profile = _profile_from_config(name, raw)
+        except BrowserAuthProfileError:
+            continue
+        if normalized_origin in profile.origins:
+            matches.append(profile.name)
+    return tuple(sorted(matches))
+
+
 def _normalize_origin(value: Any) -> str:
     text = str(value or "").strip()
     parsed = urlsplit(text)
@@ -221,5 +244,6 @@ __all__ = [
     "BrowserAuthProfileError",
     "configured_browser_auth_profile_names",
     "load_browser_auth_credentials",
+    "matching_browser_auth_profile_names",
     "select_browser_auth_profile",
 ]

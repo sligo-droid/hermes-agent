@@ -2956,6 +2956,38 @@ def _should_probe_plain_json(url: str, title: str) -> bool:
     }
 
 
+def _protected_authentication_hint(url: str, title: str, snapshot: str) -> Optional[Dict[str, Any]]:
+    """Return a secret-free authentication cue for configured sign-in pages."""
+
+    page_text = f"{title}\n{snapshot}".lower()
+    if not any(marker in page_text for marker in ("sign in", "log in", "login", "password")):
+        return None
+    try:
+        parsed = urlsplit(str(url or ""))
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return None
+        origin = f"{parsed.scheme.lower()}://{parsed.netloc}"
+        from tools.browser_auth_profiles import matching_browser_auth_profile_names
+
+        profiles = matching_browser_auth_profile_names(origin)
+    except Exception as exc:
+        logger.debug("protected browser authentication hint failed: %s", exc)
+        return None
+    if not profiles:
+        return None
+    hint: Dict[str, Any] = {
+        "available": True,
+        "tool": "browser_authenticate",
+        "instruction": (
+            "This sign-in page has operator-configured read-only QA access. "
+            "Call browser_authenticate, then inspect the protected page with browser_snapshot."
+        ),
+    }
+    if len(profiles) > 1:
+        hint["profiles"] = list(profiles)
+    return hint
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -3180,6 +3212,9 @@ def browser_navigate(
                     snapshot_text = _truncate_snapshot(snapshot_text)
                 response["snapshot"] = snapshot_text
                 response["element_count"] = len(refs) if refs else 0
+                auth_hint = _protected_authentication_hint(final_url, title, snapshot_text)
+                if auth_hint is not None:
+                    response["protected_authentication"] = auth_hint
                 if snap_result.get("fallback_warning") and not response.get("fallback_warning"):
                     _copy_fallback_warning(response, snap_result)
         except Exception as e:
@@ -5263,8 +5298,9 @@ registry.register(
         "description": (
             "Authenticate the current task browser with an operator-configured, "
             "origin-bound read-only QA profile. Navigate to the protected login page "
-            "first, then call this tool before visual_qa. Credentials, cookies, tokens, "
-            "and storage state are never exposed to the model or tool output. Omit "
+            "first, then call this tool before inspecting or visually verifying gated "
+            "content. Credentials, cookies, tokens, and storage state are never exposed "
+            "to the model or tool output. Omit "
             "profile when exactly one configured profile matches the current origin."
         ),
         "parameters": {
