@@ -80,9 +80,13 @@ def build_discord_parser(subparsers, *, cmd_discord: Callable) -> None:
 
     trace = actions.add_parser(
         "trace",
-        help="Inspect a permalink plus its channel, reactions, and thread",
+        help="Inspect a Discord channel, thread, or message URL",
     )
-    trace.add_argument("message_url_or_id")
+    trace.add_argument(
+        "message_url_or_id",
+        metavar="URL_OR_MESSAGE_ID",
+        help="Discord channel/thread URL, message URL, or message ID",
+    )
     trace.add_argument(
         "--channel-id",
         help="Required when the positional value is only a message ID",
