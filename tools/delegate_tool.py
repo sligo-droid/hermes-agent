@@ -624,7 +624,7 @@ def _resolve_delegation_model_tier(
 
 
 def _deep_review_tier_error(parent_agent: Any, requested_tier: Any) -> Optional[str]:
-    """Require an explicit human request on the root turn for deep_review."""
+    """Require root-turn authorization for elevated review reasoning."""
     if str(requested_tier or "").strip().lower() != "deep_review":
         return None
     if int(getattr(parent_agent, "_delegate_depth", 0) or 0) != 0:
@@ -632,7 +632,7 @@ def _deep_review_tier_error(parent_agent: Any, requested_tier: Any) -> Optional[
     if not bool(getattr(parent_agent, "_human_deep_review_requested", False)):
         return (
             "model_tier 'deep_review' requires the human's current message to "
-            "explicitly request xhigh or a deep review."
+            "explicitly request higher reasoning or a deep review."
         )
     return None
 
@@ -4392,7 +4392,8 @@ def _build_top_level_description() -> str:
         "work, and advanced only for the hardest cross-cutting or high-risk "
         "work. Omit model_tier to inherit your runtime model and reasoning.\n"
         "- deep_review is a reserved Sol/xhigh tier. Use it only when the human's "
-        "current root-turn message explicitly requests xhigh or a deep review; it "
+        "current root-turn message explicitly requests higher reasoning or a deep "
+        "review; it "
         "is rejected for ordinary selection and nested delegation.\n"
         "- For visual work, use the explicit purpose field instead of guessing a "
         "tier from task wording: visual_advisor for one read-only pre-implementation "
@@ -4589,7 +4590,7 @@ DELEGATE_TASK_SCHEMA = {
                                 "work, basic for straightforward bounded work, intermediate for "
                                 "ordinary multi-step work, or advanced only for the hardest "
                                 "cross-cutting/high-risk work. deep_review is reserved for an "
-                                "explicit human xhigh/deep-review request on the root turn. "
+                                "explicit human higher-reasoning/deep-review request on the root turn. "
                                 "Custom configured names are valid."
                             ),
                         },
@@ -4634,7 +4635,7 @@ DELEGATE_TASK_SCHEMA = {
                     "tiny work, basic for straightforward bounded work, intermediate for "
                     "ordinary multi-step work, and advanced only for the hardest cross-cutting "
                     "or high-risk work. deep_review is reserved for an explicit human "
-                    "xhigh/deep-review request on the root turn. Custom configured names are "
+                    "higher-reasoning/deep-review request on the root turn. Custom configured names are "
                     "valid. Omit to inherit "
                     "the parent runtime model and reasoning."
                 ),

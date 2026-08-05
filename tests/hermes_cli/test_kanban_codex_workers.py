@@ -1332,8 +1332,10 @@ def test_worker_prompt_includes_dashboard_qa_auth_without_secret(monkeypatch, tm
     assert "hermes_qa" in prompt
     assert "pnpm --dir dashboard qa:auth" in prompt
     assert "PID_QA_USERNAME" in prompt
-    assert "role `user`" in prompt
-    assert "admin visual QA as blocked" in prompt
+    assert "role `admin_viewer`" in prompt
+    assert "inspect privileged read surfaces" in prompt
+    assert "every mutation must remain denied" in prompt
+    assert "mutation testing as blocked" in prompt
     assert "HERMES_DASHBOARD_PASSWORD" in prompt
     assert "Never print, log" in prompt
     assert "super-secret-dashboard-password" not in prompt
@@ -2904,7 +2906,7 @@ def test_role_worker_logs_named_tier_and_runtime_sources(monkeypatch, tmp_path):
     assert log is not None
     assert (
         "[kanban dispatcher] scheduled Codex role worker: "
-        "role=planner reasoning=medium mode=fast "
+        "role=planner reasoning=high mode=fast "
         "model=gpt-5.6-sol tier=advanced tier_source=role "
         "reasoning_source=model_tier service_tier=fast "
         "service_tier_source=explicit"

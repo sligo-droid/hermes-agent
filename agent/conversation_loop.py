@@ -97,6 +97,21 @@ from agent.conversation_compression import (
 
 logger = logging.getLogger(__name__)
 
+_ELEVATED_REVIEW_REASONING_REQUEST_RE = re.compile(
+    r"\bxhigh\b"
+    r"|\bdeep[\s_-]+review\b"
+    r"|\b(?:higher|more|extra)\s+(?:reasoning(?:\s+effort)?|thinking)\b"
+    r"|\b(?:reason|think)\s+(?:harder|more\s+deeply)\b"
+)
+
+
+def _human_requested_elevated_review_reasoning(message: Any) -> bool:
+    """Return whether the current human turn authorizes the deep-review tier."""
+    return bool(
+        _ELEVATED_REVIEW_REASONING_REQUEST_RE.search(str(message or "").lower())
+    )
+
+
 # Stable prefix used by gateway/TUI/ACP surfaces to recognize provider-wait
 # cancellation metadata without treating it as assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
@@ -1293,8 +1308,8 @@ def run_conversation(
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     human_request_text = _summarize_user_message_for_log(original_user_message).lower()
-    agent._human_deep_review_requested = bool(
-        re.search(r"\bxhigh\b|\bdeep[\s_-]+review\b", human_request_text)
+    agent._human_deep_review_requested = (
+        _human_requested_elevated_review_reasoning(human_request_text)
     )
     messages = _ctx.messages
     conversation_history = _ctx.conversation_history

@@ -99,6 +99,7 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
     assert isinstance(event, MessageEvent)
     assert event.internal is True, "Synthetic completion event must be marked internal"
     assert event.background_process_completion is True
+    assert event.background_process_session_id == "proc_test_internal"
 
 
 @pytest.mark.asyncio

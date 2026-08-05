@@ -10,6 +10,7 @@ server or a second source of truth for Discord behavior.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from argparse import Namespace
 from collections.abc import Callable
@@ -17,6 +18,15 @@ from typing import Any
 
 
 Dispatch = Callable[[str, dict[str, Any]], str]
+
+_DISCORD_TRACE_URL_RE = re.compile(
+    r"^https?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/channels/"
+    r"(?P<guild_id>[^/]+)/(?P<channel_id>\d+)"
+    r"(?:/(?P<message_id>\d+))?/?(?:[?#].*)?$"
+)
+_DISCORD_CHANNEL_URL_PREFIX_RE = re.compile(
+    r"^https?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/channels/"
+)
 
 
 def _registry_dispatch(name: str, args: dict[str, Any]) -> str:
@@ -58,8 +68,59 @@ def _clean_optional(**values: Any) -> dict[str, Any]:
     }
 
 
+def _trace_channel(
+    args: Namespace,
+    dispatch: Dispatch,
+    channel_id: str,
+) -> dict[str, Any]:
+    """Inspect a channel URL, selecting thread or channel message retrieval."""
+    channel_result = _call(
+        dispatch,
+        "discord_get_channel",
+        {"channel_id": channel_id},
+    )
+    if not isinstance(channel_result, dict) or channel_result.get("error"):
+        return channel_result
+
+    result: dict[str, Any] = {"channel": channel_result}
+    channel = channel_result.get("channel") or channel_result
+    channel_type = str(channel.get("type") or "") if isinstance(channel, dict) else ""
+    history_args = _clean_optional(
+        limit=args.limit,
+        before=getattr(args, "before", None),
+        after=getattr(args, "after", None),
+    )
+
+    if channel_type.endswith("_thread"):
+        result["thread"] = _call(
+            dispatch,
+            "discord_get_thread",
+            {"thread_id": channel_id, **history_args},
+        )
+    else:
+        result["recent"] = _call(
+            dispatch,
+            "discord_list_recent",
+            {"channel_id": channel_id, **history_args},
+        )
+    return result
+
+
 def _trace(args: Namespace, dispatch: Dispatch) -> dict[str, Any]:
-    """Inspect a permalink and its immediate Discord context."""
+    """Inspect a Discord channel/thread URL or message reference."""
+    trace_target = str(args.message_url_or_id or "").strip()
+    url_match = _DISCORD_TRACE_URL_RE.match(trace_target)
+    if url_match and not url_match.group("message_id"):
+        return _trace_channel(args, dispatch, url_match.group("channel_id"))
+    if _DISCORD_CHANNEL_URL_PREFIX_RE.match(trace_target) and not url_match:
+        return {
+            "error": (
+                "trace target must be a Discord channel/thread URL "
+                "(/channels/<guild>/<channel>) or message URL "
+                "(/channels/<guild>/<channel>/<message>)."
+            )
+        }
+
     message_result = _call(
         dispatch,
         "discord_get_message",

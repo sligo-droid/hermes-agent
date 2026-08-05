@@ -620,6 +620,57 @@ def _ensure_cdp_supervisor(task_id: str, *, execution_guard: Any = None) -> None
         )
 
 
+def _align_cdp_supervisor_to_current_page(
+    task_id: str,
+    *,
+    supervisor: Any = None,
+    execution_guard: Any = None,
+) -> bool:
+    """Best-effort retarget the trusted supervisor to the CLI-owned page.
+
+    Local agent-browser may replace its initial Chromium target during the
+    first navigation. The ordinary CLI session keeps working, but a supervisor
+    attached before that navigation can remain on the blank target.
+    """
+
+    if execution_guard is not None:
+        execution_guard.check()
+    if supervisor is None:
+        try:
+            from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+            supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        except Exception:
+            return False
+    if supervisor is None:
+        return False
+    try:
+        url_result = _run_browser_command(
+            task_id,
+            "eval",
+            ["window.location.href"],
+            timeout=10,
+        )
+        if execution_guard is not None:
+            execution_guard.check()
+        if not url_result.get("success"):
+            return False
+        current_url = (
+            str(url_result.get("data", {}).get("result") or "")
+            .strip()
+            .strip('"')
+            .strip("'")
+        )
+        return bool(current_url and supervisor.select_page(current_url))
+    except Exception as exc:
+        logger.debug(
+            "CDP supervisor page alignment for task=%s failed (non-fatal): %s",
+            task_id,
+            exc,
+        )
+        return False
+
+
 def _discover_local_session_cdp_url(
     task_id: str,
     *,
@@ -2956,6 +3007,38 @@ def _should_probe_plain_json(url: str, title: str) -> bool:
     }
 
 
+def _protected_authentication_hint(url: str, title: str, snapshot: str) -> Optional[Dict[str, Any]]:
+    """Return a secret-free authentication cue for configured sign-in pages."""
+
+    page_text = f"{title}\n{snapshot}".lower()
+    if not any(marker in page_text for marker in ("sign in", "log in", "login", "password")):
+        return None
+    try:
+        parsed = urlsplit(str(url or ""))
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return None
+        origin = f"{parsed.scheme.lower()}://{parsed.netloc}"
+        from tools.browser_auth_profiles import matching_browser_auth_profile_names
+
+        profiles = matching_browser_auth_profile_names(origin)
+    except Exception as exc:
+        logger.debug("protected browser authentication hint failed: %s", exc)
+        return None
+    if not profiles:
+        return None
+    hint: Dict[str, Any] = {
+        "available": True,
+        "tool": "browser_authenticate",
+        "instruction": (
+            "This sign-in page has operator-configured read-only QA access. "
+            "Call browser_authenticate, then inspect the protected page with browser_snapshot."
+        ),
+    }
+    if len(profiles) > 1:
+        hint["profiles"] = list(profiles)
+    return hint
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -3081,6 +3164,11 @@ def browser_navigate(
     _last_active_session_key[effective_task_id] = nav_session_key
 
     if result.get("success"):
+        # Session creation starts the supervisor before the first navigation.
+        # Local agent-browser can replace that Chromium endpoint/target while
+        # opening the page, so refresh and align after a successful open.
+        _ensure_cdp_supervisor(nav_session_key)
+        _align_cdp_supervisor_to_current_page(nav_session_key)
         data = result.get("data", {})
         title = data.get("title", "")
         final_url = data.get("url", url)
@@ -3180,6 +3268,9 @@ def browser_navigate(
                     snapshot_text = _truncate_snapshot(snapshot_text)
                 response["snapshot"] = snapshot_text
                 response["element_count"] = len(refs) if refs else 0
+                auth_hint = _protected_authentication_hint(final_url, title, snapshot_text)
+                if auth_hint is not None:
+                    response["protected_authentication"] = auth_hint
                 if snap_result.get("fallback_warning") and not response.get("fallback_warning"):
                     _copy_fallback_warning(response, snap_result)
         except Exception as e:
@@ -3405,25 +3496,10 @@ def browser_authenticate(
             return json.dumps(
                 {"success": False, "error": "The task browser does not support protected authentication."}
             )
-        # agent-browser can open navigation in a second page target while the
-        # trusted supervisor remains attached to its initial blank page. Use
-        # the CLI-owned session URL to align the supervisor before reading the
-        # origin or injecting credentials.
-        url_result = _run_browser_command(
+        _align_cdp_supervisor_to_current_page(
             effective_task_id,
-            "eval",
-            ["window.location.href"],
-            timeout=10,
+            supervisor=supervisor,
         )
-        if url_result.get("success"):
-            current_url = (
-                str(url_result.get("data", {}).get("result") or "")
-                .strip()
-                .strip('"')
-                .strip("'")
-            )
-            if current_url:
-                supervisor.select_page(current_url)
         current = supervisor.current_origin()
         if not current.get("ok"):
             return json.dumps({"success": False, "error": current.get("error")})
@@ -5263,8 +5339,9 @@ registry.register(
         "description": (
             "Authenticate the current task browser with an operator-configured, "
             "origin-bound read-only QA profile. Navigate to the protected login page "
-            "first, then call this tool before visual_qa. Credentials, cookies, tokens, "
-            "and storage state are never exposed to the model or tool output. Omit "
+            "first, then call this tool before inspecting or visually verifying gated "
+            "content. Credentials, cookies, tokens, and storage state are never exposed "
+            "to the model or tool output. Omit "
             "profile when exactly one configured profile matches the current origin."
         ),
         "parameters": {

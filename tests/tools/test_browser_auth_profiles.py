@@ -8,6 +8,7 @@ from tools import browser_tool
 from tools.browser_auth_profiles import (
     BrowserAuthProfileError,
     load_browser_auth_credentials,
+    matching_browser_auth_profile_names,
     select_browser_auth_profile,
 )
 from tools.browser_supervisor import CDPSupervisor, _preferred_page_target
@@ -74,6 +75,66 @@ def test_profile_loads_private_hermes_secret_without_exposing_values(
     assert username == "hermes_qa"
     assert password == "correct horse battery staple"
     assert password not in repr(profile)
+
+
+def test_matching_profiles_returns_only_valid_exact_origin_profiles(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    secrets = hermes_home / "secrets"
+    secrets.mkdir(parents=True)
+    env_file = secrets / "pid-qa-readonly.env"
+    env_file.write_text(
+        "PID_QA_USERNAME=hermes_qa\nPID_QA_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = _profile_config(env_file)
+    config["browser"]["auth_profiles"]["invalid"] = {
+        "origins": ["https://pid.sligolabs.com"],
+        "env_file": str(tmp_path / "missing.env"),
+    }
+
+    assert matching_browser_auth_profile_names(
+        "https://pid.sligolabs.com", config=config
+    ) == ("pid_hermes_qa",)
+    assert matching_browser_auth_profile_names(
+        "https://example.com", config=config
+    ) == ()
+
+
+def test_navigation_auth_hint_is_limited_to_matching_sign_in_pages(monkeypatch):
+    from tools import browser_auth_profiles
+
+    monkeypatch.setattr(
+        browser_auth_profiles,
+        "matching_browser_auth_profile_names",
+        lambda origin: ("pid_hermes_qa",) if origin == "https://pid.sligolabs.com" else (),
+    )
+
+    hint = browser_tool._protected_authentication_hint(
+        "https://pid.sligolabs.com/briefing",
+        "Sign In to Briefing Studio",
+        '- textbox "Password" [required]',
+    )
+
+    assert hint == {
+        "available": True,
+        "tool": "browser_authenticate",
+        "instruction": (
+            "This sign-in page has operator-configured read-only QA access. "
+            "Call browser_authenticate, then inspect the protected page with browser_snapshot."
+        ),
+    }
+    assert (
+        browser_tool._protected_authentication_hint(
+            "https://pid.sligolabs.com/briefing",
+            "Briefing Studio",
+            "Authenticated content",
+        )
+        is None
+    )
 
 
 def test_profile_rejects_non_private_or_outside_secret_files(tmp_path, monkeypatch):
@@ -308,3 +369,41 @@ def test_browser_authenticate_schema_exposes_only_an_opaque_profile_name():
     parameters = entry.schema["parameters"]
     assert parameters["additionalProperties"] is False
     assert set(parameters["properties"]) == {"profile"}
+
+
+def test_successful_navigation_refreshes_and_aligns_cdp_supervisor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "check_website_access", lambda _url: None)
+    monkeypatch.setattr(browser_tool, "_get_session_info", lambda _key: {"_first_nav": False})
+    monkeypatch.setattr(
+        browser_tool,
+        "_run_browser_command",
+        lambda _task, command, _args, **_kwargs: (
+            {"success": True, "data": {"url": "https://app.example.test/", "title": "App"}}
+            if command == "open"
+            else {"success": False}
+        ),
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_ensure_cdp_supervisor",
+        lambda key: calls.append(("ensure", key)),
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_align_cdp_supervisor_to_current_page",
+        lambda key: calls.append(("align", key)) or True,
+    )
+    monkeypatch.setattr(browser_tool, "_should_probe_plain_json", lambda *_args: False)
+
+    result = json.loads(
+        browser_tool.browser_navigate(
+            "https://app.example.test/",
+            task_id="visual-turn",
+        )
+    )
+
+    assert result["success"] is True
+    assert calls == [("ensure", "visual-turn"), ("align", "visual-turn")]

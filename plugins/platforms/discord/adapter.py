@@ -157,7 +157,7 @@ _DISCORD_READ_ONLY_PROMPT = (
     "directly is often faster and preserves your full context. Delegate when "
     "parallelism, independent verification, context isolation, or deeper reasoning "
     "adds value; read-only delegation remains available for broader or reasoning-heavy "
-    "work. Omit delegate_task's model_tier to inherit this route tier (Sol/low by "
+    "work. Omit delegate_task's model_tier to inherit this route tier (Sol/medium by "
     "default), or choose any configured tier that matches the subtask's difficulty; "
     "read-only does not limit tier choice. Durable changes are structurally blocked: do "
     "not edit source/config, install packages, commit/push/open or merge PRs, "

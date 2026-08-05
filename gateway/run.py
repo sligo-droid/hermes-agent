@@ -3144,7 +3144,17 @@ def _resolve_gateway_session_cwd(
         if channel_id in channel_ids:
             return cwd
 
-    if getattr(source, "project_path", None) or getattr(source, "project_channel_id", None):
+    mapped_project_path = str(getattr(source, "project_path", "") or "").strip()
+    if mapped_project_path:
+        mapped_project_path = os.path.expanduser(os.path.expandvars(mapped_project_path))
+        if Path(mapped_project_path).is_dir():
+            return mapped_project_path
+        logger.warning(
+            "Mapped Discord project path does not exist; using configured project fallback: %s",
+            mapped_project_path,
+        )
+
+    if getattr(source, "project_channel_id", None):
         project_cwd = cfg_get(cfg, "discord", "project_channel_cwd", default="")
         if str(project_cwd or "").strip():
             return _expand_configured_cwd(project_cwd, fallback=default_cwd)
@@ -6062,6 +6072,35 @@ class _GatewayRunnerCore(
         }
 
     @staticmethod
+    def _is_consumed_process_completion(event: Optional[MessageEvent]) -> bool:
+        """Return whether a queued terminal completion was already read.
+
+        A process may exit while its originating agent turn is still active.
+        The watcher can queue the synthetic completion just before that turn
+        consumes the same result via ``process wait`` or ``process log``. Recheck
+        consumption when draining the queue so the raced event does not become a
+        redundant second model turn.
+        """
+        if not event or not getattr(event, "background_process_completion", False):
+            return False
+        process_session_id = str(
+            getattr(event, "background_process_session_id", "") or ""
+        ).strip()
+        if not process_session_id:
+            return False
+        try:
+            from tools.process_registry import process_registry
+
+            return process_registry.is_completion_consumed(process_session_id)
+        except Exception:
+            logger.debug(
+                "Could not check consumed process completion %s",
+                process_session_id,
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
     def _session_has_pending_background_workers(
         session_key: str,
         *,
@@ -6930,9 +6969,11 @@ class _GatewayRunnerCore(
         """Try one live steer, otherwise queue the original event once.
 
         Returns ``accepted`` when the current Hermes turn owns the text,
-        ``queued`` when a live agent rejected/failed the steer, and
-        ``unsupported`` when no steer-capable agent exists yet.  Both fallback
-        outcomes have already queued ``event`` unchanged for the next turn.
+        ``closed`` when the model turn ended but delivery cleanup still owns
+        the session, ``queued`` when a live agent otherwise rejected/failed the
+        steer, and ``unsupported`` when no steer-capable agent exists yet. All
+        fallback outcomes have already queued ``event`` unchanged for the next
+        turn.
         """
         if running_agent is None:
             running_agent = self._running_agents.get(session_key)
@@ -6952,6 +6993,15 @@ class _GatewayRunnerCore(
             accepted = False
         if accepted:
             return "accepted"
+        steer_state = getattr(running_agent, "steer_state", None)
+        if callable(steer_state):
+            try:
+                rejection = str(steer_state() or "").strip().lower()
+            except Exception:
+                rejection = ""
+            if rejection in {"closed", "unsupported"}:
+                self._queue_or_replace_pending_event(session_key, event)
+                return rejection
         self._queue_or_replace_pending_event(session_key, event)
         return "queued"
 
@@ -7199,6 +7249,7 @@ class _GatewayRunnerCore(
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
+        is_closed_steer_fallback = steer_outcome == "closed"
         is_steer_fallback = steer_outcome in {"queued", "unsupported"}
 
         # If not in queue/steer mode, interrupt the running agent immediately.
@@ -7318,6 +7369,11 @@ class _GatewayRunnerCore(
             message = (
                 f"⏳ Compressing context{status_detail} — your message is queued for "
                 f"when it finishes (use /stop to cancel everything)."
+            )
+        elif is_closed_steer_fallback:
+            message = (
+                "⏳ Finishing delivery of the previous response — "
+                "starting this as the next turn."
             )
         elif is_steer_fallback:
             message = (
@@ -16980,6 +17036,16 @@ class _GatewayRunnerCore(
                         message_type=MessageType.TEXT,
                     )
                     self._queue_or_replace_pending_event(_quick_key, queued_event)
+                    steer_state = getattr(running_agent, "steer_state", None)
+                    if callable(steer_state):
+                        try:
+                            if steer_state() == "closed":
+                                return (
+                                    "Finishing delivery of the previous response — "
+                                    "starting this as the next turn."
+                                )
+                        except Exception:
+                            pass
                     return "Live steering closed — queued for the immediate next turn."
                 # Running agent is missing or lacks steer() — fall back to queue.
                 queued_event = dataclasses.replace(
@@ -17197,6 +17263,11 @@ class _GatewayRunnerCore(
                         getattr(event, "work_item_id", "") or getattr(event, "message_id", ""),
                     )
                     return None
+                if steer_outcome == "closed":
+                    return (
+                        "⏳ Finishing delivery of the previous response — "
+                        "starting this as the next turn."
+                    )
                 return "⏳ Queued for the immediate next turn — live steering was unavailable."
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
@@ -27801,6 +27872,9 @@ class _GatewayRunnerCore(
             message_id=str(evt.get("message_id") or "").strip() or None,
         )
         synth_event.background_process_completion = True
+        synth_event.background_process_session_id = str(
+            evt.get("session_id") or ""
+        ).strip() or None
         if source.platform == Platform.DISCORD:
             origin_work_item_id = str(
                 evt.get("origin_work_item_id") or ""
@@ -32888,6 +32962,14 @@ class _GatewayRunnerCore(
                             consume=False,
                         )
                     ):
+                        pending_event = None
+                    if self._is_consumed_process_completion(pending_event):
+                        logger.info(
+                            "Discarding queued terminal-process completion already "
+                            "consumed by the originating turn: %s",
+                            getattr(pending_event, "background_process_session_id", "")
+                            or "unknown",
+                        )
                         pending_event = None
                     if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                         interrupt_message = result.get("interrupt_message")
