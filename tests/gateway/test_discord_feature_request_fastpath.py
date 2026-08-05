@@ -314,10 +314,10 @@ async def test_existing_action_thread_direct_question_uses_read_only_tier(monkey
         channel_prompt="Answer this current direct question in place.",
     )
 
-    assert result["reasoning_effort"] == "medium"
+    assert result["reasoning_effort"] == "low"
     init = _CapturingAgent.last_init
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "low"}
     assert "tool_delay" not in init
     assert "verify_on_stop" not in init
     assert init["runtime_mode"] == "read_only"
@@ -364,10 +364,10 @@ async def test_bare_discord_read_only_turn_uses_discord_read_only_tier(monkeypat
         escalation_allowed=False,
     )
 
-    assert result["reasoning_effort"] == "medium"
+    assert result["reasoning_effort"] == "low"
     init = _CapturingAgent.last_init
     assert init["model"] == "gpt-5.6-sol"
-    assert init["reasoning_config"] == {"enabled": True, "effort": "medium"}
+    assert init["reasoning_config"] == {"enabled": True, "effort": "low"}
     assert init["runtime_mode"] == "read_only"
     assert "tool_delay" not in init
     assert "verify_on_stop" not in init
