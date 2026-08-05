@@ -186,5 +186,23 @@ async def test_steer_rejected_payload_queues_immediate_next_turn():
     assert adapter._pending_messages[sk].text == "hello"
 
 
+@pytest.mark.asyncio
+async def test_steer_closed_turn_reports_delivery_finalization():
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+
+    running_agent = MagicMock()
+    running_agent.steer.return_value = False
+    running_agent.steer_state.return_value = "closed"
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer hello"))
+
+    assert result is not None
+    assert "Finishing delivery of the previous response" in result
+    assert "starting this as the next turn" in result
+    assert adapter._pending_messages[sk].text == "hello"
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])

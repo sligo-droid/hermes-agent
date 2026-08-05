@@ -2933,6 +2933,22 @@ class AIAgent:
             self._pending_steer = None
             return text
 
+    def steer_state(self) -> str:
+        """Return whether this turn can accept live steering."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+
+        def _state() -> str:
+            if not getattr(self, "_steer_supported", False):
+                return "unsupported"
+            if getattr(self, "_steer_intake_open", False):
+                return "open"
+            return "closed"
+
+        if _lock is None:
+            return _state()
+        with _lock:
+            return _state()
+
     def steer(self, text: str) -> bool:
         """
         Accept user guidance for the next safe boundary without interrupting.

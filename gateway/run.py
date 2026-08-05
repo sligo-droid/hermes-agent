@@ -6969,9 +6969,11 @@ class _GatewayRunnerCore(
         """Try one live steer, otherwise queue the original event once.
 
         Returns ``accepted`` when the current Hermes turn owns the text,
-        ``queued`` when a live agent rejected/failed the steer, and
-        ``unsupported`` when no steer-capable agent exists yet.  Both fallback
-        outcomes have already queued ``event`` unchanged for the next turn.
+        ``closed`` when the model turn ended but delivery cleanup still owns
+        the session, ``queued`` when a live agent otherwise rejected/failed the
+        steer, and ``unsupported`` when no steer-capable agent exists yet. All
+        fallback outcomes have already queued ``event`` unchanged for the next
+        turn.
         """
         if running_agent is None:
             running_agent = self._running_agents.get(session_key)
@@ -6991,6 +6993,15 @@ class _GatewayRunnerCore(
             accepted = False
         if accepted:
             return "accepted"
+        steer_state = getattr(running_agent, "steer_state", None)
+        if callable(steer_state):
+            try:
+                rejection = str(steer_state() or "").strip().lower()
+            except Exception:
+                rejection = ""
+            if rejection in {"closed", "unsupported"}:
+                self._queue_or_replace_pending_event(session_key, event)
+                return rejection
         self._queue_or_replace_pending_event(session_key, event)
         return "queued"
 
@@ -7238,6 +7249,7 @@ class _GatewayRunnerCore(
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
+        is_closed_steer_fallback = steer_outcome == "closed"
         is_steer_fallback = steer_outcome in {"queued", "unsupported"}
 
         # If not in queue/steer mode, interrupt the running agent immediately.
@@ -7357,6 +7369,11 @@ class _GatewayRunnerCore(
             message = (
                 f"⏳ Compressing context{status_detail} — your message is queued for "
                 f"when it finishes (use /stop to cancel everything)."
+            )
+        elif is_closed_steer_fallback:
+            message = (
+                "⏳ Finishing delivery of the previous response — "
+                "starting this as the next turn."
             )
         elif is_steer_fallback:
             message = (
@@ -17019,6 +17036,16 @@ class _GatewayRunnerCore(
                         message_type=MessageType.TEXT,
                     )
                     self._queue_or_replace_pending_event(_quick_key, queued_event)
+                    steer_state = getattr(running_agent, "steer_state", None)
+                    if callable(steer_state):
+                        try:
+                            if steer_state() == "closed":
+                                return (
+                                    "Finishing delivery of the previous response — "
+                                    "starting this as the next turn."
+                                )
+                        except Exception:
+                            pass
                     return "Live steering closed — queued for the immediate next turn."
                 # Running agent is missing or lacks steer() — fall back to queue.
                 queued_event = dataclasses.replace(
@@ -17236,6 +17263,11 @@ class _GatewayRunnerCore(
                         getattr(event, "work_item_id", "") or getattr(event, "message_id", ""),
                     )
                     return None
+                if steer_outcome == "closed":
+                    return (
+                        "⏳ Finishing delivery of the previous response — "
+                        "starting this as the next turn."
+                    )
                 return "⏳ Queued for the immediate next turn — live steering was unavailable."
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt

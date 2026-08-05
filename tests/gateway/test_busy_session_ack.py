@@ -494,6 +494,31 @@ class TestBusySessionAck:
         assert "Steered" not in content
 
     @pytest.mark.asyncio
+    async def test_closed_steer_turn_reports_delivery_finalization(self):
+        """A closed model turn may still hold the adapter guard during delivery."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        event = _make_event(text="start the manual run")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer.return_value = False
+        agent.steer_state.return_value = "closed"
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        agent.steer.assert_called_once_with("start the manual run")
+        assert adapter._pending_messages.get(sk) is event
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Finishing delivery of the previous response" in content
+        assert "starting this as the next turn" in content
+        assert "live steering" not in content
+
+    @pytest.mark.asyncio
     async def test_work_replay_queues_silently_when_session_is_busy(self):
         """Recovery control traffic must not emit a second user queue bubble."""
         runner, sentinel = _make_runner()

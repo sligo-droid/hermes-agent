@@ -130,6 +130,27 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
 
 
 @pytest.mark.asyncio
+async def test_priority_busy_path_reports_closed_turn_as_delivery_finalization():
+    runner, adapter = _make_runner()
+    runner._busy_input_mode = "steer"
+
+    event = _make_event("start the manual run")
+    event.internal = False
+    sk = build_session_key(event.source)
+    running_agent = MagicMock()
+    running_agent.steer.return_value = False
+    running_agent.steer_state.return_value = "closed"
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(event)
+
+    assert result is not None
+    assert "Finishing delivery of the previous response" in result
+    assert "starting this as the next turn" in result
+    assert adapter._pending_messages[sk] is event
+
+
+@pytest.mark.asyncio
 async def test_idle_queue_without_payload_returns_usage():
     runner, _adapter = _make_runner()
     called = False
