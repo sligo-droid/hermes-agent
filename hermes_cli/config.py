@@ -6580,8 +6580,9 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
 
     # ── Version 34 → 35: keep Discord actions on their dedicated tier ──
     # `basic` used to be the persisted Discord-route default while it resolved
-    # to Sol/low. It now means Luna/xhigh, so rewrite only that exact former
-    # route default. Explicit custom tiers and disabled routes remain intact.
+    # to Sol/low. It now means the general gateway tier, so rewrite only that
+    # exact former route default. Explicit custom tiers and disabled routes
+    # remain intact.
     if current_ver < 35:
         config = read_raw_config()
         discord_config = config.get("discord")

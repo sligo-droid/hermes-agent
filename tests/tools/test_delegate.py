@@ -1675,7 +1675,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         MockAgent.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
-    def test_deep_review_human_request_launches_sol_xhigh(self, mock_run):
+    def test_deep_review_human_request_launches_sol_high(self, mock_run):
         mock_run.return_value = {
             "task_index": 0,
             "status": "completed",
@@ -1698,7 +1698,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], "gpt-5.6-sol")
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
 
     def test_nested_orchestrator_cannot_select_deep_review(self):
         parent = _make_mock_parent(depth=1)
@@ -1923,7 +1923,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         kwargs = MockAgent.call_args.kwargs
         self.assertEqual(kwargs["model"], "gpt-5.6-sol")
-        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
         self.assertEqual(kwargs["provider"], parent.provider)
         self.assertEqual(kwargs["base_url"], parent.base_url)
         self.assertEqual(
@@ -1968,7 +1968,7 @@ class TestDelegationModelTierRouting(unittest.TestCase):
         ])
         self.assertEqual([call.kwargs["reasoning_config"]["effort"] for call in calls], [
             "medium",
-            "high",
+            "medium",
         ])
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")

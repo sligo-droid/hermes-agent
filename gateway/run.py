@@ -69,7 +69,10 @@ from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
-from hermes_cli.model_tiers import resolve_model_tier
+from hermes_cli.model_tiers import (
+    human_requested_elevated_reasoning,
+    resolve_model_tier,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -489,6 +492,33 @@ def _discord_action_request_model_tier(
     return resolve_model_tier(cfg, tier_name)
 
 
+def _discord_read_only_model_tier(config: Optional[dict]) -> Any:
+    """Return the configured tier for non-mutating Discord turns."""
+    cfg = config or {}
+    tier_name = cfg_get(
+        cfg,
+        "discord",
+        "read_only_model_tier",
+        default="discord_read_only",
+    )
+    return resolve_model_tier(cfg, tier_name)
+
+
+def _discord_runtime_model_tier(
+    config: Optional[dict],
+    runtime_mode: RuntimeMode,
+    message: Any,
+    feature_summary: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Resolve one Discord route tier, including explicit Sol/high requests."""
+    cfg = config or {}
+    if human_requested_elevated_reasoning(message):
+        return resolve_model_tier(cfg, "deep_review")
+    if runtime_mode is RuntimeMode.READ_ONLY:
+        return _discord_read_only_model_tier(cfg)
+    return _discord_action_request_model_tier(cfg, feature_summary)
+
+
 _MODEL_TIER_UNSET = object()
 
 
@@ -544,16 +574,16 @@ def _discord_action_request_reasoning_config(
 
     raw = cfg_get(config or {}, "discord", "action_request_reasoning_effort", default=None)
     if raw is None:
-        raw = cfg_get(config or {}, "discord", "feature_request_reasoning_effort", default="xhigh")
-    effort = str(raw or "xhigh").strip() or "xhigh"
+        raw = cfg_get(config or {}, "discord", "feature_request_reasoning_effort", default="medium")
+    effort = str(raw or "medium").strip() or "medium"
     parsed = parse_reasoning_effort(effort)
     if parsed is not None:
         return parsed
     logger.warning(
-        "Unknown Discord action-request reasoning effort '%s', using xhigh",
+        "Unknown Discord action-request reasoning effort '%s', using medium",
         effort,
     )
-    return parse_reasoning_effort("xhigh")
+    return parse_reasoning_effort("medium")
 
 
 def _fable_fail_closed_error(detail: str = "", route: str = "") -> str:
@@ -30305,16 +30335,15 @@ class _GatewayRunnerCore(
             standard_discord_action_thread
             and turn_runtime_mode is RuntimeMode.ACTION
         )
-        # READ_ONLY Discord turns use the same route tier as action requests so
-        # observation does not pay the ordinary gateway tier's Luna/xhigh
-        # latency/cost.  Keep this separate from ``discord_action_runtime``:
-        # the latter is the authority for mutable worktree/lifecycle behavior,
-        # fast-path prompts, zero tool delay, and verification-on-stop.
+        # READ_ONLY Discord turns have their own low-latency route tier. Keep
+        # this separate from ``discord_action_runtime``: only the latter owns
+        # mutable worktrees, action prompts, zero tool delay, verification, and
+        # lifecycle behavior. Read-only turns may request a clean action replay.
         discord_read_only_runtime = (
             source.platform == _GATEWAY_PLATFORM.DISCORD
             and turn_runtime_mode is RuntimeMode.READ_ONLY
         )
-        discord_action_model_route = discord_action_runtime or discord_read_only_runtime
+        discord_model_route = discord_action_runtime or discord_read_only_runtime
         fable_mode = str(
             (fable_plan_metadata or {}).get("fable_mode", "")
             if isinstance(fable_plan_metadata, dict)
@@ -31208,17 +31237,19 @@ class _GatewayRunnerCore(
             _reload_runtime_env_preserving_config_authority()
 
             try:
-                action_request_tier = None
-                if discord_action_model_route:
-                    action_request_tier = _discord_action_request_model_tier(
+                discord_route_tier = None
+                if discord_model_route:
+                    discord_route_tier = _discord_runtime_model_tier(
                         user_config,
+                        turn_runtime_mode,
+                        message,
                         feature_summary,
                     )
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
-                    model_override=action_request_tier.model if action_request_tier is not None else None,
+                    model_override=discord_route_tier.model if discord_route_tier is not None else None,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
@@ -31252,10 +31283,10 @@ class _GatewayRunnerCore(
 
                     resolved_opus_reasoning = resolve_opus_reasoning_config(user_config)
                 reasoning_config = dict(resolved_opus_reasoning)
-            elif discord_action_model_route:
+            elif discord_model_route:
                 reasoning_config = _discord_action_request_reasoning_config(
                     user_config,
-                    action_request_tier,
+                    discord_route_tier,
                 )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(
@@ -31411,10 +31442,10 @@ class _GatewayRunnerCore(
                     "gateway.runtime_mode": turn_runtime_mode.value,
                     "gateway.discord_action_request_fast_path": discord_action_runtime,
                     "gateway.discord_feature_request_fast_path": discord_action_runtime,
-                    "gateway.discord_action_model_route": discord_action_model_route,
-                    "gateway.discord_action_model_tier": (
-                        action_request_tier.name
-                        if action_request_tier is not None
+                    "gateway.discord_model_route": discord_model_route,
+                    "gateway.discord_model_tier": (
+                        discord_route_tier.name
+                        if discord_route_tier is not None
                         else None
                     ),
                     "gateway.fable_mode": fable_mode if fable_plan_metadata else "",
@@ -31724,10 +31755,10 @@ class _GatewayRunnerCore(
                 model_override_source = "opus"
             elif discord_action_runtime:
                 runtime_route = "discord_action_request"
-                active_tier = action_request_tier
+                active_tier = discord_route_tier
             elif discord_read_only_runtime:
                 runtime_route = "discord_read_only"
-                active_tier = action_request_tier
+                active_tier = discord_route_tier
             else:
                 active_tier = _gateway_model_tier(user_config)
             _set_gateway_runtime_audit(
@@ -31742,9 +31773,9 @@ class _GatewayRunnerCore(
                     else "opus"
                     if opus_plan_metadata
                     else "model_tier"
-                    if discord_action_model_route and active_tier is not None
+                    if discord_model_route and active_tier is not None
                     else "discord_config"
-                    if discord_action_model_route and reasoning_config is not None
+                    if discord_model_route and reasoning_config is not None
                     else "session_override"
                     if session_reasoning_override
                     else "model_tier"

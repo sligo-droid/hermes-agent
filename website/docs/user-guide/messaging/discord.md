@@ -339,6 +339,7 @@ discord:
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   action_request_model_tier: discord_action          # All accepted action requests: Sol/medium
+  read_only_model_tier: discord_read_only             # Questions and observation: Sol/low
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
@@ -361,11 +362,14 @@ discord:
 group_sessions_per_user: true     # Isolate sessions per user in shared channels
 ```
 
-Discord intake still distinguishes questions from action requests. Every
-accepted action thread uses the tier configured by
-`discord.action_request_model_tier` (`discord_action`, or `gpt-5.6-sol` with `medium`
-reasoning, by default). Request wording or inferred complexity does
-not select a different tier.
+Discord intake distinguishes questions from action requests. Read-only turns use
+`discord.read_only_model_tier` (`discord_read_only`, or GPT-5.6 Sol with `low`
+reasoning, by default). When a read-only turn discovers that mutation is needed,
+it stops and the gateway replays the original request through
+`discord.action_request_model_tier` (`discord_action`, or GPT-5.6 Sol with
+`medium` reasoning). Explicit requests for high or higher reasoning use the
+reserved Sol/`high` tier for that turn; other wording does not automatically
+increase the tier.
 
 #### `discord.require_mention`
 

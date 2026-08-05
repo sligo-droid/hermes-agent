@@ -13,7 +13,7 @@ def test_gateway_uses_basic_tier_instead_of_global_model_default(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: config)
     assert gateway_run.GatewayRunner._load_reasoning_config() == {
         "enabled": True,
-        "effort": "high",
+        "effort": "medium",
     }
 
 
@@ -40,4 +40,12 @@ def test_discord_action_request_uses_configured_routine_tier():
     )
 
     assert tier.name == "intermediate"
+    assert tier.reasoning_effort == "low"
+
+
+def test_discord_read_only_uses_its_dedicated_sol_low_tier():
+    tier = gateway_run._discord_read_only_model_tier({})
+
+    assert tier.name == "discord_read_only"
+    assert tier.model == "gpt-5.6-sol"
     assert tier.reasoning_effort == "low"

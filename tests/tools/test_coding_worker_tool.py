@@ -3039,7 +3039,7 @@ def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_pa
         "-c",
         'model="gpt-5.6-sol"',
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="medium"',
         "-c",
         'service_tier="normal"',
     ]
@@ -3328,9 +3328,9 @@ def test_model_tier_overrides_opencode_model_and_reasoning(monkeypatch, tmp_path
     assert resolved["simple_build_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_plan_model"] == "hermes-codex/gpt-5.6-sol"
     assert resolved["complex_build_model"] == "hermes-codex/gpt-5.6-sol"
-    assert resolved["simple_build_reasoning_level"] == "high"
-    assert resolved["complex_plan_reasoning_level"] == "high"
-    assert resolved["complex_build_reasoning_level"] == "high"
+    assert resolved["simple_build_reasoning_level"] == "medium"
+    assert resolved["complex_plan_reasoning_level"] == "medium"
+    assert resolved["complex_build_reasoning_level"] == "medium"
 
 
 def test_explicit_coding_worker_tier_is_not_keyword_rewritten(monkeypatch, tmp_path):
@@ -3376,9 +3376,9 @@ def test_explicit_coding_worker_tier_is_not_keyword_rewritten(monkeypatch, tmp_p
         worker_config=seen["worker_config"],
         task="Audit the parser and report findings without changes",
     )
-    assert resolved["simple_build_reasoning_level"] == "high"
-    assert resolved["complex_plan_reasoning_level"] == "high"
-    assert resolved["complex_build_reasoning_level"] == "high"
+    assert resolved["simple_build_reasoning_level"] == "medium"
+    assert resolved["complex_plan_reasoning_level"] == "medium"
+    assert resolved["complex_build_reasoning_level"] == "medium"
 
 
 def test_exhausted_parent_deadline_blocks_coding_worker_launch(tmp_path):
