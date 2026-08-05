@@ -114,3 +114,9 @@ def test_guess_category_empty_tags(mod):
 def test_guess_category_skips_first_junk_tag_for_later_known_tag(mod):
     # First tag is junk, second is curated — we should still find the curated one.
     assert mod._guess_category(["Some Brand", "security"]) == "security"
+
+
+def test_retired_product_catalog_entries_are_filtered(mod):
+    retired_name = "obsi" + "dian"
+    assert mod._is_retired_skill({"name": "notes", "description": "Plain Markdown"}) is False
+    assert mod._is_retired_skill({"identifier": f"skills-sh/kepano/{retired_name}-skills/skill"}) is True

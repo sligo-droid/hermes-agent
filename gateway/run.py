@@ -18162,34 +18162,6 @@ class _GatewayRunnerCore(
                         except Exception:
                             pass
 
-        if (
-            event.media_urls
-            and event.message_type == MessageType.DOCUMENT
-            and getattr(event, "text_document_inlined", False)
-            and any(os.path.splitext(path)[1].lower() == ".txt" for path in event.media_urls)
-        ):
-            _names = list(getattr(event, "inlined_text_document_names", None) or [])
-            if not _names:
-                for path in event.media_urls:
-                    if os.path.splitext(path)[1].lower() != ".txt":
-                        continue
-                    basename = os.path.basename(path)
-                    parts = basename.split("_", 2)
-                    _names.append(parts[2] if len(parts) >= 3 else basename)
-            _names = [re.sub(r'[^\w.\- ]', '_', name) for name in _names]
-            _doc_label = ", ".join(f"'{name}'" for name in _names) or ".txt upload"
-            _vault_path = os.getenv("OBSIDIAN_VAULT_PATH") or str(
-                get_hermes_home() / "obsidian-vault"
-            )
-            _obsidian_note = (
-                f"[Gateway note: The user uploaded .txt document(s) {_doc_label}. "
-                f"Before answering, synthesize durable non-secret learnings from the uploaded text "
-                f"into the Obsidian vault at: {_vault_path}. Do not store secrets, credentials, "
-                f"tokens, or raw dumps; write concise durable learnings only. Then continue treating "
-                f"the uploaded text below as the user's prompt input.]"
-            )
-            message_text = f"{_obsidian_note}\n\n{message_text}"
-
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
             for _apath in audio_file_paths:

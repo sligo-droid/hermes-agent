@@ -754,7 +754,7 @@ macOS (Host):
        ├─ api_server adapter ← listens on 0.0.0.0:8642
        ├─ AIAgent ← single source of truth
        ├─ Sessions, memory, skills
-       └─ Local file access (Obsidian, projects, etc.)
+       └─ Local file access (project notes, repositories, etc.)
 
 Linux VM (Docker):
   └─ hermes gateway (proxy mode)

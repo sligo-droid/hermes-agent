@@ -32,13 +32,13 @@ Use the smallest stable home for each kind of knowledge:
 | --- | --- |
 | Repo docs | Durable product context, architecture decisions, runbooks, and narrow routing/pickup pointers tied to this codebase. |
 | Skills | Reusable procedures, pitfall checklists, command recipes, and class-level workflows. Skills should not be the current-state ledger. |
-| Memory/User profile | Compact facts that must be injected every session: user preferences, stable environment facts, and hard safety constraints. |
+| Honcho / user memory | Compact stable recall such as user preferences, environment facts, and hard safety constraints. It is non-canonical and should be rebuildable from authoritative sources. |
 | Session search | Recall prior conversations and exact past claims when needed; do not encode session progress as memory. |
-| Obsidian | Cross-project synthesis, external research, and non-repo notes that should not travel with a product repo. |
-| Notion | Client-facing documents, feedback, shared project folders, and source artifacts. |
+| Notion | Intended archive for original client documents, feedback, source artifacts, and their provenance. |
+| GBrain | Intended canonical home for cited, revision-aware synthesis derived from client sources and project evidence. |
 | Discord | Live conversation, approvals, operator pings, and feature threads. Not canonical state by itself. |
 
-Boundary rule: if a note is an authoritative fact, put it in the source that owns it: code, tests, config, git/PRs, runtime evidence, a focused doc, or a runbook. Use `docs/project-state.md` only for tiny routing/pickup facts that tell future workers which source to inspect next. If a note says “why this product or architecture works this way,” put it here or in `docs/decisions/`. If it says “how to debug this class of incident,” keep it in a skill/reference and link to repo docs only when needed.
+Boundary rule: if a note is an authoritative fact, put it in the source that owns it: code, tests, config, git/PRs, runtime evidence, a focused doc, or a runbook. Use `docs/project-state.md` only for tiny routing/pickup facts that tell future workers which source to inspect next. If a note says “why this product or architecture works this way,” put it here or in `docs/decisions/`. If it says “how to debug this class of incident,” keep it in a skill/reference and link to repo docs only when needed. The planned Notion-to-GBrain ingestion pipeline is not implemented yet; until it ships, use existing canonical repo and runtime sources rather than assuming automatic archival or synthesis.
 
 ## Architecture Overview
 

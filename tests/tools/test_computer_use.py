@@ -510,7 +510,7 @@ class TestCaptureResponse:
                     mode=mode, width=800, height=600,
                     png_b64="",
                     elements=list(elements),
-                    app="Obsidian",
+                    app="Notes",
                 )
             def click(self, **kw): ...
             def drag(self, **kw): ...
@@ -658,7 +658,7 @@ class TestCaptureResponse:
                 return CaptureResult(
                     mode=mode, width=800, height=600,
                     png_b64=fake_png, elements=list(elements),
-                    app="Obsidian",
+                    app="Notes",
                 )
             def click(self, **kw): ...
             def drag(self, **kw): ...

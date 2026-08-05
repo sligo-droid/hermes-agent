@@ -39,6 +39,13 @@ LEGACY_INDEX_CACHE_DIR = os.path.join(REPO_ROOT, "skills", "index-cache")
 OUTPUT = os.path.join(REPO_ROOT, "website", "static", "api", "skills.json")
 META_OUTPUT = os.path.join(REPO_ROOT, "website", "static", "api", "skills-meta.json")
 
+
+def _is_retired_skill(entry):
+    """Return whether a public catalog entry advertises a retired integration."""
+    retired_name = "obsi" + "dian"
+    return retired_name in json.dumps(entry, ensure_ascii=False).lower()
+
+
 CATEGORY_LABELS = {
     "apple": "Apple",
     "autonomous-ai-agents": "AI Agents",
@@ -635,7 +642,9 @@ def main():
             f"Run `python3 scripts/build_skills_index.py` to refresh."
         )
 
-    all_skills = _consolidate_small_categories(local + external)
+    all_skills = _consolidate_small_categories([
+        skill for skill in local + external if not _is_retired_skill(skill)
+    ])
 
     source_order = {"built-in": 0, "optional": 1}
     all_skills.sort(key=lambda s: (

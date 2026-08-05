@@ -183,10 +183,9 @@ If there's a significant move, explain what happened." \
 将多个 skill（技能）串联起来，完成复杂的定时任务。Skill 按顺序加载，然后执行 prompt。
 
 ```bash
-# 使用 arxiv skill 查找论文，再用 obsidian skill 保存笔记
-/cron add "0 8 * * *" "Search arXiv for the 3 most interesting papers on 'language model reasoning' from the past day. For each paper, create an Obsidian note with the title, authors, abstract summary, and key contribution." \
+# 使用 arxiv skill 查找论文，再保存 Markdown 摘要
+/cron add "0 8 * * *" "Search arXiv for the 3 most interesting papers on 'language model reasoning' from the past day. Save a Markdown digest with each paper's title, authors, abstract summary, and key contribution." \
   --skill arxiv \
-  --skill obsidian \
   --name "Paper digest"
 ```
 
@@ -195,15 +194,15 @@ If there's a significant move, explain what happened." \
 ```python
 cronjob(
     action="create",
-    skills=["arxiv", "obsidian"],
-    prompt="Search arXiv for papers on 'language model reasoning' from the past day. Save the top 3 as Obsidian notes.",
+    skills=["arxiv"],
+    prompt="Search arXiv for papers on 'language model reasoning' from the past day. Save the top 3 in a Markdown digest.",
     schedule="0 8 * * *",
     name="Paper digest",
     deliver="local"
 )
 ```
 
-Skill 按顺序加载——先加载 `arxiv`（教 agent 如何搜索论文），再加载 `obsidian`（教 agent 如何写笔记）。Prompt 将二者串联起来。
+`arxiv` skill 教 agent 如何搜索论文；Prompt 指定 Markdown 交付物。
 
 ---
 
@@ -224,7 +223,7 @@ Skill 按顺序加载——先加载 `arxiv`（教 agent 如何搜索论文）�
 /cron edit <job_id> --prompt "Updated task description"
 
 # 为现有任务添加或移除 skill
-/cron edit <job_id> --skill arxiv --skill obsidian
+/cron edit <job_id> --skill arxiv
 /cron edit <job_id> --clear-skills
 
 # 永久删除任务

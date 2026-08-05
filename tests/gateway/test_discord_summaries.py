@@ -181,7 +181,6 @@ def adapter(monkeypatch):
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
         "DISCORD_IGNORED_CHANNELS",
-        "OBSIDIAN_VAULT_PATH",
         "PRODUCTION_URL",
         "NEXT_PUBLIC_SITE_URL",
         "NEXT_PUBLIC_APP_URL",
@@ -197,7 +196,6 @@ def adapter(monkeypatch):
         "HERMES_DASHBOARD_URL",
     ):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", "/nonexistent/hermes-test-obsidian-vault")
 
     instance = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
     instance._client = SimpleNamespace(user=SimpleNamespace(id=999))
@@ -1179,55 +1177,6 @@ def test_project_description_parses_semicolon_credentials(adapter):
     ]
 
 
-def test_project_priorities_support_implementation_priority_pseudo_heading(adapter):
-    priorities = adapter._extract_obsidian_priorities(
-        """## Current Client Focus
-
-Implementation priority:
-
-1. Build Arizona SOS ingestion.
-2. Verify Maricopa registration ingestion.
-
-Scraper design rule: keep it small.
-"""
-    )
-
-    assert priorities == "Build Arizona SOS ingestion.; Verify Maricopa registration ingestion."
-
-
-def test_project_metadata_reads_obsidian_frontmatter_app_access(adapter, tmp_path, monkeypatch):
-    adapter._collect_discord_project_metadata = (
-        DiscordAdapter._collect_discord_project_metadata.__get__(adapter, DiscordAdapter)
-    )
-    vault = tmp_path / "vault"
-    projects = vault / "Projects"
-    projects.mkdir(parents=True)
-    (projects / "PID.md").write_text(
-        """---
-app_login: use the shared demo account from the project note
-credentials: username demo; password: secret-value
-login_required: yes
----
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
-    adapter._summary_workdir = MagicMock(side_effect=AssertionError("should not use gateway cwd"))
-
-    metadata = adapter._collect_discord_project_metadata(
-        {
-            "project_name": "PID",
-            "project_path": "/missing/project/path",
-            "project_mapping_resolved": True,
-        }
-    )
-
-    assert metadata["app_access"] == (
-        "use the shared demo account from the project note; "
-        "username demo; password: secret-value"
-    )
-
-
 def test_project_metadata_does_not_fall_back_to_cwd_when_mapped_path_missing(adapter):
     adapter._collect_discord_project_metadata = (
         DiscordAdapter._collect_discord_project_metadata.__get__(adapter, DiscordAdapter)
@@ -1268,7 +1217,7 @@ async def test_project_description_is_not_refreshed_after_previous_success(adapt
         return_value={
             "production_url": "https://new.example.com",
             "repo_url": "https://github.com/acme/new",
-            "priorities": "Refresh from Obsidian",
+            "priorities": "Refresh from canonical project metadata",
         }
     )
 

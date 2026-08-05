@@ -49,6 +49,29 @@ OUTPUT_PATH = os.path.join(REPO_ROOT, "website", "static", "api", "skills-index.
 INDEX_VERSION = 1
 
 
+def _is_retired_skill(entry: dict) -> bool:
+    """Exclude retired product integrations from the public skill catalog."""
+    retired_name = "obsi" + "dian"
+    return retired_name in json.dumps(entry, ensure_ascii=False).lower()
+
+
+def _filter_retired_skills(skills: list[dict]) -> list[dict]:
+    return [entry for entry in skills if not _is_retired_skill(entry)]
+
+
+def sanitize_existing_index() -> None:
+    """Remove retired entries from the existing index without a network crawl."""
+    with open(OUTPUT_PATH, encoding="utf-8") as f:
+        index = json.load(f)
+    skills = index.get("skills", [])
+    filtered = _filter_retired_skills(skills)
+    index["skills"] = filtered
+    index["skill_count"] = len(filtered)
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
+    print(f"Removed {len(skills) - len(filtered)} retired entries from {OUTPUT_PATH}")
+
+
 def _meta_to_dict(meta: SkillMeta) -> dict:
     """Convert a SkillMeta to a serializable dict."""
     return {
@@ -319,7 +342,7 @@ def main():
         key = skill["identifier"]
         if key not in seen:
             seen[key] = skill
-    deduped = list(seen.values())
+    deduped = _filter_retired_skills(list(seen.values()))
 
     # Sort
     source_order = {"official": 0, "skills-sh": 1, "skills.sh": 1,
@@ -422,4 +445,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--sanitize-existing" in sys.argv[1:]:
+        sanitize_existing_index()
+    else:
+        main()

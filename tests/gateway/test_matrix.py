@@ -833,7 +833,7 @@ class TestMatrixBangCommandAlias:
         slash-prefixed (e.g. "/arxiv"), which the resolver must account for."""
         import agent.skill_commands as skill_commands_mod
 
-        fake_skills = {"/arxiv": {}, "/obsidian": {}}
+        fake_skills = {"/arxiv": {}, "/notes": {}}
         with patch.object(
             skill_commands_mod, "get_skill_commands", return_value=fake_skills
         ):
@@ -842,8 +842,8 @@ class TestMatrixBangCommandAlias:
             # is_gateway_known_command won't know these; the skill branch must.
             assert _normalize_matrix_bang_command("!arxiv") == "/arxiv"
             assert (
-                _normalize_matrix_bang_command("!obsidian search foo")
-                == "/obsidian search foo"
+                _normalize_matrix_bang_command("!notes search foo")
+                == "/notes search foo"
             )
             # A name in neither registry stays plain text.
             assert (

@@ -518,6 +518,13 @@ class HonchoClientConfig:
             return cls.from_env(host=resolved_host)
 
         host_block = _host_block(raw, resolved_host)
+        configured_hosts = raw.get("hosts") or {}
+        host_allowlisted = not configured_hosts or bool(host_block)
+        if configured_hosts and not host_allowlisted:
+            logger.warning(
+                "Honcho host '%s' is not present in the configured hosts map; disabling it",
+                resolved_host,
+            )
         # A hosts.hermes block or explicit enabled flag means the user
         # intentionally configured Honcho for this host.
         _explicitly_configured = bool(host_block) or raw.get("enabled") is True
@@ -563,7 +570,9 @@ class HonchoClientConfig:
         # Host-level enabled wins, then root-level, then auto-enable if key/url exists.
         host_enabled = host_block.get("enabled")
         root_enabled = raw.get("enabled")
-        if host_enabled is not None:
+        if not host_allowlisted:
+            enabled = False
+        elif host_enabled is not None:
             enabled = host_enabled
         elif root_enabled is not None:
             enabled = root_enabled
