@@ -1217,22 +1217,29 @@ choose a model and reasoning effort.
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
-| `basic` | GPT-5.6 Luna | `xhigh` | Ordinary gateway sessions |
-| `intermediate` | GPT-5.6 Sol | `medium` | Coding-worker build passes and Kanban `dev` |
+| `basic` | GPT-5.6 Terra | `medium` | Ordinary gateway sessions |
+| `intermediate` | GPT-5.6 Sol | `low` | Coding-worker build passes and Kanban `dev` |
+| `advanced` | GPT-5.6 Sol | `medium` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
 | `discord_action` | GPT-5.6 Sol | `medium` | Accepted Discord action requests |
-| `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
-| `deep_review` | GPT-5.6 Sol | `xhigh` | Root-turn deep reviews or explicit higher-reasoning requests |
+| `discord_read_only` | GPT-5.6 Sol | `low` | Non-mutating Discord questions and observation |
+| `deep_review` | GPT-5.6 Sol | `high` | Explicit higher-reasoning Discord turns and authorized root delegation |
 
-These code-owned built-ins follow the supported model/effort frontier: trivial
-work uses Luna, ordinary gateway work uses Luna at `xhigh`, moderately scoped build
-passes use Sol at `medium`, and complex planning moves to Sol at `high`. Purpose-based automatic routes may
-spill review/diagnosis work from `high` to `xhigh`, while implementation-capable
-work remains capped at `high`. Explicit `model_tier` choices on `delegate_task`
-and `delegate_coding_task` are not keyword-rewritten and retain the tier's
-bundled effort.
+These code-owned built-ins make the ordinary Hermes routes latency-conscious:
+repeatable work uses Luna, ordinary gateway work uses Terra, Discord observation
+uses Sol/`low`, and action orchestration uses Sol/`medium`. Explicit requests for
+high or higher reasoning, `xhigh`, deeper thinking, or a deep review select the
+reserved Sol/`high` tier for that Discord turn. Hermes does not automatically
+promote ordinary high-risk wording to this tier. Explicit `model_tier` choices on
+`delegate_task` and `delegate_coding_task` retain the tier's bundled effort.
 
-The built-in names `trivial`, `basic`, `intermediate`, `advanced`, and
-`discord_action` cannot be overridden in `config.yaml`. The `model_tiers`
+`trivial` and `basic` carry `fast_mode: true`. That flag currently propagates
+through named-tier coding and Kanban worker routing. Ordinary direct gateway
+requests do not derive their service tier from the named tier's `fast_mode`
+field, so enabling equivalent fast behavior there requires separate work.
+
+The built-in names `trivial`, `basic`, `intermediate`, `advanced`,
+`discord_action`, `discord_read_only`, and `deep_review` cannot be overridden in
+`config.yaml`. The `model_tiers`
 section is only for genuinely custom names; route settings reference either a
 built-in or custom tier by name:
 
@@ -1251,6 +1258,7 @@ cron:
 
 discord:
   action_request_model_tier: discord_action
+  read_only_model_tier: discord_read_only
 
 coding_worker:
   backend: codex
@@ -1268,9 +1276,11 @@ kanban:
       foreman: {model_tier: advanced}
 ```
 
-Discord intake still distinguishes questions from action requests. Once Hermes
-accepts a message as an action request, it consistently uses
-`discord.action_request_model_tier`; request wording or inferred complexity does
+Discord intake distinguishes questions from action requests. Read-only turns use
+`discord.read_only_model_tier`; if the model discovers that mutation is required,
+it stops and asks the gateway to replay the original request through
+`discord.action_request_model_tier`. Explicit higher-reasoning language selects
+`deep_review` for that turn. Other request wording or inferred complexity does
 not select a separate tier.
 
 Coding workers use one `intermediate` build pass for simple work. Complex or

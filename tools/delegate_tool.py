@@ -4391,7 +4391,7 @@ def _build_top_level_description() -> str:
         "straightforward bounded work, intermediate for ordinary multi-step "
         "work, and advanced only for the hardest cross-cutting or high-risk "
         "work. Omit model_tier to inherit your runtime model and reasoning.\n"
-        "- deep_review is a reserved Sol/xhigh tier. Use it only when the human's "
+        "- deep_review is a reserved Sol/high tier. Use it only when the human's "
         "current root-turn message explicitly requests higher reasoning or a deep "
         "review; it "
         "is rejected for ordinary selection and nested delegation.\n"
