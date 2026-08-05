@@ -616,23 +616,6 @@ def build_visual_qa_followup_nudge(
     )
 
 
-_QA_ONLY_REQUEST_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:"
-    r"(?:only|just)\s+(?:tell|report|answer|give|say)(?:\s+me)?\s+"
-    r"(?:(?:the\s+)?visual[ -]?qa\s+result|(?:whether|if)\s+"
-    r"(?:visual[ -]?qa\s+(?:passed|failed)|it\s+(?:passed|failed)(?:\s+visual[ -]?qa)?))"
-    r"|(?:respond|tell\s+me|answer|report)\s+only(?:\s+with)?\s+(?:whether|if)\s+"
-    r"(?:visual[ -]?qa\s+(?:passed|failed)|it\s+(?:passed|failed)(?:\s+visual[ -]?qa)?)"
-    r"|visual[ -]?qa\s+(?:answer|response|result)\s+only"
-    r")(?:\s+or\s+(?:passed|failed))?(?:\s+for\s+this\s+change)?[.!?]*\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-_QA_ONLY_RESPONSE_RE = re.compile(
-    r"^\s*visual[ -]?qa\s*:?[ ]*passed[.!]?"
-    r"(?:\s+(?:the\s+)?[\w -]{1,80}\s+(?:is|was)\s+"
-    r"(?:shipped(?:\s+and\s+live)?|live|complete|completed|done|deployed|released)[.!]?)?\s*$",
-    re.IGNORECASE,
-)
 def should_buffer_visual_qa_response(
     *,
     requirement: Any,
@@ -645,7 +628,7 @@ def should_buffer_visual_qa_response(
     last_edit_order: int,
     attempts: int = 0,
 ) -> bool:
-    """Return whether a final visual response may need private repair."""
+    """Return whether trusted visual evidence is ready for private synthesis."""
 
     normalized = normalize_visual_requirement(requirement)
     visual_config = normalize_visual_qa_config(config)
@@ -659,8 +642,9 @@ def should_buffer_visual_qa_response(
         or int(last_edit_order or 0) <= 0
     ):
         return False
-    request_text = str(original_request or "")
-    if _QA_ONLY_REQUEST_RE.fullmatch(request_text):
+    from agent.verification_stop import verification_result_only_requested
+
+    if verification_result_only_requested(original_request):
         return False
     completion = visual_receipt_completion(
         normalized,
@@ -674,7 +658,6 @@ def build_visual_qa_response_nudge(
     *,
     requirement: Any,
     receipts: Any,
-    final_response: Any,
     original_request: Any,
     platform: Any,
     runtime_mode: Any,
@@ -683,7 +666,7 @@ def build_visual_qa_response_nudge(
     last_edit_order: int,
     attempts: int = 0,
 ) -> str | None:
-    """Return one retry nudge for the known visual-QA-only closeout collapse."""
+    """Return one state-based closeout synthesis nudge after visual QA passes."""
 
     if not should_buffer_visual_qa_response(
         requirement=requirement,
@@ -697,14 +680,13 @@ def build_visual_qa_response_nudge(
         attempts=attempts,
     ):
         return None
-    if not _QA_ONLY_RESPONSE_RE.fullmatch(str(final_response or "")):
-        return None
     return (
-        "[System: Your draft only reports the visual-QA result. Return one complete response to "
-        "the original request from the evidence already recorded in this turn. Summarize the "
-        "implemented changes and relevant verification or delivery outcome. Mention visual QA only "
-        "as `Visual QA passed`; do not include receipt details or visual observations. Do not call "
-        "more tools.]"
+        "[System: Return one complete response to the original request using the full recorded "
+        "turn evidence and the latest candidate. State what changed, the relevant verification, "
+        "and evidenced PR, merge, deploy, or live state when applicable. Refresh or correct any "
+        "earlier draft instead of blindly concatenating it, and make no unsupported completion or "
+        "delivery claims. Mention the passed visual check only as `Visual QA passed`; do not include "
+        "receipt details or visual observations. Do not call more tools.]"
     )
 
 
