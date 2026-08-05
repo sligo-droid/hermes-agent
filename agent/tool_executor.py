@@ -67,6 +67,25 @@ _CLOSEOUT_FINALIZATION_REQUIRED = (
     "return one concise final response from the recorded evidence."
 )
 _CLOSEOUT_LOG_BUDGET = BudgetConfig(preview_size=0)
+_PENDING_CLOSEOUT_VISUAL_TOOLS = frozenset(
+    {
+        "visual_qa",
+        "browser_navigate",
+        "browser_authenticate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_press",
+        "browser_scroll",
+        "browser_back",
+    }
+)
+
+
+def _pending_closeout_allows_tool(function_name: str) -> bool:
+    """Allow only visual inspection and bounded browser-state preparation."""
+
+    return function_name in _PENDING_CLOSEOUT_VISUAL_TOOLS
 
 
 def _closeout_receipt_gate_reason(agent: Any) -> str:
@@ -295,7 +314,8 @@ def _append_pending_closeout_skipped_tool_result(
             name,
             (
                 f"[Tool execution skipped — {name} was not started because a successful "
-                "closeout is waiting only for the required visual_qa check.]"
+                "closeout is waiting for the required visual_qa check; only visual_qa "
+                "and browser preparation tools may run.]"
             ),
             tool_call.id,
             effect_disposition="none",
@@ -1433,7 +1453,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         if (
             isinstance(getattr(agent, "_pending_closeout_receipt", None), dict)
-            and function_name != "visual_qa"
+            and not _pending_closeout_allows_tool(function_name)
         ):
             _append_pending_closeout_skipped_tool_result(
                 agent,
@@ -2223,7 +2243,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if (
             isinstance(getattr(agent, "_pending_closeout_receipt", None), dict)
-            and function_name != "visual_qa"
+            and not _pending_closeout_allows_tool(function_name)
         ):
             _append_pending_closeout_skipped_tool_result(
                 agent,

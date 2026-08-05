@@ -612,7 +612,9 @@ def build_visual_qa_followup_nudge(
         "decides passed/failed/blocked/uncertain. "
         "Do not attach receipt arguments to terminal, "
         "browser, or vision tools. Do not treat navigation, a generic screenshot, or console success "
-        "as proof; if inspection is unavailable, let `visual_qa` record the concrete blocker.]"
+        "as proof. If prepared browser state was lost, use the allowed browser preparation tools to "
+        "restore the page and authentication state before retrying `visual_qa` once; if inspection "
+        "is still unavailable, let `visual_qa` record the concrete blocker.]"
     )
 
 
