@@ -8,6 +8,7 @@ import pytest
 
 from agent.terminal_outcomes import (
     classify_terminal_outcome,
+    closeout_receipt_matches_repo_state,
     exact_lock_pnpm_install_block,
     inspect_repo_closeout_receipt,
     sanitize_closeout_receipt,
@@ -301,3 +302,34 @@ def test_closeout_receipt_rejects_dirty_or_mismatched_head(tmp_path):
         classification=classification,
         output=json.dumps({"status": "passed", "head_sha": head}),
     ) is None
+
+
+def test_closeout_receipt_revalidation_rejects_later_repo_changes(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Hermes Test")
+    _git(repo, "config", "user.email", "hermes-test@example.invalid")
+    script = repo / "scripts" / "closeout.sh"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    _git(repo, "add", "scripts/closeout.sh")
+    _git(repo, "commit", "-m", "add closeout")
+    head = _git(repo, "rev-parse", "HEAD")
+    receipt = {
+        "schema_version": 1,
+        "status": "passed",
+        "head_sha": head,
+        "script": "scripts/closeout.sh",
+    }
+
+    assert closeout_receipt_matches_repo_state(receipt, repo) is True
+
+    (repo / "dirty.txt").write_text("dirty", encoding="utf-8")
+    assert closeout_receipt_matches_repo_state(receipt, repo) is False
+
+    (repo / "dirty.txt").unlink()
+    (repo / "tracked.txt").write_text("next", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-m", "advance head")
+    assert closeout_receipt_matches_repo_state(receipt, repo) is False

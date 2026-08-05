@@ -342,6 +342,72 @@ def sanitize_closeout_receipt(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _clean_repo_state(cwd: Path) -> tuple[Path, str] | None:
+    try:
+        root_proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if root_proc.returncode != 0:
+            return None
+        repo_root = Path(root_proc.stdout.strip()).resolve(strict=False)
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            return None
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        observed_head = head.stdout.strip().lower()
+        if head.returncode != 0 or not _SHA_RE.fullmatch(observed_head):
+            return None
+        return repo_root, observed_head
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def closeout_receipt_matches_repo_state(value: Any, cwd: Any) -> bool:
+    """Return whether a prior receipt still matches one clean repository state."""
+
+    receipt = sanitize_closeout_receipt(value)
+    if receipt is None:
+        return False
+    command_cwd = Path(str(cwd or ".")).expanduser().resolve(strict=False)
+    state = _clean_repo_state(command_cwd)
+    if state is None:
+        return False
+    repo_root, observed_head = state
+    if observed_head != receipt["head_sha"]:
+        return False
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", receipt["script"]],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return tracked.returncode == 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
 def inspect_repo_closeout_receipt(
     *,
     command: Any,
@@ -389,18 +455,11 @@ def inspect_repo_closeout_receipt(
         script_path = command_cwd / script_path
     script_path = script_path.resolve(strict=False)
 
+    state = _clean_repo_state(command_cwd)
+    if state is None:
+        return None
+    repo_root, observed_head = state
     try:
-        root_proc = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=command_cwd,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if root_proc.returncode != 0:
-            return None
-        repo_root = Path(root_proc.stdout.strip()).resolve(strict=False)
         relative = script_path.relative_to(repo_root)
         tracked = subprocess.run(
             ["git", "ls-files", "--error-unmatch", "--", relative.as_posix()],
@@ -411,27 +470,6 @@ def inspect_repo_closeout_receipt(
             check=False,
         )
         if tracked.returncode != 0:
-            return None
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if status.returncode != 0 or status.stdout.strip():
-            return None
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        observed_head = head.stdout.strip().lower()
-        if head.returncode != 0 or not _SHA_RE.fullmatch(observed_head):
             return None
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
