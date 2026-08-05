@@ -713,6 +713,10 @@ async def run_visual_assertions(
         return {
             "status": "blocked",
             "code": "browser_supervisor_unavailable",
+            "correction": (
+                "Reinitialize the task browser with browser_navigate, restore required "
+                "authentication and page state, then retry visual_qa once."
+            ),
             "attempts": [],
             "visual_qa_receipt": receipt,
         }

@@ -39,7 +39,7 @@ def _response(content: str = "", tool_calls=None, finish_reason: str = "stop"):
     )
 
 
-def _agent(*tools: str) -> AIAgent:
+def _agent(*tools: str, max_iterations: int = 1) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_tool_defs(*tools)),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -48,7 +48,7 @@ def _agent(*tools: str) -> AIAgent:
         agent = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://openrouter.ai/api/v1",
-            max_iterations=1,
+            max_iterations=max_iterations,
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -226,7 +226,7 @@ def test_receipt_stops_later_tools_in_same_model_batch():
     assert len(skipped) == 1
 
 
-def test_visual_qa_promotes_pending_receipt_and_skips_all_other_closeout_tools():
+def test_visual_qa_promotes_pending_receipt_and_skips_unrelated_closeout_tools():
     agent = _agent("terminal", "visual_qa", "web_search")
     agent._preview_readiness = None
     agent.client.chat.completions.create.side_effect = [
@@ -306,12 +306,123 @@ def test_visual_qa_promotes_pending_receipt_and_skips_all_other_closeout_tools()
     terminal_payload = json.loads(tool_contents[0])
     assert terminal_payload["closeout_receipt_pending"]["required_tool"] == "visual_qa"
     assert terminal_payload["closeout_log"].startswith("<persisted-output>")
-    assert "waiting only for the required visual_qa check" in tool_contents[1]
-    assert "waiting only for the required visual_qa check" in tool_contents[2]
+    assert "only visual_qa and browser preparation tools may run" in tool_contents[1]
+    assert "only visual_qa and browser preparation tools may run" in tool_contents[2]
     visual_payload = json.loads(tool_contents[3])
     assert visual_payload["closeout_receipt"]["head_sha"] == "a" * 40
     assert "finalization_required" in visual_payload
     assert "authoritative closeout receipt" in tool_contents[4]
+
+
+def test_pending_closeout_recovers_lost_browser_before_visual_qa_retry():
+    agent = _agent(
+        "terminal",
+        "visual_qa",
+        "browser_navigate",
+        "browser_authenticate",
+        "web_search",
+        max_iterations=6,
+    )
+    agent._preview_readiness = None
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[_tool_call("terminal", {"command": "./scripts/closeout.sh"})],
+            finish_reason="tool_calls",
+        ),
+        _response(
+            tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
+            finish_reason="tool_calls",
+        ),
+        _response(
+            tool_calls=[_tool_call("browser_navigate", {"url": "http://127.0.0.1:3000"})],
+            finish_reason="tool_calls",
+        ),
+        _response(
+            tool_calls=[
+                _tool_call("web_search", {"query": "must remain blocked"}),
+                _tool_call("browser_authenticate", {"profile": "local"}),
+            ],
+            finish_reason="tool_calls",
+        ),
+        _response(
+            tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
+            finish_reason="tool_calls",
+        ),
+        _response("Done after browser recovery and visual QA."),
+    ]
+    visual_passed = False
+    visual_calls = 0
+
+    def execute(name, *_args, **_kwargs):
+        nonlocal visual_calls
+        if name == "terminal":
+            return _receipt_result()
+        if name == "visual_qa":
+            visual_calls += 1
+            if visual_calls == 1:
+                return json.dumps(
+                    {
+                        "status": "blocked",
+                        "code": "browser_supervisor_unavailable",
+                        "correction": "Reinitialize the task browser, then retry visual_qa once.",
+                    }
+                )
+            return json.dumps({"status": "passed"})
+        if name in {"browser_navigate", "browser_authenticate"}:
+            return json.dumps({"status": "ok"})
+        raise AssertionError(f"unexpected tool execution: {name}")
+
+    def gate_reason(_agent):
+        return "" if visual_passed else "visual_qa_pending"
+
+    def record_evidence(_agent, function_name, _function_args, function_result, *_args, **_kwargs):
+        nonlocal visual_passed
+        if function_name == "visual_qa":
+            visual_passed = json.loads(function_result).get("status") == "passed"
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=execute) as execute_call,
+        patch(
+            "agent.terminal_outcomes.inspect_repo_closeout_receipt",
+            return_value={
+                "status": "passed",
+                "head_sha": "a" * 40,
+                "script": "scripts/closeout.sh",
+            },
+        ),
+        patch("agent.tool_executor._closeout_receipt_gate_reason", side_effect=gate_reason),
+        patch(
+            "agent.terminal_outcomes.closeout_receipt_matches_repo_state",
+            return_value=True,
+        ),
+        patch("agent.tool_executor._record_turn_verification_evidence", side_effect=record_evidence),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda *, content, **_kwargs: content,
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ship the visual change")
+
+    assert [call.args[0] for call in execute_call.call_args_list] == [
+        "terminal",
+        "visual_qa",
+        "browser_navigate",
+        "browser_authenticate",
+        "visual_qa",
+    ]
+    assert result["final_response"] == "Done after browser recovery and visual QA."
+    assert result["closeout_receipt"]["head_sha"] == "a" * 40
+    skipped = [
+        str(message.get("content"))
+        for message in result["messages"]
+        if message.get("role") == "tool"
+        and "only visual_qa and browser preparation tools may run" in str(message.get("content"))
+    ]
+    assert len(skipped) == 1
+    assert "web_search" in skipped[0]
 
 
 def test_pending_closeout_gets_visual_and_finalization_grace_calls():
