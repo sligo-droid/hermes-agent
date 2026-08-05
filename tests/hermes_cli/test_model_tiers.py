@@ -65,7 +65,7 @@ def test_default_routes_reference_resolvable_tiers():
         )
     } == {
         "trivial": "medium",
-        "basic": "medium",
+        "basic": "high",
         "intermediate": "low",
         "advanced": "medium",
         "discord_action": "medium",
@@ -221,7 +221,7 @@ def test_reserved_builtin_tier_override_is_ignored():
     assert tier is not None
     assert tier.model == "gpt-5.6-terra"
     assert tier.opencode_model == "hermes-codex/gpt-5.6-terra"
-    assert tier.reasoning_effort == "medium"
+    assert tier.reasoning_effort == "high"
 
 
 def test_custom_non_reserved_tier_resolves_atomically():
