@@ -244,6 +244,7 @@ def test_visual_qa_promotes_pending_receipt_and_skips_all_other_closeout_tools()
     ]
     visual_passed = False
     saved_closeout_results = []
+    recorded_results = []
 
     def execute(name, *_args, **_kwargs):
         if name == "terminal":
@@ -255,8 +256,9 @@ def test_visual_qa_promotes_pending_receipt_and_skips_all_other_closeout_tools()
     def gate_reason(_agent):
         return "" if visual_passed else "visual_qa_pending"
 
-    def record_evidence(_agent, function_name, *_args, **_kwargs):
+    def record_evidence(_agent, function_name, _function_args, function_result, *_args, **_kwargs):
         nonlocal visual_passed
+        recorded_results.append((function_name, function_result))
         if function_name == "visual_qa":
             visual_passed = True
 
@@ -277,6 +279,10 @@ def test_visual_qa_promotes_pending_receipt_and_skips_all_other_closeout_tools()
             },
         ),
         patch("agent.tool_executor._closeout_receipt_gate_reason", side_effect=gate_reason),
+        patch(
+            "agent.terminal_outcomes.closeout_receipt_matches_repo_state",
+            return_value=True,
+        ),
         patch("agent.tool_executor._record_turn_verification_evidence", side_effect=record_evidence),
         patch("agent.tool_executor.maybe_persist_tool_result", side_effect=persist_result),
         patch.object(agent, "_persist_session"),
@@ -290,6 +296,7 @@ def test_visual_qa_promotes_pending_receipt_and_skips_all_other_closeout_tools()
     assert result["closeout_receipt"]["head_sha"] == "a" * 40
     assert len(saved_closeout_results) == 1
     assert "closeout_receipt" in saved_closeout_results[0]
+    assert "output" in json.loads(recorded_results[0][1])
 
     tool_contents = [
         str(message.get("content"))
@@ -305,3 +312,62 @@ def test_visual_qa_promotes_pending_receipt_and_skips_all_other_closeout_tools()
     assert visual_payload["closeout_receipt"]["head_sha"] == "a" * 40
     assert "finalization_required" in visual_payload
     assert "authoritative closeout receipt" in tool_contents[4]
+
+
+def test_pending_closeout_gets_visual_and_finalization_grace_calls():
+    agent = _agent("terminal", "visual_qa")
+    agent._preview_readiness = None
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[_tool_call("terminal", {"command": "./scripts/closeout.sh"})],
+            finish_reason="tool_calls",
+        ),
+        _response(
+            tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
+            finish_reason="tool_calls",
+        ),
+        _response("Done after the required visual check."),
+    ]
+    visual_passed = False
+
+    def execute(name, *_args, **_kwargs):
+        if name == "terminal":
+            return _receipt_result()
+        if name == "visual_qa":
+            return json.dumps({"status": "passed"})
+        raise AssertionError(f"unexpected tool execution: {name}")
+
+    def gate_reason(_agent):
+        return "" if visual_passed else "visual_qa_pending"
+
+    def record_evidence(_agent, function_name, *_args, **_kwargs):
+        nonlocal visual_passed
+        if function_name == "visual_qa":
+            visual_passed = True
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=execute),
+        patch(
+            "agent.terminal_outcomes.inspect_repo_closeout_receipt",
+            return_value={
+                "status": "passed",
+                "head_sha": "a" * 40,
+                "script": "scripts/closeout.sh",
+            },
+        ),
+        patch("agent.tool_executor._closeout_receipt_gate_reason", side_effect=gate_reason),
+        patch(
+            "agent.terminal_outcomes.closeout_receipt_matches_repo_state",
+            return_value=True,
+        ),
+        patch("agent.tool_executor._record_turn_verification_evidence", side_effect=record_evidence),
+        patch("agent.tool_executor.maybe_persist_tool_result", side_effect=lambda *, content, **_kwargs: content),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ship the visual change")
+
+    assert result["final_response"] == "Done after the required visual check."
+    assert result["api_calls"] == 3
+    assert result["closeout_receipt"]["head_sha"] == "a" * 40

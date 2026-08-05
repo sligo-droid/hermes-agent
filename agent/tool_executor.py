@@ -55,7 +55,6 @@ from tools.terminal_tool import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
-    PERSISTED_OUTPUT_TAG,
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
@@ -153,6 +152,10 @@ def _process_closeout_receipt(
     reason = _closeout_receipt_gate_reason(agent)
     if reason == "visual_qa_pending":
         agent._pending_closeout_receipt = receipt
+        agent._pending_closeout_cwd = str(
+            args.get("workdir") or _current_session_cwd(agent)
+        )
+        agent._budget_grace_call = True
         payload = {
             "closeout_receipt": receipt,
             "closeout_receipt_pending": {
@@ -177,6 +180,7 @@ def _accept_closeout_receipt(agent: Any, receipt: dict[str, Any]) -> None:
     """Promote one sanitized receipt to the turn's terminal state."""
 
     agent._pending_closeout_receipt = None
+    agent._pending_closeout_cwd = None
     agent._accepted_closeout_receipt = receipt
     agent._closeout_finalization_attempts = 0
     agent._closeout_tool_choice_retries = 0
@@ -204,6 +208,19 @@ def _promote_pending_closeout_receipt(
         return result, False
     if not isinstance(payload, dict):
         return result, False
+
+    from agent.terminal_outcomes import closeout_receipt_matches_repo_state
+
+    if not closeout_receipt_matches_repo_state(
+        receipt,
+        getattr(agent, "_pending_closeout_cwd", None),
+    ):
+        agent._pending_closeout_receipt = None
+        agent._pending_closeout_cwd = None
+        payload["closeout_receipt_rejected"] = {
+            "reason": "repository_changed_after_closeout"
+        }
+        return json.dumps(payload, ensure_ascii=False), False
 
     _accept_closeout_receipt(agent, receipt)
     payload["closeout_receipt"] = receipt
@@ -236,8 +253,6 @@ def _attach_closeout_log_reference(
         config=_CLOSEOUT_LOG_BUDGET,
         threshold=0,
     )
-    if PERSISTED_OUTPUT_TAG not in reference:
-        return full_result
     payload["closeout_log"] = reference
     return json.dumps(payload, ensure_ascii=False)
 
@@ -2709,6 +2724,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
 
         _closeout_accepted_now = False
+        _verification_result = function_result
         if not _execution_blocked:
             _full_closeout_result = function_result
             function_result, _closeout_accepted_now = _process_closeout_receipt(
@@ -2784,7 +2800,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent,
                 function_name,
                 storage_args,
-                function_result,
+                (
+                    _verification_result
+                    if function_name == "terminal"
+                    else function_result
+                ),
                 _is_error_result,
                 tool_duration,
                 visual_assertion_args=function_args,

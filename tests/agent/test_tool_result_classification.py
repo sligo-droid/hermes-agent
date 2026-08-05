@@ -9,6 +9,7 @@ from agent.tool_result_classification import (
 )
 from agent.display import _detect_tool_failure
 from agent.tool_executor import (
+    _attach_closeout_log_reference,
     _promote_pending_closeout_receipt,
     _process_closeout_receipt,
     _record_coding_worker_mutation_paths,
@@ -218,6 +219,8 @@ def test_closeout_receipt_waits_for_unmet_visual_gate(monkeypatch):
     assert payload["closeout_receipt"]["head_sha"] == "b" * 40
     assert "output" not in payload
     assert agent._pending_closeout_receipt == payload["closeout_receipt"]
+    assert agent._pending_closeout_cwd
+    assert agent._budget_grace_call is True
     assert getattr(agent, "_accepted_closeout_receipt", None) is None
 
 
@@ -230,6 +233,7 @@ def test_pending_closeout_promotes_only_after_visual_gate_passes(monkeypatch):
         "script": "scripts/closeout.sh",
     }
     agent._pending_closeout_receipt = receipt
+    agent._pending_closeout_cwd = "/repo"
 
     monkeypatch.setattr(
         "agent.tool_executor._closeout_receipt_gate_reason",
@@ -249,6 +253,10 @@ def test_pending_closeout_promotes_only_after_visual_gate_passes(monkeypatch):
         "agent.tool_executor._closeout_receipt_gate_reason",
         lambda _agent: "",
     )
+    monkeypatch.setattr(
+        "agent.terminal_outcomes.closeout_receipt_matches_repo_state",
+        lambda _receipt, _cwd: True,
+    )
     result, promoted = _promote_pending_closeout_receipt(
         agent,
         "visual_qa",
@@ -260,6 +268,68 @@ def test_pending_closeout_promotes_only_after_visual_gate_passes(monkeypatch):
     assert "finalization_required" in payload
     assert agent._pending_closeout_receipt is None
     assert agent._accepted_closeout_receipt == receipt
+
+
+def test_pending_closeout_rejects_promotion_after_repo_change(monkeypatch):
+    agent = _CloseoutAgent()
+    receipt = {
+        "schema_version": 1,
+        "status": "passed",
+        "head_sha": "d" * 40,
+        "script": "scripts/closeout.sh",
+    }
+    agent._pending_closeout_receipt = receipt
+    agent._pending_closeout_cwd = "/repo"
+    monkeypatch.setattr(
+        "agent.tool_executor._closeout_receipt_gate_reason",
+        lambda _agent: "",
+    )
+    monkeypatch.setattr(
+        "agent.terminal_outcomes.closeout_receipt_matches_repo_state",
+        lambda _receipt, _cwd: False,
+    )
+
+    result, promoted = _promote_pending_closeout_receipt(
+        agent,
+        "visual_qa",
+        json.dumps({"status": "passed"}),
+    )
+
+    assert promoted is False
+    assert json.loads(result)["closeout_receipt_rejected"] == {
+        "reason": "repository_changed_after_closeout"
+    }
+    assert agent._pending_closeout_receipt is None
+    assert agent._pending_closeout_cwd is None
+    assert getattr(agent, "_accepted_closeout_receipt", None) is None
+
+
+def test_closeout_log_persistence_failure_keeps_compact_control_result(monkeypatch):
+    compact = json.dumps({
+        "closeout_receipt": {
+            "schema_version": 1,
+            "status": "passed",
+            "head_sha": "f" * 40,
+            "script": "scripts/closeout.sh",
+        },
+        "finalization_required": "finish",
+    })
+    monkeypatch.setattr(
+        "agent.tool_executor.maybe_persist_tool_result",
+        lambda **_kwargs: "[Truncated: full output could not be saved to sandbox.]",
+    )
+
+    result = _attach_closeout_log_reference(
+        compact,
+        json.dumps({"output": "large log"}),
+        tool_call_id="call-1",
+        effective_task_id="task-1",
+    )
+
+    payload = json.loads(result)
+    assert payload["finalization_required"] == "finish"
+    assert payload["closeout_log"].startswith("[Truncated:")
+    assert "output" not in payload
 
 
 def test_closeout_receipt_rejects_pending_required_async_gate(monkeypatch):
