@@ -2656,7 +2656,7 @@ class TestLoadHermesIndex:
         monkeypatch.setattr(hub.httpx, "get", fake_get)
 
         data = hub._load_hermes_index()
-        assert data == {"skills": [{"name": "x"}]}
+        assert data == {"skills": [{"name": "x"}], "skill_count": 1}
 
         accept = captured["headers"].get("Accept-Encoding", "")
         assert "br" not in [tok.strip() for tok in accept.split(",")], (
@@ -2684,7 +2684,7 @@ class TestLoadHermesIndex:
         monkeypatch.setattr(hub.httpx, "get", fake_get)
 
         data = hub._load_hermes_index()
-        assert data == {"skills": [{"name": "recovered"}]}
+        assert data == {"skills": [{"name": "recovered"}], "skill_count": 1}
         assert len(attempts) == 2, "should retry once after a DecodingError"
         # The retry must be uncompressed (identity) so a Brotli-ignoring proxy
         # can't fail the same way twice.
@@ -2710,4 +2710,35 @@ class TestLoadHermesIndex:
         monkeypatch.setattr(hub.httpx, "get", fake_get)
 
         data = hub._load_hermes_index()
-        assert data == {"skills": [{"name": "stale"}]}
+        assert data == {"skills": [{"name": "stale"}], "skill_count": 1}
+
+    def test_recent_cache_is_sanitized_before_use(self, monkeypatch, tmp_path):
+        import tools.skills_hub as hub
+
+        cache_file = self._isolate_cache(monkeypatch, tmp_path)
+        retired_name = "obsi" + "dian"
+        cache_file.write_text(json.dumps({"skills": [
+            {"name": "notes", "identifier": "github/example/notes"},
+            {"name": retired_name, "identifier": f"github/example/{retired_name}"},
+        ]}))
+
+        data = hub._load_hermes_index()
+
+        assert [entry["name"] for entry in data["skills"]] == ["notes"]
+        assert json.loads(cache_file.read_text()) == data
+
+    def test_index_source_rejects_retired_injected_entry(self):
+        import tools.skills_hub as hub
+
+        retired_name = "obsi" + "dian"
+        source = hub.HermesIndexSource(auth=MagicMock())
+        source._loaded = True
+        source._index = {"skills": [{
+            "name": retired_name,
+            "identifier": f"skills-sh/example/{retired_name}",
+            "resolved_github_id": f"example/skills/{retired_name}",
+        }]}
+
+        assert source.search(retired_name) == []
+        assert source.inspect(f"skills-sh/example/{retired_name}") is None
+        assert source.fetch(f"skills-sh/example/{retired_name}") is None

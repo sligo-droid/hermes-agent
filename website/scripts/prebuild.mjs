@@ -23,13 +23,14 @@
 // deploys get real data.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const websiteDir = resolve(scriptDir, "..");
 const extractScript = join(scriptDir, "extract-skills.py");
+const sanitizeIndexScript = resolve(scriptDir, "..", "..", "scripts", "sanitize_skills_index.py");
 const llmsScript = join(scriptDir, "generate-llms-txt.py");
 const cronBlueprintsScript = join(scriptDir, "extract-automation-blueprints.py");
 const outputFile = join(websiteDir, "static", "api", "skills.json");
@@ -64,13 +65,30 @@ function runPython(script, label) {
   return true;
 }
 
+function sanitizeUnifiedIndex(inputFile = unifiedIndexFile) {
+  if (!existsSync(sanitizeIndexScript) || !existsSync(inputFile)) return false;
+  const r = spawnSync(
+    "python3",
+    [sanitizeIndexScript, "--input", inputFile, "--output", unifiedIndexFile],
+    { stdio: "inherit", cwd: websiteDir },
+  );
+  if (r.error || r.status !== 0) {
+    console.warn("[prebuild] skills-index.json policy sanitation failed; refusing index");
+    if (inputFile === unifiedIndexFile) {
+      try { unlinkSync(unifiedIndexFile); } catch {}
+    }
+    return false;
+  }
+  return true;
+}
+
 async function ensureUnifiedIndex() {
-  // If we have a recent copy on disk, trust it.
+  // A recent copy still crosses the public catalog policy boundary.
   if (existsSync(unifiedIndexFile)) {
     try {
       const age = Date.now() - statSync(unifiedIndexFile).mtimeMs;
       if (age < UNIFIED_INDEX_MAX_AGE_MS) {
-        return true;
+        return sanitizeUnifiedIndex();
       }
       console.log(
         `[prebuild] skills-index.json is ${(age / 3600000).toFixed(1)}h old; ` +
@@ -90,7 +108,7 @@ async function ensureUnifiedIndex() {
         `[prebuild] skills-index.json fetch returned HTTP ${resp.status}; ` +
           `using local copy if any`,
       );
-      return existsSync(unifiedIndexFile);
+      return existsSync(unifiedIndexFile) && sanitizeUnifiedIndex();
     }
     const text = await resp.text();
     // Sanity check: must be valid JSON with a skills array
@@ -100,14 +118,18 @@ async function ensureUnifiedIndex() {
         console.warn(
           "[prebuild] skills-index.json from live site has no skills array; ignoring",
         );
-        return existsSync(unifiedIndexFile);
+        return existsSync(unifiedIndexFile) && sanitizeUnifiedIndex();
       }
     } catch (e) {
       console.warn(`[prebuild] skills-index.json from live site is not valid JSON: ${e}`);
-      return existsSync(unifiedIndexFile);
+      return existsSync(unifiedIndexFile) && sanitizeUnifiedIndex();
     }
     mkdirSync(dirname(unifiedIndexFile), { recursive: true });
-    writeFileSync(unifiedIndexFile, text);
+    const downloadFile = `${unifiedIndexFile}.download-${process.pid}`;
+    writeFileSync(downloadFile, text);
+    const sanitized = sanitizeUnifiedIndex(downloadFile);
+    try { unlinkSync(downloadFile); } catch {}
+    if (!sanitized) return false;
     console.log(
       `[prebuild] downloaded skills-index.json from ${UNIFIED_INDEX_URL} ` +
         `(${(text.length / 1024).toFixed(0)} KB)`,
@@ -115,7 +137,7 @@ async function ensureUnifiedIndex() {
     return true;
   } catch (e) {
     console.warn(`[prebuild] skills-index.json fetch failed: ${e}`);
-    return existsSync(unifiedIndexFile);
+    return existsSync(unifiedIndexFile) && sanitizeUnifiedIndex();
   }
 }
 

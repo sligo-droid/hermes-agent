@@ -23,6 +23,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from pathlib import Path
 
 # Allow importing from repo root
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,32 +45,25 @@ from tools.skills_hub import (
     SkillMeta,
 )
 import httpx
+from skill_catalog_policy import atomic_write_skills_index, filter_skill_records, sanitize_skills_index
 
 OUTPUT_PATH = os.path.join(REPO_ROOT, "website", "static", "api", "skills-index.json")
 INDEX_VERSION = 1
 
 
-def _is_retired_skill(entry: dict) -> bool:
-    """Exclude retired product integrations from the public skill catalog."""
-    retired_name = "obsi" + "dian"
-    return retired_name in json.dumps(entry, ensure_ascii=False).lower()
-
-
 def _filter_retired_skills(skills: list[dict]) -> list[dict]:
-    return [entry for entry in skills if not _is_retired_skill(entry)]
+    return filter_skill_records(skills)
 
 
 def sanitize_existing_index() -> None:
     """Remove retired entries from the existing index without a network crawl."""
     with open(OUTPUT_PATH, encoding="utf-8") as f:
         index = json.load(f)
-    skills = index.get("skills", [])
-    filtered = _filter_retired_skills(skills)
-    index["skills"] = filtered
-    index["skill_count"] = len(filtered)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
-    print(f"Removed {len(skills) - len(filtered)} retired entries from {OUTPUT_PATH}")
+    sanitized = sanitize_skills_index(index)
+    if sanitized is None:
+        raise ValueError("Existing skills index is malformed")
+    atomic_write_skills_index(Path(OUTPUT_PATH), sanitized)
+    print(f"Removed {len(index['skills']) - len(sanitized['skills'])} retired entries from {OUTPUT_PATH}")
 
 
 def _meta_to_dict(meta: SkillMeta) -> dict:
@@ -435,9 +429,7 @@ def main():
         "skill_count": len(deduped),
         "skills": deduped,
     }
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
+    atomic_write_skills_index(Path(OUTPUT_PATH), index)
     file_size = os.path.getsize(OUTPUT_PATH)
     print(f"\nDone! {len(deduped)} skills indexed in "
           f"{time.time() - overall_start:.0f}s")

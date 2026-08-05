@@ -53,6 +53,20 @@ def _host_block(raw: dict, host: str) -> dict:
     return hosts.get(legacy, {})
 
 
+def _host_block_with_membership(raw: dict, host: str) -> tuple[dict, bool]:
+    """Return a host block and whether its key (or legacy alias) is configured."""
+    hosts = raw.get("hosts") or {}
+    if host in hosts:
+        block = hosts[host]
+        return (block if isinstance(block, dict) else {}), True
+    if host.startswith(f"{HOST}_"):
+        legacy = f"{HOST}.{host[len(HOST) + 1:]}"
+        if legacy in hosts:
+            block = hosts[legacy]
+            return (block if isinstance(block, dict) else {}), True
+    return {}, False
+
+
 def resolve_active_host() -> str:
     """Derive the Honcho host key from the active Hermes profile.
 
@@ -517,9 +531,9 @@ class HonchoClientConfig:
             logger.warning("Failed to read %s: %s, falling back to env", path, e)
             return cls.from_env(host=resolved_host)
 
-        host_block = _host_block(raw, resolved_host)
+        host_block, host_is_configured = _host_block_with_membership(raw, resolved_host)
         configured_hosts = raw.get("hosts") or {}
-        host_allowlisted = not configured_hosts or bool(host_block)
+        host_allowlisted = not configured_hosts or host_is_configured
         if configured_hosts and not host_allowlisted:
             logger.warning(
                 "Honcho host '%s' is not present in the configured hosts map; disabling it",
@@ -527,7 +541,7 @@ class HonchoClientConfig:
             )
         # A hosts.hermes block or explicit enabled flag means the user
         # intentionally configured Honcho for this host.
-        _explicitly_configured = bool(host_block) or raw.get("enabled") is True
+        _explicitly_configured = host_is_configured or raw.get("enabled") is True
 
         # Explicit host block fields win, then flat/global, then defaults
         workspace = (

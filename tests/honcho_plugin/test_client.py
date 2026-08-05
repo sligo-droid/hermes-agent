@@ -507,6 +507,38 @@ class TestResolveConfigPath:
         assert config.workspace_id == "shared"
         assert config.ai_peer == "coder"
 
+    def test_empty_host_block_is_configured_and_inherits_root_fields(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "workspace": "root-workspace",
+            "aiPeer": "root-peer",
+            "hosts": {"hermes_coder": {}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_coder", config_path=config_file
+        )
+
+        assert config.enabled is True
+        assert config.explicitly_configured is True
+        assert config.workspace_id == "root-workspace"
+        assert config.ai_peer == "root-peer"
+
+    def test_empty_legacy_dot_host_block_is_configured(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "hosts": {"hermes.coder": {}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_coder", config_path=config_file
+        )
+
+        assert config.enabled is True
+        assert config.explicitly_configured is True
+
     def test_legacy_dot_form_host_is_allowlisted(self, tmp_path):
         config_file = tmp_path / "honcho.json"
         config_file.write_text(json.dumps({

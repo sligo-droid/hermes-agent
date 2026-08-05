@@ -29,6 +29,11 @@ from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
+from skill_catalog_policy import (
+    atomic_write_skills_index,
+    is_retired_skill_record,
+    sanitize_skills_index,
+)
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunparse
 
@@ -4011,7 +4016,12 @@ def _load_hermes_index() -> Optional[dict]:
         try:
             age = time.time() - cache_file.stat().st_mtime
             if age < HERMES_INDEX_TTL:
-                return json.loads(cache_file.read_text())
+                cached = json.loads(cache_file.read_text())
+                sanitized = sanitize_skills_index(cached)
+                if sanitized is not None:
+                    if sanitized != cached:
+                        atomic_write_skills_index(cache_file, sanitized)
+                    return sanitized
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -4058,14 +4068,13 @@ def _load_hermes_index() -> Optional[dict]:
     if data is None:
         return _load_stale_index_cache()
 
-    # Validate structure
-    if not isinstance(data, dict) or "skills" not in data:
+    data = sanitize_skills_index(data)
+    if data is None:
         return _load_stale_index_cache()
 
     # Cache locally
     try:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(data))
+        atomic_write_skills_index(cache_file, data)
     except OSError:
         pass
 
@@ -4077,7 +4086,12 @@ def _load_stale_index_cache() -> Optional[dict]:
     cache_file = _hermes_index_cache_file()
     if cache_file.exists():
         try:
-            return json.loads(cache_file.read_text())
+            cached = json.loads(cache_file.read_text())
+            sanitized = sanitize_skills_index(cached)
+            if sanitized is not None:
+                if sanitized != cached:
+                    atomic_write_skills_index(cache_file, sanitized)
+                return sanitized
         except (OSError, json.JSONDecodeError):
             pass
     return None
@@ -4107,7 +4121,8 @@ class HermesIndexSource(SkillSource):
         if not self._loaded:
             self._index = _load_hermes_index()
             self._loaded = True
-        return self._index or {}
+        sanitized = sanitize_skills_index(self._index)
+        return sanitized or {}
 
     def _get_github(self) -> GitHubSource:
         if self._github is None:
@@ -4186,7 +4201,7 @@ class HermesIndexSource(SkillSource):
         """
         index = self._ensure_loaded()
         entry = self._find_entry(identifier, index)
-        if not entry:
+        if not entry or is_retired_skill_record(entry):
             return None
 
         # Use resolved path if available
@@ -4215,7 +4230,7 @@ class HermesIndexSource(SkillSource):
         """Return metadata from the index.  Zero API calls."""
         index = self._ensure_loaded()
         entry = self._find_entry(identifier, index)
-        if entry:
+        if entry and not is_retired_skill_record(entry):
             return self._to_meta(entry)
         return None
 
@@ -4225,7 +4240,7 @@ class HermesIndexSource(SkillSource):
 
         # Exact identifier match
         for s in skills:
-            if s.get("identifier") == identifier:
+            if not is_retired_skill_record(s) and s.get("identifier") == identifier:
                 return s
 
         # Try without source prefix (e.g. "skills-sh/" stripped)
@@ -4237,6 +4252,8 @@ class HermesIndexSource(SkillSource):
 
         # Match on normalized identifier or name
         for s in skills:
+            if is_retired_skill_record(s):
+                continue
             sid = s.get("identifier", "")
             # Strip prefix from stored identifier too
             stored_normalized = sid
@@ -4408,6 +4425,11 @@ def unified_search(query: str, sources: List[SkillSource],
         source_filter=source_filter,
         overall_timeout=30,
     )
+
+    all_results = [
+        result for result in all_results
+        if not is_retired_skill_record(result.__dict__)
+    ]
 
     if source_filter.strip().lower() in _PROVIDER_FILTER_VALUES:
         all_results = _filter_results_by_provider(all_results, source_filter)

@@ -20,12 +20,16 @@ the unified index existed).
 
 import json
 import os
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 
 import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, REPO_ROOT)
+
+from skill_catalog_policy import filter_skill_records
 LOCAL_SKILL_DIRS = [
     ("skills", "built-in"),
     ("optional-skills", "optional"),
@@ -38,12 +42,6 @@ LEGACY_INDEX_CACHE_DIR = os.path.join(REPO_ROOT, "skills", "index-cache")
 # fast and shrinks the JS chunk back to a few hundred KB.
 OUTPUT = os.path.join(REPO_ROOT, "website", "static", "api", "skills.json")
 META_OUTPUT = os.path.join(REPO_ROOT, "website", "static", "api", "skills-meta.json")
-
-
-def _is_retired_skill(entry):
-    """Return whether a public catalog entry advertises a retired integration."""
-    retired_name = "obsi" + "dian"
-    return retired_name in json.dumps(entry, ensure_ascii=False).lower()
 
 
 CATEGORY_LABELS = {
@@ -78,6 +76,11 @@ CATEGORY_LABELS = {
     "translation": "Translation",
     "other": "Other",
 }
+
+
+def _is_retired_skill(entry):
+    """Compatibility helper for callers testing the shared catalog policy."""
+    return not bool(filter_skill_records([entry]))
 
 # Map the source ids the unified index emits to the friendly labels the
 # Skills Hub UI uses. Keep these in sync with the SOURCE_CONFIG dict in
@@ -366,8 +369,12 @@ def extract_unified_index_skills():
         print(f"[extract-skills] Failed to read unified index: {e}")
         return None, None
 
-    if not isinstance(data, dict) or "skills" not in data:
+    if not isinstance(data, dict) or not isinstance(data.get("skills"), list):
         return None, None
+
+    data = dict(data)
+    data["skills"] = filter_skill_records(data["skills"])
+    data["skill_count"] = len(data["skills"])
 
     meta = {
         "indexGeneratedAt": data.get("generated_at", ""),
@@ -642,9 +649,7 @@ def main():
             f"Run `python3 scripts/build_skills_index.py` to refresh."
         )
 
-    all_skills = _consolidate_small_categories([
-        skill for skill in local + external if not _is_retired_skill(skill)
-    ])
+    all_skills = _consolidate_small_categories(filter_skill_records(local + external))
 
     source_order = {"built-in": 0, "optional": 1}
     all_skills.sort(key=lambda s: (
