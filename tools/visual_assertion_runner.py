@@ -648,7 +648,11 @@ async def run_visual_assertions(
 
     if supervisor is None:
         try:
-            from tools.browser_tool import _ensure_cdp_supervisor, _last_session_key
+            from tools.browser_tool import (
+                _align_cdp_supervisor_to_current_page,
+                _ensure_cdp_supervisor,
+                _last_session_key,
+            )
             from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
             remaining = _remaining()
@@ -665,6 +669,16 @@ async def run_visual_assertions(
             )
             execution_guard.check()
             supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
+            if supervisor is not None:
+                await asyncio.wait_for(
+                    _thread_call(
+                        _align_cdp_supervisor_to_current_page,
+                        effective_task_id,
+                        supervisor=supervisor,
+                        execution_guard=execution_guard,
+                    ),
+                    timeout=max(0.01, _remaining()),
+                )
         except TimeoutError:
             execution_guard.cancel()
             supervisor = None
