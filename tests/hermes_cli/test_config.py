@@ -1425,7 +1425,7 @@ class TestDiscordActionTierMigration:
         assert "action_request_complex_model_tier" not in raw["discord"]
         assert not any("migrated from former default" in value for value in results["config_added"])
 
-    def test_migrate_to_v35_preserves_the_former_sol_low_discord_default(self, tmp_path):
+    def test_migrate_to_v35_preserves_the_former_discord_default(self, tmp_path):
         config_path = tmp_path / "config.yaml"
         config_path.write_text(
             yaml.safe_dump(
@@ -1444,7 +1444,7 @@ class TestDiscordActionTierMigration:
         assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert raw["discord"]["action_request_model_tier"] == "discord_action"
         assert (
-            "discord.action_request_model_tier=discord_action (preserved Sol/low route)"
+            "discord.action_request_model_tier=discord_action (preserved dedicated route)"
             in results["config_added"]
         )
 
@@ -1466,7 +1466,7 @@ class TestDiscordActionTierMigration:
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
         assert raw["discord"]["action_request_model_tier"] == custom_value
-        assert not any("preserved Sol/low route" in value for value in results["config_added"])
+        assert not any("preserved dedicated route" in value for value in results["config_added"])
 
 
 class TestCodingWorkerTierMigration:

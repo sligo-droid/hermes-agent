@@ -6578,7 +6578,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "delegation.model_tier_routing; custom tiers were preserved."
                 )
 
-    # ── Version 34 → 35: keep Discord actions on their dedicated Sol/low tier ──
+    # ── Version 34 → 35: keep Discord actions on their dedicated tier ──
     # `basic` used to be the persisted Discord-route default while it resolved
     # to Sol/low. It now means Luna/xhigh, so rewrite only that exact former
     # route default. Explicit custom tiers and disabled routes remain intact.
@@ -6593,10 +6593,10 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             config["discord"] = discord_config
             _persist_migration(config)
             results["config_added"].append(
-                "discord.action_request_model_tier=discord_action (preserved Sol/low route)"
+                "discord.action_request_model_tier=discord_action (preserved dedicated route)"
             )
             if not quiet:
-                print("  ✓ Kept Discord action requests on discord_action (Sol/low)")
+                print("  ✓ Kept Discord action requests on discord_action")
 
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
     # Users can hand-edit mcp_servers, and older installs may already contain a
