@@ -212,6 +212,96 @@ async def test_mentioned_audio_without_meeting_command_triggers_meeting_intake(a
 
 
 @pytest.mark.asyncio
+async def test_meeting_reply_summary_is_sent_to_created_thread(adapter, monkeypatch):
+    import discord
+
+    captured = []
+
+    async def fake_cache(att, ext):
+        assert att.filename == "meeting.ogg"
+        assert ext == ".ogg"
+        return "/tmp/uploaded-meeting.ogg"
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    feature_summary = AsyncMock(
+        return_value={"thread_id": "779", "message_id": "summary-3"}
+    )
+    monkeypatch.setattr(adapter, "initialize_feature_summary", feature_summary)
+
+    guild = SimpleNamespace(id=42, name="Guild")
+    channel = SimpleNamespace(id=12345, name="general", guild=guild)
+    thread = SimpleNamespace(
+        id=779,
+        name="Meeting notes — 2026-05-19 — look into this",
+        parent=channel,
+        guild=guild,
+    )
+    create_thread = AsyncMock(return_value=thread)
+    bot_user = adapter._client.user
+    attachment = SimpleNamespace(
+        filename="meeting.ogg",
+        content_type="audio/ogg",
+        url="https://cdn.discordapp.example/meeting.ogg",
+        size=123,
+    )
+    referenced_message = SimpleNamespace(
+        id=557,
+        content="Is auth broken?",
+        clean_content="Is auth broken?",
+        attachments=[attachment],
+        author=SimpleNamespace(id=200300400, display_name="alex", name="alex"),
+    )
+    message = SimpleNamespace(
+        id=559,
+        content=f"<@{bot_user.id}> look into this",
+        clean_content="@Sligo Labs look into this",
+        type=discord.MessageType.reply,
+        channel=channel,
+        author=SimpleNamespace(
+            id=100200300,
+            display_name="tbrent",
+            name="tbrent",
+            bot=False,
+        ),
+        mentions=[bot_user],
+        attachments=[],
+        message_snapshots=[],
+        flags=SimpleNamespace(value=0, voice=False),
+        guild=guild,
+        created_at=datetime(2026, 5, 19, 4, 0, 0),
+        reference=SimpleNamespace(
+            message_id=referenced_message.id,
+            resolved=referenced_message,
+            cached_message=None,
+        ),
+        create_thread=create_thread,
+        thread=None,
+    )
+
+    await adapter._handle_message(message)
+
+    create_thread.assert_awaited_once()
+    feature_summary.assert_awaited_once()
+    summary_call = feature_summary.await_args
+    assert summary_call.args == (thread,)
+    assert summary_call.kwargs["parent_channel"] is channel
+    assert summary_call.kwargs["initial_request"] == "/meeting look into this"
+    assert summary_call.kwargs["transcript_quote"] is None
+    assert summary_call.kwargs["source_message_id"] == "559"
+    assert "reply_to_message" not in summary_call.kwargs
+    assert len(captured) == 1
+    assert captured[0].source.thread_id == "779"
+    assert captured[0].feature_summary == {
+        "thread_id": "779",
+        "message_id": "summary-3",
+    }
+
+
+@pytest.mark.asyncio
 async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adapter, monkeypatch):
     import discord
 
