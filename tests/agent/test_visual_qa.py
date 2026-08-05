@@ -300,7 +300,7 @@ def test_visual_followup_directs_model_to_dedicated_tool():
     assert "attach `visual_qa_receipt`" not in nudge
 
 
-def test_visual_response_nudge_rejects_only_the_known_qa_only_collapse():
+def test_visual_response_nudge_uses_trusted_passed_state_not_output_phrase():
     requirement = classify_visual_requirement(
         "Split the confidence charts and add component breakdowns.",
         worker_route="action",
@@ -310,7 +310,6 @@ def test_visual_response_nudge_rejects_only_the_known_qa_only_collapse():
     nudge = build_visual_qa_response_nudge(
         requirement=requirement,
         receipts=[receipt],
-        final_response="Visual QA passed. The Confidence view is shipped and live.",
         original_request="Split the confidence charts and add component breakdowns.",
         platform="discord",
         runtime_mode="action",
@@ -320,11 +319,13 @@ def test_visual_response_nudge_rejects_only_the_known_qa_only_collapse():
     )
 
     assert nudge is not None
-    assert "complete response to the original request" in nudge
+    assert "one complete response to the original request" in nudge
+    assert "what changed" in nudge
+    assert "PR, merge, deploy, or live state" in nudge
     assert "Do not call more tools" in nudge
 
 
-def test_visual_response_nudge_allows_concise_concrete_closeouts():
+def test_visual_response_nudge_always_synthesizes_once_after_passed_state():
     requirement = classify_visual_requirement(
         "Split the confidence charts and add component breakdowns.",
         worker_route="action",
@@ -341,17 +342,8 @@ def test_visual_response_nudge_allows_concise_concrete_closeouts():
         "last_edit_order": 7,
     }
 
-    assert build_visual_qa_response_nudge(
-        final_response=(
-            "Split the financial and public charts, added component breakdowns, "
-            "and removed the old change chart. Visual QA passed."
-        ),
-        **common,
-    ) is None
-    assert build_visual_qa_response_nudge(
-        final_response="Made the requested button blue. Visual QA passed.",
-        **common,
-    ) is None
+    assert build_visual_qa_response_nudge(**common) is not None
+    assert build_visual_qa_response_nudge(attempts=1, **common) is None
 
 
 def test_visual_response_nudge_respects_explicit_qa_only_requests():
@@ -363,7 +355,6 @@ def test_visual_response_nudge_respects_explicit_qa_only_requests():
     assert build_visual_qa_response_nudge(
         requirement=requirement,
         receipts=[_receipt(requirement, order=8)],
-        final_response="Visual QA passed.",
         original_request="Only tell me whether visual QA passed or failed.",
         platform="discord",
         runtime_mode="action",
@@ -385,7 +376,6 @@ def test_visual_response_nudge_respects_explicit_qa_only_requests():
         assert build_visual_qa_response_nudge(
             requirement=requirement,
             receipts=[_receipt(requirement, order=8)],
-            final_response="Visual QA: passed.",
             original_request=request,
             platform="discord",
             runtime_mode="action",
@@ -404,7 +394,6 @@ def test_visual_response_nudge_does_not_exempt_ordinary_only_language():
     assert build_visual_qa_response_nudge(
         requirement=requirement,
         receipts=[_receipt(requirement, order=8)],
-        final_response="Visual QA passed. The dashboard is shipped and live.",
         original_request="Only change the dashboard colors and run visual QA.",
         platform="discord",
         runtime_mode="action",
@@ -423,7 +412,6 @@ def test_visual_response_nudge_does_not_exempt_wait_until_qa_language():
     assert build_visual_qa_response_nudge(
         requirement=requirement,
         receipts=[_receipt(requirement, order=8)],
-        final_response="Visual QA passed. The dashboard is shipped and live.",
         original_request=(
             "Only respond after visual QA passes, and include a full summary of what changed."
         ),
@@ -459,7 +447,6 @@ def test_visual_response_nudge_does_not_exempt_qa_status_plus_summary_requests()
         assert build_visual_qa_response_nudge(
             requirement=requirement,
             receipts=[_receipt(requirement, order=8)],
-            final_response="Visual QA passed. The dashboard is shipped and live.",
             original_request=request,
             platform="discord",
             runtime_mode="action",

@@ -568,7 +568,10 @@ def test_enforced_visual_qa_gate_keeps_prose_and_reaction_state_synchronized(
     coverage_ids = [item["id"] for item in requirement["assertions"]]
     assert successful_ledger.mark_agent_done(
         successful["id"],
-        final_response="Fresh verification passed.",
+        final_response=(
+            "Implemented the responsive dashboard and mobile sidebar. "
+            "Fresh verification and Visual QA passed. PR #42 is merged."
+        ),
         visual_qa_receipts=[
             {
                 "requirement_id": visual_requirement_id(requirement),
@@ -587,7 +590,10 @@ def test_enforced_visual_qa_gate_keeps_prose_and_reaction_state_synchronized(
         visual_qa_min_receipt_order=2,
     )
     successful_stored = successful_ledger.get(successful["id"])
-    assert successful_stored["final_response"] == "Fresh verification passed."
+    assert successful_stored["final_response"] == (
+        "Implemented the responsive dashboard and mobile sidebar. "
+        "Fresh verification and Visual QA passed. PR #42 is merged."
+    )
     assert successful_ledger.mark_completed(successful["id"])
     successful_state = successful_ledger.discord_thread_reaction_state(successful)
     assert successful_state == "done"

@@ -8,12 +8,39 @@ finish immediately after editing code without fresh evidence.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
 
 _MAX_CHANGED_PATHS_IN_NUDGE = 8
+
+_VERIFICATION_RESULT_ONLY_REQUEST_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:"
+    r"(?:only|just)\s+(?:tell|report|answer|give|say)(?:\s+me)?\s+"
+    r"(?:(?:the\s+)?(?:verification|test|tests|checks?|visual[ -]?qa)\s+result|"
+    r"(?:whether|if)\s+(?:(?:the\s+)?(?:verification|tests?|checks?|visual[ -]?qa)\s+)?"
+    r"(?:passed|failed|succeeded|was\s+green))"
+    r"|(?:respond|tell\s+me|answer|report)\s+only(?:\s+with)?\s+"
+    r"(?:(?:the\s+)?(?:verification|test|tests|checks?|visual[ -]?qa)\s+result|"
+    r"(?:whether|if)\s+(?:(?:the\s+)?(?:verification|tests?|checks?|visual[ -]?qa)\s+)?"
+    r"(?:passed|failed|succeeded|was\s+green))"
+    r"|(?:verification|test|tests|checks?|visual[ -]?qa)\s+result\s+only"
+    r")[.!?]*\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_VISUAL_QA_RESULT_ONLY_REQUEST_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:"
+    r"(?:only|just)\s+(?:tell|report|answer|give|say)(?:\s+me)?\s+"
+    r"(?:(?:the\s+)?visual[ -]?qa\s+result|(?:whether|if)\s+"
+    r"(?:visual[ -]?qa\s+(?:passed|failed)|it\s+(?:passed|failed)(?:\s+visual[ -]?qa)?))"
+    r"|(?:respond|tell\s+me|answer|report)\s+only(?:\s+with)?\s+(?:whether|if)\s+"
+    r"(?:visual[ -]?qa\s+(?:passed|failed)|it\s+(?:passed|failed)(?:\s+visual[ -]?qa)?)"
+    r"|visual[ -]?qa\s+(?:answer|response|result)\s+only"
+    r")(?:\s+or\s+(?:passed|failed))?(?:\s+for\s+this\s+change)?[.!?]*\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # Non-code file extensions whose edits carry no verifiable runtime behavior:
 # documentation, prose, and data/markup that no test/build exercises. When a
@@ -70,6 +97,15 @@ def _is_non_code_path(raw: str) -> bool:
 def _filter_verifiable_paths(paths: Iterable[str]) -> list[str]:
     """Drop documentation/prose paths; keep paths that could have verifiable behavior."""
     return [p for p in paths if p and not _is_non_code_path(p)]
+
+
+def verification_result_only_requested(value: Any) -> bool:
+    """Return whether the user explicitly requested only a verification result."""
+    text = str(value or "")
+    return bool(
+        _VERIFICATION_RESULT_ONLY_REQUEST_RE.fullmatch(text)
+        or _VISUAL_QA_RESULT_ONLY_REQUEST_RE.fullmatch(text)
+    )
 
 
 # Session identities (platform or source) that are NOT human conversational
@@ -286,7 +322,7 @@ def build_verify_on_stop_nudge(
             "Run the relevant verification command now ("
             + ", ".join(f"`{cmd}`" for cmd in verify_commands[:3])
             + (", ..." if len(verify_commands) > 3 else "")
-            + "), read any failure, repair the code, and summarize what passed."
+            + "), read any failure, and repair the code."
         )
     else:
         temp_dir = os.path.realpath(tempfile.gettempdir())
@@ -294,9 +330,8 @@ def build_verify_on_stop_nudge(
             "No canonical test/lint/build command was detected. Create a focused "
             f"temporary verification script under `{temp_dir}` using an OS-safe "
             "`tempfile` path with a `hermes-verify-` filename prefix, run it "
-            "against the changed behavior, clean it up when possible, and "
-            "summarize it explicitly as ad-hoc verification rather than suite "
-            "green."
+            "against the changed behavior and clean it up when possible. Report "
+            "it explicitly as ad-hoc verification rather than suite green."
         )
 
     return (
@@ -304,9 +339,68 @@ def build_verify_on_stop_nudge(
         "fresh passing verification evidence yet.\n\n"
         f"Verification status: {_status_detail(status)}\n\n"
         f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
-        f"{command_instruction} If verification is not possible, explain the "
-        "concrete blocker instead of claiming the work is fully verified."
+        f"{command_instruction} After verification and any required repairs, return "
+        "one complete refreshed response to the original request. State what changed, "
+        "the relevant verification, and evidenced PR, merge, deploy, or live state when "
+        "applicable. Do not reply with only the verification result, blindly concatenate "
+        "an earlier draft, or claim delivery state that the recorded evidence does not "
+        "support. If verification is not possible, explain the concrete blocker instead "
+        "of claiming the work is fully verified."
         f"{addendum}]"
+    )
+
+
+def should_synthesize_verification_response(
+    *,
+    session_id: str | None,
+    changed_paths: Iterable[str],
+    original_request: Any,
+    platform: Any,
+    runtime_mode: Any,
+    attempts: int = 0,
+) -> bool:
+    """Return whether trusted verification is ready for one private closeout pass."""
+    paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
+    if (
+        str(platform or "").strip().lower() != "discord"
+        or str(runtime_mode or "").strip().lower() != "action"
+        or attempts >= 1
+        or not paths
+        or verification_result_only_requested(original_request)
+    ):
+        return False
+    snapshot = _verification_snapshot(session_id=session_id, changed_paths=paths)
+    if snapshot is None:
+        return False
+    status, _facts = snapshot
+    return str(status.get("status") or "unverified") == "passed"
+
+
+def build_verification_response_nudge(
+    *,
+    session_id: str | None,
+    changed_paths: Iterable[str],
+    original_request: Any,
+    platform: Any,
+    runtime_mode: Any,
+    attempts: int = 0,
+) -> str | None:
+    """Return one state-based closeout synthesis nudge after trusted verification."""
+    if not should_synthesize_verification_response(
+        session_id=session_id,
+        changed_paths=changed_paths,
+        original_request=original_request,
+        platform=platform,
+        runtime_mode=runtime_mode,
+        attempts=attempts,
+    ):
+        return None
+    return (
+        "[System: Return one complete response to the original request using the full "
+        "recorded turn evidence and the latest candidate. State what changed, the relevant "
+        "verification, and evidenced PR, merge, deploy, or live state when applicable. "
+        "Refresh or correct any earlier draft instead of blindly concatenating it. Make no "
+        "unsupported completion or delivery claims. Do not call more tools.]"
     )
 
 
@@ -341,7 +435,10 @@ def build_visual_qa_stop_nudge(
 
 
 __all__ = [
+    "build_verification_response_nudge",
     "build_verify_on_stop_nudge",
     "build_visual_qa_stop_nudge",
+    "should_synthesize_verification_response",
+    "verification_result_only_requested",
     "verify_on_stop_enabled",
 ]

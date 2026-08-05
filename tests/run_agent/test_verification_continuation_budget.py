@@ -266,6 +266,59 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     agent._handle_max_iterations.assert_not_called()
 
 
+def test_verified_discord_action_gets_one_private_complete_closeout(agent, monkeypatch):
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.verify_on_stop = True
+    answers = iter([
+        _response("Fresh verification passed."),
+        _response(
+            "Updated the dashboard query handling and added the regression test. "
+            "`scripts/run_tests.sh tests/dashboard/test_query.py` passed. "
+            "PR #42 is merged."
+        ),
+    ])
+    calls = []
+
+    def model_call(api_kwargs):
+        calls.append(api_kwargs)
+        agent._turn_file_mutation_paths = {"dashboard/query.py"}
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            return_value=None,
+        ),
+        patch(
+            "agent.verification_stop.should_synthesize_verification_response",
+            return_value=True,
+        ),
+        patch(
+            "agent.verification_stop.build_verification_response_nudge",
+            return_value="return the complete evidenced closeout",
+        ),
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("Fix the dashboard query and ship it.")
+
+    assert result["final_response"].startswith("Updated the dashboard query handling")
+    assert result["api_calls"] == 2
+    assert result["completed"] is True
+    assert agent._completion_response_synthesis_attempts == 1
+    assert len(calls) == 2
+    assert calls[1].get("tool_choice") == "none"
+    assert "tools" not in calls[1]
+    assert [message.get("content") for message in result["messages"]] == [
+        "Fix the dashboard query and ship it.",
+        result["final_response"],
+    ]
+
+
 def test_visual_qa_only_response_gets_one_private_closeout_retry(agent, monkeypatch):
     agent.max_iterations = 2
     agent.iteration_budget.max_total = 2
@@ -310,7 +363,7 @@ def test_visual_qa_only_response_gets_one_private_closeout_retry(agent, monkeypa
         "Split the confidence charts and add component breakdowns.",
         result["final_response"],
     ]
-    assert agent._visual_qa_response_nudges == 1
+    assert agent._completion_response_synthesis_attempts == 1
     agent._handle_max_iterations.assert_not_called()
 
 
@@ -724,6 +777,10 @@ def test_visual_response_retry_does_not_consume_verification_attempts(
             "agent.verification_stop.build_verify_on_stop_nudge",
             side_effect=verification_nudge,
         ),
+        patch(
+            "agent.verification_stop.build_verification_response_nudge",
+            return_value="return the complete evidenced closeout",
+        ),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):
         result = agent.run_conversation(
@@ -732,6 +789,49 @@ def test_visual_response_retry_does_not_consume_verification_attempts(
 
     assert result["final_response"].startswith("Implemented the requested")
     assert verify_attempts == [0]
+
+
+def test_visual_pass_does_not_synthesize_while_generic_verification_is_blocked(
+    agent,
+    monkeypatch,
+):
+    requirement = classify_visual_requirement(
+        "Split the confidence charts and add component breakdowns.",
+        worker_route="action",
+    )
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    agent.visual_qa_requirement = requirement
+    agent.visual_qa_config = {"mode": "enforce_explicit"}
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {
+            "dashboard/src/routes/confidence/+page.svelte"
+        }
+        agent._visual_qa_last_edit_order = 1
+        agent._turn_runtime_stats["visual_qa_receipts"] = [
+            _visual_receipt(requirement, order=2)
+        ]
+        return _response("Fresh verification passed.")
+
+    agent._interruptible_api_call = MagicMock(side_effect=model_call)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch("agent.verification_stop.build_verify_on_stop_nudge", return_value=None),
+        patch(
+            "agent.verification_stop.build_verification_response_nudge",
+            return_value=None,
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "Split the confidence charts and add component breakdowns."
+        )
+
+    assert result["final_response"] == "Fresh verification passed."
+    assert agent._interruptible_api_call.call_count == 1
+    assert agent._completion_response_synthesis_attempts == 0
 
 
 def test_successful_visual_repair_does_not_leak_fallback_into_pre_verify(
@@ -821,7 +921,7 @@ def test_visual_response_retry_is_disabled_during_closeout_finalization(
         "Visual QA passed. The Confidence view is shipped and live."
     )
     assert result["completed"] is True
-    assert agent._visual_qa_response_nudges == 0
+    assert agent._completion_response_synthesis_attempts == 0
 
 
 def test_multiple_verification_retries_hide_candidates_until_verified(agent, monkeypatch):
