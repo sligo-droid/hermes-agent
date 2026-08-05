@@ -1,0 +1,11 @@
+name: traces
+version: 0.1.0
+description: "Publish protected trace links for completed Discord sessions."
+author: Sligo Labs
+provides_hooks:
+  - on_session_end
+  - on_session_finalize
+  - subagent_start
+  - subagent_stop
+  - coding_worker_start
+  - coding_worker_stop
