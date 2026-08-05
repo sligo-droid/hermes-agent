@@ -518,7 +518,7 @@ macOS（主机）：
        ├─ api_server 适配器 ← 监听 0.0.0.0:8642
        ├─ AIAgent ← 单一数据源
        ├─ 会话、记忆、技能
-       └─ 本地文件访问（Obsidian、项目等）
+       └─ 本地文件访问（项目笔记、代码仓库等）
 
 Linux 虚拟机（Docker）：
   └─ hermes gateway（代理模式）

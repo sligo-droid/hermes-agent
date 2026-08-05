@@ -118,7 +118,7 @@ def _browser_driver(authorize_url: str) -> None:
 
 def test_full_loopback_flow_then_refresh(tmp_path, fake_as):
     config_path = tmp_path / "honcho.json"
-    config_path.write_text(json.dumps({"hosts": {"obsidian": {"workspace": "obsidian"}}}))
+    config_path.write_text(json.dumps({"hosts": {"notes": {"workspace": "notes"}}}))
 
     cred = oauth_flow.authorize_via_loopback(
         config_path=config_path,
@@ -134,7 +134,7 @@ def test_full_loopback_flow_then_refresh(tmp_path, fake_as):
     assert saved["hosts"]["hermes"]["oauth"]["refreshToken"] == "hch-rt-1"
     assert saved["hosts"]["hermes"]["recallMode"] == "hybrid"
     assert saved["environment"] == "production"
-    assert saved["hosts"]["obsidian"] == {"workspace": "obsidian"}
+    assert saved["hosts"]["notes"] == {"workspace": "notes"}
 
     # Force expiry; ensure_fresh_token refreshes against the same AS and rotates.
     token, refreshed = oauth.ensure_fresh_token(

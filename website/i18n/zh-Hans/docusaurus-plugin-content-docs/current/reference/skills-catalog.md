@@ -122,7 +122,6 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
-| [`obsidian`](/user-guide/skills/bundled/note-taking/note-taking-obsidian) | 在 Obsidian 知识库中读取、搜索、创建和编辑笔记。 | `note-taking/obsidian` |
 
 ## productivity
 

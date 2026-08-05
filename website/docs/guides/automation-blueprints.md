@@ -334,8 +334,8 @@ Daily arXiv scan that saves summaries to your note-taking system.
 
 ```bash
 hermes cron create "0 8 * * *" \
-  "Search arXiv for the 3 most interesting papers on 'language model reasoning' OR 'tool-use agents' from the past day. For each paper, create an Obsidian note with the title, authors, abstract summary, key contribution, and potential relevance to Hermes Agent development." \
-  --skill arxiv --skill obsidian \
+  "Search arXiv for the 3 most interesting papers on 'language model reasoning' OR 'tool-use agents' from the past day. Save a Markdown digest with each paper's title, authors, abstract summary, key contribution, and potential relevance to Hermes Agent development." \
+  --skill arxiv \
   --name "Paper digest" \
   --deliver local
 ```
