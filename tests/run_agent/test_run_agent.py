@@ -4429,6 +4429,57 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_subagent_progress_content_completes_without_retry(self, agent):
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+        agent.iteration_budget.max_total = 2
+        agent._delegate_depth = 1
+        progress = []
+        agent.tool_progress_callback = lambda *args: progress.append(args)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="<think>Inspecting the navigation</think>\nImplementation brief",
+            finish_reason="stop",
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("review the navigation")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        assert progress == [("_thinking", "Inspecting the navigation")]
+
+    def test_post_response_local_error_stops_without_retry(self, agent):
+        self._setup_agent(agent)
+        agent.max_iterations = 3
+        agent.iteration_budget.max_total = 3
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Implementation brief",
+            finish_reason="stop",
+        )
+
+        with (
+            patch.object(
+                agent,
+                "_has_content_after_think_block",
+                side_effect=NameError("local post-response bug"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("review the navigation")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        assert "local message processing" in result["final_response"]
+        assert "local post-response bug" in result["final_response"]
+
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
         agent.api_mode = "codex_responses"

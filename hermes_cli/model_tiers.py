@@ -50,7 +50,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
     "basic": {
         "model": "gpt-5.6-terra",
         "opencode_model": "hermes-codex/gpt-5.6-terra",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "high",
         "fast_mode": True,
     },
     "intermediate": {
