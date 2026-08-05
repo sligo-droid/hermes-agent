@@ -30,6 +30,15 @@ def _bare_agent() -> AIAgent:
 
 
 class TestSteerAcceptance:
+    def test_reports_open_state_while_turn_accepts_steering(self):
+        agent = _bare_agent()
+        assert agent.steer_state() == "open"
+
+    def test_reports_unsupported_state_when_transport_cannot_steer(self):
+        agent = _bare_agent()
+        agent._open_steer_intake(supported=False)
+        assert agent.steer_state() == "unsupported"
+
     def test_accepts_non_empty_text(self):
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
@@ -77,6 +86,7 @@ class TestSteerDrain:
     def test_close_rejects_new_guidance(self):
         agent = _bare_agent()
         assert agent._close_steer_intake_and_take() is None
+        assert agent.steer_state() == "closed"
         assert agent.steer("too late") is False
 
     def test_racing_close_never_accepts_and_loses_text(self):
