@@ -1553,6 +1553,7 @@ class MessageEvent:
     # from detached delegation completions and may be discarded when their
     # originating Discord work item already has a delivered final response.
     background_process_completion: bool = False
+    background_process_session_id: Optional[str] = None
     suppress_user_output: bool = False
     participates_in_work_lifecycle: bool = True
     background_completion_required_failed: bool = False

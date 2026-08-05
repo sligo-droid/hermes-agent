@@ -6062,6 +6062,35 @@ class _GatewayRunnerCore(
         }
 
     @staticmethod
+    def _is_consumed_process_completion(event: Optional[MessageEvent]) -> bool:
+        """Return whether a queued terminal completion was already read.
+
+        A process may exit while its originating agent turn is still active.
+        The watcher can queue the synthetic completion just before that turn
+        consumes the same result via ``process wait`` or ``process log``. Recheck
+        consumption when draining the queue so the raced event does not become a
+        redundant second model turn.
+        """
+        if not event or not getattr(event, "background_process_completion", False):
+            return False
+        process_session_id = str(
+            getattr(event, "background_process_session_id", "") or ""
+        ).strip()
+        if not process_session_id:
+            return False
+        try:
+            from tools.process_registry import process_registry
+
+            return process_registry.is_completion_consumed(process_session_id)
+        except Exception:
+            logger.debug(
+                "Could not check consumed process completion %s",
+                process_session_id,
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
     def _session_has_pending_background_workers(
         session_key: str,
         *,
@@ -27829,6 +27858,9 @@ class _GatewayRunnerCore(
             message_id=str(evt.get("message_id") or "").strip() or None,
         )
         synth_event.background_process_completion = True
+        synth_event.background_process_session_id = str(
+            evt.get("session_id") or ""
+        ).strip() or None
         if source.platform == Platform.DISCORD:
             origin_work_item_id = str(
                 evt.get("origin_work_item_id") or ""
@@ -32916,6 +32948,14 @@ class _GatewayRunnerCore(
                             consume=False,
                         )
                     ):
+                        pending_event = None
+                    if self._is_consumed_process_completion(pending_event):
+                        logger.info(
+                            "Discarding queued terminal-process completion already "
+                            "consumed by the originating turn: %s",
+                            getattr(pending_event, "background_process_session_id", "")
+                            or "unknown",
+                        )
                         pending_event = None
                     if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                         interrupt_message = result.get("interrupt_message")

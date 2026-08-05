@@ -313,6 +313,42 @@ def test_stale_discord_process_completion_only_drops_after_final_delivery(
     ) is expected
 
 
+def test_consumed_queued_process_completion_is_redundant(monkeypatch):
+    """A watcher race must not create a second turn after wait/log consumed it."""
+    import tools.process_registry as pr_module
+    from gateway.platforms.base import MessageEvent
+
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry([], consumed={"proc-consumed"}),
+    )
+    event = MessageEvent(
+        text="[IMPORTANT: Background process exited]",
+        internal=True,
+        background_process_completion=True,
+        background_process_session_id="proc-consumed",
+    )
+
+    assert GatewayRunner._is_consumed_process_completion(event) is True
+
+
+def test_unconsumed_queued_process_completion_still_continues(monkeypatch):
+    """Unobserved completions retain notify_on_complete continuation semantics."""
+    import tools.process_registry as pr_module
+    from gateway.platforms.base import MessageEvent
+
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry([]))
+    event = MessageEvent(
+        text="[IMPORTANT: Background process exited]",
+        internal=True,
+        background_process_completion=True,
+        background_process_session_id="proc-unconsumed",
+    )
+
+    assert GatewayRunner._is_consumed_process_completion(event) is False
+
+
 @pytest.mark.asyncio
 async def test_tagged_process_completion_hydrates_exact_w1_not_newer_w2():
     from gateway.platforms.base import MessageType
