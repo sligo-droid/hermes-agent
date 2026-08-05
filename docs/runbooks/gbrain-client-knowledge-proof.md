@@ -20,8 +20,8 @@ commit `aecb33e795cc4806f760446c55ab1c350194ddc8`.
 - Tool responses are allowlisted and bounded. The plugin does not expose raw
   GBrain commands, synthesis, ingestion, sync, provider calls, or write tools.
 - Delegated children lose the `client_knowledge` toolset after inheritance and
-  composite expansion. OpenCode workers also lose GBrain paths and
-  `HERMES_CLIENT_KNOWLEDGE_*` environment variables.
+  composite expansion. OpenCode workers require isolated configuration and
+  also lose GBrain paths and `HERMES_CLIENT_KNOWLEDGE_*` environment variables.
 - Prompt guidance asks for explicit, on-demand retrieval only. Hermes does not
   automatically query client knowledge before every turn.
 
@@ -111,8 +111,10 @@ Lane B runs in Docker `--network none`, starts a deterministic Anthropic-shaped
 server on container loopback, and traces GBrain's network syscalls. The locked
 manifest requires exactly one `POST /v1/messages` request to
 `127.0.0.1:18765`, exact canonical body hash and model, required headers, and no
-authorization header. Any request drift, DNS/non-loopback destination,
-embedding request, reranker request, decoy disclosure, or foreign citation
+authorization header. Every output citation must name evidence present in that
+exact captured request and resolve to a valid page in the locked project/source
+corpus. Any request drift, DNS/non-loopback destination, embedding request,
+reranker request, decoy disclosure, foreign citation, or ungrounded citation
 fails the proof.
 
 Lane B is proof-only. The repository does not configure or call a live model or
