@@ -449,6 +449,124 @@ class TestResolveConfigPath:
         assert config.api_key == "***"
         assert config.workspace_id == "local-ws"
 
+    def test_hosts_map_rejects_unknown_explicit_host_even_with_root_connectivity(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "hosts": {"hermes": {"enabled": True, "workspace": "shared"}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_unknown", config_path=config_file
+        )
+
+        assert config.host == "hermes_unknown"
+        assert config.enabled is False
+        assert config.explicitly_configured is False
+
+    def test_hosts_map_rejects_unknown_profile_host_with_root_enabled(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "enabled": True,
+            "baseUrl": "http://127.0.0.1:8000",
+            "hosts": {"hermes": {"enabled": True}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_new_profile", config_path=config_file
+        )
+
+        assert config.enabled is False
+
+    def test_hosts_map_preserves_configured_disabled_host(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "hosts": {"hermes_archived": {"enabled": False}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_archived", config_path=config_file
+        )
+
+        assert config.enabled is False
+        assert config.explicitly_configured is True
+
+    def test_hosts_map_allows_configured_host_to_inherit_root_connectivity(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "hosts": {"hermes_coder": {"workspace": "shared", "aiPeer": "coder"}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_coder", config_path=config_file
+        )
+
+        assert config.enabled is True
+        assert config.workspace_id == "shared"
+        assert config.ai_peer == "coder"
+
+    def test_empty_host_block_is_configured_and_inherits_root_fields(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "workspace": "root-workspace",
+            "aiPeer": "root-peer",
+            "hosts": {"hermes_coder": {}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_coder", config_path=config_file
+        )
+
+        assert config.enabled is True
+        assert config.explicitly_configured is True
+        assert config.workspace_id == "root-workspace"
+        assert config.ai_peer == "root-peer"
+
+    def test_empty_legacy_dot_host_block_is_configured(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "hosts": {"hermes.coder": {}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_coder", config_path=config_file
+        )
+
+        assert config.enabled is True
+        assert config.explicitly_configured is True
+
+    def test_legacy_dot_form_host_is_allowlisted(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "hosts": {"hermes.coder": {"workspace": "shared", "aiPeer": "coder"}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_coder", config_path=config_file
+        )
+
+        assert config.enabled is True
+        assert config.workspace_id == "shared"
+
+    def test_flat_legacy_config_still_auto_enables(self, tmp_path):
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://127.0.0.1:8000",
+            "workspace": "legacy-shared",
+        }))
+
+        config = HonchoClientConfig.from_global_config(
+            host="hermes_any", config_path=config_file
+        )
+
+        assert config.enabled is True
+        assert config.workspace_id == "legacy-shared"
+
 
 class TestResolveActiveHost:
     def test_profile_host_key_uses_honcho_safe_separator(self):

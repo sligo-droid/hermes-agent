@@ -32,9 +32,8 @@ Use the smallest stable home for each kind of knowledge:
 | --- | --- |
 | Repo docs | Durable product context, architecture decisions, runbooks, and narrow routing/pickup pointers tied to this codebase. |
 | Skills | Reusable procedures, pitfall checklists, command recipes, and class-level workflows. Skills should not be the current-state ledger. |
-| Memory/User profile | Compact facts that must be injected every session: user preferences, stable environment facts, and hard safety constraints. |
+| Honcho / user memory | Compact stable recall such as user preferences, environment facts, and hard safety constraints. It is non-canonical and should be rebuildable from authoritative sources. |
 | Session search | Recall prior conversations and exact past claims when needed; do not encode session progress as memory. |
-| Obsidian | Cross-project synthesis, external research, and non-repo notes that should not travel with a product repo. |
 | Notion | Client-facing documents, feedback, shared project folders, and source artifacts. |
 | Discord | Live conversation, approvals, operator pings, and feature threads. Not canonical state by itself. |
 

@@ -737,11 +737,10 @@ class TestSenderPrefixWithBackfill:
         assert "[Alice] [Recent" not in result
 
     @pytest.mark.asyncio
-    async def test_inlined_txt_document_adds_obsidian_instruction_and_preserves_order(
-        self, runner, source, tmp_path, monkeypatch,
+    async def test_inlined_txt_document_behaves_like_pasted_text(
+        self, runner, source, tmp_path,
     ):
         """Decoded .txt uploads should reach the agent like pasted text."""
-        monkeypatch.delenv("OBSIDIAN_VAULT_PATH", raising=False)
         doc_path = tmp_path / "doc_abc_notes.txt"
         doc_path.write_text("file line", encoding="utf-8")
         event = MessageEvent(
@@ -758,10 +757,8 @@ class TestSenderPrefixWithBackfill:
             event=event, source=source, history=[],
         )
 
-        assert result.startswith("[Gateway note: The user uploaded .txt document(s) 'notes.txt'.")
-        assert "synthesize durable non-secret learnings" in result
-        assert "/obsidian-vault" in result
-        assert result.endswith("[Alice] please inspect\n\nfile line")
+        assert result == "[Alice] please inspect\n\nfile line"
+        assert "durable non-secret learnings" not in result
         assert "The file is also saved at" not in result
 
     @pytest.mark.asyncio

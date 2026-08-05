@@ -231,17 +231,6 @@
     "size": "sm"
   },
   {
-    "id": "discord-jezza2463-daily-journal-kimi",
-    "source": "discord",
-    "author": "@jezza2463",
-    "url": "https://github.com/teknium1/nous-discord-archive/blob/main/archives/hermes-agent.txt",
-    "date": "2026-03-29",
-    "category": "personal-assistant",
-    "headline": "Daily journaling into Obsidian, learning to use OSS models",
-    "quote": "I do a really simple journal and log at the end of every day. I tried using Kimi 2.5 just like I would a Sonnet 4.6 but it messed all sorts of things up. When I said 'This is my log for last Thursday. Log it in Obsidian,' it didn't kick off my journaling skill call.",
-    "size": "md"
-  },
-  {
     "id": "gh-2024fatwolf-qq",
     "source": "github",
     "author": "@2024fatwolf55",
@@ -383,17 +372,6 @@
     "headline": "Generative visuals in TouchDesigner, via Hermes skill",
     "quote": "Expands touchdesigner-mcp skill with extensive reference docs so Hermes can help build generative/interactive media projects in TouchDesigner.",
     "size": "sm"
-  },
-  {
-    "id": "discord-kouff-obsidian-calendar-signal",
-    "source": "discord",
-    "author": "@kouff",
-    "url": "https://github.com/teknium1/nous-discord-archive/blob/main/archives/hermes-agent/",
-    "date": "2026-04-11",
-    "category": "personal-assistant",
-    "headline": "Hermes manages my tasks across Obsidian, Apple Calendar and Signal",
-    "quote": "I speak Turkish with it... initially said him to 'now i want you to use obsidian to manage my tasks and other stuff. and cross-check with my apple calendar'. later while working on another task today i said 'okay looks good. you know how you will manage tasks and events apple calendars + obsidian + cron/signal' and it confirmed the workflow.",
-    "size": "md"
   },
   {
     "id": "gh-prasad-vertex",
@@ -693,17 +671,6 @@
     "size": "md"
   },
   {
-    "id": "gkisokay-research-brief",
-    "source": "x",
-    "author": "@gkisokay",
-    "url": "https://x.com/gkisokay/status/2050026869274395020",
-    "date": "2026-05-01",
-    "category": "research",
-    "headline": "Daily research brief across Discord, Slack, Notion & Obsidian",
-    "quote": "There's one Hermes use case for everyone — build a research agent. Mine watches the AI/agent space, picks out useful signals, writes briefs, suggests content angles, tracks what I ignore, and keeps improving its own workflow. Delivers daily via Discord, Slack, Notion, email, Obsidian, and local markdown.",
-    "size": "md"
-  },
-  {
     "id": "discord-ereid7-hermes-lab",
     "source": "discord",
     "author": "@ereid7",
@@ -847,17 +814,6 @@
     "size": "sm"
   },
   {
-    "id": "jsong-llm-wiki",
-    "source": "blog",
-    "author": "Jsong (Medium)",
-    "url": "https://medium.com/@jsong_49820/how-i-built-a-self-improving-llm-wiki-with-hermes-agent-and-why-im-not-using-obsidian-1e9a7fa438c1",
-    "date": "2026-04-16",
-    "category": "research",
-    "headline": "A self-improving LLM Wiki second brain",
-    "quote": "Built a personal knowledge base that compounds over time instead of rotting — maintained by an LLM, not by me. Stack: Hetzner VPS, Hermes Agent, Telegram bot as second brain, Karpathy's LLM Wiki pattern, public static site at wiki.ai-biz.app.",
-    "size": "md"
-  },
-  {
     "id": "discord-kysiv-hermes-control-interface",
     "source": "discord",
     "author": "@kysiv",
@@ -878,17 +834,6 @@
     "headline": "Polymarket trading, 4 layers in parallel",
     "quote": "Hermes changed how I trade on Polymarket. Before: I looked at Yes/No price and guessed. Now: I read 4 layers at once — order book, on-chain addresses, lag between news and price, position changes. Hermes monitors all 4 in parallel through its Polymarket module + News Skill.",
     "size": "md"
-  },
-  {
-    "id": "rumjahn-everything",
-    "source": "blog",
-    "author": "Keith Rumjahn (Substack)",
-    "url": "https://rumjahn.substack.com/p/complete-guide-to-mastering-hermes",
-    "date": "2026-04-26",
-    "category": "personal-assistant",
-    "headline": "Apple Health, Threads analytics, Gmail, Calendar — in one CLI",
-    "quote": "Apple Health: Hermes wrote Python on the fly and found my sleep avg was 7.59 hrs. Threads Analytics: drop cookies in, pulled 34 posts of analytics in one command. Hermes is dramatically better than OpenClaw at browser automation. Gmail + Calendar OAuth via drag-drop JSON. Hermes = CEO, OpenClaw = Senior Engineer, both pointed at the same Obsidian vault on my NAS.",
-    "size": "lg"
   },
   {
     "id": "gh-chrisr-horse-racing",
@@ -954,17 +899,6 @@
     "category": "dev-workflow",
     "headline": "Multi-agent auto-build workflow (plan → code → QA → ship)",
     "quote": "Day 8 of Building AGI for my Hermes Agent: Auto-Build saved me loads of time and tokens. Main agent (GPT-5.4) breaks a plan into phases, coder agent (MiniMax M2.7) implements, QA agent (local Qwen 35B A3B) tests. Plan → implement → test → fail → repair → ship.",
-    "size": "md"
-  },
-  {
-    "id": "worldofai-shadcn-manim",
-    "source": "youtube",
-    "author": "WorldofAI (YouTube)",
-    "url": "https://www.youtube.com/watch?v=cu2fgknmemA",
-    "date": "2026-04-07",
-    "category": "creative",
-    "headline": "shadcn finance dashboard + Manim explainer videos",
-    "quote": "Used /browse to add Obsidian as a skill, populated a vault with shadcn/ui packages, then asked Hermes to build a finance dashboard using them. Result: beautiful, modern dashboard in minutes. Also used a manim skill to convert complex technical concepts into animated videos.",
     "size": "md"
   },
   {
@@ -1078,17 +1012,6 @@
     "size": "md"
   },
   {
-    "id": "discord-dalekc72-hermes-managing-tickets",
-    "source": "discord",
-    "author": "@dalekc72",
-    "url": "https://github.com/teknium1/nous-discord-archive/blob/main/archives/community-projects-showcase/1493589434971717763-Small-Win---Hermes---Claude-Code-managing-my-Tickets.txt",
-    "date": "",
-    "category": "business-ops",
-    "headline": "Hermes triages and works tickets in my PM software",
-    "quote": "Super excited that Hermes and Claude Code are now working tickets in my PM software, Plane.so. Tickets come in and Hermes triages and assigns and starts working the tickets. Basically Paperclip that gets sh*t done. They then document in the ticket and if needed create documentation for Obsidian.",
-    "size": "lg"
-  },
-  {
     "id": "gh-alexferrari-checkin",
     "source": "github",
     "author": "@alexferrari88",
@@ -1153,17 +1076,6 @@
     "headline": "Dogfooding a memory layer that isn't a black box",
     "quote": "I've been building and dogfooding Recall, a Hermes-native memory provider designed for people who want memory that is useful, inspectable, and safe — not a black box.",
     "size": "md"
-  },
-  {
-    "source": "reddit",
-    "author": "u/Jonathan_Rivera",
-    "url": "https://www.reddit.com/r/hermesagent/comments/1stz6gd/how_i_use_obsidian_as_the_longterm_memory/",
-    "date": "2026-04-23",
-    "category": "personal-assistant",
-    "headline": "Obsidian as the long-term memory backbone for Hermes (794 upvotes)",
-    "quote": "How I use Obsidian as the long-term memory backbone for my AI assistant. (794-upvote diagram showing Hermes Agent writing structured markdown notes back into a synced Obsidian vault, treating the vault as the durable memory layer that survives context resets and cross-machine moves.)",
-    "size": "md",
-    "id": "reddit-jonathan-rivera-obsidian-as-the"
   },
   {
     "id": "nazt-mcp-hybrid",
@@ -1318,17 +1230,6 @@
     "headline": "Turned my personal site's webdev style into a skill",
     "quote": "i've had some people asking about the webdev results i get, so i had minimax (my usual webdev model) turn it all into a skill — this is the same style as my personal site.",
     "size": "sm"
-  },
-  {
-    "id": "discord-modest-maoist-cartographer-brain",
-    "source": "discord",
-    "author": "@modest.maoist",
-    "url": "https://github.com/teknium1/nous-discord-archive/blob/main/archives/community-projects-showcase/1495354913205780661-Cartographer--Fully-Configurable-Semantic-Knowledge---Memory-Substrate.txt",
-    "date": "",
-    "category": "personal-assistant",
-    "headline": "A semantic knowledge substrate I made for my brain",
-    "quote": "Point it at your existing setup — Obsidian, vimwiki, Hermes sessions — and you've already built a semantic topology over your knowledgebase. Pair it with mapsOS — braindump to your agent, it parses into a qualitative map of your entire life. I made it & mapsOS for my brain. You can make them for yours.",
-    "size": "md"
   },
   {
     "id": "saboo-monica",
@@ -1912,17 +1813,6 @@
     "headline": "Got Hermes running on AWS VPS with Google Workspace automation",
     "quote": "Although Hermes installation was significantly easier than OpenClaw, it wasn't straight forward by any means. Things kept failing and it took many days-nights to figure it out because there was no documentation about this specific setup.",
     "size": "sm"
-  },
-  {
-    "id": "hn-rnxrx-obsidian",
-    "source": "hn",
-    "author": "rnxrx (Hacker News)",
-    "url": "https://news.ycombinator.com/item?id=47786673",
-    "date": "2026-04",
-    "category": "personal-assistant",
-    "headline": "Obsidian, home automation, VPS server management — on a cheap VPS",
-    "quote": "Having a competent agent with constant state has been good for memorializing and organizing important info directly into Obsidian, planning, and working out bugs with my home automation setup. Also helpful dealing with several miscellaneous servers in the house. I have it running on a cheap VPS and it's fairly locked down.",
-    "size": "md"
   },
   {
     "id": "discord-anibal3608-ollama-multiagent",

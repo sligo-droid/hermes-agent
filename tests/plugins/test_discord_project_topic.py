@@ -16,7 +16,6 @@ def _adapter(monkeypatch, tmp_path):
     instance = discord_adapter.DiscordAdapter(PlatformConfig(enabled=True))
     monkeypatch.setattr(instance, "_project_summary_state_path", lambda: tmp_path / "project-summary.json")
     monkeypatch.setattr(instance, "_production_url_from_env", lambda: None)
-    monkeypatch.setattr(instance, "_find_obsidian_project_note", lambda *args, **kwargs: None)
     return instance
 
 

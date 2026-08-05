@@ -12,6 +12,11 @@ tests/hermes_cli/test_skills_hub.py::test_do_vet_scans_local_skill_pack_json_wit
 tests/hermes_cli/test_skills_hub.py::test_do_vet_recursive_scans_nested_skills_under_single_skill_root
 tests/hermes_cli/test_profile_distribution.py::TestCodingTeamDistributionExamples::test_example_distribution_installs
 tests/agent/test_shell_hooks.py::TestCallbackSubprocess::test_block_translation_end_to_end
+tests/test_skill_catalog_policy.py
+tests/tools/test_skills_hub.py::test_guarded_fetch_never_calls_raw_fetch_when_inspect_is_rejected
+tests/tools/test_skills_hub.py::test_bundle_policy_rejects_adversarial_contents
+tests/tools/test_skills_hub.py::test_bundle_policy_allows_binary_and_narrow_attribution_controls
+tests/scripts/test_sanitize_skills_index.py
 
 # Core session and agent sanity checks.
 tests/test_lazy_session_regressions.py

@@ -165,7 +165,7 @@ terminal(command="grok --no-auto-update -c -p 'What did you change last time?'",
 ## Read-Only Audit → Markdown Note Pattern
 
 To have Grok review local artifacts and return a clean markdown note (for
-Obsidian or a repo) without mutating anything:
+a notes directory or a repo) without mutating anything:
 
 1. Prepare stable input files first with Hermes tools (`read_file`,
    `write_file`). Snapshot only the relevant context into a temp file rather

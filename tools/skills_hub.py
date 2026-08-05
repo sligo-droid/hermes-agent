@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import time
+import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +30,14 @@ from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
+from skill_catalog_policy import (
+    RETIRED_SKILL_MARKER,
+    atomic_write_skills_index,
+    filter_skill_records,
+    is_retired_skill_record,
+    is_retired_skill_text,
+    sanitize_skills_index,
+)
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunparse
 
@@ -170,6 +179,186 @@ class SkillBundle:
     identifier: str
     trust_level: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def _policy_record_for_meta(meta: SkillMeta) -> dict[str, Any]:
+    return {
+        "name": meta.name,
+        "description": meta.description,
+        "source": meta.source,
+        "identifier": meta.identifier,
+        "repo": meta.repo or "",
+        "path": meta.path or "",
+        "tags": meta.tags,
+        "extra": meta.extra,
+    }
+
+
+def _policy_record_for_bundle(
+    bundle: SkillBundle,
+    metadata_record: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "name": bundle.name,
+        "source": bundle.source,
+        "identifier": bundle.identifier,
+        "metadata": bundle.metadata,
+    }
+    if metadata_record:
+        record.update(metadata_record)
+    skill_md = bundle.files.get("SKILL.md")
+    if isinstance(skill_md, bytes):
+        skill_md = skill_md.decode("utf-8", errors="replace")
+    if isinstance(skill_md, str):
+        frontmatter = GitHubSource._parse_frontmatter_quick(skill_md)
+        for field_name in ("name", "description", "tags", "author", "metadata"):
+            if field_name in frontmatter:
+                record[field_name] = frontmatter[field_name]
+    return record
+
+
+def _skill_meta_allowed(meta: Optional[SkillMeta]) -> bool:
+    return meta is not None and not is_retired_skill_record(_policy_record_for_meta(meta))
+
+
+def _skill_bundle_allowed(
+    bundle: Optional[SkillBundle],
+    meta: Optional[SkillMeta] = None,
+) -> bool:
+    if bundle is None:
+        return False
+    metadata_record = _policy_record_for_meta(meta) if meta is not None else None
+    if is_retired_skill_record(_policy_record_for_bundle(bundle, metadata_record)):
+        return False
+    return _bundle_contents_allowed(bundle)
+
+
+_BUNDLE_SCAN_MAX_TOTAL_BYTES = 2 * 1024 * 1024
+_BUNDLE_SCAN_MAX_FILE_BYTES = 512 * 1024
+_BUNDLE_BINARY_MAX_FILE_BYTES = 1024 * 1024
+_BUNDLE_TEXT_SUFFIXES = frozenset(
+    {
+        ".md", ".markdown", ".txt", ".json", ".jsonc", ".yaml", ".yml",
+        ".toml", ".ini", ".cfg", ".conf", ".rst", ".csv", ".xml",
+        ".html", ".htm", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+        ".py", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".env", ".css",
+        ".scss", ".less", ".svg", ".sql", ".lock",
+    }
+)
+_BUNDLE_TEXT_NAMES = frozenset(
+    {"skill.md", "readme", "readme.md", "license", "manifest", "dockerfile"}
+)
+
+
+def _bundle_text_content(rel_path: str, content: Union[str, bytes]) -> Optional[str]:
+    """Return bounded UTF-8 text for policy scanning, or None for binary data."""
+    path = PurePosixPath(rel_path)
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    must_be_text = name == "skill.md"
+    binary_asset = (
+        bool(path.parts)
+        and path.parts[0].lower() == "assets"
+        and name not in _BUNDLE_TEXT_NAMES
+        and suffix not in _BUNDLE_TEXT_SUFFIXES
+    )
+    text_candidate = not binary_asset
+    if isinstance(content, str):
+        encoded = content.encode("utf-8")
+        if len(encoded) > _BUNDLE_SCAN_MAX_FILE_BYTES:
+            raise ValueError(f"Skill bundle text file exceeds policy scan limit: {rel_path}")
+        if "\x00" in content:
+            raise ValueError(f"Skill bundle text file contains NUL bytes: {rel_path}")
+        return content
+    if len(content) > _BUNDLE_SCAN_MAX_FILE_BYTES:
+        if text_candidate:
+            raise ValueError(f"Skill bundle text file exceeds policy scan limit: {rel_path}")
+        if len(content) > _BUNDLE_BINARY_MAX_FILE_BYTES:
+            raise ValueError(f"Skill bundle binary file exceeds policy size limit: {rel_path}")
+        return None
+    if b"\x00" in content:
+        if text_candidate:
+            raise ValueError(f"Skill bundle text file contains NUL bytes: {rel_path}")
+        return None
+    try:
+        return content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        if must_be_text or text_candidate:
+            raise ValueError(f"Skill bundle text file is not valid UTF-8: {rel_path}")
+        return None
+
+
+def _bundle_contents_allowed(bundle: SkillBundle) -> bool:
+    """Fail closed across bundle paths and every bounded text-bearing file."""
+    total = 0
+    skill_md_count = 0
+    for raw_path, content in bundle.files.items():
+        try:
+            rel_path = _validate_bundle_rel_path(raw_path)
+        except ValueError:
+            return False
+        path_record = {
+            "name": bundle.name,
+            "identifier": bundle.identifier,
+            "source": bundle.source,
+            "path": rel_path,
+        }
+        if is_retired_skill_record(path_record):
+            return False
+        size = len(content.encode("utf-8")) if isinstance(content, str) else len(content)
+        total += size
+        if total > _BUNDLE_SCAN_MAX_TOTAL_BYTES:
+            return False
+        try:
+            text = _bundle_text_content(rel_path, content)
+        except ValueError:
+            return False
+        if PurePosixPath(rel_path).name.lower() == "skill.md":
+            skill_md_count += 1
+        if text is None or RETIRED_SKILL_MARKER not in text.lower():
+            continue
+        frontmatter = GitHubSource._parse_frontmatter_quick(text) if rel_path.lower().endswith("skill.md") else {}
+        record = {
+            "name": str(frontmatter.get("name") or bundle.name),
+            "description": str(frontmatter.get("description") or ""),
+            "author": frontmatter.get("author", ""),
+            "metadata": frontmatter.get("metadata", {}),
+            "source": bundle.source,
+            "identifier": bundle.identifier,
+            "path": rel_path,
+        }
+        if is_retired_skill_record(record) or is_retired_skill_text(text):
+            return False
+    return skill_md_count > 0
+
+
+def _guard_skill_source(source: "SkillSource") -> "SkillSource":
+    """Apply the catalog policy to one source without changing its concrete type."""
+    if getattr(source, "_retired_catalog_policy_guarded", False):
+        return source
+    raw_search = source.search
+    raw_inspect = source.inspect
+    raw_fetch = source.fetch
+
+    def guarded_search(self, query: str, limit: int = 10):
+        return [meta for meta in raw_search(query, limit=limit) if _skill_meta_allowed(meta)]
+
+    def guarded_inspect(self, identifier: str):
+        meta = raw_inspect(identifier)
+        return meta if _skill_meta_allowed(meta) else None
+
+    def guarded_fetch(self, identifier: str):
+        meta = guarded_inspect(self, identifier)
+        if meta is None:
+            return None
+        bundle = raw_fetch(identifier)
+        return bundle if _skill_bundle_allowed(bundle, meta) else None
+
+    source.search = types.MethodType(guarded_search, source)
+    source.inspect = types.MethodType(guarded_inspect, source)
+    source.fetch = types.MethodType(guarded_fetch, source)
+    source._retired_catalog_policy_guarded = True
+    return source
 
 
 _ALLOWED_SUPPORT_DIRS = frozenset({"references", "templates", "scripts", "assets", "examples"})
@@ -1141,7 +1330,13 @@ class GitHubSource(SkillSource):
             stat = cache_file.stat()
             if time.time() - stat.st_mtime > INDEX_CACHE_TTL:
                 return None
-            return json.loads(cache_file.read_text())
+            cached = json.loads(cache_file.read_text())
+            if not isinstance(cached, list):
+                return None
+            sanitized = filter_skill_records(cached)
+            if sanitized != cached:
+                _write_index_cache(key, sanitized)
+            return sanitized
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -3558,13 +3753,32 @@ def _read_index_cache(key: str) -> Optional[Any]:
         stat = cache_file.stat()
         if time.time() - stat.st_mtime > INDEX_CACHE_TTL:
             return None
-        return json.loads(cache_file.read_text())
+        cached = json.loads(cache_file.read_text())
+        if isinstance(cached, list):
+            sanitized = filter_skill_records(cached)
+            if sanitized != cached:
+                _write_index_cache(key, sanitized)
+            return sanitized
+        if isinstance(cached, dict) and "skills" in cached:
+            sanitized_index = sanitize_skills_index(cached)
+            if sanitized_index is None:
+                return None
+            if sanitized_index != cached:
+                atomic_write_skills_index(cache_file, sanitized_index)
+            return sanitized_index
+        return cached
     except (OSError, json.JSONDecodeError):
         return None
 
 
 def _write_index_cache(key: str, data: Any) -> None:
     """Write data to cache."""
+    if isinstance(data, list):
+        data = filter_skill_records(data)
+    elif isinstance(data, dict) and "skills" in data:
+        data = sanitize_skills_index(data)
+        if data is None:
+            return
     index_cache_dir = _index_cache_dir()
     index_cache_dir.mkdir(parents=True, exist_ok=True)
     # Ensure .ignore exists so ripgrep (and tools respecting .ignore) skip
@@ -3800,6 +4014,8 @@ def install_from_quarantine(
     scan_provenance: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Move a scanned skill from quarantine into the skills directory."""
+    if not _skill_bundle_allowed(bundle):
+        raise ValueError("Skill is blocked by the retired integration policy")
     safe_skill_name = _validate_skill_name(skill_name)
     safe_category = _validate_install_parent_path(category) if category else ""
     quarantine_resolved = quarantine_path.resolve()
@@ -4011,7 +4227,12 @@ def _load_hermes_index() -> Optional[dict]:
         try:
             age = time.time() - cache_file.stat().st_mtime
             if age < HERMES_INDEX_TTL:
-                return json.loads(cache_file.read_text())
+                cached = json.loads(cache_file.read_text())
+                sanitized = sanitize_skills_index(cached)
+                if sanitized is not None:
+                    if sanitized != cached:
+                        atomic_write_skills_index(cache_file, sanitized)
+                    return sanitized
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -4058,14 +4279,13 @@ def _load_hermes_index() -> Optional[dict]:
     if data is None:
         return _load_stale_index_cache()
 
-    # Validate structure
-    if not isinstance(data, dict) or "skills" not in data:
+    data = sanitize_skills_index(data)
+    if data is None:
         return _load_stale_index_cache()
 
     # Cache locally
     try:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(data))
+        atomic_write_skills_index(cache_file, data)
     except OSError:
         pass
 
@@ -4077,7 +4297,12 @@ def _load_stale_index_cache() -> Optional[dict]:
     cache_file = _hermes_index_cache_file()
     if cache_file.exists():
         try:
-            return json.loads(cache_file.read_text())
+            cached = json.loads(cache_file.read_text())
+            sanitized = sanitize_skills_index(cached)
+            if sanitized is not None:
+                if sanitized != cached:
+                    atomic_write_skills_index(cache_file, sanitized)
+                return sanitized
         except (OSError, json.JSONDecodeError):
             pass
     return None
@@ -4107,7 +4332,8 @@ class HermesIndexSource(SkillSource):
         if not self._loaded:
             self._index = _load_hermes_index()
             self._loaded = True
-        return self._index or {}
+        sanitized = sanitize_skills_index(self._index)
+        return sanitized or {}
 
     def _get_github(self) -> GitHubSource:
         if self._github is None:
@@ -4186,7 +4412,7 @@ class HermesIndexSource(SkillSource):
         """
         index = self._ensure_loaded()
         entry = self._find_entry(identifier, index)
-        if not entry:
+        if not entry or is_retired_skill_record(entry):
             return None
 
         # Use resolved path if available
@@ -4215,7 +4441,7 @@ class HermesIndexSource(SkillSource):
         """Return metadata from the index.  Zero API calls."""
         index = self._ensure_loaded()
         entry = self._find_entry(identifier, index)
-        if entry:
+        if entry and not is_retired_skill_record(entry):
             return self._to_meta(entry)
         return None
 
@@ -4225,7 +4451,7 @@ class HermesIndexSource(SkillSource):
 
         # Exact identifier match
         for s in skills:
-            if s.get("identifier") == identifier:
+            if not is_retired_skill_record(s) and s.get("identifier") == identifier:
                 return s
 
         # Try without source prefix (e.g. "skills-sh/" stripped)
@@ -4237,6 +4463,8 @@ class HermesIndexSource(SkillSource):
 
         # Match on normalized identifier or name
         for s in skills:
+            if is_retired_skill_record(s):
+                continue
             sid = s.get("identifier", "")
             # Strip prefix from stored identifier too
             stored_normalized = sid
@@ -4289,7 +4517,7 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills
     ]
 
-    return sources
+    return [_guard_skill_source(source) for source in sources]
 
 
 def _search_one_source(
@@ -4408,6 +4636,11 @@ def unified_search(query: str, sources: List[SkillSource],
         source_filter=source_filter,
         overall_timeout=30,
     )
+
+    all_results = [
+        result for result in all_results
+        if not is_retired_skill_record(result.__dict__)
+    ]
 
     if source_filter.strip().lower() in _PROVIDER_FILTER_VALUES:
         all_results = _filter_results_by_provider(all_results, source_filter)

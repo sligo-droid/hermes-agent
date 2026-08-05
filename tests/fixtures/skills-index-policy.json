@@ -1,0 +1,45 @@
+{
+  "generated_at": "2026-08-05T00:00:00Z",
+  "skill_count": 6,
+  "skills": [
+    {
+      "name": "plain-markdown",
+      "identifier": "official/writing/plain-markdown",
+      "description": "Write portable Markdown.",
+      "author": "Obsidian Blackbird"
+    },
+    {
+      "name": "volcanic-rock-field-guide",
+      "identifier": "community/geology/volcanic-rock-field-guide",
+      "description": "Identify obsidian volcanic glass and other igneous rocks."
+    },
+    {
+      "name": "daily-recap",
+      "identifier": "community/productivity/daily-recap",
+      "description": "Save the daily recap to Obsidian."
+    },
+    {
+      "name": "clean-name",
+      "identifier": "community/notes/clean-name",
+      "metadata": {
+        "obsidian": false
+      }
+    },
+    {
+      "name": "knowledge-importer",
+      "identifier": "community/import/knowledge-importer",
+      "repo": "example/obsidian-importer",
+      "description": "Import portable documents."
+    },
+    {
+      "name": "nested-attribution-provenance",
+      "identifier": "community/meta/nested-attribution-provenance",
+      "contributors": [
+        {
+          "name": "Obsidian Blackbird",
+          "repo": "example/obsidian-tools"
+        }
+      ]
+    }
+  ]
+}
