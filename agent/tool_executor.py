@@ -55,12 +55,19 @@ from tools.terminal_tool import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
+    PERSISTED_OUTPUT_TAG,
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+_CLOSEOUT_FINALIZATION_REQUIRED = (
+    "Closeout receipt accepted. All tools are now disabled for this turn; "
+    "return one concise final response from the recorded evidence."
+)
+_CLOSEOUT_LOG_BUDGET = BudgetConfig(preview_size=0)
 
 
 def _closeout_receipt_gate_reason(agent: Any) -> str:
@@ -144,15 +151,32 @@ def _process_closeout_receipt(
             return json.dumps(payload, ensure_ascii=False), False
         return result, False
     reason = _closeout_receipt_gate_reason(agent)
+    if reason == "visual_qa_pending":
+        agent._pending_closeout_receipt = receipt
+        payload = {
+            "closeout_receipt": receipt,
+            "closeout_receipt_pending": {
+                "reason": reason,
+                "required_tool": "visual_qa",
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False), False
     if reason:
         payload["closeout_receipt_rejected"] = {"reason": reason}
         return json.dumps(payload, ensure_ascii=False), False
 
-    payload["closeout_receipt"] = receipt
-    payload["finalization_required"] = (
-        "Closeout receipt accepted. All tools are now disabled for this turn; "
-        "return one concise final response from the recorded evidence."
-    )
+    _accept_closeout_receipt(agent, receipt)
+    payload = {
+        "closeout_receipt": receipt,
+        "finalization_required": _CLOSEOUT_FINALIZATION_REQUIRED,
+    }
+    return json.dumps(payload, ensure_ascii=False), True
+
+
+def _accept_closeout_receipt(agent: Any, receipt: dict[str, Any]) -> None:
+    """Promote one sanitized receipt to the turn's terminal state."""
+
+    agent._pending_closeout_receipt = None
     agent._accepted_closeout_receipt = receipt
     agent._closeout_finalization_attempts = 0
     agent._closeout_tool_choice_retries = 0
@@ -160,7 +184,62 @@ def _process_closeout_receipt(
     stats = getattr(agent, "_turn_runtime_stats", None)
     if isinstance(stats, dict):
         stats["closeout_receipt"] = receipt
+
+
+def _promote_pending_closeout_receipt(
+    agent: Any,
+    function_name: str,
+    result: Any,
+) -> tuple[Any, bool]:
+    """Accept a pending closeout immediately after trusted visual QA passes."""
+
+    receipt = getattr(agent, "_pending_closeout_receipt", None)
+    if function_name != "visual_qa" or not isinstance(receipt, dict):
+        return result, False
+    if _closeout_receipt_gate_reason(agent):
+        return result, False
+    try:
+        payload = json.loads(result) if isinstance(result, str) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return result, False
+    if not isinstance(payload, dict):
+        return result, False
+
+    _accept_closeout_receipt(agent, receipt)
+    payload["closeout_receipt"] = receipt
+    payload["finalization_required"] = _CLOSEOUT_FINALIZATION_REQUIRED
     return json.dumps(payload, ensure_ascii=False), True
+
+
+def _attach_closeout_log_reference(
+    compact_result: Any,
+    full_result: Any,
+    *,
+    tool_call_id: str,
+    effective_task_id: str,
+) -> Any:
+    """Persist a recognized closeout's full terminal result outside context."""
+
+    if not isinstance(compact_result, str) or not isinstance(full_result, str):
+        return compact_result
+    try:
+        payload = json.loads(compact_result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return compact_result
+    if not isinstance(payload, dict) or not isinstance(payload.get("closeout_receipt"), dict):
+        return compact_result
+    reference = maybe_persist_tool_result(
+        content=full_result,
+        tool_name="terminal",
+        tool_use_id=tool_call_id,
+        env=get_active_env(effective_task_id),
+        config=_CLOSEOUT_LOG_BUDGET,
+        threshold=0,
+    )
+    if PERSISTED_OUTPUT_TAG not in reference:
+        return full_result
+    payload["closeout_log"] = reference
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _append_closeout_skipped_tool_results(
@@ -186,6 +265,32 @@ def _append_closeout_skipped_tool_results(
             messages,
             stage=f"closeout-skipped tool result {name}",
         )
+
+
+def _append_pending_closeout_skipped_tool_result(
+    agent: Any,
+    messages: list,
+    tool_call: Any,
+    *,
+    tool_name: str | None = None,
+) -> None:
+    name = tool_name or tool_call.function.name
+    messages.append(
+        make_tool_result_message(
+            name,
+            (
+                f"[Tool execution skipped — {name} was not started because a successful "
+                "closeout is waiting only for the required visual_qa check.]"
+            ),
+            tool_call.id,
+            effect_disposition="none",
+        )
+    )
+    _flush_session_db_after_tool_progress(
+        agent,
+        messages,
+        stage=f"pending-closeout-skipped tool result {name}",
+    )
 
 
 def _agent_has_pending_steer(agent) -> bool:
@@ -1311,6 +1416,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        if (
+            isinstance(getattr(agent, "_pending_closeout_receipt", None), dict)
+            and function_name != "visual_qa"
+        ):
+            _append_pending_closeout_skipped_tool_result(
+                agent,
+                messages,
+                tool_call,
+                tool_name=function_name,
+            )
+            continue
+
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
             function_name=function_name,
@@ -2089,6 +2206,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        if (
+            isinstance(getattr(agent, "_pending_closeout_receipt", None), dict)
+            and function_name != "visual_qa"
+        ):
+            _append_pending_closeout_skipped_tool_result(
+                agent,
+                messages,
+                tool_call,
+                tool_name=function_name,
+            )
+            continue
+
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
             function_name=function_name,
@@ -2581,11 +2710,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         _closeout_accepted_now = False
         if not _execution_blocked:
+            _full_closeout_result = function_result
             function_result, _closeout_accepted_now = _process_closeout_receipt(
                 agent,
                 function_name,
                 function_args,
                 function_result,
+            )
+            function_result = _attach_closeout_log_reference(
+                function_result,
+                _full_closeout_result,
+                tool_call_id=str(getattr(tool_call, "id", "") or "closeout"),
+                effective_task_id=effective_task_id,
             )
             closeout_boundary_hit = closeout_boundary_hit or _closeout_accepted_now
 
@@ -2653,6 +2789,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 tool_duration,
                 visual_assertion_args=function_args,
             )
+            function_result, _closeout_promoted_now = _promote_pending_closeout_receipt(
+                agent,
+                function_name,
+                function_result,
+            )
+            if _closeout_promoted_now:
+                _closeout_accepted_now = True
+                closeout_boundary_hit = True
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed

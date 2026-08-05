@@ -229,6 +229,7 @@ def _new_turn_runtime_stats(started_at: float) -> dict[str, Any]:
 
 
 def _reset_closeout_turn_state(agent: Any) -> None:
+    agent._pending_closeout_receipt = None
     agent._accepted_closeout_receipt = None
     agent._closeout_finalization_attempts = 0
     agent._closeout_tool_choice_retries = 0
