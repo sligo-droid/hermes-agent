@@ -977,6 +977,7 @@ async def test_run_agent_streaming_does_not_enable_completed_interim_commentary(
     )
 
     assert result.get("already_sent") is True
+    assert result.get("streamed_message_id") == "progress-1"
     assert not any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
 
 

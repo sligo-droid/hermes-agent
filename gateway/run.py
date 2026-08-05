@@ -20418,7 +20418,10 @@ class _GatewayRunnerCore(
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
-                            response, event, _media_adapter,
+                            response,
+                            event,
+                            _media_adapter,
+                            message_id=agent_result.get("streamed_message_id"),
                         )
                 if meeting_goal_status:
                     try:
@@ -23773,6 +23776,8 @@ class _GatewayRunnerCore(
         response: str,
         event: MessageEvent,
         adapter,
+        *,
+        message_id: Optional[str] = None,
     ) -> None:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
@@ -23843,6 +23848,57 @@ class _GatewayRunnerCore(
                     image_paths.append(file_path)
                 else:
                     non_image_local.append(file_path)
+
+            # Discord can add local files to the final streamed message via
+            # Message.edit(attachments=...). Prefer that over a second empty
+            # attachment-only message so the evidence belongs to the response.
+            attach_to_message = getattr(adapter, "attach_local_files_to_message", None)
+            if message_id and callable(attach_to_message):
+                attach_paths = list(image_paths)
+                attach_paths.extend(
+                    _unquote(image_url[7:])
+                    for image_url, _alt_text in images
+                    if image_url.startswith("file://")
+                )
+                attach_paths.extend(
+                    media_path
+                    for media_path, is_voice in non_image_media
+                    if not should_send_media_as_audio(
+                        event.source.platform,
+                        Path(media_path).suffix.lower(),
+                        is_voice=is_voice,
+                    )
+                )
+                attach_paths.extend(non_image_local)
+                attach_paths = list(dict.fromkeys(attach_paths))
+                if attach_paths:
+                    attach_result = await attach_to_message(
+                        chat_id=event.source.chat_id,
+                        message_id=message_id,
+                        file_paths=attach_paths,
+                        metadata=_thread_meta,
+                    )
+                    if isinstance(attach_result, SendResult):
+                        delivery_results.append(attach_result)
+                    if attach_result is not None and (
+                        attach_result.success or attach_result.retry_safe is False
+                    ):
+                        attached = set(attach_paths)
+                        image_paths = [path for path in image_paths if path not in attached]
+                        images = [
+                            item
+                            for item in images
+                            if not (
+                                item[0].startswith("file://")
+                                and _unquote(item[0][7:]) in attached
+                            )
+                        ]
+                        non_image_media = [
+                            item for item in non_image_media if item[0] not in attached
+                        ]
+                        non_image_local = [
+                            path for path in non_image_local if path not in attached
+                        ]
 
             if images or image_paths:
                 try:
@@ -30187,7 +30243,12 @@ class _GatewayRunnerCore(
             source=source,
         )
         if already_delivered:
-            await self._deliver_media_from_response(response, media_event, adapter)
+            await self._deliver_media_from_response(
+                response,
+                media_event,
+                adapter,
+                message_id=agent_result.get("streamed_message_id"),
+            )
             if footer_line:
                 await adapter.send(source.chat_id, footer_line, metadata=metadata)
             return
@@ -33474,6 +33535,8 @@ class _GatewayRunnerCore(
                     _content_delivered,
                 )
                 response["already_sent"] = True
+                if _sc is not None and _sc.message_id and _sc.message_id != "__no_edit__":
+                    response["streamed_message_id"] = _sc.message_id
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
@@ -33487,6 +33550,7 @@ class _GatewayRunnerCore(
                             finalize=True,
                         )
                         response["already_sent"] = True
+                        response["streamed_message_id"] = _sc_msg_id
                         logger.info(
                             "Edited streamed message %s for session %s to include plugin-transformed content.",
                             _sc_msg_id, session_key or "?",

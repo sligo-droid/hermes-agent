@@ -7940,6 +7940,152 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = await channel.send(content=caption if caption else None, file=file)
         return SendResult(success=True, message_id=str(msg.id))
 
+    async def send_final_with_local_attachments(
+        self,
+        chat_id: str,
+        content: str,
+        file_paths: List[str],
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Send final response text and local attachments in one Discord message."""
+        if not self._client or not file_paths or len(file_paths) > 10:
+            return None
+        if any(not os.path.isfile(path) for path in file_paths):
+            return None
+
+        formatted = self.format_message(content)
+        if not formatted or len(formatted) > self.MAX_MESSAGE_LENGTH:
+            return None
+
+        target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+        files: List[Any] = []
+        try:
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+            if not channel:
+                return SendResult(success=False, error=f"Channel {target_id} not found", retry_safe=True)
+
+            files = [
+                discord.File(path, filename=os.path.basename(path))
+                for path in file_paths
+            ]
+            if self._is_forum_parent(channel):
+                result = await self._forum_post_file(
+                    channel,
+                    content=formatted,
+                    files=files,
+                )
+            else:
+                reference = None
+                if reply_to:
+                    try:
+                        ref_msg = await channel.fetch_message(int(reply_to))
+                        reference = (
+                            ref_msg.to_reference(fail_if_not_exists=False)
+                            if hasattr(ref_msg, "to_reference")
+                            else ref_msg
+                        )
+                    except Exception as exc:
+                        logger.debug("Could not fetch reply-to message for attachment response: %s", exc)
+                send_kwargs: Dict[str, Any] = {
+                    "content": formatted,
+                    "files": files,
+                    "reference": reference,
+                }
+                allowed_mentions = _allowed_mentions_for_metadata(metadata)
+                if allowed_mentions is not None:
+                    send_kwargs["allowed_mentions"] = allowed_mentions
+                msg = await channel.send(**send_kwargs)
+                result = SendResult(
+                    success=True,
+                    message_id=str(msg.id),
+                    confirmed_message_ids=(str(msg.id),),
+                    retry_safe=False,
+                )
+
+            if result.success:
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=True,
+                )
+            return result
+        except Exception as exc:
+            error_text = str(exc)
+            return SendResult(
+                success=False,
+                error=error_text,
+                error_kind=classify_send_error(exc),
+                retryable=self._is_retryable_error(error_text),
+                retry_safe=bool(
+                    not self._is_retryable_error(error_text)
+                    and not self._is_timeout_error(error_text)
+                ),
+            )
+        finally:
+            for file in files:
+                with suppress(Exception):
+                    file.close()
+
+    async def attach_local_files_to_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        file_paths: List[str],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Add local attachments to an existing streamed Discord response."""
+        if not self._client or not file_paths or len(file_paths) > 10:
+            return None
+        if any(not os.path.isfile(path) for path in file_paths):
+            return None
+
+        target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+        files: List[Any] = []
+        try:
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+            if not channel:
+                return SendResult(success=False, error=f"Channel {target_id} not found", retry_safe=True)
+            msg = await channel.fetch_message(int(message_id))
+            existing = list(getattr(msg, "attachments", []) or [])
+            if len(existing) + len(file_paths) > 10:
+                return None
+            files = [
+                discord.File(path, filename=os.path.basename(path))
+                for path in file_paths
+            ]
+            await msg.edit(attachments=[*existing, *files])
+            return SendResult(
+                success=True,
+                message_id=str(message_id),
+                confirmed_message_ids=(str(message_id),),
+                retry_safe=False,
+            )
+        except Exception as exc:
+            error_text = str(exc)
+            return SendResult(
+                success=False,
+                error=error_text,
+                error_kind=classify_send_error(exc),
+                retryable=self._is_retryable_error(error_text),
+                retry_safe=bool(
+                    not self._is_retryable_error(error_text)
+                    and not self._is_timeout_error(error_text)
+                ),
+            )
+        finally:
+            for file in files:
+                with suppress(Exception):
+                    file.close()
+
     async def send_multiple_images(
         self,
         chat_id: str,

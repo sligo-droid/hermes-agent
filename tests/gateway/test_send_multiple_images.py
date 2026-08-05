@@ -273,6 +273,59 @@ class TestDiscordMultiImage:
         adapter._client = MagicMock()
         _run(adapter.send_multiple_images("67890", []))
 
+    def test_final_text_and_local_files_share_one_message(self, adapter, tmp_path):
+        paths = []
+        for name in ("focused.png", "context.png"):
+            path = tmp_path / name
+            path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            paths.append(str(path))
+
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock(id=42))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        result = _run(
+            adapter.send_final_with_local_attachments(
+                chat_id="67890",
+                content="Visual QA passed.",
+                file_paths=paths,
+                metadata={"notify": True},
+            )
+        )
+
+        assert result.success is True
+        mock_channel.send.assert_awaited_once()
+        kwargs = mock_channel.send.await_args.kwargs
+        assert kwargs["content"] == "Visual QA passed."
+        assert [file.filename for file in kwargs["files"]] == [
+            "focused.png",
+            "context.png",
+        ]
+
+    def test_streamed_final_adds_files_to_existing_message(self, adapter, tmp_path):
+        image = tmp_path / "evidence.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        message = MagicMock(attachments=[])
+        message.edit = AsyncMock(return_value=message)
+        channel = MagicMock()
+        channel.fetch_message = AsyncMock(return_value=message)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        result = _run(
+            adapter.attach_local_files_to_message(
+                chat_id="67890",
+                message_id="42",
+                file_paths=[str(image)],
+            )
+        )
+
+        assert result.success is True
+        message.edit.assert_awaited_once()
+        attachments = message.edit.await_args.kwargs["attachments"]
+        assert len(attachments) == 1
+        assert attachments[0].filename == "evidence.png"
+
     def test_failed_remote_download_falls_back_to_visible_url(self, adapter):
         mock_channel = MagicMock()
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
