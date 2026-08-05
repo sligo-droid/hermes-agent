@@ -910,6 +910,13 @@ def _run_opencode_once(
     ok, binary_or_error = check_opencode_binary({"coding_worker": {"opencode": cfg}})
     if not ok:
         return OpenCodeRunResult(error=binary_or_error)
+    if not cfg.get("isolated_config"):
+        return OpenCodeRunResult(
+            error=(
+                "OpenCode coding workers require isolated_config=true so ambient "
+                "OpenCode plugins and MCP servers cannot start."
+            )
+        )
 
     workdir_path = Path(workspace).expanduser().resolve()
     workdir = str(workdir_path)
@@ -1677,9 +1684,7 @@ def _opencode_process_env(
     config_home: Optional[Path],
     *,
     env: Optional[dict[str, str]] = None,
-) -> Optional[dict[str, str]]:
-    if env is None and config_home is None:
-        return None
+) -> dict[str, str]:
     extra_env = env or {}
     try:
         from tools.environments.local import _sanitize_subprocess_env

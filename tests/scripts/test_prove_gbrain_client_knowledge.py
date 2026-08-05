@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def _load_module():
     path = Path(__file__).resolve().parents[2] / "scripts" / "prove_gbrain_client_knowledge.py"
@@ -58,3 +60,42 @@ def test_lane_b_network_audit_identifies_dns_destination():
     assert loopback == []
     assert non_loopback == [trace]
     assert dns == [trace]
+
+
+def test_lane_b_rejects_same_project_citation_absent_from_request():
+    mod = _load_module()
+    source = Path(__file__).resolve().parents[1] / "fixtures" / "client_knowledge_gbrain" / "source"
+    request = {
+        "body": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '<pages><page slug="projects/pid/project" rank="1">'
+                                "PID project evidence</page></pages>"
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    answer = {
+        "answer": (
+            "The boundary applies "
+            "[projects/pid/decisions/project-knowledge-boundary]."
+        ),
+        "citations": [
+            {
+                "page_slug": "projects/pid/decisions/project-knowledge-boundary",
+                "row_num": None,
+            }
+        ],
+        "gaps": [],
+    }
+
+    with pytest.raises(mod.ProofError, match="not present in the exact model request"):
+        mod.validate_lane_b_citations(answer, request, source)

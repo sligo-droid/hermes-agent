@@ -21,8 +21,19 @@ import time
 from pathlib import Path
 from typing import Any
 
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from plugins.client_knowledge_gbrain.scope import (
+    ClientKnowledgeValidationError,
+    validate_canonical_project_slug,
+    validate_frontmatter,
+)
+
+
 FIXTURES = ROOT / "tests" / "fixtures" / "client_knowledge_gbrain"
 PINNED_TAG = "v0.42.73.1"
 PINNED_COMMIT = "aecb33e795cc4806f760446c55ab1c350194ddc8"
@@ -51,6 +62,13 @@ PROVIDER_CONFIG_FIELDS = frozenset(
 )
 INET_RE = re.compile(r"AF_INET6?\b")
 DESTINATION_SYSCALL_RE = re.compile(r"\b(?:connect|sendto|sendmsg|sendmmsg)\(")
+PAGE_EVIDENCE_RE = re.compile(
+    r'<page\s+slug="([^"]+)"(?:\s[^>]*)?>(.*?)</page>', re.DOTALL
+)
+TAKE_EVIDENCE_RE = re.compile(
+    r'<take\s+id="([^"]+)"(?:\s[^>]*)?>(.*?)</take>', re.DOTALL
+)
+INLINE_CITATION_RE = re.compile(r"\[([^\[\]]*(?:/|#)[^\[\]]*)\]")
 
 
 class ProofError(RuntimeError):
@@ -676,6 +694,109 @@ def request_summary(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _request_evidence(request: dict[str, Any]) -> tuple[set[str], set[str]]:
+    body = request.get("body")
+    if not isinstance(body, dict):
+        raise ProofError("Lane B captured request body is missing")
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        raise ProofError("Lane B captured request messages are missing")
+    page_slugs: set[str] = set()
+    take_ids: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            text = item["text"]
+            page_slugs.update(
+                slug
+                for slug, evidence in PAGE_EVIDENCE_RE.findall(text)
+                if evidence.strip()
+            )
+            take_ids.update(
+                take_id
+                for take_id, evidence in TAKE_EVIDENCE_RE.findall(text)
+                if evidence.strip()
+            )
+    if not page_slugs and not take_ids:
+        raise ProofError("Lane B captured request contained no citable evidence")
+    return page_slugs, take_ids
+
+
+def _validate_source_page(
+    source: Path,
+    slug: str,
+    *,
+    project_key: str,
+    source_id: str,
+) -> None:
+    if source_id != SOURCE_ID:
+        raise ProofError("Lane B citation source_id is not the locked client source")
+    try:
+        validate_canonical_project_slug(slug, project_key=project_key)
+    except ClientKnowledgeValidationError as exc:
+        raise ProofError(f"Lane B citation has an invalid project slug: {slug}") from exc
+    source_root = source.resolve()
+    page_path = (source_root / f"{slug}.md").resolve()
+    if not page_path.is_relative_to(source_root) or not page_path.is_file():
+        raise ProofError(f"Lane B citation does not resolve to a source page: {slug}")
+    text = page_path.read_text(encoding="utf-8")
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        raise ProofError(f"Lane B citation page lacks frontmatter: {slug}")
+    frontmatter_text, _body = text[4:].split("\n---\n", 1)
+    try:
+        frontmatter = yaml.load(frontmatter_text, Loader=yaml.BaseLoader)
+        validate_frontmatter(frontmatter, project_key=project_key, slug=slug)
+    except (yaml.YAMLError, ClientKnowledgeValidationError) as exc:
+        raise ProofError(f"Lane B citation page is invalid: {slug}") from exc
+
+
+def validate_lane_b_citations(
+    answer: dict[str, Any],
+    request: dict[str, Any],
+    source: Path,
+    *,
+    project_key: str = "pid",
+    source_id: str = SOURCE_ID,
+) -> list[str]:
+    page_slugs, take_ids = _request_evidence(request)
+    citations = answer.get("citations")
+    if not isinstance(citations, list) or not citations:
+        raise ProofError("Lane B answer lacked citations")
+    structured_ids: list[str] = []
+    for item in citations:
+        if not isinstance(item, dict):
+            raise ProofError("Lane B answer citation is not an object")
+        slug = str(item.get("page_slug") or "")
+        row_num = item.get("row_num")
+        if row_num is None:
+            citation_id = slug
+            grounded = slug in page_slugs
+        elif isinstance(row_num, int) and not isinstance(row_num, bool) and row_num > 0:
+            citation_id = f"{slug}#{row_num}"
+            grounded = citation_id in take_ids
+        else:
+            raise ProofError(f"Lane B citation has an invalid row number: {slug}")
+        if not grounded:
+            raise ProofError(
+                f"Lane B citation was not present in the exact model request: {citation_id}"
+            )
+        _validate_source_page(source, slug, project_key=project_key, source_id=source_id)
+        structured_ids.append(citation_id)
+    inline_ids = [
+        item.strip()
+        for item in INLINE_CITATION_RE.findall(str(answer.get("answer") or ""))
+    ]
+    if set(inline_ids) != set(structured_ids):
+        raise ProofError("Lane B inline and structured citations do not match")
+    return structured_ids
+
+
 def lane_b(
     output: Path,
     upstream: dict[str, Any],
@@ -722,9 +843,7 @@ def lane_b(
     answer_blob = json.dumps(answer, sort_keys=True)
     if "ORANGE-NEBULA-7319" in answer_blob:
         raise ProofError("Lane B synthesized answer disclosed decoy project data")
-    citations = answer.get("citations") or []
-    if not citations or not all(str(item.get("page_slug", "")).startswith("projects/pid/") for item in citations):
-        raise ProofError("Lane B answer lacked project-scoped citations")
+    grounded_citations = validate_lane_b_citations(answer, request, root / "source")
     receipt = {
         "schema_version": 1,
         "lane": "loopback_synthesis",
@@ -739,6 +858,7 @@ def lane_b(
         "reranker_requests": 0,
         "external_provider_cost_usd": 0,
         "network_trace_sha256": trace_sha,
+        "grounded_citations": grounded_citations,
         "setup_command_ledger": setup_ledger,
         "normalized_answer_sha256": sha256_bytes(canonical_json(answer)),
         "verdict": "pass",
