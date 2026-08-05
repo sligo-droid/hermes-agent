@@ -1219,8 +1219,9 @@ choose a model and reasoning effort.
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
 | `basic` | GPT-5.6 Luna | `xhigh` | Ordinary gateway sessions |
 | `intermediate` | GPT-5.6 Sol | `medium` | Coding-worker build passes and Kanban `dev` |
-| `discord_action` | GPT-5.6 Sol | `low` | Accepted Discord action requests |
+| `discord_action` | GPT-5.6 Sol | `medium` | Accepted Discord action requests |
 | `advanced` | GPT-5.6 Sol | `high` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
+| `deep_review` | GPT-5.6 Sol | `xhigh` | Root-turn deep reviews or explicit higher-reasoning requests |
 
 These code-owned built-ins follow the supported model/effort frontier: trivial
 work uses Luna, ordinary gateway work uses Luna at `xhigh`, moderately scoped build

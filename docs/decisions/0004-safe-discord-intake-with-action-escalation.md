@@ -84,7 +84,7 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
     context and reduce latency, but may delegate whenever parallelism, independent
     verification, context isolation, or deeper reasoning adds value. Any configured
     delegation tier remains available; omitted tiers inherit the route-tier parent
-    (Sol/low by default) while preserving read-only enforcement.
+    (Sol/medium by default) while preserving read-only enforcement.
 
 ## Consequences
 

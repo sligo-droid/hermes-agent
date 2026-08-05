@@ -46,24 +46,25 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
     "advanced": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "high",
         "fast_mode": False,
     },
-    # Human-requested deep reviews only. Delegation enforces the explicit
-    # root-turn authorization; this tier is intentionally outside the ladder.
+    # Human-requested deep reviews or higher-reasoning passes only. Delegation
+    # enforces the explicit root-turn authorization; this tier is intentionally
+    # outside the ladder.
     "deep_review": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "high",
+        "reasoning_effort": "xhigh",
         "fast_mode": False,
     },
     # Route-specific tier for ordinary Discord action orchestration. It is
     # intentionally outside MODEL_TIER_LADDER so worker/delegation stepping
-    # continues to treat ``advanced`` as the shared Sol/medium ceiling.
+    # continues to treat ``advanced`` as the shared Sol/high ceiling.
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",
         "fast_mode": False,
     },
     # Rendered-UI sweep workers reuse the trivial Luna/medium worker profile,
