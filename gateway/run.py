@@ -3144,7 +3144,17 @@ def _resolve_gateway_session_cwd(
         if channel_id in channel_ids:
             return cwd
 
-    if getattr(source, "project_path", None) or getattr(source, "project_channel_id", None):
+    mapped_project_path = str(getattr(source, "project_path", "") or "").strip()
+    if mapped_project_path:
+        mapped_project_path = os.path.expanduser(os.path.expandvars(mapped_project_path))
+        if Path(mapped_project_path).is_dir():
+            return mapped_project_path
+        logger.warning(
+            "Mapped Discord project path does not exist; using configured project fallback: %s",
+            mapped_project_path,
+        )
+
+    if getattr(source, "project_channel_id", None):
         project_cwd = cfg_get(cfg, "discord", "project_channel_cwd", default="")
         if str(project_cwd or "").strip():
             return _expand_configured_cwd(project_cwd, fallback=default_cwd)

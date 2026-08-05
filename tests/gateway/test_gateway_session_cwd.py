@@ -48,7 +48,10 @@ def test_dev_thread_inherits_parent_channel_cwd():
     assert _resolve(source) == "/home/droid/hermes"
 
 
-def test_project_channel_uses_workspace_cwd_but_keeps_project_context():
+def test_project_channel_uses_mapped_project_cwd_and_loads_agents(tmp_path):
+    project = tmp_path / "PID"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("PID feature scope rules.", encoding="utf-8")
     source = SessionSource(
         platform=Platform.DISCORD,
         chat_id="thread-1",
@@ -57,12 +60,33 @@ def test_project_channel_uses_workspace_cwd_but_keeps_project_context():
         parent_chat_id=PID_CHANNEL_ID,
         thread_id="thread-1",
         project_name="PID",
-        project_path="/home/droid/.hermes/workspace/PID",
+        project_path=str(project),
+        project_channel_id=PID_CHANNEL_ID,
+    )
+
+    cwd = _resolve(source)
+
+    assert cwd == str(project)
+    from agent.prompt_builder import build_context_files_prompt
+
+    assert "PID feature scope rules." in build_context_files_prompt(
+        cwd=cwd,
+        skip_soul=True,
+    )
+
+
+def test_project_channel_with_missing_mapped_path_uses_project_fallback(tmp_path):
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=PID_CHANNEL_ID,
+        chat_name="Sligo Labs / #pid",
+        chat_type="group",
+        project_name="PID",
+        project_path=str(tmp_path / "missing"),
         project_channel_id=PID_CHANNEL_ID,
     )
 
     assert _resolve(source) == "/home/droid/workspaces"
-    assert source.project_path == "/home/droid/.hermes/workspace/PID"
 
 
 def test_unmapped_discord_channel_uses_default_gateway_cwd():
