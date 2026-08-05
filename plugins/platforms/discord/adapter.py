@@ -14677,7 +14677,6 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         if (
             auto_threaded_channel is not None
-            and not is_meeting_command_message
             and not auto_threaded_direct_question
             and not slash_goal_uses_attachment_body
         ):
