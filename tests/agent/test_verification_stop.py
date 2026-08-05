@@ -10,8 +10,11 @@ from agent.verification_evidence import (
     record_terminal_result,
 )
 from agent.verification_stop import (
+    build_verification_response_nudge,
     build_verify_on_stop_nudge,
     build_visual_qa_stop_nudge,
+    should_synthesize_verification_response,
+    verification_result_only_requested,
     verify_on_stop_enabled,
 )
 from agent.conversation_loop import _begin_visual_stop_followup
@@ -187,6 +190,79 @@ def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
 
 
+def test_fresh_pass_enables_discord_action_completion_synthesis(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="green",
+    )
+
+    common = {
+        "session_id": "s1",
+        "changed_paths": [changed],
+        "original_request": "Implement the dashboard fix.",
+        "platform": "discord",
+        "runtime_mode": "action",
+    }
+    assert should_synthesize_verification_response(**common) is True
+    nudge = build_verification_response_nudge(**common)
+    assert nudge is not None
+    assert "what changed" in nudge
+    assert "relevant verification" in nudge
+    assert "PR, merge, deploy, or live state" in nudge
+    assert "Do not call more tools" in nudge
+
+
+def test_completion_synthesis_requires_action_code_and_fresh_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    code = str(tmp_path / "src" / "app.ts")
+    doc = str(tmp_path / "README.md")
+    common = {
+        "session_id": "s1",
+        "original_request": "Implement the dashboard fix.",
+        "platform": "discord",
+        "runtime_mode": "action",
+    }
+
+    assert should_synthesize_verification_response(changed_paths=[code], **common) is False
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="green",
+    )
+    assert should_synthesize_verification_response(
+        changed_paths=[doc], **common
+    ) is False
+    assert should_synthesize_verification_response(
+        changed_paths=[code], runtime_mode="read_only", **{
+            key: value for key, value in common.items() if key != "runtime_mode"
+        }
+    ) is False
+    assert should_synthesize_verification_response(
+        changed_paths=[code], attempts=1, **common
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Only report the verification result.",
+        "Just tell me whether the tests passed.",
+        "Please respond only with whether visual QA passed or failed.",
+    ],
+)
+def test_explicit_result_only_requests_skip_completion_synthesis(request_text):
+    assert verification_result_only_requested(request_text) is True
+
+
 def test_visual_stop_nudge_is_independent_from_generic_messaging_default():
     requirement = {
         "level": "surface",
@@ -288,6 +364,8 @@ def test_nudge_after_unverified_edit_with_known_command(tmp_path, monkeypatch):
     assert "`pnpm run test`" in nudge
     assert changed in nudge
     assert "creative UI/visual work" in nudge
+    assert "one complete refreshed response" in nudge
+    assert "Do not reply with only the verification result" in nudge
 
 
 def test_nudge_includes_failed_output_summary(tmp_path, monkeypatch):

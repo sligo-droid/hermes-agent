@@ -279,13 +279,13 @@ def _closeout_finalize_api_kwargs(agent: Any, api_kwargs: Any) -> Any:
     return bounded
 
 
-def _repair_visual_qa_response(
+def _repair_completion_response(
     agent: Any,
     api_messages: list,
     candidate: str,
     nudge: str,
 ) -> tuple[str, Any, float]:
-    """Try one private no-tool response repair, falling back to the draft."""
+    """Try one private no-tool closeout synthesis, falling back to the candidate."""
     repair_messages = list(api_messages)
     repair_messages.append({"role": "assistant", "content": candidate})
     repair_messages.append({"role": "user", "content": nudge})
@@ -353,7 +353,7 @@ def _repair_visual_qa_response(
     except InterruptedError:
         raise
     except Exception:
-        logger.debug("visual response repair failed open", exc_info=True)
+        logger.debug("completion response synthesis failed open", exc_info=True)
         return candidate, None, time.time() - started_at
     finally:
         agent.stream_delta_callback = previous_stream_delta
@@ -361,6 +361,44 @@ def _repair_visual_qa_response(
         agent.reasoning_callback = previous_reasoning_callback
         agent.interim_assistant_callback = previous_interim_callback
         agent.tool_progress_callback = previous_tool_progress
+
+
+def _visual_qa_completion_state(agent: Any) -> tuple[bool, bool]:
+    """Return ``(required, passed)`` for the current turn's visual evidence."""
+    try:
+        from agent.visual_qa import (
+            normalize_visual_qa_config,
+            normalize_visual_requirement,
+            visual_receipt_completion,
+        )
+
+        config = normalize_visual_qa_config(
+            getattr(agent, "visual_qa_config", None)
+        )
+        requirement = normalize_visual_requirement(
+            getattr(agent, "visual_qa_requirement", None)
+        )
+        changed_paths = getattr(agent, "_turn_file_mutation_paths", set()) or set()
+        last_edit_order = int(getattr(agent, "_visual_qa_last_edit_order", 0) or 0)
+        required = bool(
+            config["mode"] == "enforce_explicit"
+            and requirement["level"] in {"surface", "artifact"}
+            and any(str(path).strip() for path in changed_paths)
+            and last_edit_order > 0
+        )
+        if not required:
+            return False, False
+        completion = visual_receipt_completion(
+            requirement,
+            getattr(agent, "_turn_runtime_stats", {}).get(
+                "visual_qa_receipts", []
+            ),
+            min_order=last_edit_order + 1,
+        )
+        return True, completion["status"] == "passed"
+    except Exception:
+        logger.debug("visual QA completion-state check failed", exc_info=True)
+        return False, False
 
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
@@ -1331,7 +1369,7 @@ def run_conversation(
     agent._turn_mutation_boundary = 0
     agent._visual_qa_last_edit_order = 0
     agent._visual_qa_followup_turns = 0
-    agent._visual_qa_response_nudges = 0
+    agent._completion_response_synthesis_attempts = 0
     _reset_closeout_turn_state(agent)
     try:
         from agent.visual_qa import normalize_visual_requirement, set_active_visual_requirement
@@ -2180,8 +2218,13 @@ def run_conversation(
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
                 buffer_visual_response = False
+                buffer_verification_response = False
                 try:
                     from agent.visual_qa import should_buffer_visual_qa_response
+                    from agent.verification_stop import (
+                        should_synthesize_verification_response,
+                        verify_on_stop_enabled,
+                    )
 
                     buffer_visual_response = should_buffer_visual_qa_response(
                         requirement=getattr(agent, "visual_qa_requirement", None),
@@ -2194,13 +2237,46 @@ def run_conversation(
                         config=getattr(agent, "visual_qa_config", None),
                         changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                         last_edit_order=getattr(agent, "_visual_qa_last_edit_order", 0),
-                        attempts=getattr(agent, "_visual_qa_response_nudges", 0),
+                        attempts=getattr(
+                            agent, "_completion_response_synthesis_attempts", 0
+                        ),
+                    )
+                    verify_setting = getattr(agent, "verify_on_stop", None)
+                    verify_config = (
+                        {"agent": {"verify_on_stop": verify_setting}}
+                        if verify_setting is not None
+                        else None
+                    )
+                    visual_required, visual_passed = _visual_qa_completion_state(agent)
+                    buffer_verification_response = bool(
+                        verify_on_stop_enabled(verify_config)
+                        and (not visual_required or visual_passed)
+                        and should_synthesize_verification_response(
+                            session_id=getattr(agent, "session_id", None),
+                            changed_paths=getattr(
+                                agent, "_turn_file_mutation_paths", set()
+                            ),
+                            original_request=original_user_message,
+                            platform=getattr(agent, "platform", ""),
+                            runtime_mode=getattr(agent, "_runtime_mode", ""),
+                            attempts=getattr(
+                                agent, "_completion_response_synthesis_attempts", 0
+                            ),
+                        )
                     )
                 except Exception:
                     pass
+                buffer_completion_response = bool(
+                    buffer_visual_response or buffer_verification_response
+                )
+                if (
+                    _closeout_finalization_active(agent)
+                    or os.environ.get("HERMES_KANBAN_TASK")
+                ):
+                    buffer_completion_response = False
                 if (
                     getattr(agent, "_disable_streaming", False)
-                    or buffer_visual_response
+                    or buffer_completion_response
                 ):
                     _use_streaming = False
                 # CopilotACPClient communicates via subprocess stdio and
@@ -2249,7 +2325,7 @@ def run_conversation(
                     previous_interim_callback = getattr(agent, "interim_assistant_callback", None)
                     previous_tool_progress = getattr(agent, "tool_progress_callback", None)
                     try:
-                        if buffer_visual_response:
+                        if buffer_completion_response:
                             agent.stream_delta_callback = None
                             agent._stream_callback = None
                             agent.reasoning_callback = None
@@ -5230,7 +5306,7 @@ def run_conversation(
             if (
                 assistant_message.content
                 and agent.tool_progress_callback
-                and not buffer_visual_response
+                and not buffer_completion_response
             ):
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
@@ -5343,7 +5419,7 @@ def run_conversation(
                                 last_msg[_key] = interim_msg[_key]
                     else:
                         messages.append(interim_msg)
-                        if not buffer_visual_response:
+                        if not buffer_completion_response:
                             agent._emit_interim_assistant_message(interim_msg)
 
                 if agent._codex_incomplete_retries < 3:
@@ -5719,7 +5795,7 @@ def run_conversation(
                     and previous_interim_visible == current_interim_visible
                 )
                 messages.append(assistant_msg)
-                if not duplicate_previous_interim and not buffer_visual_response:
+                if not duplicate_previous_interim and not buffer_completion_response:
                     agent._emit_interim_assistant_message(assistant_msg)
 
                 # Mixed batch: error-result the invalid calls and strip them
@@ -6244,7 +6320,7 @@ def run_conversation(
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
                     messages.append(interim_msg)
-                    if not buffer_visual_response:
+                    if not buffer_completion_response:
                         agent._emit_interim_assistant_message(interim_msg)
 
                     continue_msg = {
@@ -6292,6 +6368,7 @@ def run_conversation(
 
                 try:
                     from agent.verification_stop import (
+                        build_verification_response_nudge,
                         build_verify_on_stop_nudge,
                         build_visual_qa_stop_nudge,
                         verify_on_stop_enabled,
@@ -6314,7 +6391,7 @@ def run_conversation(
                     )
                     _verify_nudge = None
                     visual_nudge = None
-                    visual_response_nudge = None
+                    completion_response_nudge = None
                     # Shadow mode records/report gaps at the gateway boundary
                     # but must not withhold a response.  Enforcement remains
                     # restricted to explicitly classified visual work.
@@ -6350,57 +6427,89 @@ def run_conversation(
                                 time.perf_counter() - _turn_runtime_started_at
                             ),
                         )
-                    elif visual_config["mode"] == "enforce_explicit":
-                        visual_response_nudge = build_visual_qa_response_nudge(
-                            requirement=getattr(agent, "visual_qa_requirement", None),
-                            receipts=getattr(agent, "_turn_runtime_stats", {}).get(
-                                "visual_qa_receipts", []
-                            ),
-                            final_response=final_response,
-                            original_request=original_user_message,
-                            platform=getattr(agent, "platform", ""),
-                            runtime_mode=getattr(agent, "_runtime_mode", ""),
-                            config=visual_config,
-                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            last_edit_order=getattr(agent, "_visual_qa_last_edit_order", 0),
-                            attempts=getattr(agent, "_visual_qa_response_nudges", 0),
-                        )
-                        _verify_nudge = visual_response_nudge
                     if not _verify_nudge and verify_on_stop_enabled(verify_config):
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
                         )
+                    if not _verify_nudge:
+                        visual_required, visual_passed = _visual_qa_completion_state(agent)
+                        verification_response_nudge = (
+                            build_verification_response_nudge(
+                                session_id=getattr(agent, "session_id", None),
+                                changed_paths=getattr(
+                                    agent, "_turn_file_mutation_paths", set()
+                                ),
+                                original_request=original_user_message,
+                                platform=getattr(agent, "platform", ""),
+                                runtime_mode=getattr(agent, "_runtime_mode", ""),
+                                attempts=getattr(
+                                    agent,
+                                    "_completion_response_synthesis_attempts",
+                                    0,
+                                ),
+                            )
+                            if verify_on_stop_enabled(verify_config)
+                            else None
+                        )
+                        if visual_passed and (
+                            not verify_on_stop_enabled(verify_config)
+                            or verification_response_nudge is not None
+                        ):
+                            completion_response_nudge = build_visual_qa_response_nudge(
+                                requirement=getattr(agent, "visual_qa_requirement", None),
+                                receipts=getattr(agent, "_turn_runtime_stats", {}).get(
+                                    "visual_qa_receipts", []
+                                ),
+                                original_request=original_user_message,
+                                platform=getattr(agent, "platform", ""),
+                                runtime_mode=getattr(agent, "_runtime_mode", ""),
+                                config=visual_config,
+                                changed_paths=getattr(
+                                    agent, "_turn_file_mutation_paths", set()
+                                ),
+                                last_edit_order=getattr(
+                                    agent, "_visual_qa_last_edit_order", 0
+                                ),
+                                attempts=getattr(
+                                    agent,
+                                    "_completion_response_synthesis_attempts",
+                                    0,
+                                ),
+                            )
+                        elif not visual_required:
+                            completion_response_nudge = verification_response_nudge
                 except Exception:
                     logger.debug("verification stop-loop check failed", exc_info=True)
                     _verify_nudge = None
+                    completion_response_nudge = None
                 if _closeout_finalization_active(agent):
-                    visual_response_nudge = None
+                    completion_response_nudge = None
                     _verify_nudge = None
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    completion_response_nudge = None
 
-                if visual_response_nudge:
-                    agent._visual_qa_response_nudges = (
-                        getattr(agent, "_visual_qa_response_nudges", 0) + 1
+                if completion_response_nudge:
+                    agent._completion_response_synthesis_attempts = (
+                        getattr(agent, "_completion_response_synthesis_attempts", 0)
+                        + 1
                     )
-                    if (
-                        api_call_count < agent.max_iterations
-                        and agent.iteration_budget.consume()
-                    ):
-                        api_call_count += 1
-                        agent._api_call_count = api_call_count
-                        try:
-                            final_response, repair_usage, repair_duration = _repair_visual_qa_response(
-                                agent,
-                                api_messages,
-                                final_response,
-                                visual_response_nudge,
-                            )
-                        except InterruptedError:
-                            interrupted = True
-                            final_response = None
-                            _turn_exit_reason = "interrupted_by_user"
-                            break
+                    api_call_count += 1
+                    agent._api_call_count = api_call_count
+                    try:
+                        final_response, repair_usage, repair_duration = _repair_completion_response(
+                            agent,
+                            api_messages,
+                            final_response,
+                            completion_response_nudge,
+                        )
+                    except InterruptedError:
+                        interrupted = True
+                        final_response = None
+                        _turn_exit_reason = "interrupted_by_user"
+                        break
+                    else:
                         for key in (
                             "reasoning",
                             "reasoning_content",
@@ -6490,20 +6599,11 @@ def run_conversation(
                                     )
                                 except Exception:
                                     logger.debug(
-                                        "visual response repair usage persistence failed",
+                                        "completion response synthesis usage persistence failed",
                                         exc_info=True,
                                     )
                     final_msg["content"] = final_response
-                    visual_response_nudge = None
-                    _verify_nudge = (
-                        build_verify_on_stop_nudge(
-                            session_id=getattr(agent, "session_id", None),
-                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            attempts=getattr(agent, "_verification_stop_nudges", 0),
-                        )
-                        if verify_on_stop_enabled(verify_config)
-                        else None
-                    )
+                    completion_response_nudge = None
 
                 if _verify_nudge:
                     agent._verification_stop_nudges = (
