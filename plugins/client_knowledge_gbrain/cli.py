@@ -138,7 +138,7 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             spool = RawSpool()
             derived = DerivedStore()
             result = {
-                "notion": run_notion_once(store=store, spool=spool, config=config),
+                "notion_archive": run_notion_once(store=store, spool=spool, config=config),
                 "extraction": run_extraction_once(
                     store=store, spool=spool, derived=derived, config=config
                 ),

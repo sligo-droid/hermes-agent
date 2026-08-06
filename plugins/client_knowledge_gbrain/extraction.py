@@ -43,6 +43,15 @@ _DOC_MIMES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
+_PLAIN_ATTACHMENT_MIMES = frozenset(
+    {
+        "text/plain",
+        "text/csv",
+        "text/tab-separated-values",
+        "text/markdown",
+        "text/x-markdown",
+    }
+)
 _SECRET_PATTERNS = (
     ("private_key", re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")),
     ("authorization_header", re.compile(r"((?:Proxy-)?Authorization:\s*)(?:[A-Za-z][\w.+-]*\s+)?([^\s\"']+)", re.I)),
@@ -301,6 +310,72 @@ def _body_parts(part: Message, settings: ExtractionSettings, total: list[int]) -
     return result
 
 
+def _parent_attachment_parts(
+    message: Message, settings: ExtractionSettings
+) -> dict[str, dict[str, Any]]:
+    parts: dict[str, dict[str, Any]] = {}
+    stack: list[tuple[Message, int, str]] = [(message, 0, "1")]
+    total_bytes = 0
+    while stack:
+        part, depth, part_path = stack.pop()
+        if depth > settings.max_mime_depth:
+            raise ExtractionFailure("mime_depth_limit")
+        if part.is_multipart():
+            children = list(part.iter_parts())
+            for index, child in reversed(list(enumerate(children, 1))):
+                stack.append((child, depth + 1, f"{part_path}.{index}"))
+            continue
+        disposition = part.get_content_disposition()
+        filename = part.get_filename() or ""
+        if disposition != "attachment" and not filename:
+            continue
+        identity = f"part:{part_path}"
+        if identity in parts:
+            raise ExtractionFailure("attachment_reconciliation_failed")
+        try:
+            payload = part.get_payload(decode=True) or b""
+        except Exception as exc:
+            raise ExtractionFailure("attachment_reconciliation_failed") from exc
+        if len(payload) > settings.max_part_bytes:
+            raise ExtractionFailure("mime_part_bytes_limit")
+        total_bytes += len(payload)
+        if total_bytes > settings.max_total_decoded_bytes:
+            raise ExtractionFailure("mime_total_decoded_bytes_limit")
+        parts[identity] = {
+            "provider_attachment_id": identity,
+            "filename": str(filename),
+            "mime_type": part.get_content_type().lower(),
+            "byte_size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    return parts
+
+
+def _reconcile_attachments(
+    message: Message,
+    children: Sequence[IntakeArtifact],
+    settings: ExtractionSettings,
+) -> None:
+    parent_parts = _parent_attachment_parts(message, settings)
+    durable: dict[str, IntakeArtifact] = {}
+    for child in children:
+        identity = child.provider_attachment_id
+        if not identity.startswith("part:") or identity in durable:
+            raise ExtractionFailure("attachment_reconciliation_failed")
+        durable[identity] = child
+    if set(parent_parts) != set(durable):
+        raise ExtractionFailure("attachment_reconciliation_failed")
+    for identity, expected in parent_parts.items():
+        child = durable[identity]
+        if (
+            child.content_sha256 != expected["sha256"]
+            or child.byte_size != expected["byte_size"]
+            or child.mime_type != expected["mime_type"]
+            or child.original_filename != expected["filename"]
+        ):
+            raise ExtractionFailure("attachment_reconciliation_failed")
+
+
 def _segment(segment_id: str, kind: str, label: str, value: str) -> tuple[dict[str, Any], dict[str, int]]:
     redacted, counts = _redact(value)
     return {
@@ -318,7 +393,9 @@ def _attachment_kind(artifact: IntakeArtifact) -> str:
         return suffix[1:]
     if suffix == ".ipynb" and artifact.mime_type in {"application/json", "application/x-ipynb+json"}:
         return "ipynb"
-    if artifact.mime_type.startswith("text/") and suffix not in {".zip", ".pdf"}:
+    if artifact.mime_type == "text/html" and suffix in {".html", ".htm"}:
+        return "html"
+    if artifact.mime_type in _PLAIN_ATTACHMENT_MIMES and suffix not in {".zip", ".pdf", ".html", ".htm"}:
         return "text"
     if artifact.mime_type == "application/pdf" or suffix == ".pdf":
         return "unsupported_pdf_v1"
@@ -371,6 +448,7 @@ class ExtractionWorker:
             raw = _read_limited(handle, parent.byte_size, self.settings.max_message_bytes)
         message = _parse_message(raw, self.settings)
         _depth(message, 0, self.settings.max_mime_depth)
+        _reconcile_attachments(message, children, self.settings)
         for index, name in enumerate(_SELECTED_HEADERS, 1):
             values = message.get_all(name, [])
             for repeat, value in enumerate(values, 1):
@@ -413,14 +491,21 @@ class ExtractionWorker:
                 expected_sha256=child.content_sha256,
                 expected_size=child.byte_size,
             ) as handle:
-                if kind == "text":
+                if kind in {"text", "html"}:
                     data = _read_limited(
                         handle, child.byte_size, self.settings.document_limits.max_input_bytes
                     )
                 elif child.byte_size > self.settings.document_limits.max_input_bytes:
                     raise ExtractionFailure("source_byte_limit")
-            if kind == "text":
-                text = data.decode("utf-8", errors="replace")
+            if kind in {"text", "html"}:
+                decoded = data.decode("utf-8", errors="replace")
+                if kind == "html":
+                    parser = _VisibleHTML(self.settings.document_limits.max_output_chars)
+                    parser.feed(decoded)
+                    parser.close()
+                    text = parser.text()
+                else:
+                    text = decoded
                 if len(text) > self.settings.document_limits.max_output_chars:
                     raise ExtractionFailure("document_output_limit")
             else:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -135,17 +136,50 @@ class DerivedStore:
     def read_json(
         self, kind: str, object_id: str, expected_sha256: str = "", expected_size: int = -1
     ) -> Any:
-        _key, path = self.path_for(kind, object_id)
-        if path.is_symlink() or not path.is_file():
-            raise FileNotFoundError(object_id)
-        fd = _open_no_follow(path, os.O_RDONLY)
+        _key, _path = self.path_for(kind, object_id)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        directory_fds: list[int] = []
+        fd = -1
         try:
+            current_fd = os.open(self.root, flags)
+            directory_fds.append(current_fd)
+            root_stat = os.fstat(current_fd)
+            if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_mode & 0o077:
+                raise ValueError("derived store root must be a private directory")
+            for component in (kind, object_id[:2], object_id):
+                try:
+                    current_fd = os.open(component, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    raise FileNotFoundError(object_id) from None
+                except OSError as exc:
+                    raise ValueError("derived object path is unsafe") from exc
+                directory_fds.append(current_fd)
+                item_stat = os.fstat(current_fd)
+                if not stat.S_ISDIR(item_stat.st_mode) or item_stat.st_mode & 0o077:
+                    raise ValueError("derived object directory must be private")
+            try:
+                fd = os.open(
+                    "object.json",
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                raise FileNotFoundError(object_id) from None
+            except OSError as exc:
+                raise ValueError("derived object path is unsafe") from exc
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("derived object must be a regular file")
+            if file_stat.st_mode & 0o077:
+                raise ValueError("derived object file must be private")
             with os.fdopen(fd, "rb") as handle:
                 fd = -1
                 data = handle.read(_MAX_OBJECT_BYTES + 1)
         finally:
             if fd >= 0:
                 os.close(fd)
+            for directory_fd in reversed(directory_fds):
+                os.close(directory_fd)
         if len(data) > _MAX_OBJECT_BYTES:
             raise ValueError("derived object exceeds its byte limit")
         if expected_size >= 0 and len(data) != expected_size:

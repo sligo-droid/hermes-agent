@@ -185,6 +185,8 @@ def _extract_notebook(path: str, limits: DocumentExtractionLimits) -> str:
 def _normalized_member(name: str) -> str:
     if not name or "\x00" in name or "\\" in name or name.startswith("/"):
         raise ExtractionError("archive member path is unsafe")
+    if any(component in {".", ".."} for component in name.split("/")):
+        raise ExtractionError("archive member path contains a dot component")
     normalized = posixpath.normpath(name)
     if normalized in {"", ".", ".."} or normalized.startswith("../"):
         raise ExtractionError("archive member path escapes the package")
@@ -309,6 +311,8 @@ def _relationship_target(owner_dir: str, target: str, *, root: str) -> str:
         or _SCHEME_RE.match(target)
     ):
         raise ExtractionError("OOXML relationship target is unsafe")
+    if any(component in {".", ".."} for component in target.split("/")):
+        raise ExtractionError("OOXML relationship target contains a dot component")
     normalized = posixpath.normpath(posixpath.join(owner_dir, target))
     if normalized == ".." or normalized.startswith("../") or not normalized.startswith(root + "/"):
         raise ExtractionError("OOXML relationship target escapes its package root")
