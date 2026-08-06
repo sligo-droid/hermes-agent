@@ -313,7 +313,7 @@ async def test_orchestrated_requirement_rejects_assertions_without_semantic_cont
 
 
 @pytest.mark.asyncio
-async def test_missing_active_requirement_returns_actionable_diagnostic():
+async def test_missing_active_requirement_still_validates_contract():
     result = await run_visual_assertions(
         task_id="missing-requirement",
         requirement={"level": "none", "target": "", "assertions": []},
@@ -325,12 +325,60 @@ async def test_missing_active_requirement_returns_actionable_diagnostic():
         "status": "uncertain",
         "code": "invalid_visual_contract",
         "attempts": [],
-        "reason_code": "visual_requirement_missing",
-        "correction": (
-            "Run visual_qa only in a turn with an explicit visual change or "
-            "an explicit request to run or confirm visual QA."
-        ),
+        "reason_code": "contract_missing_fields",
+        "correction": "Provide target, page, viewport, state, and at least one assertion.",
     }
+
+
+@pytest.mark.asyncio
+async def test_visual_qa_executes_without_active_requirement():
+    contract = {
+        "target": {"description": "dashboard chart"},
+        "page": {"state": "already_open", "description": "dashboard page"},
+        "viewport": {"description": "current desktop viewport"},
+        "state": ["chart data loaded"],
+        "assertions": [
+            {
+                "kind": "screenshot_appearance",
+                "expectation": "The chart is visually balanced.",
+            }
+        ],
+    }
+
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self, **_kwargs):
+            return {"ok": True, "image_bytes": b"png"}
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(_images, assertions, *, on_provider_start, **_kwargs):
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {
+                    "id": item["id"],
+                    "status": "passed",
+                    "code": "appearance_satisfied",
+                }
+                for item in assertions
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="standalone-visual-qa",
+        requirement={"level": "none", "target": "", "assertions": []},
+        contract=contract,
+        supervisor=ScreenshotSupervisor(),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "passed"
+    assert result["visual_qa_receipt"]["requirement_id"].startswith("vrq_")
+    assert result["visual_qa_receipt"]["coverage_ids"]
 
 
 @pytest.mark.asyncio

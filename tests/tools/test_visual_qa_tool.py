@@ -92,6 +92,14 @@ def test_visual_qa_description_distinguishes_containment_from_scroll_overflow():
     assert "vertical scrolling is allowed" in description
 
 
+def test_visual_qa_description_allows_standalone_use():
+    from tools.visual_qa_tool import VISUAL_QA_SCHEMA
+
+    description = VISUAL_QA_SCHEMA["description"]
+    assert "callable in any agent turn" in description
+    assert "does not require a preceding UI change" in description
+
+
 @pytest.mark.asyncio
 async def test_visual_qa_uses_read_only_browser_namespace(monkeypatch):
     from tools import visual_qa_tool
