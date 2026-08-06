@@ -257,6 +257,11 @@ class PluginLlmTrustError(PermissionError):
 class PluginLlmRouteError(RuntimeError):
     """Raised when a strict named-tier route cannot be proven."""
 
+    def __init__(self, message: str, *, code: str = "route_error", retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
 
 def _check_overrides(
     policy: _TrustPolicy,
@@ -499,7 +504,8 @@ def _parse_structured_text(
             # Schema-backed calls must never silently downgrade to unvalidated
             # JSON.  jsonschema is a direct exact-pinned host dependency.
             raise PluginLlmRouteError(
-                "schema-backed PluginLlm output requires the jsonschema dependency"
+                "schema-backed PluginLlm output requires the jsonschema dependency",
+                code="jsonschema_dependency_missing",
             ) from exc
         except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
             raise ValueError(
@@ -1169,7 +1175,8 @@ class PluginLlm:
                 "plugin_id", task_entry.get("plugin")
             ) != self._plugin_id:
                 raise PluginLlmRouteError(
-                    f"plugin {self._plugin_id!r} does not own auxiliary task {task!r}"
+                    f"plugin {self._plugin_id!r} does not own auxiliary task {task!r}",
+                    code="auxiliary_task_unregistered",
                 )
             task_config = _get_auxiliary_task_config(task)
             task_defaults = task_entry.get("defaults") or {}
@@ -1191,11 +1198,13 @@ class PluginLlm:
                 }
             if required_tier and tier_name != required_tier:
                 raise PluginLlmRouteError(
-                    f"plugin task {task!r} requires model tier {required_tier!r}"
+                    f"plugin task {task!r} requires model tier {required_tier!r}",
+                    code="required_tier_misconfigured",
                 )
             if provider or model:
                 raise PluginLlmRouteError(
-                    "a named-tier plugin task cannot be combined with provider/model overrides"
+                    "a named-tier plugin task cannot be combined with provider/model overrides",
+                    code="named_tier_route_override_configured",
                 )
             configured_provider = str(task_config.get("provider") or "").strip().lower()
             forbidden_route_fields = (
@@ -1211,15 +1220,20 @@ class PluginLlm:
             )
             if forbidden_route_fields:
                 raise PluginLlmRouteError(
-                    f"plugin task {task!r} must use its named tier without route overrides"
+                    f"plugin task {task!r} must use its named tier without route overrides",
+                    code="named_tier_route_override_configured",
                 )
             tier = resolve_model_tier(load_config() or {}, tier_name)
             if tier is None:
-                raise PluginLlmRouteError(f"unknown model tier: {tier_name}")
+                raise PluginLlmRouteError(
+                    f"unknown model tier: {tier_name}", code="named_tier_unknown"
+                )
             selected_provider = (tier.provider or _read_main_provider() or "").strip().lower()
             if not selected_provider or selected_provider in {"auto", "main"}:
                 raise PluginLlmRouteError(
-                    f"model tier {tier.name!r} did not resolve to a concrete provider"
+                    f"model tier {tier.name!r} did not resolve to a concrete provider",
+                    code="route_temporarily_unavailable",
+                    retryable=True,
                 )
             selected_model = tier.model.strip()
             reasoning = tier.reasoning_config()
@@ -1248,7 +1262,11 @@ class PluginLlm:
         except PluginLlmRouteError:
             raise
         except Exception as exc:
-            raise PluginLlmRouteError("named model tier resolution failed") from exc
+            raise PluginLlmRouteError(
+                "named model tier resolution failed",
+                code="route_temporarily_unavailable",
+                retryable=True,
+            ) from exc
 
     def _check_strict_result(
         self,
@@ -1262,10 +1280,16 @@ class PluginLlm:
             return
         current = self._resolve_route(provider=None, model=None, task=task)
         if current.get("fingerprint") != route.get("fingerprint"):
-            raise PluginLlmRouteError("strict named-tier route changed during the call")
+            raise PluginLlmRouteError(
+                "strict named-tier route changed during the call",
+                code="route_fingerprint_drift",
+                retryable=True,
+            )
         if str(provider or "").strip().lower() != str(route["provider"]).strip().lower():
             raise PluginLlmRouteError(
-                "strict named-tier provider attribution did not match the selected tier"
+                "strict named-tier provider attribution did not match the selected tier",
+                code="strict_attribution_mismatch",
+                retryable=True,
             )
         selected_raw = str(route["model"] or "").strip().lower()
         actual_raw = str(model or "").strip().lower()
@@ -1277,7 +1301,9 @@ class PluginLlm:
         actual_model = actual_parts[-1]
         if selected_namespace and actual_namespace and selected_namespace != actual_namespace:
             raise PluginLlmRouteError(
-                "strict named-tier model attribution did not match the selected tier"
+                "strict named-tier model attribution did not match the selected tier",
+                code="strict_attribution_mismatch",
+                retryable=True,
             )
         dated_model = re.fullmatch(
             rf"{re.escape(selected_model)}-\d{{4}}-\d{{2}}-\d{{2}}",
@@ -1285,7 +1311,9 @@ class PluginLlm:
         )
         if not actual_model or (actual_model != selected_model and dated_model is None):
             raise PluginLlmRouteError(
-                "strict named-tier model attribution did not match the selected tier"
+                "strict named-tier model attribution did not match the selected tier",
+                code="strict_attribution_mismatch",
+                retryable=True,
             )
 
 

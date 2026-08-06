@@ -1,33 +1,76 @@
-"""Stdlib document-to-text extraction for ``read_file``.
+"""Dependency-free, bounded document-to-text extraction for ``read_file``.
 
-Supports Jupyter notebooks, DOCX, and XLSX without adding hard dependencies.
-Malformed documents raise :class:`ExtractionError`; callers can then fall back to
-normal text/binary handling.
+DOCX and XLSX are hostile ZIP containers.  Intake callers can supply strict
+limits; legacy ``read_file`` callers retain bounded, generous defaults.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import posixpath
+import re
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-__all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
+__all__ = [
+    "DocumentExtractionLimits",
+    "EXTRACTABLE_EXTENSIONS",
+    "ExtractionError",
+    "extract_document_text",
+    "is_extractable_document",
+]
 
 EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
-MAX_XLSX_BYTES = 50 * 1024 * 1024
-_MAX_XLSX_ROWS_PER_SHEET = 5000
-_MAX_XLSX_COLS = 256
-
 _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CHUNK = 64 * 1024
 
 
 class ExtractionError(Exception):
-    """Raised when a supported-looking document cannot be rendered as text."""
+    """Raised when a supported-looking document cannot be rendered safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentExtractionLimits:
+    max_input_bytes: int = 50 * 1024 * 1024
+    max_zip_members: int = 2048
+    max_member_bytes: int = 16 * 1024 * 1024
+    max_expanded_bytes: int = 64 * 1024 * 1024
+    max_compression_ratio: int = 200
+    max_output_chars: int = 2_000_000
+    max_notebook_cells: int = 10_000
+    max_notebook_source_items: int = 20_000
+    max_sheets: int = 256
+    max_rows_per_sheet: int = 5000
+    max_cols: int = 256
+    max_shared_strings: int = 500_000
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+class _Output:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.parts: list[str] = []
+        self.size = 0
+
+    def add(self, value: str) -> None:
+        if self.size + len(value) > self.limit:
+            raise ExtractionError("document output exceeds its character limit")
+        self.parts.append(value)
+        self.size += len(value)
+
+    def finish(self) -> str:
+        return "".join(self.parts).rstrip("\n") + "\n"
 
 
 def _extension(path: str) -> str:
@@ -39,34 +82,75 @@ def is_extractable_document(path: str) -> bool:
     return bool(_extension(path))
 
 
-def extract_document_text(path: str) -> str:
-    ext = _extension(path)
+def extract_document_text(
+    path: str,
+    limits: DocumentExtractionLimits | None = None,
+    *,
+    extension: str = "",
+) -> str:
+    limits = limits or DocumentExtractionLimits()
+    ext = extension.lower() if extension.lower() in EXTRACTABLE_EXTENSIONS else _extension(path)
     if ext == ".ipynb":
-        return _extract_notebook(path)
+        return _extract_notebook(path, limits)
     if ext == ".docx":
-        return _extract_docx(path)
+        return _extract_docx(path, limits)
     if ext == ".xlsx":
-        return _extract_xlsx(path)
+        return _extract_xlsx(path, limits)
     raise ExtractionError(f"Unsupported document type: {path!r}")
 
 
-def _source_text(source) -> str:
+def _read_file_bounded(path: str, limit: int) -> bytes:
+    try:
+        before = os.stat(path, follow_symlinks=False)
+        if before.st_size > limit:
+            raise ExtractionError("document input exceeds its byte limit")
+        data = bytearray()
+        with open(path, "rb") as handle:
+            while len(data) <= limit:
+                chunk = handle.read(min(_CHUNK, limit + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+        if len(data) > limit:
+            raise ExtractionError("document input exceeds its byte limit")
+        after = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ExtractionError("document input cannot be read safely") from exc
+    if (before.st_dev, before.st_ino, before.st_size) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ) or len(data) != before.st_size:
+        raise ExtractionError("document input changed while reading")
+    return bytes(data)
+
+
+def _source_text(source, limits: DocumentExtractionLimits, counter: list[int]) -> str:
     if isinstance(source, str):
+        counter[0] += 1
+        if counter[0] > limits.max_notebook_source_items:
+            raise ExtractionError("notebook source item limit exceeded")
         return source
     if isinstance(source, list):
-        return "".join(item for item in source if isinstance(item, str))
+        out = _Output(limits.max_output_chars)
+        for item in source:
+            if isinstance(item, str):
+                counter[0] += 1
+                if counter[0] > limits.max_notebook_source_items:
+                    raise ExtractionError("notebook source item limit exceeded")
+                out.add(item)
+        return "".join(out.parts)
     return ""
 
 
-def _extract_notebook(path: str) -> str:
+def _extract_notebook(path: str, limits: DocumentExtractionLimits) -> str:
+    raw = _read_file_bounded(path, limits.max_input_bytes)
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            nb = json.load(fh)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise ExtractionError(f"Not a valid notebook: {exc}") from exc
+        nb = json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ExtractionError("Not a valid notebook") from exc
     if not isinstance(nb, dict):
         raise ExtractionError("Notebook root is not an object")
-
     cells = nb.get("cells")
     if not isinstance(cells, list):
         cells = [
@@ -77,44 +161,193 @@ def _extract_notebook(path: str) -> str:
         ]
     if not cells:
         raise ExtractionError("Notebook contains no cells")
-
+    if len(cells) > limits.max_notebook_cells:
+        raise ExtractionError("notebook cell limit exceeded")
     counts = {"markdown": 0, "code": 0, "raw": 0}
     labels = {"markdown": "Markdown", "code": "Code", "raw": "Raw"}
-    out: list[str] = []
+    source_items = [0]
+    out = _Output(limits.max_output_chars)
+    readable = 0
     for cell in cells:
-        if not isinstance(cell, dict):
+        if not isinstance(cell, dict) or cell.get("cell_type") not in labels:
             continue
-        typ = cell.get("cell_type")
-        if typ not in labels:
-            continue
+        typ = str(cell["cell_type"])
         counts[typ] += 1
+        readable += 1
         suffix = f" {counts[typ]}" if typ != "raw" else ""
-        out.extend((f"# ── {labels[typ]} cell{suffix} ──", _source_text(cell.get("source", "")).rstrip("\n"), ""))
-    if not out:
+        text = _source_text(cell.get("source", ""), limits, source_items).rstrip("\n")
+        out.add(f"# ── {labels[typ]} cell{suffix} ──\n{text}\n\n")
+    if not readable:
         raise ExtractionError("Notebook contains no readable cells")
-    return "\n".join(out).rstrip("\n") + "\n"
+    return out.finish()
 
 
-def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
-    try:
-        return ET.fromstring(zf.read(name))
-    except KeyError as exc:
-        raise ExtractionError(f"Missing {name}") from exc
-    except ET.ParseError as exc:
-        raise ExtractionError(f"Malformed XML in {name}: {exc}") from exc
+def _normalized_member(name: str) -> str:
+    if not name or "\x00" in name or "\\" in name or name.startswith("/"):
+        raise ExtractionError("archive member path is unsafe")
+    normalized = posixpath.normpath(name)
+    if normalized in {"", ".", ".."} or normalized.startswith("../"):
+        raise ExtractionError("archive member path escapes the package")
+    return normalized
 
 
-def _extract_docx(path: str) -> str:
-    try:
-        with zipfile.ZipFile(path) as zf:
-            root = _zip_xml(zf, "word/document.xml")
-    except zipfile.BadZipFile as exc:
-        raise ExtractionError(f"Not a valid DOCX: {exc}") from exc
-    except OSError as exc:
-        raise ExtractionError(str(exc)) from exc
+class _SafeZip:
+    def __init__(self, path: str, limits: DocumentExtractionLimits) -> None:
+        self.path = path
+        self.limits = limits
+        try:
+            self.before = os.stat(path, follow_symlinks=False)
+            if self.before.st_size > limits.max_input_bytes:
+                raise ExtractionError("document input exceeds its byte limit")
+            self.zf = zipfile.ZipFile(path)
+        except zipfile.BadZipFile as exc:
+            raise ExtractionError("document is not a valid ZIP package") from exc
+        except OSError as exc:
+            raise ExtractionError("document package cannot be opened safely") from exc
+        infos = self.zf.infolist()
+        if len(infos) > limits.max_zip_members:
+            self.zf.close()
+            raise ExtractionError("archive member limit exceeded")
+        self.infos: dict[str, zipfile.ZipInfo] = {}
+        declared_total = 0
+        for info in infos:
+            name = _normalized_member(info.filename)
+            if name in self.infos:
+                self.zf.close()
+                raise ExtractionError("archive contains duplicate normalized members")
+            if info.flag_bits & 0x1:
+                self.zf.close()
+                raise ExtractionError("encrypted archive members are unsupported")
+            if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                self.zf.close()
+                raise ExtractionError("archive compression method is unsupported")
+            if info.file_size < 0 or info.compress_size < 0:
+                self.zf.close()
+                raise ExtractionError("archive member size is invalid")
+            if not info.is_dir():
+                if info.file_size > limits.max_member_bytes:
+                    self.zf.close()
+                    raise ExtractionError("archive member exceeds its byte limit")
+                ratio = info.file_size / max(1, info.compress_size)
+                if ratio > limits.max_compression_ratio:
+                    self.zf.close()
+                    raise ExtractionError("archive compression ratio exceeds its limit")
+                declared_total += info.file_size
+                if declared_total > limits.max_expanded_bytes:
+                    self.zf.close()
+                    raise ExtractionError("archive expanded size exceeds its limit")
+            self.infos[name] = info
+        self.observed_total = 0
 
+    def __enter__(self) -> "_SafeZip":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.zf.close()
+        try:
+            after = os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            raise ExtractionError("document package changed while reading") from exc
+        if (self.before.st_dev, self.before.st_ino, self.before.st_size) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ):
+            raise ExtractionError("document package changed while reading")
+
+    def has(self, name: str) -> bool:
+        return name in self.infos
+
+    def read(self, name: str) -> bytes:
+        info = self.infos.get(name)
+        if info is None:
+            raise ExtractionError(f"Missing {name}")
+        if info.is_dir():
+            raise ExtractionError("required archive member is a directory")
+        allowed = min(
+            self.limits.max_member_bytes,
+            self.limits.max_expanded_bytes - self.observed_total,
+        )
+        if allowed < 0:
+            raise ExtractionError("archive expanded size exceeds its limit")
+        data = bytearray()
+        try:
+            with self.zf.open(info, "r") as handle:
+                while len(data) <= allowed:
+                    chunk = handle.read(min(_CHUNK, allowed + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+        except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+            raise ExtractionError("archive member failed integrity verification") from exc
+        if len(data) > allowed:
+            raise ExtractionError("archive member grew beyond its byte limit")
+        if len(data) != info.file_size:
+            raise ExtractionError("archive member size conflicts with its directory entry")
+        self.observed_total += len(data)
+        return bytes(data)
+
+    def xml(self, name: str) -> ET.Element:
+        try:
+            return ET.fromstring(self.read(name))
+        except ET.ParseError as exc:
+            raise ExtractionError(f"Malformed XML in {name}") from exc
+
+
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _relationship_target(owner_dir: str, target: str, *, root: str) -> str:
+    if (
+        not target
+        or "\x00" in target
+        or "\\" in target
+        or target.startswith(("/", "//"))
+        or _SCHEME_RE.match(target)
+    ):
+        raise ExtractionError("OOXML relationship target is unsafe")
+    normalized = posixpath.normpath(posixpath.join(owner_dir, target))
+    if normalized == ".." or normalized.startswith("../") or not normalized.startswith(root + "/"):
+        raise ExtractionError("OOXML relationship target escapes its package root")
+    return normalized
+
+
+def _relationships(
+    package: _SafeZip, path: str, *, owner_dir: str, root: str
+) -> dict[str, str]:
+    if not package.has(path):
+        return {}
+    xml = package.xml(path)
+    tag = f"{{{_NS_PKG_REL}}}Relationship"
+    result: dict[str, str] = {}
+    for rel in xml.iter(tag):
+        rid = str(rel.get("Id") or "")
+        if not rid or rid in result:
+            raise ExtractionError("OOXML relationship identity is duplicate or missing")
+        if str(rel.get("TargetMode") or "").lower() == "external":
+            raise ExtractionError("external OOXML relationships are unsupported")
+        target = _relationship_target(owner_dir, str(rel.get("Target") or ""), root=root)
+        if not package.has(target):
+            raise ExtractionError("OOXML relationship target is missing")
+        result[rid] = target
+    return result
+
+
+def _extract_docx(path: str, limits: DocumentExtractionLimits) -> str:
+    with _SafeZip(path, limits) as package:
+        _relationships(
+            package,
+            "word/_rels/document.xml.rels",
+            owner_dir="word",
+            root="word",
+        )
+        root = package.xml("word/document.xml")
     w = f"{{{_NS_W}}}"
-    lines: list[str] = []
+    out = _Output(limits.max_output_chars)
+    readable = False
     for para in root.iter(f"{w}p"):
         buf: list[str] = []
         for node in para.iter():
@@ -124,80 +357,75 @@ def _extract_docx(path: str) -> str:
                 buf.append("\t")
             elif node.tag in {f"{w}br", f"{w}cr"}:
                 buf.append("\n")
-        lines.extend("".join(buf).split("\n"))
-    if not any(line.strip() for line in lines):
+        value = "".join(buf)
+        if value.strip():
+            readable = True
+        out.add(value + "\n")
+    if not readable:
         raise ExtractionError("DOCX contains no extractable text")
-    return "\n".join(lines).rstrip("\n") + "\n"
+    return out.finish()
 
 
-def _extract_xlsx(path: str) -> str:
-    try:
-        with zipfile.ZipFile(path) as zf:
-            names = set(zf.namelist())
-            shared = _shared_strings(zf, names)
-            sheets = _workbook_sheets(zf)
-            rels = _workbook_rels(zf, names)
-            out: list[str] = []
-            for name, state, rid in sheets:
-                if state in {"hidden", "veryHidden"}:
-                    continue
-                part = _sheet_part(rels.get(rid, ""))
-                if part not in names:
-                    continue
-                try:
-                    rows = _sheet_rows(zf.read(part), shared)
-                except ET.ParseError:
-                    continue
-                out.append(f"# ── Sheet: {name} ──")
-                out.extend("\t".join(row) for row in rows)
-                if not rows:
-                    out.append("(empty)")
-                out.append("")
-    except zipfile.BadZipFile as exc:
-        raise ExtractionError(f"Not a valid XLSX: {exc}") from exc
-    except OSError as exc:
-        raise ExtractionError(str(exc)) from exc
-
-    if not out:
+def _extract_xlsx(path: str, limits: DocumentExtractionLimits) -> str:
+    with _SafeZip(path, limits) as package:
+        workbook = package.xml("xl/workbook.xml")
+        rels = _relationships(
+            package,
+            "xl/_rels/workbook.xml.rels",
+            owner_dir="xl",
+            root="xl",
+        )
+        shared = _shared_strings(package, limits)
+        sheets = _workbook_sheets(workbook, limits)
+        out = _Output(limits.max_output_chars)
+        visible = 0
+        for name, state, rid in sheets:
+            if state in {"hidden", "veryHidden"}:
+                continue
+            part = rels.get(rid)
+            if not part:
+                raise ExtractionError("worksheet relationship is missing")
+            rows = _sheet_rows(package.read(part), shared, limits)
+            visible += 1
+            out.add(f"# ── Sheet: {name} ──\n")
+            if rows:
+                for row in rows:
+                    out.add("\t".join(row) + "\n")
+            else:
+                out.add("(empty)\n")
+            out.add("\n")
+    if not visible:
         raise ExtractionError("XLSX has no visible sheets with content")
-    return "\n".join(out).rstrip("\n") + "\n"
+    return out.finish()
 
 
-def _shared_strings(zf: zipfile.ZipFile, names: set[str]) -> list[str]:
-    if "xl/sharedStrings.xml" not in names:
+def _shared_strings(package: _SafeZip, limits: DocumentExtractionLimits) -> list[str]:
+    if not package.has("xl/sharedStrings.xml"):
         return []
     try:
-        root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-    except ET.ParseError:
-        return []
+        root = ET.fromstring(package.read("xl/sharedStrings.xml"))
+    except ET.ParseError as exc:
+        raise ExtractionError("Malformed XML in xl/sharedStrings.xml") from exc
     s = f"{{{_NS_S}}}"
-    return ["".join(t.text or "" for t in item.iter(f"{s}t")) for item in root.iter(f"{s}si")]
+    result: list[str] = []
+    for item in root.iter(f"{s}si"):
+        if len(result) >= limits.max_shared_strings:
+            raise ExtractionError("XLSX shared string limit exceeded")
+        result.append("".join(t.text or "" for t in item.iter(f"{s}t")))
+    return result
 
 
-def _workbook_sheets(zf: zipfile.ZipFile) -> list[tuple[str, str, str]]:
-    root = _zip_xml(zf, "xl/workbook.xml")
+def _workbook_sheets(
+    root: ET.Element, limits: DocumentExtractionLimits
+) -> list[tuple[str, str, str]]:
     s, r = f"{{{_NS_S}}}", f"{{{_NS_REL}}}"
-    return [
+    sheets = [
         (sheet.get("name", "Sheet"), sheet.get("state", "visible"), sheet.get(f"{r}id", ""))
         for sheet in root.iter(f"{s}sheet")
     ]
-
-
-def _workbook_rels(zf: zipfile.ZipFile, names: set[str]) -> dict[str, str]:
-    rels_path = "xl/_rels/workbook.xml.rels"
-    if rels_path not in names:
-        return {}
-    try:
-        root = ET.fromstring(zf.read(rels_path))
-    except ET.ParseError:
-        return {}
-    rel_tag = f"{{{_NS_PKG_REL}}}Relationship"
-    return {rel.get("Id", ""): rel.get("Target", "") for rel in root.iter(rel_tag) if rel.get("Id")}
-
-
-def _sheet_part(target: str) -> str:
-    target = target.lstrip("/")
-    return posixpath.normpath(target if target.startswith("xl/") else f"xl/{target}")
+    if len(sheets) > limits.max_sheets:
+        raise ExtractionError("XLSX sheet limit exceeded")
+    return sheets
 
 
 def _col_index(ref: str) -> int:
@@ -209,19 +437,24 @@ def _col_index(ref: str) -> int:
     return max(idx - 1, 0)
 
 
-def _sheet_rows(xml_bytes: bytes, shared: list[str]) -> list[list[str]]:
-    root = ET.fromstring(xml_bytes)
+def _sheet_rows(
+    xml_bytes: bytes, shared: list[str], limits: DocumentExtractionLimits
+) -> list[list[str]]:
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as exc:
+        raise ExtractionError("Malformed worksheet XML") from exc
     s = f"{{{_NS_S}}}"
     rows: list[list[str]] = []
     for row in root.iter(f"{s}row"):
-        if len(rows) >= _MAX_XLSX_ROWS_PER_SHEET:
-            break
+        if len(rows) >= limits.max_rows_per_sheet:
+            raise ExtractionError("XLSX row limit exceeded")
         cells: dict[int, str] = {}
         max_col = -1
         for cell in row.iter(f"{s}c"):
             col = _col_index(cell.get("r", "")) if cell.get("r") else max_col + 1
-            if col >= _MAX_XLSX_COLS:
-                continue
+            if col >= limits.max_cols:
+                raise ExtractionError("XLSX column limit exceeded")
             cells[col] = _cell_value(cell, shared, s)
             max_col = max(max_col, col)
         rows.append([cells.get(i, "") for i in range(max_col + 1)] if max_col >= 0 else [])
