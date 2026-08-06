@@ -952,6 +952,11 @@ class CDPSupervisor:
                     textbox: 'textarea, input:not([type]), input[type="text"], input[type="email"], input[type="search"], input[type="tel"], input[type="url"]',
                     checkbox: 'input[type="checkbox"]',
                     radio: 'input[type="radio"]',
+                    main: 'main',
+                    navigation: 'nav',
+                    banner: 'header',
+                    contentinfo: 'footer',
+                    complementary: 'aside',
                 }};
                 const implicitSelector = implicitRoleSelectors[spec.value] || '';
                 if (implicitSelector) {{
@@ -960,7 +965,23 @@ class CDPSupervisor:
                     }}
                 }}
                 if (spec.name) {{
-                    nodes = nodes.filter((node) => ((node.getAttribute('aria-label') || node.textContent || node.value || node.alt || '').trim() === spec.name));
+                    nodes = nodes.filter((node) => {{
+                        const labelledBy = (node.getAttribute('aria-labelledby') || '')
+                            .split(/\\s+/)
+                            .filter(Boolean)
+                            .map((id) => document.getElementById(id)?.textContent || '')
+                            .join(' ')
+                            .trim();
+                        const accessibleName = (
+                            node.getAttribute('aria-label')
+                            || labelledBy
+                            || node.textContent
+                            || node.value
+                            || node.alt
+                            || ''
+                        ).trim();
+                        return accessibleName === spec.name;
+                    }});
                 }}
             }} else {{
                 nodes = Array.from(document.querySelectorAll(spec.value));
@@ -1080,7 +1101,6 @@ class CDPSupervisor:
             execution_guard.check()
         payload = {
             "states": states,
-            "diagnostic_cursor": self.diagnostic_cursor(),
             "active": self.snapshot().active,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

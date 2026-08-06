@@ -100,6 +100,23 @@ def test_visual_qa_description_allows_standalone_use():
     assert "does not require a preceding UI change" in description
 
 
+def test_visual_qa_description_guides_snapshot_locators_and_corrections():
+    from tools.visual_qa_tool import VISUAL_QA_SCHEMA
+
+    description = VISUAL_QA_SCHEMA["description"]
+    locator = VISUAL_QA_SCHEMA["parameters"]["properties"]["target"]["properties"][
+        "locator"
+    ]
+    assertions = VISUAL_QA_SCHEMA["parameters"]["properties"]["assertions"]
+
+    assert "latest browser_snapshot" in description
+    assert "do not invent CSS selectors" in description
+    assert "Every initial or correction contract" in description
+    assert "navigation, or main" in locator["properties"]["value"]["description"]
+    assert "exact accessible name" in locator["properties"]["name"]["description"]
+    assert "every initial and correction call" in assertions["description"]
+
+
 @pytest.mark.asyncio
 async def test_visual_qa_uses_read_only_browser_namespace(monkeypatch):
     from tools import visual_qa_tool
