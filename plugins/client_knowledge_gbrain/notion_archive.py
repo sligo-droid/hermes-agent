@@ -64,6 +64,10 @@ _EXTENSIONS = {
     "application/zip": "zip",
 }
 _MARKER_RE = re.compile(r"^ckfu-v1-[0-9a-f]{12}-[0-9a-f]{12}-[0-9a-f]{12}$")
+MAX_RENDER_BYTES = 2 * 1024 * 1024
+MAX_BODY_CHARS = 100_000
+MAX_RENDER_BLOCKS = 80
+TRUNCATION_NOTICE = "\n\n[Content truncated for Notion display; raw .eml remains canonical.]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +218,20 @@ def _marker(artifact: IntakeArtifact, attempt_id: str) -> str:
     return value
 
 
+def _multipart_plan(byte_size: int, preferred_part_size: int) -> tuple[int, int]:
+    part_size = int(preferred_part_size)
+    minimum_part_size = 5 * 1024 * 1024
+    part_count = max(1, math.ceil(int(byte_size) / part_size))
+    if part_count > 1000:
+        part_size = max(minimum_part_size, math.ceil(int(byte_size) / 1000))
+        if part_size > 20 * 1024 * 1024:
+            raise NotionStaticConfigError("notion multipart upload exceeds the part limit")
+        part_count = math.ceil(int(byte_size) / part_size)
+    if not 1 <= part_count <= 1000:
+        raise NotionStaticConfigError("notion multipart upload exceeds the part limit")
+    return part_size, part_count
+
+
 def _file_block(upload_id: str, marker: str, artifact: IntakeArtifact) -> dict[str, Any]:
     caption = f"{marker} | sha256:{artifact.content_sha256} | source:{artifact.source_type}"
     if artifact.original_filename:
@@ -332,11 +350,12 @@ class NotionArchiveWorker:
                 added = after_properties.get(name)
                 if not isinstance(added, Mapping) or added.get("type") != expected_type:
                     raise NotionStaticConfigError("notion additive schema update was not verified")
-        self.client.query_data_source(
-            project.data_source_id,
-            property_name=project.properties["source_id"],
-            value="hermes-preflight-no-import-v1",
-        )
+        if not missing or apply_schema:
+            self.client.query_data_source(
+                project.data_source_id,
+                property_name=project.properties["source_id"],
+                value="hermes-preflight-no-import-v1",
+            )
         return {"project": project.project_key, "missing_properties": sorted(missing), "applied": bool(apply_schema and missing)}
 
     @staticmethod
@@ -370,6 +389,7 @@ class NotionArchiveWorker:
         receipt = StageReceipt(
             artifact.artifact_id, "notion_archived", f"notion:page:{page_id}", digest
         )
+        self._renew(claim)
         if not self.store.complete_stage(claim.job_id, claim.claim_token, receipt):
             raise PermissionError("notion job claim was lost before completion")
         return page_id
@@ -428,7 +448,15 @@ class NotionArchiveWorker:
             expected_sha256=artifact.content_sha256,
             expected_size=artifact.byte_size,
         ) as handle:
-            return _email_content(handle.read())
+            raw = handle.read(MAX_RENDER_BYTES + 1)
+        truncated = len(raw) > MAX_RENDER_BYTES
+        subject, body, headers = _email_content(raw[:MAX_RENDER_BYTES])
+        if len(body) > MAX_BODY_CHARS:
+            body = body[:MAX_BODY_CHARS]
+            truncated = True
+        if truncated:
+            body = body.rstrip() + TRUNCATION_NOTICE
+        return subject, body, headers
 
     def _ensure_source_blocks(
         self, claim: JobClaim, artifact: IntakeArtifact, page_id: str
@@ -453,6 +481,9 @@ class NotionArchiveWorker:
             "Processing metadata",
             json.dumps(metadata, sort_keys=True, ensure_ascii=False),
         ))
+        if len(blocks) > MAX_RENDER_BLOCKS:
+            blocks = blocks[: MAX_RENDER_BLOCKS - 2]
+            blocks.extend(_paragraphs("Display limit", TRUNCATION_NOTICE.strip()))
         digest = hashlib.sha256(
             json.dumps(blocks, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()[:12]
@@ -516,6 +547,8 @@ class NotionArchiveWorker:
             raise NotionAmbiguousRecoveryError("notion source page identity conflicts")
         if self._property_plain(page, project.properties["source_hash"]) != artifact.content_sha256:
             raise NotionAmbiguousRecoveryError("notion source page hash conflicts")
+        if self._property_plain(page, project.properties["source_type"]) != artifact.source_type:
+            raise NotionAmbiguousRecoveryError("notion source page type conflicts")
 
     def _ensure_file(
         self, claim: JobClaim, claimed_artifact_id: str, artifact: IntakeArtifact, page_id: str
@@ -537,14 +570,15 @@ class NotionArchiveWorker:
             marker = _marker(artifact, attempt_id)
             extension = _EXTENSIONS.get(artifact.mime_type, "bin")
             mode = "single_part" if artifact.byte_size <= 20 * 1024 * 1024 else "multi_part"
-            part_count = max(1, math.ceil(artifact.byte_size / self.settings.multipart_part_bytes))
-            if part_count > 10_000:
-                raise NotionStaticConfigError("notion multipart upload exceeds the part limit")
+            part_size, part_count = _multipart_plan(
+                artifact.byte_size, self.settings.multipart_part_bytes
+            )
             attempt = self.store.reserve_upload_attempt(
                 claim.job_id, claim.claim_token, artifact,
                 attempt_id=attempt_id, opaque_marker=marker,
                 remote_filename=f"{marker}.{extension}", upload_mode=mode,
-                expected_part_count=part_count, claimed_artifact_id=claimed_artifact_id,
+                expected_part_count=part_count, expected_part_size=part_size,
+                claimed_artifact_id=claimed_artifact_id,
             )
             self.store.select_active_upload_attempt(
                 claim.job_id, claim.claim_token, claimed_artifact_id, artifact, attempt_id
@@ -576,6 +610,7 @@ class NotionArchiveWorker:
                 remote_filename=f"{replacement_marker}.{_EXTENSIONS.get(artifact.mime_type, 'bin')}",
                 upload_mode=str(attempt["upload_mode"]),
                 expected_part_count=int(attempt["expected_part_count"]),
+                expected_part_size=int(attempt.get("expected_part_size") or 0),
                 replaces_attempt_id=attempt_id,
                 replacement_reason=f"{disposition}_before_attachment",
                 claimed_artifact_id=claimed_artifact_id,
@@ -711,6 +746,10 @@ class NotionArchiveWorker:
             return self._recover_uncertain_creation(claim, claimed_artifact_id, artifact, attempt, baseline_id)
         upload_id = str(remote.get("id") or "")
         if not upload_id:
+            self.store.append_upload_attempt_event(
+                claim.job_id, claim.claim_token, artifact.artifact_id, attempt_id,
+                "create_result_uncertain", claimed_artifact_id=claimed_artifact_id,
+            )
             return self._recover_uncertain_creation(claim, claimed_artifact_id, artifact, attempt, baseline_id)
         self._renew(claim)
         self.store.record_upload_remote_identity(
@@ -785,9 +824,14 @@ class NotionArchiveWorker:
                 if sent_parts < 0 or sent_parts > int(attempt["expected_part_count"]):
                     raise NotionAmbiguousRecoveryError("notion multipart progress conflicts")
                 if sent_parts:
-                    handle.seek(sent_parts * self.settings.multipart_part_bytes)
+                    handle.seek(sent_parts * int(attempt["expected_part_size"] or self.settings.multipart_part_bytes))
                 for part_number in range(sent_parts + 1, int(attempt["expected_part_count"]) + 1):
-                    remaining = min(self.settings.multipart_part_bytes, artifact.byte_size - handle.tell())
+                    if not 1 <= part_number <= 1000:
+                        raise NotionStaticConfigError("notion part number is outside the API limit")
+                    remaining = min(
+                        int(attempt["expected_part_size"] or self.settings.multipart_part_bytes),
+                        artifact.byte_size - handle.tell(),
+                    )
                     self._renew(claim)
                     self.client.send_file_upload(
                         upload_id, filename=str(attempt["remote_filename"]),
@@ -911,8 +955,20 @@ def _assert_sandbox_target(
     if not project.allow_synthetic_fixture_writes:
         raise NotionStaticConfigError("synthetic fixture writes are not enabled")
     projects = config.get("projects")
-    if not isinstance(projects, Mapping) or "pid" not in projects:
+    if not isinstance(projects, Mapping):
         raise NotionStaticConfigError("PID target must be configured for sandbox separation proof")
+    try:
+        pid = ProjectNotionConfig.from_config(config, "pid")
+    except NotionStaticConfigError as exc:
+        raise NotionStaticConfigError(
+            "valid PID Notion IDs are required for sandbox separation proof"
+        ) from exc
+    if not pid.database_id or not pid.data_source_id:
+        raise NotionStaticConfigError(
+            "valid PID Notion IDs are required for sandbox separation proof"
+        )
+    if pid.database_id == project.database_id or pid.data_source_id == project.data_source_id:
+        raise NotionStaticConfigError("sandbox Notion target overlaps PID")
     for key, value in projects.items():
         notion = value.get("notion") if isinstance(value, Mapping) else None
         if not isinstance(notion, Mapping) or str(key) == project.project_key:
@@ -995,6 +1051,46 @@ def run_fixed_sandbox_fixtures(
     )
     store.admit_raw_artifact(spool, small_attachment, [small])
     store.admit_raw_artifact(spool, large_attachment, [large])
+    existing_page = store.get_notion_operation(parent.artifact_id, "page")
+    if existing_page and existing_page.get("page_id"):
+        page_id = str(existing_page["page_id"])
+        page = client.retrieve_page(page_id)
+        worker = NotionArchiveWorker(store, spool, client, settings, config)
+        worker.preflight(project, apply_schema=False)
+        worker._verify_page(page, parent, project)
+        blocks = client.list_block_children(page_id)
+        rendered = json.dumps(blocks.items, sort_keys=True, ensure_ascii=False)
+        for artifact in (parent, small_attachment, large_attachment):
+            operation = store.get_notion_operation(artifact.artifact_id, "file")
+            attempts = store.get_upload_attempts(artifact.artifact_id)
+            if not operation or operation.get("state") != "receipt-verified" or not attempts:
+                raise NotionIncompleteEvidenceError(
+                    "sandbox fixture archive is incomplete and requires operator retry"
+                )
+            attempt = next(
+                (
+                    item for item in attempts
+                    if item["attempt_id"] == operation.get("active_upload_attempt_id")
+                ),
+                None,
+            )
+            if attempt is None or not attempt.get("remote_upload_id"):
+                raise NotionIncompleteEvidenceError(
+                    "sandbox fixture upload identity is incomplete"
+                )
+            remote = client.retrieve_file_upload(str(attempt["remote_upload_id"]))
+            worker._validate_remote_upload(remote, artifact, attempt)
+            if remote.get("status") != "uploaded" or str(attempt["opaque_marker"]) not in rendered:
+                raise NotionIncompleteEvidenceError(
+                    "sandbox fixture remote receipt is incomplete"
+                )
+        return {
+            "project": project_key,
+            "page_id": page_id,
+            "fixture_count": 3,
+            "multipart_exercised": True,
+            "recovered": True,
+        }
     claim = store.claim_next(
         stage="notion_archived", spool=spool, lease_seconds=settings.lease_seconds
     )
@@ -1006,6 +1102,7 @@ def run_fixed_sandbox_fixtures(
         "page_id": page_id,
         "fixture_count": 3,
         "multipart_exercised": True,
+        "recovered": False,
     }
 
 

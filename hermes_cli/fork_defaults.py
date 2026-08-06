@@ -15,28 +15,7 @@ FORK_DEFAULT_ADDITIONS = {
     # Built-ins live exclusively in hermes_cli.model_tiers. This config section
     # is reserved for genuinely custom tier names.
     "model_tiers": {},
-    "projects": {
-        "pid": {
-            "notion": {
-                "database_id": "b189603e-e75f-435c-b8b3-0babcf6be30d",
-                "data_source_id": "c8c5d6df-c08f-458a-a640-5745986a11e7",
-                "sandbox": False,
-                "allow_synthetic_fixture_writes": False,
-                "properties": {
-                    "title": "Feedback",
-                    "status": "Status",
-                    "received_at": "Date Received",
-                    "source_label": "Client / Source",
-                    "category": "Category",
-                    "priority": "Priority",
-                    "source_id": "Source ID",
-                    "source_type": "Source Type",
-                    "source_hash": "Source Hash",
-                    "source_url": "Source URL",
-                },
-            }
-        }
-    },
+    "projects": {},
     "client_knowledge": {
         "intake": {
             "enabled": False,

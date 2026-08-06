@@ -9,21 +9,27 @@ from collections import Counter
 import httpx
 import pytest
 
-from plugins.client_knowledge_gbrain.models import IntakeArtifact
+from plugins.client_knowledge_gbrain.models import IntakeArtifact, StageReceipt
 from plugins.client_knowledge_gbrain.notion import (
     NOTION_API_VERSION,
     NotionClient,
     NotionIncompleteEvidenceError,
     NotionRetryableError,
+    NotionSchemaError,
     NotionStaticConfigError,
 )
+from hermes_cli.fork_defaults import FORK_DEFAULT_ADDITIONS
 from plugins.client_knowledge_gbrain.notion_archive import (
     NotionArchiveSettings,
     NotionArchiveWorker,
     ProjectNotionConfig,
+    run_fixed_sandbox_fixtures,
     _HeartbeatReader,
     _assert_sandbox_target,
     _marker,
+    _multipart_plan,
+    MAX_BODY_CHARS,
+    TRUNCATION_NOTICE,
 )
 from plugins.client_knowledge_gbrain.spool import RawSpool
 from plugins.client_knowledge_gbrain.store import IntakeStore
@@ -153,6 +159,7 @@ def _page(artifact, page_id="page-1"):
         "properties": {
             "Source ID": rich(artifact.artifact_id),
             "Source Hash": rich(artifact.content_sha256),
+            "Source Type": rich(artifact.source_type),
         },
     }
 
@@ -166,6 +173,27 @@ def test_client_pins_api_version_and_classifies_retryable_failures():
     with pytest.raises(NotionRetryableError):
         client.retrieve_data_source("source-1")
     assert requests[0].headers["Notion-Version"] == NOTION_API_VERSION == "2026-03-11"
+
+
+def test_universal_defaults_do_not_ship_pid_notion_ids():
+    assert FORK_DEFAULT_ADDITIONS["projects"] == {}
+
+
+@pytest.mark.parametrize("path", ["/file_uploads/u/send", "/file_uploads/u/complete"])
+def test_conflict_error_is_retryable_for_upload_storage_paths(path):
+    client = NotionClient("token", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(409, json={"object": "error", "code": "conflict_error"})
+    ))
+    with pytest.raises(NotionRetryableError):
+        client._request("POST", path, json={})
+
+
+def test_terminal_409_variant_fails_closed():
+    client = NotionClient("token", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(409, json={"object": "error", "code": "agent_deleted"})
+    ))
+    with pytest.raises(NotionSchemaError):
+        client._request("POST", "/pages", json={})
 
 
 def test_upload_listing_requires_complete_paginated_evidence():
@@ -215,6 +243,26 @@ def test_preflight_adds_only_missing_machine_properties_and_preserves_schema(tmp
     assert set(patches[0]["properties"]) == {"Source ID", "Source Type", "Source Hash", "Source URL"}
     assert "Status" not in patches[0]["properties"]
     assert before["properties"]["Status"] == after["properties"]["Status"]
+
+
+def test_read_only_preflight_succeeds_when_all_machine_properties_are_absent(tmp_path):
+    methods = []
+    def handler(request):
+        methods.append((request.method, request.url.path))
+        return httpx.Response(200, json=_schema(machine=False))
+    config = _config()
+    worker = NotionArchiveWorker(
+        IntakeStore(tmp_path / "private" / "intake.db"),
+        RawSpool(tmp_path / "private" / "raw"),
+        NotionClient("token", transport=httpx.MockTransport(handler)),
+        _settings(config), config,
+    )
+    result = worker.preflight(ProjectNotionConfig.from_config(config, "pid"))
+    assert result["applied"] is False
+    assert set(result["missing_properties"]) == {
+        "Source ID", "Source Type", "Source Hash", "Source URL",
+    }
+    assert methods == [("GET", "/v1/data_sources/source-1")]
 
 
 def test_preflight_never_imports_or_mutates_historical_rows(tmp_path):
@@ -277,6 +325,30 @@ def test_multipart_part_size_config_is_bounded():
     config["client_knowledge"]["notion"]["multipart_part_bytes"] = 4 * 1024 * 1024
     with pytest.raises(NotionStaticConfigError, match="between 5 and 20"):
         NotionArchiveSettings.from_config(config)
+
+
+def test_multipart_plan_enforces_1000_part_limit_with_larger_compliant_parts():
+    part_size, count = _multipart_plan(5 * 1024 * 1024 * 1001, 5 * 1024 * 1024)
+    assert count == 1000
+    assert 5 * 1024 * 1024 < part_size <= 20 * 1024 * 1024
+    assert _multipart_plan(20 * 1024 * 1024 * 1000, 20 * 1024 * 1024) == (
+        20 * 1024 * 1024, 1000,
+    )
+    with pytest.raises(NotionStaticConfigError, match="part limit"):
+        _multipart_plan(20 * 1024 * 1024 * 1000 + 1, 20 * 1024 * 1024)
+
+
+def test_send_file_upload_rejects_part_numbers_outside_api_limit():
+    client = NotionClient("token", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={})
+    ))
+    for part_number in (0, 1001):
+        with pytest.raises(NotionSchemaError, match="part number"):
+            client.send_file_upload(
+                "upload", filename="fixture.bin",
+                content_type="application/octet-stream",
+                content=io.BytesIO(b"x"), part_number=part_number,
+            )
 
 
 def test_uncertain_creation_adopts_only_marker_bound_candidate_among_concurrent_uploads(tmp_path):
@@ -363,6 +435,37 @@ def test_uncertain_creation_with_no_marker_candidate_remains_retryable(tmp_path)
     worker = NotionArchiveWorker(store, spool, client, _settings(config), config)
     with pytest.raises(NotionIncompleteEvidenceError):
         worker._recover_uncertain_creation(claim, artifact.artifact_id, artifact, attempt, scan_id)
+
+
+def test_missing_create_id_records_uncertain_event_before_successful_adoption(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    attempt_id = "f" * 32
+    marker = _marker(artifact, attempt_id)
+    attempt = store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=attempt_id, opaque_marker=marker,
+        remote_filename=f"{marker}.eml", upload_mode="single_part",
+        expected_part_count=1,
+    )
+    worker = NotionArchiveWorker(
+        store, spool,
+        NotionClient("token", transport=httpx.MockTransport(lambda _request: httpx.Response(200))),
+        _settings(config), config,
+    )
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: ("baseline", type("E", (), {"items": (), "page_count": 1})()))
+    monkeypatch.setattr(worker.client, "create_file_upload", lambda **_kwargs: {"object": "file_upload"})
+    def adopt(*_args):
+        events = store.get_upload_attempt_events(attempt_id)
+        assert events[-1]["event_type"] == "create_result_uncertain"
+        return "adopted-upload"
+    monkeypatch.setattr(worker, "_recover_uncertain_creation", adopt)
+    assert worker._create_or_recover_upload(
+        claim, artifact.artifact_id, artifact, attempt
+    ) == "adopted-upload"
+    assert "create_result_uncertain" in {
+        event["event_type"] for event in store.get_upload_attempt_events(attempt_id)
+    }
 
 
 def test_upload_attempt_history_is_append_only_and_replacements_retain_prior_identity(tmp_path):
@@ -460,6 +563,31 @@ def test_heartbeat_reader_aborts_transfer_when_ownership_is_lost():
         reader.read(1)
 
 
+def test_process_claim_renews_immediately_before_final_completion(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    worker = NotionArchiveWorker(
+        store, spool,
+        NotionClient("token", transport=httpx.MockTransport(lambda _request: httpx.Response(200))),
+        _settings(config), config,
+    )
+    monkeypatch.setattr(worker, "preflight", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(worker, "_ensure_page", lambda *_args: "page-1")
+    monkeypatch.setattr(worker, "_ensure_file", lambda *_args: "attempt-1")
+    renewals = []
+    original_renew = worker._renew
+    def renew(current_claim):
+        renewals.append(current_claim.claim_token)
+        original_renew(current_claim)
+    monkeypatch.setattr(worker, "_renew", renew)
+    original_complete = store.complete_stage
+    def complete(job_id, claim_token, receipt):
+        assert renewals[-1] == claim_token
+        return original_complete(job_id, claim_token, receipt)
+    monkeypatch.setattr(store, "complete_stage", complete)
+    assert worker.process_claim(claim) == "page-1"
+
+
 def test_page_recovery_and_archive_fields_exclude_priority_and_synthesis(tmp_path):
     message = email.message.EmailMessage()
     message["Subject"] = "Feedback"
@@ -497,6 +625,59 @@ def test_page_recovery_and_archive_fields_exclude_priority_and_synthesis(tmp_pat
     )
     assert worker._ensure_page(claim, artifact, ProjectNotionConfig.from_config(config, "pid")) == "page-1"
     assert store.get_notion_operation(artifact.artifact_id, "page")["page_id"] == "page-1"
+
+
+def test_page_recovery_rejects_source_type_mismatch(tmp_path):
+    artifact = _artifact()
+    page = _page(artifact)
+    page["properties"]["Source Type"] = {"rich_text": [{"plain_text": "attachment"}]}
+    config = _config()
+    worker = NotionArchiveWorker(
+        IntakeStore(tmp_path / "private" / "intake.db"),
+        RawSpool(tmp_path / "private" / "raw"),
+        NotionClient("token", transport=httpx.MockTransport(lambda _request: httpx.Response(200))),
+        _settings(config), config,
+    )
+    with pytest.raises(Exception, match="type conflicts"):
+        worker._verify_page(page, artifact, ProjectNotionConfig.from_config(config, "pid"))
+
+
+def test_oversized_email_render_is_bounded_with_deterministic_notice(tmp_path):
+    body = "x" * (MAX_BODY_CHARS + 10_000)
+    message = email.message.EmailMessage()
+    message["Subject"] = "Large"
+    message.set_content(body)
+    raw = message.as_bytes()
+    artifact = _artifact(raw)
+    store, spool, claim, _ = _claim(tmp_path, artifact, raw)
+    worker = NotionArchiveWorker(
+        store, spool,
+        NotionClient("token", transport=httpx.MockTransport(lambda _request: httpx.Response(200))),
+        _settings(_config()), _config(),
+    )
+    _subject, rendered, _headers = worker._source_content(artifact)
+    assert len(rendered) <= MAX_BODY_CHARS + len(TRUNCATION_NOTICE)
+    assert rendered.endswith(TRUNCATION_NOTICE)
+
+
+def test_oversized_render_emits_no_more_than_fixed_block_limit(tmp_path, monkeypatch):
+    artifact = _artifact()
+    store, spool, claim, _ = _claim(tmp_path)
+    batches = []
+    class Client:
+        def list_block_children(self, *_args, **_kwargs):
+            return type("Evidence", (), {"items": ()})()
+        def append_block_children(self, _page_id, children):
+            batches.append(list(children))
+            return {"results": [{"id": "block"}]}
+    worker = NotionArchiveWorker(store, spool, Client(), _settings(_config()), _config())
+    monkeypatch.setattr(
+        worker, "_source_content",
+        lambda _artifact: ("Large", "x" * (MAX_BODY_CHARS + 1), {"Subject": "Large"}),
+    )
+    worker._ensure_source_blocks(claim, artifact, "page-1")
+    assert sum(len(batch) - 1 for batch in batches) <= 80
+    assert len(batches) == 1
 
 
 def test_select_status_schema_uses_select_page_property(tmp_path):
@@ -640,9 +821,33 @@ def test_multipart_flow_sends_parts_then_completes_with_heartbeats(tmp_path):
 def test_store_migration_creates_append_only_upload_tables(tmp_path):
     store = IntakeStore(tmp_path / "private" / "intake.db")
     with store._connect() as conn:
-        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "4"
+        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "5"
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"notion_upload_attempts", "notion_upload_attempt_events", "notion_upload_scans"}.issubset(tables)
+
+
+def test_schema_v4_migrates_upload_attempt_part_size_additively(tmp_path):
+    db = tmp_path / "private" / "intake.db"
+    store = IntakeStore(db)
+    with store._write() as conn:
+        conn.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
+        conn.execute(
+            "CREATE TABLE replacement AS SELECT attempt_id, artifact_id, operation_kind, ordinal, "
+            "replaces_attempt_id, replacement_reason, marker_version, opaque_marker, remote_filename, "
+            "upload_mode, expected_sha256, expected_size, expected_mime_type, expected_part_count, "
+            "baseline_scan_id, remote_upload_id, created_by_job_id, created_at "
+            "FROM notion_upload_attempts"
+        )
+        conn.execute("DROP TABLE notion_upload_attempts")
+        conn.execute("ALTER TABLE replacement RENAME TO notion_upload_attempts")
+    migrated = IntakeStore(db)
+    with migrated._connect() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(notion_upload_attempts)")}
+        version = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert version == "5"
+    assert "expected_part_size" in columns
 
 
 def test_synthetic_fixture_guard_never_allows_pid_or_production_id_collision():
@@ -661,6 +866,126 @@ def test_synthetic_fixture_guard_never_allows_pid_or_production_id_collision():
     sandbox = ProjectNotionConfig.from_config(config, "sandbox")
     with pytest.raises(NotionStaticConfigError, match="overlaps"):
         _assert_sandbox_target(config, sandbox)
+
+
+@pytest.mark.parametrize("pid_value", [{}, {"notion": {}}, {"notion": {"database_id": "db"}}])
+def test_synthetic_fixture_guard_requires_valid_pid_notion_ids(pid_value):
+    config = _config()
+    config["projects"]["pid"] = pid_value
+    config["projects"]["sandbox"] = {
+        "notion": {
+            "database_id": "sandbox-db",
+            "data_source_id": "sandbox-source",
+            "sandbox": True,
+            "allow_synthetic_fixture_writes": True,
+        }
+    }
+    sandbox = ProjectNotionConfig.from_config(config, "sandbox")
+    with pytest.raises(NotionStaticConfigError, match="valid PID"):
+        _assert_sandbox_target(config, sandbox)
+
+
+def test_fixed_sandbox_fixture_entry_point_is_repeatable_without_duplicates(tmp_path, monkeypatch):
+    config = _config(max_file_bytes=30 * 1024 * 1024)
+    config["projects"]["sandbox"] = {
+        "notion": {
+            "database_id": "sandbox-db",
+            "data_source_id": "sandbox-source",
+            "sandbox": True,
+            "allow_synthetic_fixture_writes": True,
+        }
+    }
+    store = IntakeStore(tmp_path / "private" / "intake.db")
+    spool = RawSpool(tmp_path / "private" / "raw")
+    remote_uploads = {}
+    markers = []
+    page_artifact = None
+
+    class FakeClient:
+        def retrieve_data_source(self, _source_id):
+            return _schema()
+
+        def query_data_source(self, *_args, **_kwargs):
+            return []
+
+        def retrieve_page(self, _page_id):
+            return _page(page_artifact, "sandbox-page")
+
+        def list_block_children(self, _page_id, **_kwargs):
+            return type("Evidence", (), {
+                "items": tuple({
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"plain_text": marker}]},
+                } for marker in markers)
+            })()
+
+        def retrieve_file_upload(self, upload_id):
+            return remote_uploads[upload_id]
+
+    def complete_fixture(self, claim):
+        nonlocal page_artifact
+        parent = store.get_artifact_for_notion_claim(
+            claim.job_id, claim.claim_token, claim.artifact_id
+        )
+        page_artifact = parent
+        family = [parent, *store.list_child_artifacts_for_notion_claim(
+            claim.job_id, claim.claim_token, claim.artifact_id
+        )]
+        store.advance_notion_operation(
+            claim.job_id, claim.claim_token, parent.artifact_id, "page", "page-verified",
+            expected_sha256=parent.content_sha256, expected_size=parent.byte_size,
+            expected_mime_type=parent.mime_type, page_id="sandbox-page",
+        )
+        for index, artifact in enumerate(family):
+            attempt_id = f"{index + 1:032x}"
+            marker = _marker(artifact, attempt_id)
+            markers.append(marker)
+            upload_id = f"upload-{index}"
+            attempt = store.reserve_upload_attempt(
+                claim.job_id, claim.claim_token, artifact,
+                attempt_id=attempt_id, opaque_marker=marker,
+                remote_filename=f"{marker}.bin", upload_mode="single_part",
+                expected_part_count=1, expected_part_size=artifact.byte_size,
+                claimed_artifact_id=parent.artifact_id,
+            )
+            store.record_upload_remote_identity(
+                claim.job_id, claim.claim_token, artifact.artifact_id,
+                attempt_id, upload_id, evidence_identity="fixture",
+                claimed_artifact_id=parent.artifact_id,
+            )
+            store.advance_notion_operation(
+                claim.job_id, claim.claim_token, artifact.artifact_id, "file", "receipt-verified",
+                expected_sha256=artifact.content_sha256, expected_size=artifact.byte_size,
+                expected_mime_type=artifact.mime_type, page_id="sandbox-page",
+                block_id=f"block-{index}", active_upload_attempt_id=attempt_id,
+                claimed_artifact_id=parent.artifact_id,
+            )
+            remote_uploads[upload_id] = _upload(
+                upload_id, attempt["remote_filename"], size=artifact.byte_size,
+                content_type=artifact.mime_type, status="uploaded",
+            )
+        self._renew(claim)
+        assert store.complete_stage(
+            claim.job_id, claim.claim_token,
+            StageReceipt(parent.artifact_id, "notion_archived", "notion:page:sandbox-page"),
+        )
+        return "sandbox-page"
+
+    monkeypatch.setattr(NotionArchiveWorker, "process_claim", complete_fixture)
+    first = run_fixed_sandbox_fixtures(
+        store=store, spool=spool, client=FakeClient(), config=config,
+        project_key="sandbox",
+    )
+    second = run_fixed_sandbox_fixtures(
+        store=store, spool=spool, client=FakeClient(), config=config,
+        project_key="sandbox",
+    )
+    assert first["page_id"] == second["page_id"] == "sandbox-page"
+    assert first["recovered"] is False
+    assert second["recovered"] is True
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notion_upload_attempts").fetchone()[0] == 3
+    assert len(remote_uploads) == 3
 
 
 def test_expired_upload_creates_linked_replacement_attempt(tmp_path, monkeypatch):

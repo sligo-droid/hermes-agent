@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
@@ -392,6 +392,7 @@ class IntakeStore:
                             expected_size INTEGER NOT NULL,
                             expected_mime_type TEXT NOT NULL,
                             expected_part_count INTEGER NOT NULL,
+                            expected_part_size INTEGER NOT NULL,
                             baseline_scan_id TEXT,
                             remote_upload_id TEXT UNIQUE,
                             created_by_job_id TEXT NOT NULL,
@@ -448,6 +449,23 @@ class IntakeStore:
                         "VALUES('schema_version', '4')"
                     )
                     version = 4
+                if version < 5:
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute(
+                            "PRAGMA table_info(notion_upload_attempts)"
+                        ).fetchall()
+                    }
+                    if "expected_part_size" not in columns:
+                        conn.execute(
+                            "ALTER TABLE notion_upload_attempts ADD COLUMN "
+                            "expected_part_size INTEGER NOT NULL DEFAULT 0"
+                        )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '5')"
+                    )
+                    version = 5
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -1215,6 +1233,7 @@ class IntakeStore:
         remote_filename: str,
         upload_mode: str,
         expected_part_count: int,
+        expected_part_size: int = 0,
         replaces_attempt_id: str | None = None,
         replacement_reason: str | None = None,
         claimed_artifact_id: str | None = None,
@@ -1237,12 +1256,13 @@ class IntakeStore:
                 "INSERT INTO notion_upload_attempts(attempt_id, artifact_id, operation_kind, ordinal, "
                 "replaces_attempt_id, replacement_reason, marker_version, opaque_marker, remote_filename, "
                 "upload_mode, expected_sha256, expected_size, expected_mime_type, expected_part_count, "
-                "created_by_job_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "expected_part_size, created_by_job_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     attempt_id, artifact.artifact_id, "file", ordinal,
                     replaces_attempt_id, replacement_reason, "ckfu-v1", opaque_marker,
                     remote_filename, upload_mode, artifact.content_sha256,
-                    artifact.byte_size, artifact.mime_type, int(expected_part_count), job_id, now,
+                    artifact.byte_size, artifact.mime_type, int(expected_part_count),
+                    int(expected_part_size), job_id, now,
                 ),
             )
             self._append_upload_event_locked(
@@ -1495,12 +1515,20 @@ class IntakeStore:
                 (scan_id,),
             ).fetchall()]
 
-    def complete_stage(self, job_id: str, claim_token: str, receipt: StageReceipt) -> bool:
-        now = time.time()
+    def complete_stage(
+        self,
+        job_id: str,
+        claim_token: str,
+        receipt: StageReceipt,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        now = time.time() if now is None else float(now)
         with self._write() as conn:
             row = conn.execute(
-                "SELECT artifact_id, stage FROM jobs WHERE job_id=? AND status='running' AND claim_token=?",
-                (job_id, claim_token),
+                "SELECT artifact_id, stage FROM jobs WHERE job_id=? AND status='running' "
+                "AND claim_token=? AND lease_expires_at>?",
+                (job_id, claim_token, now),
             ).fetchone()
             if row is None or row[0] != receipt.artifact_id or row[1] != receipt.stage:
                 return False
@@ -1523,13 +1551,13 @@ class IntakeStore:
                     "VALUES(?,?,?,?,?)",
                     (receipt.artifact_id, receipt.stage, receipt.receipt_id, receipt.output_sha256 or None, receipt.recorded_at),
                 )
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE jobs SET status='succeeded', claim_token=NULL, owner_pid=NULL, owner_host=NULL, "
                 "owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?, last_error_class=NULL "
-                "WHERE job_id=? AND status='running' AND claim_token=?",
-                (now, job_id, claim_token),
+                "WHERE job_id=? AND status='running' AND claim_token=? AND lease_expires_at>?",
+                (now, job_id, claim_token, now),
             )
-            return True
+            return cursor.rowcount == 1
 
     record_stage_receipt = complete_stage
 
@@ -1541,14 +1569,16 @@ class IntakeStore:
         error_class: str,
         retry_delay: float = 0,
         quarantine: bool = False,
+        now: float | None = None,
     ) -> bool:
-        now = time.time()
+        now = time.time() if now is None else float(now)
         status = "quarantined" if quarantine else "failed"
         next_retry = None if quarantine else now + max(0.0, float(retry_delay))
         with self._write() as conn:
             row = conn.execute(
-                "SELECT attempt_count, max_attempts FROM jobs WHERE job_id=? AND status='running' AND claim_token=?",
-                (job_id, claim_token),
+                "SELECT attempt_count, max_attempts FROM jobs WHERE job_id=? AND status='running' "
+                "AND claim_token=? AND lease_expires_at>?",
+                (job_id, claim_token, now),
             ).fetchone()
             if row is None:
                 return False
@@ -1560,8 +1590,8 @@ class IntakeStore:
             cursor = conn.execute(
                 "UPDATE jobs SET status=?, claim_token=NULL, owner_pid=NULL, owner_host=NULL, owner_started_at=NULL, "
                 "lease_expires_at=NULL, heartbeat_at=NULL, next_retry_at=?, last_error_class=?, updated_at=? "
-                "WHERE job_id=? AND status='running' AND claim_token=?",
-                (status, next_retry, error_class, now, job_id, claim_token),
+                "WHERE job_id=? AND status='running' AND claim_token=? AND lease_expires_at>?",
+                (status, next_retry, error_class, now, job_id, claim_token, now),
             )
             return cursor.rowcount == 1
 

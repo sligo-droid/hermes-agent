@@ -100,6 +100,14 @@ class NotionClient:
             raise NotionRetryableError("notion service failure")
         if response.status_code in {401, 403, 404}:
             raise NotionPermissionError("notion target is unavailable")
+        if response.status_code == 409:
+            try:
+                conflict = response.json()
+            except ValueError as exc:
+                raise NotionSchemaError("notion returned an invalid conflict") from exc
+            if isinstance(conflict, Mapping) and conflict.get("code") == "conflict_error":
+                raise NotionRetryableError("notion storage conflict")
+            raise NotionSchemaError("notion returned a terminal conflict")
         if response.status_code >= 400:
             raise NotionSchemaError("notion rejected a static request")
         try:
@@ -220,6 +228,8 @@ class NotionClient:
         content: Any,
         part_number: int | None = None,
     ) -> dict[str, Any]:
+        if part_number is not None and not 1 <= int(part_number) <= 1000:
+            raise NotionSchemaError("notion upload part number is outside the API limit")
         data = {"part_number": str(part_number)} if part_number is not None else None
         return self._request(
             "POST",
