@@ -98,6 +98,39 @@ def test_role_locator_includes_native_html_roles_and_names():
     assert "node.value" in expression
 
 
+def test_role_locator_matches_snapshot_landmarks_and_labelled_names():
+    supervisor = _supervisor()
+    expression = supervisor._trusted_locator_expression(
+        {"by": "role", "value": "navigation", "name": "Primary navigation"}
+    )
+
+    assert "navigation: 'nav'" in expression
+    assert "main: 'main'" in expression
+    assert "aria-labelledby" in expression
+
+
+def test_diagnostic_cursor_changes_do_not_trigger_state_retry():
+    supervisor = _supervisor()
+    with patch.object(
+        supervisor,
+        "trusted_element_state",
+        return_value={"ok": True, "count": 1, "exists": True},
+    ), patch.object(supervisor, "snapshot") as snapshot:
+        snapshot.return_value.active = True
+        before = supervisor.trusted_state_fingerprint(
+            [{"by": "role", "value": "main", "name": "Agora Home"}]
+        )
+        supervisor._on_console(
+            {"type": "warning", "args": [{"value": "late warning"}]},
+            level_from="api",
+        )
+        after = supervisor.trusted_state_fingerprint(
+            [{"by": "role", "value": "main", "name": "Agora Home"}]
+        )
+
+    assert after == before
+
+
 def test_trusted_locator_rejects_javascript_shaped_css():
     supervisor = _supervisor()
 

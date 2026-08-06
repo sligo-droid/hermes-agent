@@ -89,15 +89,42 @@ def _pending_closeout_allows_tool(function_name: str) -> bool:
 
 
 def _reserve_visual_qa_call(agent: Any, function_name: str) -> bool:
-    """Allow one initial visual check plus one correction retry per turn."""
+    """Reserve two execution slots plus one bounded contract-repair call."""
 
     if function_name != "visual_qa":
         return True
-    count = max(0, int(getattr(agent, "_visual_qa_tool_calls", 0) or 0))
-    if count >= 2:
+    execution_count = max(
+        0,
+        int(getattr(agent, "_visual_qa_tool_calls", 0) or 0),
+    )
+    total_count = max(
+        0,
+        int(getattr(agent, "_visual_qa_total_calls", 0) or 0),
+    )
+    if execution_count >= 2 or total_count >= 3:
         return False
-    agent._visual_qa_tool_calls = count + 1
+    agent._visual_qa_tool_calls = execution_count + 1
+    agent._visual_qa_total_calls = total_count + 1
     return True
+
+
+def _release_invalid_visual_qa_execution_slot(
+    agent: Any,
+    function_name: str,
+    result: Any,
+) -> None:
+    """Do not spend an execution slot on a host-rejected contract."""
+
+    if function_name != "visual_qa":
+        return
+    try:
+        data = result if isinstance(result, dict) else json.loads(str(result))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict) or data.get("code") != "invalid_visual_contract":
+        return
+    count = max(0, int(getattr(agent, "_visual_qa_tool_calls", 0) or 0))
+    agent._visual_qa_tool_calls = max(0, count - 1)
 
 
 def _append_visual_qa_limit_tool_result(
@@ -109,8 +136,8 @@ def _append_visual_qa_limit_tool_result(
         make_tool_result_message(
             "visual_qa",
             (
-                "[Tool execution skipped — visual_qa permits one initial call and one "
-                "correction retry per turn. Continue from the recorded result.]"
+                "[Tool execution skipped — visual_qa permits two executable calls plus one "
+                "malformed-contract repair per turn. Continue from the recorded result.]"
             ),
             tool_call.id,
             effect_disposition="none",
@@ -991,6 +1018,7 @@ def _record_turn_tool_runtime(
     *,
     blocked: bool = False,
 ) -> None:
+    _release_invalid_visual_qa_execution_slot(agent, function_name, result)
     stats = getattr(agent, "_turn_runtime_stats", None)
     if not isinstance(stats, dict):
         return
