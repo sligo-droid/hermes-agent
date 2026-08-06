@@ -12,6 +12,10 @@ import httpx
 
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
+# Gmail accepts inbound messages up to 50 MiB. A raw API response base64url-
+# encodes those bytes, so a configured small admission cap must not make a
+# provider-valid oversized message fail at the transport layer forever.
+GMAIL_PROVIDER_RAW_RESPONSE_BYTES = 72 * 1024 * 1024
 
 
 class GmailAPIError(RuntimeError):
@@ -70,10 +74,20 @@ class GmailClient:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
-    def _get(self, path: str, *, params: Mapping[str, Any] | None = None, kind: str) -> GmailResponse:
+    def _get(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        kind: str,
+        max_response_bytes: int | None = None,
+    ) -> GmailResponse:
         digest = hashlib.sha256()
         chunks = []
         size = 0
+        response_limit = self.max_response_bytes if max_response_bytes is None else max(
+            self.max_response_bytes, int(max_response_bytes)
+        )
         try:
             with self._client.stream("GET", path, params=params) as response:
                 status = response.status_code
@@ -82,7 +96,7 @@ class GmailClient:
                 )
                 for chunk in response.iter_bytes():
                     size += len(chunk)
-                    if size > self.max_response_bytes:
+                    if size > response_limit:
                         raise GmailRetryableError("Gmail response exceeded the transport bound")
                     digest.update(chunk)
                     chunks.append(chunk)
@@ -158,6 +172,7 @@ class GmailClient:
                 "fields": "id,threadId,historyId,internalDate,sizeEstimate,raw",
             },
             kind="message",
+            max_response_bytes=GMAIL_PROVIDER_RAW_RESPONSE_BYTES,
         )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import stat
 import time
@@ -22,6 +23,7 @@ DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token"
 TOKENINFO_URI = "https://oauth2.googleapis.com/tokeninfo"
 DEFAULT_TOKEN_RELATIVE_PATH = "secrets/client-knowledge/gmail-readonly-token.json"
 _MAX_CREDENTIAL_BYTES = 64 * 1024
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,512}$")
 
 
 class GmailAuthError(RuntimeError):
@@ -100,6 +102,13 @@ def _expiry(value: Any) -> float:
         return 0.0
 
 
+def _client_id(value: Any) -> str:
+    client_id = str(value or "")
+    if not _CLIENT_ID_RE.fullmatch(client_id):
+        raise GmailAuthError("Gmail OAuth client ID is missing or invalid")
+    return client_id
+
+
 def _atomic_save(path: Path, payload: Mapping[str, Any]) -> None:
     _reject_symlinks(path)
     encoded = json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -156,22 +165,24 @@ class GmailOAuth:
         token_uri = str(payload.get("token_uri") or DEFAULT_TOKEN_URI).strip()
         if token_uri != DEFAULT_TOKEN_URI:
             raise GmailAuthError("Gmail credential token endpoint is not approved")
+        client_id = _client_id(payload.get("client_id"))
         token = str(payload.get("token") or "").strip()
         expires_at = _expiry(payload.get("expiry"))
         if not token or expires_at <= timestamp + 60:
             token, expires_at = self._refresh(payload, timestamp)
-            self._introspect(token, str(payload.get("client_id") or "").strip())
+            self._introspect(token, client_id)
             payload["token"] = token
             payload["expiry"] = datetime.fromtimestamp(expires_at, timezone.utc).isoformat()
             _atomic_save(self.token_path, payload)
         else:
-            self._introspect(token, str(payload.get("client_id") or "").strip())
+            self._introspect(token, client_id)
         return GmailAccessToken(token, expires_at)
 
     def _refresh(self, payload: Mapping[str, Any], now: float) -> tuple[str, float]:
         required = {
-            key: str(payload.get(key) or "").strip()
-            for key in ("client_id", "client_secret", "refresh_token")
+            "client_id": _client_id(payload.get("client_id")),
+            "client_secret": str(payload.get("client_secret") or "").strip(),
+            "refresh_token": str(payload.get("refresh_token") or "").strip(),
         }
         if not all(required.values()):
             raise GmailAuthError("Gmail credential refresh fields are incomplete")
@@ -219,8 +230,14 @@ class GmailOAuth:
             raise GmailAuthError("Gmail OAuth scope verification failed") from exc
         if not isinstance(details, Mapping) or _scope_set(details.get("scope")) != {GMAIL_READONLY_SCOPE}:
             raise GmailAuthError("Gmail access token scope is not exactly gmail.readonly")
-        audience = str(details.get("aud") or details.get("issued_to") or "").strip()
-        if audience and audience != client_id:
+        aud = str(details.get("aud") or "").strip()
+        issued_to = str(details.get("issued_to") or "").strip()
+        if not aud and not issued_to:
+            raise GmailAuthError("Gmail access token audience is missing")
+        if aud and issued_to and aud != issued_to:
+            raise GmailAuthError("Gmail access token audience evidence conflicts")
+        audience = aud or issued_to
+        if audience != client_id:
             raise GmailAuthError("Gmail access token audience does not match the OAuth client")
 
 

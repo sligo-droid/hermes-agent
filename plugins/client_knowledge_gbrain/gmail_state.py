@@ -65,6 +65,17 @@ class GmailMailboxState:
     admit_after_server_ms: int
 
 
+@dataclass(frozen=True, slots=True)
+class InvalidRawResult:
+    """Outcome of disposition-fenced malformed-provider accounting."""
+
+    stop: bool
+    terminal: bool
+    adopted: bool
+    disposition: str
+    count: int
+
+
 class GmailState:
     """Gmail-specific state layered onto the shared intake database."""
 
@@ -635,34 +646,70 @@ class GmailState:
         error_class: str,
         threshold: int,
         now: float | None = None,
-    ) -> bool:
+    ) -> InvalidRawResult:
         table, key = self._item_table(kind)
         if len(fingerprint) != 64:
             raise ValueError("Gmail invalid response fingerprint is invalid")
         timestamp = time.time() if now is None else float(now)
         with self.store._write() as conn:
             row = conn.execute(
-                f"SELECT invalid_fingerprint, invalid_error_class, invalid_count FROM {table} "
+                f"SELECT disposition, invalid_fingerprint, invalid_error_class, invalid_count "
+                f"FROM {table} "
                 f"WHERE {key}=?", (item_id,)
             ).fetchone()
             if row is None:
                 raise ValueError("Gmail item does not exist")
-            count = int(row[2]) + 1 if row[0] == fingerprint and row[1] == error_class else 1
+            disposition = str(row[0])
+            if disposition != "pending":
+                return InvalidRawResult(
+                    stop=True,
+                    terminal=disposition in TERMINAL_DISPOSITIONS,
+                    adopted=True,
+                    disposition=disposition,
+                    count=int(row[3]),
+                )
+            count = int(row[3]) + 1 if row[1] == fingerprint and row[2] == error_class else 1
             terminal = count >= max(1, int(threshold))
-            conn.execute(
+            next_disposition = (
+                "rejected_invalid_provider_raw_consistent" if terminal else "pending"
+            )
+            cursor = conn.execute(
                 f"UPDATE {table} SET invalid_fingerprint=?, invalid_error_class=?, invalid_count=?, "
-                f"disposition=?, error_class=?, updated_at=? WHERE {key}=?",
+                f"disposition=?, error_class=?, updated_at=? WHERE {key}=? "
+                f"AND disposition='pending' AND invalid_count=?",
                 (
                     fingerprint,
                     error_class,
                     count,
-                    "rejected_invalid_provider_raw_consistent" if terminal else "pending",
+                    next_disposition,
                     error_class,
                     timestamp,
                     item_id,
+                    int(row[3]),
                 ),
             )
-            return terminal
+            if cursor.rowcount != 1:
+                adopted = conn.execute(
+                    f"SELECT disposition, invalid_count FROM {table} WHERE {key}=?",
+                    (item_id,),
+                ).fetchone()
+                if adopted is None:
+                    raise ValueError("Gmail item does not exist")
+                adopted_disposition = str(adopted[0])
+                return InvalidRawResult(
+                    stop=adopted_disposition != "pending",
+                    terminal=adopted_disposition in TERMINAL_DISPOSITIONS,
+                    adopted=True,
+                    disposition=adopted_disposition,
+                    count=int(adopted[1]),
+                )
+            return InvalidRawResult(
+                stop=terminal,
+                terminal=terminal,
+                adopted=False,
+                disposition=next_disposition,
+                count=count,
+            )
 
     def finalize(
         self,
@@ -772,4 +819,9 @@ class GmailState:
             return str(batch["target_cursor"])
 
 
-__all__ = ["GmailMailboxState", "GmailState", "TERMINAL_DISPOSITIONS"]
+__all__ = [
+    "GmailMailboxState",
+    "GmailState",
+    "InvalidRawResult",
+    "TERMINAL_DISPOSITIONS",
+]

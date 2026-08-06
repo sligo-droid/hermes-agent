@@ -27,6 +27,7 @@ from plugins.client_knowledge_gbrain.gmail_auth import (
 from plugins.client_knowledge_gbrain.gmail_mime import cleanup_attachments, parse_attachments, resolve_alias
 from plugins.client_knowledge_gbrain.gmail_poller import GmailPoller, GmailSettings
 from plugins.client_knowledge_gbrain.gmail_state import GmailState
+from plugins.client_knowledge_gbrain.models import IntakeArtifact
 from plugins.client_knowledge_gbrain.spool import RawSpool
 from plugins.client_knowledge_gbrain.store import IntakeStore
 
@@ -60,7 +61,7 @@ def _settings(tmp_path):
 
 def _private_token(tmp_path, *, scopes=None):
     private = tmp_path / "private"
-    private.mkdir(mode=0o700)
+    private.mkdir(mode=0o700, exist_ok=True)
     path = private / "gmail-token.json"
     path.write_text(json.dumps({
         "client_id": "synthetic-client",
@@ -103,12 +104,26 @@ def test_exact_readonly_oauth_refresh_and_introspection_use_httpx(tmp_path):
                 "expires_in": 3600,
                 "scope": GMAIL_READONLY_SCOPE,
             })
-        return httpx.Response(200, json={"scope": GMAIL_READONLY_SCOPE})
+        return httpx.Response(200, json={
+            "scope": GMAIL_READONLY_SCOPE,
+            "aud": "synthetic-client",
+        })
 
     token = GmailOAuth(path, transport=httpx.MockTransport(handler)).access_token(now=2_000_000_000)
     assert token.value == "refreshed"
     assert [request.method for request in requests] == ["POST", "GET"]
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_cached_oauth_accepts_matching_mandatory_audience(tmp_path):
+    path = _private_token(tmp_path)
+    token = GmailOAuth(path, transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={
+            "scope": GMAIL_READONLY_SCOPE,
+            "issued_to": "synthetic-client",
+        })
+    )).access_token(now=10)
+    assert token.value == "synthetic-access"
 
 
 @pytest.mark.parametrize("scopes", [
@@ -135,6 +150,39 @@ def test_oauth_rejects_introspected_audience_mismatch(tmp_path):
         GmailOAuth(path, transport=transport).access_token(now=10)
 
 
+def test_cached_oauth_requires_client_id_and_introspected_audience(tmp_path):
+    path = _private_token(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["client_id"] = ""
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    with pytest.raises(GmailAuthError, match="client"):
+        GmailOAuth(path, transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={
+                "scope": GMAIL_READONLY_SCOPE,
+                "aud": "synthetic-client",
+            })
+        )).access_token(now=10)
+
+    path = _private_token(tmp_path)
+    with pytest.raises(GmailAuthError, match="audience"):
+        GmailOAuth(path, transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"scope": GMAIL_READONLY_SCOPE})
+        )).access_token(now=10)
+
+
+def test_cached_oauth_rejects_conflicting_audience_fields(tmp_path):
+    path = _private_token(tmp_path)
+    with pytest.raises(GmailAuthError, match="audience"):
+        GmailOAuth(path, transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={
+                "scope": GMAIL_READONLY_SCOPE,
+                "aud": "synthetic-client",
+                "issued_to": "different-client",
+            })
+        )).access_token(now=10)
+
+
 def test_failed_refreshed_scope_proof_does_not_persist_new_token(tmp_path):
     path = _private_token(tmp_path)
     original = json.loads(path.read_text(encoding="utf-8"))
@@ -154,6 +202,68 @@ def test_failed_refreshed_scope_proof_does_not_persist_new_token(tmp_path):
         })
 
     with pytest.raises(GmailAuthError, match="scope"):
+        GmailOAuth(path, transport=httpx.MockTransport(handler)).access_token(now=2_000_000_000)
+    assert json.loads(path.read_text(encoding="utf-8"))["token"] == "synthetic-access"
+
+
+def test_refresh_requires_introspected_audience_before_persisting(tmp_path):
+    path = _private_token(tmp_path)
+    original = json.loads(path.read_text(encoding="utf-8"))
+    original["expiry"] = "2020-01-01T00:00:00+00:00"
+    path.write_text(json.dumps(original), encoding="utf-8")
+    path.chmod(0o600)
+
+    def handler(request):
+        if request.url.path == "/token":
+            return httpx.Response(200, json={
+                "access_token": "untrusted-new-token",
+                "expires_in": 3600,
+                "scope": GMAIL_READONLY_SCOPE,
+            })
+        return httpx.Response(200, json={"scope": GMAIL_READONLY_SCOPE})
+
+    with pytest.raises(GmailAuthError, match="audience"):
+        GmailOAuth(path, transport=httpx.MockTransport(handler)).access_token(now=2_000_000_000)
+    assert json.loads(path.read_text(encoding="utf-8"))["token"] == "synthetic-access"
+
+
+def test_refresh_rejects_missing_client_id_before_request(tmp_path):
+    path = _private_token(tmp_path)
+    original = json.loads(path.read_text(encoding="utf-8"))
+    original["client_id"] = ""
+    original["expiry"] = "2020-01-01T00:00:00+00:00"
+    path.write_text(json.dumps(original), encoding="utf-8")
+    path.chmod(0o600)
+    calls = []
+
+    with pytest.raises(GmailAuthError, match="client"):
+        GmailOAuth(path, transport=httpx.MockTransport(
+            lambda request: calls.append(request)
+        )).access_token(now=2_000_000_000)
+    assert calls == []
+    assert json.loads(path.read_text(encoding="utf-8"))["token"] == "synthetic-access"
+
+
+def test_refresh_rejects_audience_mismatch_before_persisting(tmp_path):
+    path = _private_token(tmp_path)
+    original = json.loads(path.read_text(encoding="utf-8"))
+    original["expiry"] = "2020-01-01T00:00:00+00:00"
+    path.write_text(json.dumps(original), encoding="utf-8")
+    path.chmod(0o600)
+
+    def handler(request):
+        if request.url.path == "/token":
+            return httpx.Response(200, json={
+                "access_token": "untrusted-new-token",
+                "expires_in": 3600,
+                "scope": GMAIL_READONLY_SCOPE,
+            })
+        return httpx.Response(200, json={
+            "scope": GMAIL_READONLY_SCOPE,
+            "aud": "different-client",
+        })
+
+    with pytest.raises(GmailAuthError, match="audience"):
         GmailOAuth(path, transport=httpx.MockTransport(handler)).access_token(now=2_000_000_000)
     assert json.loads(path.read_text(encoding="utf-8"))["token"] == "synthetic-access"
 
@@ -236,6 +346,99 @@ def test_actual_decoded_bytes_not_size_estimate_enforce_limit():
     assert GmailPoller._decode_raw(encoded, len(raw)) == raw
     with pytest.raises(OverflowError):
         GmailPoller._decode_raw(encoded, len(raw) - 1)
+
+
+def test_complete_large_raw_envelope_becomes_terminal_actual_oversize(tmp_path):
+    config = _config(tmp_path)
+    config["client_knowledge"]["gmail"]["max_message_bytes"] = 1024
+    config["client_knowledge"]["gmail"]["max_http_response_bytes"] = 70_000
+    settings = GmailSettings.from_config(config)
+    raw = b"Delivered-To: pid@example.invalid\r\n\r\n" + b"x" * 100_000
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        if request.url.path.endswith("/profile"):
+            return _json_response({
+                "emailAddress": settings.mailbox,
+                "historyId": "100",
+            })
+        if request.url.path.endswith("/history"):
+            return _json_response({
+                "history": [{
+                    "id": "101",
+                    "messagesAdded": [{"message": {"id": "message-1"}}],
+                }],
+                "historyId": "102",
+            })
+        if request.url.path.endswith("/messages/message-1"):
+            return _json_response({
+                "id": "message-1",
+                "historyId": "101",
+                "internalDate": "3000",
+                "sizeEstimate": 1,
+                "raw": base64.urlsafe_b64encode(raw).decode().rstrip("="),
+            })
+        return _json_response({})
+
+    store = IntakeStore(tmp_path / "private" / "intake.db")
+    spool = RawSpool(tmp_path / "private" / "raw")
+    GmailState(store).initialize_mailbox(
+        settings.mailbox,
+        cutover_history_id="100",
+        bracket_start_server_ms=1000,
+        bracket_end_server_ms=1000,
+        admit_after_server_ms=2000,
+    )
+    with GmailClient(
+        "token",
+        transport=httpx.MockTransport(handler),
+        max_response_bytes=settings.max_response_bytes,
+    ) as client:
+        result = GmailPoller(store, spool, client, settings, now=lambda: 10).run_once()
+    assert result["cursor"] == "102"
+    with store._connect() as conn:
+        assert conn.execute(
+            "SELECT disposition FROM gmail_history_candidates"
+        ).fetchone()[0] == "rejected_oversize_actual"
+        assert conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 0
+
+
+def test_raw_response_under_limit_respects_configured_transport_bound():
+    raw = b"Delivered-To: pid@example.invalid\r\n\r\n" + b"x" * 900
+    payload = {
+        "id": "message-1",
+        "historyId": "101",
+        "internalDate": "3000",
+        "raw": base64.urlsafe_b64encode(raw).decode().rstrip("="),
+    }
+    client = GmailClient(
+        "token",
+        transport=httpx.MockTransport(lambda _request: _json_response(payload)),
+        max_response_bytes=70_000,
+    )
+    try:
+        response = client.raw_message("message-1")
+    finally:
+        client.close()
+    assert GmailPoller._decode_raw(response.payload["raw"], 1024) == raw
+
+
+def test_raw_response_still_rejects_transport_abuse(monkeypatch):
+    import plugins.client_knowledge_gbrain.gmail_api as gmail_api
+
+    monkeypatch.setattr(gmail_api, "GMAIL_PROVIDER_RAW_RESPONSE_BYTES", 2048)
+    payload = {"raw": "x" * 3000}
+    client = GmailClient(
+        "token",
+        transport=httpx.MockTransport(lambda _request: _json_response(payload)),
+        max_response_bytes=1024,
+    )
+    try:
+        with pytest.raises(gmail_api.GmailRetryableError, match="transport bound"):
+            client.raw_message("message-1")
+    finally:
+        client.close()
 
 
 def test_first_start_uses_two_profile_bracket_and_processes_no_mail(tmp_path):
@@ -419,10 +622,11 @@ def test_malformed_provider_raw_is_bounded_retry_then_valid_clears_state(tmp_pat
     )
     state.complete_history(batch["batch_id"])
     item = state.pending_items(batch["batch_id"])[0]
-    assert not state.record_invalid_raw(
+    result = state.record_invalid_raw(
         "candidate", item["candidate_id"], fingerprint="1" * 64,
         error_class="gmail_invalid_provider_raw", threshold=3,
     )
+    assert not result.stop and not result.terminal and result.count == 1
     state.record_raw(
         "candidate", item["candidate_id"], spool_key="a" * 64,
         storage_id="b" * 64, sha256="c" * 64, byte_size=1,
@@ -453,11 +657,71 @@ def test_consistent_malformed_provider_raw_becomes_terminal_at_bound(tmp_path):
     state.complete_history(batch["batch_id"])
     item = state.pending_items(batch["batch_id"])[0]
     for expected_terminal in (False, False, True):
-        assert state.record_invalid_raw(
+        result = state.record_invalid_raw(
             "candidate", item["candidate_id"], fingerprint="8" * 64,
             error_class="gmail_invalid_provider_raw", threshold=3,
-        ) is expected_terminal
+        )
+        assert result.terminal is expected_terminal
+        assert result.stop is expected_terminal
     assert state.pending_items(batch["batch_id"]) == []
+
+
+@pytest.mark.parametrize("terminal", ["gone", "admitted", "needs_mapping", "quarantined"])
+def test_stale_invalid_raw_accounting_cannot_regress_terminal_disposition(tmp_path, terminal):
+    store = IntakeStore(tmp_path / "private" / "intake.db")
+    state = GmailState(store)
+    state.initialize_mailbox(
+        "collector@example.invalid", cutover_history_id="100",
+        bracket_start_server_ms=1000, bracket_end_server_ms=1000,
+        admit_after_server_ms=2000,
+    )
+    batch = state.get_or_create_batch(
+        "collector@example.invalid", "100", config_hash="4" * 64, alias_count=0
+    )
+    state.register_history_page(
+        batch["batch_id"], page_ordinal=0, request_token="", next_token="",
+        response_history_id="101", candidates=[("message-1", "101")],
+    )
+    item = state.pending_items(batch["batch_id"])[0]
+    artifact_id = ""
+    if terminal != "gone":
+        artifact = IntakeArtifact.from_bytes(
+            project_key="unmapped" if terminal == "needs_mapping" else "pid",
+            provider_id="gmail",
+            provider_artifact_id=f"terminal:{terminal}",
+            content=b"raw",
+            received_at=10,
+        )
+        spool = RawSpool(tmp_path / "private" / "raw")
+        stage = {
+            "admitted": "notion_archived",
+            "needs_mapping": "needs_mapping",
+            "quarantined": "quarantined",
+        }[terminal]
+        store.admit_raw_artifact(spool, artifact, [b"raw"], next_stages=(stage,))
+        artifact_id = artifact.artifact_id
+    state.terminal_disposition(
+        "candidate", item["candidate_id"], terminal, artifact_id=artifact_id
+    )
+    if terminal == "gone":
+        state.complete_history(batch["batch_id"])
+        state.complete_reconciliation(batch["batch_id"], max_observations=1)
+        state.finalize(batch["batch_id"], spool=RawSpool(tmp_path / "private" / "raw"))
+        assert state.get_mailbox("collector@example.invalid").cursor_history_id == "101"
+
+    result = state.record_invalid_raw(
+        "candidate", item["candidate_id"], fingerprint="3" * 64,
+        error_class="gmail_invalid_provider_raw", threshold=3,
+    )
+
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT disposition, invalid_count, COALESCE(artifact_id,'') "
+            "FROM gmail_history_candidates"
+        ).fetchone()
+    assert tuple(row) == (terminal, 0, artifact_id)
+    assert result.stop and result.terminal and result.adopted
+    assert result.disposition == terminal
 
 
 def test_client_uses_only_get_and_never_format_minimal():

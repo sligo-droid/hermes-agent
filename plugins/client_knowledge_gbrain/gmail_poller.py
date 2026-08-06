@@ -334,26 +334,26 @@ class GmailPoller:
                 return
             except GmailInvalidResponse as exc:
                 if exc.fingerprint:
-                    terminal = self.state.record_invalid_raw(
+                    invalid = self.state.record_invalid_raw(
                         kind,
                         item_id,
                         fingerprint=exc.fingerprint,
                         error_class="gmail_invalid_response",
                         threshold=self.settings.max_invalid_attempts,
                     )
-                    if terminal:
+                    if invalid.stop:
                         return
                 raise
             metadata = response.payload
             if str(metadata.get("id") or "") != message_id:
-                terminal = self.state.record_invalid_raw(
+                invalid = self.state.record_invalid_raw(
                     kind,
                     item_id,
                     fingerprint=response.fingerprint,
                     error_class="gmail_message_identity_mismatch",
                     threshold=self.settings.max_invalid_attempts,
                 )
-                if not terminal:
+                if not invalid.stop:
                     raise GmailInvalidResponse(
                         "Gmail message identity is invalid", fingerprint=response.fingerprint
                     )
@@ -362,14 +362,14 @@ class GmailPoller:
                 raw = self._decode_raw(metadata.get("raw"), self.settings.max_message_bytes)
             except ValueError as exc:
                 fingerprint = response.fingerprint
-                terminal = self.state.record_invalid_raw(
+                invalid = self.state.record_invalid_raw(
                     kind,
                     item_id,
                     fingerprint=fingerprint,
                     error_class="gmail_invalid_provider_raw",
                     threshold=self.settings.max_invalid_attempts,
                 )
-                if not terminal:
+                if not invalid.stop:
                     raise GmailInvalidResponse(
                         "Gmail raw payload is invalid", fingerprint=fingerprint
                     ) from exc
@@ -383,14 +383,14 @@ class GmailPoller:
                 internal_date = int(metadata.get("internalDate"))
                 message_history = int(metadata.get("historyId"))
             except (TypeError, ValueError) as exc:
-                terminal = self.state.record_invalid_raw(
+                invalid = self.state.record_invalid_raw(
                     kind,
                     item_id,
                     fingerprint=response.fingerprint,
                     error_class="gmail_invalid_message_metadata",
                     threshold=self.settings.max_invalid_attempts,
                 )
-                if not terminal:
+                if not invalid.stop:
                     raise GmailInvalidResponse("Gmail message metadata is invalid", fingerprint=response.fingerprint) from exc
                 return
             if kind == "observation" and message_history <= int(mailbox_state.cutover_history_id):
