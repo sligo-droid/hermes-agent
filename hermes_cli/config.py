@@ -4144,7 +4144,7 @@ OPTIONAL_ENV_VARS = {
     # skills legitimately need these passed through to curl via
     # tools/env_passthrough.py when the user's skill calls out.
     "NOTION_API_KEY": {
-        "description": "Notion integration token (used by the `notion` skill)",
+        "description": "Notion integration token (used by the `notion` skill and client-knowledge archive)",
         "prompt": "Notion API key",
         "url": "https://www.notion.so/my-integrations",
         "password": True,

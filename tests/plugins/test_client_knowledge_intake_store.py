@@ -303,7 +303,7 @@ def test_schema_migrates_existing_store_to_spool_storage_identity(tmp_path):
     with migrated._connect() as conn:
         assert conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "3"
+        ).fetchone()[0] == "4"
         assert "spool_storage_id" in {
             row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }

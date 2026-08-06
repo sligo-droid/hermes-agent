@@ -37,9 +37,18 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     run_once = subs.add_parser(
         "run-once",
-        help="Report queue state; workers are intentionally deferred to a later PR",
+        help="Run a bounded batch of Notion source-archive jobs",
     )
     run_once.add_argument("--db-path", default="")
+
+    notion_preflight = subs.add_parser(
+        "notion-preflight",
+        help="Inspect or add the minimal Notion source-archive schema",
+    )
+    notion_preflight.add_argument("--project", required=True)
+    notion_preflight.add_argument("--apply-schema", action="store_true")
+    notion_preflight.add_argument("--run-fixed-fixtures", action="store_true")
+    notion_preflight.add_argument("--db-path", default="")
 
     subparser.set_defaults(func=client_knowledge_command)
 
@@ -111,9 +120,42 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             print(json.dumps({"recovered": store.reconcile(), "stats": store.stats()}, sort_keys=True))
             return 0
         if action == "run-once":
-            # PR1 intentionally provides the bounded queue/control-plane
-            # surface only. Provider adapters and workers land in later PRs.
-            print(json.dumps({"mode": "bounded_noop", "workers_enabled": False, "stats": store.stats()}, sort_keys=True))
+            from hermes_cli.config import load_config
+            from .notion_archive import run_notion_once
+            from .spool import RawSpool
+
+            result = run_notion_once(store=store, spool=RawSpool(), config=load_config())
+            print(json.dumps({"mode": "notion_archive", **result, "stats": store.stats()}, sort_keys=True))
+            return 0
+        if action == "notion-preflight":
+            import os
+
+            from hermes_cli.config import load_config
+            from .notion import NotionClient
+            from .notion_archive import (
+                NotionArchiveSettings,
+                NotionArchiveWorker,
+                ProjectNotionConfig,
+                run_fixed_sandbox_fixtures,
+            )
+            from .spool import RawSpool
+
+            config = load_config() or {}
+            settings = NotionArchiveSettings.from_config(config)
+            project = ProjectNotionConfig.from_config(config, str(args.project))
+            api_key = settings.api_key or os.getenv("NOTION_API_KEY", "").strip()
+            with NotionClient(api_key, timeout=settings.timeout) as client:
+                worker = NotionArchiveWorker(store, RawSpool(), client, settings, config)
+                result = worker.preflight(project, apply_schema=bool(args.apply_schema))
+                if args.run_fixed_fixtures:
+                    result["fixtures"] = run_fixed_sandbox_fixtures(
+                        store=store,
+                        spool=worker.spool,
+                        client=client,
+                        config=config,
+                        project_key=project.project_key,
+                    )
+            print(json.dumps(result, sort_keys=True))
             return 0
         print(json.dumps({"error_class": "unknown_action"}, sort_keys=True))
         return 2
