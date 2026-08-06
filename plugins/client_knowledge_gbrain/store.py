@@ -1156,6 +1156,23 @@ class IntakeStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_completed_stage_receipt(
+        self, artifact_id: str, stage: str
+    ) -> dict[str, Any] | None:
+        stage = validate_stage(stage)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT stage_receipts.artifact_id, stage_receipts.stage, "
+                "stage_receipts.receipt_id, stage_receipts.output_sha256, "
+                "stage_receipts.recorded_at FROM stage_receipts "
+                "JOIN jobs ON jobs.artifact_id=stage_receipts.artifact_id "
+                "AND jobs.stage=stage_receipts.stage "
+                "WHERE stage_receipts.artifact_id=? AND stage_receipts.stage=? "
+                "AND jobs.status='succeeded'",
+                (artifact_id, stage),
+            ).fetchone()
+            return dict(row) if row else None
+
     def advance_notion_operation(
         self,
         job_id: str,

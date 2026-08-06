@@ -809,6 +809,11 @@ class NotionArchiveWorker:
         total_parts = int(remote_parts.get("total") or attempt["expected_part_count"])
         if total_parts != int(attempt["expected_part_count"]):
             raise NotionAmbiguousRecoveryError("notion multipart part count conflicts")
+        part_size = int(attempt.get("expected_part_size") or 0)
+        if mode == "multi_part" and part_size <= 0:
+            raise NotionAmbiguousRecoveryError(
+                "notion multipart partition size is not durably known"
+            )
         with self.spool.read_verified(
             artifact.spool_key, storage_id=self.spool.storage_id,
             expected_sha256=artifact.content_sha256, expected_size=artifact.byte_size,
@@ -824,12 +829,12 @@ class NotionArchiveWorker:
                 if sent_parts < 0 or sent_parts > int(attempt["expected_part_count"]):
                     raise NotionAmbiguousRecoveryError("notion multipart progress conflicts")
                 if sent_parts:
-                    handle.seek(sent_parts * int(attempt["expected_part_size"] or self.settings.multipart_part_bytes))
+                    handle.seek(sent_parts * part_size)
                 for part_number in range(sent_parts + 1, int(attempt["expected_part_count"]) + 1):
                     if not 1 <= part_number <= 1000:
                         raise NotionStaticConfigError("notion part number is outside the API limit")
                     remaining = min(
-                        int(attempt["expected_part_size"] or self.settings.multipart_part_bytes),
+                        part_size,
                         artifact.byte_size - handle.tell(),
                     )
                     self._renew(claim)
@@ -1052,7 +1057,14 @@ def run_fixed_sandbox_fixtures(
     store.admit_raw_artifact(spool, small_attachment, [small])
     store.admit_raw_artifact(spool, large_attachment, [large])
     existing_page = store.get_notion_operation(parent.artifact_id, "page")
-    if existing_page and existing_page.get("page_id"):
+    completed = store.get_completed_stage_receipt(
+        parent.artifact_id, "notion_archived"
+    )
+    if completed:
+        if not existing_page or not existing_page.get("page_id"):
+            raise NotionIncompleteEvidenceError(
+                "sandbox fixture completion has no durable page identity"
+            )
         page_id = str(existing_page["page_id"])
         page = client.retrieve_page(page_id)
         worker = NotionArchiveWorker(store, spool, client, settings, config)
@@ -1091,6 +1103,7 @@ def run_fixed_sandbox_fixtures(
             "multipart_exercised": True,
             "recovered": True,
         }
+    store.reconcile()
     claim = store.claim_next(
         stage="notion_archived", spool=spool, lease_seconds=settings.lease_seconds
     )

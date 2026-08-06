@@ -24,6 +24,7 @@ from plugins.client_knowledge_gbrain.notion_archive import (
     NotionArchiveWorker,
     ProjectNotionConfig,
     run_fixed_sandbox_fixtures,
+    run_notion_once,
     _HeartbeatReader,
     _assert_sandbox_target,
     _marker,
@@ -783,7 +784,7 @@ def test_multipart_flow_sends_parts_then_completes_with_heartbeats(tmp_path):
         claim.job_id, claim.claim_token, artifact,
         attempt_id=attempt_id, opaque_marker=marker,
         remote_filename=f"{marker}.eml", upload_mode="multi_part",
-        expected_part_count=3,
+        expected_part_count=3, expected_part_size=5,
     )
     calls = []
     def handler(request):
@@ -848,6 +849,82 @@ def test_schema_v4_migrates_upload_attempt_part_size_additively(tmp_path):
         ).fetchone()[0]
     assert version == "5"
     assert "expected_part_size" in columns
+
+
+@pytest.mark.parametrize("sent_parts", [0, 1])
+def test_migrated_legacy_multipart_attempt_blocks_unknown_partition_resume(
+    tmp_path, monkeypatch, sent_parts
+):
+    payload = b"x" * (20 * 1024 * 1024 + 1)
+    artifact = _artifact(payload)
+    db = tmp_path / "private" / "intake.db"
+    store = IntakeStore(db)
+    spool = RawSpool(tmp_path / "private" / "raw")
+    store.admit_raw_artifact(
+        spool, artifact, [payload], next_stages=("notion_archived",)
+    )
+    claim = store.claim_next(stage="notion_archived", spool=spool)
+    assert claim is not None
+    attempt_id = "8" * 32
+    marker = _marker(artifact, attempt_id)
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=attempt_id, opaque_marker=marker,
+        remote_filename=f"{marker}.eml", upload_mode="multi_part",
+        expected_part_count=5, expected_part_size=5 * 1024 * 1024,
+    )
+    store.record_upload_remote_identity(
+        claim.job_id, claim.claim_token, artifact.artifact_id,
+        attempt_id, "legacy-upload", evidence_identity="direct",
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, attempt_id
+    )
+    if sent_parts:
+        store.append_upload_attempt_event(
+            claim.job_id, claim.claim_token, artifact.artifact_id, attempt_id,
+            "part_acknowledged", remote_upload_id="legacy-upload",
+            remote_parts_sent=sent_parts,
+        )
+    assert store.fail_stage(
+        claim.job_id, claim.claim_token, error_class="notion_retryable", retry_delay=0
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE schema_meta SET value='4' WHERE key='schema_version'"
+        )
+        conn.execute(
+            "ALTER TABLE notion_upload_attempts DROP COLUMN expected_part_size"
+        )
+    migrated = IntakeStore(db)
+    assert migrated.get_upload_attempts(artifact.artifact_id)[0]["expected_part_size"] == 0
+
+    sends = []
+
+    class Client:
+        def retrieve_file_upload(self, _upload_id):
+            return _upload(
+                "legacy-upload", f"{marker}.eml", size=artifact.byte_size,
+                status="pending", total=5, sent=sent_parts,
+            )
+
+        def send_file_upload(self, *_args, **_kwargs):
+            sends.append(True)
+
+    monkeypatch.setattr(NotionArchiveWorker, "preflight", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(NotionArchiveWorker, "_ensure_page", lambda *_args: "page-1")
+    monkeypatch.setattr(
+        spool, "read_verified",
+        lambda *_args, **_kwargs: pytest.fail("legacy partition opened the spool"),
+    )
+    config = _config(max_file_bytes=30 * 1024 * 1024)
+    config["client_knowledge"]["notion"]["multipart_part_bytes"] = 10 * 1024 * 1024
+    result = run_notion_once(
+        store=migrated, spool=spool, client=Client(), config=config
+    )
+    assert result == {"processed": 1, "succeeded": 0, "failed": 0, "quarantined": 1}
+    assert migrated.get_job(claim.job_id)["status"] == "quarantined"
+    assert sends == []
 
 
 def test_synthetic_fixture_guard_never_allows_pid_or_production_id_collision():
@@ -986,6 +1063,144 @@ def test_fixed_sandbox_fixture_entry_point_is_repeatable_without_duplicates(tmp_
     with store._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM notion_upload_attempts").fetchone()[0] == 3
     assert len(remote_uploads) == 3
+
+
+def test_fixed_sandbox_fixture_resumes_after_page_persistence_without_duplicates(
+    tmp_path, monkeypatch
+):
+    config = _config(max_file_bytes=30 * 1024 * 1024)
+    config["projects"]["sandbox"] = {
+        "notion": {
+            "database_id": "sandbox-db",
+            "data_source_id": "sandbox-source",
+            "sandbox": True,
+            "allow_synthetic_fixture_writes": True,
+        }
+    }
+    store = IntakeStore(tmp_path / "private" / "intake.db")
+    spool = RawSpool(tmp_path / "private" / "raw")
+    page_artifact = None
+    page_writes = []
+    upload_writes = []
+    block_writes = []
+    remote_uploads = {}
+
+    class FakeClient:
+        def retrieve_data_source(self, _source_id):
+            return _schema()
+
+        def query_data_source(self, *_args, **_kwargs):
+            return []
+
+        def retrieve_page(self, _page_id):
+            return _page(page_artifact, "sandbox-page")
+
+        def list_block_children(self, _page_id, **_kwargs):
+            return type("Evidence", (), {
+                "items": tuple({
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"plain_text": marker}]},
+                } for marker in block_writes)
+            })()
+
+        def retrieve_file_upload(self, upload_id):
+            return remote_uploads[upload_id]
+
+    calls = 0
+
+    def interrupted_then_complete(self, claim):
+        nonlocal calls, page_artifact
+        calls += 1
+        parent = store.get_artifact_for_notion_claim(
+            claim.job_id, claim.claim_token, claim.artifact_id
+        )
+        page_artifact = parent
+        if calls == 1:
+            page_writes.append("sandbox-page")
+            store.advance_notion_operation(
+                claim.job_id, claim.claim_token, parent.artifact_id,
+                "page", "page-created",
+                expected_sha256=parent.content_sha256,
+                expected_size=parent.byte_size,
+                expected_mime_type=parent.mime_type,
+                page_id="sandbox-page",
+            )
+            with store._write() as conn:
+                conn.execute(
+                    "UPDATE jobs SET lease_expires_at=1, heartbeat_at=1, "
+                    "owner_pid=2147483647 WHERE job_id=?",
+                    (claim.job_id,),
+                )
+            raise NotionRetryableError("simulated interruption")
+        assert store.get_notion_operation(parent.artifact_id, "page")["page_id"] == "sandbox-page"
+        family = [parent, *store.list_child_artifacts_for_notion_claim(
+            claim.job_id, claim.claim_token, claim.artifact_id
+        )]
+        for index, artifact in enumerate(family):
+            attempt_id = f"{index + 1:032x}"
+            marker = _marker(artifact, attempt_id)
+            upload_id = f"upload-{index}"
+            attempt = store.reserve_upload_attempt(
+                claim.job_id, claim.claim_token, artifact,
+                attempt_id=attempt_id, opaque_marker=marker,
+                remote_filename=f"{marker}.bin", upload_mode="single_part",
+                expected_part_count=1, expected_part_size=artifact.byte_size,
+                claimed_artifact_id=parent.artifact_id,
+            )
+            upload_writes.append(upload_id)
+            block_writes.append(marker)
+            store.record_upload_remote_identity(
+                claim.job_id, claim.claim_token, artifact.artifact_id,
+                attempt_id, upload_id, evidence_identity="fixture",
+                claimed_artifact_id=parent.artifact_id,
+            )
+            store.advance_notion_operation(
+                claim.job_id, claim.claim_token, artifact.artifact_id,
+                "file", "receipt-verified",
+                expected_sha256=artifact.content_sha256,
+                expected_size=artifact.byte_size,
+                expected_mime_type=artifact.mime_type,
+                page_id="sandbox-page", block_id=f"block-{index}",
+                active_upload_attempt_id=attempt_id,
+                claimed_artifact_id=parent.artifact_id,
+            )
+            remote_uploads[upload_id] = _upload(
+                upload_id, attempt["remote_filename"], size=artifact.byte_size,
+                content_type=artifact.mime_type, status="uploaded",
+            )
+        self._renew(claim)
+        assert store.complete_stage(
+            claim.job_id, claim.claim_token,
+            StageReceipt(
+                parent.artifact_id, "notion_archived",
+                "notion:page:sandbox-page",
+            ),
+        )
+        return "sandbox-page"
+
+    monkeypatch.setattr(NotionArchiveWorker, "process_claim", interrupted_then_complete)
+    monkeypatch.setattr(
+        "plugins.client_knowledge_gbrain.store._pid_alive", lambda _pid: False
+    )
+    with pytest.raises(NotionRetryableError, match="simulated interruption"):
+        run_fixed_sandbox_fixtures(
+            store=store, spool=spool, client=FakeClient(), config=config,
+            project_key="sandbox",
+        )
+    resumed = run_fixed_sandbox_fixtures(
+        store=store, spool=spool, client=FakeClient(), config=config,
+        project_key="sandbox",
+    )
+    repeated = run_fixed_sandbox_fixtures(
+        store=store, spool=spool, client=FakeClient(), config=config,
+        project_key="sandbox",
+    )
+    assert resumed["page_id"] == repeated["page_id"] == "sandbox-page"
+    assert resumed["recovered"] is False
+    assert repeated["recovered"] is True
+    assert page_writes == ["sandbox-page"]
+    assert len(upload_writes) == len(set(upload_writes)) == 3
+    assert len(block_writes) == len(set(block_writes)) == 3
 
 
 def test_expired_upload_creates_linked_replacement_attempt(tmp_path, monkeypatch):
