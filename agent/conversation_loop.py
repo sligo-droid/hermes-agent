@@ -1346,6 +1346,7 @@ def run_conversation(
     agent._visual_qa_tool_calls = 0
     agent._visual_qa_total_calls = 0
     agent._completion_response_synthesis_attempts = 0
+    agent._lifecycle_verification_nudges = 0
     _reset_closeout_turn_state(agent)
     try:
         from agent.visual_qa import normalize_visual_requirement, set_active_visual_requirement
@@ -6344,6 +6345,7 @@ def run_conversation(
 
                 try:
                     from agent.verification_stop import (
+                        build_lifecycle_verification_nudge,
                         build_verification_response_nudge,
                         build_verify_on_stop_nudge,
                         build_visual_qa_stop_nudge,
@@ -6367,6 +6369,7 @@ def run_conversation(
                     )
                     _verify_nudge = None
                     visual_nudge = None
+                    lifecycle_nudge = None
                     completion_response_nudge = None
                     # Shadow mode records/report gaps at the gateway boundary
                     # but must not withhold a response.  Enforcement remains
@@ -6409,6 +6412,21 @@ def run_conversation(
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
                         )
+                    if not _verify_nudge and verify_on_stop_enabled(verify_config):
+                        lifecycle_nudge = build_lifecycle_verification_nudge(
+                            final_response=final_response,
+                            evidence=getattr(agent, "_turn_runtime_stats", {}).get(
+                                "verification_evidence", []
+                            ),
+                            original_request=original_user_message,
+                            runtime_mode=getattr(agent, "_runtime_mode", ""),
+                            attempts=getattr(
+                                agent,
+                                "_lifecycle_verification_nudges",
+                                0,
+                            ),
+                        )
+                        _verify_nudge = lifecycle_nudge
                     if not _verify_nudge:
                         visual_required, visual_passed = _visual_qa_completion_state(agent)
                         verification_response_nudge = (
@@ -6459,6 +6477,7 @@ def run_conversation(
                 except Exception:
                     logger.debug("verification stop-loop check failed", exc_info=True)
                     _verify_nudge = None
+                    lifecycle_nudge = None
                     completion_response_nudge = None
                 if _closeout_finalization_active(agent):
                     completion_response_nudge = None
@@ -6582,6 +6601,10 @@ def run_conversation(
                     completion_response_nudge = None
 
                 if _verify_nudge:
+                    if lifecycle_nudge:
+                        agent._lifecycle_verification_nudges = (
+                            getattr(agent, "_lifecycle_verification_nudges", 0) + 1
+                        )
                     agent._verification_stop_nudges = (
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )

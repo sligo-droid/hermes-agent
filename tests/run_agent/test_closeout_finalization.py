@@ -531,6 +531,69 @@ def test_visual_qa_malformed_correction_does_not_consume_execution_slot():
     )
 
 
+def test_closed_unmerged_pr_claim_gets_typed_main_verification_followup():
+    agent = _agent("verify_main_parent", max_iterations=3)
+    agent.verify_on_stop = True
+    agent.platform = "discord"
+    agent._runtime_mode = "action"
+    final = (
+        "PR [#1111](https://github.com/sligo-labs/PID/pull/1111) checks passed, "
+        "was closed without merge, and main stayed unchanged."
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _response(final),
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "verify_main_parent",
+                    {"pr_number": 1111, "workdir": "/tmp/pid"},
+                )
+            ],
+            finish_reason="tool_calls",
+        ),
+        _response(final),
+    ]
+    main_sha = "a" * 40
+    head_sha = "b" * 40
+    typed_result = json.dumps(
+        {
+            "success": True,
+            "exit_code": 0,
+            "error": None,
+            "repository": "sligo-labs/pid",
+            "repository_root": "/tmp/pid",
+            "pr_number": 1111,
+            "head_sha": head_sha,
+            "pr_evidence": {
+                "status": "success",
+                "state": "closed",
+                "merged": False,
+                "base_ref": "main",
+                "head_sha": head_sha,
+            },
+            "main_branch_evidence": {
+                "status": "success",
+                "remote_main": main_sha,
+                "commit_parent": main_sha,
+            },
+        }
+    )
+
+    with (
+        patch("run_agent.handle_function_call", return_value=typed_result) as execute_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("close PR #1111 and leave main unchanged")
+
+    assert execute_call.call_count == 1
+    assert execute_call.call_args.args[0] == "verify_main_parent"
+    assert result["api_calls"] == 3
+    assert result["final_response"] == final
+    assert "Verification downgrade" not in result["final_response"]
+
+
 def test_pending_closeout_gets_visual_and_finalization_grace_calls():
     agent = _agent("terminal", "visual_qa")
     agent._preview_readiness = None

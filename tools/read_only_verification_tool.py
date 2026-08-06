@@ -1281,7 +1281,9 @@ VERIFY_MAIN_PARENT_SCHEMA = {
     "name": "verify_main_parent",
     "description": (
         "Directly verify a specific closed, unmerged GitHub PR head against local HEAD and "
-        "compare origin/main with local HEAD^, returning typed PR-bound evidence."
+        "compare origin/main with local HEAD^, returning typed PR-bound evidence. Always use "
+        "this as the final check when a request requires closing a PR without merge while "
+        "leaving main unchanged; do not recreate the proof with terminal or gh JSON fields."
     ),
     "parameters": {
         "type": "object",

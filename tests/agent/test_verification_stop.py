@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from agent.verification_evidence import (
+    classify_tool_verification_evidence,
     mark_workspace_edited,
     record_terminal_result,
 )
 from agent.verification_stop import (
+    build_lifecycle_verification_nudge,
     build_verification_response_nudge,
     build_verify_on_stop_nudge,
     build_visual_qa_stop_nudge,
@@ -249,6 +251,93 @@ def test_completion_synthesis_requires_action_code_and_fresh_pass(tmp_path, monk
     assert should_synthesize_verification_response(
         changed_paths=[code], attempts=1, **common
     ) is False
+
+
+def _closed_pr_evidence(*, include_main: bool) -> list[dict]:
+    sha = "a" * 40
+    evidence = classify_tool_verification_evidence(
+        "verify_main_parent",
+        {"pr_number": 1111, "workdir": "/tmp/pid"},
+        json.dumps(
+            {
+                "success": True,
+                "exit_code": 0,
+                "error": None,
+                "repository": "sligo-labs/pid",
+                "repository_root": "/tmp/pid",
+                "pr_number": 1111,
+                "head_sha": "b" * 40,
+                "pr_evidence": {
+                    "status": "success",
+                    "state": "closed",
+                    "merged": False,
+                    "base_ref": "main",
+                    "head_sha": "b" * 40,
+                },
+                "main_branch_evidence": {
+                    "status": "success",
+                    "remote_main": sha,
+                    "commit_parent": sha,
+                },
+            }
+        ),
+        False,
+        order=4,
+    )
+    return evidence if include_main else [
+        item for item in evidence if item.get("surface") == "pr"
+    ]
+
+
+def test_lifecycle_nudge_requests_typed_closed_pr_main_proof():
+    final = (
+        "PR [#1111](https://github.com/sligo-labs/PID/pull/1111) checks passed, "
+        "was closed without merge, and main stayed unchanged."
+    )
+
+    nudge = build_lifecycle_verification_nudge(
+        final_response=final,
+        evidence=_closed_pr_evidence(include_main=False),
+        runtime_mode="action",
+    )
+
+    assert nudge is not None
+    assert "`verify_main_parent`" in nudge
+    assert "`pr_number: 1111`" in nudge
+    assert "Do not compose another terminal" in nudge
+
+
+def test_lifecycle_nudge_stops_after_typed_proof_or_one_attempt():
+    final = (
+        "PR #1111 checks passed, was closed without merge, and main stayed unchanged."
+    )
+
+    assert build_lifecycle_verification_nudge(
+        final_response=final,
+        evidence=_closed_pr_evidence(include_main=True),
+        runtime_mode="action",
+    ) is None
+    assert build_lifecycle_verification_nudge(
+        final_response=final,
+        evidence=_closed_pr_evidence(include_main=False),
+        original_request="Close the PR while leaving main unchanged.",
+        runtime_mode="action",
+        attempts=1,
+    ) is None
+
+
+def test_lifecycle_nudge_honors_request_when_draft_omits_main_claim():
+    nudge = build_lifecycle_verification_nudge(
+        final_response="Checks passed for PR #1111 and the work is complete.",
+        evidence=_closed_pr_evidence(include_main=False),
+        original_request=(
+            "After checks pass, close the PR while leaving main unchanged and report evidence."
+        ),
+        runtime_mode="action",
+    )
+
+    assert nudge is not None
+    assert "`pr_number: 1111`" in nudge
 
 
 @pytest.mark.parametrize(
