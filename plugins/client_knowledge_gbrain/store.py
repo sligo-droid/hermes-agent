@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
@@ -466,6 +466,162 @@ class IntakeStore:
                         "VALUES('schema_version', '5')"
                     )
                     version = 5
+                if version < 6:
+                    statements = (
+                        """CREATE TABLE IF NOT EXISTS gmail_mailboxes (
+                            mailbox TEXT PRIMARY KEY,
+                            cutover_history_id TEXT NOT NULL,
+                            cursor_history_id TEXT NOT NULL,
+                            bracket_start_server_ms INTEGER NOT NULL,
+                            bracket_end_server_ms INTEGER NOT NULL,
+                            admit_after_server_ms INTEGER NOT NULL,
+                            initialized_at REAL NOT NULL,
+                            updated_at REAL NOT NULL
+                        )""",
+                        """CREATE TRIGGER IF NOT EXISTS gmail_mailbox_cutover_immutable
+                        BEFORE UPDATE OF mailbox, cutover_history_id,
+                            bracket_start_server_ms, bracket_end_server_ms,
+                            admit_after_server_ms ON gmail_mailboxes
+                        BEGIN SELECT RAISE(ABORT, 'gmail cutover is immutable'); END""",
+                        """CREATE TRIGGER IF NOT EXISTS gmail_mailbox_delete_forbidden
+                        BEFORE DELETE ON gmail_mailboxes
+                        BEGIN SELECT RAISE(ABORT, 'gmail cutover is immutable'); END""",
+                        """CREATE TABLE IF NOT EXISTS gmail_batches (
+                            batch_id TEXT PRIMARY KEY,
+                            mailbox TEXT NOT NULL REFERENCES gmail_mailboxes(mailbox),
+                            expected_cursor TEXT NOT NULL,
+                            generation INTEGER NOT NULL,
+                            target_cursor TEXT,
+                            mode TEXT NOT NULL DEFAULT 'incremental',
+                            config_hash TEXT NOT NULL,
+                            alias_count INTEGER NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'active',
+                            recovery_reason TEXT,
+                            created_at REAL NOT NULL,
+                            committed_at REAL,
+                            UNIQUE(mailbox, expected_cursor, generation)
+                        )""",
+                        """CREATE UNIQUE INDEX IF NOT EXISTS gmail_active_batch_unique
+                        ON gmail_batches(mailbox, expected_cursor) WHERE status='active'""",
+                        """CREATE TABLE IF NOT EXISTS gmail_history_pages (
+                            batch_id TEXT NOT NULL REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            page_ordinal INTEGER NOT NULL,
+                            request_token TEXT NOT NULL,
+                            next_token TEXT NOT NULL,
+                            response_history_id TEXT NOT NULL,
+                            manifest_hash TEXT NOT NULL,
+                            candidate_count INTEGER NOT NULL,
+                            recorded_at REAL NOT NULL,
+                            PRIMARY KEY(batch_id, page_ordinal)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_history_candidates (
+                            candidate_id TEXT PRIMARY KEY,
+                            mailbox TEXT NOT NULL,
+                            message_id TEXT NOT NULL,
+                            addition_history_id TEXT NOT NULL,
+                            disposition TEXT NOT NULL DEFAULT 'pending',
+                            error_class TEXT,
+                            raw_spool_key TEXT,
+                            raw_storage_id TEXT,
+                            raw_sha256 TEXT,
+                            raw_byte_size INTEGER,
+                            message_history_id TEXT,
+                            internal_date_ms INTEGER,
+                            artifact_id TEXT REFERENCES artifacts(artifact_id),
+                            invalid_fingerprint TEXT,
+                            invalid_error_class TEXT,
+                            invalid_count INTEGER NOT NULL DEFAULT 0,
+                            updated_at REAL NOT NULL,
+                            UNIQUE(mailbox, message_id, addition_history_id)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_batch_candidates (
+                            batch_id TEXT NOT NULL REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            candidate_id TEXT NOT NULL REFERENCES gmail_history_candidates(candidate_id),
+                            page_ordinal INTEGER NOT NULL,
+                            discovered_ordinal INTEGER NOT NULL,
+                            adopted_at REAL NOT NULL,
+                            PRIMARY KEY(batch_id, candidate_id)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_history_page_items (
+                            batch_id TEXT NOT NULL REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            page_ordinal INTEGER NOT NULL,
+                            discovered_ordinal INTEGER NOT NULL,
+                            candidate_id TEXT NOT NULL REFERENCES gmail_history_candidates(candidate_id),
+                            PRIMARY KEY(batch_id, page_ordinal, discovered_ordinal)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_history_completion (
+                            batch_id TEXT PRIMARY KEY REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            final_history_id TEXT NOT NULL,
+                            page_count INTEGER NOT NULL,
+                            candidate_count INTEGER NOT NULL,
+                            chain_hash TEXT NOT NULL,
+                            recovery_mode INTEGER NOT NULL DEFAULT 0,
+                            completed_at REAL NOT NULL
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_reconciliation_pages (
+                            batch_id TEXT NOT NULL REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            alias_ordinal INTEGER NOT NULL,
+                            page_ordinal INTEGER NOT NULL,
+                            request_token TEXT NOT NULL,
+                            next_token TEXT NOT NULL,
+                            manifest_hash TEXT NOT NULL,
+                            observation_count INTEGER NOT NULL,
+                            recorded_at REAL NOT NULL,
+                            PRIMARY KEY(batch_id, alias_ordinal, page_ordinal)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_reconciliation_observations (
+                            observation_id TEXT PRIMARY KEY,
+                            mailbox TEXT NOT NULL,
+                            message_id TEXT NOT NULL,
+                            anchor_history_id TEXT NOT NULL,
+                            disposition TEXT NOT NULL DEFAULT 'pending',
+                            error_class TEXT,
+                            raw_spool_key TEXT,
+                            raw_storage_id TEXT,
+                            raw_sha256 TEXT,
+                            raw_byte_size INTEGER,
+                            message_history_id TEXT,
+                            internal_date_ms INTEGER,
+                            artifact_id TEXT REFERENCES artifacts(artifact_id),
+                            invalid_fingerprint TEXT,
+                            invalid_error_class TEXT,
+                            invalid_count INTEGER NOT NULL DEFAULT 0,
+                            updated_at REAL NOT NULL,
+                            UNIQUE(mailbox, message_id, anchor_history_id)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_batch_observations (
+                            batch_id TEXT NOT NULL REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            observation_id TEXT NOT NULL REFERENCES gmail_reconciliation_observations(observation_id),
+                            alias_ordinal INTEGER NOT NULL,
+                            page_ordinal INTEGER NOT NULL,
+                            discovered_ordinal INTEGER NOT NULL,
+                            adopted_at REAL NOT NULL,
+                            PRIMARY KEY(batch_id, observation_id)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_reconciliation_page_items (
+                            batch_id TEXT NOT NULL REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            alias_ordinal INTEGER NOT NULL,
+                            page_ordinal INTEGER NOT NULL,
+                            discovered_ordinal INTEGER NOT NULL,
+                            observation_id TEXT NOT NULL REFERENCES gmail_reconciliation_observations(observation_id),
+                            PRIMARY KEY(batch_id, alias_ordinal, page_ordinal, discovered_ordinal)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS gmail_reconciliation_completion (
+                            batch_id TEXT PRIMARY KEY REFERENCES gmail_batches(batch_id) ON DELETE CASCADE,
+                            alias_count INTEGER NOT NULL,
+                            page_count INTEGER NOT NULL,
+                            observation_count INTEGER NOT NULL,
+                            chain_hash TEXT NOT NULL,
+                            completed_at REAL NOT NULL
+                        )""",
+                    )
+                    for statement in statements:
+                        conn.execute(statement)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '6')"
+                    )
+                    version = 6
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -640,6 +796,7 @@ class IntakeStore:
         source: BinaryIO | Iterable[bytes],
         *,
         next_stages: Iterable[str] = (),
+        defer_stages: bool = False,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         now: float | None = None,
     ) -> "SpoolRecord":
@@ -660,7 +817,9 @@ class IntakeStore:
         if _INITIAL_RECEIPT_STAGES.intersection(stages):
             raise ValueError("initial receipt stages cannot be queued as downstream work")
         if artifact.project_key == UNMAPPED_PROJECT_KEY:
-            if set(stages) != {"needs_mapping"}:
+            if not stages and (defer_stages or artifact.source_type == "attachment"):
+                pass
+            elif set(stages) != {"needs_mapping"}:
                 raise ValueError("unmapped artifacts may only queue needs_mapping")
         elif "needs_mapping" in stages:
             raise ValueError("needs_mapping requires the unmapped project key")
@@ -838,6 +997,11 @@ class IntakeStore:
                 (project, artifact_id),
             )
             conn.execute(
+                "UPDATE artifacts SET project_key=? WHERE parent_artifact_id=? "
+                "AND project_key=?",
+                (project, artifact_id, UNMAPPED_PROJECT_KEY),
+            )
+            conn.execute(
                 "UPDATE jobs SET status='succeeded', claim_token=NULL, owner_pid=NULL, "
                 "owner_host=NULL, owner_started_at=NULL, lease_expires_at=NULL, "
                 "heartbeat_at=NULL, updated_at=? WHERE artifact_id=? "
@@ -891,6 +1055,36 @@ class IntakeStore:
                 (job_id, artifact_id, stage, "queued", max(1, int(max_attempts)), now, now),
             )
         return job_id
+
+    def ensure_job(
+        self, artifact_id: str, stage: str, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    ) -> str:
+        """Return the one durable stage job, creating it when absent."""
+        stage = validate_stage(stage)
+        if stage in _INITIAL_RECEIPT_STAGES:
+            raise ValueError("initial receipt stages are created by raw admission")
+        now = time.time()
+        with self._write() as conn:
+            artifact = conn.execute(
+                "SELECT project_key FROM artifacts WHERE artifact_id=?", (artifact_id,)
+            ).fetchone()
+            if artifact is None:
+                raise sqlite3.IntegrityError("artifact does not exist")
+            if artifact[0] == UNMAPPED_PROJECT_KEY and stage != "needs_mapping":
+                raise ValueError("unmapped artifacts may only queue needs_mapping")
+            if artifact[0] != UNMAPPED_PROJECT_KEY and stage == "needs_mapping":
+                raise ValueError("needs_mapping requires an unmapped artifact")
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (secrets.token_hex(16), artifact_id, stage, "queued", max(1, int(max_attempts)), now, now),
+            )
+            row = conn.execute(
+                "SELECT job_id FROM jobs WHERE artifact_id=? AND stage=?", (artifact_id, stage)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("intake stage job creation failed")
+            return str(row[0])
 
     def claim_next(
         self,

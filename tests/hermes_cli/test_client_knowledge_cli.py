@@ -30,6 +30,7 @@ def test_cli_parser_registers_all_operator_actions():
         "quarantine",
         "reconcile",
         "run-once",
+        "gmail-poll-once",
         "notion-preflight",
     ):
         if action in {"show", "retry", "quarantine"}:

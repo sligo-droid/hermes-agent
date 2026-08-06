@@ -41,6 +41,12 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     run_once.add_argument("--db-path", default="")
 
+    gmail_poll = subs.add_parser(
+        "gmail-poll-once",
+        help="Run one bounded present-forward Gmail poll",
+    )
+    gmail_poll.add_argument("--db-path", default="")
+
     notion_preflight = subs.add_parser(
         "notion-preflight",
         help="Inspect or add the minimal Notion source-archive schema",
@@ -126,6 +132,14 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
 
             result = run_notion_once(store=store, spool=RawSpool(), config=load_config())
             print(json.dumps({"mode": "notion_archive", **result, "stats": store.stats()}, sort_keys=True))
+            return 0
+        if action == "gmail-poll-once":
+            from hermes_cli.config import load_config
+            from .gmail_poller import run_gmail_once
+            from .spool import RawSpool
+
+            result = run_gmail_once(store=store, spool=RawSpool(), config=load_config())
+            print(json.dumps({"mode": "gmail_poll", **result}, sort_keys=True))
             return 0
         if action == "notion-preflight":
             import os

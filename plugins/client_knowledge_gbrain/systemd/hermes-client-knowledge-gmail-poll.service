@@ -1,0 +1,8 @@
+[Unit]
+Description=Hermes client-knowledge Gmail poll
+After=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/local/bin/hermes client-knowledge gmail-poll-once
