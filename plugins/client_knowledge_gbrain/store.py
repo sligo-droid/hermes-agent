@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
@@ -61,7 +61,9 @@ _BRANCH_STAGES = frozenset({"needs_mapping", "needs_review", "quarantined"})
 _INITIAL_RECEIPT_STAGES = frozenset({"discovered", "raw_preserved"})
 _BLOCKING_BRANCH_STAGES = frozenset({"needs_mapping", "needs_review"})
 
-_JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "quarantined"})
+_JOB_STATUSES = frozenset(
+    {"queued", "running", "succeeded", "failed", "quarantined", "operator_blocked"}
+)
 _ERROR_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,119}$")
 _CURSOR_NAME_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
 
@@ -622,6 +624,77 @@ class IntakeStore:
                         "VALUES('schema_version', '6')"
                     )
                     version = 6
+                if version < 7:
+                    statements = (
+                        """CREATE TABLE IF NOT EXISTS extractions (
+                            extraction_id TEXT PRIMARY KEY,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            source_sha256 TEXT NOT NULL,
+                            source_manifest_sha256 TEXT NOT NULL,
+                            extractor_version TEXT NOT NULL,
+                            limits_version TEXT NOT NULL,
+                            redaction_version TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            derived_storage_id TEXT NOT NULL,
+                            derived_object_key TEXT NOT NULL,
+                            output_sha256 TEXT NOT NULL,
+                            output_bytes INTEGER NOT NULL,
+                            output_characters INTEGER NOT NULL,
+                            redaction_counts_json TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            UNIQUE(artifact_id, source_manifest_sha256, extractor_version,
+                                   limits_version, redaction_version)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS interpretation_envelopes (
+                            envelope_id TEXT PRIMARY KEY,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            project_key TEXT NOT NULL,
+                            source_sha256 TEXT NOT NULL,
+                            extraction_id TEXT NOT NULL REFERENCES extractions(extraction_id),
+                            extraction_sha256 TEXT NOT NULL,
+                            envelope_version TEXT NOT NULL,
+                            schema_version TEXT NOT NULL,
+                            prompt_version TEXT NOT NULL,
+                            task TEXT NOT NULL,
+                            derived_storage_id TEXT NOT NULL,
+                            derived_object_key TEXT NOT NULL,
+                            output_sha256 TEXT NOT NULL,
+                            output_bytes INTEGER NOT NULL,
+                            created_at REAL NOT NULL,
+                            UNIQUE(extraction_id, envelope_version, schema_version, prompt_version, task)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS interpretations (
+                            interpretation_id TEXT PRIMARY KEY,
+                            envelope_id TEXT NOT NULL UNIQUE REFERENCES interpretation_envelopes(envelope_id),
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            extraction_id TEXT NOT NULL REFERENCES extractions(extraction_id),
+                            schema_version TEXT NOT NULL,
+                            prompt_version TEXT NOT NULL,
+                            derived_storage_id TEXT NOT NULL,
+                            derived_object_key TEXT NOT NULL,
+                            output_sha256 TEXT NOT NULL,
+                            output_bytes INTEGER NOT NULL,
+                            actual_provider TEXT NOT NULL,
+                            actual_model TEXT NOT NULL,
+                            selected_provider TEXT NOT NULL,
+                            selected_model TEXT NOT NULL,
+                            model_tier TEXT NOT NULL,
+                            route_fingerprint TEXT NOT NULL,
+                            input_tokens INTEGER NOT NULL,
+                            output_tokens INTEGER NOT NULL,
+                            total_tokens INTEGER NOT NULL,
+                            cache_read_tokens INTEGER NOT NULL,
+                            cache_write_tokens INTEGER NOT NULL,
+                            created_at REAL NOT NULL
+                        )""",
+                    )
+                    for statement in statements:
+                        conn.execute(statement)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '7')"
+                    )
+                    version = 7
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -1325,6 +1398,216 @@ class IntakeStore:
                 raise ValueError("artifact does not exist")
             return self._artifact_from_row(row)
 
+    @staticmethod
+    def _active_stage_claim_locked(
+        conn: sqlite3.Connection, claim: JobClaim, stage: str, *, now: float
+    ) -> None:
+        row = conn.execute(
+            "SELECT 1 FROM jobs WHERE job_id=? AND artifact_id=? AND stage=? "
+            "AND status='running' AND claim_token=? AND lease_expires_at>?",
+            (claim.job_id, claim.artifact_id, stage, claim.claim_token, now),
+        ).fetchone()
+        if row is None:
+            raise PermissionError(f"{stage} job claim is no longer active")
+
+    def get_artifact_family_for_claim(
+        self, claim: JobClaim
+    ) -> tuple[IntakeArtifact, list[IntakeArtifact]]:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_stage_claim_locked(conn, claim, claim.stage, now=now)
+            row = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (claim.artifact_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("artifact does not exist")
+            children = conn.execute(
+                "SELECT * FROM artifacts WHERE parent_artifact_id=? "
+                "ORDER BY provider_attachment_id, artifact_id",
+                (claim.artifact_id,),
+            ).fetchall()
+            return self._artifact_from_row(row), [self._artifact_from_row(item) for item in children]
+
+    def get_extraction(self, extraction_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM extractions WHERE extraction_id=?", (extraction_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_extraction_for_interpretation_claim(
+        self, claim: JobClaim
+    ) -> tuple[IntakeArtifact, dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_stage_claim_locked(conn, claim, "interpreted", now=now)
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (claim.artifact_id,)
+            ).fetchone()
+            receipt = conn.execute(
+                "SELECT receipt_id FROM stage_receipts WHERE artifact_id=? AND stage='extracted'",
+                (claim.artifact_id,),
+            ).fetchone()
+            if artifact is None or receipt is None or not str(receipt[0]).startswith("extraction:"):
+                raise ValueError("interpretation claim lacks a versioned extraction receipt")
+            extraction_id = str(receipt[0]).split(":", 1)[1]
+            extraction = conn.execute(
+                "SELECT * FROM extractions WHERE extraction_id=?", (extraction_id,)
+            ).fetchone()
+            if extraction is None:
+                raise ValueError("versioned extraction metadata is missing")
+            return self._artifact_from_row(artifact), dict(extraction)
+
+    @staticmethod
+    def _complete_claim_locked(
+        conn: sqlite3.Connection,
+        claim: JobClaim,
+        receipt: StageReceipt,
+        *,
+        now: float,
+        next_stage: str = "",
+    ) -> None:
+        IntakeStore._active_stage_claim_locked(conn, claim, receipt.stage, now=now)
+        existing = conn.execute(
+            "SELECT receipt_id, output_sha256 FROM stage_receipts WHERE artifact_id=? AND stage=?",
+            (receipt.artifact_id, receipt.stage),
+        ).fetchone()
+        if existing and (existing[0], existing[1] or "") != (receipt.receipt_id, receipt.output_sha256):
+            raise ValueError("stage receipt conflicts with immutable metadata")
+        conn.execute(
+            "INSERT OR IGNORE INTO stage_receipts"
+            "(artifact_id, stage, receipt_id, output_sha256, recorded_at) VALUES(?,?,?,?,?)",
+            (receipt.artifact_id, receipt.stage, receipt.receipt_id, receipt.output_sha256, receipt.recorded_at),
+        )
+        conn.execute(
+            "UPDATE jobs SET status='succeeded', claim_token=NULL, owner_pid=NULL, owner_host=NULL, "
+            "owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, next_retry_at=NULL, "
+            "last_error_class=NULL, updated_at=? WHERE job_id=? AND claim_token=?",
+            (now, claim.job_id, claim.claim_token),
+        )
+        if next_stage:
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (secrets.token_hex(16), claim.artifact_id, next_stage, "queued", DEFAULT_MAX_ATTEMPTS, now, now),
+            )
+
+    def complete_extraction(self, claim: JobClaim, row: Mapping[str, Any]) -> None:
+        now = time.time()
+        receipt = StageReceipt(
+            claim.artifact_id,
+            "extracted",
+            f"extraction:{row['extraction_id']}",
+            str(row["output_sha256"]),
+            recorded_at=now,
+        )
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "extracted", now=now)
+            existing = conn.execute(
+                "SELECT * FROM extractions WHERE extraction_id=?", (row["extraction_id"],)
+            ).fetchone()
+            values = (
+                row["extraction_id"], row["artifact_id"], row["source_sha256"],
+                row["source_manifest_sha256"], row["extractor_version"], row["limits_version"],
+                row["redaction_version"], row["status"], row["derived_storage_id"],
+                row["derived_object_key"], row["output_sha256"], int(row["output_bytes"]),
+                int(row["output_characters"]), row["redaction_counts_json"], now,
+            )
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO extractions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values
+                )
+            else:
+                columns = tuple(existing.keys())[:-1]
+                if tuple(existing[name] for name in columns) != values[:-1]:
+                    raise ValueError("extraction identity conflicts with immutable metadata")
+            self._complete_claim_locked(conn, claim, receipt, now=now, next_stage="interpreted")
+
+    def complete_interpretation(
+        self,
+        claim: JobClaim,
+        envelope: Mapping[str, Any],
+        interpretation: Mapping[str, Any],
+    ) -> None:
+        now = time.time()
+        receipt = StageReceipt(
+            claim.artifact_id,
+            "interpreted",
+            f"interpretation:{interpretation['interpretation_id']}",
+            str(interpretation["output_sha256"]),
+            recorded_at=now,
+        )
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "interpreted", now=now)
+            envelope_values = (
+                envelope["envelope_id"], envelope["artifact_id"], envelope["project_key"],
+                envelope["source_sha256"], envelope["extraction_id"], envelope["extraction_sha256"],
+                envelope["envelope_version"], envelope["schema_version"], envelope["prompt_version"],
+                envelope["task"], envelope["derived_storage_id"], envelope["derived_object_key"],
+                envelope["output_sha256"], int(envelope["output_bytes"]), now,
+            )
+            existing = conn.execute(
+                "SELECT * FROM interpretation_envelopes WHERE envelope_id=?", (envelope["envelope_id"],)
+            ).fetchone()
+            if existing is None:
+                conn.execute("INSERT INTO interpretation_envelopes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", envelope_values)
+            elif tuple(existing[name] for name in tuple(existing.keys())[:-1]) != envelope_values[:-1]:
+                raise ValueError("interpretation envelope conflicts with immutable metadata")
+            interpretation_values = (
+                interpretation["interpretation_id"], interpretation["envelope_id"],
+                interpretation["artifact_id"], interpretation["extraction_id"],
+                interpretation["schema_version"], interpretation["prompt_version"],
+                interpretation["derived_storage_id"], interpretation["derived_object_key"],
+                interpretation["output_sha256"], int(interpretation["output_bytes"]),
+                interpretation["actual_provider"], interpretation["actual_model"],
+                interpretation["selected_provider"], interpretation["selected_model"],
+                interpretation["model_tier"], interpretation["route_fingerprint"],
+                int(interpretation["input_tokens"]), int(interpretation["output_tokens"]),
+                int(interpretation["total_tokens"]), int(interpretation["cache_read_tokens"]),
+                int(interpretation["cache_write_tokens"]), now,
+            )
+            existing = conn.execute(
+                "SELECT * FROM interpretations WHERE interpretation_id=?",
+                (interpretation["interpretation_id"],),
+            ).fetchone()
+            if existing is None:
+                conn.execute("INSERT INTO interpretations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", interpretation_values)
+            elif tuple(existing[name] for name in tuple(existing.keys())[:-1]) != interpretation_values[:-1]:
+                raise ValueError("interpretation identity conflicts with immutable metadata")
+            self._complete_claim_locked(conn, claim, receipt, now=now)
+
+    def persist_interpretation_envelope(
+        self, claim: JobClaim, envelope: Mapping[str, Any]
+    ) -> None:
+        now = time.time()
+        values = (
+            envelope["envelope_id"], envelope["artifact_id"], envelope["project_key"],
+            envelope["source_sha256"], envelope["extraction_id"], envelope["extraction_sha256"],
+            envelope["envelope_version"], envelope["schema_version"], envelope["prompt_version"],
+            envelope["task"], envelope["derived_storage_id"], envelope["derived_object_key"],
+            envelope["output_sha256"], int(envelope["output_bytes"]), now,
+        )
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "interpreted", now=now)
+            existing = conn.execute(
+                "SELECT * FROM interpretation_envelopes WHERE envelope_id=?",
+                (envelope["envelope_id"],),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO interpretation_envelopes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+            elif tuple(existing[name] for name in tuple(existing.keys())[:-1]) != values[:-1]:
+                raise ValueError("interpretation envelope conflicts with immutable metadata")
+
+    def get_interpretation(self, interpretation_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM interpretations WHERE interpretation_id=?", (interpretation_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
     def list_child_artifacts_for_notion_claim(
         self, job_id: str, claim_token: str, artifact_id: str
     ) -> list[IntakeArtifact]:
@@ -1733,6 +2016,7 @@ class IntakeStore:
         receipt: StageReceipt,
         *,
         now: float | None = None,
+        next_stage: str = "",
     ) -> bool:
         now = time.time() if now is None else float(now)
         with self._write() as conn:
@@ -1768,6 +2052,13 @@ class IntakeStore:
                 "WHERE job_id=? AND status='running' AND claim_token=? AND lease_expires_at>?",
                 (now, job_id, claim_token, now),
             )
+            if cursor.rowcount == 1 and next_stage:
+                next_stage = validate_stage(next_stage)
+                conn.execute(
+                    "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                    "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (secrets.token_hex(16), receipt.artifact_id, next_stage, "queued", DEFAULT_MAX_ATTEMPTS, now, now),
+                )
             return cursor.rowcount == 1
 
     record_stage_receipt = complete_stage
@@ -1803,6 +2094,26 @@ class IntakeStore:
                 "lease_expires_at=NULL, heartbeat_at=NULL, next_retry_at=?, last_error_class=?, updated_at=? "
                 "WHERE job_id=? AND status='running' AND claim_token=? AND lease_expires_at>?",
                 (status, next_retry, error_class, now, job_id, claim_token, now),
+            )
+            return cursor.rowcount == 1
+
+    def block_stage(
+        self,
+        job_id: str,
+        claim_token: str,
+        *,
+        error_class: str,
+        now: float | None = None,
+    ) -> bool:
+        now = time.time() if now is None else float(now)
+        error_class = _error_class(error_class)
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET status='operator_blocked', claim_token=NULL, owner_pid=NULL, "
+                "owner_host=NULL, owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, "
+                "next_retry_at=NULL, last_error_class=?, updated_at=? WHERE job_id=? "
+                "AND status='running' AND claim_token=? AND lease_expires_at>?",
+                (error_class, now, job_id, claim_token, now),
             )
             return cursor.rowcount == 1
 
@@ -1858,7 +2169,7 @@ class IntakeStore:
             cursor = conn.execute(
                 "UPDATE jobs SET status='queued', attempt_count=0, next_retry_at=NULL, "
                 "last_error_class=NULL, updated_at=? "
-                "WHERE job_id=? AND status IN ('failed','quarantined')",
+                "WHERE job_id=? AND status IN ('failed','quarantined','operator_blocked')",
                 (now, job_id),
             )
             return cursor.rowcount == 1

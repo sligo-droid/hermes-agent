@@ -582,9 +582,9 @@ def test_process_claim_renews_immediately_before_final_completion(tmp_path, monk
         original_renew(current_claim)
     monkeypatch.setattr(worker, "_renew", renew)
     original_complete = store.complete_stage
-    def complete(job_id, claim_token, receipt):
+    def complete(job_id, claim_token, receipt, **kwargs):
         assert renewals[-1] == claim_token
-        return original_complete(job_id, claim_token, receipt)
+        return original_complete(job_id, claim_token, receipt, **kwargs)
     monkeypatch.setattr(store, "complete_stage", complete)
     assert worker.process_claim(claim) == "page-1"
 
@@ -822,7 +822,7 @@ def test_multipart_flow_sends_parts_then_completes_with_heartbeats(tmp_path):
 def test_store_migration_creates_append_only_upload_tables(tmp_path):
     store = IntakeStore(tmp_path / "private" / "intake.db")
     with store._connect() as conn:
-        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "6"
+        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "7"
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"notion_upload_attempts", "notion_upload_attempt_events", "notion_upload_scans"}.issubset(tables)
 
@@ -847,7 +847,7 @@ def test_schema_v4_migrates_upload_attempt_part_size_additively(tmp_path):
         version = conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
-    assert version == "6"
+    assert version == "7"
     assert "expected_part_size" in columns
 
 

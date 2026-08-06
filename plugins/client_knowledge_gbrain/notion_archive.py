@@ -390,7 +390,9 @@ class NotionArchiveWorker:
             artifact.artifact_id, "notion_archived", f"notion:page:{page_id}", digest
         )
         self._renew(claim)
-        if not self.store.complete_stage(claim.job_id, claim.claim_token, receipt):
+        if not self.store.complete_stage(
+            claim.job_id, claim.claim_token, receipt, next_stage="extracted"
+        ):
             raise PermissionError("notion job claim was lost before completion")
         return page_id
 

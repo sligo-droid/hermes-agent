@@ -37,7 +37,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     run_once = subs.add_parser(
         "run-once",
-        help="Run a bounded batch of Notion source-archive jobs",
+        help="Run bounded Notion, extraction, and interpretation stages",
     )
     run_once.add_argument("--db-path", default="")
 
@@ -126,12 +126,30 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             print(json.dumps({"recovered": store.reconcile(), "stats": store.stats()}, sort_keys=True))
             return 0
         if action == "run-once":
+            from agent.plugin_llm import PluginLlm
             from hermes_cli.config import load_config
+            from .derived import DerivedStore
+            from .extraction import run_extraction_once
+            from .interpretation import run_interpretation_once
             from .notion_archive import run_notion_once
             from .spool import RawSpool
 
-            result = run_notion_once(store=store, spool=RawSpool(), config=load_config())
-            print(json.dumps({"mode": "notion_archive", **result, "stats": store.stats()}, sort_keys=True))
+            config = load_config() or {}
+            spool = RawSpool()
+            derived = DerivedStore()
+            result = {
+                "notion_archive": run_notion_once(store=store, spool=spool, config=config),
+                "extraction": run_extraction_once(
+                    store=store, spool=spool, derived=derived, config=config
+                ),
+                "interpretation": run_interpretation_once(
+                    store=store,
+                    derived=derived,
+                    llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
+                    config=config,
+                ),
+            }
+            print(json.dumps({"mode": "client_knowledge_pipeline", **result, "stats": store.stats()}, sort_keys=True))
             return 0
         if action == "gmail-poll-once":
             from hermes_cli.config import load_config
