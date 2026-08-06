@@ -352,6 +352,8 @@ plugins = [
   "**/plugin.yaml",
   "**/plugin.yml",
   "**/README.md",
+  "**/systemd/*.service",
+  "**/systemd/*.timer",
 ]
 
 [tool.setuptools.packages.find]

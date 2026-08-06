@@ -1,0 +1,21 @@
+Delivered-To: pid@example.invalid
+X-Original-To: ignored@example.invalid
+To: conflicting@example.invalid
+From: synthetic-sender@example.invalid
+Subject: Synthetic intake fixture
+Date: Thu, 6 Aug 2026 12:00:01 +0000
+Message-ID: <synthetic-message-1@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="synthetic-boundary"
+
+--synthetic-boundary
+Content-Type: text/plain; charset="utf-8"
+
+This is synthetic test content.
+--synthetic-boundary
+Content-Type: text/plain; name="synthetic.txt"
+Content-Disposition: attachment; filename="synthetic.txt"
+Content-Transfer-Encoding: base64
+
+c3ludGhldGljIGF0dGFjaG1lbnQK
+--synthetic-boundary--

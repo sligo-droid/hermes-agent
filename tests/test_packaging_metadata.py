@@ -163,6 +163,25 @@ def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
     )
 
 
+def test_client_knowledge_systemd_units_ship_disabled_in_wheel_and_sdist():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    plugin_data = data["tool"]["setuptools"]["package-data"]["plugins"]
+    assert "**/systemd/*.service" in plugin_data
+    assert "**/systemd/*.timer" in plugin_data
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "recursive-include plugins *.service *.timer" in manifest
+
+    unit_root = REPO_ROOT / "plugins" / "client_knowledge_gbrain" / "systemd"
+    service = (unit_root / "hermes-client-knowledge-gmail-poll.service").read_text(encoding="utf-8")
+    timer = (unit_root / "hermes-client-knowledge-gmail-poll.timer").read_text(encoding="utf-8")
+    assert "Type=oneshot" in service
+    assert "UMask=0077" in service
+    assert "Restart=" not in service
+    assert "OnUnitActiveSec=2min" in timer
+    assert "WantedBy=timers.target" in timer
+    assert "enable" not in service + timer
+
+
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based

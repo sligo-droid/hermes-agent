@@ -822,7 +822,7 @@ def test_multipart_flow_sends_parts_then_completes_with_heartbeats(tmp_path):
 def test_store_migration_creates_append_only_upload_tables(tmp_path):
     store = IntakeStore(tmp_path / "private" / "intake.db")
     with store._connect() as conn:
-        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "5"
+        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "6"
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"notion_upload_attempts", "notion_upload_attempt_events", "notion_upload_scans"}.issubset(tables)
 
@@ -847,7 +847,7 @@ def test_schema_v4_migrates_upload_attempt_part_size_additively(tmp_path):
         version = conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
-    assert version == "5"
+    assert version == "6"
     assert "expected_part_size" in columns
 
 
