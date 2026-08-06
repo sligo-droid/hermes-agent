@@ -666,6 +666,51 @@ def test_orchestrated_uncertain_runner_receipt_is_persistable():
     assert classified["order"] == 31
 
 
+def test_orchestrated_receipt_survives_omitted_cursorless_diagnostic():
+    from agent.visual_assertions import (
+        normalize_orchestrated_visual_contract,
+        visual_execution_contract_id,
+    )
+
+    requirement = classify_visual_requirement(
+        "Build a responsive dashboard with a mobile sidebar.",
+        worker_route="action",
+    )
+    args = {
+        "target": {"description": "Dashboard", "locator": {"by": "css", "value": "body"}},
+        "page": {"state": "already_open", "description": "Dashboard is open"},
+        "viewport": {"description": "Desktop viewport"},
+        "state": ["Dashboard data is loaded"],
+        "assertions": [
+            {"kind": "no_new_diagnostics"},
+            {"kind": "screenshot_appearance", "expectation": "The dashboard is readable."},
+        ],
+    }
+    contract = normalize_orchestrated_visual_contract(args)
+    receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": visual_execution_contract_id(contract),
+        "coverage_ids": [item["id"] for item in requirement["assertions"]],
+        "assertion_ids": [item["id"] for item in contract["assertions"]],
+        "status": "passed",
+        "attempts": 1,
+        "vision_calls": 2,
+        "duration_ms": 100,
+        "diagnostic_codes": ["appearance_satisfied"],
+    }
+
+    classified = classify_tool_visual_receipt(
+        "visual_qa",
+        args,
+        {"status": "passed", "visual_qa_receipt": receipt},
+        False,
+        requirement=requirement,
+    )
+
+    assert classified is not None
+    assert classified["status"] == "passed"
+
+
 def test_later_success_supersedes_earlier_failed_browser_check():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     fail = json.dumps({"output": "modal missing", "exit_code": 1, "error": None})

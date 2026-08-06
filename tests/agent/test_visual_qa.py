@@ -66,6 +66,16 @@ def test_classifier_excludes_review_only_work():
     assert classify_visual_requirement("Update the responsive layout documentation.")["level"] == "none"
 
 
+def test_classifier_recognizes_explicit_visual_qa_check_without_code_action():
+    requirement = classify_visual_requirement(
+        "Confirm you can use the visual QA tool successfully now. Mimic the closeout flow.",
+        worker_route={"runtime_mode": "read_only"},
+    )
+
+    assert requirement["level"] == "surface"
+    assert requirement["assertions"][0]["kind"] == "orchestrator_contract"
+
+
 def test_classifier_allows_explicit_visual_fix_after_review_framing():
     requirement = classify_visual_requirement("Review the dashboard and fix mobile overflow in the toolbar.")
 

@@ -425,6 +425,44 @@ def test_pending_closeout_recovers_lost_browser_before_visual_qa_retry():
     assert "web_search" in skipped[0]
 
 
+def test_visual_qa_allows_only_one_correction_retry_per_turn():
+    agent = _agent("visual_qa", max_iterations=4)
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
+            finish_reason="tool_calls",
+        ),
+        _response(
+            tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
+            finish_reason="tool_calls",
+        ),
+        _response(
+            tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
+            finish_reason="tool_calls",
+        ),
+        _response("Stopped after the bounded retry."),
+    ]
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"status": "uncertain", "code": "invalid_visual_contract"}),
+        ) as execute_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("confirm visual QA")
+
+    assert execute_call.call_count == 2
+    assert result["final_response"] == "Stopped after the bounded retry."
+    assert any(
+        "one initial call and one correction retry" in str(message.get("content"))
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    )
+
+
 def test_pending_closeout_gets_visual_and_finalization_grace_calls():
     agent = _agent("terminal", "visual_qa")
     agent._preview_readiness = None

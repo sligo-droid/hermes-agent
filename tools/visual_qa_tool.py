@@ -83,6 +83,10 @@ VISUAL_QA_SCHEMA = {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 4,
+                "description": (
+                    "Required current page assumptions, separate from page.state; "
+                    "for example data loaded, menu open, or authenticated shell visible."
+                ),
                 "items": {"type": "string", "maxLength": 160},
             },
             "artifacts": {
@@ -147,7 +151,7 @@ VISUAL_QA_SCHEMA = {
                 },
             },
         },
-        "required": ["assertions"],
+        "required": ["target", "page", "viewport", "state", "assertions"],
     },
 }
 
@@ -165,8 +169,14 @@ async def _visual_qa_handler(args: dict[str, Any], **kwargs: Any) -> str:
         cfg = {}
         runtime = {}
         requirement = {"level": "none", "target": "", "assertions": []}
+    from tools.browser_tool import _read_only_browser_task_id
+
+    task_id = _read_only_browser_task_id(
+        str(kwargs.get("task_id") or "default"),
+        kwargs.get("runtime_mode"),
+    )
     result = await run_visual_assertions(
-        task_id=str(kwargs.get("task_id") or "default"),
+        task_id=str(task_id or "default"),
         requirement=requirement,
         contract=args,
         config=cfg,

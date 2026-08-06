@@ -528,6 +528,31 @@ def test_gateway_visual_qa_context_and_turn_state_are_bounded():
     assert "private/workspace" not in str(state)
 
 
+def test_read_only_visual_qa_confirmation_gets_ephemeral_requirement():
+    from gateway.run import _promote_read_only_visual_qa_request
+
+    requirement = _promote_read_only_visual_qa_request(
+        {"level": "none", "target": "", "assertions": []},
+        "Confirm you can use visual QA successfully now and mimic closeout.",
+        "read_only",
+    )
+
+    assert requirement["level"] == "surface"
+    assert requirement["assertions"][0]["kind"] == "orchestrator_contract"
+
+
+def test_read_only_non_qa_review_does_not_gain_visual_requirement():
+    from gateway.run import _promote_read_only_visual_qa_request
+
+    requirement = _promote_read_only_visual_qa_request(
+        {"level": "none", "target": "", "assertions": []},
+        "Review this screenshot and explain the current layout.",
+        "read_only",
+    )
+
+    assert requirement["level"] == "none"
+
+
 def test_resumed_turn_cannot_erase_prior_visual_mutation_boundary(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(

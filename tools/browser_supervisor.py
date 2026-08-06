@@ -946,8 +946,21 @@ class CDPSupervisor:
                 nodes = Array.from(document.querySelectorAll('[data-testid="' + CSS.escape(spec.value) + '"]'));
             }} else if (spec.by === 'role') {{
                 nodes = Array.from(document.querySelectorAll('[role="' + CSS.escape(spec.value) + '"]'));
+                const implicitRoleSelectors = {{
+                    button: 'button, input[type="button"], input[type="submit"], input[type="reset"]',
+                    link: 'a[href], area[href]',
+                    textbox: 'textarea, input:not([type]), input[type="text"], input[type="email"], input[type="search"], input[type="tel"], input[type="url"]',
+                    checkbox: 'input[type="checkbox"]',
+                    radio: 'input[type="radio"]',
+                }};
+                const implicitSelector = implicitRoleSelectors[spec.value] || '';
+                if (implicitSelector) {{
+                    for (const node of document.querySelectorAll(implicitSelector)) {{
+                        if (!nodes.includes(node)) nodes.push(node);
+                    }}
+                }}
                 if (spec.name) {{
-                    nodes = nodes.filter((node) => ((node.getAttribute('aria-label') || node.textContent || '').trim() === spec.name));
+                    nodes = nodes.filter((node) => ((node.getAttribute('aria-label') || node.textContent || node.value || node.alt || '').trim() === spec.name));
                 }}
             }} else {{
                 nodes = Array.from(document.querySelectorAll(spec.value));

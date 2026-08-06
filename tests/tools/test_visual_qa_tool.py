@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from tools.registry import _module_registers_tools, registry
 
@@ -47,7 +50,13 @@ def test_visual_qa_schema_has_no_arbitrary_execution_or_protected_inputs():
 
     assert VISUAL_QA_SCHEMA["parameters"]["additionalProperties"] is False
     property_names = {name.lower() for name in _schema_property_names(VISUAL_QA_SCHEMA)}
-    assert VISUAL_QA_SCHEMA["parameters"]["required"] == ["assertions"]
+    assert VISUAL_QA_SCHEMA["parameters"]["required"] == [
+        "target",
+        "page",
+        "viewport",
+        "state",
+        "assertions",
+    ]
     assert {"target", "page", "viewport", "state", "artifacts", "assertions"} <= property_names
     assert VISUAL_QA_SCHEMA["parameters"]["properties"]["artifacts"]["maxItems"] == 4
     assert "receipt_assertions" not in property_names
@@ -81,3 +90,25 @@ def test_visual_qa_description_distinguishes_containment_from_scroll_overflow():
     assert "do not use it for full pages" in description
     assert "Use `no_horizontal_overflow`" in description
     assert "vertical scrolling is allowed" in description
+
+
+@pytest.mark.asyncio
+async def test_visual_qa_uses_read_only_browser_namespace(monkeypatch):
+    from tools import visual_qa_tool
+
+    captured = {}
+
+    async def run(**kwargs):
+        captured.update(kwargs)
+        return {"status": "passed"}
+
+    monkeypatch.setattr(visual_qa_tool, "run_visual_assertions", run)
+
+    result = await visual_qa_tool._visual_qa_handler(
+        {},
+        task_id="turn-7",
+        runtime_mode="read_only",
+    )
+
+    assert json.loads(result)["status"] == "passed"
+    assert captured["task_id"] == "turn-7::read-only"

@@ -356,6 +356,32 @@ def _normalize_gateway_visual_qa_contract(
         )
 
 
+def _promote_read_only_visual_qa_request(
+    requirement: Any,
+    request_text: Any,
+    runtime_mode: Any,
+) -> dict[str, Any]:
+    """Create an ephemeral requirement for an explicit read-only QA check."""
+
+    normalized, _ = _normalize_gateway_visual_qa_contract(requirement, None)
+    try:
+        from agent.runtime_capabilities import RuntimeMode, normalize_runtime_mode
+
+        if (
+            normalized.get("level") != "none"
+            or normalize_runtime_mode(runtime_mode) is not RuntimeMode.READ_ONLY
+        ):
+            return normalized
+        from agent.visual_qa import classify_visual_requirement
+
+        return classify_visual_requirement(
+            request_text,
+            worker_route={"runtime_mode": "read_only"},
+        )
+    except Exception:
+        return normalized
+
+
 def _visual_qa_context_prompt(requirement: dict[str, Any], config: dict[str, Any]) -> str:
     """Render one compact, secret-safe instruction for clear visual work."""
 
@@ -30352,6 +30378,11 @@ class _GatewayRunnerCore(
         visual_qa_requirement, visual_qa_config = _normalize_gateway_visual_qa_contract(
             visual_qa_requirement,
             visual_qa_config if visual_qa_config is not None else user_config,
+        )
+        visual_qa_requirement = _promote_read_only_visual_qa_request(
+            visual_qa_requirement,
+            message,
+            turn_runtime_mode,
         )
         if source.platform != _GATEWAY_PLATFORM.DISCORD:
             visual_qa_requirement = {"level": "none", "target": "", "assertions": []}

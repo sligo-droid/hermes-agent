@@ -1343,6 +1343,7 @@ def run_conversation(
     agent._turn_mutation_boundary = 0
     agent._visual_qa_last_edit_order = 0
     agent._visual_qa_followup_turns = 0
+    agent._visual_qa_tool_calls = 0
     agent._completion_response_synthesis_attempts = 0
     _reset_closeout_turn_state(agent)
     try:

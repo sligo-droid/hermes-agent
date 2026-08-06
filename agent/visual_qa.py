@@ -88,6 +88,11 @@ _SURFACE_RE = re.compile(
     r"sidebars?|modals?|dialogs?|controls?|buttons?|charts?|maps?|dashboards?|pages?|screens?|overflow)\b",
     re.IGNORECASE,
 )
+_EXPLICIT_VISUAL_QA_CHECK_RE = re.compile(
+    r"(?:\b(?:check|confirm|mimic|retry|run|test|use|verify)\b.{0,80}\bvisual[ -]?qa\b|"
+    r"\bvisual[ -]?qa\b.{0,80}\b(?:check|confirm|mimic|retry|run|test|use|verify)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 _RENDERED_PATH_RE = re.compile(
     r"(?:^|/)(?!tests?(?:/|$)|docs?(?:/|$)|fixtures?(?:/|$)|snapshots?(?:/|$))"
     r"[^/]+\.(?:svelte|tsx|jsx|vue|html?|css|scss|sass|less|svg)$",
@@ -349,14 +354,28 @@ def classify_visual_requirement(
         return {"level": "none", "target": "", "assertions": []}
     has_action = bool(_ACTION_RE.search(text))
     has_desired_state = bool(_DESIRED_STATE_RE.search(text))
-    if not (has_action or has_desired_state or _route_is_actionable(worker_route)):
+    explicit_visual_qa_check = bool(_EXPLICIT_VISUAL_QA_CHECK_RE.search(text))
+    if not (
+        has_action
+        or has_desired_state
+        or explicit_visual_qa_check
+        or _route_is_actionable(worker_route)
+    ):
         return {"level": "none", "target": "", "assertions": []}
     # A concrete implementation action wins over review/audit framing (for
     # example, "review the dashboard and fix mobile overflow").  Generic
     # update/change/make verbs remain insufficient for documentation-only work.
     if _DOC_ONLY_RE.search(text) and not _CONCRETE_IMPLEMENTATION_ACTION_RE.search(text):
         return {"level": "none", "target": "", "assertions": []}
-    level = "artifact" if _ARTIFACT_RE.search(text) else ("surface" if _SURFACE_RE.search(text) else "none")
+    level = (
+        "artifact"
+        if _ARTIFACT_RE.search(text)
+        else (
+            "surface"
+            if _SURFACE_RE.search(text) or explicit_visual_qa_check
+            else "none"
+        )
+    )
     if level == "none":
         return {"level": "none", "target": "", "assertions": []}
     # Intake owns only the explicit visual/artifact applicability gate.  The

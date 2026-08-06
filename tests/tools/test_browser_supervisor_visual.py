@@ -87,6 +87,17 @@ def test_trusted_element_state_returns_host_authored_facts_only():
     assert "fetch(" not in expression
 
 
+def test_role_locator_includes_native_html_roles_and_names():
+    supervisor = _supervisor()
+    expression = supervisor._trusted_locator_expression(
+        {"by": "role", "value": "button", "name": "Sign In"}
+    )
+
+    assert "implicitRoleSelectors" in expression
+    assert "input[type=\"submit\"]" in expression
+    assert "node.value" in expression
+
+
 def test_trusted_locator_rejects_javascript_shaped_css():
     supervisor = _supervisor()
 
