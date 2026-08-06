@@ -14,8 +14,22 @@ _LOCATOR_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "by": {"type": "string", "enum": ["test_id", "role", "css"]},
-        "value": {"type": "string", "maxLength": 200},
-        "name": {"type": "string", "maxLength": 120},
+        "value": {
+            "type": "string",
+            "maxLength": 200,
+            "description": (
+                "For role locators, use the exact role reported by browser_snapshot, "
+                "such as button, navigation, or main. Prefer verified snapshot roles "
+                "or test IDs over guessed CSS selectors."
+            ),
+        },
+        "name": {
+            "type": "string",
+            "maxLength": 120,
+            "description": (
+                "For role locators, copy the exact accessible name from browser_snapshot."
+            ),
+        },
     },
     "required": ["by", "value"],
 }
@@ -38,7 +52,10 @@ VISUAL_QA_SCHEMA = {
         "This tool is callable in any agent turn; it does not require a preceding UI change or "
         "an active visual requirement. Formulate the smallest relevant target, prepared/current page "
         "state, viewport assumptions, and concrete assertion intent from the full accepted "
-        "request and code understanding. This tool accepts only "
+        "request and the latest browser_snapshot. Prefer exact snapshot role/name locators or "
+        "verified test IDs; do not invent CSS selectors. Every initial or correction contract "
+        "must retain at least one screenshot_appearance assertion. "
+        "This tool accepts only "
         "trusted assertion kinds; it does not accept JavaScript, CDP commands, shell commands, "
         "URLs, screenshot inputs, cookies, or headers. Request up to four meaningful human-facing "
         "artifacts from the screenshots used by QA; focused target plus surrounding context is the "
@@ -112,6 +129,10 @@ VISUAL_QA_SCHEMA = {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 6,
+                "description": (
+                    "Include at least one screenshot_appearance assertion in every initial "
+                    "and correction call."
+                ),
                 "items": {
                     "type": "object",
                     "additionalProperties": False,

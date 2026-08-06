@@ -446,7 +446,13 @@ def test_visual_qa_allows_only_one_correction_retry_per_turn():
     with (
         patch(
             "run_agent.handle_function_call",
-            return_value=json.dumps({"status": "uncertain", "code": "invalid_visual_contract"}),
+            return_value=json.dumps(
+                {
+                    "status": "failed",
+                    "code": "visual_assertions_complete",
+                    "attempts": [{"attempt": 1}],
+                }
+            ),
         ) as execute_call,
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
@@ -457,7 +463,69 @@ def test_visual_qa_allows_only_one_correction_retry_per_turn():
     assert execute_call.call_count == 2
     assert result["final_response"] == "Stopped after the bounded retry."
     assert any(
-        "one initial call and one correction retry" in str(message.get("content"))
+        "two executable calls plus one malformed-contract repair" in str(
+            message.get("content")
+        )
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    )
+
+
+def test_visual_qa_malformed_correction_does_not_consume_execution_slot():
+    agent = _agent("visual_qa", max_iterations=5)
+
+    def tool_call():
+        return _tool_call(
+            "visual_qa",
+            {"assertions": [{"kind": "visible"}]},
+        )
+
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
+        _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
+        _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
+        _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
+        _response("Stopped after contract repair and bounded retry."),
+    ]
+    failed = json.dumps(
+        {
+            "status": "failed",
+            "code": "visual_assertions_complete",
+            "attempts": [{"attempt": 1}],
+        }
+    )
+    invalid = json.dumps(
+        {
+            "status": "uncertain",
+            "code": "invalid_visual_contract",
+            "attempts": [],
+        }
+    )
+    passed = json.dumps(
+        {
+            "status": "passed",
+            "code": "visual_assertions_complete",
+            "attempts": [{"attempt": 1}],
+        }
+    )
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            side_effect=[failed, invalid, passed],
+        ) as execute_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("confirm visual QA")
+
+    assert execute_call.call_count == 3
+    assert result["final_response"] == "Stopped after contract repair and bounded retry."
+    assert any(
+        "two executable calls plus one malformed-contract repair" in str(
+            message.get("content")
+        )
         for message in result["messages"]
         if message.get("role") == "tool"
     )
