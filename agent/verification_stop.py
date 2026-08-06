@@ -41,6 +41,10 @@ _VISUAL_QA_RESULT_ONLY_REQUEST_RE = re.compile(
     r")(?:\s+or\s+(?:passed|failed))?(?:\s+for\s+this\s+change)?[.!?]*\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+_PR_NUMBER_RE = re.compile(
+    r"(?:github\.com/[^\s)]+/pull/|\b(?:pr|pull\s+request)\s*(?:#|number\s*)?)(\d+)",
+    re.IGNORECASE,
+)
 
 # Non-code file extensions whose edits carry no verifiable runtime behavior:
 # documentation, prose, and data/markup that no test/build exercises. When a
@@ -404,6 +408,79 @@ def build_verification_response_nudge(
     )
 
 
+def build_lifecycle_verification_nudge(
+    *,
+    final_response: str | None,
+    evidence: Any,
+    original_request: Any = None,
+    runtime_mode: Any,
+    attempts: int = 0,
+) -> str | None:
+    """Request one typed closed-PR/main proof when a draft lacks it."""
+
+    if (
+        not final_response
+        or str(runtime_mode or "").strip().lower() != "action"
+        or attempts >= 1
+    ):
+        return None
+    try:
+        from agent.verification_evidence import (
+            claim_constraints_for_text,
+            latest_evidence_by_surface,
+        )
+
+        constraints = claim_constraints_for_text(final_response, evidence)
+        latest = latest_evidence_by_surface(evidence)
+    except Exception:
+        return None
+    blocked = constraints.get("blocked_surfaces") if isinstance(constraints, dict) else None
+    missing_main = next(
+        (
+            item
+            for item in blocked or []
+            if isinstance(item, dict)
+            and item.get("surface") == "main_branch"
+            and str(item.get("status") or "missing") in {"", "missing", "stale", "unknown"}
+        ),
+        None,
+    )
+    request_text = " ".join(str(original_request or "").lower().split())
+    request_requires_main_proof = bool(
+        re.search(r"\b(?:pr|pull\s+request)\b", request_text)
+        and re.search(r"\bclos(?:e|ed|ing)\b", request_text)
+        and re.search(r"\bmain\b", request_text)
+        and re.search(r"\bunchanged\b", request_text)
+    )
+    latest_main_status = str((latest.get("main_branch") or {}).get("status") or "")
+    if missing_main is None and not (
+        request_requires_main_proof and latest_main_status in {"", "missing", "stale", "unknown"}
+    ):
+        return None
+    match = _PR_NUMBER_RE.search(str(final_response))
+    pr_number = int(match.group(1)) if match is not None else 0
+    if pr_number <= 0:
+        for item in evidence if isinstance(evidence, list) else []:
+            subject = str(item.get("subject") or "") if isinstance(item, dict) else ""
+            subject_match = re.search(r":pr:(\d+)$", subject)
+            if subject_match is not None:
+                pr_number = int(subject_match.group(1))
+                break
+    if pr_number <= 0:
+        return None
+    return (
+        "[System: Your draft claims that PR #"
+        f"{pr_number} was closed without merge and that main stayed unchanged, but "
+        "trusted PR-bound main-branch evidence is missing. Call `verify_main_parent` "
+        f"now with `pr_number: {pr_number}` and the current repository workdir. This "
+        "single typed check verifies the closed PR head and compares origin/main with "
+        "the commit parent. Do not compose another terminal or `gh pr view` proof. "
+        "After the tool result, return one complete refreshed response with the commit, "
+        "PR, green checks, closed/unmerged state, and main-branch result. If the typed "
+        "check fails, report that concrete failure instead of claiming success.]"
+    )
+
+
 def build_visual_qa_stop_nudge(
     *,
     requirement: Any,
@@ -435,6 +512,7 @@ def build_visual_qa_stop_nudge(
 
 
 __all__ = [
+    "build_lifecycle_verification_nudge",
     "build_verification_response_nudge",
     "build_verify_on_stop_nudge",
     "build_visual_qa_stop_nudge",
