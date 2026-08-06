@@ -25,6 +25,16 @@ FORK_DEFAULT_ADDITIONS = {
             "max_attempts": 3,
             "retry_delay_seconds": 60,
         },
+        "notion": {
+            "enabled": False,
+            "api_key_env": "NOTION_API_KEY",
+            "request_timeout_seconds": 30,
+            "max_file_bytes": 0,
+            "multipart_part_bytes": 10 * 1024 * 1024,
+            "max_jobs_per_run": 10,
+            "lease_seconds": 300,
+            "claim_heartbeat_seconds": 30,
+        },
     },
     "plugins": {
         "entries": {

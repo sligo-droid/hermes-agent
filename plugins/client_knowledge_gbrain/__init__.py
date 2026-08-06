@@ -25,12 +25,11 @@ def register(ctx) -> None:
     )
     ctx.register_cli_command(
         name="client-knowledge",
-        help="Inspect the redacted client-knowledge intake queue",
+        help="Inspect intake and operate the Notion source archive",
         setup_fn=register_cli,
         handler_fn=client_knowledge_command,
         description=(
-            "Operator-only queue status and lease controls. run-once is a bounded "
-            "no-op until provider adapters and workers land in a later PR."
+            "Operator-only queue, Notion preflight, and bounded archive controls."
         ),
     )
     ctx.register_auxiliary_task(

@@ -30,8 +30,15 @@ def test_cli_parser_registers_all_operator_actions():
         "quarantine",
         "reconcile",
         "run-once",
+        "notion-preflight",
     ):
-        args = parser.parse_args([action] + (["0" * 32] if action in {"show", "retry", "quarantine"} else []))
+        if action in {"show", "retry", "quarantine"}:
+            suffix = ["0" * 32]
+        elif action == "notion-preflight":
+            suffix = ["--project", "pid"]
+        else:
+            suffix = []
+        args = parser.parse_args([action] + suffix)
         assert args.client_knowledge_action == action
         assert args.func is client_knowledge_command
 
@@ -58,8 +65,9 @@ def test_cli_output_is_redacted_and_run_once_is_explicit(tmp_path, capsys):
     assert payload["jobs"][0]["stage"] == "quarantined"
 
     args.client_knowledge_action = "run-once"
+    # Disabled-by-default Notion configuration remains a bounded no-work run.
     assert client_knowledge_command(args) == 0
-    assert "bounded_noop" in capsys.readouterr().out
+    assert "notion_archive" in capsys.readouterr().out
 
 
 def test_cli_rejects_noncanonical_job_ids_without_echoing_them(tmp_path, capsys):

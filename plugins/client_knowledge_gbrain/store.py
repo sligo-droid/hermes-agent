@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 5
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
@@ -361,6 +361,111 @@ class IntakeStore:
                         "VALUES('schema_version', '3')"
                     )
                     version = 3
+                if version < 4:
+                    statements = (
+                        """CREATE TABLE IF NOT EXISTS notion_operations (
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            operation_kind TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            page_id TEXT,
+                            block_id TEXT,
+                            active_upload_attempt_id TEXT,
+                            expected_sha256 TEXT NOT NULL,
+                            expected_size INTEGER NOT NULL,
+                            expected_mime_type TEXT NOT NULL,
+                            last_job_id TEXT NOT NULL,
+                            updated_at REAL NOT NULL,
+                            PRIMARY KEY(artifact_id, operation_kind)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS notion_upload_attempts (
+                            attempt_id TEXT PRIMARY KEY,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            operation_kind TEXT NOT NULL,
+                            ordinal INTEGER NOT NULL,
+                            replaces_attempt_id TEXT REFERENCES notion_upload_attempts(attempt_id),
+                            replacement_reason TEXT,
+                            marker_version TEXT NOT NULL,
+                            opaque_marker TEXT NOT NULL UNIQUE,
+                            remote_filename TEXT NOT NULL,
+                            upload_mode TEXT NOT NULL,
+                            expected_sha256 TEXT NOT NULL,
+                            expected_size INTEGER NOT NULL,
+                            expected_mime_type TEXT NOT NULL,
+                            expected_part_count INTEGER NOT NULL,
+                            expected_part_size INTEGER NOT NULL,
+                            baseline_scan_id TEXT,
+                            remote_upload_id TEXT UNIQUE,
+                            created_by_job_id TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            UNIQUE(artifact_id, operation_kind, ordinal)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS notion_upload_attempt_events (
+                            event_id TEXT PRIMARY KEY,
+                            attempt_id TEXT NOT NULL REFERENCES notion_upload_attempts(attempt_id) ON DELETE CASCADE,
+                            sequence INTEGER NOT NULL,
+                            event_type TEXT NOT NULL,
+                            job_id TEXT NOT NULL,
+                            claim_fingerprint TEXT NOT NULL,
+                            remote_upload_id TEXT,
+                            remote_state TEXT,
+                            remote_parts_sent INTEGER,
+                            page_id TEXT,
+                            block_id TEXT,
+                            evidence_identity TEXT,
+                            classified_reason TEXT,
+                            observed_at REAL NOT NULL,
+                            UNIQUE(attempt_id, sequence)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS notion_upload_scans (
+                            scan_id TEXT PRIMARY KEY,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            attempt_id TEXT NOT NULL REFERENCES notion_upload_attempts(attempt_id) ON DELETE CASCADE,
+                            scan_role TEXT NOT NULL,
+                            request_status TEXT NOT NULL,
+                            page_count INTEGER NOT NULL,
+                            result_count INTEGER NOT NULL,
+                            completed_at REAL NOT NULL,
+                            created_by_job_id TEXT NOT NULL
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS notion_upload_scan_items (
+                            scan_id TEXT NOT NULL REFERENCES notion_upload_scans(scan_id) ON DELETE CASCADE,
+                            remote_upload_id TEXT NOT NULL,
+                            opaque_marker TEXT NOT NULL,
+                            remote_filename TEXT NOT NULL,
+                            content_type TEXT,
+                            content_length INTEGER,
+                            status TEXT NOT NULL,
+                            created_time TEXT,
+                            expiry_time TEXT,
+                            part_count_total INTEGER,
+                            part_count_sent INTEGER,
+                            PRIMARY KEY(scan_id, remote_upload_id)
+                        )""",
+                    )
+                    for statement in statements:
+                        conn.execute(statement)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '4')"
+                    )
+                    version = 4
+                if version < 5:
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute(
+                            "PRAGMA table_info(notion_upload_attempts)"
+                        ).fetchall()
+                    }
+                    if "expected_part_size" not in columns:
+                        conn.execute(
+                            "ALTER TABLE notion_upload_attempts ADD COLUMN "
+                            "expected_part_size INTEGER NOT NULL DEFAULT 0"
+                        )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '5')"
+                    )
+                    version = 5
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -938,12 +1043,509 @@ class IntakeStore:
 
     heartbeat_job = heartbeat
 
-    def complete_stage(self, job_id: str, claim_token: str, receipt: StageReceipt) -> bool:
+    @staticmethod
+    def _claim_fingerprint(job_id: str, claim_token: str) -> str:
+        import hashlib
+
+        return hashlib.sha256(f"{job_id}\0{claim_token}".encode()).hexdigest()
+
+    @staticmethod
+    def _active_notion_claim_locked(
+        conn: sqlite3.Connection,
+        job_id: str,
+        claim_token: str,
+        artifact_id: str,
+        *,
+        now: float,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT job_id, artifact_id, stage, lease_expires_at FROM jobs "
+            "WHERE job_id=? AND artifact_id=? AND stage='notion_archived' "
+            "AND status='running' AND claim_token=?",
+            (job_id, artifact_id, claim_token),
+        ).fetchone()
+        if row is None or row[3] is None or float(row[3]) <= now:
+            raise PermissionError("notion job claim is no longer active")
+        return row
+
+    def renew_notion_claim(
+        self,
+        job_id: str,
+        claim_token: str,
+        artifact_id: str,
+        *,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    ) -> bool:
+        now = time.time()
+        expires = now + max(1.0, float(lease_seconds))
+        with self._write() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, artifact_id, now=now
+            )
+            cursor = conn.execute(
+                "UPDATE jobs SET heartbeat_at=?, lease_expires_at=?, updated_at=? "
+                "WHERE job_id=? AND artifact_id=? AND stage='notion_archived' "
+                "AND status='running' AND claim_token=?",
+                (now, expires, now, job_id, artifact_id, claim_token),
+            )
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _artifact_from_row(row: sqlite3.Row) -> IntakeArtifact:
+        return IntakeArtifact(
+            artifact_id=row["artifact_id"],
+            project_key=row["project_key"],
+            provider_id=row["provider_id"],
+            provider_artifact_id=row["provider_artifact_id"],
+            source_type=row["source_type"],
+            parent_artifact_id=row["parent_artifact_id"] or "",
+            provider_message_id=row["provider_message_id"],
+            provider_attachment_id=row["provider_attachment_id"] or "",
+            occurred_at=float(row["occurred_at"]),
+            actor_display=row["actor_display"] or "",
+            actor_id=row["actor_id"] or "",
+            delivered_alias=row["delivered_alias"] or "",
+            original_filename=row["original_filename"] or "",
+            mime_type=row["mime_type"],
+            source_url=row["source_url"] or "",
+            text_context=row["text_context"] or "",
+            provenance_json=row["provenance_json"],
+            content_sha256=row["content_sha256"],
+            byte_size=int(row["byte_size"]),
+            spool_key=row["spool_key"],
+            received_at=float(row["received_at"]),
+        )
+
+    def get_artifact_for_notion_claim(
+        self, job_id: str, claim_token: str, artifact_id: str
+    ) -> IntakeArtifact:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, artifact_id, now=now
+            )
+            row = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (artifact_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("artifact does not exist")
+            return self._artifact_from_row(row)
+
+    def list_child_artifacts_for_notion_claim(
+        self, job_id: str, claim_token: str, artifact_id: str
+    ) -> list[IntakeArtifact]:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, artifact_id, now=now
+            )
+            rows = conn.execute(
+                "SELECT * FROM artifacts WHERE parent_artifact_id=? "
+                "ORDER BY provider_attachment_id, artifact_id",
+                (artifact_id,),
+            ).fetchall()
+            return [self._artifact_from_row(row) for row in rows]
+
+    def get_notion_operation(
+        self, artifact_id: str, operation_kind: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM notion_operations WHERE artifact_id=? AND operation_kind=?",
+                (artifact_id, operation_kind),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_completed_stage_receipt(
+        self, artifact_id: str, stage: str
+    ) -> dict[str, Any] | None:
+        stage = validate_stage(stage)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT stage_receipts.artifact_id, stage_receipts.stage, "
+                "stage_receipts.receipt_id, stage_receipts.output_sha256, "
+                "stage_receipts.recorded_at FROM stage_receipts "
+                "JOIN jobs ON jobs.artifact_id=stage_receipts.artifact_id "
+                "AND jobs.stage=stage_receipts.stage "
+                "WHERE stage_receipts.artifact_id=? AND stage_receipts.stage=? "
+                "AND jobs.status='succeeded'",
+                (artifact_id, stage),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def advance_notion_operation(
+        self,
+        job_id: str,
+        claim_token: str,
+        artifact_id: str,
+        operation_kind: str,
+        state: str,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+        expected_mime_type: str,
+        page_id: str | None = None,
+        block_id: str | None = None,
+        active_upload_attempt_id: str | None = None,
+        claimed_artifact_id: str | None = None,
+    ) -> None:
         now = time.time()
         with self._write() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, claimed_artifact_id or artifact_id, now=now
+            )
+            existing = conn.execute(
+                "SELECT expected_sha256, expected_size, expected_mime_type, page_id, block_id, "
+                "state, "
+                "active_upload_attempt_id FROM notion_operations "
+                "WHERE artifact_id=? AND operation_kind=?",
+                (artifact_id, operation_kind),
+            ).fetchone()
+            if existing is not None and (
+                existing[0] != expected_sha256
+                or int(existing[1]) != int(expected_size)
+                or existing[2] != expected_mime_type
+            ):
+                raise ValueError("notion operation identity conflicts with immutable artifact")
+            durable_state = state
+            state_order = {
+                "attempt-selected": 0,
+                "upload-created": 1,
+                "bytes-sent": 2,
+                "multipart-completed": 3,
+                "page-attached": 4,
+                "receipt-verified": 5,
+            }
+            if (
+                existing is not None
+                and operation_kind == "file"
+                and state_order.get(str(existing[5]), -1)
+                > state_order.get(state, -1)
+            ):
+                durable_state = str(existing[5])
+            conn.execute(
+                "INSERT INTO notion_operations(artifact_id, operation_kind, state, page_id, block_id, "
+                "active_upload_attempt_id, expected_sha256, expected_size, expected_mime_type, "
+                "last_job_id, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(artifact_id, operation_kind) DO UPDATE SET "
+                "state=excluded.state, page_id=COALESCE(excluded.page_id, notion_operations.page_id), "
+                "block_id=COALESCE(excluded.block_id, notion_operations.block_id), "
+                "active_upload_attempt_id=COALESCE(excluded.active_upload_attempt_id, notion_operations.active_upload_attempt_id), "
+                "last_job_id=excluded.last_job_id, updated_at=excluded.updated_at",
+                (
+                    artifact_id, operation_kind, durable_state, page_id, block_id,
+                    active_upload_attempt_id, expected_sha256, int(expected_size),
+                    expected_mime_type, job_id, now,
+                ),
+            )
+
+    def reserve_upload_attempt(
+        self,
+        job_id: str,
+        claim_token: str,
+        artifact: IntakeArtifact,
+        *,
+        attempt_id: str,
+        opaque_marker: str,
+        remote_filename: str,
+        upload_mode: str,
+        expected_part_count: int,
+        expected_part_size: int = 0,
+        replaces_attempt_id: str | None = None,
+        replacement_reason: str | None = None,
+        claimed_artifact_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self._write() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, claimed_artifact_id or artifact.artifact_id, now=now
+            )
+            existing = conn.execute(
+                "SELECT * FROM notion_upload_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            ordinal = int(conn.execute(
+                "SELECT COUNT(*) FROM notion_upload_attempts WHERE artifact_id=? AND operation_kind='file'",
+                (artifact.artifact_id,),
+            ).fetchone()[0]) + 1
+            conn.execute(
+                "INSERT INTO notion_upload_attempts(attempt_id, artifact_id, operation_kind, ordinal, "
+                "replaces_attempt_id, replacement_reason, marker_version, opaque_marker, remote_filename, "
+                "upload_mode, expected_sha256, expected_size, expected_mime_type, expected_part_count, "
+                "expected_part_size, created_by_job_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    attempt_id, artifact.artifact_id, "file", ordinal,
+                    replaces_attempt_id, replacement_reason, "ckfu-v1", opaque_marker,
+                    remote_filename, upload_mode, artifact.content_sha256,
+                    artifact.byte_size, artifact.mime_type, int(expected_part_count),
+                    int(expected_part_size), job_id, now,
+                ),
+            )
+            self._append_upload_event_locked(
+                conn, job_id, claim_token, attempt_id, "attempt_reserved", now=now
+            )
+            return dict(conn.execute(
+                "SELECT * FROM notion_upload_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone())
+
+    def _append_upload_event_locked(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        claim_token: str,
+        attempt_id: str,
+        event_type: str,
+        *,
+        now: float,
+        remote_upload_id: str | None = None,
+        remote_state: str | None = None,
+        remote_parts_sent: int | None = None,
+        page_id: str | None = None,
+        block_id: str | None = None,
+        evidence_identity: str | None = None,
+        classified_reason: str | None = None,
+    ) -> None:
+        sequence = int(conn.execute(
+            "SELECT COUNT(*) FROM notion_upload_attempt_events WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()[0]) + 1
+        conn.execute(
+            "INSERT INTO notion_upload_attempt_events(event_id, attempt_id, sequence, event_type, "
+            "job_id, claim_fingerprint, remote_upload_id, remote_state, remote_parts_sent, page_id, "
+            "block_id, evidence_identity, classified_reason, observed_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                secrets.token_hex(16), attempt_id, sequence, event_type, job_id,
+                self._claim_fingerprint(job_id, claim_token), remote_upload_id, remote_state,
+                remote_parts_sent, page_id, block_id, evidence_identity, classified_reason, now,
+            ),
+        )
+
+    def append_upload_attempt_event(
+        self,
+        job_id: str,
+        claim_token: str,
+        artifact_id: str,
+        attempt_id: str,
+        event_type: str,
+        claimed_artifact_id: str | None = None,
+        **evidence: Any,
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, claimed_artifact_id or artifact_id, now=now
+            )
+            attempt = conn.execute(
+                "SELECT artifact_id FROM notion_upload_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone()
+            if attempt is None or attempt[0] != artifact_id:
+                raise ValueError("upload attempt does not belong to claimed artifact")
+            self._append_upload_event_locked(
+                conn, job_id, claim_token, attempt_id, event_type, now=now, **evidence
+            )
+
+    def publish_upload_scan(
+        self,
+        job_id: str,
+        claim_token: str,
+        artifact_id: str,
+        attempt_id: str,
+        *,
+        scan_role: str,
+        page_count: int,
+        items: list[dict[str, Any]],
+        claimed_artifact_id: str | None = None,
+    ) -> str:
+        now = time.time()
+        scan_id = secrets.token_hex(16)
+        with self._write() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, claimed_artifact_id or artifact_id, now=now
+            )
+            attempt = conn.execute(
+                "SELECT artifact_id, baseline_scan_id FROM notion_upload_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None or attempt[0] != artifact_id:
+                raise ValueError("upload attempt does not belong to claimed artifact")
+            conn.execute(
+                "INSERT INTO notion_upload_scans(scan_id, artifact_id, attempt_id, scan_role, "
+                "request_status, page_count, result_count, completed_at, created_by_job_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (scan_id, artifact_id, attempt_id, scan_role, "complete", int(page_count), len(items), now, job_id),
+            )
+            for item in items:
+                parts = item.get("number_of_parts") or {}
+                filename = str(item.get("filename") or "")
+                conn.execute(
+                    "INSERT INTO notion_upload_scan_items(scan_id, remote_upload_id, opaque_marker, "
+                    "remote_filename, content_type, content_length, status, created_time, expiry_time, "
+                    "part_count_total, part_count_sent) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        scan_id, str(item["id"]), filename.rsplit(".", 1)[0], filename,
+                        item.get("content_type"), item.get("content_length"), str(item.get("status") or ""),
+                        item.get("created_time"), item.get("expiry_time"), parts.get("total"), parts.get("sent"),
+                    ),
+                )
+            if scan_role == "baseline":
+                if attempt[1] and attempt[1] != scan_id:
+                    raise ValueError("upload attempt already has a baseline scan")
+                conn.execute(
+                    "UPDATE notion_upload_attempts SET baseline_scan_id=? WHERE attempt_id=?",
+                    (scan_id, attempt_id),
+                )
+            self._append_upload_event_locked(
+                conn, job_id, claim_token, attempt_id,
+                "baseline_scan_completed" if scan_role == "baseline" else "reconciliation_scan_completed",
+                now=now, evidence_identity=scan_id,
+            )
+        return scan_id
+
+    def record_upload_remote_identity(
+        self,
+        job_id: str,
+        claim_token: str,
+        artifact_id: str,
+        attempt_id: str,
+        remote_upload_id: str,
+        *,
+        evidence_identity: str,
+        claimed_artifact_id: str | None = None,
+    ) -> None:
+        now = time.time()
+        conflict = False
+        with self._write() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, claimed_artifact_id or artifact_id, now=now
+            )
             row = conn.execute(
-                "SELECT artifact_id, stage FROM jobs WHERE job_id=? AND status='running' AND claim_token=?",
-                (job_id, claim_token),
+                "SELECT artifact_id, remote_upload_id FROM notion_upload_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None or row[0] != artifact_id:
+                raise ValueError("upload attempt does not belong to claimed artifact")
+            owner = conn.execute(
+                "SELECT attempt_id FROM notion_upload_attempts "
+                "WHERE remote_upload_id=? AND attempt_id!=?",
+                (remote_upload_id, attempt_id),
+            ).fetchone()
+            if (row[1] and row[1] != remote_upload_id) or owner is not None:
+                self._append_upload_event_locked(
+                    conn, job_id, claim_token, attempt_id, "remote_identity_conflict",
+                    now=now, remote_upload_id=remote_upload_id,
+                    evidence_identity=evidence_identity,
+                )
+                conflict = True
+            else:
+                conn.execute(
+                    "UPDATE notion_upload_attempts SET remote_upload_id=COALESCE(remote_upload_id, ?) "
+                    "WHERE attempt_id=?",
+                    (remote_upload_id, attempt_id),
+                )
+                self._append_upload_event_locked(
+                    conn, job_id, claim_token, attempt_id, "remote_id_recorded", now=now,
+                    remote_upload_id=remote_upload_id, evidence_identity=evidence_identity,
+                )
+        if conflict:
+            raise ValueError("upload attempt has conflicting remote identity")
+
+    def get_upload_attempts(self, artifact_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM notion_upload_attempts WHERE artifact_id=? ORDER BY ordinal",
+                (artifact_id,),
+            ).fetchall()]
+
+    def get_upload_attempt_events(self, attempt_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM notion_upload_attempt_events WHERE attempt_id=? ORDER BY sequence",
+                (attempt_id,),
+            ).fetchall()]
+
+    def select_active_upload_attempt(
+        self,
+        job_id: str,
+        claim_token: str,
+        claimed_artifact_id: str,
+        artifact: IntakeArtifact,
+        attempt_id: str,
+        state: str = "attempt-selected",
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            self._active_notion_claim_locked(
+                conn, job_id, claim_token, claimed_artifact_id, now=now
+            )
+            attempt = conn.execute(
+                "SELECT artifact_id FROM notion_upload_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None or attempt[0] != artifact.artifact_id:
+                raise ValueError("upload attempt does not belong to artifact")
+            conn.execute(
+                "INSERT INTO notion_operations(artifact_id, operation_kind, state, "
+                "active_upload_attempt_id, expected_sha256, expected_size, expected_mime_type, "
+                "last_job_id, updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(artifact_id, operation_kind) DO UPDATE SET "
+                "active_upload_attempt_id=excluded.active_upload_attempt_id, "
+                "last_job_id=excluded.last_job_id, updated_at=excluded.updated_at",
+                (
+                    artifact.artifact_id, "file", state, attempt_id,
+                    artifact.content_sha256, artifact.byte_size, artifact.mime_type,
+                    job_id, now,
+                ),
+            )
+
+    def set_upload_attempt_disposition(
+        self,
+        job_id: str,
+        claim_token: str,
+        claimed_artifact_id: str,
+        artifact_id: str,
+        attempt_id: str,
+        disposition: str,
+        *,
+        remote_upload_id: str | None = None,
+    ) -> None:
+        event_type = {
+            "expired": "attempt_expired",
+            "failed": "attempt_failed",
+            "superseded": "attempt_superseded",
+            "verified": "receipt_verified",
+        }.get(disposition)
+        if event_type is None:
+            raise ValueError("unknown upload attempt disposition")
+        self.append_upload_attempt_event(
+            job_id, claim_token, artifact_id, attempt_id, event_type,
+            claimed_artifact_id=claimed_artifact_id,
+            remote_upload_id=remote_upload_id,
+            remote_state=disposition,
+        )
+
+    def get_upload_scan_items(self, scan_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM notion_upload_scan_items WHERE scan_id=? ORDER BY remote_upload_id",
+                (scan_id,),
+            ).fetchall()]
+
+    def complete_stage(
+        self,
+        job_id: str,
+        claim_token: str,
+        receipt: StageReceipt,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        now = time.time() if now is None else float(now)
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT artifact_id, stage FROM jobs WHERE job_id=? AND status='running' "
+                "AND claim_token=? AND lease_expires_at>?",
+                (job_id, claim_token, now),
             ).fetchone()
             if row is None or row[0] != receipt.artifact_id or row[1] != receipt.stage:
                 return False
@@ -966,13 +1568,13 @@ class IntakeStore:
                     "VALUES(?,?,?,?,?)",
                     (receipt.artifact_id, receipt.stage, receipt.receipt_id, receipt.output_sha256 or None, receipt.recorded_at),
                 )
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE jobs SET status='succeeded', claim_token=NULL, owner_pid=NULL, owner_host=NULL, "
                 "owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?, last_error_class=NULL "
-                "WHERE job_id=? AND status='running' AND claim_token=?",
-                (now, job_id, claim_token),
+                "WHERE job_id=? AND status='running' AND claim_token=? AND lease_expires_at>?",
+                (now, job_id, claim_token, now),
             )
-            return True
+            return cursor.rowcount == 1
 
     record_stage_receipt = complete_stage
 
@@ -984,14 +1586,16 @@ class IntakeStore:
         error_class: str,
         retry_delay: float = 0,
         quarantine: bool = False,
+        now: float | None = None,
     ) -> bool:
-        now = time.time()
+        now = time.time() if now is None else float(now)
         status = "quarantined" if quarantine else "failed"
         next_retry = None if quarantine else now + max(0.0, float(retry_delay))
         with self._write() as conn:
             row = conn.execute(
-                "SELECT attempt_count, max_attempts FROM jobs WHERE job_id=? AND status='running' AND claim_token=?",
-                (job_id, claim_token),
+                "SELECT attempt_count, max_attempts FROM jobs WHERE job_id=? AND status='running' "
+                "AND claim_token=? AND lease_expires_at>?",
+                (job_id, claim_token, now),
             ).fetchone()
             if row is None:
                 return False
@@ -1003,8 +1607,8 @@ class IntakeStore:
             cursor = conn.execute(
                 "UPDATE jobs SET status=?, claim_token=NULL, owner_pid=NULL, owner_host=NULL, owner_started_at=NULL, "
                 "lease_expires_at=NULL, heartbeat_at=NULL, next_retry_at=?, last_error_class=?, updated_at=? "
-                "WHERE job_id=? AND status='running' AND claim_token=?",
-                (status, next_retry, error_class, now, job_id, claim_token),
+                "WHERE job_id=? AND status='running' AND claim_token=? AND lease_expires_at>?",
+                (status, next_retry, error_class, now, job_id, claim_token, now),
             )
             return cursor.rowcount == 1
 

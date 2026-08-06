@@ -303,7 +303,7 @@ def test_schema_migrates_existing_store_to_spool_storage_identity(tmp_path):
     with migrated._connect() as conn:
         assert conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "3"
+        ).fetchone()[0] == "5"
         assert "spool_storage_id" in {
             row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }
@@ -465,6 +465,7 @@ def test_store_uses_wal_foreign_keys_and_transactional_receipt(tmp_path):
         claim.job_id,
         claim.claim_token,
         StageReceipt(artifact.artifact_id, "notion_archived", "receipt-1", recorded_at=21),
+        now=21,
     )
     assert store.stats()["succeeded"] == 1
     with store._connect() as conn:
@@ -490,6 +491,7 @@ def test_stage_receipt_and_job_update_roll_back_together(tmp_path):
             claim.job_id,
             claim.claim_token,
             StageReceipt(artifact.artifact_id, "notion_archived", "receipt-1"),
+            now=21,
         )
 
     with store._connect() as conn:
@@ -530,11 +532,51 @@ def test_stale_dead_owner_is_requeued_and_retry_quarantine_are_bounded(tmp_path,
     assert store.get_job(claim.job_id)["status"] == "queued"
     claim = store.claim_next(stage="quarantined", now=21)
     assert claim is not None
-    assert store.fail_stage(claim.job_id, claim.claim_token, error_class="provider_error", quarantine=True)
+    assert store.fail_stage(
+        claim.job_id, claim.claim_token, error_class="provider_error",
+        quarantine=True, now=22,
+    )
     assert store.retry(claim.job_id)
     assert store.get_job(claim.job_id)["attempt_count"] == 0
     assert store.quarantine(claim.job_id)
     assert store.get_job(claim.job_id)["status"] == "quarantined"
+
+
+def test_expired_claim_cannot_complete_or_fail_before_or_after_reclamation(tmp_path, monkeypatch):
+    store = IntakeStore(tmp_path / "private" / "intake.db")
+    spool = RawSpool(tmp_path / "private" / "raw")
+    artifact = _artifact()
+    store.admit_raw_artifact(
+        spool, artifact, [b"raw"], next_stages=("notion_archived",)
+    )
+    first = store.claim_next(
+        stage="notion_archived", spool=spool, lease_seconds=1, now=10
+    )
+    assert first is not None
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE jobs SET lease_expires_at=1 WHERE job_id=?", (first.job_id,)
+        )
+    receipt = StageReceipt(
+        artifact.artifact_id, "notion_archived", "notion:page:one"
+    )
+    assert not store.complete_stage(first.job_id, first.claim_token, receipt, now=20)
+    assert not store.fail_stage(
+        first.job_id, first.claim_token, error_class="notion_retryable", now=20
+    )
+    monkeypatch.setattr(
+        "plugins.client_knowledge_gbrain.store._pid_alive", lambda _pid: False
+    )
+    assert store.reconcile(now=20) == 1
+    second = store.claim_next(stage="notion_archived", spool=spool, now=21)
+    assert second is not None and second.claim_token != first.claim_token
+    assert not store.complete_stage(first.job_id, first.claim_token, receipt, now=22)
+    assert not store.fail_stage(
+        first.job_id, first.claim_token, error_class="notion_retryable", now=22
+    )
+    assert store.fail_stage(
+        second.job_id, second.claim_token, error_class="notion_retryable", now=22
+    )
 
 
 def test_exhausted_job_does_not_starve_later_runnable_job(tmp_path):
