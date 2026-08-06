@@ -20,6 +20,7 @@ from agent.visual_assertions import (
     validate_visual_execution_contract,
     visual_assertion_contract_id,
     visual_execution_contract_id,
+    visual_requirement_for_execution_contract,
 )
 from agent.visual_qa import (
     normalize_visual_qa_config,
@@ -543,8 +544,10 @@ async def run_visual_assertions(
         if isinstance(contract, dict)
         else {"assertions": assertions}
     )
-    orchestrated_contract = visual_requirement_uses_orchestrator_contract(
-        normalized_requirement
+    standalone_contract = normalized_requirement["level"] == "none"
+    orchestrated_contract = (
+        standalone_contract
+        or visual_requirement_uses_orchestrator_contract(normalized_requirement)
     )
     contract_diagnostic = (
         diagnose_orchestrated_visual_contract(
@@ -564,23 +567,17 @@ async def run_visual_assertions(
         )
     )
     normalized_assertions = normalized_contract.get("assertions") or []
-    if normalized_requirement["level"] == "none":
-        return {
-            "status": "uncertain",
-            "code": "invalid_visual_contract",
-            "attempts": [],
-            "reason_code": "visual_requirement_missing",
-            "correction": (
-                "Run visual_qa only in a turn with an explicit visual change or "
-                "an explicit request to run or confirm visual QA."
-            ),
-        }
     if not normalized_assertions:
         output = {"status": "uncertain", "code": "invalid_visual_contract", "attempts": []}
         if contract_diagnostic is not None:
             output["reason_code"] = contract_diagnostic["reason_code"]
             output["correction"] = contract_diagnostic["correction"]
         return output
+    if standalone_contract:
+        normalized_requirement = visual_requirement_for_execution_contract(
+            normalized_contract,
+            max_assertions=visual_config["max_assertions"],
+        )
     requirement_id = visual_requirement_id(normalized_requirement)
     contract_id = (
         visual_execution_contract_id(normalized_contract)

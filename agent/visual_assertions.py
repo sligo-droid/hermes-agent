@@ -499,6 +499,33 @@ def visual_execution_contract_id(value: Any) -> str:
     return "vac_" + hashlib.sha256(encoded).hexdigest()[:24]
 
 
+def visual_requirement_for_execution_contract(
+    value: Any,
+    *,
+    max_assertions: int = 6,
+) -> dict[str, Any]:
+    """Create a stable transient requirement for standalone visual QA."""
+
+    contract = normalize_orchestrated_visual_contract(
+        value,
+        max_assertions=max_assertions,
+    )
+    if not contract:
+        return {"level": "none", "target": "", "assertions": []}
+    return normalize_visual_requirement(
+        {
+            "level": "surface",
+            "target": _opaque_contract_id("vtarget", contract.get("target")),
+            "assertions": [
+                {
+                    "id": _opaque_contract_id("vassert", contract),
+                    "kind": "orchestrator_contract",
+                }
+            ],
+        }
+    )
+
+
 def storage_safe_visual_qa_args(value: Any) -> dict[str, Any]:
     """Drop transient semantics while retaining opaque contract evidence."""
 
@@ -700,4 +727,5 @@ __all__ = [
     "validate_visual_execution_contract",
     "visual_assertion_contract_id",
     "visual_execution_contract_id",
+    "visual_requirement_for_execution_contract",
 ]

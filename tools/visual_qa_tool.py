@@ -35,8 +35,8 @@ VISUAL_QA_SCHEMA = {
     "name": "visual_qa",
     "description": (
         "Run bounded declarative visual assertions against the existing task browser session. "
-        "Use this after an explicit rendered UI or artifact change. During the normal "
-        "implementation turn, formulate the smallest relevant target, prepared/current page "
+        "This tool is callable in any agent turn; it does not require a preceding UI change or "
+        "an active visual requirement. Formulate the smallest relevant target, prepared/current page "
         "state, viewport assumptions, and concrete assertion intent from the full accepted "
         "request and code understanding. This tool accepts only "
         "trusted assertion kinds; it does not accept JavaScript, CDP commands, shell commands, "

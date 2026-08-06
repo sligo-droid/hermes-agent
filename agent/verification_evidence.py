@@ -1428,14 +1428,23 @@ def classify_tool_visual_receipt(
             validate_visual_execution_contract,
             visual_assertion_contract_id,
             visual_execution_contract_id,
+            visual_requirement_for_execution_contract,
         )
-        from agent.visual_qa import visual_requirement_uses_orchestrator_contract
+        from agent.visual_qa import (
+            normalize_visual_requirement,
+            visual_requirement_uses_orchestrator_contract,
+        )
 
-        orchestrated = visual_requirement_uses_orchestrator_contract(requirement)
+        effective_requirement = normalize_visual_requirement(requirement)
+        if effective_requirement["level"] == "none":
+            effective_requirement = visual_requirement_for_execution_contract(tool_args)
+        orchestrated = visual_requirement_uses_orchestrator_contract(
+            effective_requirement
+        )
         contract = (
             diagnose_orchestrated_visual_contract(tool_args)["contract"]
             if orchestrated
-            else validate_visual_execution_contract(requirement, tool_args)
+            else validate_visual_execution_contract(effective_requirement, tool_args)
         )
         assertions = contract.get("assertions") or []
     except Exception:
@@ -1470,7 +1479,10 @@ def classify_tool_visual_receipt(
     try:
         from agent.visual_qa import sanitize_visual_receipt
 
-        return sanitize_visual_receipt(candidate, requirement=requirement)
+        return sanitize_visual_receipt(
+            candidate,
+            requirement=effective_requirement,
+        )
     except Exception:
         return None
 

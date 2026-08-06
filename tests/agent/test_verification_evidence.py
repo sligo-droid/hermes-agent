@@ -472,6 +472,60 @@ def test_orchestrated_visual_contract_is_opaque_in_durable_tool_calls():
     assert requirement["assertions"][0]["kind"] == "orchestrator_contract"
 
 
+def test_standalone_visual_qa_receipt_is_recorded_without_active_requirement():
+    from agent.visual_assertions import (
+        diagnose_orchestrated_visual_contract,
+        visual_execution_contract_id,
+        visual_requirement_for_execution_contract,
+    )
+
+    execution_args = {
+        "target": {"description": "dashboard chart"},
+        "page": {"state": "already_open", "description": "dashboard page"},
+        "viewport": {"description": "current desktop viewport"},
+        "state": ["chart data loaded"],
+        "assertions": [
+            {
+                "kind": "screenshot_appearance",
+                "expectation": "The chart is visually balanced.",
+            }
+        ],
+    }
+    contract = diagnose_orchestrated_visual_contract(execution_args)["contract"]
+    requirement = visual_requirement_for_execution_contract(contract)
+    assertion_ids = [item["id"] for item in contract["assertions"]]
+    receipt = {
+        "requirement_id": visual_requirement_id(requirement),
+        "contract_id": visual_execution_contract_id(contract),
+        "coverage_ids": [requirement["assertions"][0]["id"]],
+        "assertion_ids": assertion_ids,
+        "status": "passed",
+        "attempts": 1,
+        "vision_calls": 2,
+        "duration_ms": 100,
+        "diagnostic_codes": ["appearance_satisfied"],
+    }
+    agent = SimpleNamespace(
+        _turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0),
+        visual_qa_requirement={"level": "none", "target": "", "assertions": []},
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+    result = json.dumps({"status": "passed", "visual_qa_receipt": receipt})
+
+    tool_executor._record_turn_tool_runtime(agent, "visual_qa", 0.1, result, False)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "visual_qa",
+        execution_args,
+        result,
+        False,
+    )
+
+    assert agent._turn_runtime_stats["visual_qa_receipts"] == [
+        {**receipt, "order": 1}
+    ]
+
+
 def test_later_visual_receipt_replaces_earlier_failure_after_edit():
     requirement = normalize_visual_requirement(
         {
