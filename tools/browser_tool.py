@@ -5359,11 +5359,14 @@ registry.register(
     },
     handler=lambda args, **kw: browser_authenticate(
         profile=args.get("profile", ""),
-        task_id=kw.get("task_id"),
+        task_id=_read_only_browser_task_id(
+            kw.get("task_id"),
+            kw.get("runtime_mode"),
+        ),
     ),
     check_fn=check_browser_auth_requirements,
     emoji="🔐",
-    effect="mutating",
+    effect="read_only",
 )
 registry.register(
     name="browser_scroll",

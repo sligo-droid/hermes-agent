@@ -365,10 +365,34 @@ def test_browser_authenticate_schema_exposes_only_an_opaque_profile_name():
     entry = registry.get_entry("browser_authenticate")
 
     assert entry is not None
-    assert entry.effect == "mutating"
+    assert entry.effect == "read_only"
     parameters = entry.schema["parameters"]
     assert parameters["additionalProperties"] is False
     assert set(parameters["properties"]) == {"profile"}
+
+
+def test_browser_authenticate_uses_read_only_browser_namespace(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        browser_tool,
+        "browser_authenticate",
+        lambda profile="", task_id=None: captured.update(
+            profile=profile,
+            task_id=task_id,
+        ) or "{}",
+    )
+
+    entry = registry.get_entry("browser_authenticate")
+    entry.handler(
+        {"profile": "pid_hermes_qa"},
+        task_id="turn-7",
+        runtime_mode="read_only",
+    )
+
+    assert captured == {
+        "profile": "pid_hermes_qa",
+        "task_id": "turn-7::read-only",
+    }
 
 
 def test_successful_navigation_refreshes_and_aligns_cdp_supervisor(monkeypatch):

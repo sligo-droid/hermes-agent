@@ -1424,28 +1424,31 @@ def classify_tool_visual_receipt(
         return None
     try:
         from agent.visual_assertions import (
+            diagnose_orchestrated_visual_contract,
             validate_visual_execution_contract,
             visual_assertion_contract_id,
             visual_execution_contract_id,
         )
         from agent.visual_qa import visual_requirement_uses_orchestrator_contract
 
-        contract = validate_visual_execution_contract(
-            requirement,
-            tool_args,
+        orchestrated = visual_requirement_uses_orchestrator_contract(requirement)
+        contract = (
+            diagnose_orchestrated_visual_contract(tool_args)["contract"]
+            if orchestrated
+            else validate_visual_execution_contract(requirement, tool_args)
         )
         assertions = contract.get("assertions") or []
     except Exception:
         return None
-    # Validation normally omits malformed, duplicate, or over-limit entries.
-    # Receipt acceptance is a security boundary, so fail closed unless every
-    # supplied assertion survived validation in its original order.
-    if len(assertions) != len(raw_assertions):
+    # Legacy coverage validation must preserve every submitted assertion.
+    # Orchestrated diagnosis already fails closed on malformed/duplicate input
+    # and deliberately omits only cursorless optional diagnostics.
+    if not orchestrated and len(assertions) != len(raw_assertions):
         return None
     assertion_ids = [item["id"] for item in assertions]
     contract_id = (
         visual_execution_contract_id(contract)
-        if visual_requirement_uses_orchestrator_contract(requirement)
+        if orchestrated
         else visual_assertion_contract_id(assertions)
     )
     if not contract_id:

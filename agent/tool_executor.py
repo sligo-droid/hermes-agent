@@ -88,6 +88,41 @@ def _pending_closeout_allows_tool(function_name: str) -> bool:
     return function_name in _PENDING_CLOSEOUT_VISUAL_TOOLS
 
 
+def _reserve_visual_qa_call(agent: Any, function_name: str) -> bool:
+    """Allow one initial visual check plus one correction retry per turn."""
+
+    if function_name != "visual_qa":
+        return True
+    count = max(0, int(getattr(agent, "_visual_qa_tool_calls", 0) or 0))
+    if count >= 2:
+        return False
+    agent._visual_qa_tool_calls = count + 1
+    return True
+
+
+def _append_visual_qa_limit_tool_result(
+    agent: Any,
+    messages: list,
+    tool_call: Any,
+) -> None:
+    messages.append(
+        make_tool_result_message(
+            "visual_qa",
+            (
+                "[Tool execution skipped — visual_qa permits one initial call and one "
+                "correction retry per turn. Continue from the recorded result.]"
+            ),
+            tool_call.id,
+            effect_disposition="none",
+        )
+    )
+    _flush_session_db_after_tool_progress(
+        agent,
+        messages,
+        stage="visual QA retry limit tool result",
+    )
+
+
 def _closeout_receipt_gate_reason(agent: Any) -> str:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return "kanban_terminal_required"
@@ -1462,6 +1497,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 tool_name=function_name,
             )
             continue
+        if not _reserve_visual_qa_call(agent, function_name):
+            _append_visual_qa_limit_tool_result(agent, messages, tool_call)
+            continue
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
@@ -2251,6 +2289,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 tool_call,
                 tool_name=function_name,
             )
+            continue
+        if not _reserve_visual_qa_call(agent, function_name):
+            _append_visual_qa_limit_tool_result(agent, messages, tool_call)
             continue
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(

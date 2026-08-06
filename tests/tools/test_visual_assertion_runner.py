@@ -313,6 +313,27 @@ async def test_orchestrated_requirement_rejects_assertions_without_semantic_cont
 
 
 @pytest.mark.asyncio
+async def test_missing_active_requirement_returns_actionable_diagnostic():
+    result = await run_visual_assertions(
+        task_id="missing-requirement",
+        requirement={"level": "none", "target": "", "assertions": []},
+        contract={},
+        supervisor=FakeSupervisor(contained=True),
+    )
+
+    assert result == {
+        "status": "uncertain",
+        "code": "invalid_visual_contract",
+        "attempts": [],
+        "reason_code": "visual_requirement_missing",
+        "correction": (
+            "Run visual_qa only in a turn with an explicit visual change or "
+            "an explicit request to run or confirm visual QA."
+        ),
+    }
+
+
+@pytest.mark.asyncio
 async def test_unrelated_exists_assertion_cannot_cover_overflow_requirement():
     requirement = normalize_visual_requirement(
         {

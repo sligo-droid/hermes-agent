@@ -564,7 +564,18 @@ async def run_visual_assertions(
         )
     )
     normalized_assertions = normalized_contract.get("assertions") or []
-    if normalized_requirement["level"] == "none" or not normalized_assertions:
+    if normalized_requirement["level"] == "none":
+        return {
+            "status": "uncertain",
+            "code": "invalid_visual_contract",
+            "attempts": [],
+            "reason_code": "visual_requirement_missing",
+            "correction": (
+                "Run visual_qa only in a turn with an explicit visual change or "
+                "an explicit request to run or confirm visual QA."
+            ),
+        }
+    if not normalized_assertions:
         output = {"status": "uncertain", "code": "invalid_visual_contract", "attempts": []}
         if contract_diagnostic is not None:
             output["reason_code"] = contract_diagnostic["reason_code"]
