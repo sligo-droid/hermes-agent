@@ -60,6 +60,7 @@ supports.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -171,6 +172,7 @@ class _TrustPolicy:
     allow_model_override: bool = False
     allowed_models: Optional[frozenset] = None  # None = no allowlist
     allow_any_model: bool = False  # True when allowed_models == ["*"]
+    allowed_model_tiers: Optional[frozenset] = None
     allow_agent_id_override: bool = False
     allow_profile_override: bool = False
 
@@ -232,6 +234,7 @@ def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
     allowed_providers, allow_any_provider = _coerce_allowlist(
         llm_cfg.get("allowed_providers")
     )
+    allowed_model_tiers, _ = _coerce_allowlist(llm_cfg.get("allowed_model_tiers"))
 
     return _TrustPolicy(
         plugin_id=plugin_id,
@@ -241,6 +244,7 @@ def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
         allow_model_override=bool(llm_cfg.get("allow_model_override", False)),
         allowed_models=allowed_models,
         allow_any_model=allow_any_model,
+        allowed_model_tiers=allowed_model_tiers,
         allow_agent_id_override=bool(llm_cfg.get("allow_agent_id_override", False)),
         allow_profile_override=bool(llm_cfg.get("allow_profile_override", False)),
     )
@@ -248,6 +252,10 @@ def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
 
 class PluginLlmTrustError(PermissionError):
     """Raised when a plugin attempts an LLM override without trust."""
+
+
+class PluginLlmRouteError(RuntimeError):
+    """Raised when a strict named-tier route cannot be proven."""
 
 
 def _check_overrides(
@@ -327,6 +335,16 @@ def _check_overrides(
         final_profile = requested_profile.strip()
 
     return final_provider, final_model, requested_agent_id, final_profile
+
+
+def _check_named_tier(policy: _TrustPolicy, tier_name: str) -> None:
+    """Authorize a host-resolved tier without granting arbitrary overrides."""
+    normalized = _normalize_ref(tier_name)
+    if not normalized or normalized not in (policy.allowed_model_tiers or frozenset()):
+        raise PluginLlmTrustError(
+            f"Plugin {policy.plugin_id!r} cannot use model tier {tier_name!r} "
+            f"(add it to plugins.entries.{policy.plugin_id}.llm.allowed_model_tiers)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -462,20 +480,27 @@ def _parse_structured_text(
     if not (json_mode or json_schema is not None):
         return None, "text"
     if not text:
+        if json_schema is not None:
+            raise ValueError("Plugin LLM schema-backed output was empty")
         return None, "text"
 
     try:
         parsed = json.loads(_strip_code_fences(text))
     except (json.JSONDecodeError, ValueError):
+        if json_schema is not None:
+            raise ValueError("Plugin LLM schema-backed output was not valid JSON")
         return None, "text"
 
     if json_schema is not None:
         try:
             import jsonschema  # type: ignore[import-untyped]
             jsonschema.validate(parsed, json_schema)
-        except ImportError:
-            # jsonschema is optional; skip strict validation when absent.
-            logger.debug("jsonschema unavailable; skipping schema validation")
+        except ImportError as exc:
+            # Schema-backed calls must never silently downgrade to unvalidated
+            # JSON.  jsonschema is a direct exact-pinned host dependency.
+            raise PluginLlmRouteError(
+                "schema-backed PluginLlm output requires the jsonschema dependency"
+            ) from exc
         except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
             raise ValueError(
                 f"Plugin LLM structured output did not match schema: {exc.message}"
@@ -566,7 +591,10 @@ def _resolve_attribution(
     4. If everything above is empty, fall back to ``"auto"`` /
        ``"default"`` so the result object has non-empty strings.
     """
-    if provider_override:
+    response_provider = getattr(response, "_hermes_provider", None)
+    if isinstance(response_provider, str) and response_provider.strip():
+        provider = response_provider.strip().lower()
+    elif provider_override:
         provider = provider_override
     else:
         try:
@@ -631,6 +659,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        task: Optional[str] = None,
     ) -> PluginLlmCompleteResult:
         """Run a host-owned chat completion against the user's active model.
 
@@ -641,14 +670,19 @@ class PluginLlm:
         ``plugins.entries.<id>.llm.allow_*_override`` (see module
         docstring).
         """
+        route = self._resolve_route(provider=provider, model=model, task=task)
         policy = self._policy_loader(self._plugin_id)
+        if route["strict"]:
+            _check_named_tier(policy, route["tier_name"])
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
-            requested_provider=provider,
-            requested_model=model,
+            requested_provider=None if route["strict"] else provider,
+            requested_model=None if route["strict"] else model,
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        if route["strict"]:
+            eff_provider, eff_model = route["provider"], route["model"]
         real_provider, real_model, response = self._invoke_sync(
             messages=messages,
             provider_override=eff_provider,
@@ -657,7 +691,13 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            task=task,
+            reasoning_config=route["reasoning_config"],
+            fast_mode=route["fast_mode"],
+            single_attempt=route["strict"],
+            strict_provider=route["strict"],
         )
+        self._check_strict_result(route, real_provider, real_model, task=task)
         text = _extract_text(response)
         usage = _extract_usage(response)
         result = PluginLlmCompleteResult(
@@ -670,6 +710,13 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
+                "task": task or purpose or "plugin_llm",
+                "model_tier": route["tier_name"],
+                "route_fingerprint": route["fingerprint"],
+                "selected_provider": route["provider"] or "",
+                "selected_model": route["model"] or "",
+                "actual_provider": real_provider,
+                "actual_model": real_model,
             },
         )
         logger.info(
@@ -697,6 +744,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        task: Optional[str] = None,
     ) -> PluginLlmStructuredResult:
         """Run a bounded host-owned structured completion.
 
@@ -706,23 +754,26 @@ class PluginLlm:
         is parsed and (if a schema is given) validated; the parsed value
         is returned in :attr:`PluginLlmStructuredResult.parsed`.
 
-        Validation requires the optional ``jsonschema`` package. When it
-        isn't installed, JSON mode still works but schema enforcement is
-        skipped with a debug log.
+         Schema validation is fail-closed when ``json_schema`` is supplied.
         """
         if not instructions or not instructions.strip():
             raise ValueError("complete_structured requires non-empty instructions")
         if not input:
             raise ValueError("complete_structured requires at least one input block")
 
+        route = self._resolve_route(provider=provider, model=model, task=task)
         policy = self._policy_loader(self._plugin_id)
+        if route["strict"]:
+            _check_named_tier(policy, route["tier_name"])
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
-            requested_provider=provider,
-            requested_model=model,
+            requested_provider=None if route["strict"] else provider,
+            requested_model=None if route["strict"] else model,
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        if route["strict"]:
+            eff_provider, eff_model = route["provider"], route["model"]
 
         messages = _build_structured_messages(
             instructions=instructions,
@@ -742,8 +793,14 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            task=task,
+            reasoning_config=route["reasoning_config"],
+            fast_mode=route["fast_mode"],
+            single_attempt=route["strict"],
+            strict_provider=route["strict"],
             extra_body=extra_body,
         )
+        self._check_strict_result(route, real_provider, real_model, task=task)
         text = _extract_text(response)
         usage = _extract_usage(response)
         parsed, content_type = _parse_structured_text(
@@ -762,6 +819,13 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                "task": task or purpose or "plugin_llm",
+                "model_tier": route["tier_name"],
+                "route_fingerprint": route["fingerprint"],
+                "selected_provider": route["provider"] or "",
+                "selected_model": route["model"] or "",
+                "actual_provider": real_provider,
+                "actual_model": real_model,
             },
         )
         logger.info(
@@ -786,16 +850,22 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        task: Optional[str] = None,
     ) -> PluginLlmCompleteResult:
         """Async sibling of :meth:`complete`."""
+        route = self._resolve_route(provider=provider, model=model, task=task)
         policy = self._policy_loader(self._plugin_id)
+        if route["strict"]:
+            _check_named_tier(policy, route["tier_name"])
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
-            requested_provider=provider,
-            requested_model=model,
+            requested_provider=None if route["strict"] else provider,
+            requested_model=None if route["strict"] else model,
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        if route["strict"]:
+            eff_provider, eff_model = route["provider"], route["model"]
         real_provider, real_model, response = await self._invoke_async(
             messages=messages,
             provider_override=eff_provider,
@@ -804,7 +874,13 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            task=task,
+            reasoning_config=route["reasoning_config"],
+            fast_mode=route["fast_mode"],
+            single_attempt=route["strict"],
+            strict_provider=route["strict"],
         )
+        self._check_strict_result(route, real_provider, real_model, task=task)
         text = _extract_text(response)
         usage = _extract_usage(response)
         return PluginLlmCompleteResult(
@@ -817,6 +893,13 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
+                "task": task or purpose or "plugin_llm",
+                "model_tier": route["tier_name"],
+                "route_fingerprint": route["fingerprint"],
+                "selected_provider": route["provider"] or "",
+                "selected_model": route["model"] or "",
+                "actual_provider": real_provider,
+                "actual_model": real_model,
             },
         )
 
@@ -837,6 +920,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        task: Optional[str] = None,
     ) -> PluginLlmStructuredResult:
         """Async sibling of :meth:`complete_structured`."""
         if not instructions or not instructions.strip():
@@ -844,14 +928,19 @@ class PluginLlm:
         if not input:
             raise ValueError("acomplete_structured requires at least one input block")
 
+        route = self._resolve_route(provider=provider, model=model, task=task)
         policy = self._policy_loader(self._plugin_id)
+        if route["strict"]:
+            _check_named_tier(policy, route["tier_name"])
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
-            requested_provider=provider,
-            requested_model=model,
+            requested_provider=None if route["strict"] else provider,
+            requested_model=None if route["strict"] else model,
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        if route["strict"]:
+            eff_provider, eff_model = route["provider"], route["model"]
         messages = _build_structured_messages(
             instructions=instructions,
             inputs=list(input),
@@ -869,8 +958,14 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            task=task,
+            reasoning_config=route["reasoning_config"],
+            fast_mode=route["fast_mode"],
+            single_attempt=route["strict"],
+            strict_provider=route["strict"],
             extra_body=extra_body,
         )
+        self._check_strict_result(route, real_provider, real_model, task=task)
         text = _extract_text(response)
         usage = _extract_usage(response)
         parsed, content_type = _parse_structured_text(
@@ -889,6 +984,13 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                "task": task or purpose or "plugin_llm",
+                "model_tier": route["tier_name"],
+                "route_fingerprint": route["fingerprint"],
+                "selected_provider": route["provider"] or "",
+                "selected_model": route["model"] or "",
+                "actual_provider": real_provider,
+                "actual_model": real_model,
             },
         )
 
@@ -926,6 +1028,11 @@ class PluginLlm:
         temperature: Optional[float],
         max_tokens: Optional[int],
         timeout: Optional[float],
+        task: Optional[str] = None,
+        reasoning_config: Optional[Dict[str, Any]] = None,
+        fast_mode: Optional[bool] = None,
+        single_attempt: bool = False,
+        strict_provider: bool = False,
         extra_body: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
@@ -940,6 +1047,11 @@ class PluginLlm:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                task=task,
+                reasoning_config=reasoning_config,
+                fast_mode=fast_mode,
+                single_attempt=single_attempt,
+                strict_provider=strict_provider,
                 extra_body=extra_body,
             )
         from agent.auxiliary_client import call_llm
@@ -947,13 +1059,17 @@ class PluginLlm:
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
         response = call_llm(
-            task=None,
+            task=task,
             provider=provider_override,
             model=model_override,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            reasoning_config=reasoning_config,
+            fast_mode=fast_mode,
+            single_attempt=single_attempt,
+            strict_provider=strict_provider,
             extra_body=merged_extra or None,
         )
         provider, model = _resolve_attribution(
@@ -973,6 +1089,11 @@ class PluginLlm:
         temperature: Optional[float],
         max_tokens: Optional[int],
         timeout: Optional[float],
+        task: Optional[str] = None,
+        reasoning_config: Optional[Dict[str, Any]] = None,
+        fast_mode: Optional[bool] = None,
+        single_attempt: bool = False,
+        strict_provider: bool = False,
         extra_body: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
         if self._async_caller is not None:
@@ -984,6 +1105,11 @@ class PluginLlm:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                task=task,
+                reasoning_config=reasoning_config,
+                fast_mode=fast_mode,
+                single_attempt=single_attempt,
+                strict_provider=strict_provider,
                 extra_body=extra_body,
             )
         from agent.auxiliary_client import async_call_llm
@@ -991,13 +1117,17 @@ class PluginLlm:
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
         response = await async_call_llm(
-            task=None,
+            task=task,
             provider=provider_override,
             model=model_override,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            reasoning_config=reasoning_config,
+            fast_mode=fast_mode,
+            single_attempt=single_attempt,
+            strict_provider=strict_provider,
             extra_body=merged_extra or None,
         )
         provider, model = _resolve_attribution(
@@ -1006,6 +1136,157 @@ class PluginLlm:
             response=response,
         )
         return provider, model, response
+
+    def _resolve_route(
+        self,
+        *,
+        provider: Optional[str],
+        model: Optional[str],
+        task: Optional[str],
+    ) -> Dict[str, Any]:
+        """Resolve a plugin auxiliary task's named host tier fail-closed."""
+        if not task:
+            return {
+                "provider": provider,
+                "model": model,
+                "tier_name": "",
+                "reasoning_config": None,
+                "fast_mode": None,
+                "strict": False,
+                "fingerprint": "",
+            }
+        try:
+            from agent.auxiliary_client import _get_auxiliary_task_config, _read_main_provider
+            from hermes_cli.config import load_config
+            from hermes_cli.model_tiers import resolve_model_tier
+            from hermes_cli.plugins import get_plugin_auxiliary_tasks
+
+            task_entry = next(
+                (entry for entry in get_plugin_auxiliary_tasks() if entry.get("key") == task),
+                None,
+            )
+            if task_entry is None or task_entry.get(
+                "plugin_id", task_entry.get("plugin")
+            ) != self._plugin_id:
+                raise PluginLlmRouteError(
+                    f"plugin {self._plugin_id!r} does not own auxiliary task {task!r}"
+                )
+            task_config = _get_auxiliary_task_config(task)
+            task_defaults = task_entry.get("defaults") or {}
+            required_tier = str(
+                task_defaults.get("required_model_tier")
+                or task_defaults.get("model_tier")
+                or ""
+            ).strip()
+            tier_name = str(task_config.get("model_tier") or required_tier).strip()
+            if not tier_name:
+                return {
+                    "provider": provider,
+                    "model": model,
+                    "tier_name": "",
+                    "reasoning_config": None,
+                    "fast_mode": None,
+                    "strict": False,
+                    "fingerprint": "",
+                }
+            if required_tier and tier_name != required_tier:
+                raise PluginLlmRouteError(
+                    f"plugin task {task!r} requires model tier {required_tier!r}"
+                )
+            if provider or model:
+                raise PluginLlmRouteError(
+                    "a named-tier plugin task cannot be combined with provider/model overrides"
+                )
+            configured_provider = str(task_config.get("provider") or "").strip().lower()
+            forbidden_route_fields = (
+                configured_provider not in {"", "auto"}
+                or bool(str(task_config.get("model") or "").strip())
+                or bool(str(task_config.get("base_url") or "").strip())
+                or bool(str(task_config.get("api_key") or "").strip())
+                or bool(str(task_config.get("key_env") or task_config.get("api_key_env") or "").strip())
+                or bool(str(task_config.get("api_mode") or "").strip())
+                or bool(str(task_config.get("reasoning_effort") or "").strip())
+                or bool(task_config.get("extra_body"))
+                or "fast_mode" in task_config
+            )
+            if forbidden_route_fields:
+                raise PluginLlmRouteError(
+                    f"plugin task {task!r} must use its named tier without route overrides"
+                )
+            tier = resolve_model_tier(load_config() or {}, tier_name)
+            if tier is None:
+                raise PluginLlmRouteError(f"unknown model tier: {tier_name}")
+            selected_provider = (tier.provider or _read_main_provider() or "").strip().lower()
+            if not selected_provider or selected_provider in {"auto", "main"}:
+                raise PluginLlmRouteError(
+                    f"model tier {tier.name!r} did not resolve to a concrete provider"
+                )
+            selected_model = tier.model.strip()
+            reasoning = tier.reasoning_config()
+            payload = json.dumps(
+                {
+                    "plugin_id": self._plugin_id,
+                    "task": task,
+                    "tier": tier.name,
+                    "provider": selected_provider,
+                    "model": selected_model,
+                    "reasoning": reasoning,
+                    "fast_mode": tier.fast_mode,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return {
+                "provider": selected_provider,
+                "model": selected_model,
+                "tier_name": tier.name,
+                "reasoning_config": reasoning,
+                "fast_mode": tier.fast_mode,
+                "strict": True,
+                "fingerprint": hashlib.sha256(payload).hexdigest(),
+            }
+        except PluginLlmRouteError:
+            raise
+        except Exception as exc:
+            raise PluginLlmRouteError("named model tier resolution failed") from exc
+
+    def _check_strict_result(
+        self,
+        route: Dict[str, Any],
+        provider: str,
+        model: str,
+        *,
+        task: Optional[str],
+    ) -> None:
+        if not route.get("strict"):
+            return
+        current = self._resolve_route(provider=None, model=None, task=task)
+        if current.get("fingerprint") != route.get("fingerprint"):
+            raise PluginLlmRouteError("strict named-tier route changed during the call")
+        if str(provider or "").strip().lower() != str(route["provider"]).strip().lower():
+            raise PluginLlmRouteError(
+                "strict named-tier provider attribution did not match the selected tier"
+            )
+        selected_raw = str(route["model"] or "").strip().lower()
+        actual_raw = str(model or "").strip().lower()
+        selected_parts = selected_raw.rsplit("/", 1)
+        actual_parts = actual_raw.rsplit("/", 1)
+        selected_namespace = selected_parts[0] if len(selected_parts) == 2 else ""
+        actual_namespace = actual_parts[0] if len(actual_parts) == 2 else ""
+        selected_model = selected_parts[-1]
+        actual_model = actual_parts[-1]
+        if selected_namespace and actual_namespace and selected_namespace != actual_namespace:
+            raise PluginLlmRouteError(
+                "strict named-tier model attribution did not match the selected tier"
+            )
+        dated_model = re.fullmatch(
+            rf"{re.escape(selected_model)}-\d{{4}}-\d{{2}}-\d{{2}}",
+            actual_model,
+        )
+        if not actual_model or (actual_model != selected_model and dated_model is None):
+            raise PluginLlmRouteError(
+                "strict named-tier model attribution did not match the selected tier"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1042,5 +1323,6 @@ __all__ = [
     "PluginLlmCompleteResult",
     "PluginLlmStructuredResult",
     "PluginLlmTrustError",
+    "PluginLlmRouteError",
     "make_plugin_llm_for_test",
 ]

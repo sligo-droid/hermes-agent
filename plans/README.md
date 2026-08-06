@@ -6,7 +6,7 @@ Updated on 2026-08-05 from repository, runtime, Gmail, Notion, GBrain, Honcho, a
 
 | Plan | Title | Priority | Effort | Depends on | Status | Verification |
 | --- | --- | --- | --- | --- | --- | --- |
-| 018 | Ship Gmail client-knowledge intake | P1 | L | #834, #836, #852 | TODO (xhigh findings incorporated) | PID email -> Notion source -> GBrain synthesis -> Honcho projection; Discord deferred |
+| 018 | Ship Gmail client-knowledge intake | P1 | L | #834, #836, #852 | IN PROGRESS (PR 1 durable core) | PID email -> Notion source -> GBrain synthesis -> Honcho projection; Discord deferred |
 
 Status values: `PLANNING`, `TODO`, `IN PROGRESS`, `DONE`, `BLOCKED (<reason>)`, or `REJECTED (<reason>)`.
 

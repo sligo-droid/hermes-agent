@@ -1,6 +1,7 @@
 # Plan 018: Ship Gmail Client-Knowledge Intake
 
-> **Status:** Reviewed implementation plan. Initial xhigh verdict: `REVISE`.
+> **Status:** IN PROGRESS. Reviewed implementation plan; PR 1 durable core is
+> under implementation. Initial xhigh verdict: `REVISE`.
 > Material findings were incorporated on 2026-08-05; execute only the revised
 > ordered pull requests below.
 > Operator decisions were recorded on 2026-08-05: Gmail-first PID scope and the
@@ -352,7 +353,7 @@ a crash instead of creating a duplicate or losing the ability to retract it.
 
 **Implement**
 
-- Extend the bundled client-knowledge plugin with:
+- Extend the bundled `client-knowledge-gbrain` plugin in place with:
   - immutable artifact dataclasses and validators;
   - plugin-owned SQLite store and schema migrations;
   - atomic job claim/lease/heartbeat/retry/quarantine;
@@ -362,6 +363,9 @@ a crash instead of creating a duplicate or losing the ability to retract it.
   - non-secret `client_knowledge` config defaults and secret metadata only for
     required credentials.
 - Reuse project-key validation from `scope.py`.
+- Keep the existing plugin manifest identity through PR 1 so enabled-plugin
+  configuration, imports, proof scripts, and read-tool registrations remain
+  compatible. Reconsider a rename only in a separately reviewed migration.
 - Add a small task-aware plugin LLM bridge if needed, register the two auxiliary
   task slots, but do not call models yet.
 - Propagate concrete provider/model attribution from the dynamically resolved

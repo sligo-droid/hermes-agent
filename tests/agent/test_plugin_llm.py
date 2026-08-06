@@ -23,6 +23,7 @@ from agent.plugin_llm import (
     PluginLlmStructuredResult,
     PluginLlmTextInput,
     PluginLlmTrustError,
+    PluginLlmRouteError,
     _build_structured_messages,
     _check_overrides,
     _coerce_allowlist,
@@ -63,6 +64,7 @@ def _trusted_policy(plugin_id: str = "trusted-plugin", **overrides: Any) -> _Tru
         allow_model_override=True,
         allowed_models=None,
         allow_any_model=True,
+        allowed_model_tiers=frozenset({"advanced"}),
         allow_agent_id_override=True,
         allow_profile_override=True,
     )
@@ -465,6 +467,37 @@ class TestJsonParsing:
         assert parsed == {"language": "French"}
         assert ct == "json"
 
+    def test_schema_validation_fails_closed_when_dependency_is_missing(self, monkeypatch):
+        schema = {"type": "object"}
+        real_import = __import__
+
+        def missing_jsonschema(name, *args, **kwargs):
+            if name == "jsonschema":
+                raise ImportError("simulated missing dependency")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", missing_jsonschema)
+        with pytest.raises(PluginLlmRouteError, match="requires the jsonschema dependency"):
+            _parse_structured_text(
+                text='{"ok": true}', json_mode=False, json_schema=schema
+            )
+
+    def test_schema_validation_rejects_invalid_json(self):
+        with pytest.raises(ValueError, match="not valid JSON"):
+            _parse_structured_text(
+                text="not-json",
+                json_mode=False,
+                json_schema={"type": "object"},
+            )
+
+    def test_schema_validation_rejects_empty_output(self):
+        with pytest.raises(ValueError, match="was empty"):
+            _parse_structured_text(
+                text="",
+                json_mode=False,
+                json_schema={"type": "object"},
+            )
+
 
 # ---------------------------------------------------------------------------
 # End-to-end facade
@@ -492,6 +525,295 @@ class TestPluginLlmFacade:
         assert captured["profile_override"] is None
         assert result.usage.input_tokens == 4
         assert result.usage.total_tokens == 10
+
+    def test_named_task_tier_obeys_plugin_provider_model_trust_gate_and_is_strict(self, monkeypatch):
+        captured: dict = {}
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return "provider-a", "gpt-5.6-sol", _fake_response("ok")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+            sync_caller=fake_caller,
+        )
+        result = llm.complete(
+            [{"role": "user", "content": "hi"}],
+            task="client_knowledge_interpret",
+            purpose="client_knowledge_interpret",
+        )
+        assert result.provider == "provider-a"
+        assert result.model == "gpt-5.6-sol"
+        assert result.audit["model_tier"] == "advanced"
+        assert result.audit["actual_provider"] == "provider-a"
+        assert result.audit["route_fingerprint"]
+        assert captured["provider_override"] == "provider-a"
+        assert captured["model_override"] == "gpt-5.6-sol"
+        assert captured["single_attempt"] is True
+        assert captured["strict_provider"] is True
+        assert captured["task"] == "client_knowledge_interpret"
+
+    def test_named_task_provider_drift_fails_closed(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+            sync_caller=lambda **_: ("provider-b", "gpt-5.6-sol", _fake_response("bad")),
+        )
+        with pytest.raises(PluginLlmRouteError, match="attribution"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                task="client_knowledge_interpret",
+            )
+
+    def test_named_task_route_config_override_fails_closed(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced", "provider": "provider-b"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+            sync_caller=lambda **_: ("provider-b", "gpt-5.6-sol", _fake_response("bad")),
+        )
+        with pytest.raises(PluginLlmRouteError, match="route overrides"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                task="client_knowledge_interpret",
+            )
+
+    def test_named_task_records_canonicalized_response_model(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+            sync_caller=lambda **_: (
+                "provider-a",
+                "gpt-5.6-sol-2026-08-01",
+                _fake_response("ok"),
+            ),
+        )
+        result = llm.complete(
+            [{"role": "user", "content": "hi"}],
+            task="client_knowledge_interpret",
+        )
+        assert result.model == "gpt-5.6-sol-2026-08-01"
+        assert result.audit["selected_model"] == "gpt-5.6-sol"
+
+    def test_plugin_cannot_claim_another_plugins_named_task(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{"key": "other_task", "plugin": "other-plugin"}],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=lambda **_: ("provider-a", "model-a", _fake_response("bad")),
+        )
+
+        with pytest.raises(PluginLlmRouteError, match="does not own"):
+            llm.complete([{"role": "user", "content": "hi"}], task="other_task")
+
+    def test_named_task_cannot_change_required_tier(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "trivial"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=lambda **_: ("provider-a", "model-a", _fake_response("bad")),
+        )
+
+        with pytest.raises(PluginLlmRouteError, match="requires model tier"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                task="client_knowledge_interpret",
+            )
+
+    def test_named_task_rejects_untrusted_tier_route(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "plugin_task",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=lambda **_: ("provider-a", "gpt-5.6-sol", _fake_response("bad")),
+        )
+
+        with pytest.raises(PluginLlmTrustError, match="cannot use model tier"):
+            llm.complete([{"role": "user", "content": "hi"}], task="plugin_task")
+
+    def test_named_task_rejects_unrelated_actual_model(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+            sync_caller=lambda **_: ("provider-a", "other-model", _fake_response("bad")),
+        )
+
+        with pytest.raises(PluginLlmRouteError, match="model attribution"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                task="client_knowledge_interpret",
+            )
+
+    def test_named_task_rejects_same_prefix_different_model(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+            sync_caller=lambda **_: (
+                "provider-a",
+                "gpt-5.6-sol-unrelated-premium",
+                _fake_response("bad"),
+            ),
+        )
+
+        with pytest.raises(PluginLlmRouteError, match="model attribution"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                task="client_knowledge_interpret",
+            )
+
+    def test_named_task_rejects_conflicting_model_namespace(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "provider-a")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"model_tier": "advanced"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [{
+                "key": "client_knowledge_interpret",
+                "plugin_id": "my-plugin",
+                "defaults": {"required_model_tier": "advanced"},
+            }],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.model_tiers.resolve_model_tier",
+            lambda *_: SimpleNamespace(
+                name="advanced",
+                provider="provider-a",
+                model="expected-vendor/gpt-5.6-sol",
+                fast_mode=False,
+                reasoning_config=lambda: {},
+            ),
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+            sync_caller=lambda **_: (
+                "provider-a",
+                "other-vendor/gpt-5.6-sol",
+                _fake_response("bad"),
+            ),
+        )
+
+        with pytest.raises(PluginLlmRouteError, match="model attribution"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                task="client_knowledge_interpret",
+            )
 
     def test_complete_rejects_provider_override_without_trust(self):
         llm = make_plugin_llm_for_test(
@@ -856,6 +1178,23 @@ class TestAttribution:
         assert model == "gpt-4o-2024-08-06"
         # Provider override is unaffected by response.model.
         assert provider == "openrouter"
+
+    def test_response_provider_provenance_wins_over_requested_override(self):
+        from agent.plugin_llm import _resolve_attribution
+
+        response = SimpleNamespace(
+            model="model-a",
+            choices=[],
+            _hermes_provider="provider-b",
+        )
+        provider, model = _resolve_attribution(
+            provider_override="provider-a",
+            model_override="model-a",
+            response=response,
+        )
+
+        assert provider == "provider-b"
+        assert model == "model-a"
 
     def test_falls_back_to_main_provider_and_model_when_no_overrides(self, monkeypatch):
         """When the plugin doesn't override anything, attribution

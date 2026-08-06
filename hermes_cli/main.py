@@ -3333,6 +3333,8 @@ def _all_aux_tasks() -> list[tuple[str, str, str]]:
     try:
         from hermes_cli.plugins import get_plugin_auxiliary_tasks
         for entry in get_plugin_auxiliary_tasks():
+            if (entry.get("defaults") or {}).get("configurable") is False:
+                continue
             tasks.append((entry["key"], entry["display_name"], entry["description"]))
     except Exception:
         # Plugin discovery failure must not break the aux config UI.

@@ -1280,12 +1280,13 @@ class PluginContext:
             )
 
         # Reject duplicate registrations across plugins
+        plugin_id = self.manifest.key or self.manifest.name
         existing = self._manager._aux_tasks.get(key)
-        if existing is not None and existing.get("plugin") != self.manifest.name:
+        if existing is not None and existing.get("plugin_id", existing.get("plugin")) != plugin_id:
             raise ValueError(
                 f"Plugin '{self.manifest.name}' cannot register auxiliary task "
                 f"{key!r} — already registered by plugin "
-                f"'{existing.get('plugin')}'"
+                f"'{existing.get('plugin_id', existing.get('plugin'))}'"
             )
 
         # Normalize defaults — plugin owns the schema, but we ensure routing
@@ -1308,6 +1309,7 @@ class PluginContext:
             "description": description,
             "defaults": merged_defaults,
             "plugin": self.manifest.name,
+            "plugin_id": plugin_id,
         }
         logger.debug(
             "Plugin %s registered auxiliary task: %s (%s)",

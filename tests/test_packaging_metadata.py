@@ -99,6 +99,14 @@ def test_packaging_declared_as_core_dependency():
     )
 
 
+def test_jsonschema_is_exact_core_dependency():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core = data["project"]["dependencies"]
+    assert "jsonschema==4.26.0" in core
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    assert "name = \"jsonschema\"" in lock
+
+
 def test_faster_whisper_is_not_a_base_dependency():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     deps = data["project"]["dependencies"]
