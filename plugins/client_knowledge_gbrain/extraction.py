@@ -80,6 +80,8 @@ class ExtractionSettings:
     max_message_bytes: int
     max_part_bytes: int
     max_total_decoded_bytes: int
+    max_attachment_reconciliation_bytes: int
+    max_total_attachment_reconciliation_bytes: int
     max_mime_parts: int
     max_mime_depth: int
     max_header_chars: int
@@ -89,11 +91,14 @@ class ExtractionSettings:
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ExtractionSettings":
+        from .gmail_poller import GmailSettings
+
         ck = config.get("client_knowledge", {})
         raw = ck.get("extraction", {}) if isinstance(ck, Mapping) else {}
         if not isinstance(raw, Mapping):
             raise ExtractionFailure("static_extraction_config_invalid")
         try:
+            gmail_mime = GmailSettings.from_config(config).mime
             limits = DocumentExtractionLimits(
                 max_input_bytes=int(raw.get("max_document_bytes", 32 * 1024 * 1024)),
                 max_zip_members=int(raw.get("max_zip_members", 1024)),
@@ -116,6 +121,10 @@ class ExtractionSettings:
                 max_message_bytes=int(raw.get("max_message_bytes", 16 * 1024 * 1024)),
                 max_part_bytes=int(raw.get("max_part_bytes", 4 * 1024 * 1024)),
                 max_total_decoded_bytes=int(raw.get("max_total_decoded_bytes", 16 * 1024 * 1024)),
+                max_attachment_reconciliation_bytes=int(gmail_mime["max_attachment_bytes"]),
+                max_total_attachment_reconciliation_bytes=int(
+                    gmail_mime["max_total_attachment_bytes"]
+                ),
                 max_mime_parts=int(raw.get("max_mime_parts", 512)),
                 max_mime_depth=int(raw.get("max_mime_depth", 20)),
                 max_header_chars=int(raw.get("max_header_chars", 32_000)),
@@ -129,6 +138,8 @@ class ExtractionSettings:
             values.max_message_bytes,
             values.max_part_bytes,
             values.max_total_decoded_bytes,
+            values.max_attachment_reconciliation_bytes,
+            values.max_total_attachment_reconciliation_bytes,
             values.max_mime_parts,
             values.max_mime_depth,
             values.max_header_chars,
@@ -336,11 +347,11 @@ def _parent_attachment_parts(
             payload = part.get_payload(decode=True) or b""
         except Exception as exc:
             raise ExtractionFailure("attachment_reconciliation_failed") from exc
-        if len(payload) > settings.max_part_bytes:
-            raise ExtractionFailure("mime_part_bytes_limit")
+        if len(payload) > settings.max_attachment_reconciliation_bytes:
+            raise ExtractionFailure("mime_attachment_bytes_limit")
         total_bytes += len(payload)
-        if total_bytes > settings.max_total_decoded_bytes:
-            raise ExtractionFailure("mime_total_decoded_bytes_limit")
+        if total_bytes > settings.max_total_attachment_reconciliation_bytes:
+            raise ExtractionFailure("mime_total_attachment_bytes_limit")
         parts[identity] = {
             "provider_attachment_id": identity,
             "filename": str(filename),

@@ -21,9 +21,12 @@ from plugins.client_knowledge_gbrain.store import IntakeStore
 from tools.read_extract import DocumentExtractionLimits, ExtractionError, extract_document_text
 
 
-def _settings() -> ExtractionSettings:
+def _settings(*, gmail: dict | None = None) -> ExtractionSettings:
     return ExtractionSettings.from_config({
-        "client_knowledge": {"extraction": {"enabled": True}}
+        "client_knowledge": {
+            "extraction": {"enabled": True},
+            "gmail": gmail or {},
+        }
     })
 
 
@@ -200,6 +203,47 @@ def test_parent_mime_attachment_reconciliation_happy_path(tmp_path):
         tmp_path, raw, [("note.txt", "text/plain", b"ORIGINAL")]
     )
     assert ExtractionWorker(store, spool, derived, _settings()).process_claim(claim)
+
+
+def test_matching_five_mib_pdf_reconciles_and_is_recorded_unsupported(tmp_path):
+    payload = b"P" * (5 * 1024 * 1024)
+    raw = _message_with_attachment(
+        payload, mime=b"application/pdf", filename=b"report.pdf"
+    )
+    store, spool, derived, claim, _parent = _claim(
+        tmp_path, raw, [("report.pdf", "application/pdf", payload)]
+    )
+    extraction_id = ExtractionWorker(
+        store, spool, derived, _settings()
+    ).process_claim(claim)
+    row = store.get_extraction(extraction_id)
+    value = derived.read_json(
+        "extractions", extraction_id, row["output_sha256"], row["output_bytes"]
+    )
+    assert value["unsupported_attachments"][0]["reason_code"] == "unsupported_pdf_v1"
+
+
+def test_parent_attachment_reconciliation_rejects_above_gmail_cap(tmp_path):
+    cap = 5 * 1024 * 1024
+    payload = b"P" * (cap + 1)
+    raw = _message_with_attachment(
+        payload, mime=b"application/pdf", filename=b"report.pdf"
+    )
+    store, spool, derived, claim, _parent = _claim(
+        tmp_path, raw, [("report.pdf", "application/pdf", payload)]
+    )
+    with pytest.raises(ExtractionFailure, match="mime_attachment_bytes_limit"):
+        ExtractionWorker(
+            store,
+            spool,
+            derived,
+            _settings(
+                gmail={
+                    "max_attachment_bytes": cap,
+                    "max_total_attachment_bytes": 2 * cap,
+                }
+            ),
+        ).process_claim(claim)
 
 
 def test_parent_mime_attachment_reconciliation_rejects_missing_part_identity(tmp_path):
