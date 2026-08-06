@@ -4877,10 +4877,22 @@ def _single_attempt_async_client(client: Any) -> Any:
 
     with_options = getattr(client, "with_options", None)
     if callable(with_options):
-        return with_options(max_retries=0)
+        wrapped = with_options(max_retries=0)
+        _annotate_resolved_provider(wrapped, getattr(client, "_hermes_provider", ""))
+        return wrapped
     # Native adapters without ``with_options`` issue one HTTP request per
     # create call. Hermes-level retry and fallback branches are separately
     # disabled by ``single_attempt`` in ``async_call_llm``.
+    return client
+
+
+def _single_attempt_sync_client(client: Any) -> Any:
+    """Return a task-local sync SDK view with provider retries disabled."""
+    with_options = getattr(client, "with_options", None)
+    if callable(with_options):
+        wrapped = with_options(max_retries=0)
+        _annotate_resolved_provider(wrapped, getattr(client, "_hermes_provider", ""))
+        return wrapped
     return client
 
 
@@ -4907,6 +4919,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    strict_provider: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -5215,9 +5228,14 @@ def resolve_provider_client(
             client = _wrap_if_needed(client, final_model, custom_base, custom_key)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
-        # Try custom first, then API-key providers (Codex excluded here:
-        # falling through to Codex with no model is a stale-constant trap).
-        for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+        # Ordinary auto-style custom routing may fall through to configured
+        # API-key providers. Strict callers must remain on the selected custom
+        # endpoint and fail closed when it is unavailable.
+        try_functions = (_try_custom_endpoint,) if strict_provider else (
+            _try_custom_endpoint,
+            _resolve_api_key_provider,
+        )
+        for try_fn in try_functions:
             client, default = try_fn()
             if client is not None:
                 final_model = _normalize_resolved_model(model or default, provider)
@@ -5228,6 +5246,7 @@ def resolve_provider_client(
                 _raw_ckey = getattr(client, "api_key", "")
                 _ckey = "" if (callable(_raw_ckey) and not isinstance(_raw_ckey, str)) else str(_raw_ckey or "")
                 client = _wrap_if_needed(client, final_model, _cbase, _ckey)
+                _annotate_resolved_provider(client, "custom")
                 return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                         else (client, final_model))
         logger.warning("resolve_provider_client: custom/main requested "
@@ -6172,6 +6191,7 @@ def _client_cache_key(
     is_vision: bool = False,
     task: Optional[str] = None,
     model: Optional[str] = None,
+    strict_provider: bool = False,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
 
@@ -6195,7 +6215,19 @@ def _client_cache_key(
     # model its own client, so concurrent fan-out calls never cross-close.
     model_key = model or runtime.get("model", "")
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
-    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
+    return (
+        provider,
+        async_mode,
+        base_url or "",
+        api_key_key,
+        api_mode or "",
+        runtime_key,
+        is_vision,
+        task_key,
+        pool_hint,
+        model_key,
+        strict_provider,
+    )
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
@@ -6387,6 +6419,7 @@ def _get_cached_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    strict_provider: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Get or create a cached client for the given provider.
 
@@ -6426,6 +6459,7 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
         model=model,
+        strict_provider=strict_provider,
     )
     with _client_cache_lock:
         if cache_key in _client_cache:
@@ -6471,8 +6505,12 @@ def _get_cached_client(
         main_runtime=runtime,
         is_vision=is_vision,
         task=task,
+        strict_provider=strict_provider,
     )
     if client is not None:
+        if strict_provider:
+            requested_provider = _normalize_aux_provider(provider)
+            _annotate_resolved_provider(client, requested_provider)
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
@@ -6899,6 +6937,7 @@ def _build_call_kwargs(
     timeout: float = 30.0,
     extra_body: Optional[dict] = None,
     reasoning_config: Optional[dict] = None,
+    fast_mode: Optional[bool] = None,
     base_url: Optional[str] = None,
     *,
     task: Optional[str] = None,
@@ -6910,6 +6949,19 @@ def _build_call_kwargs(
         "messages": messages,
         "timeout": timeout,
     }
+    if fast_mode is not None:
+        try:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            overrides = resolve_fast_mode_overrides(model) if fast_mode else {}
+        except Exception:
+            overrides = {}
+        if fast_mode and not overrides:
+            # The named tier requested fast mode but the concrete model does
+            # not support the host's known fast-mode contract. Do not invent a
+            # provider-specific wire field and silently drift.
+            raise RuntimeError("fast mode is unsupported for the selected auxiliary model")
+        kwargs.update(overrides)
 
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:
@@ -7090,6 +7142,11 @@ def _validate_llm_response(
         )
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
+    if provider:
+        try:
+            response._hermes_provider = str(provider).strip().lower()
+        except (AttributeError, TypeError):
+            pass
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
     # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:
@@ -7736,6 +7793,9 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    single_attempt: bool = False,
+    fast_mode: Optional[bool] = None,
+    strict_provider: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -7789,7 +7849,12 @@ def call_llm(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not single_attempt
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -7815,6 +7880,7 @@ def call_llm(
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
             task=task,
+            strict_provider=strict_provider,
         )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
@@ -7822,7 +7888,7 @@ def call_llm(
             # through OpenRouter (which causes confusing 404s).
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                fb_client, fb_model, fb_label = (None, None, "") if single_attempt else _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason="provider unavailable")
                 if fb_client is not None:
                     client = fb_client
@@ -7833,11 +7899,19 @@ def call_llm(
             elif not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
+                if not single_attempt:
+                    client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
+
+    if single_attempt:
+        client = _single_attempt_sync_client(client)
+
+    actual_provider = _client_provider_provenance(client, resolved_provider)
+    if strict_provider and actual_provider != _normalize_aux_provider(resolved_provider):
+        raise RuntimeError("strict auxiliary provider resolution changed provider")
 
 
     effective_timeout = _effective_aux_timeout(task, timeout)
@@ -7857,6 +7931,7 @@ def call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
+        fast_mode=fast_mode,
         base_url=_base_info or resolved_base_url, task=task, client=client)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
@@ -7897,8 +7972,10 @@ def call_llm(
         try:
             return _validate_llm_response(
                 client.chat.completions.create(**kwargs), task,
-                provider=resolved_provider, base_url=_base_info)
+                provider=actual_provider, base_url=_base_info)
         except Exception as transient_err:
+            if single_attempt:
+                raise
             if not _is_transient_transport_error(transient_err):
                 raise
             _skip_reason = _compression_retry_skip_reason(task, transient_err)
@@ -7931,6 +8008,8 @@ def call_llm(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if single_attempt:
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -8444,6 +8523,8 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    fast_mode: Optional[bool] = None,
+    strict_provider: bool = False,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -8508,12 +8589,18 @@ async def async_call_llm(
             main_runtime=main_runtime,
 
             task=task,
+            strict_provider=strict_provider,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason="provider unavailable")
+                fb_client, fb_model, fb_label = (
+                    (None, None, "")
+                    if single_attempt
+                    else _try_configured_fallback_chain(
+                        task, resolved_provider or "auto", reason="provider unavailable"
+                    )
+                )
                 if fb_client is not None:
                     client, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
@@ -8525,9 +8612,10 @@ async def async_call_llm(
             elif not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client(
-                    "auto", async_mode=True, main_runtime=main_runtime, task=task
-                )
+                if not single_attempt:
+                    client, final_model = _get_cached_client(
+                        "auto", async_mode=True, main_runtime=main_runtime, task=task
+                    )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -8536,6 +8624,10 @@ async def async_call_llm(
 
     if single_attempt:
         client = _single_attempt_async_client(client)
+
+    actual_provider = _client_provider_provenance(client, resolved_provider)
+    if strict_provider and actual_provider != _normalize_aux_provider(resolved_provider):
+        raise RuntimeError("strict auxiliary provider resolution changed provider")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
     # Pass the client's actual base_url (not just resolved_base_url) so
@@ -8547,6 +8639,7 @@ async def async_call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
+        fast_mode=fast_mode,
         base_url=_client_base or resolved_base_url, task=task, client=client)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
@@ -8561,7 +8654,7 @@ async def async_call_llm(
         try:
             return _validate_llm_response(
                 await client.chat.completions.create(**kwargs), task,
-                provider=resolved_provider, base_url=_client_base)
+                provider=actual_provider, base_url=_client_base)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise

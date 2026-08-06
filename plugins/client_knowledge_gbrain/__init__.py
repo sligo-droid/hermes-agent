@@ -9,10 +9,11 @@ from plugins.client_knowledge_gbrain.tools import (
     handle_client_knowledge_get,
     handle_client_knowledge_search,
 )
+from plugins.client_knowledge_gbrain.cli import client_knowledge_command, register_cli
 
 
 def register(ctx) -> None:
-    """Register the two bounded, read-only client-knowledge tools."""
+    """Register the two bounded read-only tools and operator-only controls."""
     ctx.register_tool(
         name="client_knowledge_search",
         toolset="client_knowledge",
@@ -21,6 +22,36 @@ def register(ctx) -> None:
         check_fn=check_client_knowledge_available,
         emoji="🧠",
         effect="read",
+    )
+    ctx.register_cli_command(
+        name="client-knowledge",
+        help="Inspect the redacted client-knowledge intake queue",
+        setup_fn=register_cli,
+        handler_fn=client_knowledge_command,
+        description=(
+            "Operator-only queue status and lease controls. run-once is a bounded "
+            "no-op until provider adapters and workers land in a later PR."
+        ),
+    )
+    ctx.register_auxiliary_task(
+        key="client_knowledge_interpret",
+        display_name="Client knowledge interpretation",
+        description="Interpret a validated client-knowledge artifact.",
+        defaults={
+            "model_tier": "advanced",
+            "required_model_tier": "advanced",
+            "configurable": False,
+        },
+    )
+    ctx.register_auxiliary_task(
+        key="client_knowledge_assimilate",
+        display_name="Client knowledge assimilation",
+        description="Assimilate validated interpretation into canonical knowledge.",
+        defaults={
+            "model_tier": "advanced",
+            "required_model_tier": "advanced",
+            "configurable": False,
+        },
     )
     ctx.register_tool(
         name="client_knowledge_get",

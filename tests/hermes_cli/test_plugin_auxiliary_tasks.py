@@ -351,3 +351,61 @@ def test_get_auxiliary_task_config_unknown_task_returns_empty(
     (tmp_path / ".hermes").mkdir(exist_ok=True)
 
     assert _get_auxiliary_task_config("nonexistent") == {}
+
+
+def test_named_tier_default_is_preserved_under_empty_user_route(patched_manager):
+    from agent.auxiliary_client import _get_auxiliary_task_config
+
+    manifest = PluginManifest(name="client-knowledge-gbrain")
+    ctx = PluginContext(manifest, patched_manager)
+    ctx.register_auxiliary_task(
+        key="client_knowledge_interpret",
+        display_name="Client knowledge interpretation",
+        description="Interpret a source",
+        defaults={
+            "model_tier": "advanced",
+            "required_model_tier": "advanced",
+            "configurable": False,
+        },
+    )
+
+    resolved = _get_auxiliary_task_config("client_knowledge_interpret")
+    assert resolved["model_tier"] == "advanced"
+    assert resolved["provider"] == "auto"
+    assert resolved["model"] == ""
+
+
+def test_fixed_tier_plugin_task_is_hidden_from_auxiliary_picker(patched_manager):
+    from hermes_cli.main import _all_aux_tasks
+
+    manifest = PluginManifest(name="client-knowledge-gbrain")
+    ctx = PluginContext(manifest, patched_manager)
+    ctx.register_auxiliary_task(
+        key="client_knowledge_interpret",
+        display_name="Client knowledge interpretation",
+        description="Interpret a source",
+        defaults={
+            "model_tier": "advanced",
+            "required_model_tier": "advanced",
+            "configurable": False,
+        },
+    )
+
+    assert "client_knowledge_interpret" not in {key for key, _, _ in _all_aux_tasks()}
+
+
+def test_category_plugin_owns_task_by_manifest_key():
+    manager = PluginManager()
+    manager._discovered = True
+    ctx = PluginContext(
+        PluginManifest(name="leaf", key="category/leaf"),
+        manager,
+    )
+    ctx.register_auxiliary_task(
+        key="leaf_task",
+        display_name="Leaf",
+        description="Leaf task",
+        defaults={"model_tier": "advanced"},
+    )
+
+    assert manager._aux_tasks["leaf_task"]["plugin_id"] == "category/leaf"

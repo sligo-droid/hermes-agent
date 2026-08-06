@@ -16,6 +16,25 @@ FORK_DEFAULT_ADDITIONS = {
     # is reserved for genuinely custom tier names.
     "model_tiers": {},
     "projects": {},
+    "client_knowledge": {
+        "intake": {
+            "enabled": False,
+            "db_path": "",
+            "spool_path": "",
+            "lease_seconds": 300,
+            "max_attempts": 3,
+            "retry_delay_seconds": 60,
+        },
+    },
+    "plugins": {
+        "entries": {
+            "client-knowledge-gbrain": {
+                "llm": {
+                    "allowed_model_tiers": ["advanced"],
+                },
+            },
+        },
+    },
     "agent": {
         "codex_app_server_turn_timeout": 1800,
         "provider_no_progress_timeout": 900,
