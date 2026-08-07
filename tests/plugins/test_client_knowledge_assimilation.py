@@ -476,6 +476,22 @@ def test_assimilation_schema_rejects_invalid_classification_values():
             )
 
 
+def test_non_transient_operation_rejects_empty_classification_values():
+    op = _operation("add")
+    for key in (
+        "kind", "status", "confidence", "sensitivity", "impact",
+        "honcho_projection",
+    ):
+        invalid = _proposal({**op, key: ""})
+        with pytest.raises(AssimilationFailure, match="schema_mismatch"):
+            validate_proposal(
+                invalid, artifact_id="a" * 64, interpretation_id="b" * 64,
+                project_key="pid", notion_ref="notion:page:new", current_pages={},
+                interpretation=_interpretation(op["claim"]), source_root=Path("/tmp"),
+                max_output_bytes=500_000,
+            )
+
+
 def test_confirmation_preserves_timeline_beyond_model_context_truncation(tmp_path):
     path = tmp_path / "projects/pid/requirements/reporting.md"
     path.parent.mkdir(parents=True)
