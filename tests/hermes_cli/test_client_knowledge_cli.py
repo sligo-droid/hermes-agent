@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from plugins.client_knowledge_gbrain.cli import client_knowledge_command, register_cli
 from plugins.client_knowledge_gbrain.models import IntakeArtifact
@@ -69,6 +70,57 @@ def test_cli_output_is_redacted_and_run_once_is_explicit(tmp_path, capsys):
     # Disabled-by-default Notion configuration remains a bounded no-work run.
     assert client_knowledge_command(args) == 0
     assert "notion_archive" in capsys.readouterr().out
+
+
+def test_run_once_dry_run_reports_readiness_without_loading_stages(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "client_knowledge": {
+                "notion": {"enabled": True},
+                "extraction": {"enabled": False},
+                "interpretation": {"enabled": True},
+                "assimilation": {"enabled": False},
+                "review_notifications": {"enabled": True},
+                "honcho_projection": {"enabled": False},
+            }
+        },
+    )
+    blocked = {
+        "plugins.client_knowledge_gbrain.notion_archive",
+        "plugins.client_knowledge_gbrain.extraction",
+        "plugins.client_knowledge_gbrain.interpretation",
+        "plugins.client_knowledge_gbrain.assimilation",
+        "plugins.client_knowledge_gbrain.review",
+        "plugins.client_knowledge_gbrain.honcho_projection",
+    }
+    for name in blocked:
+        sys.modules.pop(name, None)
+    args = argparse.Namespace(
+        client_knowledge_action="run-once",
+        dry_run=True,
+        db_path=str(tmp_path / "private" / "intake.db"),
+    )
+
+    assert client_knowledge_command(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "downstream_writes": False,
+        "mode": "dry_run",
+        "stages": {
+            "assimilation": False,
+            "extraction": False,
+            "honcho_projection": False,
+            "interpretation": True,
+            "notion": True,
+            "review_notifications": True,
+        },
+        "stats": {
+            "failed": 0, "operator_blocked": 0, "quarantined": 0,
+            "queued": 0, "running": 0, "succeeded": 0, "total": 0,
+        },
+    }
+    assert blocked.isdisjoint(sys.modules)
 
 
 def test_cli_rejects_noncanonical_job_ids_without_echoing_them(tmp_path, capsys):

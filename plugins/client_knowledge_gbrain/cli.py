@@ -69,6 +69,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Run bounded Notion, extraction, and interpretation stages",
     )
     run_once.add_argument("--db-path", default="")
+    run_once.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report configured stage enablement without running downstream work",
+    )
 
     gmail_poll = subs.add_parser(
         "gmail-poll-once",
@@ -206,6 +211,27 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             print(json.dumps(result, sort_keys=True))
             return 0
         if action == "run-once":
+            if bool(getattr(args, "dry_run", False)):
+                from hermes_cli.config import load_config
+
+                config = load_config() or {}
+                raw = config.get("client_knowledge", {})
+                raw = raw if isinstance(raw, dict) else {}
+                stages = {
+                    name: bool((raw.get(name) or {}).get("enabled", False))
+                    for name in (
+                        "notion", "extraction", "interpretation", "assimilation",
+                        "review_notifications", "honcho_projection",
+                    )
+                    if isinstance(raw.get(name) or {}, dict)
+                }
+                print(json.dumps({
+                    "mode": "dry_run",
+                    "downstream_writes": False,
+                    "stages": stages,
+                    "stats": store.stats(),
+                }, sort_keys=True))
+                return 0
             from agent.plugin_llm import PluginLlm
             from hermes_cli.config import load_config
             from .derived import DerivedStore
