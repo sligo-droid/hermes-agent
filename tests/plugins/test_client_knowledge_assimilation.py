@@ -437,6 +437,9 @@ def test_confirmation_requires_persisted_finding_and_host_preserves_timeline(tmp
 def test_non_confirmation_grounding_mismatch_is_host_normalized_for_review(tmp_path):
     op = _operation("add", claim="Paraphrased reporting requirement.")
     op["evidence_ids"] = ["evidence-999"]
+    op["kind"] = "decision"
+    op["confidence"] = "low"
+    op["sensitivity"] = "confidential"
     op["final_markdown"] = _canonical_markdown(op, project_key="pid")
     parsed, review, reason = validate_proposal(
         _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
@@ -449,8 +452,28 @@ def test_non_confirmation_grounding_mismatch_is_host_normalized_for_review(tmp_p
     assert reason == "finding_grounding_mismatch"
     assert rendered["claim"] == "Weekly report is due Monday."
     assert rendered["evidence_ids"] == ["evidence-001"]
+    assert rendered["kind"] == "requirement"
+    assert rendered["confidence"] == "high"
+    assert rendered["sensitivity"] == "internal"
     assert "Paraphrased reporting requirement." not in rendered["final_markdown"]
     assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
+
+
+def test_assimilation_schema_rejects_invalid_classification_values():
+    op = _operation("add")
+    for key, value in (
+        ("status", "active"),
+        ("impact", "medium"),
+        ("honcho_projection", "project_requirement"),
+    ):
+        invalid = _proposal({**op, key: value})
+        with pytest.raises(AssimilationFailure, match="schema_mismatch"):
+            validate_proposal(
+                invalid, artifact_id="a" * 64, interpretation_id="b" * 64,
+                project_key="pid", notion_ref="notion:page:new", current_pages={},
+                interpretation=_interpretation(op["claim"]), source_root=Path("/tmp"),
+                max_output_bytes=500_000,
+            )
 
 
 def test_confirmation_preserves_timeline_beyond_model_context_truncation(tmp_path):
