@@ -144,8 +144,17 @@ def _semantic_validate(parsed: Any, extraction: Mapping[str, Any], max_bytes: in
         if segment is None:
             raise InterpretationFailure("interpretation_evidence_segment_missing")
         start, end = int(item["start"]), int(item["end"])
-        if not 0 <= start < end <= len(segment) or segment[start:end] != item["quote"]:
-            raise InterpretationFailure("interpretation_evidence_mismatch")
+        quote = str(item["quote"])
+        if not 0 <= start < end <= len(segment) or segment[start:end] != quote:
+            repaired_start = segment.find(quote)
+            if (
+                not quote
+                or repaired_start < 0
+                or segment.find(quote, repaired_start + 1) >= 0
+            ):
+                raise InterpretationFailure("interpretation_evidence_mismatch")
+            item["start"] = repaired_start
+            item["end"] = repaired_start + len(quote)
         evidence[evidence_id] = item
     finding_ids: set[str] = set()
     used: set[str] = set()
