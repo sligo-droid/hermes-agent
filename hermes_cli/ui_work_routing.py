@@ -155,9 +155,21 @@ _EXACT_VISUAL_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _ADDITIVE_VISUAL_CLAUSE_RE = re.compile(
-    r"(?:[,;]|\b(?:and|then|while|plus|also)\b)",
+    r"(?:[,;:()]|\b(?:and|but|or|nor|yet|then|while|plus|also|as well as|"
+    r"along with|together with)\b)",
     re.IGNORECASE,
 )
+
+
+def _is_single_clause_exact_visual_request(text: str) -> bool:
+    """Return true only for one bounded exact-value visual instruction."""
+
+    if not _EXACT_VISUAL_VALUE_RE.search(text):
+        return False
+    without_final_punctuation = text.rstrip().rstrip(".!?")
+    if re.search(r"[.!?]", without_final_punctuation):
+        return False
+    return _ADDITIVE_VISUAL_CLAUSE_RE.search(without_final_punctuation) is None
 
 
 @dataclass(frozen=True)
@@ -450,13 +462,11 @@ def _classify_ui_work(
     primary_text = _normalize_text(title, task)
     body_text = _normalize_text(title, task, context)
 
-    if (
-        _EXACT_VISUAL_VALUE_RE.search(primary_text)
-        # Only bypass consultation when the whole request is one exact-value
-        # clause. Any additive clause is ambiguous enough to default back to
-        # visual advice instead of maintaining an incomplete keyword denylist.
-        and not _ADDITIVE_VISUAL_CLAUSE_RE.search(primary_text)
-    ):
+    # Only bypass consultation when the whole request is one exact-value
+    # clause. Any additional sentence, delimiter, or clause connector defaults
+    # back to visual advice; under-classifying is cheaper than skipping needed
+    # design judgment.
+    if _is_single_clause_exact_visual_request(primary_text):
         return False, "deterministic exact visual value"
 
     # CWD/project names are deliberately not positive evidence: repository names

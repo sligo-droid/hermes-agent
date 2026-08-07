@@ -308,6 +308,9 @@ def test_exact_visual_property_edit_stays_on_default_coding_route(task):
             "Style the dashboard with exactly 8px spacing and balance the typography "
             "and colors."
         ),
+        "Style the dashboard with exactly 8px spacing but choose appropriate typography.",
+        "Style the dashboard with exactly 8px spacing as well as appropriate typography.",
+        "Style the dashboard with exactly 8px spacing. Choose appropriate typography.",
     ],
 )
 def test_exact_value_does_not_suppress_subjective_visual_work(task):
