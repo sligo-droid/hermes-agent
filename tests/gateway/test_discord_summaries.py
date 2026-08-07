@@ -878,6 +878,7 @@ async def test_tagged_thread_action_followup_creates_request_scoped_feature_summ
     assert event.feature_summary["thread_id"] == "200"
     assert event.feature_summary["message_id"] == "301"
     assert event.feature_summary["source_message_id"] == "501"
+    assert event._discord_promotion_created_feature_summary is True
     assert thread.sent[1][0]["reference"] is followup
     assert event.feature_summary["_thread_obj"] is thread
 

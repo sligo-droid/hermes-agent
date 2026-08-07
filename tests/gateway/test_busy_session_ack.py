@@ -3,6 +3,7 @@
 Verifies that users get an immediate status response instead of total silence
 when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -113,6 +114,141 @@ def test_long_running_status_detail_omits_codex_app_server_event():
 
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
+
+    @pytest.mark.asyncio
+    async def test_typed_choice_resolves_pending_clarify_and_removes_new_summary(self, tmp_path):
+        """A typed choice is prompt input, not a new busy-session turn."""
+        from gateway.run import GatewayRunner
+        from tools import clarify_gateway as cm
+
+        _clear = cm.clear_session
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+            thread_id="thread-1",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="option 1",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="choice-message",
+        )
+        event._discord_promotion_created_feature_summary = True
+        event.discord_runtime_mode = "action"
+        event.participates_in_work_lifecycle = True
+        session_key = build_session_key(source)
+        _clear(session_key)
+        cm.register("clarify-1", session_key, "Pick", ["First", "Second"])
+
+        runner, _sentinel = _make_runner()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        adapter = _make_adapter("discord")
+        adapter.finalize_clarify_prompt = AsyncMock(return_value=True)
+        adapter.rollback_promoted_action_request = AsyncMock()
+        adapter.resume_typing_for_chat = MagicMock()
+        runner.adapters[source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result == ""
+        assert cm.wait_for_response("clarify-1", timeout=0.1) == "First"
+        adapter.finalize_clarify_prompt.assert_awaited_once_with("clarify-1")
+        adapter.rollback_promoted_action_request.assert_awaited_once_with(event)
+        adapter.resume_typing_for_chat.assert_called_once_with("thread-1")
+        assert runner.work_ledger.incomplete_items() == []
+        consumed = runner.work_ledger.get(event.work_item_id)
+        assert consumed["status"] == "completed"
+        assert consumed["consumed_reason"] == "clarify_response"
+        assert runner.work_ledger.pending_terminal_reaction_items() == []
+
+    @pytest.mark.asyncio
+    async def test_clarify_work_is_terminal_before_cancelled_summary_rollback(self, tmp_path):
+        """Shutdown cancellation cannot leave an accepted answer replayable."""
+        from gateway.run import GatewayRunner
+        from tools import clarify_gateway as cm
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="cancel-thread",
+            chat_type="thread",
+            thread_id="cancel-thread",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="1",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="cancel-choice",
+        )
+        event._discord_promotion_created_feature_summary = True
+        event.discord_runtime_mode = "action"
+        event.participates_in_work_lifecycle = True
+        session_key = build_session_key(source)
+        cm.clear_session(session_key)
+        cm.register("cancel-clarify", session_key, "Pick", ["First"])
+        runner, _sentinel = _make_runner()
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        adapter = _make_adapter("discord")
+        adapter.rollback_promoted_action_request = AsyncMock(
+            side_effect=asyncio.CancelledError,
+        )
+        adapter.finalize_clarify_prompt = AsyncMock(return_value=True)
+        runner.adapters[source.platform] = adapter
+
+        with pytest.raises(asyncio.CancelledError):
+            await GatewayRunner._handle_message(runner, event)
+
+        assert cm.wait_for_response("cancel-clarify", timeout=0.1) == "First"
+        assert runner.work_ledger.incomplete_items() == []
+        consumed = runner.work_ledger.get(event.work_item_id)
+        assert consumed["status"] == "completed"
+        assert consumed["consumed_reason"] == "clarify_response"
+        assert runner.work_ledger.pending_terminal_reaction_items() == []
+
+    @pytest.mark.asyncio
+    async def test_successful_steer_removes_unused_discord_summary(self, monkeypatch, tmp_path):
+        """Steering joins the active turn and must not leave a second summary card."""
+        import gateway.run as _gr
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        adapter = _make_adapter("discord")
+        adapter.rollback_promoted_action_request = AsyncMock()
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-steer",
+            chat_type="thread",
+            thread_id="thread-steer",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="also do this",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="steer-message",
+        )
+        event._discord_promotion_created_feature_summary = True
+        event.discord_runtime_mode = "action"
+        event.participates_in_work_lifecycle = True
+        session_key = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[session_key] = agent
+
+        await GatewayRunner._handle_message(runner, event)
+
+        adapter.rollback_promoted_action_request.assert_awaited_once_with(event)
+        assert runner.work_ledger.incomplete_items() == []
+        consumed = runner.work_ledger.get(event.work_item_id)
+        assert consumed["status"] == "completed"
+        assert consumed["consumed_reason"] == "accepted_steer"
+        assert runner.work_ledger.pending_terminal_reaction_items() == []
 
     @pytest.mark.asyncio
     async def test_handle_message_queue_mode_queues_without_interrupt(self):
@@ -882,6 +1018,48 @@ class TestBusySessionAck:
         assert sk not in adapter._pending_messages
         assert runner._consume_start_user_followups(sk, 3) == ["hey"]
         adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discord_startup_followup_is_not_replayable_work(self, tmp_path):
+        """Input folded into a starting turn is terminalized in the ledger."""
+        from gateway.run import GatewayRunner
+
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        adapter = _make_adapter("discord")
+        adapter.rollback_promoted_action_request = AsyncMock()
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="startup-thread",
+            chat_type="thread",
+            thread_id="startup-thread",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="include this too",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="startup-followup",
+        )
+        event._discord_promotion_created_feature_summary = True
+        event.discord_runtime_mode = "action"
+        event.participates_in_work_lifecycle = True
+        session_key = build_session_key(source)
+        runner._running_agents[session_key] = sentinel
+        runner._running_agents_ts[session_key] = time.time()
+        runner._session_run_generation = {session_key: 4}
+        runner._open_start_user_followups(session_key, 4)
+        runner.adapters[source.platform] = adapter
+
+        await GatewayRunner._handle_message(runner, event)
+
+        assert runner._consume_start_user_followups(session_key, 4) == ["include this too"]
+        assert runner.work_ledger.incomplete_items() == []
+        consumed = runner.work_ledger.get(event.work_item_id)
+        assert consumed["consumed_reason"] == "startup_followup"
+        assert runner.work_ledger.pending_terminal_reaction_items() == []
+        adapter.rollback_promoted_action_request.assert_awaited_once_with(event)
 
     def test_start_user_followups_are_generation_scoped_and_user_role_folded(self):
         runner, _sentinel = _make_runner()
