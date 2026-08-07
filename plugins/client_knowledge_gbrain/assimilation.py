@@ -574,8 +574,32 @@ def validate_proposal(
         if not slug.startswith(f"projects/{project_key}/"):
             raise AssimilationFailure("assimilation_project_scope_invalid", quarantine=True)
         validated.append(item)
-    if seen_findings != set(findings):
-        raise AssimilationFailure("assimilation_findings_incomplete", quarantine=True)
+    omitted_findings = set(findings) - seen_findings
+    for finding_id in sorted(omitted_findings):
+        finding = findings[finding_id]
+        validated.append({
+            "operation": "ignore_transient",
+            "target_slug": "",
+            "title": "",
+            "kind": "",
+            "status": "",
+            "confidence": "",
+            "sensitivity": "",
+            "impact": "",
+            "honcho_projection": "",
+            "effective_at": "",
+            "source_refs": [],
+            "supersedes": [],
+            "claim": "",
+            "timeline_entry": "",
+            "expected_prior_sha256": "",
+            "finding_id": finding_id,
+            "evidence_ids": list(finding["evidence_ids"]),
+            "final_markdown": "",
+        })
+    if omitted_findings:
+        finding_grounding_mismatch = True
+    parsed["operations"] = validated
     review, reason = _review_policy(validated, current_pages, notion_ref)
     if finding_grounding_mismatch:
         review, reason = True, "finding_grounding_mismatch"

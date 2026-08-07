@@ -627,6 +627,37 @@ def test_grounded_transient_may_reference_exact_finding_evidence(tmp_path):
     assert reason == "closed_allowlist_ignore_transient"
 
 
+def test_omitted_findings_become_grounded_transient_review_entries(tmp_path):
+    interpretation = _interpretation("First requirement.")
+    interpretation["requirements"].append({
+        "id": "requirement-second",
+        "text": "Second requirement.",
+        "confidence": "high",
+        "sensitivity": "internal",
+        "evidence_ids": ["evidence-002"],
+    })
+    interpretation["evidence"].append({
+        "id": "evidence-002",
+        "segment_id": "body-0001",
+        "start": 20,
+        "end": 39,
+        "quote": "Second requirement.",
+    })
+    op = _operation("add", claim="First requirement.")
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=interpretation, source_root=tmp_path, max_output_bytes=500_000,
+    )
+    assert review is True
+    assert reason == "finding_grounding_mismatch"
+    assert len(parsed["operations"]) == 2
+    omitted = parsed["operations"][1]
+    assert omitted["operation"] == "ignore_transient"
+    assert omitted["finding_id"] == "requirement-second"
+    assert omitted["evidence_ids"] == ["evidence-002"]
+
+
 def test_confirmation_preserves_timeline_beyond_model_context_truncation(tmp_path):
     path = tmp_path / "projects/pid/requirements/reporting.md"
     path.parent.mkdir(parents=True)
@@ -669,12 +700,17 @@ def test_proposal_requires_one_operation_for_each_grounded_finding(tmp_path):
         "end": len(second["claim"]), "quote": second["claim"],
     })
     proposal = _proposal(first)
-    with pytest.raises(AssimilationFailure, match="findings_incomplete"):
-        validate_proposal(
-            proposal, artifact_id="a" * 64, interpretation_id="b" * 64,
-            project_key="pid", notion_ref="notion:page:new", current_pages={},
-            interpretation=interpretation, source_root=tmp_path, max_output_bytes=500_000,
-        )
+    parsed, review, reason = validate_proposal(
+        proposal, artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=interpretation, source_root=tmp_path, max_output_bytes=500_000,
+    )
+    assert review is True
+    assert reason == "finding_grounding_mismatch"
+    assert parsed["operations"][1]["operation"] == "ignore_transient"
+    assert parsed["operations"][1]["finding_id"] == "requirement-invoicing"
+    assert parsed["operations"][1]["evidence_ids"] == ["evidence-002"]
+    proposal = _proposal(first)
     proposal["operations"].append(second)
     parsed, review, reason = validate_proposal(
         proposal, artifact_id="a" * 64, interpretation_id="b" * 64,
