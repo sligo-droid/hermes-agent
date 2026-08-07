@@ -140,14 +140,17 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             config = load_config() or {}
             raw = config.get("client_knowledge", {})
             raw = raw if isinstance(raw, dict) else {}
-            stages = {
-                name: bool((raw.get(name) or {}).get("enabled", False))
-                for name in (
-                    "notion", "extraction", "interpretation", "assimilation",
-                    "review_notifications", "honcho_projection",
+            stage_enablement = {}
+            for name in (
+                "notion", "extraction", "interpretation", "assimilation",
+                "review_notifications", "honcho_projection",
+            ):
+                stage_config = raw.get(name)
+                stage_enablement[name] = bool(
+                    stage_config.get("enabled", False)
+                    if isinstance(stage_config, dict)
+                    else False
                 )
-                if isinstance(raw.get(name) or {}, dict)
-            }
             path_arg = str(getattr(args, "db_path", "") or "").strip()
             ledger_path = (
                 resolve_store_path()
@@ -159,9 +162,9 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             print(json.dumps({
                 "mode": "dry_run",
                 "downstream_writes": False,
-                "filesystem_writes": False,
+                "ledger_writes": False,
                 "ledger_exists": ledger_path.is_file(),
-                "stages": stages,
+                "stage_enablement": stage_enablement,
             }, sort_keys=True))
             return 0
         store = _store(getattr(args, "db_path", ""))

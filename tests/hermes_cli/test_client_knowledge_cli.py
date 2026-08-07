@@ -74,7 +74,7 @@ def test_cli_output_is_redacted_and_run_once_is_explicit(tmp_path, capsys):
     assert "notion_archive" in capsys.readouterr().out
 
 
-def test_run_once_dry_run_reports_readiness_without_loading_stages(tmp_path, capsys, monkeypatch):
+def test_run_once_dry_run_reports_enablement_without_loading_stages(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {
@@ -84,7 +84,7 @@ def test_run_once_dry_run_reports_readiness_without_loading_stages(tmp_path, cap
                 "interpretation": {"enabled": True},
                 "assimilation": {"enabled": False},
                 "review_notifications": {"enabled": True},
-                "honcho_projection": {"enabled": False},
+                "honcho_projection": "invalid",
             }
         },
     )
@@ -108,10 +108,10 @@ def test_run_once_dry_run_reports_readiness_without_loading_stages(tmp_path, cap
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
         "downstream_writes": False,
-        "filesystem_writes": False,
         "ledger_exists": False,
+        "ledger_writes": False,
         "mode": "dry_run",
-        "stages": {
+        "stage_enablement": {
             "assimilation": False,
             "extraction": False,
             "honcho_projection": False,
@@ -162,7 +162,7 @@ def test_real_cli_dry_run_does_not_import_stages_or_create_ledger(tmp_path):
         "plugins:\n  enabled:\n    - client-knowledge-gbrain\n",
         encoding="utf-8",
     )
-    ledger = tmp_path / "intake.db"
+    ledger = tmp_path / "private" / "intake.db"
     probe = (
         "import json,sys; "
         "from hermes_cli.main import main; "
@@ -182,5 +182,7 @@ def test_real_cli_dry_run_does_not_import_stages_or_create_ledger(tmp_path):
     )
     lines = [json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")]
     assert lines[-1] == {"downstream_modules_imported": [], "exit_code": None}
-    assert lines[0]["filesystem_writes"] is False
+    assert lines[0]["downstream_writes"] is False
+    assert lines[0]["ledger_writes"] is False
     assert not ledger.exists()
+    assert not ledger.parent.exists()
