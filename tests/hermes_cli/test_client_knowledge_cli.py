@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 
 from plugins.client_knowledge_gbrain.cli import client_knowledge_command, register_cli
@@ -106,6 +108,8 @@ def test_run_once_dry_run_reports_readiness_without_loading_stages(tmp_path, cap
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
         "downstream_writes": False,
+        "filesystem_writes": False,
+        "ledger_exists": False,
         "mode": "dry_run",
         "stages": {
             "assimilation": False,
@@ -115,12 +119,9 @@ def test_run_once_dry_run_reports_readiness_without_loading_stages(tmp_path, cap
             "notion": True,
             "review_notifications": True,
         },
-        "stats": {
-            "failed": 0, "operator_blocked": 0, "quarantined": 0,
-            "queued": 0, "running": 0, "succeeded": 0, "total": 0,
-        },
     }
     assert blocked.isdisjoint(sys.modules)
+    assert not (tmp_path / "private" / "intake.db").exists()
 
 
 def test_cli_rejects_noncanonical_job_ids_without_echoing_them(tmp_path, capsys):
@@ -145,8 +146,41 @@ def test_real_plugin_cli_discovery_registers_command(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     manager = PluginManager()
+    sys.modules.pop("plugins.client_knowledge_gbrain.review", None)
     manager.discover_and_load(force=True)
 
     assert "client-knowledge" in manager._cli_commands
     assert callable(manager._cli_commands["client-knowledge"]["setup_fn"])
     assert callable(manager._cli_commands["client-knowledge"]["handler_fn"])
+    assert "plugins.client_knowledge_gbrain.review" not in sys.modules
+
+
+def test_real_cli_dry_run_does_not_import_stages_or_create_ledger(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - client-knowledge-gbrain\n",
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "intake.db"
+    probe = (
+        "import json,sys; "
+        "from hermes_cli.main import main; "
+        f"sys.argv=['hermes','client-knowledge','run-once','--dry-run','--db-path',{str(ledger)!r}]; "
+        "code=main(); "
+        "print(json.dumps({'exit_code':code,'downstream_modules_imported':sorted("
+        "name for name in sys.modules if name.startswith('plugins.client_knowledge_gbrain.') "
+        "and name.rsplit('.',1)[-1] in {'notion_archive','extraction','interpretation',"
+        "'assimilation','review','honcho_projection'})}))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        env={**os.environ, "HERMES_HOME": str(home)},
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    lines = [json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")]
+    assert lines[-1] == {"downstream_modules_imported": [], "exit_code": None}
+    assert lines[0]["filesystem_writes"] is False
+    assert not ledger.exists()

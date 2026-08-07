@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any
 
 from .store import IntakeStore, resolve_store_path
@@ -133,6 +134,36 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
         print(json.dumps({"error_class": "usage"}, sort_keys=True))
         return 2
     try:
+        if action == "run-once" and bool(getattr(args, "dry_run", False)):
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+            raw = config.get("client_knowledge", {})
+            raw = raw if isinstance(raw, dict) else {}
+            stages = {
+                name: bool((raw.get(name) or {}).get("enabled", False))
+                for name in (
+                    "notion", "extraction", "interpretation", "assimilation",
+                    "review_notifications", "honcho_projection",
+                )
+                if isinstance(raw.get(name) or {}, dict)
+            }
+            path_arg = str(getattr(args, "db_path", "") or "").strip()
+            ledger_path = (
+                resolve_store_path()
+                if not path_arg
+                else Path(path_arg).expanduser()
+            )
+            if path_arg and not ledger_path.is_absolute():
+                raise ValueError("db_path must be absolute")
+            print(json.dumps({
+                "mode": "dry_run",
+                "downstream_writes": False,
+                "filesystem_writes": False,
+                "ledger_exists": ledger_path.is_file(),
+                "stages": stages,
+            }, sort_keys=True))
+            return 0
         store = _store(getattr(args, "db_path", ""))
         if action == "status":
             print(json.dumps({"stats": store.stats()}, sort_keys=True))
@@ -211,27 +242,6 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             print(json.dumps(result, sort_keys=True))
             return 0
         if action == "run-once":
-            if bool(getattr(args, "dry_run", False)):
-                from hermes_cli.config import load_config
-
-                config = load_config() or {}
-                raw = config.get("client_knowledge", {})
-                raw = raw if isinstance(raw, dict) else {}
-                stages = {
-                    name: bool((raw.get(name) or {}).get("enabled", False))
-                    for name in (
-                        "notion", "extraction", "interpretation", "assimilation",
-                        "review_notifications", "honcho_projection",
-                    )
-                    if isinstance(raw.get(name) or {}, dict)
-                }
-                print(json.dumps({
-                    "mode": "dry_run",
-                    "downstream_writes": False,
-                    "stages": stages,
-                    "stats": store.stats(),
-                }, sort_keys=True))
-                return 0
             from agent.plugin_llm import PluginLlm
             from hermes_cli.config import load_config
             from .derived import DerivedStore

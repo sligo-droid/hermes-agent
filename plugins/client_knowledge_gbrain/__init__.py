@@ -12,6 +12,14 @@ from plugins.client_knowledge_gbrain.tools import (
 from plugins.client_knowledge_gbrain.cli import client_knowledge_command, register_cli
 
 
+def _handle_review_command(*args, **kwargs):
+    from plugins.client_knowledge_gbrain.review import (
+        handle_client_knowledge_review_command,
+    )
+
+    return handle_client_knowledge_review_command(*args, **kwargs)
+
+
 def register(ctx) -> None:
     """Register the two bounded read-only tools and operator-only controls."""
     ctx.register_tool(
@@ -32,13 +40,9 @@ def register(ctx) -> None:
             "Operator-only queue, bounded Gmail polling, and Notion archive controls."
         ),
     )
-    from plugins.client_knowledge_gbrain.review import (
-        handle_client_knowledge_review_command,
-    )
-
     ctx.register_command(
         name="client-knowledge",
-        handler=handle_client_knowledge_review_command,
+        handler=_handle_review_command,
         description="Approve or reject a client-knowledge review.",
         args_hint="approve|reject <review-id> [reason]",
     )
