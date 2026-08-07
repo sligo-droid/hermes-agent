@@ -35,6 +35,35 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     reconcile = subs.add_parser("reconcile", help="Recover stale intake leases")
     reconcile.add_argument("--db-path", default="")
 
+    reviews = subs.add_parser("reviews", help="List pending redacted reviews")
+    reviews.add_argument("--db-path", default="")
+
+    notify = subs.add_parser(
+        "notify-reviews-once", help="Attempt bounded pending Discord review delivery"
+    )
+    notify.add_argument("--db-path", default="")
+
+    adopt_review = subs.add_parser(
+        "adopt-review-message", help="Verify and adopt one exact uncertain Discord review message"
+    )
+    adopt_review.add_argument("--review-id", required=True)
+    adopt_review.add_argument("--message-id", required=True)
+    adopt_review.add_argument("--db-path", default="")
+
+    requeue_review = subs.add_parser(
+        "requeue-review-notification",
+        help="Requeue an uncertain review after the operator proves no message exists",
+    )
+    requeue_review.add_argument("--review-id", required=True)
+    requeue_review.add_argument("--confirm-absent", action="store_true")
+    requeue_review.add_argument("--db-path", default="")
+
+    honcho = subs.add_parser(
+        "reconcile-honcho", help="Adopt deterministic Honcho projection markers"
+    )
+    honcho.add_argument("--project", required=True)
+    honcho.add_argument("--db-path", default="")
+
     run_once = subs.add_parser(
         "run-once",
         help="Run bounded Notion, extraction, and interpretation stages",
@@ -125,12 +154,66 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
         if action == "reconcile":
             print(json.dumps({"recovered": store.reconcile(), "stats": store.stats()}, sort_keys=True))
             return 0
+        if action == "reviews":
+            reviews = store.list_pending_reviews(limit=50)
+            print(json.dumps({
+                "reviews": [
+                    {
+                        "review_id": row["review_id"],
+                        "artifact_id": row["artifact_id"],
+                        "project_key": row["project_key"],
+                        "state": row["state"],
+                        "reason_code": row["reason_code"],
+                        "notification_state": row["notification_state"],
+                    }
+                    for row in reviews
+                ]
+            }, sort_keys=True))
+            return 0
+        if action == "notify-reviews-once":
+            from .derived import DerivedStore
+            from .review import run_notification_once
+
+            result = run_notification_once(store=store, derived=DerivedStore())
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if action == "adopt-review-message":
+            from .review import fetch_and_reconcile_notification
+
+            changed = fetch_and_reconcile_notification(
+                store, str(args.review_id), str(args.message_id)
+            )
+            print(json.dumps({"review_id": str(args.review_id), "adopted": changed}, sort_keys=True))
+            return 0 if changed else 1
+        if action == "requeue-review-notification":
+            if not bool(args.confirm_absent):
+                raise ValueError("operator absence confirmation is required")
+            changed = store.requeue_review_notification(str(args.review_id))
+            print(json.dumps({"review_id": str(args.review_id), "requeued": changed}, sort_keys=True))
+            return 0 if changed else 1
+        if action == "reconcile-honcho":
+            from hermes_cli.config import load_config
+            from .client import GBrainClient, load_settings
+            from .honcho_projection import reconcile_honcho_project
+
+            config = load_config() or {}
+            result = reconcile_honcho_project(
+                store=store,
+                client=GBrainClient(load_settings(config)),
+                project_key=str(args.project),
+                config=config,
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0
         if action == "run-once":
             from agent.plugin_llm import PluginLlm
             from hermes_cli.config import load_config
             from .derived import DerivedStore
             from .extraction import run_extraction_once
             from .interpretation import run_interpretation_once
+            from .assimilation import run_assimilation_once
+            from .honcho_projection import run_honcho_projection_once
+            from .review import run_notification_once
             from .notion_archive import run_notion_once
             from .spool import RawSpool
 
@@ -147,6 +230,18 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                     derived=derived,
                     llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
                     config=config,
+                ),
+                "assimilation": run_assimilation_once(
+                    store=store,
+                    derived=derived,
+                    llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
+                    config=config,
+                ),
+                "review_notifications": run_notification_once(
+                    store=store, derived=derived, config=config,
+                ),
+                "honcho_projection": run_honcho_projection_once(
+                    store=store, derived=derived, config=config,
                 ),
             }
             print(json.dumps({"mode": "client_knowledge_pipeline", **result, "stats": store.stats()}, sort_keys=True))

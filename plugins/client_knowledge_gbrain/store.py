@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
@@ -695,6 +695,94 @@ class IntakeStore:
                         "VALUES('schema_version', '7')"
                     )
                     version = 7
+                if version < 8:
+                    statements = (
+                        """CREATE TABLE IF NOT EXISTS assimilation_proposals (
+                            assimilation_id TEXT PRIMARY KEY,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            interpretation_id TEXT NOT NULL REFERENCES interpretations(interpretation_id),
+                            assimilation_version TEXT NOT NULL,
+                            schema_version TEXT NOT NULL,
+                            prompt_version TEXT NOT NULL,
+                            policy_version TEXT NOT NULL,
+                            project_key TEXT NOT NULL,
+                            proposal_sha256 TEXT NOT NULL,
+                            derived_storage_id TEXT NOT NULL,
+                            derived_object_key TEXT NOT NULL,
+                            output_sha256 TEXT NOT NULL,
+                            output_bytes INTEGER NOT NULL,
+                            actual_provider TEXT NOT NULL,
+                            actual_model TEXT NOT NULL,
+                            selected_provider TEXT NOT NULL,
+                            selected_model TEXT NOT NULL,
+                            model_tier TEXT NOT NULL,
+                            route_fingerprint TEXT NOT NULL,
+                            review_required INTEGER NOT NULL,
+                            review_reason TEXT NOT NULL,
+                            base_git_head TEXT NOT NULL,
+                            git_commit_sha TEXT,
+                            sync_verified INTEGER NOT NULL DEFAULT 0,
+                            created_at REAL NOT NULL,
+                            UNIQUE(artifact_id, assimilation_version)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_reviews (
+                            review_id TEXT PRIMARY KEY,
+                            assimilation_id TEXT NOT NULL UNIQUE REFERENCES assimilation_proposals(assimilation_id) ON DELETE CASCADE,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            project_key TEXT NOT NULL,
+                            proposal_sha256 TEXT NOT NULL,
+                            assimilation_version TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            reason_code TEXT NOT NULL,
+                            notification_state TEXT NOT NULL DEFAULT 'pending',
+                            notification_content_sha256 TEXT,
+                            notification_message_id TEXT,
+                            notification_guild_id TEXT,
+                            notification_channel_id TEXT,
+                            notification_role_id TEXT,
+                            notification_marker TEXT,
+                            reviewer_user_id TEXT,
+                            reviewer_role_id TEXT,
+                            decision_message_id TEXT,
+                            decision_reason TEXT,
+                            decided_at REAL,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS publication_transactions (
+                            assimilation_id TEXT PRIMARY KEY REFERENCES assimilation_proposals(assimilation_id) ON DELETE CASCADE,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            assimilation_version TEXT NOT NULL,
+                            proposal_sha256 TEXT NOT NULL,
+                            branch_ref TEXT NOT NULL,
+                            expected_head TEXT NOT NULL,
+                            commit_sha TEXT,
+                            state TEXT NOT NULL,
+                            manifest_json TEXT NOT NULL,
+                            error_class TEXT,
+                            updated_at REAL NOT NULL
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS honcho_projections (
+                            projection_key TEXT PRIMARY KEY,
+                            project_key TEXT NOT NULL,
+                            page_slug TEXT NOT NULL,
+                            page_sha256 TEXT NOT NULL,
+                            marker TEXT NOT NULL UNIQUE,
+                            exact_content TEXT NOT NULL,
+                            conclusion_id TEXT,
+                            obsolete_conclusion_id TEXT,
+                            state TEXT NOT NULL,
+                            updated_at REAL NOT NULL,
+                            UNIQUE(project_key, page_slug)
+                        )""",
+                    )
+                    for statement in statements:
+                        conn.execute(statement)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '8')"
+                    )
+                    version = 8
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -1574,7 +1662,9 @@ class IntakeStore:
                 conn.execute("INSERT INTO interpretations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", interpretation_values)
             elif tuple(existing[name] for name in tuple(existing.keys())[:-1]) != interpretation_values[:-1]:
                 raise ValueError("interpretation identity conflicts with immutable metadata")
-            self._complete_claim_locked(conn, claim, receipt, now=now)
+            self._complete_claim_locked(
+                conn, claim, receipt, now=now, next_stage="assimilated"
+            )
 
     def persist_interpretation_envelope(
         self, claim: JobClaim, envelope: Mapping[str, Any]
@@ -1607,6 +1697,518 @@ class IntakeStore:
                 "SELECT * FROM interpretations WHERE interpretation_id=?", (interpretation_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def get_interpretation_for_assimilation_claim(
+        self, claim: JobClaim
+    ) -> tuple[IntakeArtifact, dict[str, Any], str]:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_stage_claim_locked(conn, claim, "assimilated", now=now)
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (claim.artifact_id,)
+            ).fetchone()
+            receipt = conn.execute(
+                "SELECT receipt_id FROM stage_receipts WHERE artifact_id=? AND stage='interpreted'",
+                (claim.artifact_id,),
+            ).fetchone()
+            notion = conn.execute(
+                "SELECT receipt_id FROM stage_receipts WHERE artifact_id=? AND stage='notion_archived'",
+                (claim.artifact_id,),
+            ).fetchone()
+            if artifact is None or receipt is None or not str(receipt[0]).startswith(
+                "interpretation:"
+            ):
+                raise ValueError("assimilation claim lacks a versioned interpretation")
+            if notion is None or not str(notion[0]).startswith("notion:page:"):
+                raise ValueError("assimilation claim lacks its Notion source citation")
+            interpretation_id = str(receipt[0]).split(":", 1)[1]
+            interpretation = conn.execute(
+                "SELECT * FROM interpretations WHERE interpretation_id=?",
+                (interpretation_id,),
+            ).fetchone()
+            if interpretation is None:
+                raise ValueError("versioned interpretation metadata is missing")
+            return (
+                self._artifact_from_row(artifact),
+                dict(interpretation),
+                str(notion[0]),
+            )
+
+    def get_assimilation(self, assimilation_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM assimilation_proposals WHERE assimilation_id=?",
+                (assimilation_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_assimilation_for_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM assimilation_proposals WHERE artifact_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (artifact_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def persist_assimilation_proposal(
+        self, claim: JobClaim, row: Mapping[str, Any]
+    ) -> None:
+        now = time.time()
+        values = (
+            row["assimilation_id"], row["artifact_id"], row["interpretation_id"],
+            row["assimilation_version"], row["schema_version"], row["prompt_version"],
+            row["policy_version"], row["project_key"], row["proposal_sha256"],
+            row["derived_storage_id"], row["derived_object_key"], row["output_sha256"],
+            int(row["output_bytes"]), row["actual_provider"], row["actual_model"],
+            row["selected_provider"], row["selected_model"], row["model_tier"],
+            row["route_fingerprint"], int(bool(row["review_required"])),
+            row["review_reason"], row["base_git_head"], row.get("git_commit_sha") or None,
+            int(bool(row.get("sync_verified"))), now,
+        )
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "assimilated", now=now)
+            existing = conn.execute(
+                "SELECT * FROM assimilation_proposals WHERE assimilation_id=?",
+                (row["assimilation_id"],),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO assimilation_proposals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+            else:
+                immutable = tuple(existing[name] for name in tuple(existing.keys())[:22])
+                if immutable != values[:22]:
+                    raise ValueError("assimilation identity conflicts with immutable metadata")
+
+    def require_assimilation_review(
+        self,
+        claim: JobClaim,
+        *,
+        assimilation_id: str,
+        review_id: str,
+        proposal_sha256: str,
+        assimilation_version: str,
+        project_key: str,
+        reason_code: str,
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "assimilated", now=now)
+            proposal = conn.execute(
+                "SELECT artifact_id FROM assimilation_proposals WHERE assimilation_id=?",
+                (assimilation_id,),
+            ).fetchone()
+            if proposal is None or proposal[0] != claim.artifact_id:
+                raise ValueError("review does not belong to the active assimilation")
+            conn.execute(
+                "INSERT OR IGNORE INTO client_knowledge_reviews("
+                "review_id, assimilation_id, artifact_id, project_key, proposal_sha256, "
+                "assimilation_version, state, reason_code, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,'pending',?,?,?)",
+                (
+                    review_id, assimilation_id, claim.artifact_id, project_key,
+                    proposal_sha256, assimilation_version, reason_code, now, now,
+                ),
+            )
+            review = conn.execute(
+                "SELECT assimilation_id, proposal_sha256, state FROM client_knowledge_reviews "
+                "WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if review is None or review[0] != assimilation_id or review[1] != proposal_sha256:
+                raise ValueError("review identity conflicts with immutable proposal")
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                "last_error_class, created_at, updated_at) VALUES(?,?,?,'operator_blocked',?,?,?,?)",
+                (
+                    secrets.token_hex(16), claim.artifact_id, "needs_review",
+                    DEFAULT_MAX_ATTEMPTS, "review_pending", now, now,
+                ),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='queued', claim_token=NULL, owner_pid=NULL, owner_host=NULL, "
+                "owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, next_retry_at=NULL, "
+                "last_error_class='review_pending', updated_at=? WHERE job_id=? AND claim_token=?",
+                (now, claim.job_id, claim.claim_token),
+            )
+
+    def get_review(self, review_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_reviews WHERE review_id=?", (review_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_pending_reviews(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM client_knowledge_reviews WHERE state='pending' "
+                    "ORDER BY created_at LIMIT ?", (max(1, min(limit, 500)),)
+                ).fetchall()
+            ]
+
+    def record_review_notification(
+        self,
+        review_id: str,
+        *,
+        state: str,
+        content_sha256: str,
+        guild_id: str,
+        channel_id: str,
+        role_id: str,
+        marker: str,
+        message_id: str = "",
+    ) -> None:
+        if state not in {"pending", "confirmed", "proven_none", "uncertain"}:
+            raise ValueError("invalid review notification state")
+        now = time.time()
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT notification_content_sha256, notification_guild_id, "
+                "notification_channel_id, notification_role_id, notification_marker, "
+                "notification_message_id FROM client_knowledge_reviews WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("review does not exist")
+            expected = (content_sha256, guild_id, channel_id, role_id, marker)
+            actual = tuple(str(value or "") for value in row[:5])
+            if any(actual) and actual != expected:
+                raise ValueError("notification identity conflicts with existing review")
+            if row[5] and message_id and row[5] != message_id:
+                raise ValueError("review already has a different Discord message id")
+            conn.execute(
+                "UPDATE client_knowledge_reviews SET notification_state=?, "
+                "notification_content_sha256=?, notification_message_id=COALESCE(notification_message_id, ?), "
+                "notification_guild_id=?, notification_channel_id=?, notification_role_id=?, "
+                "notification_marker=?, updated_at=? WHERE review_id=?",
+                (
+                    state, content_sha256, message_id or None, guild_id, channel_id,
+                    role_id, marker, now, review_id,
+                ),
+            )
+
+    def claim_review_notification(
+        self,
+        review_id: str,
+        *,
+        content_sha256: str,
+        guild_id: str,
+        channel_id: str,
+        role_id: str,
+        marker: str,
+    ) -> bool:
+        """Reserve the one Discord POST by durably entering uncertainty first."""
+        now = time.time()
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT state, notification_state, notification_content_sha256, "
+                "notification_guild_id, notification_channel_id, notification_role_id, "
+                "notification_marker FROM client_knowledge_reviews WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if row is None or row[0] != "pending" or row[1] not in {
+                "pending",
+                "proven_none",
+            }:
+                return False
+            expected = (content_sha256, guild_id, channel_id, role_id, marker)
+            actual = tuple(str(value or "") for value in row[2:])
+            if any(actual) and actual != expected:
+                raise ValueError("notification identity conflicts with existing review")
+            updated = conn.execute(
+                "UPDATE client_knowledge_reviews SET notification_state='uncertain', "
+                "notification_content_sha256=?, notification_guild_id=?, "
+                "notification_channel_id=?, notification_role_id=?, notification_marker=?, "
+                "updated_at=? WHERE review_id=? AND state='pending' "
+                "AND notification_state IN ('pending','proven_none')",
+                (
+                    content_sha256,
+                    guild_id,
+                    channel_id,
+                    role_id,
+                    marker,
+                    now,
+                    review_id,
+                ),
+            ).rowcount
+            return updated == 1
+
+    def decide_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+        reviewer_user_id: str,
+        reviewer_role_id: str,
+        decision_message_id: str,
+        reason: str = "",
+    ) -> bool:
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("review decision must be approved or rejected")
+        now = time.time()
+        with self._write() as conn:
+            review = conn.execute(
+                "SELECT artifact_id, state, notification_state, notification_message_id "
+                "FROM client_knowledge_reviews WHERE review_id=?", (review_id,)
+            ).fetchone()
+            if review is None or review[1] != "pending":
+                return False
+            if review[2] != "confirmed" or not review[3]:
+                raise ValueError("review notification is not confirmed")
+            conn.execute(
+                "UPDATE client_knowledge_reviews SET state=?, reviewer_user_id=?, reviewer_role_id=?, "
+                "decision_message_id=?, decision_reason=?, decided_at=?, updated_at=? "
+                "WHERE review_id=? AND state='pending'",
+                (
+                    decision, reviewer_user_id, reviewer_role_id or None,
+                    decision_message_id, reason or None, now, now, review_id,
+                ),
+            )
+            if decision == "approved":
+                conn.execute(
+                    "UPDATE jobs SET status='succeeded', last_error_class=NULL, updated_at=? "
+                    "WHERE artifact_id=? AND stage='needs_review' AND status!='succeeded'",
+                    (now, review[0]),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO stage_receipts(artifact_id, stage, receipt_id, recorded_at) "
+                    "VALUES(?,?,?,?)",
+                    (review[0], "needs_review", f"review:{review_id}:approved", now),
+                )
+                conn.execute(
+                    "UPDATE jobs SET status='queued', attempt_count=0, next_retry_at=NULL, "
+                    "last_error_class=NULL, updated_at=? WHERE artifact_id=? AND stage='assimilated' "
+                    "AND status IN ('queued','failed','operator_blocked')",
+                    (now, review[0]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET status='succeeded', last_error_class=NULL, updated_at=? "
+                    "WHERE artifact_id=? AND stage='needs_review'",
+                    (now, review[0]),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO stage_receipts(artifact_id, stage, receipt_id, recorded_at) "
+                    "VALUES(?,?,?,?)",
+                    (review[0], "needs_review", f"review:{review_id}:rejected", now),
+                )
+                conn.execute(
+                    "UPDATE jobs SET status='quarantined', next_retry_at=NULL, "
+                    "last_error_class='review_rejected', updated_at=? "
+                    "WHERE artifact_id=? AND stage='assimilated'",
+                    (now, review[0]),
+                )
+            return True
+
+    def record_publication(
+        self,
+        *,
+        assimilation_id: str,
+        artifact_id: str,
+        assimilation_version: str,
+        proposal_sha256: str,
+        branch_ref: str,
+        expected_head: str,
+        manifest_json: str,
+        state: str,
+        commit_sha: str = "",
+        error_class: str = "",
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            existing = conn.execute(
+                "SELECT artifact_id, assimilation_version, proposal_sha256, branch_ref, "
+                "expected_head, manifest_json, commit_sha FROM publication_transactions "
+                "WHERE assimilation_id=?", (assimilation_id,)
+            ).fetchone()
+            identity = (
+                artifact_id, assimilation_version, proposal_sha256, branch_ref,
+                expected_head, manifest_json,
+            )
+            if existing is not None and tuple(existing[:6]) != identity:
+                raise ValueError("publication identity conflicts with immutable proposal")
+            if existing is not None and existing[6] and commit_sha and existing[6] != commit_sha:
+                raise ValueError("publication commit identity conflicts")
+            conn.execute(
+                "INSERT INTO publication_transactions(assimilation_id, artifact_id, assimilation_version, "
+                "proposal_sha256, branch_ref, expected_head, commit_sha, state, manifest_json, error_class, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(assimilation_id) DO UPDATE SET "
+                "commit_sha=COALESCE(publication_transactions.commit_sha, excluded.commit_sha), "
+                "state=excluded.state, error_class=excluded.error_class, updated_at=excluded.updated_at",
+                (
+                    assimilation_id, artifact_id, assimilation_version, proposal_sha256,
+                    branch_ref, expected_head, commit_sha or None, state, manifest_json,
+                    error_class or None, now,
+                ),
+            )
+
+    def get_publication(self, assimilation_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM publication_transactions WHERE assimilation_id=?",
+                (assimilation_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def complete_assimilation(
+        self,
+        claim: JobClaim,
+        *,
+        assimilation_id: str,
+        commit_sha: str,
+        output_sha256: str,
+        next_stage: str = "honcho_projected",
+        sync_verified: bool = True,
+    ) -> None:
+        now = time.time()
+        receipt = StageReceipt(
+            claim.artifact_id, "assimilated", f"assimilation:{assimilation_id}:{commit_sha}",
+            output_sha256, recorded_at=now,
+        )
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "assimilated", now=now)
+            conn.execute(
+                "UPDATE assimilation_proposals SET git_commit_sha=?, sync_verified=? "
+                "WHERE assimilation_id=?",
+                (commit_sha or None, int(sync_verified), assimilation_id),
+            )
+            if next_stage != "complete":
+                self._complete_claim_locked(
+                    conn, claim, receipt, now=now, next_stage=next_stage
+                )
+                return
+            self._complete_claim_locked(conn, claim, receipt, now=now)
+            conn.execute(
+                "INSERT OR IGNORE INTO stage_receipts"
+                "(artifact_id, stage, receipt_id, output_sha256, recorded_at) VALUES(?,?,?,?,?)",
+                (
+                    claim.artifact_id,
+                    "honcho_projected",
+                    f"honcho:none:{assimilation_id}",
+                    output_sha256,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    secrets.token_hex(16),
+                    claim.artifact_id,
+                    "complete",
+                    "queued",
+                    DEFAULT_MAX_ATTEMPTS,
+                    now,
+                    now,
+                ),
+            )
+
+    def requeue_review_notification(self, review_id: str) -> bool:
+        """Operator-confirmed reset after proving an uncertain POST did not land."""
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_reviews SET notification_state='proven_none', "
+                "notification_message_id=NULL, updated_at=? WHERE review_id=? "
+                "AND state='pending' AND notification_state='uncertain'",
+                (now, review_id),
+            ).rowcount == 1
+
+    def upsert_honcho_projection(
+        self,
+        *,
+        projection_key: str,
+        project_key: str,
+        page_slug: str,
+        page_sha256: str,
+        marker: str,
+        exact_content: str,
+        state: str,
+        conclusion_id: str = "",
+        obsolete_conclusion_id: str = "",
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT project_key, page_slug, marker FROM honcho_projections "
+                "WHERE projection_key=?", (projection_key,)
+            ).fetchone()
+            if row is not None and tuple(row) != (project_key, page_slug, marker):
+                raise ValueError("Honcho projection identity conflicts")
+            conn.execute(
+                "INSERT INTO honcho_projections(projection_key, project_key, page_slug, page_sha256, "
+                "marker, exact_content, conclusion_id, obsolete_conclusion_id, state, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(projection_key) DO UPDATE SET "
+                "page_sha256=excluded.page_sha256, exact_content=excluded.exact_content, "
+                "conclusion_id=excluded.conclusion_id, "
+                "obsolete_conclusion_id=excluded.obsolete_conclusion_id, "
+                "state=excluded.state, updated_at=excluded.updated_at",
+                (
+                    projection_key, project_key, page_slug, page_sha256, marker,
+                    exact_content, conclusion_id or None, obsolete_conclusion_id or None,
+                    state, now,
+                ),
+            )
+
+    def get_honcho_projection(self, project_key: str, page_slug: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM honcho_projections WHERE project_key=? AND page_slug=?",
+                (project_key, page_slug),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_honcho_projections(self, project_key: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM honcho_projections WHERE project_key=? ORDER BY page_slug",
+                (project_key,),
+            ).fetchall()]
+
+    def get_assimilation_for_projection_claim(
+        self, claim: JobClaim
+    ) -> tuple[IntakeArtifact, dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_stage_claim_locked(conn, claim, "honcho_projected", now=now)
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (claim.artifact_id,)
+            ).fetchone()
+            receipt = conn.execute(
+                "SELECT receipt_id FROM stage_receipts WHERE artifact_id=? AND stage='assimilated'",
+                (claim.artifact_id,),
+            ).fetchone()
+            if artifact is None or receipt is None or not str(receipt[0]).startswith(
+                "assimilation:"
+            ):
+                raise ValueError("projection claim lacks a verified assimilation")
+            parts = str(receipt[0]).split(":")
+            if len(parts) < 3:
+                raise ValueError("assimilation receipt is invalid")
+            assimilation = conn.execute(
+                "SELECT * FROM assimilation_proposals WHERE assimilation_id=?", (parts[1],)
+            ).fetchone()
+            if assimilation is None or not int(assimilation["sync_verified"]):
+                raise ValueError("projection claim lacks verified GBrain sync")
+            return self._artifact_from_row(artifact), dict(assimilation)
+
+    def complete_honcho_projection(
+        self, claim: JobClaim, *, receipt_id: str, output_sha256: str
+    ) -> None:
+        now = time.time()
+        receipt = StageReceipt(
+            claim.artifact_id, "honcho_projected", receipt_id, output_sha256,
+            recorded_at=now,
+        )
+        with self._write() as conn:
+            self._complete_claim_locked(
+                conn, claim, receipt, now=now, next_stage="complete"
+            )
 
     def list_child_artifacts_for_notion_claim(
         self, job_id: str, claim_token: str, artifact_id: str

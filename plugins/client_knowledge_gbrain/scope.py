@@ -14,6 +14,8 @@ VALID_KINDS = frozenset(
 )
 VALID_CONFIDENCE = frozenset({"low", "medium", "high"})
 VALID_SENSITIVITY = frozenset({"public", "internal", "confidential", "restricted"})
+VALID_IMPACTS = frozenset({"ordinary", "high"})
+VALID_PROJECTION_POLICIES = frozenset({"eligible", "ineligible"})
 NOTION_REF_RE = re.compile(r"^notion:page:[A-Za-z0-9_-]{1,200}$")
 
 
@@ -132,6 +134,12 @@ def validate_frontmatter(
         raise ClientKnowledgeValidationError("frontmatter.confidence is not supported")
     if sensitivity not in VALID_SENSITIVITY:
         raise ClientKnowledgeValidationError("frontmatter.sensitivity is not supported")
+    impact = frontmatter.get("impact")
+    if impact is not None and impact not in VALID_IMPACTS:
+        raise ClientKnowledgeValidationError("frontmatter.impact is not supported")
+    projection = frontmatter.get("honcho_projection")
+    if projection is not None and projection not in VALID_PROJECTION_POLICIES:
+        raise ClientKnowledgeValidationError("frontmatter.honcho_projection is not supported")
     _require_string(frontmatter, "effective_at")
     _require_string(frontmatter, "updated_at")
     validate_source_refs(frontmatter.get("source_refs"))
@@ -204,7 +212,7 @@ def citations_from_frontmatter(frontmatter: dict[str, Any]) -> list[str]:
 
 def public_frontmatter(frontmatter: dict[str, Any], *, max_items: int = 20) -> dict[str, Any]:
     """Return only validated, bounded fields safe for the tool response."""
-    return {
+    result = {
         "project": frontmatter["project"],
         "status": frontmatter["status"],
         "kind": frontmatter["kind"],
@@ -215,3 +223,8 @@ def public_frontmatter(frontmatter: dict[str, Any], *, max_items: int = 20) -> d
         "confidence": frontmatter["confidence"],
         "sensitivity": frontmatter["sensitivity"],
     }
+    if frontmatter.get("impact") in VALID_IMPACTS:
+        result["impact"] = frontmatter["impact"]
+    if frontmatter.get("honcho_projection") in VALID_PROJECTION_POLICIES:
+        result["honcho_projection"] = frontmatter["honcho_projection"]
+    return result

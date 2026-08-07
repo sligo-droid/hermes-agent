@@ -303,7 +303,7 @@ def test_schema_migrates_existing_store_to_spool_storage_identity(tmp_path):
     with migrated._connect() as conn:
         assert conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "7"
+        ).fetchone()[0] == "8"
         assert "spool_storage_id" in {
             row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }
@@ -690,10 +690,43 @@ def test_external_receipts_and_cursors_are_idempotent(tmp_path):
     assert store.get_cursor("gmail.history") == "cursor-1"
 
 
+def test_noop_assimilation_skips_honcho_and_queues_complete(tmp_path):
+    store = IntakeStore(tmp_path / "intake.db")
+    spool = RawSpool(tmp_path / "raw")
+    artifact = _artifact()
+    spool.preserve_artifact(artifact, [b"raw"])
+    store.insert_artifact(artifact)
+    store.add_job(artifact.artifact_id, "assimilated")
+    with store._write() as conn:
+        conn.execute(
+            "INSERT INTO stage_receipts(artifact_id, stage, receipt_id, recorded_at) "
+            "VALUES(?,?,?,?)",
+            (artifact.artifact_id, "interpreted", "interpretation:" + "b" * 64, 1),
+        )
+    claim = store.claim_next(stage="assimilated", spool=spool)
+    assert claim is not None
+    store.complete_assimilation(
+        claim, assimilation_id="a" * 64, commit_sha="none", output_sha256="c" * 64,
+        next_stage="complete", sync_verified=False,
+    )
+    with store._connect() as conn:
+        stages = dict(conn.execute(
+            "SELECT stage, receipt_id FROM stage_receipts WHERE artifact_id=?",
+            (artifact.artifact_id,),
+        ).fetchall())
+        jobs = dict(conn.execute(
+            "SELECT stage, status FROM jobs WHERE artifact_id=?",
+            (artifact.artifact_id,),
+        ).fetchall())
+    assert stages["honcho_projected"] == "honcho:none:" + "a" * 64
+    assert jobs["complete"] == "queued"
+    assert "honcho_projected" not in jobs
+
+
 def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch):
     import plugins.client_knowledge_gbrain as plugin
 
-    calls = {"tools": [], "cli": [], "aux": []}
+    calls = {"tools": [], "cli": [], "commands": [], "aux": []}
 
     class Context:
         def register_tool(self, **kwargs):
@@ -702,12 +735,16 @@ def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch
         def register_cli_command(self, **kwargs):
             calls["cli"].append(kwargs["name"])
 
+        def register_command(self, **kwargs):
+            calls["commands"].append(kwargs["name"])
+
         def register_auxiliary_task(self, **kwargs):
             calls["aux"].append((kwargs["key"], kwargs["defaults"]))
 
     plugin.register(Context())
     assert calls["tools"] == ["client_knowledge_search", "client_knowledge_get"]
     assert calls["cli"] == ["client-knowledge"]
+    assert calls["commands"] == ["client-knowledge"]
     assert calls["aux"] == [
         (
             "client_knowledge_interpret",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,8 @@ class GBrainSettings:
     executable: Path
     home: Path
     checkout: Path | None = None
+    source_checkout: Path | None = None
+    source_branch: str = "main"
     args: tuple[str, ...] = ()
     source_id: str = DEFAULT_SOURCE_ID
     timeout_seconds: float = 30.0
@@ -44,6 +47,8 @@ def load_settings(config: Mapping[str, Any] | None = None) -> GBrainSettings:
     executable = Path(str(block.get("executable") or "")).expanduser()
     home = Path(str(block.get("home") or "")).expanduser()
     checkout = Path(str(block.get("checkout") or "")).expanduser()
+    source_checkout_raw = str(block.get("source_checkout") or "").strip()
+    source_checkout = Path(source_checkout_raw).expanduser() if source_checkout_raw else None
     if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise ClientKnowledgeValidationError(
             "client_knowledge.gbrain.executable must be an absolute executable path"
@@ -60,6 +65,15 @@ def load_settings(config: Mapping[str, Any] | None = None) -> GBrainSettings:
     source_id = str(block.get("source_id") or DEFAULT_SOURCE_ID).strip()
     if source_id != DEFAULT_SOURCE_ID:
         raise ClientKnowledgeValidationError("client knowledge source_id must be client-knowledge")
+    if source_checkout is not None:
+        if not source_checkout.is_absolute():
+            raise ClientKnowledgeValidationError(
+                "client_knowledge.gbrain.source_checkout must be an absolute path"
+            )
+        _assert_nonsymlink_directory(source_checkout, "configured GBrain source checkout")
+    source_branch = str(block.get("source_branch") or "main").strip()
+    if not source_branch or any(ch.isspace() or ord(ch) < 32 for ch in source_branch):
+        raise ClientKnowledgeValidationError("GBrain source branch is invalid")
     timeout = float(block.get("timeout_seconds") or 30)
     max_context = int(block.get("max_context_chars") or 8_000)
     raw_args = block.get("args") or []
@@ -82,11 +96,33 @@ def load_settings(config: Mapping[str, Any] | None = None) -> GBrainSettings:
         executable=executable.resolve(),
         home=home.resolve(),
         checkout=checkout,
+        source_checkout=source_checkout,
+        source_branch=source_branch,
         args=resolved_args,
         source_id=source_id,
         timeout_seconds=max(1.0, min(timeout, 120.0)),
         max_context_chars=max(1_000, min(max_context, 32_000)),
     )
+
+
+def _assert_nonsymlink_directory(path: Path, label: str) -> Path:
+    """Reject symlink roots/components before resolving filesystem identity."""
+    if not path.is_absolute():
+        raise ClientKnowledgeValidationError(f"{label} must be absolute")
+    if any(part in {".", ".."} for part in path.parts):
+        raise ClientKnowledgeValidationError(f"{label} may not contain dot components")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            item = os.lstat(current)
+        except OSError as exc:
+            raise ClientKnowledgeValidationError(f"{label} does not exist") from exc
+        if stat.S_ISLNK(item.st_mode):
+            raise ClientKnowledgeValidationError(f"{label} may not contain symlinks")
+        if not stat.S_ISDIR(item.st_mode):
+            raise ClientKnowledgeValidationError(f"{label} must be a directory")
+    return path
 
 
 def client_knowledge_environment(settings: GBrainSettings) -> dict[str, str]:
@@ -135,6 +171,36 @@ class GBrainClient:
             return json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("pinned GBrain returned malformed JSON") from exc
+
+    def list_sources(self) -> list[dict[str, Any]]:
+        result = self._run(["sources", "list", "--json"])
+        if isinstance(result, dict):
+            result = result.get("sources")
+        if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+            raise RuntimeError("pinned GBrain source list did not return a source array")
+        return result
+
+    def assert_source_checkout(self) -> Path:
+        configured = self.settings.source_checkout
+        if configured is None:
+            raise RuntimeError("client knowledge source checkout is not configured")
+        _assert_nonsymlink_directory(configured, "configured GBrain source checkout")
+        matches = [
+            item for item in self.list_sources()
+            if str(item.get("id") or item.get("source_id") or "") == self.settings.source_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("pinned GBrain must expose exactly one client-knowledge source")
+        raw = matches[0].get("local_path")
+        if not isinstance(raw, str) or not raw.strip():
+            raise RuntimeError("pinned GBrain source is missing local_path")
+        listed = Path(raw)
+        _assert_nonsymlink_directory(listed, "GBrain source local_path")
+        configured_real = Path(os.path.realpath(configured))
+        listed_real = Path(os.path.realpath(listed))
+        if configured_real != listed_real or not os.path.samefile(configured, listed):
+            raise RuntimeError("GBrain source local_path does not match the configured checkout")
+        return configured_real
 
     def assert_pinned_version(self) -> None:
         bun = subprocess.run(
@@ -223,7 +289,15 @@ class GBrainClient:
         ):
             raise RuntimeError("GBrain search.mcp_keyword_only must read back as true")
 
+    def assert_runtime_ready(self) -> Path:
+        """Reprove the pinned executable, checkout, config, and source boundary."""
+        self.assert_pinned_version()
+        self.assert_pinned_checkout()
+        self.assert_keyword_only()
+        return self.assert_source_checkout()
+
     def search(self, query: str, *, limit: int) -> list[dict[str, Any]]:
+        self.assert_runtime_ready()
         payload = json.dumps({"query": query, "limit": limit}, separators=(",", ":"))
         result = self._run(
             ["call", "--source", self.settings.source_id, "search", payload]
@@ -233,10 +307,23 @@ class GBrainClient:
         return result
 
     def get_page(self, slug: str) -> dict[str, Any]:
+        self.assert_runtime_ready()
         payload = json.dumps({"slug": slug, "fuzzy": False}, separators=(",", ":"))
         result = self._run(
             ["call", "--source", self.settings.source_id, "get_page", payload]
         )
         if not isinstance(result, dict):
             raise RuntimeError("pinned GBrain get_page did not return an object")
+        return result
+
+    def sync_no_pull(self) -> dict[str, Any]:
+        self.assert_runtime_ready()
+        result = self._run(
+            [
+                "sync", "--source", self.settings.source_id, "--no-pull",
+                "--no-embed", "--yes", "--json",
+            ]
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("pinned GBrain sync did not return an object")
         return result

@@ -169,3 +169,15 @@ def test_metadata_can_allow_specific_role_mentions_without_everyone():
     assert [role.id for role in am.roles] == [1503914570077442058]
     assert am.users is True
     assert am.replied_user is True
+
+
+def test_strict_metadata_allows_only_specific_roles():
+    am = _allowed_mentions_for_metadata({
+        "allowed_role_mentions": ["1503914570077442058"],
+        "strict_role_mentions": True,
+    })
+
+    assert am.everyone is False
+    assert [role.id for role in am.roles] == [1503914570077442058]
+    assert am.users is False
+    assert am.replied_user is False
