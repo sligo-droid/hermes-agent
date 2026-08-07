@@ -345,6 +345,79 @@ def test_legacy_email_create_with_no_reconciled_candidate_is_replaced(tmp_path, 
     assert attempts[1]["remote_filename"].endswith(".txt")
 
 
+def test_legacy_email_marker_conflict_does_not_create_replacement(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    legacy_id = "d" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    filename = f"{legacy_marker}.eml"
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=filename, upload_mode="single_part",
+        expected_part_count=1,
+    )
+    store.publish_upload_scan(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        scan_role="baseline", page_count=1, items=[],
+    )
+    store.append_upload_attempt_event(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        "create_started",
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "reconciliation", type("Evidence", (), {
+            "items": (_upload(
+                "conflict", filename, size=artifact.byte_size,
+                content_type="text/plain",
+            ),),
+            "page_count": 1,
+        })()
+    ))
+    with pytest.raises(Exception, match="conflicting metadata"):
+        worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    assert len(store.get_upload_attempts(artifact.artifact_id)) == 1
+
+
+def test_legacy_multipart_replacement_computes_new_partition(tmp_path, monkeypatch):
+    payload = b"x" * (21 * 1024 * 1024)
+    artifact = _artifact(content=payload)
+    store, spool, claim, artifact = _claim(
+        tmp_path, artifact=artifact, content=payload
+    )
+    config = _config(max_file_bytes=30 * 1024 * 1024)
+    legacy_id = "e" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=f"{legacy_marker}.eml", upload_mode="multi_part",
+        expected_part_count=2, expected_part_size=0,
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_create_or_recover_upload", lambda *_args: "upload-1")
+    worker.client = type("Client", (), {
+        "retrieve_file_upload": staticmethod(lambda _upload_id: _upload(
+            "upload-1", store.get_upload_attempts(artifact.artifact_id)[-1]["remote_filename"],
+            size=artifact.byte_size, content_type="text/plain", status="uploaded",
+            total=5, sent=5,
+        )),
+    })()
+    monkeypatch.setattr(worker, "_ensure_attachment_block", lambda *_args: "block-1")
+    worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    replacement = store.get_upload_attempts(artifact.artifact_id)[-1]
+    assert replacement["upload_mode"] == "multi_part"
+    assert replacement["expected_part_size"] == 5 * 1024 * 1024
+    assert replacement["expected_part_count"] == 5
+
+
 def test_preflight_adds_only_missing_machine_properties_and_preserves_schema(tmp_path):
     before = _schema(machine=False)
     after = _schema(machine=True)

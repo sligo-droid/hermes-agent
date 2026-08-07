@@ -707,13 +707,16 @@ class NotionArchiveWorker:
     ) -> dict[str, Any]:
         replacement_id = secrets.token_hex(16)
         replacement_marker = _marker(artifact, replacement_id)
+        part_size, part_count = _multipart_plan(
+            artifact.byte_size, self.settings.multipart_part_bytes
+        )
         replacement = self.store.reserve_upload_attempt(
             claim.job_id, claim.claim_token, artifact,
             attempt_id=replacement_id, opaque_marker=replacement_marker,
             remote_filename=f"{replacement_marker}.{_EXTENSIONS.get(artifact.mime_type, 'bin')}",
-            upload_mode=str(attempt["upload_mode"]),
-            expected_part_count=int(attempt["expected_part_count"]),
-            expected_part_size=int(attempt.get("expected_part_size") or 0),
+            upload_mode="single_part" if artifact.byte_size <= 20 * 1024 * 1024 else "multi_part",
+            expected_part_count=part_count,
+            expected_part_size=part_size,
             replaces_attempt_id=str(attempt["attempt_id"]),
             replacement_reason=reason,
             claimed_artifact_id=claimed_artifact_id,
@@ -817,8 +820,11 @@ class NotionArchiveWorker:
         baseline = {item["remote_upload_id"] for item in self.store.get_upload_scan_items(baseline_id)}
         delta = [item for item in evidence.items if str(item.get("id") or "") not in baseline]
         eligible = []
+        marker_bound = []
         for item in delta:
             parts = item.get("number_of_parts") or {}
+            if item.get("filename") == attempt["remote_filename"]:
+                marker_bound.append(item)
             if (
                 item.get("filename") == attempt["remote_filename"]
                 and item.get("content_type") in {None, _upload_content_type(artifact, attempt)}
@@ -830,6 +836,10 @@ class NotionArchiveWorker:
             ):
                 eligible.append(item)
         if not eligible:
+            if marker_bound:
+                raise NotionAmbiguousRecoveryError(
+                    "notion upload marker has conflicting metadata"
+                )
             if allow_absent:
                 return None
             raise NotionIncompleteEvidenceError(
