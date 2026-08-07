@@ -570,7 +570,6 @@ def is_storage_safe_visual_qa_args(value: Any) -> bool:
     if contract_id is not None:
         if not _EXECUTION_CONTRACT_ID_RE.fullmatch(str(contract_id)) or not assertions:
             return False
-    seen_ids: set[str] = set()
     for item in assertions:
         if not isinstance(item, dict) or set(item) != {"id", "kind"}:
             return False
@@ -578,11 +577,9 @@ def is_storage_safe_visual_qa_args(value: Any) -> bool:
         kind = str(item.get("kind") or "")
         if (
             not _HOST_ASSERTION_ID_RE.fullmatch(assertion_id)
-            or assertion_id in seen_ids
             or kind not in ASSERTION_KINDS
         ):
             return False
-        seen_ids.add(assertion_id)
     return True
 
 
