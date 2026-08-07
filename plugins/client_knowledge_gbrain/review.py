@@ -74,8 +74,8 @@ def _render_notification(
         if not isinstance(operation, Mapping):
             raise ReviewFailure("review proposal operation is invalid")
         refs = operation.get("source_refs")
-        notion_ref = bounded(refs[-1], 40) if isinstance(refs, list) and refs else ""
-        target = bounded(operation.get("target_slug"), 56)
+        notion_ref = bounded(refs[-1], 72) if isinstance(refs, list) and refs else ""
+        target = bounded(operation.get("target_slug"), 32)
         summaries.append(
             f"{index}. {operation.get('operation')} | "
             f"{target} | {notion_ref}"

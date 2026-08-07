@@ -171,6 +171,29 @@ def test_maximum_review_batch_remains_deliverable():
     assert "10. needs_review" in sent[0]
 
 
+def test_review_preserves_exact_normal_notion_page_reference():
+    store = _Store()
+    notion_ref = "notion:page:4b02af635e494840b7620ef94009b1f2"
+    sent = []
+
+    class Derived:
+        def read_json(self, *_args):
+            return {"proposal": {"operations": [{
+                "operation": "refine", "target_slug": "requirements/reporting",
+                "source_refs": [notion_ref],
+            }]}}
+
+    async def sender(**kwargs):
+        sent.append(kwargs["content"])
+        return {"success": True, "message_id": "400", "side_effect_state": "confirmed"}
+
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=Derived(), config=CFG, sender=sender,
+    ))
+    assert result["confirmed"] == 1
+    assert notion_ref in sent[0]
+
+
 def test_uncertain_delivery_adopts_exact_one_message():
     store = _Store()
     store.record_review_notification(
