@@ -1621,7 +1621,7 @@ async def test_foreman_feature_summary_uses_source_task_state_over_done_board(ad
     assert synced == "source-active"
     active_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
     assert active_fields["Status"] == "⏳ In progress"
-    message.add_reaction.assert_awaited_once_with("⏳")
+    message.add_reaction.assert_not_awaited()
 
     conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
     try:

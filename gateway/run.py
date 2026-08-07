@@ -700,6 +700,8 @@ def _gateway_flow_telemetry_fields(
     admission_ts: Optional[float] = None,
     dispatch_start_ts: Optional[float] = None,
     finished_ts: Optional[float] = None,
+    phase_timestamps: Optional[dict[str, Any]] = None,
+    phase_durations: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build sanitized flow telemetry fields without user content."""
     fields: dict[str, Any] = {"route_type": str(route_type or "mainline")}
@@ -731,6 +733,37 @@ def _gateway_flow_telemetry_fields(
         )
     if admission_ts is not None and finished_ts is not None:
         fields["total_ms"] = max(0, int((float(finished_ts) - float(admission_ts)) * 1000))
+    timestamps = phase_timestamps if isinstance(phase_timestamps, dict) else {}
+    for key in (
+        "request_ts",
+        "adapter_dispatch_ts",
+        "intake_ts",
+        "admitted_ts",
+        "agent_handler_start_ts",
+        "model_start_ts",
+        "first_commentary_ts",
+    ):
+        value = timestamps.get(key)
+        if value is not None:
+            fields[key] = round(float(value), 3)
+    phase_pairs = (
+        ("request_to_adapter_dispatch_ms", "request_ts", "adapter_dispatch_ts"),
+        ("adapter_dispatch_to_intake_ms", "adapter_dispatch_ts", "intake_ts"),
+        ("intake_to_admission_ms", "intake_ts", "admitted_ts"),
+        ("admission_to_agent_handler_ms", "admitted_ts", "agent_handler_start_ts"),
+        ("agent_handler_to_model_ms", "agent_handler_start_ts", "model_start_ts"),
+        ("model_to_first_commentary_ms", "model_start_ts", "first_commentary_ts"),
+        ("request_to_first_commentary_ms", "request_ts", "first_commentary_ts"),
+    )
+    for field, start_key, end_key in phase_pairs:
+        start = timestamps.get(start_key)
+        end = timestamps.get(end_key)
+        if start is not None and end is not None:
+            fields[field] = max(0, int((float(end) - float(start)) * 1000))
+    if isinstance(phase_durations, dict):
+        for key, value in phase_durations.items():
+            if value is not None:
+                fields[str(key)] = int(value)
     return fields
 
 
@@ -749,6 +782,20 @@ def _format_gateway_flow_telemetry(fields: dict[str, Any]) -> str:
         "admission_to_dispatch_ms",
         "dispatch_to_finish_ms",
         "total_ms",
+        "request_ts",
+        "adapter_dispatch_ts",
+        "intake_ts",
+        "admitted_ts",
+        "agent_handler_start_ts",
+        "model_start_ts",
+        "first_commentary_ts",
+        "request_to_adapter_dispatch_ms",
+        "adapter_dispatch_to_intake_ms",
+        "intake_to_admission_ms",
+        "admission_to_agent_handler_ms",
+        "agent_handler_to_model_ms",
+        "model_to_first_commentary_ms",
+        "request_to_first_commentary_ms",
     ]
     parts = []
     for key in ordered:
@@ -13052,6 +13099,8 @@ class _GatewayRunnerCore(
         admission_ts: Optional[float] = None,
         dispatch_start_ts: Optional[float] = None,
         finished_ts: Optional[float] = None,
+        phase_timestamps: Optional[dict[str, Any]] = None,
+        phase_durations: Optional[dict[str, Any]] = None,
     ) -> None:
         fields = _gateway_flow_telemetry_fields(
             route_type=route_type,
@@ -13060,6 +13109,8 @@ class _GatewayRunnerCore(
             admission_ts=admission_ts,
             dispatch_start_ts=dispatch_start_ts,
             finished_ts=finished_ts,
+            phase_timestamps=phase_timestamps,
+            phase_durations=phase_durations,
         )
         logger.info(_format_gateway_flow_telemetry(fields))
 
@@ -18039,6 +18090,20 @@ class _GatewayRunnerCore(
 
         _flow_admission_ts = time.time()
         _flow_route_type = _gateway_flow_route_type(event, command)
+        _event_metadata = getattr(event, "metadata", None)
+        if not isinstance(_event_metadata, dict):
+            _event_metadata = {}
+            event.metadata = _event_metadata
+        _flow_phase_timestamps = {
+            "request_ts": _event_metadata.get("discord_request_ts"),
+            "adapter_dispatch_ts": _event_metadata.get("discord_adapter_dispatch_ts"),
+            "intake_ts": _event_metadata.get("gateway_intake_ts"),
+            "admitted_ts": _event_metadata.get("gateway_admitted_ts"),
+            "agent_handler_start_ts": _event_metadata.get("gateway_agent_handler_start_ts"),
+        }
+        _flow_phase_durations: dict[str, Any] = {}
+        _event_metadata["gateway_flow_phase_timestamps"] = _flow_phase_timestamps
+        _event_metadata["gateway_flow_phase_durations"] = _flow_phase_durations
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -18067,6 +18132,7 @@ class _GatewayRunnerCore(
         self._open_start_user_followups(_quick_key, _run_generation)
         _work_item_id = str(getattr(event, "work_item_id", "") or "")
         if _work_item_id and getattr(source, "platform", None) == Platform.DISCORD:
+            _ledger_claim_started = time.perf_counter()
             try:
                 self._ledger().claim(
                     _work_item_id,
@@ -18076,6 +18142,11 @@ class _GatewayRunnerCore(
                 )
             except Exception:
                 logger.debug("Discord work ledger run-generation claim failed", exc_info=True)
+            finally:
+                _flow_phase_durations["ledger_claim_ms"] = int(
+                    (time.perf_counter() - _ledger_claim_started) * 1000
+                )
+                _flow_phase_durations["ledger_claim_calls"] = 1
 
         try:
             _flow_dispatch_start_ts = time.time()
@@ -18101,6 +18172,8 @@ class _GatewayRunnerCore(
                 admission_ts=_flow_admission_ts,
                 dispatch_start_ts=_flow_dispatch_start_ts,
                 finished_ts=time.time(),
+                phase_timestamps=_flow_phase_timestamps,
+                phase_durations=_flow_phase_durations,
             )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -19598,6 +19671,7 @@ class _GatewayRunnerCore(
             work_item_expected_run_state = None
             work_item_heartbeat_task = None
             if work_item_id and source.platform == Platform.DISCORD:
+                _ledger_running_started = time.perf_counter()
                 try:
                     self._ledger().mark_agent_running(
                         str(work_item_id),
@@ -19652,6 +19726,15 @@ class _GatewayRunnerCore(
                         pass
                 except Exception as exc:
                     logger.debug("Discord work ledger agent_running update failed: %s", exc)
+                finally:
+                    _flow_durations = getattr(event, "metadata", {}).get(
+                        "gateway_flow_phase_durations"
+                    )
+                    if isinstance(_flow_durations, dict):
+                        _flow_durations["ledger_agent_running_ms"] = int(
+                            (time.perf_counter() - _ledger_running_started) * 1000
+                        )
+                        _flow_durations["ledger_agent_running_calls"] = 1
             detached_accounting = []
             pending_accounting = getattr(
                 self,
@@ -19712,6 +19795,9 @@ class _GatewayRunnerCore(
                     origin_work_item_id=str(work_item_id or ""),
                     suppress_user_output=bool(
                         getattr(event, "suppress_user_output", False)
+                    ),
+                    flow_timing=getattr(event, "metadata", {}).get(
+                        "gateway_flow_phase_timestamps"
                     ),
                     defer_persistence=bool(
                         source.platform == Platform.DISCORD
@@ -30390,6 +30476,7 @@ class _GatewayRunnerCore(
         origin_work_item_id: Optional[str] = None,
         suppress_user_output: bool = False,
         defer_persistence: bool = False,
+        flow_timing: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -31528,6 +31615,10 @@ class _GatewayRunnerCore(
                             ) -> bool:
                                 delivered = await _send(text)
                                 if delivered:
+                                    if isinstance(flow_timing, dict):
+                                        flow_timing.setdefault(
+                                            "first_commentary_ts", time.time()
+                                        )
                                     delivered_interim_texts.append(str(text or "").strip())
                                 return delivered
 
@@ -31569,6 +31660,10 @@ class _GatewayRunnerCore(
                         except Exception:
                             return
                         if getattr(sent, "success", False):
+                            if isinstance(flow_timing, dict):
+                                flow_timing.setdefault(
+                                    "first_commentary_ts", time.time()
+                                )
                             delivered_interim_texts.append(
                                 str(display_text or "").strip()
                             )
@@ -32340,6 +32435,8 @@ class _GatewayRunnerCore(
                     _conversation_kwargs["persist_user_message"] = _persist_user_message or message
                 elif _persist_user_message:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message
+                if isinstance(flow_timing, dict):
+                    flow_timing.setdefault("model_start_ts", time.time())
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
