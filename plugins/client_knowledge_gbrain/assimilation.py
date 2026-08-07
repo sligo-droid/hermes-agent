@@ -88,6 +88,28 @@ _OPERATION_SCHEMA = {
         },
         "final_markdown": {"type": "string", "maxLength": 24000},
     },
+    "allOf": [{
+        "if": {"properties": {"operation": {"const": "ignore_transient"}}},
+        "then": {
+            "properties": {
+                key: {"const": ""}
+                for key in (
+                    "kind", "status", "confidence", "sensitivity", "impact",
+                    "honcho_projection",
+                )
+            }
+        },
+        "else": {
+            "properties": {
+                "kind": {"enum": sorted(VALID_KINDS)},
+                "status": {"enum": sorted(VALID_STATUSES)},
+                "confidence": {"enum": sorted(VALID_CONFIDENCE)},
+                "sensitivity": {"enum": sorted(VALID_SENSITIVITY)},
+                "impact": {"enum": sorted(VALID_IMPACTS)},
+                "honcho_projection": {"enum": sorted(VALID_PROJECTION_POLICIES)},
+            }
+        },
+    }],
 }
 ASSIMILATION_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
