@@ -218,13 +218,17 @@ def test_project_citation_and_markdown_boundaries_fail_closed(tmp_path):
         )
     op = _operation("add")
     op["final_markdown"] += "model-added"
-    with pytest.raises(AssimilationFailure, match="assimilation_markdown_mismatch"):
-        validate_proposal(
-            _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
-            project_key="pid", notion_ref="notion:page:new", current_pages={},
-            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
-            max_output_bytes=500_000,
-        )
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
+    )
+    rendered = parsed["operations"][0]
+    assert review is True
+    assert reason == "finding_grounding_mismatch"
+    assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
+    assert "model-added" not in rendered["final_markdown"]
 
 
 class _Client:

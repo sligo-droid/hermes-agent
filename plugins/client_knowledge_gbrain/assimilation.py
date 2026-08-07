@@ -457,7 +457,6 @@ def validate_proposal(
     confirmation_truth_mismatch = False
     for raw in parsed["operations"]:
         item = dict(raw)
-        item_grounding_mismatch = False
         operation = item["operation"]
         finding_id = str(item["finding_id"])
         finding = findings.get(finding_id)
@@ -495,7 +494,6 @@ def validate_proposal(
             or item["sensitivity"] != finding["sensitivity"]
         ):
             finding_grounding_mismatch = True
-            item_grounding_mismatch = True
             item["claim"] = finding["text"]
             item["evidence_ids"] = list(finding["evidence_ids"])
             item["kind"] = finding["kind"]
@@ -567,10 +565,9 @@ def validate_proposal(
                 confirmation_truth_mismatch = True
         else:
             canonical_markdown = _canonical_markdown(item, project_key=project_key)
-            if item_grounding_mismatch:
-                item["final_markdown"] = canonical_markdown
-            elif item["final_markdown"] != canonical_markdown:
-                raise AssimilationFailure("assimilation_markdown_mismatch")
+            if item["final_markdown"] != canonical_markdown:
+                finding_grounding_mismatch = True
+            item["final_markdown"] = canonical_markdown
         if not slug.startswith(f"projects/{project_key}/"):
             raise AssimilationFailure("assimilation_project_scope_invalid", quarantine=True)
         validated.append(item)
