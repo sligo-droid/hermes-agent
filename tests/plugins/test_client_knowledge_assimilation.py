@@ -463,6 +463,57 @@ def test_non_confirmation_grounding_mismatch_is_host_normalized_for_review(tmp_p
     assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
 
 
+@pytest.mark.parametrize(("operation", "model_status", "host_status"), [
+    ("add", "tentative", "current"),
+    ("refine", "disputed", "current"),
+    ("contradict", "current", "disputed"),
+    ("mark_tentative", "current", "tentative"),
+    ("supersede", "archived", "current"),
+])
+def test_operation_status_is_host_normalized_for_review(
+    tmp_path, operation, model_status, host_status
+):
+    op = _operation(operation)
+    op["status"] = model_status
+    current = {}
+    if operation in {"refine", "contradict", "mark_tentative"}:
+        path = tmp_path / "projects/pid/requirements/reporting.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("prior", encoding="utf-8")
+        op["expected_prior_sha256"] = hashlib.sha256(b"prior").hexdigest()
+        current = {
+            "requirements/reporting": {
+                "title": "Reporting", "compiled_truth": "prior", "timeline": "- prior",
+                "markdown_sha256": hashlib.sha256(b"prior").hexdigest(),
+                "frontmatter": _frontmatter(),
+            }
+        }
+    if operation == "supersede":
+        op["target_slug"] = "requirements/reporting-v2"
+        op["supersedes"] = ["projects/pid/requirements/reporting"]
+        current = {
+            "requirements/reporting": {
+                "title": "Reporting", "compiled_truth": "prior", "timeline": "- prior",
+                "markdown_sha256": hashlib.sha256(b"prior").hexdigest(),
+                "frontmatter": _frontmatter(),
+            }
+        }
+    op["final_markdown"] = _canonical_markdown(op, project_key="pid")
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages=current,
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
+    )
+    rendered = parsed["operations"][0]
+    assert review is True
+    assert reason == "finding_grounding_mismatch"
+    assert rendered["status"] == host_status
+    if host_status in {"disputed", "tentative"}:
+        assert rendered["honcho_projection"] == "ineligible"
+    assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
+
+
 def test_assimilation_schema_rejects_invalid_classification_values():
     op = _operation("add")
     for key, value in (
