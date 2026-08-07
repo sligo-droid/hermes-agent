@@ -154,9 +154,8 @@ _EXACT_VISUAL_VALUE_RE = re.compile(
     r"(?:#[0-9a-f]{3,8}\b|\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)\b))",
     re.IGNORECASE,
 )
-_SUBJECTIVE_VISUAL_JUDGMENT_RE = re.compile(
-    r"\b(?:polish|redesign|hierarchy|composition|improve|responsive|interaction|"
-    r"usability|visual direction|design system)\b",
+_ADDITIVE_VISUAL_CLAUSE_RE = re.compile(
+    r"(?:[,;]|\b(?:and|then|while|plus|also)\b)",
     re.IGNORECASE,
 )
 
@@ -453,7 +452,10 @@ def _classify_ui_work(
 
     if (
         _EXACT_VISUAL_VALUE_RE.search(primary_text)
-        and not _SUBJECTIVE_VISUAL_JUDGMENT_RE.search(primary_text)
+        # Only bypass consultation when the whole request is one exact-value
+        # clause. Any additive clause is ambiguous enough to default back to
+        # visual advice instead of maintaining an incomplete keyword denylist.
+        and not _ADDITIVE_VISUAL_CLAUSE_RE.search(primary_text)
     ):
         return False, "deterministic exact visual value"
 

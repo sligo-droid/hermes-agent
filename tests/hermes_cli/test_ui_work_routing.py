@@ -303,6 +303,11 @@ def test_exact_visual_property_edit_stays_on_default_coding_route(task):
             "Redesign the dashboard layout, set the card width to 320px, and improve "
             "responsive hierarchy."
         ),
+        "Style the dashboard with exactly 8px spacing and choose appropriate typography.",
+        (
+            "Style the dashboard with exactly 8px spacing and balance the typography "
+            "and colors."
+        ),
     ],
 )
 def test_exact_value_does_not_suppress_subjective_visual_work(task):
