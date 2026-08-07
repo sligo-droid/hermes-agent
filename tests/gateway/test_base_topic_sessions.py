@@ -69,6 +69,26 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 
 class TestBasePlatformTopicSessions:
     @pytest.mark.asyncio
+    async def test_gateway_phase_timestamps_separate_intake_admission_and_handler_start(self):
+        adapter = DummyTelegramAdapter()
+        observed = {}
+
+        async def handler(event):
+            observed.update(event.metadata)
+            return None
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "12")
+        session_key = build_session_key(event.source)
+
+        await adapter.handle_message(event)
+        task = adapter.active_processing_tasks()[session_key]
+        await task
+
+        assert observed["gateway_intake_ts"] <= observed["gateway_admitted_ts"]
+        assert observed["gateway_admitted_ts"] <= observed["gateway_agent_handler_start_ts"]
+
+    @pytest.mark.asyncio
     async def test_handle_message_does_not_interrupt_different_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()
         adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))

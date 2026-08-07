@@ -4439,6 +4439,9 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        if isinstance(getattr(event, "metadata", None), dict):
+            event.metadata.setdefault("gateway_intake_ts", time.time())
+
         coerce_plaintext_gateway_command(event)
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
@@ -4647,6 +4650,8 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
+        if isinstance(getattr(event, "metadata", None), dict):
+            event.metadata.setdefault("gateway_admitted_ts", time.time())
         self._start_session_processing(event, session_key)
     
     @staticmethod
@@ -4897,6 +4902,8 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
+            if isinstance(getattr(event, "metadata", None), dict):
+                event.metadata.setdefault("gateway_agent_handler_start_ts", time.time())
             response = await self._message_handler(event)
             response_metadata = dict(getattr(response, "metadata", {}) or {})
             is_ephemeral_response = isinstance(response, EphemeralReply)
