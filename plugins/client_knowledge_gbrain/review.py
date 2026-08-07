@@ -62,15 +62,23 @@ def _render_notification(
     if not isinstance(operations, list) or not operations:
         raise ReviewFailure("review proposal has no operations")
     summaries: list[str] = []
+
+    def bounded(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        digest = hashlib.sha256(text.encode()).hexdigest()[:10]
+        return f"{text[:limit - 13]}...#{digest}"
+
     for index, operation in enumerate(operations, start=1):
         if not isinstance(operation, Mapping):
             raise ReviewFailure("review proposal operation is invalid")
         refs = operation.get("source_refs")
-        notion_ref = str(refs[-1]) if isinstance(refs, list) and refs else ""
-        target = str(operation.get("target_slug") or "")
+        notion_ref = bounded(refs[-1], 40) if isinstance(refs, list) and refs else ""
+        target = bounded(operation.get("target_slug"), 56)
         summaries.append(
             f"{index}. {operation.get('operation')} | "
-            f"gbrain:projects/{config.project_key}/{target} | {notion_ref}"
+            f"{target} | {notion_ref}"
         )
     operation_summary = "\n".join(summaries)
     marker = f"[ck-review:{review['review_id']}:{str(review['proposal_sha256'])[:16]}]"

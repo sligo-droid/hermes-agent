@@ -141,8 +141,34 @@ def test_multi_operation_review_notification_renders_complete_batch():
         store=store, derived=_MultiDerived(), config=CFG, sender=sender,
     ))
     assert result["confirmed"] == 1
-    assert "1. refine | gbrain:projects/pid/requirements/reporting | notion:page:one" in sent[0]
-    assert "2. add | gbrain:projects/pid/requirements/invoicing | notion:page:two" in sent[0]
+    assert "1. refine | requirements/reporting | notion:page:one" in sent[0]
+    assert "2. add | requirements/invoicing | notion:page:two" in sent[0]
+
+
+def test_maximum_review_batch_remains_deliverable():
+    store = _Store()
+    sent = []
+
+    class Derived:
+        def read_json(self, *_args):
+            return {"proposal": {"operations": [
+                {
+                    "operation": "needs_review", "target_slug": "segment-" + "x" * 490,
+                    "source_refs": ["notion:page:" + "y" * 228],
+                }
+                for _ in range(10)
+            ]}}
+
+    async def sender(**kwargs):
+        sent.append(kwargs["content"])
+        return {"success": True, "message_id": "400", "side_effect_state": "confirmed"}
+
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=Derived(), config=CFG, sender=sender,
+    ))
+    assert result["confirmed"] == 1
+    assert len(sent[0]) <= 1800
+    assert "10. needs_review" in sent[0]
 
 
 def test_uncertain_delivery_adopts_exact_one_message():

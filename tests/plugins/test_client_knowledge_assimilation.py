@@ -493,6 +493,30 @@ def test_proposal_requires_one_operation_for_each_grounded_finding(tmp_path):
     assert reason == "outside_auto_publication_allowlist"
 
 
+def test_empty_interpretation_accepts_one_empty_transient_operation(tmp_path):
+    op = {key: "" for key in (
+        "target_slug", "title", "kind", "status", "confidence", "sensitivity",
+        "impact", "honcho_projection", "effective_at", "claim", "timeline_entry",
+        "expected_prior_sha256", "finding_id", "final_markdown",
+    )}
+    op.update({
+        "operation": "ignore_transient", "source_refs": [], "supersedes": [],
+        "evidence_ids": [],
+    })
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation={
+            "candidate_learnings": [], "decisions": [], "requirements": [],
+            "preferences": [], "evidence": [],
+        },
+        source_root=tmp_path, max_output_bytes=500_000,
+    )
+    assert parsed["operations"] == [op]
+    assert review is False
+    assert reason == "closed_allowlist_ignore_transient"
+
+
 def test_frontmatter_scalar_injection_fails_closed(tmp_path):
     op = _operation("add")
     op["effective_at"] = "2026-08-04\nstatus: current"
@@ -539,7 +563,7 @@ def test_publisher_never_overwrites_target_created_during_atomic_install(tmp_pat
     assert target.read_bytes() == b"concurrent edit\n"
 
 
-def test_publisher_restores_prior_target_when_atomic_install_loses_race(tmp_path, monkeypatch):
+def test_publisher_preserves_concurrent_edit_during_atomic_exchange(tmp_path, monkeypatch):
     root = _repo(tmp_path)
     target = root / "projects/pid/requirements/reporting.md"
     target.parent.mkdir(parents=True)
@@ -547,14 +571,14 @@ def test_publisher_restores_prior_target_when_atomic_install_loses_race(tmp_path
     subprocess.run(["git", "add", str(target.relative_to(root))], cwd=root, check=True)
     subprocess.run(["git", "commit", "-m", "prior"], cwd=root, check=True, capture_output=True)
     expected_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    original = os.link
+    original = GitSourcePublisher._exchange_paths
 
-    def race(source, destination, *args, **kwargs):
-        if Path(destination) == target and Path(source).name.startswith(".reporting.md.tmp-"):
+    def race(left, right):
+        if Path(right) == target:
             target.write_bytes(b"concurrent edit\n")
-        return original(source, destination, *args, **kwargs)
+        return original(left, right)
 
-    monkeypatch.setattr(os, "link", race)
+    monkeypatch.setattr(GitSourcePublisher, "_exchange_paths", staticmethod(race))
     with GitSourcePublisher(_Client(root), project_key="pid") as publisher:
         with pytest.raises(PublicationFailure, match="target_changed_before_materialization"):
             publisher.publish(
@@ -568,7 +592,57 @@ def test_publisher_restores_prior_target_when_atomic_install_loses_race(tmp_path
                 interpretation_id="d" * 64,
             )
     assert target.read_bytes() == b"concurrent edit\n"
-    assert any(target.parent.glob(".reporting.md.prior-*"))
+    assert not any(target.parent.glob(".reporting.md.tmp-*"))
+
+
+def test_publisher_recovers_crash_after_atomic_exchange(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    target = root / "projects/pid/requirements/reporting.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"prior\n")
+    subprocess.run(["git", "add", str(target.relative_to(root))], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "prior"], cwd=root, check=True, capture_output=True)
+    expected_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    original_unlink = Path.unlink
+
+    def crash_on_sidecar_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".reporting.md.tmp-"):
+            raise RuntimeError("simulated crash after exchange")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", crash_on_sidecar_cleanup)
+    with GitSourcePublisher(_Client(root), project_key="pid") as publisher:
+        with pytest.raises(RuntimeError, match="simulated crash after exchange"):
+            publisher.publish(
+                artifact_id="a" * 64, assimilation_id="b" * 64,
+                assimilation_version=ASSIMILATION_VERSION, proposal_sha256="c" * 64,
+                expected_head=expected_head, authored_at=1,
+                files=[PublicationFile(
+                    "requirements/reporting", b"content\n",
+                    expected_prior_sha256=hashlib.sha256(b"prior\n").hexdigest(),
+                )],
+                interpretation_id="d" * 64,
+            )
+    assert target.read_bytes() == b"content\n"
+    assert any(target.parent.glob(".reporting.md.tmp-*"))
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    with GitSourcePublisher(_Client(root), project_key="pid") as publisher:
+        recovered = publisher.publish(
+            artifact_id="a" * 64, assimilation_id="b" * 64,
+            assimilation_version=ASSIMILATION_VERSION, proposal_sha256="c" * 64,
+            expected_head=expected_head, authored_at=1,
+            files=[PublicationFile(
+                "requirements/reporting", b"content\n",
+                expected_prior_sha256=hashlib.sha256(b"prior\n").hexdigest(),
+            )],
+            interpretation_id="d" * 64,
+        )
+    assert recovered.commit_sha == subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+    ).strip()
+    assert target.read_bytes() == b"content\n"
+    assert not any(target.parent.glob(".reporting.md.tmp-*"))
 
 
 def test_post_sync_verifies_exact_page_and_blob(tmp_path):

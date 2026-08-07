@@ -81,9 +81,9 @@ _OPERATION_SCHEMA = {
         "expected_prior_sha256": {
             "type": "string", "pattern": "^(?:|[0-9a-f]{64})$",
         },
-        "finding_id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+        "finding_id": {"type": "string", "pattern": "^(?:|[a-z][a-z0-9_-]{0,63})$"},
         "evidence_ids": {
-            "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": True,
+            "type": "array", "maxItems": 20, "uniqueItems": True,
             "items": {"type": "string", "pattern": "^evidence-[0-9]{3}$"},
         },
         "final_markdown": {"type": "string", "maxLength": 24000},
@@ -417,9 +417,10 @@ def validate_proposal(
         operation = item["operation"]
         finding_id = str(item["finding_id"])
         finding = findings.get(finding_id)
-        if finding_id in seen_findings:
-            raise AssimilationFailure("assimilation_duplicate_finding")
-        seen_findings.add(finding_id)
+        if finding_id:
+            if finding_id in seen_findings:
+                raise AssimilationFailure("assimilation_duplicate_finding")
+            seen_findings.add(finding_id)
         if operation == "ignore_transient":
             if any(
                 item[key]
@@ -429,7 +430,12 @@ def validate_proposal(
                     "source_refs", "supersedes", "claim", "timeline_entry",
                     "expected_prior_sha256", "final_markdown",
                 )
-            ) or finding is None or list(item["evidence_ids"]) != finding["evidence_ids"]:
+            ) or (
+                bool(findings)
+                and (finding is None or list(item["evidence_ids"]) != finding["evidence_ids"])
+            ) or (
+                not findings and (finding_id or item["evidence_ids"])
+            ):
                 raise AssimilationFailure("assimilation_transient_payload_invalid")
             validated.append(item)
             continue
