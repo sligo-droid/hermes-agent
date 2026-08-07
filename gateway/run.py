@@ -23234,7 +23234,7 @@ class _GatewayRunnerCore(
                 }
                 if runtime_breakdown is not None:
                     update_kwargs["runtime_breakdown"] = runtime_breakdown
-                if session_id and str(status or "").strip().lower() != "running":
+                if session_id:
                     try:
                         from hermes_cli.plugins import collect_session_artifacts
 

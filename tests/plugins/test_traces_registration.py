@@ -53,6 +53,7 @@ def test_registers_required_hooks_and_provider(monkeypatch, tmp_path):
 
     assert hermes_traces_plugin.register(registrar) is None
     assert set(registrar.hooks) == {
+        "on_session_start",
         "on_session_end",
         "on_session_finalize",
         "subagent_start",
@@ -73,6 +74,38 @@ def test_registers_required_hooks_and_provider(monkeypatch, tmp_path):
         "url": "https://sligo.sligolabs.com/traces/" + slug,
     }
     assert registrar.provider("abc", "other") is None
+
+
+def test_session_start_creates_pending_root_artifact_without_publishing(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_traces_plugin, "Publisher", FakePublisher)
+    monkeypatch.setattr(hermes_traces_plugin, "_runtimes", {})
+    registrar = Registrar()
+    hermes_traces_plugin.register(registrar)
+
+    assert registrar.hooks["on_session_start"](
+        session_id="abc",
+        platform="slack",
+    ) is None
+    url = registrar.hooks["on_session_start"](
+        session_id="abc",
+        platform="discord",
+    )
+    _config, state, publisher, _store = hermes_traces_plugin._runtime()
+    record = state.get("abc", "discord")
+
+    assert record is not None
+    assert record["status"] == "pending"
+    assert url == "https://sligo.sligolabs.com/traces/" + record["slug"]
+    assert registrar.provider("abc", "discord_feature_summary") == {
+        "kind": "external_url",
+        "label": "Agent Trace",
+        "url": url,
+    }
+    assert publisher.enqueued == []
 
 
 def test_provider_is_read_only(monkeypatch, tmp_path):
