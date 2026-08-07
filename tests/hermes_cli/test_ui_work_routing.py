@@ -295,6 +295,24 @@ def test_exact_visual_property_edit_stays_on_default_coding_route(task):
     assert decision.advisory_reason == "deterministic exact visual value"
 
 
+@pytest.mark.parametrize(
+    "task",
+    [
+        "Polish the responsive dashboard hierarchy and use exactly 8px spacing between cards.",
+        (
+            "Redesign the dashboard layout, set the card width to 320px, and improve "
+            "responsive hierarchy."
+        ),
+    ],
+)
+def test_exact_value_does_not_suppress_subjective_visual_work(task):
+    decision = resolve_ui_work_route(_cfg(), task=task)
+
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.advisory_matched is True
+    assert decision.visual_advisor_tier == "standard"
+
+
 def test_negative_backend_only_overrides_ui_keyword():
     decision = resolve_ui_work_route(
         _cfg(),

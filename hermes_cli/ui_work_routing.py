@@ -154,6 +154,11 @@ _EXACT_VISUAL_VALUE_RE = re.compile(
     r"(?:#[0-9a-f]{3,8}\b|\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)\b))",
     re.IGNORECASE,
 )
+_SUBJECTIVE_VISUAL_JUDGMENT_RE = re.compile(
+    r"\b(?:polish|redesign|hierarchy|composition|improve|responsive|interaction|"
+    r"usability|visual direction|design system)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -446,7 +451,10 @@ def _classify_ui_work(
     primary_text = _normalize_text(title, task)
     body_text = _normalize_text(title, task, context)
 
-    if _EXACT_VISUAL_VALUE_RE.search(primary_text):
+    if (
+        _EXACT_VISUAL_VALUE_RE.search(primary_text)
+        and not _SUBJECTIVE_VISUAL_JUDGMENT_RE.search(primary_text)
+    ):
         return False, "deterministic exact visual value"
 
     # CWD/project names are deliberately not positive evidence: repository names

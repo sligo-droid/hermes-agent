@@ -441,7 +441,6 @@ FORK_DEFAULT_ADDITIONS = {
         # Design-sensitive visual implementation gets one read-only advisor
         # consultation before the normal Codex/OpenCode coding worker. Sonnet
         # is standard; callers explicitly reserve Opus for advanced design.
-        # Set false to keep detection advisory-only.
         "route_delegate_task": True,
     },
     "skills": {"index": {"workers": "focus", "debug": False}},
