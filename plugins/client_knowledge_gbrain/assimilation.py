@@ -530,20 +530,24 @@ def validate_proposal(
             raise AssimilationFailure("assimilation_add_target_exists")
         if operation in {"confirm", "refine", "contradict"} and not actual_prior:
             raise AssimilationFailure("assimilation_target_missing")
-        if operation == "add" and item["status"] != "current":
-            raise AssimilationFailure("assimilation_add_status_invalid")
-        if operation == "refine" and item["status"] != "current":
-            raise AssimilationFailure("assimilation_refine_status_invalid")
-        if operation == "contradict" and item["status"] != "disputed":
-            raise AssimilationFailure("assimilation_contradiction_status_invalid")
-        if operation == "mark_tentative" and item["status"] != "tentative":
-            raise AssimilationFailure("assimilation_tentative_status_invalid")
+        required_status = {
+            "add": "current",
+            "confirm": "current",
+            "refine": "current",
+            "contradict": "disputed",
+            "mark_tentative": "tentative",
+            "supersede": "current",
+        }.get(operation)
+        if required_status and item["status"] != required_status:
+            finding_grounding_mismatch = True
+            item["status"] = required_status
+        if required_status in {"disputed", "tentative"} and item["honcho_projection"] != "ineligible":
+            finding_grounding_mismatch = True
+            item["honcho_projection"] = "ineligible"
         if operation == "supersede" and (
-            item["status"] != "current" or not item["supersedes"]
+            not item["supersedes"]
         ):
             raise AssimilationFailure("assimilation_supersede_status_invalid")
-        if operation == "confirm" and item["status"] != "current":
-            raise AssimilationFailure("assimilation_confirmation_status_invalid")
         if (
             item["impact"] == "high"
             or item["sensitivity"] in {"confidential", "restricted"}
