@@ -434,6 +434,65 @@ def test_confirmation_requires_persisted_finding_and_host_preserves_timeline(tmp
     assert "erase history" not in rendered["final_markdown"]
 
 
+def test_confirmation_preserves_timeline_beyond_model_context_truncation(tmp_path):
+    path = tmp_path / "projects/pid/requirements/reporting.md"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"prior")
+    timeline = "x" * 5000
+    current = {
+        "requirements/reporting": {
+            "title": "Reporting", "compiled_truth": "Weekly report is due Monday.",
+            "timeline": timeline, "frontmatter": _frontmatter(),
+        }
+    }
+    op = _operation("confirm", prior=hashlib.sha256(b"prior").hexdigest())
+    op["source_refs"] = ["notion:page:old", "notion:page:new"]
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages=current,
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
+    )
+    assert review is False
+    assert reason == "closed_allowlist_exact_confirmation"
+    assert timeline in parsed["operations"][0]["final_markdown"]
+
+
+def test_proposal_requires_one_operation_for_each_grounded_finding(tmp_path):
+    first = _operation("add")
+    second = _operation("add", claim="Invoices are due Friday.")
+    second.update({
+        "target_slug": "requirements/invoicing", "finding_id": "requirement-invoicing",
+        "evidence_ids": ["evidence-002"],
+    })
+    second["final_markdown"] = _canonical_markdown(second, project_key="pid")
+    interpretation = _interpretation(first["claim"])
+    interpretation["requirements"].append({
+        "id": "requirement-invoicing", "text": second["claim"], "confidence": "high",
+        "sensitivity": "internal", "evidence_ids": ["evidence-002"],
+    })
+    interpretation["evidence"].append({
+        "id": "evidence-002", "segment_id": "body-0002", "start": 0,
+        "end": len(second["claim"]), "quote": second["claim"],
+    })
+    proposal = _proposal(first)
+    with pytest.raises(AssimilationFailure, match="findings_incomplete"):
+        validate_proposal(
+            proposal, artifact_id="a" * 64, interpretation_id="b" * 64,
+            project_key="pid", notion_ref="notion:page:new", current_pages={},
+            interpretation=interpretation, source_root=tmp_path, max_output_bytes=500_000,
+        )
+    proposal["operations"].append(second)
+    parsed, review, reason = validate_proposal(
+        proposal, artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=interpretation, source_root=tmp_path, max_output_bytes=500_000,
+    )
+    assert len(parsed["operations"]) == 2
+    assert review is True
+    assert reason == "outside_auto_publication_allowlist"
+
+
 def test_frontmatter_scalar_injection_fails_closed(tmp_path):
     op = _operation("add")
     op["effective_at"] = "2026-08-04\nstatus: current"
@@ -462,6 +521,54 @@ def test_publisher_rechecks_target_immediately_before_materialization(tmp_path, 
     with pytest.raises(PublicationFailure, match="target_changed_before_materialization"):
         _publish(root)
     assert target.read_bytes() == b"concurrent edit\n"
+
+
+def test_publisher_never_overwrites_target_created_during_atomic_install(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    target = root / "projects/pid/requirements/reporting.md"
+    original = os.link
+
+    def race(source, destination, *args, **kwargs):
+        if Path(destination) == target:
+            target.write_bytes(b"concurrent edit\n")
+        return original(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", race)
+    with pytest.raises(PublicationFailure, match="target_changed_before_materialization"):
+        _publish(root)
+    assert target.read_bytes() == b"concurrent edit\n"
+
+
+def test_publisher_restores_prior_target_when_atomic_install_loses_race(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    target = root / "projects/pid/requirements/reporting.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"prior\n")
+    subprocess.run(["git", "add", str(target.relative_to(root))], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "prior"], cwd=root, check=True, capture_output=True)
+    expected_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    original = os.link
+
+    def race(source, destination, *args, **kwargs):
+        if Path(destination) == target and Path(source).name.startswith(".reporting.md.tmp-"):
+            target.write_bytes(b"concurrent edit\n")
+        return original(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", race)
+    with GitSourcePublisher(_Client(root), project_key="pid") as publisher:
+        with pytest.raises(PublicationFailure, match="target_changed_before_materialization"):
+            publisher.publish(
+                artifact_id="a" * 64, assimilation_id="b" * 64,
+                assimilation_version=ASSIMILATION_VERSION, proposal_sha256="c" * 64,
+                expected_head=expected_head, authored_at=1,
+                files=[PublicationFile(
+                    "requirements/reporting", b"content\n",
+                    expected_prior_sha256=hashlib.sha256(b"prior\n").hexdigest(),
+                )],
+                interpretation_id="d" * 64,
+            )
+    assert target.read_bytes() == b"concurrent edit\n"
+    assert any(target.parent.glob(".reporting.md.prior-*"))
 
 
 def test_post_sync_verifies_exact_page_and_blob(tmp_path):

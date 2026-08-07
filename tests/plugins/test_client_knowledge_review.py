@@ -83,6 +83,14 @@ class _Derived:
         }]}}
 
 
+class _MultiDerived:
+    def read_json(self, *_args):
+        return {"proposal": {"operations": [
+            {"operation": "refine", "target_slug": "requirements/reporting", "source_refs": ["notion:page:one"]},
+            {"operation": "add", "target_slug": "requirements/invoicing", "source_refs": ["notion:page:two"]},
+        ]}}
+
+
 def test_timed_out_post_remains_uncertain_and_no_match_never_retries():
     store = _Store()
     calls = 0
@@ -119,6 +127,22 @@ def test_disabled_notifications_do_not_claim_or_send():
     assert result == {"processed": 0, "confirmed": 0, "proven_none": 0, "uncertain": 0}
     assert calls == 0
     assert store.review["notification_state"] == "pending"
+
+
+def test_multi_operation_review_notification_renders_complete_batch():
+    store = _Store()
+    sent = []
+
+    async def sender(**kwargs):
+        sent.append(kwargs["content"])
+        return {"success": True, "message_id": "400", "side_effect_state": "confirmed"}
+
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=_MultiDerived(), config=CFG, sender=sender,
+    ))
+    assert result["confirmed"] == 1
+    assert "1. refine | gbrain:projects/pid/requirements/reporting | notion:page:one" in sent[0]
+    assert "2. add | gbrain:projects/pid/requirements/invoicing | notion:page:two" in sent[0]
 
 
 def test_uncertain_delivery_adopts_exact_one_message():
