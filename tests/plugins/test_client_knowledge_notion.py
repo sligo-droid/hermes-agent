@@ -383,6 +383,44 @@ def test_legacy_email_marker_conflict_does_not_create_replacement(tmp_path, monk
     assert len(store.get_upload_attempts(artifact.artifact_id)) == 1
 
 
+def test_mixed_valid_and_conflicting_marker_candidates_fail_closed(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    attempt_id = "f" * 32
+    marker = _marker(artifact, attempt_id)
+    filename = f"{marker}.eml"
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=attempt_id, opaque_marker=marker,
+        remote_filename=filename, upload_mode="single_part",
+        expected_part_count=1,
+    )
+    baseline_id = store.publish_upload_scan(
+        claim.job_id, claim.claim_token, artifact.artifact_id, attempt_id,
+        scan_role="baseline", page_count=1, items=[],
+    )
+    attempt = store.get_upload_attempts(artifact.artifact_id)[0]
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "reconciliation", type("Evidence", (), {
+            "items": (
+                _upload("valid", filename, size=artifact.byte_size),
+                _upload(
+                    "conflict", filename, size=artifact.byte_size,
+                    content_type="text/plain",
+                ),
+            ),
+            "page_count": 1,
+        })()
+    ))
+    with pytest.raises(Exception, match="conflicting metadata"):
+        worker._recover_uncertain_creation(
+            claim, artifact.artifact_id, artifact, attempt, baseline_id,
+            allow_absent=True,
+        )
+    assert store.get_upload_attempts(artifact.artifact_id)[0]["remote_upload_id"] is None
+
+
 def test_legacy_multipart_replacement_computes_new_partition(tmp_path, monkeypatch):
     payload = b"x" * (21 * 1024 * 1024)
     artifact = _artifact(content=payload)
@@ -608,7 +646,7 @@ def test_uncertain_creation_quarantines_two_fully_matching_candidates(tmp_path):
         ]))
     ))
     worker = NotionArchiveWorker(store, spool, client, _settings(config), config)
-    with pytest.raises(Exception, match="safely"):
+    with pytest.raises(Exception, match="conflicting metadata"):
         worker._recover_uncertain_creation(claim, artifact.artifact_id, artifact, attempt, scan_id)
 
 

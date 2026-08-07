@@ -835,18 +835,16 @@ class NotionArchiveWorker:
                 )
             ):
                 eligible.append(item)
+        if marker_bound and (len(marker_bound) != 1 or len(eligible) != 1):
+            raise NotionAmbiguousRecoveryError(
+                "notion upload marker has conflicting metadata"
+            )
         if not eligible:
-            if marker_bound:
-                raise NotionAmbiguousRecoveryError(
-                    "notion upload marker has conflicting metadata"
-                )
             if allow_absent:
                 return None
             raise NotionIncompleteEvidenceError(
                 "notion upload creation is not yet visible in complete evidence"
             )
-        if len(eligible) != 1:
-            raise NotionAmbiguousRecoveryError("notion upload creation cannot be attributed safely")
         upload_id = str(eligible[0]["id"])
         evidence_identity = hashlib.sha256(
             f"{baseline_id}\0{reconciliation_id}\0{attempt['opaque_marker']}\0{upload_id}".encode()
