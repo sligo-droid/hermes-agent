@@ -51,6 +51,30 @@ def test_converter_links_turns_as_linked_list():
         prev = o["uuid"]
 
 
+def test_converter_preserves_distinct_message_timestamps():
+    messages = [
+        {"role": "user", "content": "start", "timestamp": 1786066802.051},
+        {
+            "role": "assistant",
+            "content": "working",
+            "timestamp": "2026-08-07T01:41:37.484000+00:00",
+        },
+        {"role": "assistant", "content": "done", "timestamp": "invalid"},
+    ]
+
+    with patch.object(trace_upload, "_now_iso", return_value="2026-08-07T01:49:38.099Z"):
+        lines = [
+            json.loads(line)
+            for line in build_trace_jsonl(messages, session_id="s1").strip().splitlines()
+        ]
+
+    assert [line["timestamp"] for line in lines] == [
+        "2026-08-07T01:40:02.051Z",
+        "2026-08-07T01:41:37.484Z",
+        "2026-08-07T01:49:38.099Z",
+    ]
+
+
 def test_converter_emits_tool_use_and_tool_result():
     jsonl = build_trace_jsonl(_sample_messages(), session_id="s1", model="m")
     lines = [json.loads(x) for x in jsonl.strip().split("\n")]

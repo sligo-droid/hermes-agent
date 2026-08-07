@@ -4396,8 +4396,9 @@ def _build_top_level_description() -> str:
         "review; it "
         "is rejected for ordinary selection and nested delegation.\n"
         "- For visual work, use the explicit purpose field instead of guessing a "
-        "tier from task wording: visual_advisor for one read-only pre-implementation "
-        "design consultation, visual_sweep for one browser/navigation evidence "
+        "tier from task wording: visual_advisor for an ordinary read-only "
+        "pre-implementation consultation, visual_advisor_advanced for a novel or "
+        "high-impact design pass, visual_sweep for one browser/navigation evidence "
         "pass, visual_inspector for bounded screenshot judgement over collected "
         "evidence, and visual_critique for at most one final aesthetic critique. "
         "Run the sweep before judgement passes; do not fan out duplicate browser "
@@ -4596,7 +4597,13 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "purpose": {
                             "type": "string",
-                            "enum": ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
+                            "enum": [
+                                "visual_advisor",
+                                "visual_advisor_advanced",
+                                "visual_sweep",
+                                "visual_inspector",
+                                "visual_critique",
+                            ],
                             "description": (
                                 "Explicit visual-workflow purpose. Selects the matching "
                                 "visual model tier automatically without task-text inference."
@@ -4642,11 +4649,18 @@ DELEGATE_TASK_SCHEMA = {
             },
             "purpose": {
                 "type": "string",
-                "enum": ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
+                "enum": [
+                    "visual_advisor",
+                    "visual_advisor_advanced",
+                    "visual_sweep",
+                    "visual_inspector",
+                    "visual_critique",
+                ],
                 "description": (
                     "Explicit visual-workflow purpose for a single task or batch default. "
                     "Selects the matching visual tier automatically. Use visual_advisor "
-                    "once before explicit visual implementation, one visual_sweep "
+                    "for ordinary pre-implementation direction, visual_advisor_advanced "
+                    "only for novel or high-impact design, and one visual_sweep "
                     "before evidence-only inspector passes and at most one visual_critique."
                 ),
             },
@@ -4751,6 +4765,26 @@ REQUEST_CODING_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Root-registered structured delegate handoff IDs to attach.",
             },
+            "route_decision": {
+                "type": "object",
+                "properties": {
+                    "route": {
+                        "type": "string",
+                        "enum": ["default_coding_worker", "ui_visual_specialist"],
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "rationale": {"type": "string"},
+                    "visual_advisor_tier": {
+                        "type": "string",
+                        "enum": ["standard", "advanced"],
+                    },
+                },
+                "required": ["route"],
+                "description": (
+                    "Optional root-owned UI route. Use advanced visual advice only for "
+                    "novel, ambiguous, or high-impact design decisions."
+                ),
+            },
         },
         "required": ["task", "scope_paths"],
     },
@@ -4769,6 +4803,7 @@ def request_coding_task(
     verification: Optional[str],
     scope_paths: Optional[list[str]],
     analysis_handoff_ids: Optional[list[str]],
+    route_decision: Optional[dict[str, Any]],
     parent_agent: Any,
 ) -> str:
     """Broker nested coding through state owned by the original root agent."""
@@ -4803,6 +4838,7 @@ def request_coding_task(
             verification=verification,
             scope_paths=scope_paths,
             analysis_handoff_ids=analysis_handoff_ids,
+            route_decision=route_decision,
             background=False,
             allow_git_pr_lifecycle=False,
             trusted_allow_git_pr_lifecycle=False,
@@ -4946,6 +4982,7 @@ registry.register(
         verification=args.get("verification"),
         scope_paths=args.get("scope_paths"),
         analysis_handoff_ids=args.get("analysis_handoff_ids"),
+        route_decision=args.get("route_decision"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

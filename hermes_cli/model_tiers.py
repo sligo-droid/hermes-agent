@@ -120,7 +120,11 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
 }
 
 VISUAL_DELEGATION_PURPOSE_TIERS: dict[str, str] = {
-    "visual_advisor": "visual_critique",
+    # Sonnet is the normal pre-implementation visual advisor. Opus remains the
+    # explicitly selected premium tier through ``visual_critique`` for novel,
+    # ambiguous, or high-impact design decisions.
+    "visual_advisor": "visual_inspector",
+    "visual_advisor_advanced": "visual_critique",
     "visual_sweep": "visual_sweep",
     "visual_inspector": "visual_inspector",
     "visual_critique": "visual_critique",

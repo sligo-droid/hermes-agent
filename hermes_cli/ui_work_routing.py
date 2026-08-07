@@ -148,6 +148,29 @@ _SOFT_VERIFICATION_NEGATIVE_KEYWORDS = {
     "regression",
 }
 
+_EXACT_VISUAL_VALUE_RE = re.compile(
+    r"(?:\bexactly\b.{0,48}(?:#[0-9a-f]{3,8}\b|\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)\b))"
+    r"|(?:\b(?:set|change|make|use|add)\b.{0,64}\bto\s+"
+    r"(?:#[0-9a-f]{3,8}\b|\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)\b))",
+    re.IGNORECASE,
+)
+_ADDITIVE_VISUAL_CLAUSE_RE = re.compile(
+    r"(?:[,;:()]|\b(?:and|but|or|nor|yet|then|while|plus|also|as well as|"
+    r"along with|together with)\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_single_clause_exact_visual_request(text: str) -> bool:
+    """Return true only for one bounded exact-value visual instruction."""
+
+    if not _EXACT_VISUAL_VALUE_RE.search(text):
+        return False
+    without_final_punctuation = text.rstrip().rstrip(".!?")
+    if re.search(r"[!?]|(?<!\d)\.|\.(?!\d)", without_final_punctuation):
+        return False
+    return _ADDITIVE_VISUAL_CLAUSE_RE.search(without_final_punctuation) is None
+
 
 @dataclass(frozen=True)
 class UIWorkRouteDecision:
@@ -173,6 +196,7 @@ class UIWorkRouteDecision:
     advisory_reason: str = ""
     launch_worker: bool = True
     model_tier: str = ""
+    visual_advisor_tier: str = "standard"
 
     def metadata(self) -> dict[str, Any]:
         metadata = {
@@ -196,6 +220,7 @@ class UIWorkRouteDecision:
             "advisory_matched": self.advisory_matched,
             "advisory_reason": self.advisory_reason,
             "model_tier": self.model_tier,
+            "visual_advisor_tier": self.visual_advisor_tier,
         }
         metadata["recommended_skills"] = (
             list(ui_specialist_skills_for_model_tier(self.model_tier))
@@ -229,6 +254,7 @@ class _RouteDecisionInput:
     confidence: float | None = None
     rationale: str = ""
     error: str = ""
+    visual_advisor_tier: str = "standard"
 
 
 _DEFAULT_ROUTE = "default_coding_worker"
@@ -328,6 +354,7 @@ def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
         source = "orchestrator"
         confidence = None
         rationale = ""
+        visual_advisor_tier = "standard"
     elif isinstance(value, dict):
         route = _normalize_route_name(
             value.get("route")
@@ -338,11 +365,26 @@ def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
         source = str(value.get("source") or "orchestrator").strip() or "orchestrator"
         confidence = _normalize_confidence(value.get("confidence"))
         rationale = str(value.get("rationale") or value.get("reason") or "").strip()
+        visual_advisor_tier = str(
+            value.get("visual_advisor_tier") or value.get("advisor_tier") or "standard"
+        ).strip().lower()
     else:
         return _RouteDecisionInput(
             route="",
             source="orchestrator",
             error="route_decision must be a string or object",
+        )
+    if visual_advisor_tier not in {"standard", "advanced"}:
+        return _RouteDecisionInput(
+            route=route,
+            source=source,
+            confidence=confidence,
+            rationale=rationale,
+            visual_advisor_tier=visual_advisor_tier,
+            error=(
+                "visual_advisor_tier must be 'standard' or 'advanced', not "
+                f"{visual_advisor_tier!r}"
+            ),
         )
     if route not in _VALID_ROUTES:
         label = route or "<empty>"
@@ -359,6 +401,7 @@ def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
         source=source,
         confidence=confidence,
         rationale=rationale,
+        visual_advisor_tier=visual_advisor_tier,
     )
 
 
@@ -418,6 +461,13 @@ def _classify_ui_work(
 
     primary_text = _normalize_text(title, task)
     body_text = _normalize_text(title, task, context)
+
+    # Only bypass consultation when the whole request is one exact-value
+    # clause. Any additional sentence, delimiter, or clause connector defaults
+    # back to visual advice; under-classifying is cheaper than skipping needed
+    # design judgment.
+    if _is_single_clause_exact_visual_request(primary_text):
+        return False, "deterministic exact visual value"
 
     # CWD/project names are deliberately not positive evidence: repository names
     # like PID or Command Center should not route backend, docs, test, or review
@@ -512,6 +562,7 @@ def resolve_ui_work_route(
         "route_decision_rationale": requested.rationale,
         "advisory_matched": advisory_matched,
         "advisory_reason": advisory_reason,
+        "visual_advisor_tier": requested.visual_advisor_tier,
     }
 
     if requested.error:
@@ -550,7 +601,7 @@ def resolve_ui_work_route(
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
-                reason="explicit visual UI work selected the Opus advisor route",
+                reason="explicit visual UI work selected the visual advisor route",
                 selected_route=_UI_SPECIALIST_ROUTE,
                 **automatic_fields,
             )

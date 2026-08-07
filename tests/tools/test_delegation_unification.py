@@ -575,6 +575,10 @@ def test_request_coding_task_forces_root_owned_context(monkeypatch, tmp_path):
             verification="focused test",
             scope_paths=["src"],
             analysis_handoff_ids=["handoff_1"],
+            route_decision={
+                "route": "ui_visual_specialist",
+                "visual_advisor_tier": "advanced",
+            },
             parent_agent=child,
         )
     )
@@ -586,6 +590,10 @@ def test_request_coding_task_forces_root_owned_context(monkeypatch, tmp_path):
     assert captured["parent_agent"] is root
     assert captured["model_tier"] == "trivial"
     assert captured["reasoning_effort"] == "high"
+    assert captured["route_decision"] == {
+        "route": "ui_visual_specialist",
+        "visual_advisor_tier": "advanced",
+    }
     assert "worker_tier" not in captured
     assert root._coding_worker_used_this_turn is True
     assert captured["visual_qa_requirement"]["level"] == "surface"
@@ -638,6 +646,7 @@ def test_request_coding_task_serializes_same_root_workspace(monkeypatch, tmp_pat
             verification=None,
             scope_paths=["src"],
             analysis_handoff_ids=None,
+            route_decision=None,
             parent_agent=parent,
         )
 
