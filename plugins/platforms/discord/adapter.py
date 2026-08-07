@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from dataclasses import replace
 from types import SimpleNamespace
@@ -124,6 +124,7 @@ _DISCORD_SHIP_REACTION_EMOJIS = frozenset({
     "👍🏿",
 })
 _DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳", "🔨")
+_DISCORD_REACTION_STATE_CACHE_LIMIT = 4096
 _DISCORD_GOAL_THREAD_CONTEXT_LIMIT = 25
 _DISCORD_GOAL_THREAD_CONTEXT_MAX_CHARS = 12_000
 _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
@@ -1217,6 +1218,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
         self._reaction_dedup = MessageDeduplicator()
+        # Reaction state is authoritative only for mutations performed by this
+        # adapter instance. A missing key means unknown (typically restart-era
+        # state); a present None means Hermes knows no status reaction exists.
+        # Per-message locks plus monotonically increasing generations make a
+        # later terminal transition win over delayed cosmetic work.
+        self._hermes_reaction_states: OrderedDict[Tuple[str, str], Optional[str]] = OrderedDict()
+        self._hermes_reaction_generations: Dict[Tuple[str, str], int] = {}
+        self._hermes_reaction_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        self._hermes_reaction_generation = 0
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1298,6 +1308,7 @@ class DiscordAdapter(BasePlatformAdapter):
         stages = timing.get("stages") if isinstance(timing.get("stages"), dict) else {}
         fields = [
             "discord_intake_timing",
+            "phase=request_to_adapter_dispatch",
             f"total_ms={total_ms}",
             f"batched={str(bool(batched)).lower()}",
             f"message_id={timing.get('message_id') or ''}",
@@ -2638,6 +2649,9 @@ class DiscordAdapter(BasePlatformAdapter):
         message: Any,
         *,
         status: str,
+        generation: Optional[int] = None,
+        transition: str = "",
+        metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self._reactions_enabled() or not hasattr(message, "add_reaction"):
             return
@@ -2645,7 +2659,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if not emoji:
             return
         try:
-            await self._set_message_reaction_state(message, emoji)
+            await self._set_message_reaction_state(
+                message,
+                emoji,
+                generation=generation,
+                transition=transition,
+                metrics=metrics,
+            )
         except Exception as exc:
             logger.debug("[%s] Failed to sync Discord feature summary reaction: %s", self.name, exc)
 
@@ -2741,6 +2761,9 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         status: str,
         summary_message: Any = None,
+        generation: Optional[int] = None,
+        transition: str = "",
+        metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not handle or not self._reactions_enabled():
             return
@@ -2758,7 +2781,13 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         for message in messages:
             try:
-                await self._set_message_reaction_state(message, emoji)
+                await self._set_message_reaction_state(
+                    message,
+                    emoji,
+                    generation=generation,
+                    transition=transition,
+                    metrics=metrics,
+                )
             except Exception as exc:
                 logger.debug("[%s] Failed to sync Discord feature summary source reaction: %s", self.name, exc)
 
@@ -3384,6 +3413,9 @@ class DiscordAdapter(BasePlatformAdapter):
         kanban_sync: bool = False,
         runtime_breakdown: Optional[Dict[str, Any]] = None,
         artifacts: Optional[List[Dict[str, Any]]] = None,
+        reaction_generation: Optional[int] = None,
+        reaction_transition: str = "",
+        reaction_metrics: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not handle:
             return False
@@ -3483,12 +3515,22 @@ class DiscordAdapter(BasePlatformAdapter):
             current_payload = self._current_feature_summary_embed_payload(msg)
             if payload is not None and (cached_payload == payload or current_payload == payload):
                 self._feature_summary_edit_payloads[edit_key] = payload
-                await self._sync_feature_summary_message_reaction(handle, msg, status=status)
+                await self._sync_feature_summary_message_reaction(
+                    handle,
+                    msg,
+                    status=status,
+                    generation=reaction_generation,
+                    transition=reaction_transition,
+                    metrics=reaction_metrics,
+                )
                 await self._sync_feature_summary_source_reaction(
                     handle,
                     thread,
                     status=status,
                     summary_message=msg,
+                    generation=reaction_generation,
+                    transition=reaction_transition,
+                    metrics=reaction_metrics,
                 )
                 return True
             await msg.edit(embed=embed)
@@ -3498,12 +3540,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 setattr(msg, "embeds", [embed])
             except Exception:
                 pass
-            await self._sync_feature_summary_message_reaction(handle, msg, status=status)
+            await self._sync_feature_summary_message_reaction(
+                handle,
+                msg,
+                status=status,
+                generation=reaction_generation,
+                transition=reaction_transition,
+                metrics=reaction_metrics,
+            )
             await self._sync_feature_summary_source_reaction(
                 handle,
                 thread,
                 status=status,
                 summary_message=msg,
+                generation=reaction_generation,
+                transition=reaction_transition,
+                metrics=reaction_metrics,
             )
             return True
         except Exception as exc:
@@ -6149,6 +6201,63 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] remove_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
+    def _next_reaction_generation(self) -> int:
+        self._hermes_reaction_generation += 1
+        return self._hermes_reaction_generation
+
+    def _remember_reaction_state(
+        self,
+        identity: Tuple[str, str],
+        emoji: Optional[str],
+    ) -> None:
+        self._hermes_reaction_states[identity] = emoji
+        self._hermes_reaction_states.move_to_end(identity)
+        while len(self._hermes_reaction_states) > _DISCORD_REACTION_STATE_CACHE_LIMIT:
+            expired, _state = self._hermes_reaction_states.popitem(last=False)
+            lock = self._hermes_reaction_locks.get(expired)
+            if lock is None or not lock.locked():
+                self._hermes_reaction_locks.pop(expired, None)
+                self._hermes_reaction_generations.pop(expired, None)
+
+    @staticmethod
+    def _reaction_metrics_increment(metrics: Optional[Dict[str, Any]], key: str) -> None:
+        if metrics is not None:
+            metrics[key] = int(metrics.get(key, 0) or 0) + 1
+
+    async def _timed_reaction_mutation(
+        self,
+        message: Any,
+        emoji: str,
+        *,
+        operation: str,
+        generation: int,
+        transition: str,
+        metrics: Optional[Dict[str, Any]],
+    ) -> bool:
+        started = time.perf_counter()
+        self._reaction_metrics_increment(metrics, f"rest_{operation}_attempts")
+        if operation == "add":
+            success = await self._add_reaction(message, emoji)
+        else:
+            success = await self._remove_reaction(message, emoji)
+        if success:
+            self._reaction_metrics_increment(metrics, f"rest_{operation}_successes")
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if metrics is not None:
+            metrics["rest_mutation_ms"] = int(metrics.get("rest_mutation_ms", 0) or 0) + duration_ms
+        logger.info(
+            "discord_reaction_operation operation=%s transition=%s emoji=%s "
+            "success=%s duration_ms=%d generation=%d message_id=%s",
+            operation,
+            transition or "unspecified",
+            emoji,
+            str(bool(success)).lower(),
+            duration_ms,
+            generation,
+            getattr(message, "id", "") or "",
+        )
+        return success
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
@@ -6304,7 +6413,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if not source_messages:
                 return None
             for message in source_messages:
-                if not await self._set_message_reaction_state(message, emoji):
+                if not await self._set_message_reaction_state(
+                    message,
+                    emoji,
+                    transition="terminal_reconciliation",
+                    cleanup_unknown=True,
+                ):
                     return None
 
             summary_message_id = str(feature_summary.get("message_id") or "").strip()
@@ -6350,7 +6464,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if (
                 summary_message is None
                 or not hasattr(summary_message, "add_reaction")
-                or not await self._set_message_reaction_state(summary_message, emoji)
+                or not await self._set_message_reaction_state(
+                    summary_message,
+                    emoji,
+                    transition="terminal_reconciliation",
+                    cleanup_unknown=True,
+                )
             ):
                 return None
 
@@ -6372,48 +6491,121 @@ class DiscordAdapter(BasePlatformAdapter):
                         message = None
             if message is None or not hasattr(message, "add_reaction"):
                 return None
-            if not await self._set_message_reaction_state(message, emoji):
+            if not await self._set_message_reaction_state(
+                message,
+                emoji,
+                transition="terminal_reconciliation",
+                cleanup_unknown=True,
+            ):
                 return None
         if acknowledge:
             ledger.mark_discord_thread_reaction_synced(item)
         return resolved_state
 
-    async def _mark_feature_summary_running(self, event: MessageEvent) -> None:
+    async def _mark_feature_summary_running(
+        self,
+        event: MessageEvent,
+        *,
+        generation: int,
+        metrics: Dict[str, Any],
+    ) -> None:
         handle = getattr(event, "feature_summary", None)
         if isinstance(handle, dict):
             try:
-                await self.update_feature_summary(handle, status="Running")
+                await self.update_feature_summary(
+                    handle,
+                    status="Running",
+                    reaction_generation=generation,
+                    reaction_transition="processing_start",
+                    reaction_metrics=metrics,
+                )
             except Exception as exc:
                 logger.debug("[%s] Failed to reopen Discord feature summary: %s", self.name, exc)
 
-    async def _set_message_reaction_state(self, message: Any, emoji: Optional[str]) -> bool:
-        """Set one status reaction and report whether every mutation succeeded."""
+    async def _set_message_reaction_state(
+        self,
+        message: Any,
+        emoji: Optional[str],
+        *,
+        generation: Optional[int] = None,
+        transition: str = "",
+        metrics: Optional[Dict[str, Any]] = None,
+        cleanup_unknown: bool = False,
+    ) -> bool:
+        """Set one Hermes status reaction with known-state and generation fencing.
 
-        success = True
-        target_present = self._message_has_own_reaction(message, emoji) if emoji else False
-        for existing in _DISCORD_STATUS_REACTION_EMOJIS:
-            if emoji and existing == emoji:
-                continue
-            existing_present = self._message_has_own_reaction(message, existing)
-            removed = await self._remove_reaction(message, existing)
-            if existing_present is True and not removed:
-                success = False
-        if emoji and target_present is not True:
-            if not await self._add_reaction(message, emoji):
-                success = False
-        return success
+        Hot-path transitions remove only a status this adapter knows it added.
+        Restart-era state is unknown, not absent, so exhaustive cleanup is
+        reserved for explicit reconciliation paths outside inference startup.
+        """
 
-    def _message_has_own_reaction(self, message: Any, emoji: Optional[str]) -> Optional[bool]:
-        if not emoji:
+        identity = self._message_identity(message)
+        if generation is None:
+            generation = self._next_reaction_generation()
+        current_generation = self._hermes_reaction_generations.get(identity, 0)
+        if generation < current_generation:
+            self._reaction_metrics_increment(metrics, "stale_skips")
             return False
-        reactions = getattr(message, "reactions", None)
-        if reactions is None:
-            return None
-        for reaction in reactions or []:
-            reaction_emoji = getattr(reaction, "emoji", reaction)
-            if str(reaction_emoji) == emoji and bool(getattr(reaction, "me", False)):
+        self._hermes_reaction_generations[identity] = generation
+        lock = self._hermes_reaction_locks.setdefault(identity, asyncio.Lock())
+        async with lock:
+            if generation < self._hermes_reaction_generations.get(identity, 0):
+                self._reaction_metrics_increment(metrics, "stale_skips")
+                return False
+
+            known = identity in self._hermes_reaction_states
+            prior = self._hermes_reaction_states.get(identity)
+            if known and prior == emoji:
+                self._reaction_metrics_increment(metrics, "state_noops")
                 return True
-        return False
+            if not known:
+                self._reaction_metrics_increment(metrics, "unknown_states")
+
+            success = True
+            if known and prior and prior != emoji:
+                removed = await self._timed_reaction_mutation(
+                    message,
+                    prior,
+                    operation="remove",
+                    generation=generation,
+                    transition=transition,
+                    metrics=metrics,
+                )
+                success = removed and success
+                if removed:
+                    self._remember_reaction_state(identity, None)
+            elif not known and cleanup_unknown:
+                for existing in _DISCORD_STATUS_REACTION_EMOJIS:
+                    if existing == emoji:
+                        continue
+                    # Unknown-state cleanup is best effort: removing a status
+                    # that is already absent may return a Discord 404 and must
+                    # not prevent the desired terminal reaction from landing.
+                    await self._timed_reaction_mutation(
+                        message,
+                        existing,
+                        operation="remove",
+                        generation=generation,
+                        transition=transition or "reconciliation",
+                        metrics=metrics,
+                    )
+
+            if emoji and (not known or prior != emoji):
+                success = await self._timed_reaction_mutation(
+                    message,
+                    emoji,
+                    operation="add",
+                    generation=generation,
+                    transition=transition,
+                    metrics=metrics,
+                ) and success
+
+            # Record the mutation we attempted even if a newer generation was
+            # reserved while Discord REST was in flight. The newer waiter then
+            # removes this exact known prior state before applying its target.
+            if success and (emoji is not None or known):
+                self._remember_reaction_state(identity, emoji)
+            return success
 
     @staticmethod
     def _message_identity(message: Any) -> Tuple[str, str]:
@@ -6529,7 +6721,12 @@ class DiscordAdapter(BasePlatformAdapter):
         for message in messages:
             try:
                 message_emoji = origin_emoji if origin_identity == self._message_identity(message) else emoji
-                await self._set_message_reaction_state(message, message_emoji)
+                await self._set_message_reaction_state(
+                    message,
+                    message_emoji,
+                    transition="kanban_reconciliation",
+                    cleanup_unknown=True,
+                )
             except Exception as exc:
                 if self._is_permanent_feature_summary_error(exc):
                     continue
@@ -7021,6 +7218,9 @@ class DiscordAdapter(BasePlatformAdapter):
         Action turns reopen/update the summary embed. Every turn updates the
         triggering user message and, within a thread, its original post.
         """
+        started = time.perf_counter()
+        metrics: Dict[str, Any] = {}
+        generation = self._next_reaction_generation()
         action_lifecycle = self._action_lifecycle_enabled(event)
         if (
             action_lifecycle
@@ -7036,25 +7236,82 @@ class DiscordAdapter(BasePlatformAdapter):
                 event,
                 emoji_ack=False,
             )
+            logger.info(
+                "discord_processing_start_timing total_ms=%d summary_ms=0 "
+                "reaction_resolve_ms=0 reaction_sync_ms=0 recovery_record_ms=%d "
+                "reaction_targets=0 rest_add_attempts=0 rest_remove_attempts=0 "
+                "message_id=%s work_item_id=%s sticky_failure=true",
+                int((time.perf_counter() - started) * 1000),
+                int((time.perf_counter() - started) * 1000),
+                getattr(event, "message_id", "") or "",
+                getattr(event, "work_item_id", "") or "",
+            )
             return
+        summary_started = time.perf_counter()
         if action_lifecycle:
-            await self._mark_feature_summary_running(event)
+            await self._mark_feature_summary_running(
+                event,
+                generation=generation,
+                metrics=metrics,
+            )
+        summary_ms = int((time.perf_counter() - summary_started) * 1000)
         acked = False
+        reaction_resolve_started = time.perf_counter()
+        messages: List[Any] = []
         if self._reactions_enabled():
             messages = await self._processing_reaction_messages(event)
+        reaction_resolve_ms = int((time.perf_counter() - reaction_resolve_started) * 1000)
+        reaction_sync_started = time.perf_counter()
+        if self._reactions_enabled():
             for message in messages:
                 if not hasattr(message, "add_reaction"):
                     continue
-                await self._set_message_reaction_state(message, "⏳")
-                acked = True
+                acked = bool(
+                    await self._set_message_reaction_state(
+                        message,
+                        "⏳",
+                        generation=generation,
+                        transition="processing_start",
+                        metrics=metrics,
+                    )
+                ) or acked
+        reaction_sync_ms = int((time.perf_counter() - reaction_sync_started) * 1000)
+        recovery_started = time.perf_counter()
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
             emoji_ack=acked,
         )
+        recovery_record_ms = int((time.perf_counter() - recovery_started) * 1000)
+        logger.info(
+            "discord_processing_start_timing total_ms=%d summary_ms=%d "
+            "reaction_resolve_ms=%d reaction_sync_ms=%d recovery_record_ms=%d "
+            "reaction_targets=%d rest_add_attempts=%d rest_add_successes=%d "
+            "rest_remove_attempts=%d rest_remove_successes=%d rest_mutation_ms=%d "
+            "state_noops=%d unknown_states=%d stale_skips=%d message_id=%s "
+            "work_item_id=%s generation=%d",
+            int((time.perf_counter() - started) * 1000),
+            summary_ms,
+            reaction_resolve_ms,
+            reaction_sync_ms,
+            recovery_record_ms,
+            len(messages),
+            int(metrics.get("rest_add_attempts", 0) or 0),
+            int(metrics.get("rest_add_successes", 0) or 0),
+            int(metrics.get("rest_remove_attempts", 0) or 0),
+            int(metrics.get("rest_remove_successes", 0) or 0),
+            int(metrics.get("rest_mutation_ms", 0) or 0),
+            int(metrics.get("state_noops", 0) or 0),
+            int(metrics.get("unknown_states", 0) or 0),
+            int(metrics.get("stale_skips", 0) or 0),
+            getattr(event, "message_id", "") or "",
+            getattr(event, "work_item_id", "") or "",
+            generation,
+        )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
+        generation = self._next_reaction_generation()
         await asyncio.to_thread(
             self._record_discord_processing_complete,
             event,
@@ -7118,7 +7375,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 continue
             target_emoji = kanban_emoji or ledger_emoji or outcome_emoji
             reactions_synced = bool(
-                await self._set_message_reaction_state(message, target_emoji)
+                await self._set_message_reaction_state(
+                    message,
+                    target_emoji,
+                    generation=generation,
+                    transition="processing_complete",
+                )
             ) and reactions_synced
         if (
             reactions_synced
@@ -13910,6 +14172,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return False
         _intake_timing = self._new_discord_intake_timing(message)
+        _request_started_ts = time.time()
 
         thread_id = None
         parent_channel_id = None
@@ -14847,6 +15110,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     or is_meeting_command_message
                 )
             ),
+        )
+        event.metadata.update(
+            {
+                "discord_request_ts": _request_started_ts,
+                "discord_adapter_dispatch_ts": time.time(),
+            }
         )
 
         # Track thread participation so the bot won't require @mention for

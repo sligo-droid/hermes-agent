@@ -169,6 +169,21 @@ def test_gateway_flow_telemetry_formats_ids_and_durations_only():
         admission_ts=10.0,
         dispatch_start_ts=10.25,
         finished_ts=11.0,
+        phase_timestamps={
+            "request_ts": 9.0,
+            "adapter_dispatch_ts": 9.1,
+            "intake_ts": 9.2,
+            "admitted_ts": 9.3,
+            "agent_handler_start_ts": 9.5,
+            "model_start_ts": 9.8,
+            "first_commentary_ts": 10.4,
+        },
+        phase_durations={
+            "ledger_claim_ms": 7,
+            "ledger_claim_calls": 1,
+            "ledger_agent_running_ms": 11,
+            "ledger_agent_running_calls": 1,
+        },
     )
     line = _format_gateway_flow_telemetry(fields)
 
@@ -182,6 +197,17 @@ def test_gateway_flow_telemetry_formats_ids_and_durations_only():
     assert "session_id=session-4" in line
     assert "admission_to_dispatch_ms=250" in line
     assert "dispatch_to_finish_ms=750" in line
+    assert "request_to_adapter_dispatch_ms=99" in line
+    assert "adapter_dispatch_to_intake_ms=99" in line
+    assert "intake_to_admission_ms=100" in line
+    assert "admission_to_agent_handler_ms=199" in line
+    assert "agent_handler_to_model_ms=300" in line
+    assert "model_to_first_commentary_ms=599" in line
+    assert "request_to_first_commentary_ms=1400" in line
+    assert "ledger_claim_ms=7" in line
+    assert "ledger_claim_calls=1" in line
+    assert "ledger_agent_running_ms=11" in line
+    assert "ledger_agent_running_calls=1" in line
     assert "ship" not in line
 
 
