@@ -75,6 +75,24 @@ def test_honcho_marker_first_resolution_replaces_stale_and_paginates_with_api_li
         HonchoProjectionApi(_Scope(values), max_items=100).list()
 
 
+def test_honcho_later_page_failure_is_wrapped():
+    class Page:
+        total = 2
+        items = [SimpleNamespace(id="one", content="one")]
+
+        @staticmethod
+        def get_next_page():
+            raise ConnectionError("later page failed")
+
+    class Scope:
+        @staticmethod
+        def list(**_kwargs):
+            return Page()
+
+    with pytest.raises(HonchoProjectionFailure, match="projection_list_failed"):
+        HonchoProjectionApi(Scope()).list()
+
+
 def test_only_stable_current_non_sensitive_allowlisted_pages_promote():
     base = {"frontmatter": {
         "status": "current", "confidence": "high", "sensitivity": "internal",

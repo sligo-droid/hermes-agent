@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import ctypes
 import shutil
 import stat
 import subprocess
@@ -288,6 +289,18 @@ class GitSourcePublisher:
     def _sha256(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
+    @staticmethod
+    def _exchange_paths(left: Path, right: Path) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise PublicationFailure("atomic_path_exchange_unavailable")
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        if renameat2(-100, os.fsencode(left), -100, os.fsencode(right), 2) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(right))
+
     def _prior_bytes(self, path: str, expected_head: str) -> bytes | None:
         completed = subprocess.run(
             [
@@ -412,6 +425,38 @@ class GitSourcePublisher:
                 return False
         return True
 
+    def _recover_materialization_sidecars(
+        self,
+        assimilation_id: str,
+        manifest: list[dict[str, Any]],
+        contents: Mapping[str, bytes | None],
+        targets: Mapping[str, Path],
+    ) -> None:
+        for row in manifest:
+            target = targets[row["path"]]
+            temporary = target.parent / f".{target.name}.tmp-{assimilation_id[:12]}"
+            if not temporary.exists() and not temporary.is_symlink():
+                continue
+            if temporary.is_symlink() or not temporary.is_file():
+                raise PublicationFailure("git_adoption_workspace_unsafe")
+            temporary_sha = self._sha256(temporary.read_bytes())
+            target_sha = self._sha256(target.read_bytes()) if target.is_file() else ""
+            desired = contents[row["path"]]
+            desired_sha = self._sha256(desired) if desired is not None else ""
+            if target_sha == desired_sha and temporary_sha in {
+                row["prior_sha256"], desired_sha
+            }:
+                temporary.unlink()
+            elif target_sha == row["prior_sha256"] and temporary_sha == desired_sha:
+                temporary.unlink()
+            elif not target.exists() and temporary_sha == row["prior_sha256"]:
+                if desired is None:
+                    temporary.unlink()
+                else:
+                    os.rename(temporary, target)
+            else:
+                raise PublicationFailure("git_adoption_workspace_unsafe")
+
     def _materialize_commit(
         self,
         *,
@@ -421,13 +466,6 @@ class GitSourcePublisher:
         contents: Mapping[str, bytes | None],
         targets: Mapping[str, Path],
     ) -> None:
-        def restore_retired(retired: Path, target: Path) -> None:
-            try:
-                os.link(retired, target)
-            except FileExistsError:
-                return
-            retired.unlink()
-
         for row in manifest:
             path = row["path"]
             target = targets[path]
@@ -446,17 +484,17 @@ class GitSourcePublisher:
                 raise PublicationFailure("git_target_changed_before_materialization")
             if content is None:
                 if target.exists():
-                    retired = target.parent / f".{target.name}.prior-{assimilation_id[:12]}"
-                    if retired.exists() or retired.is_symlink():
+                    temporary = target.parent / f".{target.name}.tmp-{assimilation_id[:12]}"
+                    if temporary.exists() or temporary.is_symlink():
                         raise PublicationFailure("publication_temporary_path_exists")
-                    os.rename(target, retired)
-                    if self._sha256(retired.read_bytes()) not in {
+                    os.rename(target, temporary)
+                    if self._sha256(temporary.read_bytes()) not in {
                         row["prior_sha256"], desired_sha
                     }:
-                        restore_retired(retired, target)
+                        if not target.exists():
+                            os.rename(temporary, target)
                         raise PublicationFailure("git_target_changed_before_materialization")
-                    else:
-                        retired.unlink(missing_ok=True)
+                    temporary.unlink()
                 continue
             temporary = target.parent / f".{target.name}.tmp-{assimilation_id[:12]}"
             if temporary.exists() or temporary.is_symlink():
@@ -479,20 +517,16 @@ class GitSourcePublisher:
                         continue
                     if current_sha != row["prior_sha256"]:
                         raise PublicationFailure("git_target_changed_before_materialization")
-                    retired = target.parent / f".{target.name}.prior-{assimilation_id[:12]}"
-                    if retired.exists() or retired.is_symlink():
-                        raise PublicationFailure("publication_temporary_path_exists")
-                    os.rename(target, retired)
-                    if self._sha256(retired.read_bytes()) != row["prior_sha256"]:
-                        restore_retired(retired, target)
-                        raise PublicationFailure("git_target_changed_before_materialization")
                     try:
-                        os.link(temporary, target)
-                    except FileExistsError as exc:
-                        restore_retired(retired, target)
+                        self._exchange_paths(temporary, target)
+                    except OSError as exc:
                         raise PublicationFailure("git_target_changed_before_materialization") from exc
-                    else:
-                        retired.unlink(missing_ok=True)
+                    if self._sha256(temporary.read_bytes()) != row["prior_sha256"]:
+                        try:
+                            self._exchange_paths(temporary, target)
+                        except OSError as exc:
+                            raise PublicationFailure("git_target_exchange_recovery_failed") from exc
+                        raise PublicationFailure("git_target_changed_before_materialization")
                 else:
                     try:
                         os.link(temporary, target)
@@ -552,6 +586,9 @@ class GitSourcePublisher:
             if all(value in message for value in trailers):
                 self._audit_commit(expected_head, current_head, manifest)
                 commit_sha = current_head
+                self._recover_materialization_sidecars(
+                    assimilation_id, manifest, contents, targets
+                )
                 try:
                     self._workspace_snapshot(commit_sha)
                 except PublicationFailure:
