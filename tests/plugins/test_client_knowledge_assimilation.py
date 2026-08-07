@@ -496,7 +496,7 @@ def test_non_transient_operation_rejects_empty_classification_values():
             )
 
 
-def test_operation_schema_requires_grounded_date_and_empty_transient_payload():
+def test_operation_schema_requires_grounded_date_and_empty_transient_content():
     op = _operation("add")
     with pytest.raises(AssimilationFailure, match="schema_mismatch"):
         validate_proposal(
@@ -524,6 +524,28 @@ def test_operation_schema_requires_grounded_date_and_empty_transient_payload():
                 "preferences": [], "evidence": [],
             }, source_root=Path("/tmp"), max_output_bytes=500_000,
         )
+
+
+def test_grounded_transient_may_reference_exact_finding_evidence(tmp_path):
+    transient = {key: "" for key in (
+        "target_slug", "title", "kind", "status", "confidence", "sensitivity",
+        "impact", "honcho_projection", "effective_at", "claim", "timeline_entry",
+        "expected_prior_sha256", "final_markdown",
+    )}
+    transient.update({
+        "operation": "ignore_transient", "finding_id": "requirement-reporting",
+        "source_refs": [], "supersedes": [], "evidence_ids": ["evidence-001"],
+    })
+    parsed, review, reason = validate_proposal(
+        _proposal(transient), artifact_id="a" * 64,
+        interpretation_id="b" * 64, project_key="pid",
+        notion_ref="notion:page:new", current_pages={},
+        interpretation=_interpretation("Transient test instruction."),
+        source_root=tmp_path, max_output_bytes=500_000,
+    )
+    assert parsed["operations"] == [transient]
+    assert review is False
+    assert reason == "closed_allowlist_ignore_transient"
 
 
 def test_confirmation_preserves_timeline_beyond_model_context_truncation(tmp_path):
