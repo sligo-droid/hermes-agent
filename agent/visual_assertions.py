@@ -41,6 +41,7 @@ _ELEMENT_KINDS = frozenset(
 )
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
 _HOST_ASSERTION_ID_RE = re.compile(r"^vassert_[0-9a-f]{24}$")
+_EXECUTION_CONTRACT_ID_RE = re.compile(r"^vac_[0-9a-f]{24}$")
 _UNSAFE_RE = re.compile(
     r"(?:https?://|\b(?:authorization|bearer|cookie|password|secret|token)\b|"
     r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token)\b)",
@@ -554,6 +555,34 @@ def storage_safe_visual_qa_args(value: Any) -> dict[str, Any]:
     return {"assertions": assertions}
 
 
+def is_storage_safe_visual_qa_args(value: Any) -> bool:
+    """Return whether ``value`` is opaque durable evidence, not an executable contract."""
+
+    if not isinstance(value, dict):
+        return False
+    keys = set(value)
+    if keys not in ({"assertions"}, {"contract_id", "assertions"}):
+        return False
+    assertions = value.get("assertions")
+    if not isinstance(assertions, list) or len(assertions) > 6:
+        return False
+    contract_id = value.get("contract_id")
+    if contract_id is not None:
+        if not _EXECUTION_CONTRACT_ID_RE.fullmatch(str(contract_id)) or not assertions:
+            return False
+    for item in assertions:
+        if not isinstance(item, dict) or set(item) != {"id", "kind"}:
+            return False
+        assertion_id = str(item.get("id") or "")
+        kind = str(item.get("kind") or "")
+        if (
+            not _HOST_ASSERTION_ID_RE.fullmatch(assertion_id)
+            or kind not in ASSERTION_KINDS
+        ):
+            return False
+    return True
+
+
 def validate_visual_assertion_coverage(
     requirement: Any,
     assertions: Any,
@@ -720,6 +749,7 @@ __all__ = [
     "diagnose_orchestrated_visual_contract",
     "normalize_assertion_result_coverage",
     "normalize_orchestrated_visual_contract",
+    "is_storage_safe_visual_qa_args",
     "sanitize_assertion_result",
     "storage_safe_visual_qa_args",
     "validate_visual_assertion_coverage",

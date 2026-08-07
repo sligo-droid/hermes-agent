@@ -602,6 +602,65 @@ class TestWireInvariant:
         )
         assert "PLUGIN-CTX" in current["content"]
 
+    def test_next_turn_does_not_replay_storage_only_visual_qa_contract(self, wire_env):
+        from agent.tool_executor import storage_safe_tool_calls
+
+        make_agent, handler, db, sid = wire_env
+        rich_arguments = {
+            "target": {"description": "Federal dashboard hero"},
+            "page": {"state": "already_open", "description": "Federal dashboard"},
+            "viewport": {"description": "desktop"},
+            "state": ["authenticated dashboard loaded"],
+            "assertions": [
+                {
+                    "kind": "screenshot_appearance",
+                    "expectation": "The Federal dashboard remains visually intact.",
+                }
+            ],
+        }
+        safe_calls = storage_safe_tool_calls(
+            [
+                {
+                    "id": "call_visual",
+                    "type": "function",
+                    "function": {
+                        "name": "visual_qa",
+                        "arguments": json.dumps(rich_arguments),
+                    },
+                }
+            ]
+        )
+        db.create_session(session_id=sid, source="cli")
+        db.append_message(sid, role="user", content="previous request")
+        db.append_message(sid, role="assistant", content="", tool_calls=safe_calls)
+        db.append_message(
+            sid,
+            role="tool",
+            content="opaque visual receipt",
+            tool_name="visual_qa",
+            tool_call_id="call_visual",
+        )
+
+        stored = repr(db.get_messages(sid))
+        assert "Federal dashboard" not in stored
+        assert "vac_" in stored
+
+        history = db.get_messages_as_conversation(sid)
+        handler.captured_requests = []
+        make_agent().run_conversation(
+            "next request", conversation_history=history, task_id="visual-replay"
+        )
+
+        request = _chat_requests(handler)[0]
+        serialized = json.dumps(request)
+        assert "visual_qa" not in serialized
+        assert "vac_" not in serialized
+        assert "opaque visual receipt" not in serialized
+        user_messages = _user_messages(request)
+        assert len(user_messages) == 1
+        assert "previous request" in user_messages[0]["content"]
+        assert "next request" in user_messages[0]["content"]
+
 
 # ---------------------------------------------------------------------------
 # Review fixes: re-anchoring, MoA, in-place compaction backfill, override

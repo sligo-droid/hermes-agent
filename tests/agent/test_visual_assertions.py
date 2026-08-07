@@ -1,6 +1,7 @@
 from agent.visual_assertions import (
     aggregate_assertion_results,
     diagnose_orchestrated_visual_contract,
+    is_storage_safe_visual_qa_args,
     normalize_assertion_result_coverage,
     normalize_orchestrated_visual_contract,
     storage_safe_visual_qa_args,
@@ -42,6 +43,40 @@ def _incident_contract():
             },
         ],
     }
+
+
+def test_storage_safe_visual_qa_shape_is_recognized_but_not_executable():
+    safe = storage_safe_visual_qa_args(_incident_contract())
+
+    assert is_storage_safe_visual_qa_args(safe) is True
+    assert normalize_orchestrated_visual_contract(safe) == {}
+    assert is_storage_safe_visual_qa_args({"assertions": []}) is True
+
+
+def test_storage_safe_visual_qa_shape_rejects_lookalikes():
+    safe = storage_safe_visual_qa_args(_incident_contract())
+
+    assert is_storage_safe_visual_qa_args({**safe, "target": {}}) is False
+    assert is_storage_safe_visual_qa_args(
+        {"assertions": [{"id": "vassert_" + "a" * 24, "kind": "visible", "locator": {}}]}
+    ) is False
+    assert is_storage_safe_visual_qa_args(
+        {"contract_id": "vac_not-valid", "assertions": safe["assertions"]}
+    ) is False
+
+
+def test_every_legacy_storage_producer_shape_is_recognized():
+    duplicate_assertion = {
+        "id": "vassert_" + "a" * 24,
+        "kind": "screenshot_appearance",
+    }
+    safe = storage_safe_visual_qa_args(
+        {"assertions": [duplicate_assertion, duplicate_assertion]}
+    )
+
+    assert safe == {"assertions": [duplicate_assertion, duplicate_assertion]}
+    assert is_storage_safe_visual_qa_args(safe) is True
+    assert normalize_orchestrated_visual_contract(safe) == {}
 
 
 def test_validation_accepts_bounded_declarative_assertions():
