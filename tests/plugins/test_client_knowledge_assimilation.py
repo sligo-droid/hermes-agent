@@ -492,6 +492,36 @@ def test_non_transient_operation_rejects_empty_classification_values():
             )
 
 
+def test_operation_schema_requires_grounded_date_and_empty_transient_payload():
+    op = _operation("add")
+    with pytest.raises(AssimilationFailure, match="schema_mismatch"):
+        validate_proposal(
+            _proposal({**op, "effective_at": ""}),
+            artifact_id="a" * 64, interpretation_id="b" * 64,
+            project_key="pid", notion_ref="notion:page:new", current_pages={},
+            interpretation=_interpretation(op["claim"]), source_root=Path("/tmp"),
+            max_output_bytes=500_000,
+        )
+    transient = {key: "" for key in (
+        "target_slug", "title", "kind", "status", "confidence", "sensitivity",
+        "impact", "honcho_projection", "effective_at", "claim", "timeline_entry",
+        "expected_prior_sha256", "finding_id", "final_markdown",
+    )}
+    transient.update({
+        "operation": "ignore_transient", "source_refs": ["notion:page:new"],
+        "supersedes": [], "evidence_ids": [],
+    })
+    with pytest.raises(AssimilationFailure, match="schema_mismatch"):
+        validate_proposal(
+            _proposal(transient), artifact_id="a" * 64,
+            interpretation_id="b" * 64, project_key="pid",
+            notion_ref="notion:page:new", current_pages={}, interpretation={
+                "candidate_learnings": [], "decisions": [], "requirements": [],
+                "preferences": [], "evidence": [],
+            }, source_root=Path("/tmp"), max_output_bytes=500_000,
+        )
+
+
 def test_confirmation_preserves_timeline_beyond_model_context_truncation(tmp_path):
     path = tmp_path / "projects/pid/requirements/reporting.md"
     path.parent.mkdir(parents=True)

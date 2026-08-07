@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -94,10 +95,16 @@ _OPERATION_SCHEMA = {
             "properties": {
                 key: {"const": ""}
                 for key in (
-                    "kind", "status", "confidence", "sensitivity", "impact",
-                    "honcho_projection",
+                    "target_slug", "title", "kind", "status", "confidence",
+                    "sensitivity", "impact", "honcho_projection", "effective_at",
+                    "claim", "timeline_entry", "expected_prior_sha256", "finding_id",
+                    "final_markdown",
                 )
-            }
+            } | {
+                "source_refs": {"const": []},
+                "supersedes": {"const": []},
+                "evidence_ids": {"const": []},
+            },
         },
         "else": {
             "properties": {
@@ -107,6 +114,11 @@ _OPERATION_SCHEMA = {
                 "sensitivity": {"enum": sorted(VALID_SENSITIVITY)},
                 "impact": {"enum": sorted(VALID_IMPACTS)},
                 "honcho_projection": {"enum": sorted(VALID_PROJECTION_POLICIES)},
+                "effective_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                },
             }
         },
     }],
@@ -652,6 +664,9 @@ class AssimilationWorker:
                     "interpretation_id": interpretation_row["interpretation_id"],
                     "project_key": artifact.project_key,
                     "notion_source_ref": notion_ref,
+                    "source_received_date": time.strftime(
+                        "%Y-%m-%d", time.gmtime(artifact.received_at)
+                    ),
                     "interpretation": assimilable,
                     "current_pages": current_pages,
                 },
