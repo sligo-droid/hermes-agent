@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from agent.plugin_llm import (
     PluginLlmRouteError,
     PluginLlmStructuredResult,
@@ -12,6 +14,9 @@ from plugins.client_knowledge_gbrain.extraction import ExtractionSettings, Extra
 from plugins.client_knowledge_gbrain.interpretation import (
     PROMPT_VERSION,
     SCHEMA_VERSION,
+    _CATEGORIES,
+    _semantic_validate,
+    InterpretationFailure,
     InterpretationSettings,
     InterpretationWorker,
 )
@@ -173,6 +178,45 @@ def test_unused_valid_evidence_is_discarded_deterministically(tmp_path):
     assert [item["id"] for item in persisted["interpretation"]["evidence"]] == [
         "evidence-001"
     ]
+
+
+def test_unique_exact_quote_repairs_model_offsets(tmp_path):
+    store, derived, _artifact, claim = _prepared(tmp_path)
+    _artifact, extraction_row = store.get_extraction_for_interpretation_claim(claim)
+    extraction = derived.read_json(
+        "extractions", extraction_row["extraction_id"],
+        extraction_row["output_sha256"], extraction_row["output_bytes"],
+    )
+    parsed = _valid(extraction)
+    parsed["evidence"][0]["start"] = 1
+    parsed["evidence"][0]["end"] = 2
+    interpretation_id = InterpretationWorker(
+        store, derived, _FakeLlm(parsed),
+        InterpretationSettings.from_config(
+            {"client_knowledge": {"interpretation": {"enabled": True}}}
+        ),
+    ).process_claim(claim)
+    row = store.get_interpretation(interpretation_id)
+    persisted = derived.read_json(
+        "interpretations", interpretation_id, row["output_sha256"], row["output_bytes"]
+    )
+    evidence = persisted["interpretation"]["evidence"][0]
+    body = next(item for item in extraction["segments"] if item["kind"] == "body_plain")
+    assert body["text"][evidence["start"]:evidence["end"]] == evidence["quote"]
+
+
+def test_repeated_quote_does_not_repair_model_offsets():
+    extraction = {"segments": [{"segment_id": "body-0001", "text": "same same"}]}
+    parsed = {
+        **{category: [] for category in _CATEGORIES},
+        "summary": "",
+        "evidence": [{
+            "id": "evidence-001", "segment_id": "body-0001", "start": 1, "end": 2,
+            "quote": "same",
+        }],
+    }
+    with pytest.raises(InterpretationFailure, match="evidence_mismatch"):
+        _semantic_validate(parsed, extraction, 500_000)
 
 
 def test_route_drift_is_retryable_and_static_route_error_is_operator_blocked(tmp_path):
