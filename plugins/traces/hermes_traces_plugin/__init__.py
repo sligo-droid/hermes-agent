@@ -86,6 +86,29 @@ def register(ctx: Any) -> None:
         except Exception:
             return None
 
+    def on_session_start(
+        session_id: str | None = None,
+        platform: str | None = None,
+        parent_session_id: str | None = None,
+        root_session_id: str | None = None,
+        **_: Any,
+    ) -> str | None:
+        if not session_id or (platform or "").strip().lower() != "discord":
+            return None
+        try:
+            config, state, _publisher, store = _runtime()
+            root_id = store.resolve_root(
+                session_id,
+                parent_session_id=parent_session_id,
+                root_session_id=root_session_id,
+            )
+            if not root_id:
+                return None
+            record = state.create(root_id, "discord")
+            return config.sligo_url(record["slug"])
+        except Exception:
+            return None
+
     def on_session_finalize(
         session_id: str | None = None,
         platform: str | None = None,
@@ -213,6 +236,7 @@ def register(ctx: Any) -> None:
             "url": config.sligo_url(record["slug"]),
         }
 
+    ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("on_session_end", on_session_end)
     ctx.register_hook("on_session_finalize", on_session_finalize)
     ctx.register_hook("subagent_start", on_subagent_start)

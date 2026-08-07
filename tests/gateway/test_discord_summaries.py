@@ -3678,10 +3678,17 @@ async def test_terminal_feature_summary_collects_transient_session_artifacts(mon
 
 
 @pytest.mark.asyncio
-async def test_running_feature_summary_does_not_collect_session_artifacts(monkeypatch):
+async def test_running_feature_summary_collects_session_artifacts(monkeypatch):
     from hermes_cli import plugins as plugin_api
 
-    collect = MagicMock(return_value=[])
+    artifacts = [
+        {
+            "kind": "external_url",
+            "label": "Agent Trace",
+            "url": "https://artifacts.example.test/runs/live",
+        }
+    ]
+    collect = MagicMock(return_value=artifacts)
     monkeypatch.setattr(plugin_api, "collect_session_artifacts", collect)
     runner = object.__new__(gateway_run.GatewayRunner)
     runner._session_db = None
@@ -3697,8 +3704,17 @@ async def test_running_feature_summary_does_not_collect_session_artifacts(monkey
         session_id="session-1",
     )
 
-    collect.assert_not_called()
-    assert "artifacts" not in adapter.update_feature_summary.await_args.kwargs
+    collect.assert_called_once_with(
+        "session-1",
+        surface="discord_feature_summary",
+    )
+    adapter.update_feature_summary.assert_awaited_once_with(
+        {"message_id": "300", "initial_request": "Keep working"},
+        final_response="Still working.",
+        status="Running",
+        title="Keep working",
+        artifacts=artifacts,
+    )
 
 
 @pytest.mark.asyncio
