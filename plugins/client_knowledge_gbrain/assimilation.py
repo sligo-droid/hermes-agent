@@ -97,13 +97,11 @@ _OPERATION_SCHEMA = {
                 for key in (
                     "target_slug", "title", "kind", "status", "confidence",
                     "sensitivity", "impact", "honcho_projection", "effective_at",
-                    "claim", "timeline_entry", "expected_prior_sha256", "finding_id",
-                    "final_markdown",
+                    "claim", "timeline_entry", "expected_prior_sha256", "final_markdown",
                 )
             } | {
                 "source_refs": {"const": []},
                 "supersedes": {"const": []},
-                "evidence_ids": {"const": []},
             },
         },
         "else": {
