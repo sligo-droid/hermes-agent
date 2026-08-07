@@ -167,7 +167,7 @@ def _is_single_clause_exact_visual_request(text: str) -> bool:
     if not _EXACT_VISUAL_VALUE_RE.search(text):
         return False
     without_final_punctuation = text.rstrip().rstrip(".!?")
-    if re.search(r"[.!?]", without_final_punctuation):
+    if re.search(r"[!?]|(?<!\d)\.|\.(?!\d)", without_final_punctuation):
         return False
     return _ADDITIVE_VISUAL_CLAUSE_RE.search(without_final_punctuation) is None
 

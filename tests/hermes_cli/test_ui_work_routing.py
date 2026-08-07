@@ -285,6 +285,7 @@ def test_deterministic_navigation_edit_stays_on_default_coding_route():
         "Add exactly 8px spacing between the dashboard cards.",
         "Style the dashboard button color exactly #112233.",
         "Set the card width to 320px.",
+        "Add exactly 1.25rem spacing between the dashboard cards.",
     ],
 )
 def test_exact_visual_property_edit_stays_on_default_coding_route(task):
