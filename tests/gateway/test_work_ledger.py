@@ -174,6 +174,158 @@ def test_ledger_deduplicates_discord_message_ids(tmp_path):
     assert len(ledger.incomplete_items()) == 1
 
 
+def test_ledger_compaction_preserves_live_and_pending_terminal_records(tmp_path):
+    now = [10 * 24 * 60 * 60.0]
+    path = tmp_path / "work_ledger.json"
+    ledger = GatewayWorkLedger(path, now_fn=lambda: now[0])
+    old = now[0] - (8 * 24 * 60 * 60)
+    items = {
+        "active": {"id": "active", "status": "agent_running", "updated_at": old},
+        "delivery": {
+            "id": "delivery",
+            "status": "blocked",
+            "updated_at": old,
+            "terminal_delivery": {"status": "pending", "summary_updated_at": None},
+        },
+        "blocked": {"id": "blocked", "status": "blocked", "updated_at": old},
+        "reaction": {
+            "id": "reaction",
+            "status": "completed",
+            "updated_at": old,
+            "terminal_reaction_sync_pending": True,
+        },
+        "closeout": {
+            "id": "closeout",
+            "status": "completed",
+            "updated_at": old,
+            "closeout_authoritative": True,
+            "closeout_activated_at": old,
+            "closeout": {"status": "waiting_for_ci", "next_due_at": now[0]},
+        },
+        "quiescent": {"id": "quiescent", "status": "completed", "updated_at": old},
+    }
+    path.write_text(json.dumps({"version": 2, "items": deepcopy(items)}), encoding="utf-8")
+
+    ledger.accept_event(
+        _discord_event(message_id="compact-trigger"),
+        session_key="compact-trigger",
+        freshness_seconds=60,
+    )
+
+    stored = json.loads(path.read_text(encoding="utf-8"))["items"]
+    for work_id in ("active", "delivery", "blocked", "reaction", "closeout"):
+        assert stored[work_id] == items[work_id]
+    assert stored["quiescent"] == {
+        "id": "quiescent",
+        "status": "completed",
+        "tombstone": True,
+        "tombstoned_at": now[0],
+        "tombstone_expires_at": now[0] + (30 * 24 * 60 * 60),
+    }
+
+
+def test_ledger_compaction_tombstones_then_expires_duplicate_suppression(tmp_path):
+    now = [10 * 24 * 60 * 60.0]
+    path = tmp_path / "work_ledger.json"
+    ledger = GatewayWorkLedger(path, now_fn=lambda: now[0])
+    event = _discord_event(message_id="old-duplicate")
+    work_id = ledger.id_for_event(event, "duplicate-session")
+    assert work_id is not None
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "items": {
+                    work_id: {
+                        "id": work_id,
+                        "status": "completed",
+                        "updated_at": now[0] - (8 * 24 * 60 * 60),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ledger.accept_event(
+        _discord_event(message_id="tombstone-trigger"),
+        session_key="tombstone-trigger",
+        freshness_seconds=60,
+    )
+    duplicate = ledger.accept_event(event, session_key="duplicate-session", freshness_seconds=60)
+
+    assert duplicate is not None
+    assert duplicate["_existing"] is True
+    assert duplicate["tombstone"] is True
+    now[0] += (30 * 24 * 60 * 60) + (60 * 60)
+    ledger.accept_event(
+        _discord_event(message_id="prune-trigger"),
+        session_key="prune-trigger",
+        freshness_seconds=60,
+    )
+    replay_after_horizon = ledger.accept_event(
+        event,
+        session_key="duplicate-session",
+        freshness_seconds=60,
+    )
+
+    assert replay_after_horizon is not None
+    assert replay_after_horizon["_existing"] is False
+
+
+def test_ledger_compaction_runs_only_after_its_bounded_cadence(tmp_path):
+    now = [10 * 24 * 60 * 60.0]
+    path = tmp_path / "work_ledger.json"
+    ledger = GatewayWorkLedger(path, now_fn=lambda: now[0])
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "last_compacted_at": now[0],
+                "items": {
+                    "old": {
+                        "id": "old",
+                        "status": "completed",
+                        "updated_at": now[0] - (8 * 24 * 60 * 60),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ledger.accept_event(
+        _discord_event(message_id="before-cadence"),
+        session_key="before-cadence",
+        freshness_seconds=60,
+    )
+    assert ledger.get("old").get("tombstone") is not True
+
+    now[0] += 60 * 60
+    ledger.accept_event(
+        _discord_event(message_id="at-cadence"),
+        session_key="at-cadence",
+        freshness_seconds=60,
+    )
+    assert ledger.get("old")["tombstone"] is True
+
+
+def test_ledger_uses_compact_json_serialization(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    for index in range(4):
+        item = ledger.accept_event(
+            _discord_event(message_id=f"compact-json-{index}", text="x" * 20),
+            session_key=f"compact-json-{index}",
+            freshness_seconds=60,
+        )
+        assert item is not None
+
+    raw = ledger.path.read_bytes()
+    pretty = json.dumps(json.loads(raw), indent=2, sort_keys=True).encode("utf-8")
+
+    assert len(raw) < len(pretty) * 0.8
+
+
 def test_visual_requirement_uses_reply_and_goal_thread_context(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="contextual", text="Please proceed with that.")

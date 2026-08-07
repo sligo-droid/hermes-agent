@@ -72,6 +72,12 @@ _REQUIRED_ASYNC_CHECKPOINT_PATH_LIMIT = 1000
 _REQUIRED_ASYNC_RECOVERY_TEXT_LIMIT = 20_000
 _REQUIRED_ASYNC_RECOVERY_CONTEXT_LIMIT = 40_000
 _MAX_REQUIRED_ASYNC_RECOVERY_FILES = 32
+_FULL_RECORD_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_TOMBSTONE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_COMPACTION_INTERVAL_SECONDS = 60 * 60
+_QUIESCENT_CLOSEOUT_STATUSES = frozenset(
+    {"completed", "not_required", "pr_open", "post_merge_complete", "blocked", "repair_required"}
+)
 _REQUIRED_ASYNC_RECOVERY_STATUSES = frozenset(
     {
         "registered",
@@ -2059,7 +2065,108 @@ class GatewayWorkLedger:
         return data
 
     def _write(self, data: dict[str, Any]) -> None:
-        atomic_json_write(self.path, data, indent=2, sort_keys=True)
+        self._compact_if_due(data)
+        # The ledger is a hot recovery path, not an operator-edited config.
+        # Keep the existing atomic/fsync write guarantees while avoiding the
+        # whitespace and key-sorting cost on every full-file rewrite.
+        atomic_json_write(self.path, data, indent=None, separators=(",", ":"))
+
+    @staticmethod
+    def _terminal_delivery_is_pending(item: Mapping[str, Any]) -> bool:
+        delivery = item.get("terminal_delivery")
+        if not isinstance(delivery, dict):
+            return False
+        return (
+            str(delivery.get("status") or "") not in {"completed", "uncertain"}
+            or delivery.get("summary_updated_at") is None
+        )
+
+    @staticmethod
+    def _closeout_reconciliation_is_pending(item: Mapping[str, Any]) -> bool:
+        closeout = item.get("closeout")
+        if not isinstance(closeout, dict):
+            return False
+        active = item.get("closeout_authoritative") is True or item.get(
+            "closeout_activated_at"
+        ) is not None
+        if not active:
+            return False
+        lease = closeout.get("lease") if isinstance(closeout.get("lease"), dict) else {}
+        return (
+            str(closeout.get("status") or "") not in _QUIESCENT_CLOSEOUT_STATUSES
+            or bool(lease.get("owner"))
+            or lease.get("until") is not None
+            or closeout.get("next_due_at") is not None
+        )
+
+    @classmethod
+    def _is_quiescent_terminal_item(cls, item: Mapping[str, Any]) -> bool:
+        status = str(item.get("status") or "")
+        if status not in TERMINAL_STATUSES or status == "blocked":
+            return False
+        if item.get("terminal_reaction_sync_pending") is True:
+            return False
+        if cls._terminal_delivery_is_pending(item):
+            return False
+        if cls._closeout_reconciliation_is_pending(item):
+            return False
+        if _required_async_completion_state(item).get("owns_recovery"):
+            return False
+        delivery_attempt = item.get("delivery_attempt")
+        return not (
+            isinstance(delivery_attempt, dict)
+            and str(delivery_attempt.get("status") or "") in {"sending", "uncertain"}
+        )
+
+    @staticmethod
+    def _tombstone_for(item: Mapping[str, Any], *, now: float) -> dict[str, Any]:
+        return {
+            "id": str(item.get("id") or ""),
+            "status": str(item.get("status") or "expired"),
+            "tombstone": True,
+            "tombstoned_at": now,
+            "tombstone_expires_at": now + _TOMBSTONE_RETENTION_SECONDS,
+        }
+
+    def _compact_if_due(self, data: dict[str, Any]) -> None:
+        """Bound old terminal history without adding read-path rewrites."""
+
+        now = self._now()
+        previous = data.get("last_compacted_at")
+        if isinstance(previous, (int, float)):
+            try:
+                if now - float(previous) < _COMPACTION_INTERVAL_SECONDS:
+                    return
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        items = data.get("items")
+        if not isinstance(items, dict):
+            data["items"] = {}
+            data["last_compacted_at"] = now
+            return
+        for work_id, item in list(items.items()):
+            if not isinstance(item, dict):
+                items.pop(work_id, None)
+                continue
+            if item.get("tombstone") is True:
+                try:
+                    tombstone_expires_at = float(item.get("tombstone_expires_at") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    tombstone_expires_at = 0
+                if tombstone_expires_at <= now:
+                    items.pop(work_id, None)
+                continue
+            try:
+                updated_at = float(item.get("updated_at") or item.get("created_at") or now)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                updated_at <= now - _FULL_RECORD_RETENTION_SECONDS
+                and self._is_quiescent_terminal_item(item)
+            ):
+                items[work_id] = self._tombstone_for(item, now=now)
+        data["last_compacted_at"] = now
 
     @staticmethod
     def id_for_event(event: Any, session_key: str | None = None) -> str | None:
