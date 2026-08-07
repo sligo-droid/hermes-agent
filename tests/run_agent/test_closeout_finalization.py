@@ -425,9 +425,13 @@ def test_pending_closeout_recovers_lost_browser_before_visual_qa_retry():
     assert "web_search" in skipped[0]
 
 
-def test_visual_qa_allows_only_one_correction_retry_per_turn():
-    agent = _agent("visual_qa", max_iterations=4)
+def test_visual_qa_allows_two_correction_retries_per_turn():
+    agent = _agent("visual_qa", max_iterations=5)
     agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
+            finish_reason="tool_calls",
+        ),
         _response(
             tool_calls=[_tool_call("visual_qa", {"assertions": [{"kind": "visible"}]})],
             finish_reason="tool_calls",
@@ -460,10 +464,10 @@ def test_visual_qa_allows_only_one_correction_retry_per_turn():
     ):
         result = agent.run_conversation("confirm visual QA")
 
-    assert execute_call.call_count == 2
+    assert execute_call.call_count == 3
     assert result["final_response"] == "Stopped after the bounded retry."
     assert any(
-        "two executable calls plus one malformed-contract repair" in str(
+        "three executable calls plus one malformed-contract repair" in str(
             message.get("content")
         )
         for message in result["messages"]
@@ -472,7 +476,7 @@ def test_visual_qa_allows_only_one_correction_retry_per_turn():
 
 
 def test_visual_qa_malformed_correction_does_not_consume_execution_slot():
-    agent = _agent("visual_qa", max_iterations=5)
+    agent = _agent("visual_qa", max_iterations=6)
 
     def tool_call():
         return _tool_call(
@@ -481,6 +485,7 @@ def test_visual_qa_malformed_correction_does_not_consume_execution_slot():
         )
 
     agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
         _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
         _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
         _response(tool_calls=[tool_call()], finish_reason="tool_calls"),
@@ -512,7 +517,7 @@ def test_visual_qa_malformed_correction_does_not_consume_execution_slot():
     with (
         patch(
             "run_agent.handle_function_call",
-            side_effect=[failed, invalid, passed],
+            side_effect=[failed, invalid, failed, passed],
         ) as execute_call,
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
@@ -520,10 +525,10 @@ def test_visual_qa_malformed_correction_does_not_consume_execution_slot():
     ):
         result = agent.run_conversation("confirm visual QA")
 
-    assert execute_call.call_count == 3
+    assert execute_call.call_count == 4
     assert result["final_response"] == "Stopped after contract repair and bounded retry."
     assert any(
-        "two executable calls plus one malformed-contract repair" in str(
+        "three executable calls plus one malformed-contract repair" in str(
             message.get("content")
         )
         for message in result["messages"]
