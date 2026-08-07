@@ -67,6 +67,8 @@ _CLOSEOUT_FINALIZATION_REQUIRED = (
     "return one concise final response from the recorded evidence."
 )
 _CLOSEOUT_LOG_BUDGET = BudgetConfig(preview_size=0)
+_MAX_VISUAL_QA_EXECUTIONS_PER_TURN = 3
+_MAX_VISUAL_QA_CALLS_PER_TURN = 4
 _PENDING_CLOSEOUT_VISUAL_TOOLS = frozenset(
     {
         "visual_qa",
@@ -89,7 +91,7 @@ def _pending_closeout_allows_tool(function_name: str) -> bool:
 
 
 def _reserve_visual_qa_call(agent: Any, function_name: str) -> bool:
-    """Reserve two execution slots plus one bounded contract-repair call."""
+    """Reserve three execution slots plus one bounded contract-repair call."""
 
     if function_name != "visual_qa":
         return True
@@ -101,7 +103,10 @@ def _reserve_visual_qa_call(agent: Any, function_name: str) -> bool:
         0,
         int(getattr(agent, "_visual_qa_total_calls", 0) or 0),
     )
-    if execution_count >= 2 or total_count >= 3:
+    if (
+        execution_count >= _MAX_VISUAL_QA_EXECUTIONS_PER_TURN
+        or total_count >= _MAX_VISUAL_QA_CALLS_PER_TURN
+    ):
         return False
     agent._visual_qa_tool_calls = execution_count + 1
     agent._visual_qa_total_calls = total_count + 1
@@ -136,7 +141,7 @@ def _append_visual_qa_limit_tool_result(
         make_tool_result_message(
             "visual_qa",
             (
-                "[Tool execution skipped — visual_qa permits two executable calls plus one "
+                "[Tool execution skipped — visual_qa permits three executable calls plus one "
                 "malformed-contract repair per turn. Continue from the recorded result.]"
             ),
             tool_call.id,
