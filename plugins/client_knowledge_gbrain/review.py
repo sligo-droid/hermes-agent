@@ -59,8 +59,8 @@ def _render_notification(
     review: Mapping[str, Any], proposal: Mapping[str, Any], config: ProjectReviewConfig
 ) -> tuple[str, str, str]:
     operations = proposal.get("operations")
-    if not isinstance(operations, list) or not operations:
-        raise ReviewFailure("review proposal has no operation")
+    if not isinstance(operations, list) or len(operations) != 1:
+        raise ReviewFailure("review proposal must contain exactly one operation")
     operation = operations[0]
     refs = operation.get("source_refs") if isinstance(operation, Mapping) else None
     notion_ref = str(refs[0]) if isinstance(refs, list) and refs else ""
@@ -118,6 +118,12 @@ async def send_pending_review_notifications(
     sender: Callable[..., Awaitable[Mapping[str, Any]]] | None = None,
 ) -> dict[str, int]:
     effective = dict(config or load_config() or {})
+    ck = effective.get("client_knowledge")
+    notification_config = ck.get("review_notifications") if isinstance(ck, Mapping) else None
+    if not isinstance(notification_config, Mapping) or not bool(
+        notification_config.get("enabled", False)
+    ):
+        return {"processed": 0, "confirmed": 0, "proven_none": 0, "uncertain": 0}
     send = sender or _default_sender
     result = {"processed": 0, "confirmed": 0, "proven_none": 0, "uncertain": 0}
     for review in store.list_pending_reviews(limit=50):
@@ -203,6 +209,39 @@ def reconcile_uncertain_notification(
     return True
 
 
+def fetch_and_reconcile_notification(store: IntakeStore, review_id: str, message_id: str) -> bool:
+    """Fetch one operator-selected Discord message and adopt only an exact match."""
+    review = store.get_review(review_id)
+    if (
+        review is None
+        or review["notification_state"] != "uncertain"
+        or not str(message_id).isdigit()
+    ):
+        return False
+    from tools.discord_tool import _discord_request, _get_bot_token
+
+    token = _get_bot_token()
+    if not token:
+        raise ReviewFailure("Discord bot token is unavailable")
+    channel_id = str(review["notification_channel_id"] or "")
+    message = _discord_request(
+        "GET", f"/channels/{channel_id}/messages/{message_id}", token
+    )
+    if not isinstance(message, Mapping):
+        return False
+    content = str(message.get("content") or "")
+    candidate = {
+        "guild_id": str(message.get("guild_id") or review["notification_guild_id"] or ""),
+        "channel_id": str(message.get("channel_id") or channel_id),
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "content": content,
+        "message_id": str(message.get("id") or ""),
+        "author_is_bot": bool((message.get("author") or {}).get("bot")),
+        "allowed_role_mentions": [str(value) for value in message.get("mention_roles", [])],
+    }
+    return reconcile_uncertain_notification(store, review_id, [candidate])
+
+
 def _member_role_ids(raw_message: Any) -> set[str]:
     member = getattr(raw_message, "user", None) or getattr(raw_message, "author", None)
     return {
@@ -281,7 +320,7 @@ def run_notification_once(**kwargs: Any) -> dict[str, int]:
 
 
 __all__ = [
-    "ProjectReviewConfig", "ReviewFailure", "handle_client_knowledge_review_command",
-    "reconcile_uncertain_notification", "run_notification_once",
+    "ProjectReviewConfig", "ReviewFailure", "fetch_and_reconcile_notification",
+    "handle_client_knowledge_review_command", "reconcile_uncertain_notification", "run_notification_once",
     "send_pending_review_notifications",
 ]

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import socket
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,10 +38,10 @@ from .scope import (
 from .spool import RawSpool
 from .store import DEFAULT_LEASE_SECONDS, IntakeStore, JobClaim
 
-SCHEMA_VERSION = "client-knowledge-assimilation-schema/v1"
-PROMPT_VERSION = "client-knowledge-assimilation-prompt/v1"
-POLICY_VERSION = "client-knowledge-auto-publication/v1"
-ASSIMILATION_VERSION = "client-knowledge-assimilation/v1"
+SCHEMA_VERSION = "client-knowledge-assimilation-schema/v2"
+PROMPT_VERSION = "client-knowledge-assimilation-prompt/v2"
+POLICY_VERSION = "client-knowledge-auto-publication/v2"
+ASSIMILATION_VERSION = "client-knowledge-assimilation/v2"
 TASK = "client_knowledge_assimilate"
 OPERATIONS = (
     "add", "confirm", "refine", "supersede", "contradict",
@@ -56,7 +55,7 @@ _OPERATION_SCHEMA = {
         "operation", "target_slug", "title", "kind", "status", "confidence",
         "sensitivity", "impact", "honcho_projection", "effective_at", "source_refs",
         "supersedes", "claim", "timeline_entry", "expected_prior_sha256",
-        "final_markdown",
+        "finding_id", "evidence_ids", "final_markdown",
     ],
     "properties": {
         "operation": {"enum": list(OPERATIONS)},
@@ -82,17 +81,14 @@ _OPERATION_SCHEMA = {
         "expected_prior_sha256": {
             "type": "string", "pattern": "^(?:|[0-9a-f]{64})$",
         },
+        "finding_id": {"type": "string", "maxLength": 64},
+        "evidence_ids": {
+            "type": "array", "maxItems": 20, "uniqueItems": True,
+            "items": {"type": "string", "pattern": "^evidence-[0-9]{3}$"},
+        },
         "final_markdown": {"type": "string", "maxLength": 24000},
     },
 }
-
-_HIGH_IMPACT_RE = re.compile(
-    r"\b(?:contract|agreement|payment|invoice|price|pricing|budget|financial|"
-    r"credential|password|secret|token|api key|private key|authentication|"
-    r"authorization|security|breach|production access|scope change|major scope|"
-    r"legal|liability|compliance)\b",
-    re.IGNORECASE,
-)
 ASSIMILATION_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -102,7 +98,7 @@ ASSIMILATION_SCHEMA: dict[str, Any] = {
         "artifact_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "interpretation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "project_key": {"type": "string", "minLength": 1, "maxLength": 63},
-        "operations": {"type": "array", "minItems": 1, "maxItems": 10, "items": _OPERATION_SCHEMA},
+        "operations": {"type": "array", "minItems": 1, "maxItems": 1, "items": _OPERATION_SCHEMA},
     },
 }
 
@@ -186,6 +182,80 @@ def _canonical_markdown(operation: Mapping[str, Any], *, project_key: str) -> st
     )
 
 
+def _validate_scalar(value: Any, *, field: str, date: bool = False) -> str:
+    text = str(value or "")
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise AssimilationFailure(f"assimilation_{field}_invalid")
+    if date:
+        parts = text.split("-")
+        if (
+            len(parts) != 3
+            or tuple(map(len, parts)) != (4, 2, 2)
+            or not all(part.isdigit() for part in parts)
+        ):
+            raise AssimilationFailure("assimilation_effective_at_invalid")
+        try:
+            from datetime import date as date_type
+
+            date_type.fromisoformat(text)
+        except ValueError as exc:
+            raise AssimilationFailure("assimilation_effective_at_invalid") from exc
+    return text
+
+
+def _grounded_findings(interpretation: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    evidence = {
+        str(item.get("id")): item
+        for item in interpretation.get("evidence", [])
+        if isinstance(item, Mapping)
+    }
+    findings: dict[str, dict[str, Any]] = {}
+    for category in ("candidate_learnings", "decisions", "requirements", "preferences"):
+        for raw in interpretation.get(category, []):
+            if not isinstance(raw, Mapping):
+                continue
+            identifier = str(raw.get("id") or "")
+            evidence_ids = [str(value) for value in raw.get("evidence_ids", [])]
+            if (
+                not identifier
+                or identifier in findings
+                or not evidence_ids
+                or any(value not in evidence for value in evidence_ids)
+            ):
+                raise AssimilationFailure("assimilation_interpretation_grounding_invalid", quarantine=True)
+            findings[identifier] = {
+                "text": str(raw.get("text") or ""),
+                "evidence_ids": evidence_ids,
+            }
+    return findings
+
+
+def _render_confirmation(
+    item: dict[str, Any], current: Mapping[str, Any], notion_ref: str, *, project_key: str
+) -> None:
+    fm = current["frontmatter"]
+    item.update(
+        {
+            "title": current["title"],
+            "kind": fm["kind"],
+            "status": fm["status"],
+            "confidence": fm["confidence"],
+            "sensitivity": fm["sensitivity"],
+            "impact": fm.get("impact", "ordinary"),
+            "honcho_projection": fm.get("honcho_projection", "ineligible"),
+            "effective_at": fm["effective_at"],
+            "source_refs": list(dict.fromkeys([*fm["source_refs"], notion_ref])),
+            "supersedes": list(fm["supersedes"]),
+            "claim": current["compiled_truth"],
+            "timeline_entry": (
+                f"{str(current.get('timeline') or '').rstrip()}\n\n"
+                f"- Confirmed by source. [Source: {notion_ref}]"
+            ).strip(),
+        }
+    )
+    item["final_markdown"] = _canonical_markdown(item, project_key=project_key)
+
+
 def _page_prior_sha(source_root: Path, project_key: str, relative_slug: str) -> str:
     path = source_root / f"{full_project_slug(project_key, relative_slug)}.md"
     if not path.exists():
@@ -228,6 +298,47 @@ def _current_page_map(
             "markdown_sha256": _page_prior_sha(source_root, project_key, relative),
         }
     return pages
+
+
+def _verify_synced_pages(
+    client: GBrainClient,
+    *,
+    project_key: str,
+    expected_pages: Mapping[str, Mapping[str, Any]],
+    expected_content: Mapping[str, bytes],
+) -> None:
+    source_root = client.assert_runtime_ready()
+    for slug, expected in expected_pages.items():
+        page = validate_page(
+            client.get_page(slug),
+            project_key=project_key,
+            source_id=client.settings.source_id,
+        )
+        fm = page["frontmatter"]
+        if (
+            page.get("title") != expected["title"]
+            or str(page.get("compiled_truth") or "").strip() != str(expected["claim"]).strip()
+            or str(page.get("timeline") or "").strip()
+            != str(expected["timeline_entry"]).strip()
+            or any(
+                fm.get(key) != expected[key]
+                for key in (
+                    "kind", "status", "confidence", "sensitivity", "impact",
+                    "honcho_projection", "effective_at", "source_refs", "supersedes",
+                )
+            )
+        ):
+            raise AssimilationFailure("gbrain_post_sync_verification_failed")
+        content = expected_content.get(slug)
+        path = source_root / f"{slug}.md"
+        if (
+            content is None
+            or path.is_symlink()
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest()
+            != hashlib.sha256(content).hexdigest()
+        ):
+            raise AssimilationFailure("gbrain_post_sync_blob_verification_failed")
 
 
 def _review_policy(
@@ -274,6 +385,7 @@ def validate_proposal(
     interpretation_id: str,
     project_key: str,
     notion_ref: str,
+    interpretation: Mapping[str, Any],
     current_pages: Mapping[str, Mapping[str, Any]],
     source_root: Path,
     max_output_bytes: int,
@@ -292,8 +404,11 @@ def validate_proposal(
         or validate_project_key(parsed["project_key"]) != project_key
     ):
         raise AssimilationFailure("assimilation_identity_mismatch", quarantine=True)
+    findings = _grounded_findings(interpretation)
     seen: set[str] = set()
     validated: list[dict[str, Any]] = []
+    confirmation_grounding_mismatch = False
+    confirmation_truth_mismatch = False
     for raw in parsed["operations"]:
         item = dict(raw)
         operation = item["operation"]
@@ -304,12 +419,23 @@ def validate_proposal(
                     "target_slug", "title", "kind", "status", "confidence",
                     "sensitivity", "impact", "honcho_projection", "effective_at",
                     "source_refs", "supersedes", "claim", "timeline_entry",
-                    "expected_prior_sha256", "final_markdown",
+                    "expected_prior_sha256", "finding_id", "evidence_ids",
+                    "final_markdown",
                 )
             ):
                 raise AssimilationFailure("assimilation_transient_payload_invalid")
             validated.append(item)
             continue
+        finding = findings.get(str(item["finding_id"]))
+        if (
+            finding is None
+            or item["claim"] != finding["text"]
+            or list(item["evidence_ids"]) != finding["evidence_ids"]
+        ):
+            if operation == "confirm":
+                confirmation_grounding_mismatch = True
+            else:
+                raise AssimilationFailure("assimilation_finding_grounding_mismatch", quarantine=True)
         slug = full_project_slug(project_key, item["target_slug"])
         if item["target_slug"] in seen:
             raise AssimilationFailure("assimilation_duplicate_target")
@@ -322,6 +448,8 @@ def validate_proposal(
             raise AssimilationFailure("assimilation_page_classification_invalid")
         if not item["title"].strip() or not item["claim"].strip() or not item["timeline_entry"].strip():
             raise AssimilationFailure("assimilation_page_text_invalid")
+        _validate_scalar(item["title"], field="title")
+        _validate_scalar(item["effective_at"], field="effective_at", date=True)
         refs = validate_source_refs(item["source_refs"])
         existing = current_pages.get(item["target_slug"])
         allowed_refs = {notion_ref}
@@ -355,23 +483,33 @@ def validate_proposal(
             raise AssimilationFailure("assimilation_supersede_status_invalid")
         if operation == "confirm" and item["status"] != "current":
             raise AssimilationFailure("assimilation_confirmation_status_invalid")
-        high_impact_text = "\n".join(
-            (item["title"], item["claim"], item["timeline_entry"])
-        )
-        if _HIGH_IMPACT_RE.search(high_impact_text) and item["impact"] != "high":
-            raise AssimilationFailure("assimilation_high_impact_misclassified")
         if (
             item["impact"] == "high"
             or item["sensitivity"] in {"confidential", "restricted"}
             or item["status"] in {"tentative", "disputed", "superseded", "archived"}
         ) and item["honcho_projection"] != "ineligible":
             raise AssimilationFailure("assimilation_projection_policy_invalid")
-        if item["final_markdown"] != _canonical_markdown(item, project_key=project_key):
+        if operation == "confirm" and existing:
+            model_item = dict(item)
+            _render_confirmation(item, existing, notion_ref, project_key=project_key)
+            if any(
+                model_item[key] != item[key]
+                for key in (
+                    "title", "kind", "status", "confidence", "sensitivity", "impact",
+                    "honcho_projection", "effective_at", "supersedes", "claim",
+                )
+            ):
+                confirmation_truth_mismatch = True
+        elif item["final_markdown"] != _canonical_markdown(item, project_key=project_key):
             raise AssimilationFailure("assimilation_markdown_mismatch")
         if not slug.startswith(f"projects/{project_key}/"):
             raise AssimilationFailure("assimilation_project_scope_invalid", quarantine=True)
         validated.append(item)
     review, reason = _review_policy(validated, current_pages, notion_ref)
+    if confirmation_grounding_mismatch:
+        review, reason = True, "confirmation_finding_grounding_mismatch"
+    elif confirmation_truth_mismatch:
+        review, reason = True, "confirmation_changes_truth"
     return {**parsed, "operations": validated}, review, reason
 
 
@@ -473,6 +611,7 @@ class AssimilationWorker:
                 interpretation_id=interpretation_row["interpretation_id"],
                 project_key=artifact.project_key,
                 notion_ref=notion_ref,
+                interpretation=interpretation,
                 current_pages=current_pages,
                 source_root=source_root,
                 max_output_bytes=self.settings.max_output_bytes,
@@ -553,9 +692,19 @@ class AssimilationWorker:
         operations = proposal["operations"]
         if all(item["operation"] == "ignore_transient" for item in operations):
             self.store.complete_assimilation(
-                claim, assimilation_id=assimilation_id, commit_sha="none", output_sha256=proposal_sha
+                claim,
+                assimilation_id=assimilation_id,
+                commit_sha="none",
+                output_sha256=proposal_sha,
+                next_stage="complete",
+                sync_verified=False,
             )
             return assimilation_id
+        expected_pages: dict[str, dict[str, Any]] = {
+            full_project_slug(artifact.project_key, item["target_slug"]): item
+            for item in operations
+            if item["operation"] != "ignore_transient"
+        }
         files = [
             PublicationFile(
                 relative_slug=item["target_slug"],
@@ -599,6 +748,7 @@ class AssimilationWorker:
                         expected_prior_sha256=prior["markdown_sha256"],
                     )
                 )
+                expected_pages[canonical_slug] = retirement
         try:
             with GitSourcePublisher(
                 self.client, project_key=artifact.project_key, store=self.store
@@ -618,16 +768,17 @@ class AssimilationWorker:
             raise AssimilationFailure(exc.error_class, operator_blocked=True) from exc
         try:
             self.client.sync_no_pull()
-            for item in operations:
-                if item["operation"] == "ignore_transient":
-                    continue
-                page = validate_page(
-                    self.client.get_page(full_project_slug(artifact.project_key, item["target_slug"])),
-                    project_key=artifact.project_key,
-                    source_id=self.client.settings.source_id,
-                )
-                if page["frontmatter"]["status"] != item["status"]:
-                    raise AssimilationFailure("gbrain_post_sync_verification_failed")
+            expected_content = {
+                full_project_slug(artifact.project_key, item.relative_slug): item.content
+                for item in files
+                if item.content is not None
+            }
+            _verify_synced_pages(
+                self.client,
+                project_key=artifact.project_key,
+                expected_pages=expected_pages,
+                expected_content=expected_content,
+            )
         except AssimilationFailure:
             raise
         except Exception as exc:

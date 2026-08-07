@@ -12,6 +12,7 @@ from plugins.client_knowledge_gbrain.assimilation import (
     ASSIMILATION_VERSION,
     AssimilationFailure,
     _canonical_markdown,
+    _verify_synced_pages,
     validate_proposal,
 )
 from plugins.client_knowledge_gbrain.publisher import (
@@ -48,6 +49,8 @@ def _operation(operation="add", *, prior="", claim="Weekly report is due Monday.
         "claim": claim,
         "timeline_entry": "- **2026-08-04** | Confirmed. [Source: notion:page:new]",
         "expected_prior_sha256": prior,
+        "finding_id": "requirement-reporting",
+        "evidence_ids": ["evidence-001"],
         "final_markdown": "",
     }
     value["final_markdown"] = _canonical_markdown(value, project_key="pid")
@@ -60,6 +63,28 @@ def _proposal(operation):
         "interpretation_id": "b" * 64,
         "project_key": "pid",
         "operations": [operation],
+    }
+
+
+def _interpretation(claim="Weekly report is due Monday."):
+    return {
+        "candidate_learnings": [],
+        "decisions": [],
+        "requirements": [{
+            "id": "requirement-reporting",
+            "text": claim,
+            "confidence": "high",
+            "sensitivity": "internal",
+            "evidence_ids": ["evidence-001"],
+        }],
+        "preferences": [],
+        "evidence": [{
+            "id": "evidence-001",
+            "segment_id": "body-0001",
+            "start": 0,
+            "end": len(claim),
+            "quote": claim,
+        }],
     }
 
 
@@ -97,7 +122,8 @@ def test_closed_allowlist_routes_all_content_changes_to_review(tmp_path):
         parsed, review, reason = validate_proposal(
             _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
             project_key="pid", notion_ref="notion:page:new", current_pages=current_pages,
-            source_root=tmp_path, max_output_bytes=500_000,
+            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+            max_output_bytes=500_000,
         )
         assert parsed["operations"][0]["operation"] == operation_name
         assert review is True
@@ -127,7 +153,8 @@ def test_adversarial_ordinary_fact_requirement_preference_never_auto_publishes(t
     _parsed, review, reason = validate_proposal(
         _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
         project_key="pid", notion_ref="notion:page:new", current_pages={},
-        source_root=tmp_path, max_output_bytes=500_000,
+        interpretation=_interpretation(claim), source_root=tmp_path,
+        max_output_bytes=500_000,
     )
     assert review is True
     assert reason in {"outside_auto_publication_allowlist", "high_impact_claim"}
@@ -144,13 +171,15 @@ def test_exact_confirmation_is_the_only_write_auto_allowlist(tmp_path):
     current = {
         "requirements/reporting": {
             "title": "Reporting", "compiled_truth": op["claim"],
+            "timeline": "- prior",
             "frontmatter": _frontmatter(),
         }
     }
     _parsed, review, reason = validate_proposal(
         _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
         project_key="pid", notion_ref="notion:page:new", current_pages=current,
-        source_root=tmp_path, max_output_bytes=500_000,
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
     )
     assert review is False
     assert reason == "closed_allowlist_exact_confirmation"
@@ -160,7 +189,8 @@ def test_exact_confirmation_is_the_only_write_auto_allowlist(tmp_path):
     _parsed, review, reason = validate_proposal(
         _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
         project_key="pid", notion_ref="notion:page:new", current_pages=current,
-        source_root=tmp_path, max_output_bytes=500_000,
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
     )
     assert review is True
     assert reason == "confirmation_changes_truth"
@@ -174,7 +204,8 @@ def test_project_citation_and_markdown_boundaries_fail_closed(tmp_path):
         validate_proposal(
             _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
             project_key="pid", notion_ref="notion:page:new", current_pages={},
-            source_root=tmp_path, max_output_bytes=500_000,
+            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+            max_output_bytes=500_000,
         )
     op = _operation("add")
     op["target_slug"] = "projects/decoy/canary"
@@ -182,7 +213,8 @@ def test_project_citation_and_markdown_boundaries_fail_closed(tmp_path):
         validate_proposal(
             _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
             project_key="pid", notion_ref="notion:page:new", current_pages={},
-            source_root=tmp_path, max_output_bytes=500_000,
+            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+            max_output_bytes=500_000,
         )
     op = _operation("add")
     op["final_markdown"] += "model-added"
@@ -190,7 +222,8 @@ def test_project_citation_and_markdown_boundaries_fail_closed(tmp_path):
         validate_proposal(
             _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
             project_key="pid", notion_ref="notion:page:new", current_pages={},
-            source_root=tmp_path, max_output_bytes=500_000,
+            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+            max_output_bytes=500_000,
         )
 
 
@@ -340,19 +373,22 @@ def test_publisher_rejects_symlink_in_target_parent_and_git_metadata(tmp_path):
 
 def test_high_impact_and_unsafe_projection_metadata_fail_closed(tmp_path):
     op = _operation("add", claim="The signed contract requires a payment tomorrow.")
-    with pytest.raises(AssimilationFailure, match="high_impact_misclassified"):
-        validate_proposal(
-            _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
-            project_key="pid", notion_ref="notion:page:new", current_pages={},
-            source_root=tmp_path, max_output_bytes=500_000,
-        )
+    _parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
+    )
+    assert review is True
+    assert reason == "outside_auto_publication_allowlist"
     op["impact"] = "high"
     op["honcho_projection"] = "ineligible"
     op["final_markdown"] = _canonical_markdown(op, project_key="pid")
     _parsed, review, reason = validate_proposal(
         _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
         project_key="pid", notion_ref="notion:page:new", current_pages={},
-        source_root=tmp_path, max_output_bytes=500_000,
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
     )
     assert review is True
     assert reason == "high_impact_claim"
@@ -363,5 +399,99 @@ def test_high_impact_and_unsafe_projection_metadata_fail_closed(tmp_path):
         validate_proposal(
             _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
             project_key="pid", notion_ref="notion:page:new", current_pages={},
-            source_root=tmp_path, max_output_bytes=500_000,
+            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+            max_output_bytes=500_000,
+        )
+
+
+def test_confirmation_requires_persisted_finding_and_host_preserves_timeline(tmp_path):
+    path = tmp_path / "projects/pid/requirements/reporting.md"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"prior")
+    prior = hashlib.sha256(b"prior").hexdigest()
+    current = {
+        "requirements/reporting": {
+            "title": "Reporting",
+            "compiled_truth": "Weekly report is due Monday.",
+            "timeline": "- original timeline",
+            "frontmatter": _frontmatter(),
+        }
+    }
+    op = _operation("confirm", prior=prior)
+    op["source_refs"] = ["notion:page:old", "notion:page:new"]
+    op["timeline_entry"] = "erase history"
+    op["final_markdown"] = _canonical_markdown(op, project_key="pid")
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages=current,
+        interpretation=_interpretation("Unrelated finding."), source_root=tmp_path,
+        max_output_bytes=500_000,
+    )
+    assert review is True
+    assert reason == "confirmation_finding_grounding_mismatch"
+    rendered = parsed["operations"][0]
+    assert rendered["timeline_entry"].startswith("- original timeline")
+    assert "erase history" not in rendered["final_markdown"]
+
+
+def test_frontmatter_scalar_injection_fails_closed(tmp_path):
+    op = _operation("add")
+    op["effective_at"] = "2026-08-04\nstatus: current"
+    op["final_markdown"] = _canonical_markdown(op, project_key="pid")
+    with pytest.raises(AssimilationFailure, match="effective_at_invalid"):
+        validate_proposal(
+            _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+            project_key="pid", notion_ref="notion:page:new", current_pages={},
+            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+            max_output_bytes=500_000,
+        )
+
+
+def test_publisher_rechecks_target_immediately_before_materialization(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    target = root / "projects/pid/requirements/reporting.md"
+    original = GitSourcePublisher._materialization_state_is_recoverable
+
+    def race(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"concurrent edit\n")
+        return result
+
+    monkeypatch.setattr(GitSourcePublisher, "_materialization_state_is_recoverable", race)
+    with pytest.raises(PublicationFailure, match="target_changed_before_materialization"):
+        _publish(root)
+    assert target.read_bytes() == b"concurrent edit\n"
+
+
+def test_post_sync_verifies_exact_page_and_blob(tmp_path):
+    slug = "projects/pid/requirements/reporting"
+    content = _canonical_markdown(_operation("add"), project_key="pid").encode()
+    target = tmp_path / f"{slug}.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(content)
+    expected = _operation("add")
+
+    class Client:
+        settings = type("Settings", (), {"source_id": "client-knowledge"})()
+
+        def assert_runtime_ready(self):
+            return tmp_path
+
+        def get_page(self, _slug):
+            return {
+                "source_id": "client-knowledge", "slug": slug, "title": expected["title"],
+                "frontmatter": {**_frontmatter(["notion:page:new"]), "impact": "ordinary", "honcho_projection": "eligible"},
+                "compiled_truth": expected["claim"], "timeline": expected["timeline_entry"],
+            }
+
+    _verify_synced_pages(
+        Client(), project_key="pid", expected_pages={slug: expected},
+        expected_content={slug: content},
+    )
+    target.write_bytes(b"stale")
+    with pytest.raises(AssimilationFailure, match="blob_verification_failed"):
+        _verify_synced_pages(
+            Client(), project_key="pid", expected_pages={slug: expected},
+            expected_content={slug: content},
         )

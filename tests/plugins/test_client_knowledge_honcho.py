@@ -28,6 +28,7 @@ class _Scope:
 
     def delete(self, conclusion_id):
         self.deleted.append(conclusion_id)
+        self.values = [value for value in self.values if str(value.id) != str(conclusion_id)]
 
 
 def test_honcho_create_returns_and_adopt_reuses_exact_id():
@@ -51,6 +52,17 @@ def test_honcho_duplicate_marker_fails_closed_and_retracts_by_id():
     api = HonchoProjectionApi(scope)
     api.delete("old-id")
     assert scope.deleted == ["old-id"]
+
+
+def test_honcho_marker_first_resolution_replaces_stale_and_detects_truncation():
+    stale = SimpleNamespace(id="old", content="stale [ckp:marker]")
+    api = HonchoProjectionApi(_Scope([stale]))
+    assert api.resolve_marker("ckp:marker", "fresh [ckp:marker]") == ("", "old")
+    with pytest.raises(HonchoProjectionFailure, match="remote_set_truncated"):
+        HonchoProjectionApi(
+            _Scope([SimpleNamespace(id="one", content="x")]),
+            max_items=1,
+        ).list()
 
 
 def test_only_stable_current_non_sensitive_allowlisted_pages_promote():

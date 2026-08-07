@@ -9,6 +9,7 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 from hermes_cli.plugin_command_context import bind_plugin_command_context
 from plugins.client_knowledge_gbrain.review import (
+    fetch_and_reconcile_notification,
     handle_client_knowledge_review_command,
     reconcile_uncertain_notification,
     send_pending_review_notifications,
@@ -16,6 +17,7 @@ from plugins.client_knowledge_gbrain.review import (
 
 
 CFG = {
+    "client_knowledge": {"review_notifications": {"enabled": True}},
     "projects": {
         "pid": {
             "client_knowledge_review": {
@@ -102,6 +104,23 @@ def test_timed_out_post_remains_uncertain_and_no_match_never_retries():
     assert calls == 1
 
 
+def test_disabled_notifications_do_not_claim_or_send():
+    store = _Store()
+    calls = 0
+
+    async def sender(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"success": True, "message_id": "400", "side_effect_state": "confirmed"}
+
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=_Derived(), config={"projects": CFG["projects"]}, sender=sender,
+    ))
+    assert result == {"processed": 0, "confirmed": 0, "proven_none": 0, "uncertain": 0}
+    assert calls == 0
+    assert store.review["notification_state"] == "pending"
+
+
 def test_uncertain_delivery_adopts_exact_one_message():
     store = _Store()
     store.record_review_notification(
@@ -113,6 +132,22 @@ def test_uncertain_delivery_adopts_exact_one_message():
         "content": "x [marker]", "message_id": "400", "author_is_bot": True,
         "allowed_role_mentions": ["300"],
     }]) is True
+    assert store.review["notification_message_id"] == "400"
+
+
+def test_operator_fetch_adopts_only_exact_message(monkeypatch):
+    store = _Store()
+    content = "review [marker]"
+    store.record_review_notification(
+        "a" * 64, state="uncertain", content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+        guild_id="100", channel_id="200", role_id="300", marker="[marker]",
+    )
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+    monkeypatch.setattr("tools.discord_tool._discord_request", lambda *_args, **_kwargs: {
+        "id": "400", "guild_id": "100", "channel_id": "200", "content": content,
+        "author": {"bot": True}, "mention_roles": ["300"],
+    })
+    assert fetch_and_reconcile_notification(store, "a" * 64, "400") is True
     assert store.review["notification_message_id"] == "400"
 
 

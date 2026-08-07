@@ -43,6 +43,21 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     notify.add_argument("--db-path", default="")
 
+    adopt_review = subs.add_parser(
+        "adopt-review-message", help="Verify and adopt one exact uncertain Discord review message"
+    )
+    adopt_review.add_argument("--review-id", required=True)
+    adopt_review.add_argument("--message-id", required=True)
+    adopt_review.add_argument("--db-path", default="")
+
+    requeue_review = subs.add_parser(
+        "requeue-review-notification",
+        help="Requeue an uncertain review after the operator proves no message exists",
+    )
+    requeue_review.add_argument("--review-id", required=True)
+    requeue_review.add_argument("--confirm-absent", action="store_true")
+    requeue_review.add_argument("--db-path", default="")
+
     honcho = subs.add_parser(
         "reconcile-honcho", help="Adopt deterministic Honcho projection markers"
     )
@@ -162,6 +177,20 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             result = run_notification_once(store=store, derived=DerivedStore())
             print(json.dumps(result, sort_keys=True))
             return 0
+        if action == "adopt-review-message":
+            from .review import fetch_and_reconcile_notification
+
+            changed = fetch_and_reconcile_notification(
+                store, str(args.review_id), str(args.message_id)
+            )
+            print(json.dumps({"review_id": str(args.review_id), "adopted": changed}, sort_keys=True))
+            return 0 if changed else 1
+        if action == "requeue-review-notification":
+            if not bool(args.confirm_absent):
+                raise ValueError("operator absence confirmation is required")
+            changed = store.requeue_review_notification(str(args.review_id))
+            print(json.dumps({"review_id": str(args.review_id), "requeued": changed}, sort_keys=True))
+            return 0 if changed else 1
         if action == "reconcile-honcho":
             from hermes_cli.config import load_config
             from .client import GBrainClient, load_settings

@@ -83,6 +83,7 @@ FORK_DEFAULT_ADDITIONS = {
             "retry_delay_seconds": 60,
             "observer_peer_id": "hermes",
             "max_reconcile_pages": 500,
+            "max_remote_conclusions": 500,
         },
         "notion": {
             "enabled": False,
