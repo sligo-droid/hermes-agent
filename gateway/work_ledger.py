@@ -2113,6 +2113,12 @@ class GatewayWorkLedger:
         status = str(item.get("status") or "")
         if status not in TERMINAL_STATUSES or status == "blocked":
             return False
+        if isinstance(item.get("active_run"), dict) or item.get("lease_until") not in {
+            None,
+            0,
+            0.0,
+        }:
+            return False
         if item.get("terminal_reaction_sync_pending") is True:
             return False
         if cls._terminal_delivery_is_pending(item):

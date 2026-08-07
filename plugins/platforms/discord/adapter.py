@@ -14173,6 +14173,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         _intake_timing = self._new_discord_intake_timing(message)
         _request_started_ts = time.time()
+        created_at = getattr(message, "created_at", None)
+        if created_at is not None and callable(getattr(created_at, "timestamp", None)):
+            try:
+                _request_started_ts = float(created_at.timestamp())
+            except (TypeError, ValueError, OverflowError):
+                pass
 
         thread_id = None
         parent_channel_id = None

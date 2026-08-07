@@ -181,6 +181,12 @@ def test_ledger_compaction_preserves_live_and_pending_terminal_records(tmp_path)
     old = now[0] - (8 * 24 * 60 * 60)
     items = {
         "active": {"id": "active", "status": "agent_running", "updated_at": old},
+        "terminal-active-run": {
+            "id": "terminal-active-run",
+            "status": "completed",
+            "updated_at": old,
+            "active_run": {"generation": 4},
+        },
         "delivery": {
             "id": "delivery",
             "status": "blocked",
@@ -213,7 +219,14 @@ def test_ledger_compaction_preserves_live_and_pending_terminal_records(tmp_path)
     )
 
     stored = json.loads(path.read_text(encoding="utf-8"))["items"]
-    for work_id in ("active", "delivery", "blocked", "reaction", "closeout"):
+    for work_id in (
+        "active",
+        "terminal-active-run",
+        "delivery",
+        "blocked",
+        "reaction",
+        "closeout",
+    ):
         assert stored[work_id] == items[work_id]
     assert stored["quiescent"] == {
         "id": "quiescent",
