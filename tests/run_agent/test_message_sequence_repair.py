@@ -9,6 +9,9 @@ providers (violating role alternation), which retriggered the empty-retry
 recovery every turn.
 """
 
+import copy
+import json
+
 from run_agent import AIAgent
 
 
@@ -710,6 +713,154 @@ def test_sanitize_preserves_distinct_tool_call_ids():
     assistant = [m for m in out if m.get("role") == "assistant"][0]
     assert [tc["id"] for tc in assistant["tool_calls"]] == ["call_A", "call_B"]
     assert sorted(m["tool_call_id"] for m in out if m.get("role") == "tool") == ["call_A", "call_B"]
+
+
+def _stored_visual_qa_arguments(*, legacy: bool = False) -> str:
+    payload = {
+        "assertions": [
+            {"id": "vassert_" + "a" * 24, "kind": "screenshot_appearance"}
+        ]
+    }
+    if not legacy:
+        payload["contract_id"] = "vac_" + "b" * 24
+    return json.dumps(payload)
+
+
+def test_sanitize_removes_storage_only_visual_qa_pair_and_merges_users():
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "previous request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "response-item-id",
+                    "call_id": "call_visual",
+                    "type": "function",
+                    "function": {
+                        "name": "visual_qa",
+                        "arguments": _stored_visual_qa_arguments(),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "visual_qa",
+            "tool_call_id": "call_visual",
+            "content": "opaque receipt",
+        },
+        {"role": "user", "content": "next request"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    assert out == [{"role": "user", "content": "previous request\n\nnext request"}]
+
+
+def test_sanitize_removes_only_storage_visual_call_from_mixed_batch():
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "kept context",
+            "tool_calls": [
+                {
+                    "id": "call_keep",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                },
+                {
+                    "id": "call_visual",
+                    "name": "visual_qa",
+                    "arguments": _stored_visual_qa_arguments(legacy=True),
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_keep", "content": "kept result"},
+        {"role": "tool", "tool_call_id": "call_visual", "content": "visual result"},
+        {"role": "user", "content": "continue"},
+    ]
+
+    original = copy.deepcopy(messages)
+    out = sanitize_api_messages(messages)
+
+    assert messages == original
+    assert [call["id"] for call in out[0]["tool_calls"]] == ["call_keep"]
+    assert out[0]["content"] == "kept context"
+    assert [msg.get("tool_call_id") for msg in out if msg.get("role") == "tool"] == [
+        "call_keep"
+    ]
+    assert out[-1] == {"role": "user", "content": "continue"}
+
+
+def test_sanitize_preserves_current_turn_storage_shaped_visual_call_for_repair():
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "current request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_visual",
+                    "type": "function",
+                    "function": {
+                        "name": "visual_qa",
+                        "arguments": _stored_visual_qa_arguments(),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_visual",
+            "content": "contract_unknown_fields: use the executable schema",
+        },
+    ]
+
+    assert sanitize_api_messages(messages) == messages
+
+
+def test_sanitize_preserves_rich_or_lookalike_visual_qa_calls():
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    rich_arguments = json.dumps(
+        {
+            "target": {"description": "dashboard"},
+            "page": {"state": "already_open", "description": "dashboard"},
+            "viewport": {"description": "desktop"},
+            "state": ["loaded"],
+            "assertions": [
+                {
+                    "kind": "screenshot_appearance",
+                    "expectation": "The dashboard is visually intact.",
+                }
+            ],
+        }
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_visual",
+                    "type": "function",
+                    "function": {"name": "visual_qa", "arguments": rich_arguments},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_visual", "content": "result"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    assert out == messages
 
 
 def test_sanitize_drops_empty_tool_calls_array():

@@ -1142,10 +1142,19 @@ def drop_thinking_only_and_merge_users(
     if dropped == 0:
         return messages
 
-    # Pass 2: merge any newly-adjacent user messages.
+    return _merge_adjacent_user_api_messages(kept, dropped=dropped)
+
+
+def _merge_adjacent_user_api_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    dropped: int = 0,
+) -> List[Dict[str, Any]]:
+    """Merge adjacent API-copy user messages without mutating the source history."""
+
     merged: List[Dict[str, Any]] = []
     merges = 0
-    for m in kept:
+    for m in messages:
         prev = merged[-1] if merged else None
         if (
             prev is not None
@@ -1190,12 +1199,13 @@ def drop_thinking_only_and_merge_users(
         else:
             merged.append(m)
 
-    _ra().logger.debug(
-        "Pre-call sanitizer: dropped %d thinking-only assistant turn(s), "
-        "merged %d adjacent user message(s)",
-        dropped,
-        merges,
-    )
+    if dropped or merges:
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d non-replayable assistant turn(s), "
+            "merged %d adjacent user message(s)",
+            dropped,
+            merges,
+        )
     return merged
 
 
@@ -2542,6 +2552,104 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
 
 
+def _tool_call_name_and_arguments(tool_call: Any) -> tuple[str, Any]:
+    """Read nested OpenAI or flat durable tool-call representations."""
+
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or ""), function.get("arguments")
+        return str(tool_call.get("name") or ""), tool_call.get("arguments")
+    function = getattr(tool_call, "function", None)
+    if function is not None:
+        return str(getattr(function, "name", "") or ""), getattr(
+            function, "arguments", None
+        )
+    return str(getattr(tool_call, "name", "") or ""), getattr(
+        tool_call, "arguments", None
+    )
+
+
+def _is_storage_only_visual_qa_tool_call(tool_call: Any) -> bool:
+    name, arguments = _tool_call_name_and_arguments(tool_call)
+    if name != "visual_qa":
+        return False
+    try:
+        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    from agent.visual_assertions import is_storage_safe_visual_qa_args
+
+    return is_storage_safe_visual_qa_args(parsed)
+
+
+def _drop_storage_only_visual_qa_replay(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Remove historical opaque visual-QA evidence from the model-facing copy."""
+
+    removed_call_ids: set[str] = set()
+    removed_calls = 0
+    dropped_assistants = 0
+    filtered: List[Dict[str, Any]] = []
+    last_user_index = max(
+        (index for index, msg in enumerate(messages) if msg.get("role") == "user"),
+        default=-1,
+    )
+    for index, msg in enumerate(messages):
+        if (
+            index >= last_user_index
+            or msg.get("role") != "assistant"
+            or not isinstance(msg.get("tool_calls"), list)
+        ):
+            filtered.append(msg)
+            continue
+        tool_calls = msg.get("tool_calls") or []
+        kept_calls = []
+        for tool_call in tool_calls:
+            if not _is_storage_only_visual_qa_tool_call(tool_call):
+                kept_calls.append(tool_call)
+                continue
+            removed_calls += 1
+            call_id = _ra().AIAgent._get_tool_call_id_static(tool_call)
+            if call_id:
+                removed_call_ids.add(call_id)
+        if len(kept_calls) == len(tool_calls):
+            filtered.append(msg)
+            continue
+        content = msg.get("content")
+        has_visible_content = bool(
+            content.strip() if isinstance(content, str) else content
+        )
+        if kept_calls or has_visible_content:
+            replacement = dict(msg)
+            if kept_calls:
+                replacement["tool_calls"] = list(kept_calls)
+            else:
+                replacement.pop("tool_calls", None)
+            filtered.append(replacement)
+        else:
+            dropped_assistants += 1
+
+    if not removed_calls:
+        return messages
+    filtered = [
+        msg
+        for msg in filtered
+        if not (
+            msg.get("role") == "tool"
+            and str(msg.get("tool_call_id") or "") in removed_call_ids
+        )
+    ]
+    _ra().logger.debug(
+        "Pre-call sanitizer: removed %d storage-only visual_qa call(s) and %d "
+        "empty assistant turn(s)",
+        removed_calls,
+        dropped_assistants,
+    )
+    return _merge_adjacent_user_api_messages(filtered, dropped=dropped_assistants)
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -2561,6 +2669,11 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
         filtered.append(msg)
     messages = filtered
+
+    # Visual-QA contracts are intentionally reduced to opaque evidence before
+    # durable storage. That storage-only shape is not executable and must not be
+    # replayed as an example for the model to copy on the next turn.
+    messages = _drop_storage_only_visual_qa_replay(messages)
 
 
     # --- Drop empty / malformed tool_calls arrays on assistant messages ---
