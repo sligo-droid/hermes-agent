@@ -148,6 +148,13 @@ _SOFT_VERIFICATION_NEGATIVE_KEYWORDS = {
     "regression",
 }
 
+_EXACT_VISUAL_VALUE_RE = re.compile(
+    r"(?:\bexactly\b.{0,48}(?:#[0-9a-f]{3,8}\b|\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)\b))"
+    r"|(?:\b(?:set|change|make|use|add)\b.{0,64}\bto\s+"
+    r"(?:#[0-9a-f]{3,8}\b|\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)\b))",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class UIWorkRouteDecision:
@@ -438,6 +445,9 @@ def _classify_ui_work(
 
     primary_text = _normalize_text(title, task)
     body_text = _normalize_text(title, task, context)
+
+    if _EXACT_VISUAL_VALUE_RE.search(primary_text):
+        return False, "deterministic exact visual value"
 
     # CWD/project names are deliberately not positive evidence: repository names
     # like PID or Command Center should not route backend, docs, test, or review

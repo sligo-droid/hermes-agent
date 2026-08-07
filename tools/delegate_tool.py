@@ -4765,6 +4765,26 @@ REQUEST_CODING_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Root-registered structured delegate handoff IDs to attach.",
             },
+            "route_decision": {
+                "type": "object",
+                "properties": {
+                    "route": {
+                        "type": "string",
+                        "enum": ["default_coding_worker", "ui_visual_specialist"],
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "rationale": {"type": "string"},
+                    "visual_advisor_tier": {
+                        "type": "string",
+                        "enum": ["standard", "advanced"],
+                    },
+                },
+                "required": ["route"],
+                "description": (
+                    "Optional root-owned UI route. Use advanced visual advice only for "
+                    "novel, ambiguous, or high-impact design decisions."
+                ),
+            },
         },
         "required": ["task", "scope_paths"],
     },
@@ -4783,6 +4803,7 @@ def request_coding_task(
     verification: Optional[str],
     scope_paths: Optional[list[str]],
     analysis_handoff_ids: Optional[list[str]],
+    route_decision: Optional[dict[str, Any]],
     parent_agent: Any,
 ) -> str:
     """Broker nested coding through state owned by the original root agent."""
@@ -4817,6 +4838,7 @@ def request_coding_task(
             verification=verification,
             scope_paths=scope_paths,
             analysis_handoff_ids=analysis_handoff_ids,
+            route_decision=route_decision,
             background=False,
             allow_git_pr_lifecycle=False,
             trusted_allow_git_pr_lifecycle=False,
@@ -4960,6 +4982,7 @@ registry.register(
         verification=args.get("verification"),
         scope_paths=args.get("scope_paths"),
         analysis_handoff_ids=args.get("analysis_handoff_ids"),
+        route_decision=args.get("route_decision"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

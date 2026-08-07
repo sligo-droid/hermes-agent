@@ -13,6 +13,7 @@ from tools.read_only_verification_tool import (
     _TASK_LIMIT,
     _pnpm_cache_roots,
     _pnpm_package_manager_pin,
+    _package_manager_source_cwd,
     _prepared_pnpm_runtime,
     _with_verification_cgroup,
     _prepared_dependency_roots,
@@ -91,6 +92,21 @@ def test_read_only_verification_parser_rejects_unsafe_package_manager_forms(comm
 
     assert argv is None
     assert error
+
+
+def test_package_manager_source_cwd_resolves_nested_directory(tmp_path):
+    repo = tmp_path / "repo"
+    dashboard = repo / "dashboard"
+    dashboard.mkdir(parents=True)
+
+    effective, error = _package_manager_source_cwd(
+        ["pnpm", "--dir", "dashboard", "test"],
+        source_cwd=repo,
+        source_root=repo,
+    )
+
+    assert error is None
+    assert effective == dashboard
 
 
 def test_read_only_verification_parser_rejects_main_parent_pseudo_command():
@@ -773,8 +789,8 @@ def test_read_only_verify_mounts_nested_dependencies_and_writable_vite_caches(tm
 
     payload = json.loads(
         read_only_verify(
-            command="pnpm test -- fixture-selector",
-            workdir=str(dashboard),
+            command="pnpm --dir dashboard test -- fixture-selector",
+            workdir=str(repo),
             timeout=90,
             runtime_mode="read_only",
         )

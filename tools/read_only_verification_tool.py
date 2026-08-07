@@ -220,6 +220,42 @@ def _strip_package_manager_workdir_args(
     return remaining, None
 
 
+def _package_manager_source_cwd(
+    argv: list[str],
+    *,
+    source_cwd: Path,
+    source_root: Path,
+) -> tuple[Path, str | None]:
+    """Resolve leading npm/pnpm directory flags to a repository package cwd."""
+
+    if Path(argv[0]).name.lower() not in {"npm", "pnpm"}:
+        return source_cwd, None
+    remaining = list(argv[1:])
+    effective = source_cwd
+    while remaining:
+        flag = remaining[0]
+        directory = ""
+        consumed = 0
+        if flag in {"--dir", "-C", "--prefix"} and len(remaining) >= 2:
+            directory = remaining[1]
+            consumed = 2
+        elif flag.startswith("--dir=") or flag.startswith("--prefix="):
+            directory = flag.split("=", 1)[1]
+            consumed = 1
+        else:
+            break
+        candidate = (source_cwd / directory).resolve(strict=False)
+        try:
+            candidate.relative_to(source_root)
+        except ValueError:
+            return source_cwd, "package-manager directory is outside the Git root"
+        if not candidate.is_dir():
+            return source_cwd, "package-manager directory is unavailable"
+        effective = candidate
+        remaining = remaining[consumed:]
+    return effective, None
+
+
 def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None, str | None]:
     """Parse a deliberately small set of test/check commands without a shell."""
 
@@ -494,14 +530,25 @@ def _resolved_verification_argv(
         if not has_pnpm_runtime:
             raise RuntimeError("a prepared offline pnpm runtime is unavailable")
         tail = resolved[1:]
-        script_index = 1 if tail[:1] == ["run"] else 0
+        command_tail, workdir_error = _strip_package_manager_workdir_args(tail)
+        if workdir_error or command_tail is None:
+            raise RuntimeError(workdir_error or "invalid pnpm working-directory flags")
+        prefix_length = len(tail) - len(command_tail)
+        script_index = 1 if command_tail[:1] == ["run"] else 0
         separator_index = script_index + 1
         if (
-            len(tail) > separator_index + 1
-            and tail[separator_index] == "--"
-            and all(not value.startswith("-") for value in tail[separator_index + 1 :])
+            len(command_tail) > separator_index + 1
+            and command_tail[separator_index] == "--"
+            and all(
+                not value.startswith("-")
+                for value in command_tail[separator_index + 1 :]
+            )
         ):
-            tail = tail[:separator_index] + tail[separator_index + 1 :]
+            absolute_separator_index = prefix_length + separator_index
+            tail = (
+                tail[:absolute_separator_index]
+                + tail[absolute_separator_index + 1 :]
+            )
         return ["/usr/bin/node", "/opt/hermes-pnpm/bin/pnpm.cjs", *tail]
     if "/" not in resolved[0]:
         executable = shutil.which(resolved[0])
@@ -962,11 +1009,18 @@ def read_only_verify(
         relative_cwd = source_cwd.relative_to(source_root)
     except ValueError:
         return tool_error("verification workdir is outside its Git root")
+    package_cwd, package_cwd_error = _package_manager_source_cwd(
+        argv,
+        source_cwd=source_cwd,
+        source_root=source_root,
+    )
+    if package_cwd_error:
+        return tool_error(f"Unsafe package-manager verification: {package_cwd_error}")
 
     pnpm_runtime: Path | None = None
     if Path(argv[0]).name.lower() == "pnpm":
         pnpm_version, manifest, pin_error = _pnpm_package_manager_pin(
-            source_cwd,
+            package_cwd,
             source_root,
         )
         if pin_error or pnpm_version is None:
@@ -1038,7 +1092,7 @@ def read_only_verify(
 
             dependencies = _prepared_dependency_roots(
                 source_root,
-                source_cwd=source_cwd,
+                source_cwd=package_cwd,
                 pnpm_runtime=pnpm_runtime,
             )
             if "venv" in dependencies:

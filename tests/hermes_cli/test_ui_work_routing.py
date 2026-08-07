@@ -279,6 +279,22 @@ def test_deterministic_navigation_edit_stays_on_default_coding_route():
     assert decision.visual_advisor_tier == "standard"
 
 
+@pytest.mark.parametrize(
+    "task",
+    [
+        "Add exactly 8px spacing between the dashboard cards.",
+        "Style the dashboard button color exactly #112233.",
+        "Set the card width to 320px.",
+    ],
+)
+def test_exact_visual_property_edit_stays_on_default_coding_route(task):
+    decision = resolve_ui_work_route(_cfg(), task=task)
+
+    assert decision.selected_route == "default_coding_worker"
+    assert decision.advisory_matched is False
+    assert decision.advisory_reason == "deterministic exact visual value"
+
+
 def test_negative_backend_only_overrides_ui_keyword():
     decision = resolve_ui_work_route(
         _cfg(),
