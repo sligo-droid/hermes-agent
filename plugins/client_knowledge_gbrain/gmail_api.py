@@ -113,6 +113,8 @@ class GmailClient:
             raise GmailRetryableError("Gmail service is temporarily unavailable")
         if status in {401, 403}:
             raise GmailAPIError("Gmail authorization failed")
+        if status == 204 and kind == "list":
+            return GmailResponse({}, server_ms, fingerprint)
         if status != 200:
             raise GmailAPIError("Gmail request was rejected")
         raw = b"".join(chunks)

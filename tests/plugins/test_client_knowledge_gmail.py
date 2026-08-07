@@ -424,6 +424,40 @@ def test_raw_response_under_limit_respects_configured_transport_bound():
     assert GmailPoller._decode_raw(response.payload["raw"], 1024) == raw
 
 
+def test_empty_message_list_accepts_gmail_204_response():
+    client = GmailClient(
+        "token",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                204,
+                headers={"Date": "Thu, 06 Aug 2026 12:00:00 GMT"},
+            )
+        ),
+    )
+    try:
+        response = client.list_messages("to:pid@example.invalid")
+    finally:
+        client.close()
+    assert response.payload == {}
+
+
+def test_non_list_204_response_remains_rejected():
+    client = GmailClient(
+        "token",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                204,
+                headers={"Date": "Thu, 06 Aug 2026 12:00:00 GMT"},
+            )
+        ),
+    )
+    try:
+        with pytest.raises(Exception, match="rejected"):
+            client.history("100")
+    finally:
+        client.close()
+
+
 def test_raw_response_still_rejects_transport_abuse(monkeypatch):
     import plugins.client_knowledge_gbrain.gmail_api as gmail_api
 
