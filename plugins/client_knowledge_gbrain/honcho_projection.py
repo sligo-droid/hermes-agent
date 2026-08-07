@@ -88,15 +88,23 @@ class HonchoProjectionApi:
 
     def list(self) -> list[Any]:
         try:
-            values = self.scope.list(size=self.max_items + 1)
+            page = self.scope.list(page=1, size=min(100, self.max_items))
         except Exception as exc:
             raise HonchoProjectionFailure("honcho_projection_list_failed") from exc
-        items = getattr(values, "items", values)
-        result = list(items or [])
-        if len(result) >= self.max_items:
-            raise HonchoProjectionFailure(
-                "honcho_projection_remote_set_truncated", operator_blocked=True
-            )
+        total = getattr(page, "total", None)
+        if total is not None and int(total) > self.max_items:
+            raise HonchoProjectionFailure("honcho_projection_remote_set_truncated", operator_blocked=True)
+        result: list[Any] = []
+        while page is not None:
+            result.extend(list(getattr(page, "items", page) or []))
+            if len(result) > self.max_items:
+                raise HonchoProjectionFailure(
+                    "honcho_projection_remote_set_truncated", operator_blocked=True
+                )
+            next_page = getattr(page, "get_next_page", None)
+            page = next_page() if callable(next_page) else None
+        if total is not None and len(result) != int(total):
+            raise HonchoProjectionFailure("honcho_projection_remote_set_incomplete", operator_blocked=True)
         return result
 
     @staticmethod

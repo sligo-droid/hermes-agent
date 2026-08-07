@@ -59,21 +59,27 @@ def _render_notification(
     review: Mapping[str, Any], proposal: Mapping[str, Any], config: ProjectReviewConfig
 ) -> tuple[str, str, str]:
     operations = proposal.get("operations")
-    if not isinstance(operations, list) or len(operations) != 1:
-        raise ReviewFailure("review proposal must contain exactly one operation")
-    operation = operations[0]
-    refs = operation.get("source_refs") if isinstance(operation, Mapping) else None
-    notion_ref = str(refs[0]) if isinstance(refs, list) and refs else ""
-    target = str(operation.get("target_slug") or "") if isinstance(operation, Mapping) else ""
+    if not isinstance(operations, list) or not operations:
+        raise ReviewFailure("review proposal has no operations")
+    summaries: list[str] = []
+    for index, operation in enumerate(operations, start=1):
+        if not isinstance(operation, Mapping):
+            raise ReviewFailure("review proposal operation is invalid")
+        refs = operation.get("source_refs")
+        notion_ref = str(refs[-1]) if isinstance(refs, list) and refs else ""
+        target = str(operation.get("target_slug") or "")
+        summaries.append(
+            f"{index}. {operation.get('operation')} | "
+            f"gbrain:projects/{config.project_key}/{target} | {notion_ref}"
+        )
+    operation_summary = "\n".join(summaries)
     marker = f"[ck-review:{review['review_id']}:{str(review['proposal_sha256'])[:16]}]"
     content = (
         f"<@&{config.role_id}> Client-knowledge review required\n\n"
         f"Project: {config.project_key}\n"
         f"Review: {review['review_id']}\n"
-        f"Operation: {operation.get('operation')}\n"
-        f"Target: gbrain:projects/{config.project_key}/{target}\n"
-        f"Source: {notion_ref}\n"
         f"Reason: {review['reason_code']}\n\n"
+        f"Operations:\n{operation_summary}\n\n"
         f"Approve: /client-knowledge approve {review['review_id']}\n"
         f"Reject: /client-knowledge reject {review['review_id']} [reason]\n\n"
         f"{marker}"

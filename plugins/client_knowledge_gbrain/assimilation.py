@@ -81,9 +81,9 @@ _OPERATION_SCHEMA = {
         "expected_prior_sha256": {
             "type": "string", "pattern": "^(?:|[0-9a-f]{64})$",
         },
-        "finding_id": {"type": "string", "maxLength": 64},
+        "finding_id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
         "evidence_ids": {
-            "type": "array", "maxItems": 20, "uniqueItems": True,
+            "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": True,
             "items": {"type": "string", "pattern": "^evidence-[0-9]{3}$"},
         },
         "final_markdown": {"type": "string", "maxLength": 24000},
@@ -98,7 +98,7 @@ ASSIMILATION_SCHEMA: dict[str, Any] = {
         "artifact_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "interpretation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "project_key": {"type": "string", "minLength": 1, "maxLength": 63},
-        "operations": {"type": "array", "minItems": 1, "maxItems": 1, "items": _OPERATION_SCHEMA},
+        "operations": {"type": "array", "minItems": 1, "maxItems": 10, "items": _OPERATION_SCHEMA},
     },
 }
 
@@ -294,7 +294,7 @@ def _current_page_map(
             "title": str(page.get("title") or "")[:300],
             "frontmatter": page["frontmatter"],
             "compiled_truth": str(page.get("compiled_truth") or "")[:8000],
-            "timeline": str(page.get("timeline") or "")[:4000],
+            "timeline": str(page.get("timeline") or ""),
             "markdown_sha256": _page_prior_sha(source_root, project_key, relative),
         }
     return pages
@@ -405,13 +405,21 @@ def validate_proposal(
     ):
         raise AssimilationFailure("assimilation_identity_mismatch", quarantine=True)
     findings = _grounded_findings(interpretation)
+    if len(findings) > 10:
+        raise AssimilationFailure("assimilation_finding_limit", quarantine=True)
     seen: set[str] = set()
+    seen_findings: set[str] = set()
     validated: list[dict[str, Any]] = []
     confirmation_grounding_mismatch = False
     confirmation_truth_mismatch = False
     for raw in parsed["operations"]:
         item = dict(raw)
         operation = item["operation"]
+        finding_id = str(item["finding_id"])
+        finding = findings.get(finding_id)
+        if finding_id in seen_findings:
+            raise AssimilationFailure("assimilation_duplicate_finding")
+        seen_findings.add(finding_id)
         if operation == "ignore_transient":
             if any(
                 item[key]
@@ -419,14 +427,12 @@ def validate_proposal(
                     "target_slug", "title", "kind", "status", "confidence",
                     "sensitivity", "impact", "honcho_projection", "effective_at",
                     "source_refs", "supersedes", "claim", "timeline_entry",
-                    "expected_prior_sha256", "finding_id", "evidence_ids",
-                    "final_markdown",
+                    "expected_prior_sha256", "final_markdown",
                 )
-            ):
+            ) or finding is None or list(item["evidence_ids"]) != finding["evidence_ids"]:
                 raise AssimilationFailure("assimilation_transient_payload_invalid")
             validated.append(item)
             continue
-        finding = findings.get(str(item["finding_id"]))
         if (
             finding is None
             or item["claim"] != finding["text"]
@@ -505,12 +511,17 @@ def validate_proposal(
         if not slug.startswith(f"projects/{project_key}/"):
             raise AssimilationFailure("assimilation_project_scope_invalid", quarantine=True)
         validated.append(item)
+    if seen_findings != set(findings):
+        raise AssimilationFailure("assimilation_findings_incomplete", quarantine=True)
     review, reason = _review_policy(validated, current_pages, notion_ref)
     if confirmation_grounding_mismatch:
         review, reason = True, "confirmation_finding_grounding_mismatch"
     elif confirmation_truth_mismatch:
         review, reason = True, "confirmation_changes_truth"
-    return {**parsed, "operations": validated}, review, reason
+    proposal = {**parsed, "operations": validated}
+    if len(canonical_json(proposal)) > max_output_bytes:
+        raise AssimilationFailure("assimilation_output_limit")
+    return proposal, review, reason
 
 
 class AssimilationWorker:
@@ -590,7 +601,7 @@ class AssimilationWorker:
                     ),
                     input=[PluginLlmTextInput(text=source_data)],
                     json_schema=ASSIMILATION_SCHEMA,
-                    schema_name="client_knowledge_assimilation_v1",
+                    schema_name="client_knowledge_assimilation_v2",
                     temperature=0.0,
                     max_tokens=self.settings.max_tokens,
                     timeout=self.settings.timeout_seconds,

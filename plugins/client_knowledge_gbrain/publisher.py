@@ -421,6 +421,13 @@ class GitSourcePublisher:
         contents: Mapping[str, bytes | None],
         targets: Mapping[str, Path],
     ) -> None:
+        def restore_retired(retired: Path, target: Path) -> None:
+            try:
+                os.link(retired, target)
+            except FileExistsError:
+                return
+            retired.unlink()
+
         for row in manifest:
             path = row["path"]
             target = targets[path]
@@ -439,7 +446,17 @@ class GitSourcePublisher:
                 raise PublicationFailure("git_target_changed_before_materialization")
             if content is None:
                 if target.exists():
-                    target.unlink()
+                    retired = target.parent / f".{target.name}.prior-{assimilation_id[:12]}"
+                    if retired.exists() or retired.is_symlink():
+                        raise PublicationFailure("publication_temporary_path_exists")
+                    os.rename(target, retired)
+                    if self._sha256(retired.read_bytes()) not in {
+                        row["prior_sha256"], desired_sha
+                    }:
+                        restore_retired(retired, target)
+                        raise PublicationFailure("git_target_changed_before_materialization")
+                    else:
+                        retired.unlink(missing_ok=True)
                 continue
             temporary = target.parent / f".{target.name}.tmp-{assimilation_id[:12]}"
             if temporary.exists() or temporary.is_symlink():
@@ -456,7 +473,32 @@ class GitSourcePublisher:
                     handle.flush()
                     os.fsync(handle.fileno())
                 self._assert_target_path_safe(path)
-                os.replace(temporary, target)
+                if target.exists():
+                    current_sha = self._sha256(target.read_bytes())
+                    if current_sha == desired_sha:
+                        continue
+                    if current_sha != row["prior_sha256"]:
+                        raise PublicationFailure("git_target_changed_before_materialization")
+                    retired = target.parent / f".{target.name}.prior-{assimilation_id[:12]}"
+                    if retired.exists() or retired.is_symlink():
+                        raise PublicationFailure("publication_temporary_path_exists")
+                    os.rename(target, retired)
+                    if self._sha256(retired.read_bytes()) != row["prior_sha256"]:
+                        restore_retired(retired, target)
+                        raise PublicationFailure("git_target_changed_before_materialization")
+                    try:
+                        os.link(temporary, target)
+                    except FileExistsError as exc:
+                        restore_retired(retired, target)
+                        raise PublicationFailure("git_target_changed_before_materialization") from exc
+                    else:
+                        retired.unlink(missing_ok=True)
+                else:
+                    try:
+                        os.link(temporary, target)
+                    except FileExistsError as exc:
+                        raise PublicationFailure("git_target_changed_before_materialization") from exc
+                temporary.unlink()
             finally:
                 if fd >= 0:
                     os.close(fd)

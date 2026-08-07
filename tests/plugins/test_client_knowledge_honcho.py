@@ -17,8 +17,19 @@ class _Scope:
         self.created = []
         self.deleted = []
 
-    def list(self, size=500):
-        return SimpleNamespace(items=list(self.values[:size]))
+    def list(self, page=1, size=100):
+        values = self.values
+
+        class Page:
+            def __init__(self, number):
+                self.page = number
+                self.total = len(values)
+                self.items = list(values[(number - 1) * size:number * size])
+
+            def get_next_page(self):
+                return Page(self.page + 1) if self.page * size < self.total else None
+
+        return Page(page)
 
     def create(self, payload):
         self.created.append(payload)
@@ -54,15 +65,14 @@ def test_honcho_duplicate_marker_fails_closed_and_retracts_by_id():
     assert scope.deleted == ["old-id"]
 
 
-def test_honcho_marker_first_resolution_replaces_stale_and_detects_truncation():
+def test_honcho_marker_first_resolution_replaces_stale_and_paginates_with_api_limit():
     stale = SimpleNamespace(id="old", content="stale [ckp:marker]")
     api = HonchoProjectionApi(_Scope([stale]))
     assert api.resolve_marker("ckp:marker", "fresh [ckp:marker]") == ("", "old")
+    values = [SimpleNamespace(id=str(index), content=f"value {index}") for index in range(101)]
+    assert len(HonchoProjectionApi(_Scope(values), max_items=101).list()) == 101
     with pytest.raises(HonchoProjectionFailure, match="remote_set_truncated"):
-        HonchoProjectionApi(
-            _Scope([SimpleNamespace(id="one", content="x")]),
-            max_items=1,
-        ).list()
+        HonchoProjectionApi(_Scope(values), max_items=100).list()
 
 
 def test_only_stable_current_non_sensitive_allowlisted_pages_promote():
