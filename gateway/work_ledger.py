@@ -5259,7 +5259,7 @@ class GatewayWorkLedger:
         item.pop("claim_pid", None)
         item["lease_until"] = None
         item["terminal_reaction_state"] = "done"
-        item["terminal_reaction_sync_pending"] = True
+        item["terminal_reaction_sync_pending"] = False
         _record_provider_progress(item, "ledger_status_consumed", status="completed")
         self._write(data)
         return True
