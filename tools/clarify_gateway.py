@@ -155,10 +155,10 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.event.is_set():
             return False
-    entry.response = str(response) if response is not None else ""
-    entry.event.set()
+        entry.response = str(response) if response is not None else ""
+        entry.event.set()
     return True
 
 
@@ -191,8 +191,11 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> str:
     """Map typed choice replies to canonical choice text, otherwise keep custom text."""
     text = str(response).strip()
     if entry.choices:
+        numeric_text = text
+        if text.casefold().startswith("option "):
+            numeric_text = text[7:].strip()
         try:
-            idx = int(text) - 1
+            idx = int(numeric_text) - 1
         except ValueError:
             idx = -1
         if 0 <= idx < len(entry.choices):
@@ -221,7 +224,7 @@ def mark_awaiting_text(clarify_id: str) -> bool:
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.event.is_set():
             return False
         entry.awaiting_text = True
         return True
