@@ -61,12 +61,12 @@ _OPERATION_SCHEMA = {
         "operation": {"enum": list(OPERATIONS)},
         "target_slug": {"type": "string", "maxLength": 500},
         "title": {"type": "string", "maxLength": 300},
-        "kind": {"type": "string", "maxLength": 64},
-        "status": {"type": "string", "maxLength": 64},
-        "confidence": {"type": "string", "maxLength": 64},
-        "sensitivity": {"type": "string", "maxLength": 64},
-        "impact": {"type": "string", "maxLength": 64},
-        "honcho_projection": {"type": "string", "maxLength": 64},
+        "kind": {"enum": ["", *sorted(VALID_KINDS)]},
+        "status": {"enum": ["", *sorted(VALID_STATUSES)]},
+        "confidence": {"enum": ["", *sorted(VALID_CONFIDENCE)]},
+        "sensitivity": {"enum": ["", *sorted(VALID_SENSITIVITY)]},
+        "impact": {"enum": ["", *sorted(VALID_IMPACTS)]},
+        "honcho_projection": {"enum": ["", *sorted(VALID_PROJECTION_POLICIES)]},
         "effective_at": {"type": "string", "maxLength": 100},
         "source_refs": {
             "type": "array", "maxItems": 20, "uniqueItems": True,
@@ -210,7 +210,13 @@ def _grounded_findings(interpretation: Mapping[str, Any]) -> dict[str, dict[str,
         if isinstance(item, Mapping)
     }
     findings: dict[str, dict[str, Any]] = {}
-    for category in ("candidate_learnings", "decisions", "requirements", "preferences"):
+    kind_by_category = {
+        "candidate_learnings": "fact",
+        "decisions": "decision",
+        "requirements": "requirement",
+        "preferences": "preference",
+    }
+    for category, kind in kind_by_category.items():
         for raw in interpretation.get(category, []):
             if not isinstance(raw, Mapping):
                 continue
@@ -226,6 +232,9 @@ def _grounded_findings(interpretation: Mapping[str, Any]) -> dict[str, dict[str,
             findings[identifier] = {
                 "text": str(raw.get("text") or ""),
                 "evidence_ids": evidence_ids,
+                "kind": kind,
+                "confidence": str(raw.get("confidence") or ""),
+                "sensitivity": str(raw.get("sensitivity") or ""),
             }
     return findings
 
@@ -447,11 +456,17 @@ def validate_proposal(
         if (
             item["claim"] != finding["text"]
             or list(item["evidence_ids"]) != finding["evidence_ids"]
+            or item["kind"] != finding["kind"]
+            or item["confidence"] != finding["confidence"]
+            or item["sensitivity"] != finding["sensitivity"]
         ):
             finding_grounding_mismatch = True
             item_grounding_mismatch = True
             item["claim"] = finding["text"]
             item["evidence_ids"] = list(finding["evidence_ids"])
+            item["kind"] = finding["kind"]
+            item["confidence"] = finding["confidence"]
+            item["sensitivity"] = finding["sensitivity"]
         slug = full_project_slug(project_key, item["target_slug"])
         if item["target_slug"] in seen:
             raise AssimilationFailure("assimilation_duplicate_target")
@@ -590,13 +605,32 @@ class AssimilationWorker:
             review_required = bool(existing["review_required"])
             review_reason = str(existing["review_reason"])
         else:
+            assimilable_categories = (
+                "candidate_learnings", "decisions", "requirements", "preferences"
+            )
+            assimilable = {
+                category: list(interpretation.get(category, []))
+                for category in assimilable_categories
+            }
+            evidence_ids = {
+                str(evidence_id)
+                for category in assimilable_categories
+                for finding in assimilable[category]
+                if isinstance(finding, Mapping)
+                for evidence_id in finding.get("evidence_ids", [])
+            }
+            assimilable["evidence"] = [
+                item for item in interpretation.get("evidence", [])
+                if isinstance(item, Mapping) and str(item.get("id")) in evidence_ids
+            ]
+            assimilable["summary"] = str(interpretation.get("summary") or "")
             source_data = json.dumps(
                 {
                     "artifact_id": artifact.artifact_id,
                     "interpretation_id": interpretation_row["interpretation_id"],
                     "project_key": artifact.project_key,
                     "notion_source_ref": notion_ref,
-                    "interpretation": interpretation,
+                    "interpretation": assimilable,
                     "current_pages": current_pages,
                 },
                 ensure_ascii=False, sort_keys=True,
