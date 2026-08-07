@@ -410,10 +410,11 @@ def validate_proposal(
     seen: set[str] = set()
     seen_findings: set[str] = set()
     validated: list[dict[str, Any]] = []
-    confirmation_grounding_mismatch = False
+    finding_grounding_mismatch = False
     confirmation_truth_mismatch = False
     for raw in parsed["operations"]:
         item = dict(raw)
+        item_grounding_mismatch = False
         operation = item["operation"]
         finding_id = str(item["finding_id"])
         finding = findings.get(finding_id)
@@ -441,13 +442,16 @@ def validate_proposal(
             continue
         if (
             finding is None
-            or item["claim"] != finding["text"]
+        ):
+            raise AssimilationFailure("assimilation_finding_grounding_mismatch", quarantine=True)
+        if (
+            item["claim"] != finding["text"]
             or list(item["evidence_ids"]) != finding["evidence_ids"]
         ):
-            if operation == "confirm":
-                confirmation_grounding_mismatch = True
-            else:
-                raise AssimilationFailure("assimilation_finding_grounding_mismatch", quarantine=True)
+            finding_grounding_mismatch = True
+            item_grounding_mismatch = True
+            item["claim"] = finding["text"]
+            item["evidence_ids"] = list(finding["evidence_ids"])
         slug = full_project_slug(project_key, item["target_slug"])
         if item["target_slug"] in seen:
             raise AssimilationFailure("assimilation_duplicate_target")
@@ -512,16 +516,20 @@ def validate_proposal(
                 )
             ):
                 confirmation_truth_mismatch = True
-        elif item["final_markdown"] != _canonical_markdown(item, project_key=project_key):
-            raise AssimilationFailure("assimilation_markdown_mismatch")
+        else:
+            canonical_markdown = _canonical_markdown(item, project_key=project_key)
+            if item_grounding_mismatch:
+                item["final_markdown"] = canonical_markdown
+            elif item["final_markdown"] != canonical_markdown:
+                raise AssimilationFailure("assimilation_markdown_mismatch")
         if not slug.startswith(f"projects/{project_key}/"):
             raise AssimilationFailure("assimilation_project_scope_invalid", quarantine=True)
         validated.append(item)
     if seen_findings != set(findings):
         raise AssimilationFailure("assimilation_findings_incomplete", quarantine=True)
     review, reason = _review_policy(validated, current_pages, notion_ref)
-    if confirmation_grounding_mismatch:
-        review, reason = True, "confirmation_finding_grounding_mismatch"
+    if finding_grounding_mismatch:
+        review, reason = True, "finding_grounding_mismatch"
     elif confirmation_truth_mismatch:
         review, reason = True, "confirmation_changes_truth"
     proposal = {**parsed, "operations": validated}

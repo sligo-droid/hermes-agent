@@ -428,10 +428,29 @@ def test_confirmation_requires_persisted_finding_and_host_preserves_timeline(tmp
         max_output_bytes=500_000,
     )
     assert review is True
-    assert reason == "confirmation_finding_grounding_mismatch"
+    assert reason == "finding_grounding_mismatch"
     rendered = parsed["operations"][0]
     assert rendered["timeline_entry"].startswith("- original timeline")
     assert "erase history" not in rendered["final_markdown"]
+
+
+def test_non_confirmation_grounding_mismatch_is_host_normalized_for_review(tmp_path):
+    op = _operation("add", claim="Paraphrased reporting requirement.")
+    op["evidence_ids"] = ["evidence-999"]
+    op["final_markdown"] = _canonical_markdown(op, project_key="pid")
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=_interpretation("Weekly report is due Monday."),
+        source_root=tmp_path, max_output_bytes=500_000,
+    )
+    rendered = parsed["operations"][0]
+    assert review is True
+    assert reason == "finding_grounding_mismatch"
+    assert rendered["claim"] == "Weekly report is due Monday."
+    assert rendered["evidence_ids"] == ["evidence-001"]
+    assert "Paraphrased reporting requirement." not in rendered["final_markdown"]
+    assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
 
 
 def test_confirmation_preserves_timeline_beyond_model_context_truncation(tmp_path):
