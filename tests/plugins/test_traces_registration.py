@@ -108,18 +108,23 @@ def test_session_start_creates_pending_root_artifact_without_publishing(
     assert publisher.enqueued == []
 
 
-def test_provider_is_read_only(monkeypatch, tmp_path):
+def test_provider_lazily_creates_stable_url_without_publishing(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(hermes_traces_plugin, "Publisher", FakePublisher)
     monkeypatch.setattr(hermes_traces_plugin, "_runtimes", {})
     registrar = Registrar()
     hermes_traces_plugin.register(registrar)
-    registrar.hooks["on_session_end"]("abc", "discord")
     index_path = tmp_path / "state" / "plugins" / "traces" / "index.json"
+
+    artifact = registrar.provider("abc", "discord_feature_summary")
     before = index_path.read_bytes()
 
-    assert registrar.provider("abc", "discord_feature_summary") is not None
+    assert artifact is not None
+    assert artifact["url"].startswith("https://sligo.sligolabs.com/traces/")
+    assert registrar.provider("abc", "discord_feature_summary") == artifact
     assert index_path.read_bytes() == before
+    _config, _state, publisher, _store = hermes_traces_plugin._runtime()
+    assert publisher.enqueued == []
 
 
 def test_finalize_creates_root_trace_when_end_hook_was_missed(monkeypatch, tmp_path):

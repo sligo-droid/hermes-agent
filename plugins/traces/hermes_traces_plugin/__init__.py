@@ -228,6 +228,11 @@ def register(ctx: Any) -> None:
         config, state, _publisher, store = _runtime()
         root_id = store.resolve_root(session_id)
         record = state.get(root_id, "discord") if root_id else None
+        if root_id and not record:
+            # The adapter creates the feature-summary embed before the gateway
+            # resolves a session. Create only the stable protected URL on the
+            # first artifact lookup; transcript publication remains completion-only.
+            record = state.create(root_id, "discord")
         if not record or record.get("status") not in {"pending", "ready"}:
             return None
         return {
