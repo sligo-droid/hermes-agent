@@ -3718,6 +3718,42 @@ async def test_running_feature_summary_collects_session_artifacts(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolved_session_refreshes_running_feature_summary_artifacts(monkeypatch):
+    from hermes_cli import plugins as plugin_api
+
+    artifacts = [
+        {
+            "kind": "external_url",
+            "label": "Agent Trace",
+            "url": "https://artifacts.example.test/runs/live",
+        }
+    ]
+    collect = MagicMock(return_value=artifacts)
+    monkeypatch.setattr(plugin_api, "collect_session_artifacts", collect)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    adapter = SimpleNamespace(update_feature_summary=AsyncMock(return_value=True))
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="200", chat_type="thread")
+    feature_summary = {"message_id": "300", "initial_request": "Keep working"}
+
+    assert await runner._refresh_discord_running_summary_artifacts(
+        source=source,
+        feature_summary=feature_summary,
+        session_id="session-1",
+    )
+
+    collect.assert_called_once_with(
+        "session-1",
+        surface="discord_feature_summary",
+    )
+    adapter.update_feature_summary.assert_awaited_once_with(
+        feature_summary,
+        status="Running",
+        artifacts=artifacts,
+    )
+
+
+@pytest.mark.asyncio
 async def test_feature_summary_artifact_provider_failure_is_fail_open(monkeypatch):
     from hermes_cli import plugins as plugin_api
 

@@ -18834,6 +18834,12 @@ class _GatewayRunnerCore(
                 "session_key": session_key,
             })
 
+        await self._refresh_discord_running_summary_artifacts(
+            source=source,
+            feature_summary=getattr(event, "feature_summary", None),
+            session_id=session_entry.session_id,
+        )
+
         _pcfg = {}
         _redact_pii = False
         try:
@@ -23259,6 +23265,42 @@ class _GatewayRunnerCore(
                 logger.debug("Discord feature summary update failed", exc_info=True)
                 return False
         return True
+
+    async def _refresh_discord_running_summary_artifacts(
+        self,
+        *,
+        source: SessionSource,
+        feature_summary: Optional[Dict[str, Any]],
+        session_id: str,
+    ) -> bool:
+        """Attach session artifacts after Discord resolves the live session."""
+        if source.platform != Platform.DISCORD or not feature_summary or not session_id:
+            return True
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter or not hasattr(adapter, "update_feature_summary"):
+            return False
+        try:
+            from hermes_cli.plugins import collect_session_artifacts
+
+            artifacts = await asyncio.to_thread(
+                collect_session_artifacts,
+                session_id,
+                surface="discord_feature_summary",
+            )
+            if not artifacts:
+                return True
+            result = await adapter.update_feature_summary(
+                feature_summary,
+                status="Running",
+                artifacts=artifacts,
+            )
+            return bool(result) if result is not None else True
+        except Exception:
+            logger.debug(
+                "Discord running feature-summary artifact refresh failed",
+                exc_info=True,
+            )
+            return False
 
     def _register_discord_summary_post_delivery(
         self,
