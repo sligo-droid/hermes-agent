@@ -76,7 +76,13 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("model_tier", props["tasks"]["items"]["properties"])
         self.assertEqual(
             props["purpose"]["enum"],
-            ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
+            [
+                "visual_advisor",
+                "visual_advisor_advanced",
+                "visual_sweep",
+                "visual_inspector",
+                "visual_critique",
+            ],
         )
         self.assertIn("purpose", props["tasks"]["items"]["properties"])
         self.assertIn("context", props)
@@ -1751,7 +1757,8 @@ class TestDelegationModelTierRouting(unittest.TestCase):
 
         mock_resolve.side_effect = resolve_provider
         expected = {
-            "visual_advisor": ("anthropic", "claude-opus-5", "medium"),
+            "visual_advisor": ("anthropic", "claude-sonnet-5", "medium"),
+            "visual_advisor_advanced": ("anthropic", "claude-opus-5", "medium"),
             "visual_sweep": ("openai-codex", "gpt-5.6-luna", "medium"),
             "visual_inspector": ("anthropic", "claude-sonnet-5", "medium"),
             # ``medium`` is stable under the review spillover, so the explicit
@@ -1781,7 +1788,13 @@ class TestDelegationModelTierRouting(unittest.TestCase):
                 self.assertIsNone(kwargs["fallback_model"])
                 self.assertEqual(
                     MockAgent.return_value._runtime_audit_context["model_tier"],
-                    "visual_critique" if purpose == "visual_advisor" else purpose,
+                    (
+                        "visual_inspector"
+                        if purpose == "visual_advisor"
+                        else "visual_critique"
+                        if purpose == "visual_advisor_advanced"
+                        else purpose
+                    ),
                 )
 
     def test_exhausted_parent_worker_budget_fails_before_launch(self):

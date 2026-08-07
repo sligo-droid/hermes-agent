@@ -23,6 +23,7 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import time
 import threading
 from types import SimpleNamespace
 from pathlib import Path
@@ -481,6 +482,35 @@ def test_final_rewrite_preserves_concurrent_external_sqlite_append(tmp_path):
 
     rows = db.get_messages(agent.session_id)
     assert [row["content"] for row in rows] == ["original", "external concurrent row"]
+
+
+def test_incremental_flush_stamps_timestamp_for_final_rewrite(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    agent = _make_agent()
+    agent._session_db = db
+    agent.session_id = "timestamped-final-rewrite"
+    agent._session_db_created = False
+    agent._last_flushed_db_idx = 0
+    agent._ensure_db_session()
+    messages = [{"role": "assistant", "content": "first durable event"}]
+
+    before = time.time()
+    agent._flush_messages_to_session_db(messages)
+    after = time.time()
+
+    assert before <= messages[0]["timestamp"] <= after
+    messages.append({"role": "assistant", "content": "later event"})
+    agent._flush_messages_to_session_db(messages)
+    assert messages[1]["timestamp"] >= messages[0]["timestamp"]
+
+    agent._rewrite_messages_to_session_db(messages)
+    rows = db.get_messages(agent.session_id)
+    assert [row["timestamp"] for row in rows] == [
+        messages[0]["timestamp"],
+        messages[1]["timestamp"],
+    ]
 
 
 def test_final_rewrite_rejects_same_count_concurrent_sqlite_replacement(tmp_path):

@@ -173,6 +173,7 @@ class UIWorkRouteDecision:
     advisory_reason: str = ""
     launch_worker: bool = True
     model_tier: str = ""
+    visual_advisor_tier: str = "standard"
 
     def metadata(self) -> dict[str, Any]:
         metadata = {
@@ -196,6 +197,7 @@ class UIWorkRouteDecision:
             "advisory_matched": self.advisory_matched,
             "advisory_reason": self.advisory_reason,
             "model_tier": self.model_tier,
+            "visual_advisor_tier": self.visual_advisor_tier,
         }
         metadata["recommended_skills"] = (
             list(ui_specialist_skills_for_model_tier(self.model_tier))
@@ -229,6 +231,7 @@ class _RouteDecisionInput:
     confidence: float | None = None
     rationale: str = ""
     error: str = ""
+    visual_advisor_tier: str = "standard"
 
 
 _DEFAULT_ROUTE = "default_coding_worker"
@@ -328,6 +331,7 @@ def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
         source = "orchestrator"
         confidence = None
         rationale = ""
+        visual_advisor_tier = "standard"
     elif isinstance(value, dict):
         route = _normalize_route_name(
             value.get("route")
@@ -338,11 +342,26 @@ def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
         source = str(value.get("source") or "orchestrator").strip() or "orchestrator"
         confidence = _normalize_confidence(value.get("confidence"))
         rationale = str(value.get("rationale") or value.get("reason") or "").strip()
+        visual_advisor_tier = str(
+            value.get("visual_advisor_tier") or value.get("advisor_tier") or "standard"
+        ).strip().lower()
     else:
         return _RouteDecisionInput(
             route="",
             source="orchestrator",
             error="route_decision must be a string or object",
+        )
+    if visual_advisor_tier not in {"standard", "advanced"}:
+        return _RouteDecisionInput(
+            route=route,
+            source=source,
+            confidence=confidence,
+            rationale=rationale,
+            visual_advisor_tier=visual_advisor_tier,
+            error=(
+                "visual_advisor_tier must be 'standard' or 'advanced', not "
+                f"{visual_advisor_tier!r}"
+            ),
         )
     if route not in _VALID_ROUTES:
         label = route or "<empty>"
@@ -359,6 +378,7 @@ def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
         source=source,
         confidence=confidence,
         rationale=rationale,
+        visual_advisor_tier=visual_advisor_tier,
     )
 
 
@@ -512,6 +532,7 @@ def resolve_ui_work_route(
         "route_decision_rationale": requested.rationale,
         "advisory_matched": advisory_matched,
         "advisory_reason": advisory_reason,
+        "visual_advisor_tier": requested.visual_advisor_tier,
     }
 
     if requested.error:
@@ -550,7 +571,7 @@ def resolve_ui_work_route(
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
-                reason="explicit visual UI work selected the Opus advisor route",
+                reason="explicit visual UI work selected the visual advisor route",
                 selected_route=_UI_SPECIALIST_ROUTE,
                 **automatic_fields,
             )

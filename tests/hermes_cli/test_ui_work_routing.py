@@ -95,6 +95,7 @@ def test_explicit_visual_route_selects_behavioral_profile(task):
     assert decision.model == ""
     assert decision.backend == "codex"
     assert decision.backend_config == {}
+    assert decision.visual_advisor_tier == "standard"
 
 
 def test_visual_specialist_preserves_configured_opencode_backend():
@@ -145,6 +146,36 @@ def test_visual_specialist_accepts_json_encoded_route_decision():
     assert decision.selected_model == ""
 
 
+def test_visual_specialist_accepts_advanced_advisor_tier():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Design a novel high-impact Command Center workspace hierarchy.",
+        route_decision={
+            "route": "ui_visual_specialist",
+            "visual_advisor_tier": "advanced",
+            "rationale": "new product hierarchy with meaningful alternatives",
+        },
+    )
+
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.visual_advisor_tier == "advanced"
+    assert decision.metadata()["visual_advisor_tier"] == "advanced"
+
+
+def test_visual_specialist_rejects_unknown_advisor_tier():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Polish the dashboard.",
+        route_decision={
+            "route": "ui_visual_specialist",
+            "visual_advisor_tier": "premium",
+        },
+    )
+
+    assert decision.selected_route == "default_coding_worker"
+    assert "visual_advisor_tier must be" in decision.error
+
+
 def test_tui_terminal_rendering_work_does_not_route():
     decision = resolve_ui_work_route(
         _cfg(),
@@ -188,7 +219,7 @@ def test_explicit_ui_route_overrides_review_keyword_veto():
     assert "visual ui work" in decision.advisory_reason
 
 
-def test_visual_keywords_without_route_select_automatic_opus_advisor():
+def test_visual_keywords_without_route_select_automatic_standard_advisor():
     decision = resolve_ui_work_route(
         _cfg(),
         task="Implement responsive dashboard card visual polish.",
@@ -206,10 +237,11 @@ def test_visual_keywords_without_route_select_automatic_opus_advisor():
     assert decision.route_decision_source == "deterministic_explicit_visual"
     assert decision.route_decision_confidence is None
     assert decision.advisory_matched is True
+    assert decision.visual_advisor_tier == "standard"
     assert "visual ui work" in decision.advisory_reason
 
 
-def test_command_center_polish_smoke_selects_automatic_opus_advisor():
+def test_command_center_polish_smoke_selects_automatic_standard_advisor():
     decision = resolve_ui_work_route(
         _cfg(),
         task="Smoke-test UI specialist route on Command Center polish.",
@@ -231,6 +263,20 @@ def test_non_visual_command_center_smoke_still_does_not_route():
     assert decision.matched is False
     assert decision.advisory_matched is False
     assert "negative keyword" in decision.advisory_reason
+
+
+def test_deterministic_navigation_edit_stays_on_default_coding_route():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task=(
+            "Remove the Briefing Studio tab from the sidebar and move Confidence "
+            "directly beneath Races."
+        ),
+    )
+
+    assert decision.selected_route == "default_coding_worker"
+    assert decision.advisory_matched is False
+    assert decision.visual_advisor_tier == "standard"
 
 
 def test_negative_backend_only_overrides_ui_keyword():

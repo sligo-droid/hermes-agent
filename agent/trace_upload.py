@@ -55,6 +55,34 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def _trace_timestamp(value: Any, fallback: str) -> str:
+    """Normalize a persisted message timestamp for Claude Code JSONL."""
+
+    if value is None:
+        return fallback
+    try:
+        if hasattr(value, "timestamp"):
+            parsed = datetime.fromtimestamp(float(value.timestamp()), tz=timezone.utc)
+        elif isinstance(value, (int, float)):
+            parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return fallback
+            try:
+                parsed = datetime.fromtimestamp(float(stripped), tz=timezone.utc)
+            except ValueError:
+                parsed = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed = parsed.astimezone(timezone.utc)
+        else:
+            return fallback
+    except (OSError, OverflowError, TypeError, ValueError):
+        return fallback
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def _redact(text: Any, enabled: bool) -> Any:
     """Redact secrets from a string body when redaction is enabled.
 
@@ -169,7 +197,7 @@ def build_trace_jsonl(
     except Exception:
         git_branch = ""
 
-    def _common(turn_uuid: str) -> Dict[str, Any]:
+    def _common(turn_uuid: str, timestamp: Any = None) -> Dict[str, Any]:
         return {
             "parentUuid": parent,
             "isSidechain": False,
@@ -179,7 +207,7 @@ def build_trace_jsonl(
             "version": _HERMES_VERSION,
             "gitBranch": git_branch,
             "uuid": turn_uuid,
-            "timestamp": base_ts,
+            "timestamp": _trace_timestamp(timestamp, base_ts),
         }
 
     for msg in messages:
@@ -193,7 +221,7 @@ def build_trace_jsonl(
             blocks.extend(_tool_calls_to_blocks(msg.get("tool_calls"), redact))
             if not blocks:
                 blocks = [{"type": "text", "text": ""}]
-            entry = _common(turn_uuid)
+            entry = _common(turn_uuid, msg.get("timestamp"))
             entry["type"] = "assistant"
             entry["message"] = {
                 "role": "assistant",
@@ -211,7 +239,7 @@ def build_trace_jsonl(
                 else json.dumps(msg.get("content")),
                 redact,
             )
-            entry = _common(turn_uuid)
+            entry = _common(turn_uuid, msg.get("timestamp"))
             entry["type"] = "user"
             entry["message"] = {
                 "role": "user",
@@ -231,7 +259,7 @@ def build_trace_jsonl(
             message_content: Any = _redact(content, redact)
         else:
             message_content = _content_to_blocks(content, redact)
-        entry = _common(turn_uuid)
+        entry = _common(turn_uuid, msg.get("timestamp"))
         entry["type"] = "user"
         entry["message"] = {"role": "user", "content": message_content}
         lines.append(json.dumps(entry, ensure_ascii=False))

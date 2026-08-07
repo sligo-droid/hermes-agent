@@ -1904,6 +1904,14 @@ class AIAgent:
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
+                # Preserve the first durable-observation time on the in-memory
+                # message. Final transcript rewrites reuse this list; without
+                # the stamp they collapse every row to rewrite time and destroy
+                # the real tool/API sequence used by uploaded traces.
+                if _row_timestamp is None:
+                    _row_timestamp = time.time()
+                if msg.get("timestamp") is None:
+                    msg["timestamp"] = _row_timestamp
                 # Store the sidecar only when it actually differs.
                 if _row_api_content == content:
                     _row_api_content = None

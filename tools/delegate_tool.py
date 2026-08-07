@@ -4396,8 +4396,9 @@ def _build_top_level_description() -> str:
         "review; it "
         "is rejected for ordinary selection and nested delegation.\n"
         "- For visual work, use the explicit purpose field instead of guessing a "
-        "tier from task wording: visual_advisor for one read-only pre-implementation "
-        "design consultation, visual_sweep for one browser/navigation evidence "
+        "tier from task wording: visual_advisor for an ordinary read-only "
+        "pre-implementation consultation, visual_advisor_advanced for a novel or "
+        "high-impact design pass, visual_sweep for one browser/navigation evidence "
         "pass, visual_inspector for bounded screenshot judgement over collected "
         "evidence, and visual_critique for at most one final aesthetic critique. "
         "Run the sweep before judgement passes; do not fan out duplicate browser "
@@ -4596,7 +4597,13 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "purpose": {
                             "type": "string",
-                            "enum": ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
+                            "enum": [
+                                "visual_advisor",
+                                "visual_advisor_advanced",
+                                "visual_sweep",
+                                "visual_inspector",
+                                "visual_critique",
+                            ],
                             "description": (
                                 "Explicit visual-workflow purpose. Selects the matching "
                                 "visual model tier automatically without task-text inference."
@@ -4642,11 +4649,18 @@ DELEGATE_TASK_SCHEMA = {
             },
             "purpose": {
                 "type": "string",
-                "enum": ["visual_advisor", "visual_sweep", "visual_inspector", "visual_critique"],
+                "enum": [
+                    "visual_advisor",
+                    "visual_advisor_advanced",
+                    "visual_sweep",
+                    "visual_inspector",
+                    "visual_critique",
+                ],
                 "description": (
                     "Explicit visual-workflow purpose for a single task or batch default. "
                     "Selects the matching visual tier automatically. Use visual_advisor "
-                    "once before explicit visual implementation, one visual_sweep "
+                    "for ordinary pre-implementation direction, visual_advisor_advanced "
+                    "only for novel or high-impact design, and one visual_sweep "
                     "before evidence-only inspector passes and at most one visual_critique."
                 ),
             },

@@ -850,7 +850,7 @@ def _run_ui_visual_advisor(
     constraints: Any,
     parent_agent: Any,
 ) -> tuple[str, dict[str, Any]]:
-    """Run one cached read-only Opus design consultation for visual work."""
+    """Run one cached read-only design consultation for visual work."""
 
     if not (
         ui_route is not None
@@ -867,6 +867,9 @@ def _run_ui_visual_advisor(
         "relevant_files": relevant_files if isinstance(relevant_files, list) else [],
         "approach": str(approach or ""),
         "constraints": str(constraints or ""),
+        "visual_advisor_tier": str(
+            getattr(ui_route, "visual_advisor_tier", "standard") or "standard"
+        ),
         "turn_id": str(
             getattr(root, "_current_turn_id", "")
             or getattr(root, "_current_task_id", "")
@@ -920,20 +923,28 @@ def _run_ui_visual_advisor(
     metadata: dict[str, Any] = {
         "advisor_invoked": True,
         "advisor_cached": False,
-        "advisor_model": "claude-opus-5",
+        "advisor_model": (
+            "claude-opus-5"
+            if getattr(ui_route, "visual_advisor_tier", "standard") == "advanced"
+            else "claude-sonnet-5"
+        ),
     }
     guidance = ""
     try:
-        from hermes_cli.opus_planner import _anthropic_budget_preflight_error
+        advanced_advisor = (
+            getattr(ui_route, "visual_advisor_tier", "standard") == "advanced"
+        )
+        if advanced_advisor:
+            from hermes_cli.opus_planner import _anthropic_budget_preflight_error
 
-        budget_error = _anthropic_budget_preflight_error()
-        if budget_error:
-            metadata.update(
-                advisor_status="skipped",
-                advisor_failure_class="opus_budget_exhausted",
-            )
-            cache[fingerprint] = {"guidance": "", "metadata": dict(metadata)}
-            return "", metadata
+            budget_error = _anthropic_budget_preflight_error()
+            if budget_error:
+                metadata.update(
+                    advisor_status="skipped",
+                    advisor_failure_class="opus_budget_exhausted",
+                )
+                cache[fingerprint] = {"guidance": "", "metadata": dict(metadata)}
+                return "", metadata
 
         from tools.delegate_tool import delegate_task
 
@@ -948,7 +959,9 @@ def _run_ui_visual_advisor(
             ),
             context=advisor_context,
             toolsets=["file"],
-            purpose="visual_advisor",
+            purpose=(
+                "visual_advisor_advanced" if advanced_advisor else "visual_advisor"
+            ),
             read_only=True,
             parent_agent=parent_agent,
         )
@@ -970,7 +983,7 @@ def _run_ui_visual_advisor(
                 entry.get("exit_reason") or "no_completed_guidance"
             )[:120]
     except Exception as exc:
-        logger.warning("Opus visual advisor unavailable; continuing with coding worker: %s", exc)
+        logger.warning("Visual advisor unavailable; continuing with coding worker: %s", exc)
         metadata.update(
             advisor_status="failed",
             advisor_failure_class="route_or_runtime_unavailable",
@@ -2552,7 +2565,7 @@ def _delegate_coding_task_impl(
         worker_prompt_parts.extend(
             [
                 "",
-                "Opus visual advisor guidance (read-only design direction; the coding worker "
+                "Visual advisor guidance (read-only design direction; the coding worker "
                 "still owns implementation and must verify the rendered result):",
                 advisor_guidance,
             ]
@@ -5112,6 +5125,15 @@ CODING_WORKER_SCHEMA = {
                     "rationale": {
                         "type": "string",
                         "description": "Short reason for the route decision.",
+                    },
+                    "visual_advisor_tier": {
+                        "type": "string",
+                        "enum": ["standard", "advanced"],
+                        "description": (
+                            "For ui_visual_specialist only: standard uses Sonnet for "
+                            "ordinary design-sensitive work; advanced uses Opus and is "
+                            "reserved for novel, ambiguous, or high-impact visual decisions."
+                        ),
                     },
                     "source": {
                         "type": "string",

@@ -198,6 +198,28 @@ def _path_arg_is_safe(arg: str) -> bool:
     return ".." not in PurePosixPath(value.replace("\\", "/")).parts
 
 
+def _strip_package_manager_workdir_args(
+    tail: list[str],
+) -> tuple[list[str] | None, str | None]:
+    """Remove supported npm/pnpm working-directory flags from ``tail``."""
+
+    remaining = list(tail)
+    while remaining:
+        flag = remaining[0]
+        if flag in {"--dir", "-C", "--prefix"}:
+            if len(remaining) < 2 or not remaining[1] or remaining[1].startswith("-"):
+                return None, f"{flag} requires a relative directory"
+            remaining = remaining[2:]
+            continue
+        if flag.startswith("--dir=") or flag.startswith("--prefix="):
+            if not flag.split("=", 1)[1]:
+                return None, f"{flag.split('=', 1)[0]} requires a relative directory"
+            remaining = remaining[1:]
+            continue
+        break
+    return remaining, None
+
+
 def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None, str | None]:
     """Parse a deliberately small set of test/check commands without a shell."""
 
@@ -228,10 +250,16 @@ def parse_read_only_verification_command(command: Any) -> tuple[list[str] | None
     elif argv == ["git", "diff", "--check"]:
         allowed = True
     elif base in {"npm", "pnpm"}:
-        tail = argv[1:]
+        tail, workdir_error = _strip_package_manager_workdir_args(argv[1:])
+        if workdir_error:
+            return None, workdir_error
+        assert tail is not None
         if tail and tail[0] == "run":
             tail = tail[1:]
-        allowed = bool(tail and _SAFE_SCRIPT_NAMES.fullmatch(tail[0]))
+        if base == "pnpm" and len(tail) >= 3 and tail[:2] == ["exec", "vitest"]:
+            allowed = tail[2] == "run"
+        else:
+            allowed = bool(tail and _SAFE_SCRIPT_NAMES.fullmatch(tail[0]))
     if not allowed:
         return None, (
             "only repository test wrappers, pytest, and npm/pnpm test, lint, "

@@ -59,6 +59,40 @@ def test_read_only_verification_parser_allows_git_diff_check():
     assert error is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pnpm --dir dashboard check",
+        "pnpm -C dashboard run type-check",
+        "pnpm --dir=dashboard test",
+        "npm --prefix dashboard run lint",
+        "npm --prefix=dashboard build",
+        "pnpm --dir dashboard exec vitest run src/routes/layout-source.test.ts",
+    ],
+)
+def test_read_only_verification_parser_allows_package_manager_workdir_forms(command):
+    argv, error = parse_read_only_verification_command(command)
+
+    assert argv == command.split()
+    assert error is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pnpm --dir dashboard exec node script.js",
+        "pnpm --dir dashboard exec vitest watch",
+        "pnpm --dir check",
+        "npm --prefix --help test",
+    ],
+)
+def test_read_only_verification_parser_rejects_unsafe_package_manager_forms(command):
+    argv, error = parse_read_only_verification_command(command)
+
+    assert argv is None
+    assert error
+
+
 def test_read_only_verification_parser_rejects_main_parent_pseudo_command():
     argv, error = parse_read_only_verification_command("verify-main-parent")
 

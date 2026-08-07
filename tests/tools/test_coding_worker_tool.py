@@ -1701,7 +1701,7 @@ def test_ui_specialist_route_uses_normal_codex_backend_and_skills(monkeypatch, t
     ]
 
 
-def test_automatic_visual_route_injects_opus_advisor_guidance(monkeypatch, tmp_path):
+def test_automatic_visual_route_injects_standard_advisor_guidance(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -1720,7 +1720,7 @@ def test_automatic_visual_route_injects_opus_advisor_guidance(monkeypatch, tmp_p
             {
                 "advisor_invoked": True,
                 "advisor_status": "completed",
-                "advisor_model": "claude-opus-5",
+                "advisor_model": "claude-sonnet-5",
                 "advisor_cached": False,
             },
         )
@@ -1738,9 +1738,10 @@ def test_automatic_visual_route_injects_opus_advisor_guidance(monkeypatch, tmp_p
     assert len(calls) == 1
     assert result["ui_work_route"]["selected_route"] == "ui_visual_specialist"
     assert result["ui_work_route"]["route_decision_source"] == "deterministic_explicit_visual"
-    assert result["ui_work_route"]["advisor_model"] == "claude-opus-5"
+    assert result["ui_work_route"]["advisor_model"] == "claude-sonnet-5"
+    assert result["ui_work_route"]["visual_advisor_tier"] == "standard"
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
-    assert "Opus visual advisor guidance" in prompt
+    assert "Visual advisor guidance" in prompt
     assert "strong information hierarchy" in prompt
 
 
@@ -1750,10 +1751,6 @@ def test_ui_visual_advisor_helper_caches_same_turn_result(monkeypatch, tmp_path)
     parent = _parent(tmp_path)
     parent._current_turn_id = "turn-visual-1"
     calls = []
-    monkeypatch.setattr(
-        "hermes_cli.opus_planner._anthropic_budget_preflight_error",
-        lambda: "",
-    )
 
     def fake_delegate_task(**kwargs):
         calls.append(kwargs)
@@ -1763,7 +1760,7 @@ def test_ui_visual_advisor_helper_caches_same_turn_result(monkeypatch, tmp_path)
                     {
                         "status": "completed",
                         "summary": "Keep the layout calm and align controls to one grid.",
-                        "model": "claude-opus-5",
+                        "model": "claude-sonnet-5",
                         "handoff": {"handoff_id": "handoff_visual_1"},
                     }
                 ]
@@ -1798,13 +1795,55 @@ def test_ui_visual_advisor_helper_caches_same_turn_result(monkeypatch, tmp_path)
     assert second_metadata["advisor_cached"] is True
 
 
-def test_ui_visual_advisor_failure_is_fail_open(monkeypatch, tmp_path):
+def test_ui_visual_advisor_advanced_tier_uses_opus_purpose(monkeypatch, tmp_path):
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     parent = _parent(tmp_path)
+    calls = []
     monkeypatch.setattr(
         "hermes_cli.opus_planner._anthropic_budget_preflight_error",
         lambda: "",
     )
+
+    def fake_delegate_task(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "results": [
+                    {
+                        "status": "completed",
+                        "summary": "Use the new hierarchy deliberately.",
+                        "model": "claude-opus-5",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", fake_delegate_task)
+
+    guidance, metadata = _REAL_UI_VISUAL_ADVISOR(
+        loaded_config=cfg,
+        ui_route=SimpleNamespace(
+            selected_route="ui_visual_specialist",
+            launch_worker=True,
+            visual_advisor_tier="advanced",
+        ),
+        task="Design a novel high-impact workspace hierarchy.",
+        context="",
+        workdir=str(tmp_path),
+        relevant_files=None,
+        approach=None,
+        constraints=None,
+        parent_agent=parent,
+    )
+
+    assert guidance == "Use the new hierarchy deliberately."
+    assert metadata["advisor_model"] == "claude-opus-5"
+    assert calls[0]["purpose"] == "visual_advisor_advanced"
+
+
+def test_ui_visual_advisor_failure_is_fail_open(monkeypatch, tmp_path):
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    parent = _parent(tmp_path)
     monkeypatch.setattr(
         "tools.delegate_tool.delegate_task",
         lambda **kwargs: json.dumps(
@@ -1813,7 +1852,7 @@ def test_ui_visual_advisor_failure_is_fail_open(monkeypatch, tmp_path):
                     {
                         "status": "failed",
                         "exit_reason": "provider_failure",
-                        "model": "claude-opus-5",
+                        "model": "claude-sonnet-5",
                     }
                 ]
             }
@@ -1856,6 +1895,7 @@ def test_ui_visual_advisor_skips_known_opus_budget_exhaustion(monkeypatch, tmp_p
         ui_route=SimpleNamespace(
             selected_route="ui_visual_specialist",
             launch_worker=True,
+            visual_advisor_tier="advanced",
         ),
         task="Polish responsive dashboard spacing.",
         context="",
