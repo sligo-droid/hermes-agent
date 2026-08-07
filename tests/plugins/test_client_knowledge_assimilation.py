@@ -399,13 +399,15 @@ def test_high_impact_and_unsafe_projection_metadata_fail_closed(tmp_path):
 
     op["honcho_projection"] = "eligible"
     op["final_markdown"] = _canonical_markdown(op, project_key="pid")
-    with pytest.raises(AssimilationFailure, match="projection_policy_invalid"):
-        validate_proposal(
-            _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
-            project_key="pid", notion_ref="notion:page:new", current_pages={},
-            interpretation=_interpretation(op["claim"]), source_root=tmp_path,
-            max_output_bytes=500_000,
-        )
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=_interpretation(op["claim"]), source_root=tmp_path,
+        max_output_bytes=500_000,
+    )
+    assert review is True
+    assert reason == "finding_grounding_mismatch"
+    assert parsed["operations"][0]["honcho_projection"] == "ineligible"
 
 
 def test_confirmation_requires_persisted_finding_and_host_preserves_timeline(tmp_path):
@@ -511,6 +513,32 @@ def test_operation_status_is_host_normalized_for_review(
     assert rendered["status"] == host_status
     if host_status in {"disputed", "tentative"}:
         assert rendered["honcho_projection"] == "ineligible"
+    assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("impact", "high"),
+    ("sensitivity", "confidential"),
+    ("sensitivity", "restricted"),
+])
+def test_projection_ineligibility_is_host_normalized_for_review(tmp_path, field, value):
+    op = _operation("add")
+    op[field] = value
+    op["honcho_projection"] = "eligible"
+    op["final_markdown"] = _canonical_markdown(op, project_key="pid")
+    interpretation = _interpretation(op["claim"])
+    if field == "sensitivity":
+        interpretation["requirements"][0]["sensitivity"] = value
+    parsed, review, reason = validate_proposal(
+        _proposal(op), artifact_id="a" * 64, interpretation_id="b" * 64,
+        project_key="pid", notion_ref="notion:page:new", current_pages={},
+        interpretation=interpretation, source_root=tmp_path,
+        max_output_bytes=500_000,
+    )
+    rendered = parsed["operations"][0]
+    assert review is True
+    assert reason == "finding_grounding_mismatch"
+    assert rendered["honcho_projection"] == "ineligible"
     assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
 
 

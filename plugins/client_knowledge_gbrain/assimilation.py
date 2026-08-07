@@ -553,7 +553,8 @@ def validate_proposal(
             or item["sensitivity"] in {"confidential", "restricted"}
             or item["status"] in {"tentative", "disputed", "superseded", "archived"}
         ) and item["honcho_projection"] != "ineligible":
-            raise AssimilationFailure("assimilation_projection_policy_invalid")
+            finding_grounding_mismatch = True
+            item["honcho_projection"] = "ineligible"
         if operation == "confirm" and existing:
             model_item = dict(item)
             _render_confirmation(item, existing, notion_ref, project_key=project_key)
