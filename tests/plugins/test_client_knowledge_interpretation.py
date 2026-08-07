@@ -144,6 +144,37 @@ def test_evidence_mismatch_retries_without_persistence(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM interpretations").fetchone()[0] == 0
 
 
+def test_unused_valid_evidence_is_discarded_deterministically(tmp_path):
+    store, derived, _artifact, claim = _prepared(tmp_path)
+    _artifact, extraction_row = store.get_extraction_for_interpretation_claim(claim)
+    extraction = derived.read_json(
+        "extractions", extraction_row["extraction_id"],
+        extraction_row["output_sha256"], extraction_row["output_bytes"],
+    )
+    parsed = _valid(extraction)
+    body = next(item for item in extraction["segments"] if item["kind"] == "body_plain")
+    parsed["evidence"].append({
+        "id": "evidence-002",
+        "segment_id": body["segment_id"],
+        "start": 0,
+        "end": len(body["text"]),
+        "quote": body["text"],
+    })
+    interpretation_id = InterpretationWorker(
+        store, derived, _FakeLlm(parsed),
+        InterpretationSettings.from_config(
+            {"client_knowledge": {"interpretation": {"enabled": True}}}
+        ),
+    ).process_claim(claim)
+    row = store.get_interpretation(interpretation_id)
+    persisted = derived.read_json(
+        "interpretations", interpretation_id, row["output_sha256"], row["output_bytes"]
+    )
+    assert [item["id"] for item in persisted["interpretation"]["evidence"]] == [
+        "evidence-001"
+    ]
+
+
 def test_route_drift_is_retryable_and_static_route_error_is_operator_blocked(tmp_path):
     from plugins.client_knowledge_gbrain.interpretation import InterpretationFailure
 
