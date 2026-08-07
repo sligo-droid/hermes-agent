@@ -7098,6 +7098,24 @@ class _GatewayRunnerCore(
         ack_ts[session_key] = now
         return True
 
+    async def _rollback_unused_discord_feature_summary(self, event: MessageEvent) -> None:
+        """Remove a summary created for input consumed by the active turn."""
+        if not getattr(event, "_discord_promotion_created_feature_summary", False):
+            return
+        adapter = self._adapter_for_source(event.source)
+        rollback = getattr(adapter, "rollback_promoted_action_request", None)
+        if not callable(rollback):
+            return
+        try:
+            result = rollback(event)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug(
+                "Failed to roll back unused Discord feature summary",
+                exc_info=True,
+            )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -7301,6 +7319,8 @@ class _GatewayRunnerCore(
             )
             if steer_outcome != "accepted":
                 effective_mode = "queue"
+            else:
+                await self._rollback_unused_discord_feature_summary(event)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -16788,15 +16808,17 @@ class _GatewayRunnerCore(
                     )
                 _update_prompts.pop(_quick_key, None)
 
-        # Intercept messages that are responses to a pending clarify
-        # request that is awaiting free-form text (either an open-ended
-        # clarify with no choices, or one where the user picked the
-        # "Other" button).  The first non-empty user message in the
-        # session resolves the clarify and unblocks the agent thread —
-        # we do NOT route it to the agent as a new turn.
+        # Intercept typed responses to any pending clarify request. This
+        # covers open-ended prompts, "Other" free-form replies, numeric
+        # choices, and natural replies such as "option 1". The response
+        # resolves the clarify and unblocks the agent thread; it must not
+        # also become a new turn or live steer.
         try:
             from tools import clarify_gateway as _clarify_mod
-            _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key)
+            _pending_clarify = _clarify_mod.get_pending_for_session(
+                _quick_key,
+                include_choice_prompts=True,
+            )
         except Exception:
             _pending_clarify = None
         if _pending_clarify is not None:
@@ -16806,8 +16828,9 @@ class _GatewayRunnerCore(
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_gateway_clarify(
-                    _pending_clarify.clarify_id, _raw_clarify_reply,
+                _resolved = _clarify_mod.resolve_text_response_for_session(
+                    _quick_key,
+                    _raw_clarify_reply,
                 )
                 if _resolved:
                     logger.info(
@@ -16822,6 +16845,22 @@ class _GatewayRunnerCore(
                     # long-running heartbeat fires (three minutes by default).
                     _clarify_adapter = self._adapter_for_source(source)
                     if _clarify_adapter:
+                        try:
+                            finalize = getattr(
+                                _clarify_adapter,
+                                "finalize_clarify_prompt",
+                                None,
+                            )
+                            if callable(finalize):
+                                finalized = finalize(_pending_clarify.clarify_id)
+                                if inspect.isawaitable(finalized):
+                                    await finalized
+                        except Exception:
+                            logger.debug(
+                                "Failed to finalize clarify prompt after text response",
+                                exc_info=True,
+                            )
+                        await self._rollback_unused_discord_feature_summary(event)
                         try:
                             _clarify_adapter.resume_typing_for_chat(source.chat_id)
                         except Exception:
@@ -17310,6 +17349,7 @@ class _GatewayRunnerCore(
                     running_agent=running_agent,
                 )
                 if steer_outcome == "accepted":
+                    await self._rollback_unused_discord_feature_summary(event)
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     if (
                         os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"

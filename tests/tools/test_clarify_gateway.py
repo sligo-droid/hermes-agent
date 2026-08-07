@@ -81,6 +81,14 @@ class TestClarifyPrimitive:
         assert cm.resolve_text_response_for_session("sk3c", "2") is True
         assert cm.wait_for_response("id3c", timeout=0.1) == "Y"
 
+    def test_resolve_text_response_maps_option_number(self):
+        """Natural typed replies such as 'option 1' map to the canonical choice."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id3option", "sk3option", "Pick", ["X", "Y"])
+        assert cm.resolve_text_response_for_session("sk3option", "option 1") is True
+        assert cm.wait_for_response("id3option", timeout=0.1) == "X"
+
     def test_resolve_text_response_accepts_custom_other_text(self):
         """Arbitrary typed text should resolve as a custom Other answer."""
         from tools import clarify_gateway as cm

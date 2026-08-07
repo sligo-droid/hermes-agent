@@ -191,8 +191,11 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> str:
     """Map typed choice replies to canonical choice text, otherwise keep custom text."""
     text = str(response).strip()
     if entry.choices:
+        numeric_text = text
+        if text.casefold().startswith("option "):
+            numeric_text = text[7:].strip()
         try:
-            idx = int(text) - 1
+            idx = int(numeric_text) - 1
         except ValueError:
             idx = -1
         if 0 <= idx < len(entry.choices):

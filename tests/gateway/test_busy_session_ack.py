@@ -115,6 +115,69 @@ class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
     @pytest.mark.asyncio
+    async def test_typed_choice_resolves_pending_clarify_and_removes_new_summary(self):
+        """A typed choice is prompt input, not a new busy-session turn."""
+        from gateway.run import GatewayRunner
+        from tools import clarify_gateway as cm
+
+        _clear = cm.clear_session
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+            thread_id="thread-1",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="option 1",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="choice-message",
+        )
+        event._discord_promotion_created_feature_summary = True
+        session_key = build_session_key(source)
+        _clear(session_key)
+        cm.register("clarify-1", session_key, "Pick", ["First", "Second"])
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter("discord")
+        adapter.finalize_clarify_prompt = AsyncMock(return_value=True)
+        adapter.rollback_promoted_action_request = AsyncMock()
+        adapter.resume_typing_for_chat = MagicMock()
+        runner.adapters[source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result == ""
+        assert cm.wait_for_response("clarify-1", timeout=0.1) == "First"
+        adapter.finalize_clarify_prompt.assert_awaited_once_with("clarify-1")
+        adapter.rollback_promoted_action_request.assert_awaited_once_with(event)
+        adapter.resume_typing_for_chat.assert_called_once_with("thread-1")
+
+    @pytest.mark.asyncio
+    async def test_successful_steer_removes_unused_discord_summary(self, monkeypatch):
+        """Steering joins the active turn and must not leave a second summary card."""
+        import gateway.run as _gr
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter("discord")
+        adapter.rollback_promoted_action_request = AsyncMock()
+        event = _make_event(text="also do this", platform_val="discord")
+        event._discord_promotion_created_feature_summary = True
+        session_key = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[session_key] = agent
+
+        await runner._handle_active_session_busy_message(event, session_key)
+
+        adapter.rollback_promoted_action_request.assert_awaited_once_with(event)
+
+    @pytest.mark.asyncio
     async def test_handle_message_queue_mode_queues_without_interrupt(self):
         """Runner queue mode must not interrupt an active agent for text follow-ups."""
         from gateway.run import GatewayRunner

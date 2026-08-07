@@ -72,7 +72,7 @@ def _make_interaction(*, user_id="42", display_name="Tester", roles=None,
         embed = MagicMock()
         embed.color = None
         embed.set_footer = MagicMock()
-        message = SimpleNamespace(embeds=[embed])
+        message = SimpleNamespace(embeds=[embed], edit=AsyncMock())
     else:
         message = None
     return SimpleNamespace(user=user, response=response, message=message)
@@ -232,8 +232,9 @@ class TestClarifyChoiceResolve:
         assert entry.event.is_set()
         # Buttons disabled
         assert all(b.disabled for b in view.children)
-        # Embed updated + edit_message called
-        interaction.response.edit_message.assert_called_once()
+        # Interaction acknowledged immediately, then the source message edited.
+        interaction.response.defer.assert_awaited_once()
+        interaction.message.edit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_choice_falls_back_to_label_text_when_entry_missing(self):
@@ -270,6 +271,7 @@ class TestClarifyChoiceResolve:
         assert kwargs.get("ephemeral") is True
         # No resolve was called
         interaction.response.edit_message.assert_not_called()
+        interaction.response.defer.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_rejected(self):
@@ -334,7 +336,8 @@ class TestClarifyOtherButton:
         # View locked + buttons disabled
         assert view.resolved is True
         assert all(b.disabled for b in view.children)
-        interaction.response.edit_message.assert_called_once()
+        interaction.response.defer.assert_awaited_once()
+        interaction.message.edit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_other_unauthorized_user_rejected(self):
@@ -372,6 +375,29 @@ class TestClarifyTimeout:
         assert view.resolved is True
         assert all(button.disabled for button in view.children)
         message.edit.assert_awaited_once_with(view=view)
+
+    @pytest.mark.asyncio
+    async def test_typed_response_disables_visible_buttons_and_cleans_registry(self):
+        adapter = _make_adapter(allowed_users={"42"})
+        view = ClarifyChoiceView(
+            choices=["apple"],
+            clarify_id="cidTyped",
+            allowed_user_ids={"42"},
+            on_finished=adapter._forget_clarify_view,
+        )
+        embed = MagicMock()
+        message = SimpleNamespace(embeds=[embed], edit=AsyncMock())
+        view._message = message
+        adapter._clarify_views["cidTyped"] = view
+
+        resolved = await adapter.finalize_clarify_prompt("cidTyped")
+
+        assert resolved is True
+        assert view.resolved is True
+        assert all(button.disabled for button in view.children)
+        assert "cidTyped" not in adapter._clarify_views
+        embed.set_footer.assert_called_once_with(text="Answered via typed response")
+        message.edit.assert_awaited_once_with(embed=embed, view=view)
 
 
 # ===========================================================================
@@ -411,6 +437,7 @@ class TestDiscordSendClarify:
         assert isinstance(kwargs["view"], ClarifyChoiceView)
         # 3 choice buttons + 1 Other
         assert len(kwargs["view"].children) == 4
+        assert adapter._clarify_views["cidM"] is kwargs["view"]
 
     @pytest.mark.asyncio
     async def test_open_ended_omits_view(self):

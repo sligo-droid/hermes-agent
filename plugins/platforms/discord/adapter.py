@@ -1170,6 +1170,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._typing_ready: Dict[str, asyncio.Future[None]] = {}
         self._typing_aliases: Dict[str, set[str]] = {}
+        self._clarify_views: Dict[str, Any] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
         self._thread_backfill_task: Optional[asyncio.Task] = None
@@ -13461,6 +13462,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
                     allowed_role_ids=self._allowed_role_ids,
+                    on_finished=self._forget_clarify_view,
                 )
             else:
                 embed.add_field(
@@ -13484,10 +13486,21 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
+                self._clarify_views[clarify_id] = view
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
+
+    def _forget_clarify_view(self, clarify_id: str) -> None:
+        self._clarify_views.pop(str(clarify_id or ""), None)
+
+    async def finalize_clarify_prompt(self, clarify_id: str) -> bool:
+        """Disable a Discord clarify view resolved through typed text."""
+        view = self._clarify_views.pop(str(clarify_id or ""), None)
+        if view is None:
+            return False
+        return bool(await view.finalize_from_text())
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
@@ -14415,6 +14428,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         project_summary_handle = None
         feature_summary_handle = None
+        created_feature_summary_handle = False
         if (
             is_parent_channel_message
             and mention_prefix
@@ -14439,6 +14453,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 transcript_quote=voice_action_transcript if message_is_voice else None,
                 source_message_id=str(message.id),
             )
+            created_feature_summary_handle = feature_summary_handle is not None
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         elif (
             is_thread
@@ -14461,6 +14476,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     source_message_id=str(message.id),
                     reply_to_message=message,
                 )
+                created_feature_summary_handle = feature_summary_handle is not None
                 self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         elif (
             is_thread
@@ -14484,6 +14500,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     source_message_id=str(message.id),
                     reply_to_message=message,
                 )
+                created_feature_summary_handle = feature_summary_handle is not None
                 self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         elif is_thread and isinstance(existing_feature_summary_handle, dict):
             feature_summary_handle = existing_feature_summary_handle
@@ -14701,6 +14718,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_message_id=str(message.id),
                 reply_to_message=None if auto_threaded_channel is not None else message,
             )
+            created_feature_summary_handle = feature_summary_handle is not None
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         # ── History backfill ─────────────────────────────────────────
         # When require_mention is active, the bot only processes messages
@@ -14848,6 +14866,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             ),
         )
+        event._discord_promotion_created_feature_summary = created_feature_summary_handle
 
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
@@ -15899,12 +15918,14 @@ def _define_discord_view_classes() -> None:
             clarify_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            on_finished: Optional[Callable[[str], None]] = None,
         ):
             super().__init__(timeout=_read_discord_clarify_timeout())
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self._on_finished = on_finished
             self.resolved = False
 
             for index, choice in enumerate(self.choices):
@@ -15976,6 +15997,93 @@ def _define_discord_view_classes() -> None:
                 await self._resolve_choice(interaction, index, choice)
             return _callback
 
+        def _finish(self) -> None:
+            callback = self._on_finished
+            self._on_finished = None
+            if callback is not None:
+                try:
+                    callback(self.clarify_id)
+                except Exception:
+                    logger.debug(
+                        "Discord clarify cleanup callback failed for %s",
+                        self.clarify_id,
+                        exc_info=True,
+                    )
+
+        def _disable(self) -> None:
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+
+        async def _acknowledge_and_edit(
+            self,
+            interaction: "discord.Interaction",
+            *,
+            embed: Any,
+        ) -> None:
+            started = time.perf_counter()
+            logger.info(
+                "Discord clarify interaction received (id=%s, user=%s)",
+                self.clarify_id,
+                getattr(getattr(interaction, "user", None), "display_name", "?"),
+            )
+            try:
+                await interaction.response.defer()
+            except Exception:
+                logger.debug(
+                    "Discord clarify defer failed for %s",
+                    self.clarify_id,
+                    exc_info=True,
+                )
+                try:
+                    await interaction.response.edit_message(embed=embed, view=self)
+                except Exception:
+                    logger.warning(
+                        "Discord clarify interaction acknowledgement failed for %s",
+                        self.clarify_id,
+                        exc_info=True,
+                    )
+                return
+            logger.info(
+                "Discord clarify interaction acknowledged (id=%s, latency_ms=%d)",
+                self.clarify_id,
+                int((time.perf_counter() - started) * 1000),
+            )
+            message = getattr(interaction, "message", None)
+            edit = getattr(message, "edit", None)
+            if callable(edit):
+                try:
+                    await edit(embed=embed, view=self)
+                except Exception:
+                    logger.debug(
+                        "Discord clarify message edit failed for %s",
+                        self.clarify_id,
+                        exc_info=True,
+                    )
+
+        async def finalize_from_text(self) -> bool:
+            """Disable this view after the gateway accepted a typed answer."""
+            if self.resolved:
+                self._finish()
+                return False
+            self._disable()
+            message = getattr(self, "_message", None)
+            if message is not None:
+                embed = message.embeds[0] if getattr(message, "embeds", None) else None
+                if embed:
+                    embed.color = discord.Color.green()
+                    embed.set_footer(text="Answered via typed response")
+                try:
+                    await message.edit(embed=embed, view=self)
+                except Exception:
+                    logger.debug(
+                        "Discord clarify typed-response edit failed for %s",
+                        self.clarify_id,
+                        exc_info=True,
+                    )
+            self._finish()
+            return True
+
         async def _resolve_choice(
             self,
             interaction: "discord.Interaction",
@@ -15994,9 +16102,7 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
+            self._disable()
 
             embed = interaction.message.embeds[0] if (
                 interaction.message and interaction.message.embeds
@@ -16007,18 +16113,7 @@ def _define_discord_view_classes() -> None:
                 embed.color = discord.Color.green()
                 embed.set_footer(text=f"Answered by {display_name}: {choice}")
 
-            try:
-                await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
-                logger.debug(
-                    "Discord clarify edit_message failed for %s",
-                    self.clarify_id,
-                    exc_info=True,
-                )
-                try:
-                    await interaction.response.defer()
-                except Exception:
-                    pass
+            await self._acknowledge_and_edit(interaction, embed=embed)
 
             # Resolve via the gateway clarify primitive — same mechanism as
             # Telegram. Look up the canonical choice text from the entry so
@@ -16048,6 +16143,8 @@ def _define_discord_view_classes() -> None:
                     "Discord clarify resolve_gateway_clarify failed (id=%s): %s",
                     self.clarify_id, exc,
                 )
+            finally:
+                self._finish()
 
         async def _on_other(self, interaction: "discord.Interaction") -> None:
             """Flip the clarify entry into text-capture mode."""
@@ -16074,9 +16171,7 @@ def _define_discord_view_classes() -> None:
                     self.clarify_id, exc,
                 )
 
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
+            self._disable()
 
             embed = interaction.message.embeds[0] if (
                 interaction.message and interaction.message.embeds
@@ -16089,18 +16184,11 @@ def _define_discord_view_classes() -> None:
                     text=f"Awaiting typed response from {display_name}…",
                 )
 
-            try:
-                await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
-                try:
-                    await interaction.response.defer()
-                except Exception:
-                    pass
+            await self._acknowledge_and_edit(interaction, embed=embed)
+            self._finish()
 
         async def on_timeout(self):
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
+            self._disable()
             message = getattr(self, "_message", None)
             if message is not None:
                 try:
@@ -16111,6 +16199,7 @@ def _define_discord_view_classes() -> None:
                         self.clarify_id,
                         exc_info=True,
                     )
+            self._finish()
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 
