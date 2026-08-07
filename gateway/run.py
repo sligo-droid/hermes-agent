@@ -7116,6 +7116,20 @@ class _GatewayRunnerCore(
                 exc_info=True,
             )
 
+    def _mark_discord_work_consumed(self, event: MessageEvent, *, reason: str) -> None:
+        """Prevent active-turn input from replaying as independent work."""
+        work_item_id = str(getattr(event, "work_item_id", None) or "").strip()
+        if not work_item_id:
+            return
+        try:
+            self._ledger().mark_consumed(work_item_id, reason=reason)
+        except Exception:
+            logger.debug(
+                "Failed to terminalize consumed Discord work item %s",
+                work_item_id,
+                exc_info=True,
+            )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -7311,6 +7325,12 @@ class _GatewayRunnerCore(
                 session_key,
                 event,
             )
+            if start_followup_accepted:
+                await self._rollback_unused_discord_feature_summary(event)
+                self._mark_discord_work_consumed(
+                    event,
+                    reason="startup_followup",
+                )
         if effective_mode == "steer":
             steer_outcome = self._try_steer_busy_event(
                 event,
@@ -7321,6 +7341,7 @@ class _GatewayRunnerCore(
                 effective_mode = "queue"
             else:
                 await self._rollback_unused_discord_feature_summary(event)
+                self._mark_discord_work_consumed(event, reason="accepted_steer")
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -16844,6 +16865,11 @@ class _GatewayRunnerCore(
                     # Without this, Slack stays silent until the independent
                     # long-running heartbeat fires (three minutes by default).
                     _clarify_adapter = self._adapter_for_source(source)
+                    await self._rollback_unused_discord_feature_summary(event)
+                    self._mark_discord_work_consumed(
+                        event,
+                        reason="clarify_response",
+                    )
                     if _clarify_adapter:
                         try:
                             finalize = getattr(
@@ -16860,7 +16886,6 @@ class _GatewayRunnerCore(
                                 "Failed to finalize clarify prompt after text response",
                                 exc_info=True,
                             )
-                        await self._rollback_unused_discord_feature_summary(event)
                         try:
                             _clarify_adapter.resume_typing_for_chat(source.chat_id)
                         except Exception:
@@ -17110,6 +17135,11 @@ class _GatewayRunnerCore(
                         message_type=MessageType.TEXT,
                     )
                     if self._stage_start_user_followup(_quick_key, staged_event):
+                        await self._rollback_unused_discord_feature_summary(event)
+                        self._mark_discord_work_consumed(
+                            event,
+                            reason="startup_followup",
+                        )
                         return "⏩ Folded into the turn that is starting."
                     self._queue_or_replace_pending_event(_quick_key, staged_event)
                     return "Agent startup intake closed — queued for the immediate next turn."
@@ -17126,6 +17156,11 @@ class _GatewayRunnerCore(
                         self._queue_or_replace_pending_event(_quick_key, queued_event)
                         return "Live steering failed — queued for the immediate next turn."
                     if accepted:
+                        await self._rollback_unused_discord_feature_summary(event)
+                        self._mark_discord_work_consumed(
+                            event,
+                            reason="accepted_steer",
+                        )
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return (
                             "⏩ Steered into the current run; it will apply at the "
@@ -17312,6 +17347,11 @@ class _GatewayRunnerCore(
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 if self._busy_input_mode in {"steer", "interrupt"}:
                     if self._stage_start_user_followup(_quick_key, event):
+                        await self._rollback_unused_discord_feature_summary(event)
+                        self._mark_discord_work_consumed(
+                            event,
+                            reason="startup_followup",
+                        )
                         return None
                 # Queue the message so it will be picked up after the agent starts.
                 adapter = self._adapter_for_source(source)
@@ -17350,6 +17390,7 @@ class _GatewayRunnerCore(
                 )
                 if steer_outcome == "accepted":
                     await self._rollback_unused_discord_feature_summary(event)
+                    self._mark_discord_work_consumed(event, reason="accepted_steer")
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     if (
                         os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"

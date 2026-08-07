@@ -232,6 +232,7 @@ class TestClarifyChoiceResolve:
         assert entry.event.is_set()
         # Buttons disabled
         assert all(b.disabled for b in view.children)
+        assert view.is_finished() is True
         # Interaction acknowledged immediately, then the source message edited.
         interaction.response.defer.assert_awaited_once()
         interaction.message.edit.assert_awaited_once()
@@ -253,6 +254,26 @@ class TestClarifyChoiceResolve:
         # Still marks the view resolved + disables buttons
         assert view.resolved is True
         assert all(b.disabled for b in view.children)
+        assert view.is_finished() is True
+
+    @pytest.mark.asyncio
+    async def test_late_button_cannot_overwrite_typed_response(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("cidTypedWinner", "sk-typed-winner", "Pick", ["alpha", "beta"])
+        assert cm.resolve_text_response_for_session("sk-typed-winner", "1") is True
+        view = ClarifyChoiceView(
+            choices=["alpha", "beta"],
+            clarify_id="cidTypedWinner",
+            allowed_user_ids={"42"},
+        )
+        interaction = _make_interaction()
+
+        await view._resolve_choice(interaction, index=1, choice="beta")
+
+        interaction.response.send_message.assert_awaited_once()
+        interaction.response.defer.assert_not_awaited()
+        assert cm.wait_for_response("cidTypedWinner", timeout=0.1) == "alpha"
 
     @pytest.mark.asyncio
     async def test_already_resolved_sends_ephemeral_reply(self):
@@ -374,6 +395,7 @@ class TestClarifyTimeout:
 
         assert view.resolved is True
         assert all(button.disabled for button in view.children)
+        assert view.is_finished() is True
         message.edit.assert_awaited_once_with(view=view)
 
     @pytest.mark.asyncio
@@ -395,6 +417,7 @@ class TestClarifyTimeout:
         assert resolved is True
         assert view.resolved is True
         assert all(button.disabled for button in view.children)
+        assert view.is_finished() is True
         assert "cidTyped" not in adapter._clarify_views
         embed.set_footer.assert_called_once_with(text="Answered via typed response")
         message.edit.assert_awaited_once_with(embed=embed, view=view)

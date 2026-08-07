@@ -132,6 +132,24 @@ class TestClarifyPrimitive:
 
         assert cm.resolve_gateway_clarify("nope", "anything") is False
 
+    def test_first_response_wins_atomically(self):
+        """A late button or typed reply cannot overwrite the accepted answer."""
+        from tools import clarify_gateway as cm
+
+        cm.register("single-winner", "single-winner-session", "Pick", ["A", "B"])
+
+        assert cm.resolve_gateway_clarify("single-winner", "A") is True
+        assert cm.resolve_gateway_clarify("single-winner", "B") is False
+        assert cm.wait_for_response("single-winner", timeout=0.1) == "A"
+
+    def test_other_cannot_reopen_resolved_prompt(self):
+        """The Other button must not revive an already-resolved prompt."""
+        from tools import clarify_gateway as cm
+
+        cm.register("resolved-other", "resolved-other-session", "Pick", ["A"])
+        assert cm.resolve_gateway_clarify("resolved-other", "A") is True
+        assert cm.mark_awaiting_text("resolved-other") is False
+
     def test_resolve_after_wait_completes_is_noop(self):
         """A late resolve on a finished entry doesn't blow up."""
         from tools import clarify_gateway as cm

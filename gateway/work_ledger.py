@@ -5242,6 +5242,29 @@ class GatewayWorkLedger:
         return True
 
     @_locked_ledger_mutation
+    def mark_consumed(self, work_id: str, *, reason: str) -> bool:
+        """Terminalize input absorbed by an already-running agent turn."""
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("status") or "") in TERMINAL_STATUSES:
+            return True
+        now = self._now()
+        item["status"] = "completed"
+        item["updated_at"] = now
+        item["consumed_at"] = now
+        item["consumed_reason"] = str(reason or "active_turn")[:120]
+        item["active_run"] = None
+        item.pop("claim_pid", None)
+        item["lease_until"] = None
+        item["terminal_reaction_state"] = "done"
+        item["terminal_reaction_sync_pending"] = True
+        _record_provider_progress(item, "ledger_status_consumed", status="completed")
+        self._write(data)
+        return True
+
+    @_locked_ledger_mutation
     def mark_blocked(self, work_id: str, *, reason: str | None = None) -> bool:
         data = self._read()
         item = data["items"].get(work_id)
