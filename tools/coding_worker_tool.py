@@ -4772,10 +4772,10 @@ def _delegate_coding_task_dispatch(
             loaded_config=loaded_config,
         )
     if _parallel_group is None:
-        return _delegate_coding_task_impl(**call_kwargs)
+        return _run_isolated_coding_worker(call_kwargs)
 
     if not is_coding_worker_parallel_enabled():
-        payload = json.loads(_delegate_coding_task_impl(**call_kwargs))
+        payload = json.loads(_run_isolated_coding_worker(call_kwargs))
         payload["parallel"] = {"disabled": True}
         return json.dumps(payload, ensure_ascii=False)
 
@@ -4806,7 +4806,7 @@ def _delegate_coding_task_dispatch(
     call_kwargs["cwd"] = _resolve_cwd(cwd, parent_agent) if cwd else base_cwd
     call_kwargs["_parallel_request"] = parallel_request
     try:
-        raw_result = _delegate_coding_task_impl(**call_kwargs)
+        raw_result = _run_isolated_coding_worker(call_kwargs)
         payload = json.loads(raw_result)
     except Exception as exc:
         payload = json.loads(tool_error(f"parallel coding worker failed: {exc}"))
@@ -4831,6 +4831,24 @@ def _delegate_coding_task_dispatch(
             "worktree_kept": False,
         }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _run_isolated_coding_worker(call_kwargs: dict[str, Any]) -> str:
+    """Run one coding worker with task-local Hermes/config/env isolation."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        config = {}
+    from agent.worker_config import WorkerRuntimeEnvelope
+
+    runtime = WorkerRuntimeEnvelope.create(config)
+    try:
+        with runtime.bind():
+            return _delegate_coding_task_impl(**call_kwargs)
+    finally:
+        runtime.cleanup()
 
 
 def delegate_coding_task(

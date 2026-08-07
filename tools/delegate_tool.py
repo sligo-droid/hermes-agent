@@ -1812,6 +1812,16 @@ def _build_child_agent(
     child._delegate_role = effective_role
     child._delegation_read_only = bool(read_only)
     child._delegation_broker_only_mutation = bool(brokered_coding)
+    from agent.worker_config import WorkerRuntimeEnvelope
+
+    full_config = {}
+    try:
+        from hermes_cli.config import load_config
+
+        full_config = load_config() or {}
+    except Exception:
+        pass
+    child._worker_runtime_envelope = WorkerRuntimeEnvelope.create(full_config)
     child._delegate_root_agent = root_agent
     child._delegation_root_binding = copy.deepcopy(
         _delegation_binding(root_agent, workspace_hint)
@@ -2434,7 +2444,11 @@ def _run_single_child(
             )
             if child_stream_cb is not None:
                 run_kwargs["stream_callback"] = child_stream_cb
-            return child.run_conversation(**run_kwargs)
+            envelope = getattr(child, "_worker_runtime_envelope", None)
+            if envelope is None:
+                return child.run_conversation(**run_kwargs)
+            with envelope.bind():
+                return child.run_conversation(**run_kwargs)
 
         try:
             _child_future = _timeout_executor.submit(_run_with_thread_capture)
@@ -2856,6 +2870,9 @@ def _run_single_child(
                 child.close()
         except Exception:
             logger.debug("Failed to close child agent after delegation")
+        envelope = getattr(child, "_worker_runtime_envelope", None)
+        if envelope is not None:
+            envelope.cleanup()
 
 
 def _recover_tasks_from_json_string(
@@ -2922,6 +2939,9 @@ def _discard_unstarted_background_children(
                 child.close()
         except Exception:
             logger.debug("Failed to close unscheduled background child", exc_info=True)
+        envelope = getattr(child, "_worker_runtime_envelope", None)
+        if envelope is not None:
+            envelope.cleanup()
 
 
 def _execute_background_children(

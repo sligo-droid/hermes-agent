@@ -613,8 +613,8 @@ def _allowed_mentions_for_metadata(metadata: Optional[Dict[str, Any]] = None):
     return discord.AllowedMentions(
         everyone=False,
         roles=roles,
-        users=True,
-        replied_user=True,
+        users=not bool(metadata.get("strict_role_mentions")),
+        replied_user=not bool(metadata.get("strict_role_mentions")),
     )
 
 
@@ -7179,6 +7179,14 @@ class DiscordAdapter(BasePlatformAdapter):
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if metadata and metadata.get("require_single_message") and len(chunks) != 1:
+                return SendResult(
+                    success=False,
+                    error="Discord strict single-message payload exceeds the platform limit",
+                    error_kind="validation",
+                    retry_safe=True,
+                    raw_response={"side_effect_state": "proven_none"},
+                )
 
             reference = None
             metadata_embed = _discord_embed_for_metadata(metadata)
@@ -7278,10 +7286,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if plan_artifact:
                 raw_response["plan_artifact"] = plan_artifact
 
+            strict_single = bool(metadata and metadata.get("require_single_message"))
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response=raw_response,
+                raw_response=(
+                    {**raw_response, "side_effect_state": "confirmed"}
+                    if strict_single else raw_response
+                ),
                 confirmed_message_ids=tuple(message_ids),
                 retry_safe=False,
             )
@@ -7297,19 +7309,30 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             error_text = str(e)
-            retryable = bool(not message_ids and self._is_retryable_error(error_text))
+            strict_single = bool(metadata and metadata.get("require_single_message"))
+            uncertain = bool(strict_single and not message_ids)
+            retryable = bool(
+                not strict_single and not message_ids and self._is_retryable_error(error_text)
+            )
             result = SendResult(
                 success=False,
                 message_id=message_ids[0] if message_ids else None,
                 error=error_text,
                 error_kind=classify_send_error(e),
-                raw_response={"message_ids": list(message_ids)} if message_ids else None,
+                raw_response=(
+                    {
+                        "message_ids": list(message_ids),
+                        "side_effect_state": (
+                            "confirmed" if message_ids else "uncertain"
+                        ),
+                    }
+                    if strict_single
+                    else ({"message_ids": list(message_ids)} if message_ids else None)
+                ),
                 retryable=retryable,
                 confirmed_message_ids=tuple(message_ids),
-                retry_safe=bool(
-                    not message_ids
-                    and not retryable
-                    and not self._is_timeout_error(error_text)
+                retry_safe=False if uncertain else bool(
+                    not message_ids and not retryable and not self._is_timeout_error(error_text)
                 ),
             )
             await asyncio.to_thread(
@@ -16232,6 +16255,7 @@ async def _standalone_send(
     media_files: Optional[list] = None,
     force_document: bool = False,
     caption: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send via Discord REST API without a live gateway adapter.
 
@@ -16250,6 +16274,28 @@ async def _standalone_send(
     ``force_document`` is accepted for signature parity but unused — Discord
     treats every uploaded file as a generic attachment.
     """
+    strict_single = bool(metadata and metadata.get("require_single_message"))
+    raw_roles = metadata.get("allowed_role_mentions") if isinstance(metadata, dict) else None
+    roles = [str(value) for value in (raw_roles or []) if str(value).isdigit()]
+    if strict_single:
+        if thread_id or media_files or caption or len(message) > 1800 or len(roles) != 1:
+            return {
+                "error": "Discord strict review notification validation failed",
+                "side_effect_state": "proven_none",
+            }
+        role_token = f"<@&{roles[0]}>"
+        mentions = re.findall(r"<@&?(\d+)>", message)
+        if role_token not in message or mentions != [roles[0]] or "@everyone" in message or "@here" in message:
+            return {
+                "error": "Discord strict review mention validation failed",
+                "side_effect_state": "proven_none",
+            }
+    allowed_mentions = {
+        "parse": [],
+        "roles": roles,
+        "users": [],
+        "replied_user": False,
+    } if roles else None
     try:
         import aiohttp
     except ImportError:
@@ -16400,13 +16446,19 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                payload = {"content": message}
+                if allowed_mentions is not None:
+                    payload["allowed_mentions"] = allowed_mentions
+                async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await _standalone_read_text_limited(
                             resp,
                             _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                         )
-                        return {"error": f"Discord API error ({resp.status}): {body}"}
+                        return {
+                            "error": f"Discord API error ({resp.status}): {body}",
+                            "side_effect_state": "uncertain" if strict_single else "proven_none",
+                        }
                     last_data = await _standalone_read_json_limited(
                         resp,
                         _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
@@ -16475,12 +16527,24 @@ async def _standalone_send(
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        message_id = last_data.get("id")
+        if strict_single and not message_id:
+            return {
+                "error": "Discord strict send returned no message identity",
+                "side_effect_state": "uncertain",
+            }
+        result = {
+            "success": True, "platform": "discord", "chat_id": chat_id,
+            "message_id": message_id, "side_effect_state": "confirmed",
+        }
         if warnings:
             result["warnings"] = warnings
         return result
     except Exception as e:
-        return {"error": _standalone_sanitize_error(f"Discord send failed: {e}")}
+        return {
+            "error": _standalone_sanitize_error(f"Discord send failed: {e}"),
+            "side_effect_state": "uncertain" if strict_single else "proven_none",
+        }
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────

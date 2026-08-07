@@ -1,5 +1,5 @@
 name: client-knowledge-gbrain
-version: 1.3.0
+version: 1.4.0
 description: "Project-scoped client knowledge ingestion and retrieval."
 author: Sligo Labs
 kind: standalone

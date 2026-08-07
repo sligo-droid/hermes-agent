@@ -2405,6 +2405,8 @@ DEFAULT_CONFIG = {
             "source_id": "client-knowledge",
             "timeout_seconds": 30,
             "max_context_chars": 8000,
+            "source_checkout": "",
+            "source_branch": "main",
         },
     },
 

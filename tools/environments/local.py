@@ -519,6 +519,20 @@ def _bootstrap_profile_subprocess_env(
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
+        from agent.worker_config import get_worker_environment_override
+
+        worker_env = get_worker_environment_override()
+    except Exception:
+        worker_env = None
+    if worker_env is not None:
+        base_env = worker_env
+    try:
+        from agent.worker_config import get_worker_protected_paths
+
+        protected_paths = get_worker_protected_paths()
+    except Exception:
+        protected_paths = ()
+    try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
@@ -544,6 +558,11 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
+    if protected_paths:
+        for key in list(sanitized):
+            if any(path and path in str(sanitized[key]) for path in protected_paths):
+                sanitized.pop(key, None)
+
     explicit_keys = set((extra_env or {}).keys())
     explicit_keys.update(
         key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
@@ -558,6 +577,11 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(marker, None)
     _apply_windows_msys_bash_env_defaults(sanitized)
+
+    if protected_paths:
+        for key in list(sanitized):
+            if any(path and path in str(sanitized[key]) for path in protected_paths):
+                sanitized.pop(key, None)
 
     return sanitized
 
@@ -1048,7 +1072,13 @@ def _make_run_env(env: dict) -> dict:
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
 
-    merged = dict(os.environ | env)
+    try:
+        from agent.worker_config import get_worker_environment_override
+
+        base_env = get_worker_environment_override()
+    except Exception:
+        base_env = None
+    merged = dict((base_env if base_env is not None else os.environ) | env)
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
