@@ -16671,6 +16671,30 @@ class _GatewayRunnerCore(
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _dispatch_plugin_command(
+        self, event: MessageEvent, command: str
+    ) -> tuple[bool, Optional[str]]:
+        """Invoke one plugin command with a trusted post-auth task context."""
+        try:
+            from hermes_cli.plugin_command_context import bind_plugin_command_context
+            from hermes_cli.plugins import get_plugin_command_handler
+
+            canonical = str(command or "").replace("_", "-")
+            handler = get_plugin_command_handler(canonical)
+            if handler is None:
+                return False, None
+            raw_args = event.get_command_args().strip()
+            with bind_plugin_command_context(
+                event=event, canonical_command=canonical, raw_args=raw_args
+            ):
+                result = handler(raw_args)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            return True, str(result) if result else None
+        except Exception as exc:
+            logger.exception("Plugin command dispatch failed: /%s", command)
+            return True, "Plugin command failed. Check gateway logs for details."
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -17060,6 +17084,7 @@ class _GatewayRunnerCore(
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
                 ACTIVE_SESSION_BYPASS_COMMANDS as _DEDICATED_HANDLERS,
+                is_gateway_known_command as _is_known_inner,
                 resolve_command as _resolve_cmd_inner,
             )
             _evt_cmd = event.get_command()
@@ -17350,6 +17375,14 @@ class _GatewayRunnerCore(
                     f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
+
+            if _evt_cmd and _is_known_inner(_evt_cmd):
+                _denied = self._check_slash_access(source, _evt_cmd)
+                if _denied is not None:
+                    return _denied
+                handled, response = await self._dispatch_plugin_command(event, _evt_cmd)
+                if handled:
+                    return response
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -17874,20 +17907,9 @@ class _GatewayRunnerCore(
 
         # Plugin-registered slash commands
         if command:
-            try:
-                from hermes_cli.plugins import get_plugin_command_handler
-                # Normalize underscores to hyphens so Telegram's underscored
-                # autocomplete form matches plugin commands registered with
-                # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
-                    user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
-                    return str(result) if result else None
-            except Exception as e:
-                logger.debug("Plugin command dispatch failed (non-fatal): %s", e)
+            handled, result = await self._dispatch_plugin_command(event, command)
+            if handled:
+                return result
 
         # Skill slash commands: /skill-name loads the skill and sends to agent.
         # resolve_skill_command_key() handles the Telegram underscore/hyphen

@@ -1359,7 +1359,13 @@ def execute_code(
         # OS-essential allowlist (SYSTEMROOT, WINDIR, COMSPEC, ...) is also
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
-        child_env = _scrub_child_env(os.environ)
+        try:
+            from agent.worker_config import get_worker_environment_override
+
+            source_env = get_worker_environment_override()
+        except Exception:
+            source_env = None
+        child_env = _scrub_child_env(source_env if source_env is not None else os.environ)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"

@@ -303,7 +303,7 @@ def test_schema_migrates_existing_store_to_spool_storage_identity(tmp_path):
     with migrated._connect() as conn:
         assert conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "7"
+        ).fetchone()[0] == "8"
         assert "spool_storage_id" in {
             row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }
@@ -693,7 +693,7 @@ def test_external_receipts_and_cursors_are_idempotent(tmp_path):
 def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch):
     import plugins.client_knowledge_gbrain as plugin
 
-    calls = {"tools": [], "cli": [], "aux": []}
+    calls = {"tools": [], "cli": [], "commands": [], "aux": []}
 
     class Context:
         def register_tool(self, **kwargs):
@@ -702,12 +702,16 @@ def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch
         def register_cli_command(self, **kwargs):
             calls["cli"].append(kwargs["name"])
 
+        def register_command(self, **kwargs):
+            calls["commands"].append(kwargs["name"])
+
         def register_auxiliary_task(self, **kwargs):
             calls["aux"].append((kwargs["key"], kwargs["defaults"]))
 
     plugin.register(Context())
     assert calls["tools"] == ["client_knowledge_search", "client_knowledge_get"]
     assert calls["cli"] == ["client-knowledge"]
+    assert calls["commands"] == ["client-knowledge"]
     assert calls["aux"] == [
         (
             "client_knowledge_interpret",

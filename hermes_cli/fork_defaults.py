@@ -62,6 +62,28 @@ FORK_DEFAULT_ADDITIONS = {
             "max_input_chars": 600_000,
             "max_output_bytes": 1_000_000,
         },
+        "assimilation": {
+            "enabled": False,
+            "max_jobs_per_run": 10,
+            "lease_seconds": 300,
+            "retry_delay_seconds": 60,
+            "timeout_seconds": 180,
+            "max_tokens": 8192,
+            "max_input_chars": 200_000,
+            "max_output_bytes": 500_000,
+            "max_current_pages": 8,
+        },
+        "review_notifications": {
+            "enabled": False,
+        },
+        "honcho_projection": {
+            "enabled": False,
+            "max_jobs_per_run": 10,
+            "lease_seconds": 300,
+            "retry_delay_seconds": 60,
+            "observer_peer_id": "hermes",
+            "max_reconcile_pages": 500,
+        },
         "notion": {
             "enabled": False,
             "api_key_env": "NOTION_API_KEY",

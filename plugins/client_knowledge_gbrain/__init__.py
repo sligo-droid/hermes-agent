@@ -32,6 +32,16 @@ def register(ctx) -> None:
             "Operator-only queue, bounded Gmail polling, and Notion archive controls."
         ),
     )
+    from plugins.client_knowledge_gbrain.review import (
+        handle_client_knowledge_review_command,
+    )
+
+    ctx.register_command(
+        name="client-knowledge",
+        handler=handle_client_knowledge_review_command,
+        description="Approve or reject a client-knowledge review.",
+        args_hint="approve|reject <review-id> [reason]",
+    )
     ctx.register_auxiliary_task(
         key="client_knowledge_interpret",
         display_name="Client knowledge interpretation",

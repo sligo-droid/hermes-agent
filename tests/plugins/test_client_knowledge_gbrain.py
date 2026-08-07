@@ -38,6 +38,8 @@ def _frontmatter(project="pid"):
         "supersedes": [],
         "confidence": "high",
         "sensitivity": "internal",
+        "impact": "ordinary",
+        "honcho_projection": "eligible",
     }
 
 
