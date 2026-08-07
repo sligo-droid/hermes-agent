@@ -176,6 +176,7 @@ def test_client_knowledge_systemd_units_ship_disabled_in_wheel_and_sdist():
     timer = (unit_root / "hermes-client-knowledge-gmail-poll.timer").read_text(encoding="utf-8")
     assert "Type=oneshot" in service
     assert "UMask=0077" in service
+    assert "ExecStart=%h/.local/bin/hermes client-knowledge gmail-poll-once" in service
     assert "Restart=" not in service
     assert "OnUnitActiveSec=2min" in timer
     assert "WantedBy=timers.target" in timer

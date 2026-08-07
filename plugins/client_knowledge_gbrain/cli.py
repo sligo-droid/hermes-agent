@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any
 
 from .store import IntakeStore, resolve_store_path
@@ -69,6 +70,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Run bounded Notion, extraction, and interpretation stages",
     )
     run_once.add_argument("--db-path", default="")
+    run_once.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report configured stage enablement without running downstream work",
+    )
 
     gmail_poll = subs.add_parser(
         "gmail-poll-once",
@@ -128,6 +134,39 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
         print(json.dumps({"error_class": "usage"}, sort_keys=True))
         return 2
     try:
+        if action == "run-once" and bool(getattr(args, "dry_run", False)):
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+            raw = config.get("client_knowledge", {})
+            raw = raw if isinstance(raw, dict) else {}
+            stage_enablement = {}
+            for name in (
+                "notion", "extraction", "interpretation", "assimilation",
+                "review_notifications", "honcho_projection",
+            ):
+                stage_config = raw.get(name)
+                stage_enablement[name] = bool(
+                    stage_config.get("enabled", False)
+                    if isinstance(stage_config, dict)
+                    else False
+                )
+            path_arg = str(getattr(args, "db_path", "") or "").strip()
+            ledger_path = (
+                resolve_store_path()
+                if not path_arg
+                else Path(path_arg).expanduser()
+            )
+            if path_arg and not ledger_path.is_absolute():
+                raise ValueError("db_path must be absolute")
+            print(json.dumps({
+                "mode": "dry_run",
+                "downstream_writes": False,
+                "ledger_writes": False,
+                "ledger_exists": ledger_path.is_file(),
+                "stage_enablement": stage_enablement,
+            }, sort_keys=True))
+            return 0
         store = _store(getattr(args, "db_path", ""))
         if action == "status":
             print(json.dumps({"stats": store.stats()}, sort_keys=True))

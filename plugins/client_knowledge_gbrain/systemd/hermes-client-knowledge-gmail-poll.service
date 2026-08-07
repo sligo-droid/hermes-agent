@@ -5,4 +5,4 @@ After=network-online.target
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=/usr/local/bin/hermes client-knowledge gmail-poll-once
+ExecStart=%h/.local/bin/hermes client-knowledge gmail-poll-once
