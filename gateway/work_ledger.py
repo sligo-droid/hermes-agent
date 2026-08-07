@@ -16,6 +16,11 @@ from typing import Any, Mapping
 
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
 from gateway.session import Platform, SessionSource
+from gateway.work_ledger_budget import (
+    DEFAULT_LEDGER_HARD_BYTES,
+    DEFAULT_LEDGER_TARGET_BYTES,
+    enforce_ledger_budget,
+)
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 from agent.verification_evidence import (
@@ -2065,7 +2070,11 @@ class GatewayWorkLedger:
         return data
 
     def _write(self, data: dict[str, Any]) -> None:
-        self._compact_if_due(data)
+        try:
+            force_budget = self.path.stat().st_size > DEFAULT_LEDGER_HARD_BYTES
+        except OSError:
+            force_budget = False
+        self._compact_if_due(data, force_budget=force_budget)
         # The ledger is a hot recovery path, not an operator-edited config.
         # Keep the existing atomic/fsync write guarantees while avoiding the
         # whitespace and key-sorting cost on every full-file rewrite.
@@ -2128,14 +2137,22 @@ class GatewayWorkLedger:
             "tombstone_expires_at": now + _TOMBSTONE_RETENTION_SECONDS,
         }
 
-    def _compact_if_due(self, data: dict[str, Any]) -> None:
+    def _compact_if_due(
+        self,
+        data: dict[str, Any],
+        *,
+        force_budget: bool = False,
+    ) -> None:
         """Bound old terminal history without adding read-path rewrites."""
 
         now = self._now()
         previous = data.get("last_compacted_at")
         if isinstance(previous, (int, float)):
             try:
-                if now - float(previous) < _COMPACTION_INTERVAL_SECONDS:
+                if (
+                    not force_budget
+                    and now - float(previous) < _COMPACTION_INTERVAL_SECONDS
+                ):
                     return
             except (TypeError, ValueError, OverflowError):
                 pass
@@ -2166,6 +2183,15 @@ class GatewayWorkLedger:
                 and self._is_quiescent_terminal_item(item)
             ):
                 items[work_id] = self._tombstone_for(item, now=now)
+        if force_budget:
+            enforce_ledger_budget(
+                data,
+                now=now,
+                is_quiescent=self._is_quiescent_terminal_item,
+                make_tombstone=lambda item: self._tombstone_for(item, now=now),
+                target_bytes=DEFAULT_LEDGER_TARGET_BYTES,
+                hard_bytes=DEFAULT_LEDGER_HARD_BYTES,
+            )
         data["last_compacted_at"] = now
 
     @staticmethod

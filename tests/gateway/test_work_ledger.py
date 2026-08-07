@@ -310,6 +310,41 @@ def test_ledger_compaction_runs_only_after_its_bounded_cadence(tmp_path):
     assert ledger.get("old")["tombstone"] is True
 
 
+def test_ledger_hard_budget_bypasses_compaction_cadence(tmp_path, monkeypatch):
+    now = [10 * 24 * 60 * 60.0]
+    path = tmp_path / "work_ledger.json"
+    ledger = GatewayWorkLedger(path, now_fn=lambda: now[0])
+    items = {
+        f"old-{index}": {
+            "id": f"old-{index}",
+            "status": "completed",
+            "updated_at": now[0] - (3 * 60 * 60),
+            "text": "x" * 2_000,
+        }
+        for index in range(8)
+    }
+    path.write_text(
+        json.dumps(
+            {"version": 2, "last_compacted_at": now[0], "items": items},
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gateway.work_ledger.DEFAULT_LEDGER_TARGET_BYTES", 4_000)
+    monkeypatch.setattr("gateway.work_ledger.DEFAULT_LEDGER_HARD_BYTES", 8_000)
+
+    ledger.accept_event(
+        _discord_event(message_id="budget-trigger"),
+        session_key="budget-trigger",
+        freshness_seconds=60,
+    )
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert sum(
+        item.get("tombstone") is True for item in stored["items"].values()
+    ) > 0
+    assert len(path.read_bytes()) <= 4_000
+
+
 def test_ledger_uses_compact_json_serialization(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
     for index in range(4):
