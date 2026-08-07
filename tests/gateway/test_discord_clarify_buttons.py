@@ -85,6 +85,19 @@ def _make_interaction(*, user_id="42", display_name="Tester", roles=None,
 class TestClarifyChoiceViewConstruction:
     """The view should build numeric buttons plus an Other button."""
 
+    def test_view_timeout_matches_clarify_response_timeout(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 600)
+
+        view = ClarifyChoiceView(
+            choices=["apple"],
+            clarify_id="cidTimeout",
+            allowed_user_ids={"42"},
+        )
+
+        assert view.timeout == 600
+
     def test_renders_n_choice_buttons_plus_other(self):
         view = ClarifyChoiceView(
             choices=["apple", "banana", "cherry"],
@@ -341,6 +354,24 @@ class TestClarifyOtherButton:
         interaction.response.send_message.assert_called_once()
         pending = cm.get_pending_for_session("sk-E")
         assert pending is None or pending.awaiting_text is False
+
+
+class TestClarifyTimeout:
+    @pytest.mark.asyncio
+    async def test_timeout_disables_visible_buttons(self):
+        view = ClarifyChoiceView(
+            choices=["apple"],
+            clarify_id="cidExpired",
+            allowed_user_ids={"42"},
+        )
+        message = SimpleNamespace(edit=AsyncMock())
+        view._message = message
+
+        await view.on_timeout()
+
+        assert view.resolved is True
+        assert all(button.disabled for button in view.children)
+        message.edit.assert_awaited_once_with(view=view)
 
 
 # ===========================================================================

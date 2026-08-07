@@ -1049,8 +1049,8 @@ def _normalize_discord_allow_bots(value: Any) -> Optional[str]:
     return None
 
 
-# Default timeout for Discord interactive button views (exec approval, slash
-# confirm, update prompt, clarify choice). Used when the user has not set
+# Default timeout for short-lived Discord interactive button views (exec
+# approval, slash confirm, update prompt). Used when the user has not set
 # ``approvals.discord_prompt_timeout`` in config.yaml. 300s (5 min) matches
 # the previous hardcoded value. Bounded to a sane range — Discord
 # interaction tokens expire from the API's side at ~15 minutes, so 900s is
@@ -1096,6 +1096,16 @@ def _read_discord_prompt_timeout() -> int:
     if seconds > _DISCORD_PROMPT_TIMEOUT_MAX:
         return _DISCORD_PROMPT_TIMEOUT_MAX
     return seconds
+
+
+def _read_discord_clarify_timeout() -> int:
+    """Keep clarify buttons alive for the clarify request's full lifetime."""
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+
+        return max(0, get_clarify_timeout())
+    except Exception:
+        return 3600
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -15890,7 +15900,7 @@ def _define_discord_view_classes() -> None:
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
         ):
-            super().__init__(timeout=_read_discord_prompt_timeout())
+            super().__init__(timeout=_read_discord_clarify_timeout())
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
             self.allowed_user_ids = allowed_user_ids
@@ -16091,6 +16101,16 @@ def _define_discord_view_classes() -> None:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+            message = getattr(self, "_message", None)
+            if message is not None:
+                try:
+                    await message.edit(view=self)
+                except Exception:
+                    logger.debug(
+                        "Discord clarify timeout edit failed for %s",
+                        self.clarify_id,
+                        exc_info=True,
+                    )
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 
