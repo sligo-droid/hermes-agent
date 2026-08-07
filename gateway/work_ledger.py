@@ -290,6 +290,9 @@ _REVIEW_REQUEST_ACTION_PATTERNS = (
     r"\bmerge\b",
     r"\bdeploy\b",
 )
+_READ_ONLY_REQUEST_PATTERNS = (
+    r"^\s*(?:why|what|when|where|who|how)\b",
+)
 _INCOMPLETE_FINAL_PATTERNS = (
     ("not_done_yet", r"\bnot\s+done\s+yet\b"),
     ("no_commit", r"\bno\s+commit\b"),
@@ -1648,6 +1651,12 @@ def _looks_like_review_only_request(text: str) -> bool:
     return not _matches_any(text, _REVIEW_REQUEST_ACTION_PATTERNS)
 
 
+def _looks_like_read_only_request(text: str) -> bool:
+    if not _matches_any(text, _READ_ONLY_REQUEST_PATTERNS):
+        return False
+    return not _matches_any(text, _REVIEW_REQUEST_ACTION_PATTERNS)
+
+
 def _repo_backed_discord_item(item: dict[str, Any]) -> bool:
     if item.get("platform") != "discord":
         return False
@@ -1682,6 +1691,8 @@ def _delivery_intent_for_item(item: dict[str, Any]) -> str:
         return "no_merge"
     if _looks_like_review_only_request(request_text):
         return "review_only"
+    if _looks_like_read_only_request(request_text):
+        return "read_only"
     return "full_lifecycle"
 
 
@@ -1803,6 +1814,10 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
     only_narrow_lifecycle_markers = set(matched) <= {"not_merged", "no_deploy"}
     if intent == "review_only" and "not_done_yet" not in matched and _matches_any(final_text, _REVIEW_ONLY_FINAL_PATTERNS):
         gate["reason"] = "intentional_review_only_terminal"
+        gate["matched_markers"] = matched
+        return _apply_visual_qa_completion(item, gate)
+    if intent == "read_only" and "not_done_yet" not in matched:
+        gate["reason"] = "answered_read_only_request"
         gate["matched_markers"] = matched
         return _apply_visual_qa_completion(item, gate)
     if narrow_intent and only_narrow_lifecycle_markers and (

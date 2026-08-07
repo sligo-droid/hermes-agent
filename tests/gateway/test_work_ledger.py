@@ -2491,6 +2491,61 @@ def test_review_request_allows_negative_findings_about_uncommitted_manifest_path
     assert stored["completion_gate"]["delivery_intent"] == "review_only"
 
 
+def test_read_only_diagnostic_answer_is_not_blocked_by_reported_runtime_lag(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="why do we have no poll data since july 31")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    final_response = (
+        "The scraper is working. The displayed date is the poll fieldwork end date, "
+        "not the ingestion date. Three newer polls appeared after the daily scrape. "
+        "One issue remains: the Airflow runtime is now behind sensitive commits, so "
+        "its write guard may block today's scrape until runtime reconciliation completes."
+    )
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=final_response,
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Complete"
+    assert stored["final_response"] == final_response
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["delivery_intent"] == "read_only"
+    assert stored["completion_gate"]["reason"] == "answered_read_only_request"
+    assert stored["completion_gate"]["matched_markers"] == ["runtime_not_synced"]
+
+
+def test_question_that_requests_a_fix_keeps_full_lifecycle_gate(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="why is the scraper stale, and can you fix it?")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="The runtime is behind and not synced yet.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["delivery_intent"] == "full_lifecycle"
+
+
 def test_review_only_no_mutation_is_not_blocked_by_incidental_ci_lookup(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(
