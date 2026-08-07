@@ -56,13 +56,19 @@ UPLOAD_STATES = (
     "receipt-verified",
 )
 _EXTENSIONS = {
-    "message/rfc822": "eml",
+    "message/rfc822": "txt",
     "application/pdf": "pdf",
     "text/plain": "txt",
     "image/png": "png",
     "image/jpeg": "jpg",
     "application/zip": "zip",
 }
+
+
+def _upload_content_type(artifact: IntakeArtifact, attempt: Mapping[str, Any]) -> str:
+    if artifact.mime_type == "message/rfc822" and str(attempt["remote_filename"]).endswith(".txt"):
+        return "text/plain"
+    return artifact.mime_type
 _MARKER_RE = re.compile(r"^ckfu-v1-[0-9a-f]{12}-[0-9a-f]{12}-[0-9a-f]{12}$")
 MAX_RENDER_BYTES = 2 * 1024 * 1024
 MAX_BODY_CHARS = 100_000
@@ -691,7 +697,7 @@ class NotionArchiveWorker:
             raise NotionAmbiguousRecoveryError("notion upload identity conflicts")
         if remote.get("filename") not in {None, attempt["remote_filename"]}:
             raise NotionAmbiguousRecoveryError("notion upload marker conflicts")
-        if remote.get("content_type") not in {None, artifact.mime_type}:
+        if remote.get("content_type") not in {None, _upload_content_type(artifact, attempt)}:
             raise NotionAmbiguousRecoveryError("notion upload content type conflicts")
         if remote.get("content_length") not in {None, artifact.byte_size}:
             raise NotionAmbiguousRecoveryError("notion upload size conflicts")
@@ -736,7 +742,7 @@ class NotionArchiveWorker:
         try:
             remote = self.client.create_file_upload(
                 filename=str(attempt["remote_filename"]),
-                content_type=artifact.mime_type,
+                content_type=_upload_content_type(artifact, attempt),
                 mode=str(attempt["upload_mode"]),
                 number_of_parts=int(attempt["expected_part_count"]),
             )
@@ -774,7 +780,7 @@ class NotionArchiveWorker:
             parts = item.get("number_of_parts") or {}
             if (
                 item.get("filename") == attempt["remote_filename"]
-                and item.get("content_type") in {None, artifact.mime_type}
+                and item.get("content_type") in {None, _upload_content_type(artifact, attempt)}
                 and (item.get("content_length") in {None, artifact.byte_size})
                 and (
                     attempt["upload_mode"] != "multi_part"
@@ -824,7 +830,7 @@ class NotionArchiveWorker:
                 self._renew(claim)
                 self.client.send_file_upload(
                     upload_id, filename=str(attempt["remote_filename"]),
-                    content_type=artifact.mime_type,
+                    content_type=_upload_content_type(artifact, attempt),
                     content=_HeartbeatReader(handle, lambda: self._renew(claim), self.settings.heartbeat_seconds),
                 )
             else:
@@ -842,7 +848,7 @@ class NotionArchiveWorker:
                     self._renew(claim)
                     self.client.send_file_upload(
                         upload_id, filename=str(attempt["remote_filename"]),
-                        content_type=artifact.mime_type,
+                        content_type=_upload_content_type(artifact, attempt),
                         content=_PartReader(handle, remaining, lambda: self._renew(claim), self.settings.heartbeat_seconds),
                         part_number=part_number,
                     )

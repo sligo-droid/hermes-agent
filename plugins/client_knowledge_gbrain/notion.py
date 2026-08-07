@@ -267,12 +267,11 @@ class NotionClient:
                 params["start_cursor"] = cursor
             payload = self._request("GET", path, params=params)
             page_count += 1
-            if require_request_status and not isinstance(
-                payload.get("request_status"), Mapping
+            request_status = payload.get("request_status")
+            if require_request_status and request_status is not None and not isinstance(
+                request_status, Mapping
             ):
-                raise NotionIncompleteEvidenceError(
-                    "notion list completion evidence is missing"
-                )
+                raise NotionIncompleteEvidenceError("notion result status is invalid")
             self._require_complete_page(payload)
             results = payload.get("results")
             if not isinstance(results, list):

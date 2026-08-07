@@ -210,14 +210,51 @@ def test_upload_listing_requires_complete_paginated_evidence():
     assert "start_cursor=opaque" in calls[1]
 
 
-def test_upload_listing_rejects_missing_request_status():
+def test_upload_listing_accepts_optional_request_status_when_pagination_is_complete():
     client = NotionClient("token", transport=httpx.MockTransport(
         lambda _request: httpx.Response(200, json={
             "object": "list", "results": [], "has_more": False, "next_cursor": None,
         })
     ))
-    with pytest.raises(NotionIncompleteEvidenceError):
+    evidence = client.list_file_uploads()
+    assert evidence.items == ()
+    assert evidence.page_count == 1
+
+
+def test_upload_listing_rejects_invalid_request_status():
+    client = NotionClient("token", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={
+            "object": "list", "results": [], "has_more": False, "next_cursor": None,
+            "request_status": "complete",
+        })
+    ))
+    with pytest.raises(NotionIncompleteEvidenceError, match="status is invalid"):
         client.list_file_uploads()
+
+
+def test_raw_email_uses_supported_notion_upload_transport(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    client = type("Client", (), {})()
+    worker = NotionArchiveWorker(store, spool, client, _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "baseline", type("Evidence", (), {"items": (), "page_count": 1})()
+    ))
+    created = {}
+    client.create_file_upload = lambda **kwargs: created.update(kwargs) or {"id": "upload-1"}
+    attempt_id = "a" * 32
+    marker = _marker(artifact, attempt_id)
+    attempt = store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=attempt_id, opaque_marker=marker,
+        remote_filename=f"{marker}.txt", upload_mode="single_part",
+        expected_part_count=1,
+    )
+    assert worker._create_or_recover_upload(
+        claim, artifact.artifact_id, artifact, attempt
+    ) == "upload-1"
+    assert created["filename"] == f"{marker}.txt"
+    assert created["content_type"] == "text/plain"
 
 
 def test_preflight_adds_only_missing_machine_properties_and_preserves_schema(tmp_path):
@@ -1235,6 +1272,11 @@ def test_expired_upload_creates_linked_replacement_attempt(tmp_path, monkeypatch
             upload_id,
             current_attempt["remote_filename"],
             size=artifact.byte_size,
+            content_type=(
+                "text/plain"
+                if current_attempt["remote_filename"].endswith(".txt")
+                else artifact.mime_type
+            ),
             status="expired" if calls == 1 else "uploaded",
         )
     worker = NotionArchiveWorker(
