@@ -210,14 +210,250 @@ def test_upload_listing_requires_complete_paginated_evidence():
     assert "start_cursor=opaque" in calls[1]
 
 
-def test_upload_listing_rejects_missing_request_status():
+def test_upload_listing_accepts_optional_request_status_when_pagination_is_complete():
     client = NotionClient("token", transport=httpx.MockTransport(
         lambda _request: httpx.Response(200, json={
             "object": "list", "results": [], "has_more": False, "next_cursor": None,
         })
     ))
+    evidence = client.list_file_uploads()
+    assert evidence.items == ()
+    assert evidence.page_count == 1
+
+
+def test_upload_listing_rejects_invalid_request_status():
+    client = NotionClient("token", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={
+            "object": "list", "results": [], "has_more": False, "next_cursor": None,
+            "request_status": "complete",
+        })
+    ))
+    with pytest.raises(NotionIncompleteEvidenceError, match="status is invalid"):
+        client.list_file_uploads()
+
+
+@pytest.mark.parametrize("payload", [
+    {"object": "list", "results": [], "has_more": False, "next_cursor": None,
+     "request_status": None},
+    {"object": "list", "results": [], "has_more": False},
+    {"object": "list", "results": [], "has_more": False, "next_cursor": "stale"},
+])
+def test_upload_listing_rejects_malformed_optional_evidence(payload):
+    client = NotionClient("token", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=payload)
+    ))
     with pytest.raises(NotionIncompleteEvidenceError):
         client.list_file_uploads()
+
+
+def test_raw_email_uses_supported_notion_upload_transport(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    client = type("Client", (), {})()
+    worker = NotionArchiveWorker(store, spool, client, _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "baseline", type("Evidence", (), {"items": (), "page_count": 1})()
+    ))
+    created = {}
+    client.create_file_upload = lambda **kwargs: created.update(kwargs) or {"id": "upload-1"}
+    attempt_id = "a" * 32
+    marker = _marker(artifact, attempt_id)
+    attempt = store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=attempt_id, opaque_marker=marker,
+        remote_filename=f"{marker}.txt", upload_mode="single_part",
+        expected_part_count=1,
+    )
+    assert worker._create_or_recover_upload(
+        claim, artifact.artifact_id, artifact, attempt
+    ) == "upload-1"
+    assert created["filename"] == f"{marker}.txt"
+    assert created["content_type"] == "text/plain"
+
+
+def test_legacy_email_attempt_without_create_is_replaced_before_retry(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    legacy_id = "b" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=f"{legacy_marker}.eml", upload_mode="single_part",
+        expected_part_count=1,
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_create_or_recover_upload", lambda *_args: "upload-1")
+    monkeypatch.setattr(worker, "_send_bytes", lambda *_args: None)
+    monkeypatch.setattr(worker, "_ensure_attachment_block", lambda *_args: "block-1")
+    worker.client = type("Client", (), {
+        "retrieve_file_upload": staticmethod(lambda _upload_id: _upload(
+            "upload-1", store.get_upload_attempts(artifact.artifact_id)[-1]["remote_filename"],
+            size=artifact.byte_size, content_type="text/plain", status="uploaded",
+        )),
+    })()
+    worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    attempts = store.get_upload_attempts(artifact.artifact_id)
+    assert len(attempts) == 2
+    assert attempts[1]["remote_filename"].endswith(".txt")
+    assert attempts[1]["replaces_attempt_id"] == legacy_id
+    assert attempts[1]["replacement_reason"] == "notion_eml_transport_unsupported"
+
+
+def test_legacy_email_create_with_no_reconciled_candidate_is_replaced(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    legacy_id = "c" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=f"{legacy_marker}.eml", upload_mode="single_part",
+        expected_part_count=1,
+    )
+    baseline_id = store.publish_upload_scan(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        scan_role="baseline", page_count=1, items=[],
+    )
+    store.append_upload_attempt_event(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        "create_started",
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "reconciliation", type("Evidence", (), {"items": (), "page_count": 1})()
+    ))
+    monkeypatch.setattr(worker, "_create_or_recover_upload", lambda *_args: "upload-1")
+    monkeypatch.setattr(worker, "_send_bytes", lambda *_args: None)
+    monkeypatch.setattr(worker, "_ensure_attachment_block", lambda *_args: "block-1")
+    worker.client = type("Client", (), {
+        "retrieve_file_upload": staticmethod(lambda _upload_id: _upload(
+            "upload-1", store.get_upload_attempts(artifact.artifact_id)[-1]["remote_filename"],
+            size=artifact.byte_size, content_type="text/plain", status="uploaded",
+        )),
+    })()
+    assert baseline_id
+    worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    attempts = store.get_upload_attempts(artifact.artifact_id)
+    assert len(attempts) == 2
+    assert attempts[1]["remote_filename"].endswith(".txt")
+
+
+def test_legacy_email_marker_conflict_does_not_create_replacement(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    legacy_id = "d" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    filename = f"{legacy_marker}.eml"
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=filename, upload_mode="single_part",
+        expected_part_count=1,
+    )
+    store.publish_upload_scan(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        scan_role="baseline", page_count=1, items=[],
+    )
+    store.append_upload_attempt_event(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        "create_started",
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "reconciliation", type("Evidence", (), {
+            "items": (_upload(
+                "conflict", filename, size=artifact.byte_size,
+                content_type="text/plain",
+            ),),
+            "page_count": 1,
+        })()
+    ))
+    with pytest.raises(Exception, match="conflicting metadata"):
+        worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    assert len(store.get_upload_attempts(artifact.artifact_id)) == 1
+
+
+def test_mixed_valid_and_conflicting_marker_candidates_fail_closed(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    attempt_id = "f" * 32
+    marker = _marker(artifact, attempt_id)
+    filename = f"{marker}.eml"
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=attempt_id, opaque_marker=marker,
+        remote_filename=filename, upload_mode="single_part",
+        expected_part_count=1,
+    )
+    baseline_id = store.publish_upload_scan(
+        claim.job_id, claim.claim_token, artifact.artifact_id, attempt_id,
+        scan_role="baseline", page_count=1, items=[],
+    )
+    attempt = store.get_upload_attempts(artifact.artifact_id)[0]
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "reconciliation", type("Evidence", (), {
+            "items": (
+                _upload("valid", filename, size=artifact.byte_size),
+                _upload(
+                    "conflict", filename, size=artifact.byte_size,
+                    content_type="text/plain",
+                ),
+            ),
+            "page_count": 1,
+        })()
+    ))
+    with pytest.raises(Exception, match="conflicting metadata"):
+        worker._recover_uncertain_creation(
+            claim, artifact.artifact_id, artifact, attempt, baseline_id,
+            allow_absent=True,
+        )
+    assert store.get_upload_attempts(artifact.artifact_id)[0]["remote_upload_id"] is None
+
+
+def test_legacy_multipart_replacement_computes_new_partition(tmp_path, monkeypatch):
+    payload = b"x" * (21 * 1024 * 1024)
+    artifact = _artifact(content=payload)
+    store, spool, claim, artifact = _claim(
+        tmp_path, artifact=artifact, content=payload
+    )
+    config = _config(max_file_bytes=30 * 1024 * 1024)
+    legacy_id = "e" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=f"{legacy_marker}.eml", upload_mode="multi_part",
+        expected_part_count=2, expected_part_size=0,
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_create_or_recover_upload", lambda *_args: "upload-1")
+    worker.client = type("Client", (), {
+        "retrieve_file_upload": staticmethod(lambda _upload_id: _upload(
+            "upload-1", store.get_upload_attempts(artifact.artifact_id)[-1]["remote_filename"],
+            size=artifact.byte_size, content_type="text/plain", status="uploaded",
+            total=5, sent=5,
+        )),
+    })()
+    monkeypatch.setattr(worker, "_ensure_attachment_block", lambda *_args: "block-1")
+    worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    replacement = store.get_upload_attempts(artifact.artifact_id)[-1]
+    assert replacement["upload_mode"] == "multi_part"
+    assert replacement["expected_part_size"] == 5 * 1024 * 1024
+    assert replacement["expected_part_count"] == 5
 
 
 def test_preflight_adds_only_missing_machine_properties_and_preserves_schema(tmp_path):
@@ -410,7 +646,7 @@ def test_uncertain_creation_quarantines_two_fully_matching_candidates(tmp_path):
         ]))
     ))
     worker = NotionArchiveWorker(store, spool, client, _settings(config), config)
-    with pytest.raises(Exception, match="safely"):
+    with pytest.raises(Exception, match="conflicting metadata"):
         worker._recover_uncertain_creation(claim, artifact.artifact_id, artifact, attempt, scan_id)
 
 
@@ -1235,6 +1471,11 @@ def test_expired_upload_creates_linked_replacement_attempt(tmp_path, monkeypatch
             upload_id,
             current_attempt["remote_filename"],
             size=artifact.byte_size,
+            content_type=(
+                "text/plain"
+                if current_attempt["remote_filename"].endswith(".txt")
+                else artifact.mime_type
+            ),
             status="expired" if calls == 1 else "uploaded",
         )
     worker = NotionArchiveWorker(

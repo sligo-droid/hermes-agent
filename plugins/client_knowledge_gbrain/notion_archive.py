@@ -56,13 +56,19 @@ UPLOAD_STATES = (
     "receipt-verified",
 )
 _EXTENSIONS = {
-    "message/rfc822": "eml",
+    "message/rfc822": "txt",
     "application/pdf": "pdf",
     "text/plain": "txt",
     "image/png": "png",
     "image/jpeg": "jpg",
     "application/zip": "zip",
 }
+
+
+def _upload_content_type(artifact: IntakeArtifact, attempt: Mapping[str, Any]) -> str:
+    if artifact.mime_type == "message/rfc822" and str(attempt["remote_filename"]).endswith(".txt"):
+        return "text/plain"
+    return artifact.mime_type
 _MARKER_RE = re.compile(r"^ckfu-v1-[0-9a-f]{12}-[0-9a-f]{12}-[0-9a-f]{12}$")
 MAX_RENDER_BYTES = 2 * 1024 * 1024
 MAX_BODY_CHARS = 100_000
@@ -585,6 +591,32 @@ class NotionArchiveWorker:
             self.store.select_active_upload_attempt(
                 claim.job_id, claim.claim_token, claimed_artifact_id, artifact, attempt_id
             )
+        elif (
+            artifact.mime_type == "message/rfc822"
+            and str(attempt["remote_filename"]).endswith(".eml")
+            and not attempt.get("remote_upload_id")
+        ):
+            events = self.store.get_upload_attempt_events(str(attempt["attempt_id"]))
+            create_started = any(item["event_type"] == "create_started" for item in events)
+            recovered_upload_id = None
+            if create_started:
+                baseline_id = str(attempt.get("baseline_scan_id") or "")
+                if not baseline_id:
+                    raise NotionIncompleteEvidenceError(
+                        "legacy notion upload has no baseline evidence"
+                    )
+                recovered_upload_id = self._recover_uncertain_creation(
+                    claim, claimed_artifact_id, artifact, attempt, baseline_id,
+                    allow_absent=True,
+                )
+            if recovered_upload_id:
+                attempt = dict(attempt)
+                attempt["remote_upload_id"] = recovered_upload_id
+            else:
+                attempt = self._replace_upload_attempt(
+                    claim, claimed_artifact_id, artifact, attempt,
+                    reason="notion_eml_transport_unsupported",
+                )
         attempt_id = str(attempt["attempt_id"])
         marker = str(attempt["opaque_marker"])
         upload_id = str(attempt.get("remote_upload_id") or "")
@@ -604,35 +636,15 @@ class NotionArchiveWorker:
                 artifact.artifact_id, attempt_id, disposition,
                 remote_upload_id=upload_id,
             )
-            replacement_id = secrets.token_hex(16)
-            replacement_marker = _marker(artifact, replacement_id)
-            replacement = self.store.reserve_upload_attempt(
-                claim.job_id, claim.claim_token, artifact,
-                attempt_id=replacement_id, opaque_marker=replacement_marker,
-                remote_filename=f"{replacement_marker}.{_EXTENSIONS.get(artifact.mime_type, 'bin')}",
-                upload_mode=str(attempt["upload_mode"]),
-                expected_part_count=int(attempt["expected_part_count"]),
-                expected_part_size=int(attempt.get("expected_part_size") or 0),
-                replaces_attempt_id=attempt_id,
-                replacement_reason=f"{disposition}_before_attachment",
-                claimed_artifact_id=claimed_artifact_id,
-            )
-            self.store.set_upload_attempt_disposition(
-                claim.job_id, claim.claim_token, claimed_artifact_id,
-                artifact.artifact_id, attempt_id, "superseded",
+            replacement = self._replace_upload_attempt(
+                claim, claimed_artifact_id, artifact, attempt,
+                reason=f"{disposition}_before_attachment",
                 remote_upload_id=upload_id,
-            )
-            self.store.select_active_upload_attempt(
-                claim.job_id,
-                claim.claim_token,
-                claimed_artifact_id,
-                artifact,
-                replacement_id,
                 state="upload-created",
             )
             attempt = replacement
-            attempt_id = replacement_id
-            marker = replacement_marker
+            attempt_id = str(replacement["attempt_id"])
+            marker = str(replacement["opaque_marker"])
             upload_id = self._create_or_recover_upload(
                 claim, claimed_artifact_id, artifact, replacement
             )
@@ -682,6 +694,44 @@ class NotionArchiveWorker:
         )
         return attempt_id
 
+    def _replace_upload_attempt(
+        self,
+        claim: JobClaim,
+        claimed_artifact_id: str,
+        artifact: IntakeArtifact,
+        attempt: Mapping[str, Any],
+        *,
+        reason: str,
+        remote_upload_id: str | None = None,
+        state: str = "attempt-selected",
+    ) -> dict[str, Any]:
+        replacement_id = secrets.token_hex(16)
+        replacement_marker = _marker(artifact, replacement_id)
+        part_size, part_count = _multipart_plan(
+            artifact.byte_size, self.settings.multipart_part_bytes
+        )
+        replacement = self.store.reserve_upload_attempt(
+            claim.job_id, claim.claim_token, artifact,
+            attempt_id=replacement_id, opaque_marker=replacement_marker,
+            remote_filename=f"{replacement_marker}.{_EXTENSIONS.get(artifact.mime_type, 'bin')}",
+            upload_mode="single_part" if artifact.byte_size <= 20 * 1024 * 1024 else "multi_part",
+            expected_part_count=part_count,
+            expected_part_size=part_size,
+            replaces_attempt_id=str(attempt["attempt_id"]),
+            replacement_reason=reason,
+            claimed_artifact_id=claimed_artifact_id,
+        )
+        self.store.set_upload_attempt_disposition(
+            claim.job_id, claim.claim_token, claimed_artifact_id,
+            artifact.artifact_id, str(attempt["attempt_id"]), "superseded",
+            remote_upload_id=remote_upload_id,
+        )
+        self.store.select_active_upload_attempt(
+            claim.job_id, claim.claim_token, claimed_artifact_id,
+            artifact, replacement_id, state=state,
+        )
+        return replacement
+
     @staticmethod
     def _validate_remote_upload(
         remote: Mapping[str, Any], artifact: IntakeArtifact, attempt: Mapping[str, Any]
@@ -691,7 +741,7 @@ class NotionArchiveWorker:
             raise NotionAmbiguousRecoveryError("notion upload identity conflicts")
         if remote.get("filename") not in {None, attempt["remote_filename"]}:
             raise NotionAmbiguousRecoveryError("notion upload marker conflicts")
-        if remote.get("content_type") not in {None, artifact.mime_type}:
+        if remote.get("content_type") not in {None, _upload_content_type(artifact, attempt)}:
             raise NotionAmbiguousRecoveryError("notion upload content type conflicts")
         if remote.get("content_length") not in {None, artifact.byte_size}:
             raise NotionAmbiguousRecoveryError("notion upload size conflicts")
@@ -736,7 +786,7 @@ class NotionArchiveWorker:
         try:
             remote = self.client.create_file_upload(
                 filename=str(attempt["remote_filename"]),
-                content_type=artifact.mime_type,
+                content_type=_upload_content_type(artifact, attempt),
                 mode=str(attempt["upload_mode"]),
                 number_of_parts=int(attempt["expected_part_count"]),
             )
@@ -762,19 +812,22 @@ class NotionArchiveWorker:
 
     def _recover_uncertain_creation(
         self, claim: JobClaim, claimed_artifact_id: str, artifact: IntakeArtifact,
-        attempt: Mapping[str, Any], baseline_id: str,
-    ) -> str:
+        attempt: Mapping[str, Any], baseline_id: str, *, allow_absent: bool = False,
+    ) -> str | None:
         reconciliation_id, evidence = self._complete_scan(
             claim, artifact.artifact_id, str(attempt["attempt_id"]), "reconciliation"
         )
         baseline = {item["remote_upload_id"] for item in self.store.get_upload_scan_items(baseline_id)}
         delta = [item for item in evidence.items if str(item.get("id") or "") not in baseline]
         eligible = []
+        marker_bound = []
         for item in delta:
             parts = item.get("number_of_parts") or {}
+            if item.get("filename") == attempt["remote_filename"]:
+                marker_bound.append(item)
             if (
                 item.get("filename") == attempt["remote_filename"]
-                and item.get("content_type") in {None, artifact.mime_type}
+                and item.get("content_type") in {None, _upload_content_type(artifact, attempt)}
                 and (item.get("content_length") in {None, artifact.byte_size})
                 and (
                     attempt["upload_mode"] != "multi_part"
@@ -782,12 +835,16 @@ class NotionArchiveWorker:
                 )
             ):
                 eligible.append(item)
+        if marker_bound and (len(marker_bound) != 1 or len(eligible) != 1):
+            raise NotionAmbiguousRecoveryError(
+                "notion upload marker has conflicting metadata"
+            )
         if not eligible:
+            if allow_absent:
+                return None
             raise NotionIncompleteEvidenceError(
                 "notion upload creation is not yet visible in complete evidence"
             )
-        if len(eligible) != 1:
-            raise NotionAmbiguousRecoveryError("notion upload creation cannot be attributed safely")
         upload_id = str(eligible[0]["id"])
         evidence_identity = hashlib.sha256(
             f"{baseline_id}\0{reconciliation_id}\0{attempt['opaque_marker']}\0{upload_id}".encode()
@@ -824,7 +881,7 @@ class NotionArchiveWorker:
                 self._renew(claim)
                 self.client.send_file_upload(
                     upload_id, filename=str(attempt["remote_filename"]),
-                    content_type=artifact.mime_type,
+                    content_type=_upload_content_type(artifact, attempt),
                     content=_HeartbeatReader(handle, lambda: self._renew(claim), self.settings.heartbeat_seconds),
                 )
             else:
@@ -842,7 +899,7 @@ class NotionArchiveWorker:
                     self._renew(claim)
                     self.client.send_file_upload(
                         upload_id, filename=str(attempt["remote_filename"]),
-                        content_type=artifact.mime_type,
+                        content_type=_upload_content_type(artifact, attempt),
                         content=_PartReader(handle, remaining, lambda: self._renew(claim), self.settings.heartbeat_seconds),
                         part_number=part_number,
                     )
