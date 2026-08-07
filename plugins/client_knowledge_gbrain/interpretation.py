@@ -160,7 +160,7 @@ def _semantic_validate(parsed: Any, extraction: Mapping[str, Any], max_bytes: in
                     raise InterpretationFailure("interpretation_evidence_reference_missing")
                 used.add(evidence_id)
     if set(evidence) != used:
-        raise InterpretationFailure("interpretation_orphan_evidence")
+        parsed["evidence"] = [item for item in evidence_items if str(item["id"]) in used]
     return parsed
 
 
