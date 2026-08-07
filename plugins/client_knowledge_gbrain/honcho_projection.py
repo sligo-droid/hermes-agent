@@ -35,6 +35,7 @@ class HonchoProjectionSettings:
     lease_seconds: float
     retry_delay_seconds: float
     observer_peer_id: str
+    max_remote_conclusions: int
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "HonchoProjectionSettings":
@@ -51,6 +52,9 @@ class HonchoProjectionSettings:
             lease_seconds=max(5.0, float(raw.get("lease_seconds", DEFAULT_LEASE_SECONDS))),
             retry_delay_seconds=max(0.0, float(raw.get("retry_delay_seconds", 60))),
             observer_peer_id=observer,
+            max_remote_conclusions=max(
+                1, min(5000, int(raw.get("max_remote_conclusions", 500)))
+            ),
         )
 
 
@@ -78,16 +82,22 @@ def promotable_page(page: Mapping[str, Any]) -> bool:
 
 
 class HonchoProjectionApi:
-    def __init__(self, scope: Any) -> None:
+    def __init__(self, scope: Any, *, max_items: int = 500) -> None:
         self.scope = scope
+        self.max_items = max(1, min(5000, int(max_items)))
 
     def list(self) -> list[Any]:
         try:
-            values = self.scope.list(size=500)
+            values = self.scope.list(size=self.max_items + 1)
         except Exception as exc:
             raise HonchoProjectionFailure("honcho_projection_list_failed") from exc
         items = getattr(values, "items", values)
-        return list(items or [])
+        result = list(items or [])
+        if len(result) >= self.max_items:
+            raise HonchoProjectionFailure(
+                "honcho_projection_remote_set_truncated", operator_blocked=True
+            )
+        return result
 
     @staticmethod
     def _id(value: Any) -> str:
@@ -97,11 +107,20 @@ class HonchoProjectionApi:
     def _content(value: Any) -> str:
         return str(getattr(value, "content", None) or (value.get("content") if isinstance(value, Mapping) else "") or "")
 
-    def adopt(self, marker: str, content: str) -> str:
-        matches = [value for value in self.list() if marker in self._content(value) and self._content(value) == content]
+    def resolve_marker(self, marker: str, content: str) -> tuple[str, str]:
+        matches = [value for value in self.list() if marker in self._content(value)]
         if len(matches) > 1:
             raise HonchoProjectionFailure("honcho_projection_duplicate_remote_marker", operator_blocked=True)
-        return self._id(matches[0]) if matches else ""
+        if not matches:
+            return "", ""
+        conclusion_id = self._id(matches[0])
+        if not conclusion_id:
+            raise HonchoProjectionFailure("honcho_projection_remote_identity_invalid")
+        return (conclusion_id, "") if self._content(matches[0]) == content else ("", conclusion_id)
+
+    def adopt(self, marker: str, content: str) -> str:
+        exact, _stale = self.resolve_marker(marker, content)
+        return exact
 
     def create(self, content: str) -> str:
         try:
@@ -119,6 +138,8 @@ class HonchoProjectionApi:
             message = str(exc).lower()
             if "404" not in message and "not found" not in message:
                 raise HonchoProjectionFailure("honcho_projection_delete_failed") from exc
+        if any(self._id(value) == conclusion_id for value in self.list()):
+            raise HonchoProjectionFailure("honcho_projection_delete_unverified")
 
 
 def _default_scope(observer_peer_id: str, project_peer_id: str) -> Any:
@@ -192,7 +213,13 @@ def _apply_projection(
             old_id = str(existing.get("obsolete_conclusion_id") or "")
         else:
             old_id = str(existing.get("conclusion_id") or existing.get("obsolete_conclusion_id") or "")
-    conclusion_id = api.adopt(marker, content)
+    conclusion_id, remote_stale_id = api.resolve_marker(marker, content)
+    if remote_stale_id:
+        if old_id and old_id != remote_stale_id:
+            raise HonchoProjectionFailure(
+                "honcho_projection_remote_marker_conflicts_with_ledger", operator_blocked=True
+            )
+        old_id = remote_stale_id
     if not conclusion_id:
         store.upsert_honcho_projection(
             projection_key=projection_key, project_key=project_key,
@@ -284,7 +311,10 @@ class HonchoProjectionWorker:
         )
         proposal = value["proposal"]
         project_peer = _project_peer(self.config, artifact.project_key)
-        api = HonchoProjectionApi(self.scope_factory(self.settings.observer_peer_id, project_peer))
+        api = HonchoProjectionApi(
+            self.scope_factory(self.settings.observer_peer_id, project_peer),
+            max_items=self.settings.max_remote_conclusions,
+        )
         receipt_parts: list[str] = []
         for slug in _publication_slugs(self.store, assimilation):
             page = validate_page(
@@ -308,7 +338,10 @@ def reconcile_honcho_project(
     project_key = validate_project_key(project_key)
     settings = HonchoProjectionSettings.from_config(config)
     project_peer = _project_peer(config, project_key)
-    api = HonchoProjectionApi(scope_factory(settings.observer_peer_id, project_peer))
+    api = HonchoProjectionApi(
+        scope_factory(settings.observer_peer_id, project_peer),
+        max_items=settings.max_remote_conclusions,
+    )
     result = {"confirmed": 0, "retracted": 0}
     limit = max(1, min(5000, int(
         config.get("client_knowledge", {}).get("honcho_projection", {}).get(

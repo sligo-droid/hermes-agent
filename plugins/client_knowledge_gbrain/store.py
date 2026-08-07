@@ -2056,7 +2056,14 @@ class IntakeStore:
             return dict(row) if row else None
 
     def complete_assimilation(
-        self, claim: JobClaim, *, assimilation_id: str, commit_sha: str, output_sha256: str
+        self,
+        claim: JobClaim,
+        *,
+        assimilation_id: str,
+        commit_sha: str,
+        output_sha256: str,
+        next_stage: str = "honcho_projected",
+        sync_verified: bool = True,
     ) -> None:
         now = time.time()
         receipt = StageReceipt(
@@ -2066,12 +2073,51 @@ class IntakeStore:
         with self._write() as conn:
             self._active_stage_claim_locked(conn, claim, "assimilated", now=now)
             conn.execute(
-                "UPDATE assimilation_proposals SET git_commit_sha=?, sync_verified=1 "
-                "WHERE assimilation_id=?", (commit_sha or None, assimilation_id)
+                "UPDATE assimilation_proposals SET git_commit_sha=?, sync_verified=? "
+                "WHERE assimilation_id=?",
+                (commit_sha or None, int(sync_verified), assimilation_id),
             )
-            self._complete_claim_locked(
-                conn, claim, receipt, now=now, next_stage="honcho_projected"
+            if next_stage != "complete":
+                self._complete_claim_locked(
+                    conn, claim, receipt, now=now, next_stage=next_stage
+                )
+                return
+            self._complete_claim_locked(conn, claim, receipt, now=now)
+            conn.execute(
+                "INSERT OR IGNORE INTO stage_receipts"
+                "(artifact_id, stage, receipt_id, output_sha256, recorded_at) VALUES(?,?,?,?,?)",
+                (
+                    claim.artifact_id,
+                    "honcho_projected",
+                    f"honcho:none:{assimilation_id}",
+                    output_sha256,
+                    now,
+                ),
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    secrets.token_hex(16),
+                    claim.artifact_id,
+                    "complete",
+                    "queued",
+                    DEFAULT_MAX_ATTEMPTS,
+                    now,
+                    now,
+                ),
+            )
+
+    def requeue_review_notification(self, review_id: str) -> bool:
+        """Operator-confirmed reset after proving an uncertain POST did not land."""
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_reviews SET notification_state='proven_none', "
+                "notification_message_id=NULL, updated_at=? WHERE review_id=? "
+                "AND state='pending' AND notification_state='uncertain'",
+                (now, review_id),
+            ).rowcount == 1
 
     def upsert_honcho_projection(
         self,

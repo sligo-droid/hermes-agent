@@ -427,6 +427,16 @@ class GitSourcePublisher:
             content = contents[path]
             target.parent.mkdir(parents=True, exist_ok=True)
             self._assert_target_path_safe(path)
+            if target.exists():
+                try:
+                    current_sha = self._sha256(target.read_bytes())
+                except OSError as exc:
+                    raise PublicationFailure("git_target_changed_before_materialization") from exc
+            else:
+                current_sha = ""
+            desired_sha = self._sha256(content) if content is not None else ""
+            if current_sha not in {row["prior_sha256"], desired_sha}:
+                raise PublicationFailure("git_target_changed_before_materialization")
             if content is None:
                 if target.exists():
                     target.unlink()

@@ -289,8 +289,15 @@ class GBrainClient:
         ):
             raise RuntimeError("GBrain search.mcp_keyword_only must read back as true")
 
+    def assert_runtime_ready(self) -> Path:
+        """Reprove the pinned executable, checkout, config, and source boundary."""
+        self.assert_pinned_version()
+        self.assert_pinned_checkout()
+        self.assert_keyword_only()
+        return self.assert_source_checkout()
+
     def search(self, query: str, *, limit: int) -> list[dict[str, Any]]:
-        self.assert_source_checkout()
+        self.assert_runtime_ready()
         payload = json.dumps({"query": query, "limit": limit}, separators=(",", ":"))
         result = self._run(
             ["call", "--source", self.settings.source_id, "search", payload]
@@ -300,7 +307,7 @@ class GBrainClient:
         return result
 
     def get_page(self, slug: str) -> dict[str, Any]:
-        self.assert_source_checkout()
+        self.assert_runtime_ready()
         payload = json.dumps({"slug": slug, "fuzzy": False}, separators=(",", ":"))
         result = self._run(
             ["call", "--source", self.settings.source_id, "get_page", payload]
@@ -310,7 +317,7 @@ class GBrainClient:
         return result
 
     def sync_no_pull(self) -> dict[str, Any]:
-        self.assert_source_checkout()
+        self.assert_runtime_ready()
         result = self._run(
             [
                 "sync", "--source", self.settings.source_id, "--no-pull",
