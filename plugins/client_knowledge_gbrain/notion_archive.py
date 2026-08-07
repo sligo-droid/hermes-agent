@@ -591,6 +591,32 @@ class NotionArchiveWorker:
             self.store.select_active_upload_attempt(
                 claim.job_id, claim.claim_token, claimed_artifact_id, artifact, attempt_id
             )
+        elif (
+            artifact.mime_type == "message/rfc822"
+            and str(attempt["remote_filename"]).endswith(".eml")
+            and not attempt.get("remote_upload_id")
+        ):
+            events = self.store.get_upload_attempt_events(str(attempt["attempt_id"]))
+            create_started = any(item["event_type"] == "create_started" for item in events)
+            recovered_upload_id = None
+            if create_started:
+                baseline_id = str(attempt.get("baseline_scan_id") or "")
+                if not baseline_id:
+                    raise NotionIncompleteEvidenceError(
+                        "legacy notion upload has no baseline evidence"
+                    )
+                recovered_upload_id = self._recover_uncertain_creation(
+                    claim, claimed_artifact_id, artifact, attempt, baseline_id,
+                    allow_absent=True,
+                )
+            if recovered_upload_id:
+                attempt = dict(attempt)
+                attempt["remote_upload_id"] = recovered_upload_id
+            else:
+                attempt = self._replace_upload_attempt(
+                    claim, claimed_artifact_id, artifact, attempt,
+                    reason="notion_eml_transport_unsupported",
+                )
         attempt_id = str(attempt["attempt_id"])
         marker = str(attempt["opaque_marker"])
         upload_id = str(attempt.get("remote_upload_id") or "")
@@ -610,35 +636,15 @@ class NotionArchiveWorker:
                 artifact.artifact_id, attempt_id, disposition,
                 remote_upload_id=upload_id,
             )
-            replacement_id = secrets.token_hex(16)
-            replacement_marker = _marker(artifact, replacement_id)
-            replacement = self.store.reserve_upload_attempt(
-                claim.job_id, claim.claim_token, artifact,
-                attempt_id=replacement_id, opaque_marker=replacement_marker,
-                remote_filename=f"{replacement_marker}.{_EXTENSIONS.get(artifact.mime_type, 'bin')}",
-                upload_mode=str(attempt["upload_mode"]),
-                expected_part_count=int(attempt["expected_part_count"]),
-                expected_part_size=int(attempt.get("expected_part_size") or 0),
-                replaces_attempt_id=attempt_id,
-                replacement_reason=f"{disposition}_before_attachment",
-                claimed_artifact_id=claimed_artifact_id,
-            )
-            self.store.set_upload_attempt_disposition(
-                claim.job_id, claim.claim_token, claimed_artifact_id,
-                artifact.artifact_id, attempt_id, "superseded",
+            replacement = self._replace_upload_attempt(
+                claim, claimed_artifact_id, artifact, attempt,
+                reason=f"{disposition}_before_attachment",
                 remote_upload_id=upload_id,
-            )
-            self.store.select_active_upload_attempt(
-                claim.job_id,
-                claim.claim_token,
-                claimed_artifact_id,
-                artifact,
-                replacement_id,
                 state="upload-created",
             )
             attempt = replacement
-            attempt_id = replacement_id
-            marker = replacement_marker
+            attempt_id = str(replacement["attempt_id"])
+            marker = str(replacement["opaque_marker"])
             upload_id = self._create_or_recover_upload(
                 claim, claimed_artifact_id, artifact, replacement
             )
@@ -687,6 +693,41 @@ class NotionArchiveWorker:
             active_upload_attempt_id=attempt_id, claimed_artifact_id=claimed_artifact_id,
         )
         return attempt_id
+
+    def _replace_upload_attempt(
+        self,
+        claim: JobClaim,
+        claimed_artifact_id: str,
+        artifact: IntakeArtifact,
+        attempt: Mapping[str, Any],
+        *,
+        reason: str,
+        remote_upload_id: str | None = None,
+        state: str = "attempt-selected",
+    ) -> dict[str, Any]:
+        replacement_id = secrets.token_hex(16)
+        replacement_marker = _marker(artifact, replacement_id)
+        replacement = self.store.reserve_upload_attempt(
+            claim.job_id, claim.claim_token, artifact,
+            attempt_id=replacement_id, opaque_marker=replacement_marker,
+            remote_filename=f"{replacement_marker}.{_EXTENSIONS.get(artifact.mime_type, 'bin')}",
+            upload_mode=str(attempt["upload_mode"]),
+            expected_part_count=int(attempt["expected_part_count"]),
+            expected_part_size=int(attempt.get("expected_part_size") or 0),
+            replaces_attempt_id=str(attempt["attempt_id"]),
+            replacement_reason=reason,
+            claimed_artifact_id=claimed_artifact_id,
+        )
+        self.store.set_upload_attempt_disposition(
+            claim.job_id, claim.claim_token, claimed_artifact_id,
+            artifact.artifact_id, str(attempt["attempt_id"]), "superseded",
+            remote_upload_id=remote_upload_id,
+        )
+        self.store.select_active_upload_attempt(
+            claim.job_id, claim.claim_token, claimed_artifact_id,
+            artifact, replacement_id, state=state,
+        )
+        return replacement
 
     @staticmethod
     def _validate_remote_upload(
@@ -768,8 +809,8 @@ class NotionArchiveWorker:
 
     def _recover_uncertain_creation(
         self, claim: JobClaim, claimed_artifact_id: str, artifact: IntakeArtifact,
-        attempt: Mapping[str, Any], baseline_id: str,
-    ) -> str:
+        attempt: Mapping[str, Any], baseline_id: str, *, allow_absent: bool = False,
+    ) -> str | None:
         reconciliation_id, evidence = self._complete_scan(
             claim, artifact.artifact_id, str(attempt["attempt_id"]), "reconciliation"
         )
@@ -789,6 +830,8 @@ class NotionArchiveWorker:
             ):
                 eligible.append(item)
         if not eligible:
+            if allow_absent:
+                return None
             raise NotionIncompleteEvidenceError(
                 "notion upload creation is not yet visible in complete evidence"
             )

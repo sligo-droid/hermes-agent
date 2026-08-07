@@ -232,6 +232,20 @@ def test_upload_listing_rejects_invalid_request_status():
         client.list_file_uploads()
 
 
+@pytest.mark.parametrize("payload", [
+    {"object": "list", "results": [], "has_more": False, "next_cursor": None,
+     "request_status": None},
+    {"object": "list", "results": [], "has_more": False},
+    {"object": "list", "results": [], "has_more": False, "next_cursor": "stale"},
+])
+def test_upload_listing_rejects_malformed_optional_evidence(payload):
+    client = NotionClient("token", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=payload)
+    ))
+    with pytest.raises(NotionIncompleteEvidenceError):
+        client.list_file_uploads()
+
+
 def test_raw_email_uses_supported_notion_upload_transport(tmp_path, monkeypatch):
     store, spool, claim, artifact = _claim(tmp_path)
     config = _config()
@@ -255,6 +269,80 @@ def test_raw_email_uses_supported_notion_upload_transport(tmp_path, monkeypatch)
     ) == "upload-1"
     assert created["filename"] == f"{marker}.txt"
     assert created["content_type"] == "text/plain"
+
+
+def test_legacy_email_attempt_without_create_is_replaced_before_retry(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    legacy_id = "b" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=f"{legacy_marker}.eml", upload_mode="single_part",
+        expected_part_count=1,
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_create_or_recover_upload", lambda *_args: "upload-1")
+    monkeypatch.setattr(worker, "_send_bytes", lambda *_args: None)
+    monkeypatch.setattr(worker, "_ensure_attachment_block", lambda *_args: "block-1")
+    worker.client = type("Client", (), {
+        "retrieve_file_upload": staticmethod(lambda _upload_id: _upload(
+            "upload-1", store.get_upload_attempts(artifact.artifact_id)[-1]["remote_filename"],
+            size=artifact.byte_size, content_type="text/plain", status="uploaded",
+        )),
+    })()
+    worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    attempts = store.get_upload_attempts(artifact.artifact_id)
+    assert len(attempts) == 2
+    assert attempts[1]["remote_filename"].endswith(".txt")
+    assert attempts[1]["replaces_attempt_id"] == legacy_id
+    assert attempts[1]["replacement_reason"] == "notion_eml_transport_unsupported"
+
+
+def test_legacy_email_create_with_no_reconciled_candidate_is_replaced(tmp_path, monkeypatch):
+    store, spool, claim, artifact = _claim(tmp_path)
+    config = _config()
+    legacy_id = "c" * 32
+    legacy_marker = _marker(artifact, legacy_id)
+    store.reserve_upload_attempt(
+        claim.job_id, claim.claim_token, artifact,
+        attempt_id=legacy_id, opaque_marker=legacy_marker,
+        remote_filename=f"{legacy_marker}.eml", upload_mode="single_part",
+        expected_part_count=1,
+    )
+    baseline_id = store.publish_upload_scan(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        scan_role="baseline", page_count=1, items=[],
+    )
+    store.append_upload_attempt_event(
+        claim.job_id, claim.claim_token, artifact.artifact_id, legacy_id,
+        "create_started",
+    )
+    store.select_active_upload_attempt(
+        claim.job_id, claim.claim_token, artifact.artifact_id, artifact, legacy_id
+    )
+    worker = NotionArchiveWorker(store, spool, object(), _settings(config), config)
+    monkeypatch.setattr(worker, "_complete_scan", lambda *_args: (
+        "reconciliation", type("Evidence", (), {"items": (), "page_count": 1})()
+    ))
+    monkeypatch.setattr(worker, "_create_or_recover_upload", lambda *_args: "upload-1")
+    monkeypatch.setattr(worker, "_send_bytes", lambda *_args: None)
+    monkeypatch.setattr(worker, "_ensure_attachment_block", lambda *_args: "block-1")
+    worker.client = type("Client", (), {
+        "retrieve_file_upload": staticmethod(lambda _upload_id: _upload(
+            "upload-1", store.get_upload_attempts(artifact.artifact_id)[-1]["remote_filename"],
+            size=artifact.byte_size, content_type="text/plain", status="uploaded",
+        )),
+    })()
+    assert baseline_id
+    worker._ensure_file(claim, artifact.artifact_id, artifact, "page-1")
+    attempts = store.get_upload_attempts(artifact.artifact_id)
+    assert len(attempts) == 2
+    assert attempts[1]["remote_filename"].endswith(".txt")
 
 
 def test_preflight_adds_only_missing_machine_properties_and_preserves_schema(tmp_path):
