@@ -595,6 +595,45 @@ def test_publisher_preserves_concurrent_edit_during_atomic_exchange(tmp_path, mo
     assert not any(target.parent.glob(".reporting.md.tmp-*"))
 
 
+def test_publisher_preserves_concurrent_edit_when_exchange_rollback_fails(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    target = root / "projects/pid/requirements/reporting.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"prior\n")
+    subprocess.run(["git", "add", str(target.relative_to(root))], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "prior"], cwd=root, check=True, capture_output=True)
+    expected_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    original = GitSourcePublisher._exchange_paths
+    calls = 0
+
+    def fail_rollback(left, right):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            target.write_bytes(b"concurrent edit\n")
+            original(left, right)
+            return
+        raise OSError("rollback failed")
+
+    monkeypatch.setattr(GitSourcePublisher, "_exchange_paths", staticmethod(fail_rollback))
+    with GitSourcePublisher(_Client(root), project_key="pid") as publisher:
+        with pytest.raises(PublicationFailure, match="exchange_recovery_failed"):
+            publisher.publish(
+                artifact_id="a" * 64, assimilation_id="b" * 64,
+                assimilation_version=ASSIMILATION_VERSION, proposal_sha256="c" * 64,
+                expected_head=expected_head, authored_at=1,
+                files=[PublicationFile(
+                    "requirements/reporting", b"content\n",
+                    expected_prior_sha256=hashlib.sha256(b"prior\n").hexdigest(),
+                )],
+                interpretation_id="d" * 64,
+            )
+    assert target.read_bytes() == b"content\n"
+    sidecars = list(target.parent.glob(".reporting.md.tmp-*"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_bytes() == b"concurrent edit\n"
+
+
 def test_publisher_recovers_crash_after_atomic_exchange(tmp_path, monkeypatch):
     root = _repo(tmp_path)
     target = root / "projects/pid/requirements/reporting.md"

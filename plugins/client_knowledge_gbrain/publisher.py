@@ -504,6 +504,7 @@ class GitSourcePublisher:
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
+            preserve_temporary = False
             try:
                 with os.fdopen(fd, "wb") as handle:
                     fd = -1
@@ -525,6 +526,7 @@ class GitSourcePublisher:
                         try:
                             self._exchange_paths(temporary, target)
                         except OSError as exc:
+                            preserve_temporary = True
                             raise PublicationFailure("git_target_exchange_recovery_failed") from exc
                         raise PublicationFailure("git_target_changed_before_materialization")
                 else:
@@ -536,7 +538,11 @@ class GitSourcePublisher:
             finally:
                 if fd >= 0:
                     os.close(fd)
-                if temporary.exists() and not temporary.is_symlink():
+                if (
+                    not preserve_temporary
+                    and temporary.exists()
+                    and not temporary.is_symlink()
+                ):
                     temporary.unlink()
         self._git("read-tree", commit_sha)
         if self._git_text("write-tree") != self._git_text(
