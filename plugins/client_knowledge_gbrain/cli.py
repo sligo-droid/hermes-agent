@@ -59,6 +59,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     requeue_review.add_argument("--confirm-absent", action="store_true")
     requeue_review.add_argument("--db-path", default="")
 
+    refresh_review = subs.add_parser(
+        "refresh-review-notification",
+        help="Replace one confirmed legacy pending review with the native review UX",
+    )
+    refresh_review.add_argument("--review-id", required=True)
+    refresh_review.add_argument("--db-path", default="")
+
     honcho = subs.add_parser(
         "reconcile-honcho", help="Adopt deterministic Honcho projection markers"
     )
@@ -194,7 +201,7 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             print(json.dumps({"recovered": store.reconcile(), "stats": store.stats()}, sort_keys=True))
             return 0
         if action == "reviews":
-            reviews = store.list_pending_reviews(limit=50)
+            reviews = store.list_open_reviews(limit=50)
             print(json.dumps({
                 "reviews": [
                     {
@@ -204,6 +211,9 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                         "state": row["state"],
                         "reason_code": row["reason_code"],
                         "notification_state": row["notification_state"],
+                        "revision_state": row.get("revision_state"),
+                        "revision_attempt_count": row.get("revision_attempt_count"),
+                        "revision_error_class": row.get("revision_error_class"),
                     }
                     for row in reviews
                 ]
@@ -229,6 +239,13 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                 raise ValueError("operator absence confirmation is required")
             changed = store.requeue_review_notification(str(args.review_id))
             print(json.dumps({"review_id": str(args.review_id), "requeued": changed}, sort_keys=True))
+            return 0 if changed else 1
+        if action == "refresh-review-notification":
+            review_id = str(args.review_id or "").strip().lower()
+            if len(review_id) != 64 or any(ch not in "0123456789abcdef" for ch in review_id):
+                raise ValueError("review_id must be a canonical opaque id")
+            changed = store.refresh_review_notification(review_id)
+            print(json.dumps({"review_id": review_id, "refreshed": changed}, sort_keys=True))
             return 0 if changed else 1
         if action == "reconcile-honcho":
             from hermes_cli.config import load_config
@@ -277,7 +294,10 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                     config=config,
                 ),
                 "review_notifications": run_notification_once(
-                    store=store, derived=derived, config=config,
+                    store=store,
+                    derived=derived,
+                    config=config,
+                    llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
                 ),
                 "honcho_projection": run_honcho_projection_once(
                     store=store, derived=derived, config=config,

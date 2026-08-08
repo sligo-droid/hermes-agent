@@ -465,6 +465,28 @@ def test_non_confirmation_grounding_mismatch_is_host_normalized_for_review(tmp_p
     assert rendered["final_markdown"] == _canonical_markdown(rendered, project_key="pid")
 
 
+def test_explicit_review_revision_path_preserves_reviewer_requested_wording(tmp_path):
+    revised_claim = "Send a concise weekly status report every Monday."
+    op = _operation("add", claim=revised_claim)
+    parsed, review, reason = validate_proposal(
+        _proposal(op),
+        artifact_id="a" * 64,
+        interpretation_id="b" * 64,
+        project_key="pid",
+        notion_ref="notion:page:new",
+        current_pages={},
+        interpretation=_interpretation("Weekly report is due Monday."),
+        source_root=tmp_path,
+        max_output_bytes=500_000,
+        allow_revised_claim=True,
+    )
+    rendered = parsed["operations"][0]
+    assert review is True
+    assert reason == "outside_auto_publication_allowlist"
+    assert rendered["claim"] == revised_claim
+    assert revised_claim in rendered["final_markdown"]
+
+
 @pytest.mark.parametrize(("operation", "model_status", "host_status"), [
     ("add", "tentative", "current"),
     ("refine", "disputed", "current"),

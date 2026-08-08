@@ -186,6 +186,16 @@ def _ensure_discord_mock() -> None:
             self.sku_id = sku_id
             self.callback = None
 
+    class _FakeModal:
+        def __init__(self, *, title=None, timeout=None, custom_id=None, **_):
+            self.title = title
+            self.timeout = timeout
+            self.custom_id = custom_id
+            self.children = []
+
+        def add_item(self, item):
+            self.children.append(item)
+
     class _FakeSelectOption:
         def __init__(self, *, label=None, value=None, description=None, **_):
             self.label = label
@@ -197,6 +207,7 @@ def _ensure_discord_mock() -> None:
         View=_FakeView,
         Select=_FakeSelect,
         Button=_FakeButton,
+        Modal=_FakeModal,
         button=lambda *a, **k: (lambda fn: fn),
     )
     discord_mod.ButtonStyle = SimpleNamespace(

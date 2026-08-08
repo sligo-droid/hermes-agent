@@ -16,7 +16,7 @@ from plugins.client_knowledge_gbrain.models import (
     storage_key,
 )
 from plugins.client_knowledge_gbrain.spool import RawSpool
-from plugins.client_knowledge_gbrain.store import IntakeStore
+from plugins.client_knowledge_gbrain.store import CURRENT_SCHEMA_VERSION, IntakeStore
 
 
 def _artifact(provider: str = "gmail", external: str = "item-1", content: bytes = b"raw"):
@@ -303,7 +303,7 @@ def test_schema_migrates_existing_store_to_spool_storage_identity(tmp_path):
     with migrated._connect() as conn:
         assert conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "8"
+        ).fetchone()[0] == str(CURRENT_SCHEMA_VERSION)
         assert "spool_storage_id" in {
             row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }
@@ -726,7 +726,7 @@ def test_noop_assimilation_skips_honcho_and_queues_complete(tmp_path):
 def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch):
     import plugins.client_knowledge_gbrain as plugin
 
-    calls = {"tools": [], "cli": [], "commands": [], "aux": []}
+    calls = {"tools": [], "cli": [], "hooks": [], "views": [], "aux": []}
 
     class Context:
         def register_tool(self, **kwargs):
@@ -735,8 +735,11 @@ def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch
         def register_cli_command(self, **kwargs):
             calls["cli"].append(kwargs["name"])
 
-        def register_command(self, **kwargs):
-            calls["commands"].append(kwargs["name"])
+        def register_hook(self, name, _callback):
+            calls["hooks"].append(name)
+
+        def register_discord_component_view(self, **kwargs):
+            calls["views"].append(kwargs)
 
         def register_auxiliary_task(self, **kwargs):
             calls["aux"].append((kwargs["key"], kwargs["defaults"]))
@@ -744,7 +747,11 @@ def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch
     plugin.register(Context())
     assert calls["tools"] == ["client_knowledge_search", "client_knowledge_get"]
     assert calls["cli"] == ["client-knowledge"]
-    assert calls["commands"] == ["client-knowledge"]
+    assert calls["hooks"] == ["pre_gateway_dispatch"]
+    assert [item["name"] for item in calls["views"]] == ["client-knowledge-review"]
+    assert [item["action"] for item in calls["views"][0]["components"]] == [
+        "approve", "reject", "instructions",
+    ]
     assert calls["aux"] == [
         (
             "client_knowledge_interpret",

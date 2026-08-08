@@ -9,6 +9,7 @@ the database contains only bounded metadata and classified errors.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import re
 import secrets
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 10
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
@@ -77,6 +78,16 @@ class JobClaim:
     owner_pid: int
     owner_host: str
     lease_expires_at: float
+    attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewRevisionClaim:
+    revision_id: str
+    source_review_id: str
+    root_assimilation_id: str
+    instruction_text: str
+    claim_token: str
     attempt_count: int
 
 
@@ -783,6 +794,96 @@ class IntakeStore:
                         "VALUES('schema_version', '8')"
                     )
                     version = 8
+                if version < 9:
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute(
+                            "PRAGMA table_info(client_knowledge_reviews)"
+                        ).fetchall()
+                    }
+                    additions = {
+                        "detail_state": "TEXT NOT NULL DEFAULT 'pending'",
+                        "detail_content_sha256": "TEXT",
+                        "detail_thread_id": "TEXT",
+                        "capture_mode": "TEXT",
+                        "capture_user_id": "TEXT",
+                        "capture_role_id": "TEXT",
+                        "capture_channel_id": "TEXT",
+                        "capture_started_at": "REAL",
+                    }
+                    for name, definition in additions.items():
+                        if name not in columns:
+                            conn.execute(
+                                f"ALTER TABLE client_knowledge_reviews ADD COLUMN {name} {definition}"
+                            )
+                    conn.execute(
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_review_notification_history (
+                            review_id TEXT NOT NULL REFERENCES client_knowledge_reviews(review_id) ON DELETE CASCADE,
+                            revision INTEGER NOT NULL,
+                            notification_state TEXT NOT NULL,
+                            content_sha256 TEXT,
+                            message_id TEXT,
+                            guild_id TEXT,
+                            channel_id TEXT,
+                            role_id TEXT,
+                            marker TEXT,
+                            detail_state TEXT,
+                            detail_content_sha256 TEXT,
+                            detail_thread_id TEXT,
+                            archived_at REAL NOT NULL,
+                            PRIMARY KEY(review_id, revision)
+                        )"""
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '9')"
+                    )
+                    version = 9
+                if version < 10:
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute(
+                            "PRAGMA table_info(client_knowledge_reviews)"
+                        ).fetchall()
+                    }
+                    additions = {
+                        "parent_review_id": "TEXT",
+                        "superseded_by_review_id": "TEXT",
+                        "revision_number": "INTEGER NOT NULL DEFAULT 0",
+                    }
+                    for name, definition in additions.items():
+                        if name not in columns:
+                            conn.execute(
+                                f"ALTER TABLE client_knowledge_reviews ADD COLUMN {name} {definition}"
+                            )
+                    conn.execute(
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_review_revisions (
+                            revision_id TEXT PRIMARY KEY,
+                            source_review_id TEXT NOT NULL UNIQUE REFERENCES client_knowledge_reviews(review_id) ON DELETE CASCADE,
+                            root_assimilation_id TEXT NOT NULL REFERENCES assimilation_proposals(assimilation_id),
+                            replacement_assimilation_id TEXT UNIQUE REFERENCES assimilation_proposals(assimilation_id),
+                            replacement_review_id TEXT UNIQUE REFERENCES client_knowledge_reviews(review_id),
+                            instruction_text TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            attempt_count INTEGER NOT NULL DEFAULT 0,
+                            claim_token TEXT,
+                            lease_expires_at REAL,
+                            next_retry_at REAL,
+                            last_error_class TEXT,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL,
+                            completed_at REAL
+                        )"""
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS client_knowledge_review_revisions_pickup_idx "
+                        "ON client_knowledge_review_revisions(state, next_retry_at, created_at)"
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '10')"
+                    )
+                    version = 10
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -1486,6 +1587,13 @@ class IntakeStore:
                 raise ValueError("artifact does not exist")
             return self._artifact_from_row(row)
 
+    def get_artifact(self, artifact_id: str) -> IntakeArtifact | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (artifact_id,)
+            ).fetchone()
+            return self._artifact_from_row(row) if row else None
+
     @staticmethod
     def _active_stage_claim_locked(
         conn: sqlite3.Connection, claim: JobClaim, stage: str, *, now: float
@@ -1841,6 +1949,71 @@ class IntakeStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_active_review_for_assimilation(
+        self, assimilation_id: str
+    ) -> dict[str, Any] | None:
+        """Follow durable supersession links to the current review."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_reviews WHERE assimilation_id=?",
+                (assimilation_id,),
+            ).fetchone()
+            seen: set[str] = set()
+            while row is not None and row["state"] == "superseded":
+                source_review_id = str(row["review_id"])
+                if source_review_id in seen:
+                    raise ValueError("review supersession cycle detected")
+                seen.add(source_review_id)
+                replacement_review_id = str(row["superseded_by_review_id"] or "")
+                revision = conn.execute(
+                    "SELECT replacement_review_id, state "
+                    "FROM client_knowledge_review_revisions WHERE source_review_id=?",
+                    (source_review_id,),
+                ).fetchone()
+                if (
+                    not replacement_review_id
+                    or revision is None
+                    or revision[1] != "succeeded"
+                    or str(revision[0] or "") != replacement_review_id
+                ):
+                    return dict(row)
+                row = conn.execute(
+                    "SELECT * FROM client_knowledge_reviews WHERE review_id=?",
+                    (replacement_review_id,),
+                ).fetchone()
+            return dict(row) if row else None
+
+    def get_review_revision(self, revision_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_review_revisions WHERE revision_id=?",
+                (revision_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_review_revision_for_source(
+        self, source_review_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_review_revisions WHERE source_review_id=?",
+                (source_review_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_review_by_notification_message(
+        self, message_id: str
+    ) -> dict[str, Any] | None:
+        if not str(message_id or "").isdigit():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_reviews "
+                "WHERE notification_message_id=?",
+                (str(message_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
     def list_pending_reviews(self, *, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as conn:
             return [
@@ -1848,6 +2021,24 @@ class IntakeStore:
                 for row in conn.execute(
                     "SELECT * FROM client_knowledge_reviews WHERE state='pending' "
                     "ORDER BY created_at LIMIT ?", (max(1, min(limit, 500)),)
+                ).fetchall()
+            ]
+
+    def list_open_reviews(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT reviews.*, revisions.revision_id AS pending_revision_id, "
+                    "revisions.state AS revision_state, "
+                    "revisions.attempt_count AS revision_attempt_count, "
+                    "revisions.last_error_class AS revision_error_class "
+                    "FROM client_knowledge_reviews AS reviews "
+                    "LEFT JOIN client_knowledge_review_revisions AS revisions "
+                    "ON revisions.source_review_id=reviews.review_id "
+                    "WHERE reviews.state IN ('pending','instructions_pending') "
+                    "ORDER BY reviews.created_at LIMIT ?",
+                    (max(1, min(limit, 500)),),
                 ).fetchall()
             ]
 
@@ -1862,9 +2053,14 @@ class IntakeStore:
         role_id: str,
         marker: str,
         message_id: str = "",
+        detail_state: str = "pending",
+        detail_content_sha256: str = "",
+        detail_thread_id: str = "",
     ) -> None:
         if state not in {"pending", "confirmed", "proven_none", "uncertain"}:
             raise ValueError("invalid review notification state")
+        if detail_state not in {"pending", "confirmed", "proven_none", "uncertain"}:
+            raise ValueError("invalid review detail state")
         now = time.time()
         with self._write() as conn:
             row = conn.execute(
@@ -1885,10 +2081,12 @@ class IntakeStore:
                 "UPDATE client_knowledge_reviews SET notification_state=?, "
                 "notification_content_sha256=?, notification_message_id=COALESCE(notification_message_id, ?), "
                 "notification_guild_id=?, notification_channel_id=?, notification_role_id=?, "
-                "notification_marker=?, updated_at=? WHERE review_id=?",
+                "notification_marker=?, detail_state=?, detail_content_sha256=?, "
+                "detail_thread_id=COALESCE(detail_thread_id, ?), updated_at=? WHERE review_id=?",
                 (
                     state, content_sha256, message_id or None, guild_id, channel_id,
-                    role_id, marker, now, review_id,
+                    role_id, marker, detail_state, detail_content_sha256 or None,
+                    detail_thread_id or None, now, review_id,
                 ),
             )
 
@@ -1953,22 +2151,40 @@ class IntakeStore:
         now = time.time()
         with self._write() as conn:
             review = conn.execute(
-                "SELECT artifact_id, state, notification_state, notification_message_id "
+                "SELECT artifact_id, state, notification_state, notification_message_id, "
+                "capture_mode, capture_user_id, detail_state, detail_thread_id "
                 "FROM client_knowledge_reviews WHERE review_id=?", (review_id,)
             ).fetchone()
             if review is None or review[1] != "pending":
                 return False
             if review[2] != "confirmed" or not review[3]:
                 raise ValueError("review notification is not confirmed")
-            conn.execute(
+            if review[6] != "confirmed" or not review[7]:
+                raise ValueError("review details are not confirmed")
+            capture_mode = str(review[4] or "")
+            if capture_mode and not (
+                decision == "rejected"
+                and capture_mode == "reject_reason"
+                and str(review[5] or "") == reviewer_user_id
+            ):
+                return False
+            changed = conn.execute(
                 "UPDATE client_knowledge_reviews SET state=?, reviewer_user_id=?, reviewer_role_id=?, "
-                "decision_message_id=?, decision_reason=?, decided_at=?, updated_at=? "
-                "WHERE review_id=? AND state='pending'",
+                "decision_message_id=?, decision_reason=?, capture_mode=NULL, "
+                "capture_user_id=NULL, capture_role_id=NULL, capture_channel_id=NULL, "
+                "capture_started_at=NULL, decided_at=?, updated_at=? "
+                "WHERE review_id=? AND state='pending' AND notification_state='confirmed' "
+                "AND detail_state='confirmed' AND detail_thread_id IS NOT NULL "
+                "AND (COALESCE(capture_mode, '')='' OR "
+                "(capture_mode='reject_reason' AND capture_user_id=? AND ?='rejected'))",
                 (
                     decision, reviewer_user_id, reviewer_role_id or None,
                     decision_message_id, reason or None, now, now, review_id,
+                    reviewer_user_id, decision,
                 ),
-            )
+            ).rowcount
+            if changed != 1:
+                return False
             if decision == "approved":
                 conn.execute(
                     "UPDATE jobs SET status='succeeded', last_error_class=NULL, updated_at=? "
@@ -2004,6 +2220,424 @@ class IntakeStore:
                     (now, review[0]),
                 )
             return True
+
+    def begin_review_text_capture(
+        self,
+        review_id: str,
+        *,
+        mode: str,
+        reviewer_user_id: str,
+        reviewer_role_id: str,
+        channel_id: str,
+    ) -> bool:
+        if mode not in {"reject_reason", "instructions"}:
+            raise ValueError("invalid review text-capture mode")
+        if not reviewer_user_id or not str(channel_id).isdigit():
+            raise ValueError("review text capture requires a user and channel")
+        now = time.time()
+        with self._write() as conn:
+            review = conn.execute(
+                "SELECT state, notification_state, notification_message_id, capture_mode, "
+                "detail_state, detail_thread_id "
+                "FROM client_knowledge_reviews WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if (
+                review is None
+                or review[0] != "pending"
+                or review[1] != "confirmed"
+                or not review[2]
+                or str(review[3] or "")
+                or review[4] != "confirmed"
+                or not review[5]
+            ):
+                return False
+            return conn.execute(
+                "UPDATE client_knowledge_reviews SET capture_mode=?, capture_user_id=?, "
+                "capture_role_id=?, capture_channel_id=?, capture_started_at=?, updated_at=? "
+                "WHERE review_id=? AND state='pending' AND COALESCE(capture_mode, '')=''",
+                (
+                    mode,
+                    reviewer_user_id,
+                    reviewer_role_id or None,
+                    channel_id,
+                    now,
+                    now,
+                    review_id,
+                ),
+            ).rowcount == 1
+
+    def get_review_text_capture(
+        self,
+        *,
+        guild_id: str,
+        channel_id: str,
+        user_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_reviews WHERE state='pending' "
+                "AND notification_state='confirmed' AND notification_guild_id=? "
+                "AND capture_channel_id=? AND capture_user_id=? "
+                "AND COALESCE(capture_mode, '')!='' ORDER BY capture_started_at LIMIT 1",
+                (guild_id, channel_id, user_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def record_review_instruction(
+        self,
+        review_id: str,
+        *,
+        reviewer_user_id: str,
+        reviewer_role_id: str,
+        decision_message_id: str,
+        instruction: str,
+    ) -> bool:
+        text = str(instruction or "").strip()
+        if not text or len(text) > 4000:
+            raise ValueError("review instruction must be bounded non-empty text")
+        now = time.time()
+        with self._write() as conn:
+            review = conn.execute(
+                "SELECT artifact_id, state, notification_state, notification_message_id, "
+                "capture_mode, capture_user_id, detail_state, detail_thread_id "
+                "FROM client_knowledge_reviews WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if (
+                review is None
+                or review[1] != "pending"
+                or review[2] != "confirmed"
+                or not review[3]
+                or review[4] != "instructions"
+                or review[5] != reviewer_user_id
+                or review[6] != "confirmed"
+                or not review[7]
+            ):
+                return False
+            changed = conn.execute(
+                "UPDATE client_knowledge_reviews SET state='instructions_pending', "
+                "reviewer_user_id=?, reviewer_role_id=?, decision_message_id=?, "
+                "decision_reason=?, capture_mode=NULL, capture_user_id=NULL, "
+                "capture_role_id=NULL, capture_channel_id=NULL, capture_started_at=NULL, "
+                "decided_at=?, updated_at=? WHERE review_id=? AND state='pending' "
+                "AND capture_mode='instructions'",
+                (
+                    reviewer_user_id,
+                    reviewer_role_id or None,
+                    decision_message_id,
+                    text,
+                    now,
+                    now,
+                    review_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+            prior_revision = conn.execute(
+                "SELECT root_assimilation_id FROM client_knowledge_review_revisions "
+                "WHERE replacement_review_id=?",
+                (review_id,),
+            ).fetchone()
+            source = conn.execute(
+                "SELECT assimilation_id FROM client_knowledge_reviews WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if source is None:
+                raise ValueError("review disappeared during instruction capture")
+            root_assimilation_id = str(
+                prior_revision[0] if prior_revision is not None else source[0]
+            )
+            revision_id = hashlib.sha256(
+                (
+                    "client-knowledge-review-revision\0"
+                    + review_id
+                    + "\0"
+                    + decision_message_id
+                    + "\0"
+                    + text
+                ).encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                "INSERT INTO client_knowledge_review_revisions("
+                "revision_id, source_review_id, root_assimilation_id, instruction_text, "
+                "state, created_at, updated_at) VALUES(?,?,?,?,'queued',?,?)",
+                (
+                    revision_id,
+                    review_id,
+                    root_assimilation_id,
+                    text,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='operator_blocked', next_retry_at=NULL, "
+                "last_error_class='review_instructions_pending', updated_at=? "
+                "WHERE artifact_id=? AND stage IN ('needs_review','assimilated') "
+                "AND (stage='assimilated' OR status!='succeeded')",
+                (now, review[0]),
+            )
+            return True
+
+    def claim_next_review_revision(
+        self,
+        *,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        now: float | None = None,
+    ) -> ReviewRevisionClaim | None:
+        timestamp = time.time() if now is None else float(now)
+        lease = max(1.0, float(lease_seconds))
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE client_knowledge_review_revisions SET state='failed', "
+                "claim_token=NULL, lease_expires_at=NULL, next_retry_at=?, "
+                "last_error_class='review_revision_claim_expired', updated_at=? "
+                "WHERE state='running' AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at<=?",
+                (timestamp, timestamp, timestamp),
+            )
+            row = conn.execute(
+                "SELECT revision_id, source_review_id, root_assimilation_id, "
+                "instruction_text, attempt_count FROM client_knowledge_review_revisions "
+                "WHERE state IN ('queued','failed') "
+                "AND (next_retry_at IS NULL OR next_retry_at<=?) "
+                "ORDER BY created_at, revision_id LIMIT 1",
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                return None
+            token = secrets.token_urlsafe(24)
+            attempt = int(row[4]) + 1
+            changed = conn.execute(
+                "UPDATE client_knowledge_review_revisions SET state='running', "
+                "attempt_count=?, claim_token=?, lease_expires_at=?, "
+                "next_retry_at=NULL, last_error_class=NULL, updated_at=? "
+                "WHERE revision_id=? AND state IN ('queued','failed')",
+                (attempt, token, timestamp + lease, timestamp, row[0]),
+            ).rowcount
+            if changed != 1:
+                return None
+            return ReviewRevisionClaim(
+                revision_id=str(row[0]),
+                source_review_id=str(row[1]),
+                root_assimilation_id=str(row[2]),
+                instruction_text=str(row[3]),
+                claim_token=token,
+                attempt_count=attempt,
+            )
+
+    def fail_review_revision(
+        self,
+        claim: ReviewRevisionClaim,
+        *,
+        error_class: str,
+        retry_delay: float,
+    ) -> bool:
+        now = time.time()
+        error = _error_class(error_class)
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_review_revisions SET state='failed', "
+                "claim_token=NULL, lease_expires_at=NULL, next_retry_at=?, "
+                "last_error_class=?, updated_at=? WHERE revision_id=? "
+                "AND source_review_id=? AND state='running' AND claim_token=?",
+                (
+                    now + max(0.0, float(retry_delay)),
+                    error,
+                    now,
+                    claim.revision_id,
+                    claim.source_review_id,
+                    claim.claim_token,
+                ),
+            ).rowcount == 1
+
+    def complete_review_revision(
+        self,
+        claim: ReviewRevisionClaim,
+        *,
+        assimilation: Mapping[str, Any],
+        replacement_review_id: str,
+        reason_code: str,
+    ) -> bool:
+        """Atomically persist a revised proposal and superseding review."""
+        now = time.time()
+        with self._write() as conn:
+            revision = conn.execute(
+                "SELECT state, claim_token, lease_expires_at, instruction_text "
+                "FROM client_knowledge_review_revisions WHERE revision_id=? "
+                "AND source_review_id=?",
+                (claim.revision_id, claim.source_review_id),
+            ).fetchone()
+            source_review = conn.execute(
+                "SELECT * FROM client_knowledge_reviews WHERE review_id=?",
+                (claim.source_review_id,),
+            ).fetchone()
+            if (
+                revision is None
+                or revision[0] != "running"
+                or revision[1] != claim.claim_token
+                or revision[2] is None
+                or float(revision[2]) <= now
+                or str(revision[3]) != claim.instruction_text
+                or source_review is None
+                or source_review["state"] != "instructions_pending"
+                or str(source_review["decision_reason"] or "") != claim.instruction_text
+            ):
+                return False
+            values = (
+                assimilation["assimilation_id"],
+                assimilation["artifact_id"],
+                assimilation["interpretation_id"],
+                assimilation["assimilation_version"],
+                assimilation["schema_version"],
+                assimilation["prompt_version"],
+                assimilation["policy_version"],
+                assimilation["project_key"],
+                assimilation["proposal_sha256"],
+                assimilation["derived_storage_id"],
+                assimilation["derived_object_key"],
+                assimilation["output_sha256"],
+                int(assimilation["output_bytes"]),
+                assimilation["actual_provider"],
+                assimilation["actual_model"],
+                assimilation["selected_provider"],
+                assimilation["selected_model"],
+                assimilation["model_tier"],
+                assimilation["route_fingerprint"],
+                1,
+                reason_code,
+                assimilation["base_git_head"],
+                None,
+                0,
+                now,
+            )
+            existing = conn.execute(
+                "SELECT * FROM assimilation_proposals WHERE assimilation_id=?",
+                (assimilation["assimilation_id"],),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO assimilation_proposals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+            elif tuple(existing[name] for name in tuple(existing.keys())[:22]) != values[:22]:
+                raise ValueError("review revision conflicts with immutable assimilation metadata")
+            revision_number = int(source_review["revision_number"] or 0) + 1
+            conn.execute(
+                "INSERT INTO client_knowledge_reviews("
+                "review_id, assimilation_id, artifact_id, project_key, proposal_sha256, "
+                "assimilation_version, state, reason_code, parent_review_id, revision_number, "
+                "created_at, updated_at) VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?)",
+                (
+                    replacement_review_id,
+                    assimilation["assimilation_id"],
+                    assimilation["artifact_id"],
+                    assimilation["project_key"],
+                    assimilation["proposal_sha256"],
+                    assimilation["assimilation_version"],
+                    reason_code,
+                    claim.source_review_id,
+                    revision_number,
+                    now,
+                    now,
+                ),
+            )
+            changed = conn.execute(
+                "UPDATE client_knowledge_reviews SET state='superseded', "
+                "superseded_by_review_id=?, updated_at=? WHERE review_id=? "
+                "AND state='instructions_pending'",
+                (replacement_review_id, now, claim.source_review_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("source review could not be superseded")
+            conn.execute(
+                "UPDATE client_knowledge_review_revisions SET state='succeeded', "
+                "replacement_assimilation_id=?, replacement_review_id=?, claim_token=NULL, "
+                "lease_expires_at=NULL, next_retry_at=NULL, last_error_class=NULL, "
+                "completed_at=?, updated_at=? WHERE revision_id=? AND state='running' "
+                "AND claim_token=?",
+                (
+                    assimilation["assimilation_id"],
+                    replacement_review_id,
+                    now,
+                    now,
+                    claim.revision_id,
+                    claim.claim_token,
+                ),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='operator_blocked', next_retry_at=NULL, "
+                "last_error_class='review_pending', updated_at=? WHERE artifact_id=? "
+                "AND stage IN ('needs_review','assimilated') "
+                "AND (stage='assimilated' OR status!='succeeded')",
+                (now, assimilation["artifact_id"]),
+            )
+            return True
+
+    def refresh_review_notification(self, review_id: str) -> bool:
+        """Archive one pending card and queue a replacement when safe.
+
+        A legacy card is always refreshable. A native card is refreshable only
+        when its detail thread was not fully confirmed; a healthy native card
+        is never duplicated.
+        """
+        now = time.time()
+        with self._write() as conn:
+            review = conn.execute(
+                "SELECT * FROM client_knowledge_reviews WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if (
+                review is None
+                or review["state"] != "pending"
+                or review["notification_state"] != "confirmed"
+                or not review["notification_message_id"]
+                or (
+                    str(review["notification_marker"] or "").endswith(":ux2]")
+                    and review["detail_state"] == "confirmed"
+                    and review["detail_thread_id"]
+                )
+            ):
+                return False
+            revision = int(conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 "
+                "FROM client_knowledge_review_notification_history WHERE review_id=?",
+                (review_id,),
+            ).fetchone()[0])
+            conn.execute(
+                "INSERT INTO client_knowledge_review_notification_history("
+                "review_id, revision, notification_state, content_sha256, message_id, "
+                "guild_id, channel_id, role_id, marker, detail_state, "
+                "detail_content_sha256, detail_thread_id, archived_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    review_id,
+                    revision,
+                    review["notification_state"],
+                    review["notification_content_sha256"],
+                    review["notification_message_id"],
+                    review["notification_guild_id"],
+                    review["notification_channel_id"],
+                    review["notification_role_id"],
+                    review["notification_marker"],
+                    review["detail_state"],
+                    review["detail_content_sha256"],
+                    review["detail_thread_id"],
+                    now,
+                ),
+            )
+            return conn.execute(
+                "UPDATE client_knowledge_reviews SET notification_state='pending', "
+                "notification_content_sha256=NULL, notification_message_id=NULL, "
+                "notification_guild_id=NULL, notification_channel_id=NULL, "
+                "notification_role_id=NULL, notification_marker=NULL, "
+                "detail_state='pending', detail_content_sha256=NULL, detail_thread_id=NULL, "
+                "capture_mode=NULL, capture_user_id=NULL, capture_role_id=NULL, "
+                "capture_channel_id=NULL, capture_started_at=NULL, updated_at=? "
+                "WHERE review_id=? AND state='pending'",
+                (now, review_id),
+            ).rowcount == 1
 
     def record_publication(
         self,
@@ -2875,6 +3509,7 @@ __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "IntakeStore",
     "JobClaim",
+    "ReviewRevisionClaim",
     "resolve_intake_store_path",
     "resolve_store_path",
 ]

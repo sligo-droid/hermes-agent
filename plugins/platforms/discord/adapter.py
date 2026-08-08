@@ -28,7 +28,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple, cast
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Any, Tuple, cast
 from urllib.parse import quote, urljoin, urlparse
 
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
@@ -651,6 +651,48 @@ def _discord_embed_for_metadata(metadata: Optional[Dict[str, Any]] = None):
                     continue
                 add_field(name=name, value=value, inline=bool(field.get("inline")))
     return embed
+
+
+def _discord_components_for_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("_discord_components")
+    if not isinstance(raw, list) or len(raw) > 5:
+        return None
+    rows: List[Dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, dict) or row.get("type") != 1:
+            return None
+        components = row.get("components")
+        if not isinstance(components, list) or not components or len(components) > 5:
+            return None
+        clean_components: List[Dict[str, Any]] = []
+        for component in components:
+            if not isinstance(component, dict) or component.get("type") != 2:
+                return None
+            label = str(component.get("label") or "").strip()
+            custom_id = str(component.get("custom_id") or "").strip()
+            style = int(component.get("style") or 0)
+            if (
+                not label
+                or utf16_len(label) > _DISCORD_BUTTON_LABEL_LIMIT
+                or not custom_id
+                or utf16_len(custom_id) > 100
+                or style not in {1, 2, 3, 4}
+            ):
+                return None
+            clean_components.append(
+                {
+                    "type": 2,
+                    "style": style,
+                    "label": label,
+                    "custom_id": custom_id,
+                }
+            )
+        rows.append({"type": 1, "components": clean_components})
+    return rows
 
 
 class VoiceReceiver:
@@ -4296,6 +4338,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
+
+            try:
+                from hermes_cli.plugins import get_discord_component_views
+
+                for definition in get_discord_component_views():
+                    self._client.add_view(PluginPersistentView(definition))
+            except Exception:
+                logger.exception("[%s] Failed to register plugin Discord component views", self.name)
 
             # Register event handlers
             @self._client.event
@@ -15455,7 +15505,57 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, PluginPersistentView
+
+    class PluginPersistentView(discord.ui.View):
+        """Generic timeout-free button view registered by a trusted plugin."""
+
+        def __init__(self, definition: Mapping[str, Any]):
+            super().__init__(timeout=None)
+            name = str(definition.get("name") or "")
+            handler = definition.get("handler")
+            self.name = name
+            self.handler = handler
+            style_map = {
+                "primary": discord.ButtonStyle.primary,
+                "secondary": discord.ButtonStyle.secondary,
+                "success": discord.ButtonStyle.success,
+                "danger": discord.ButtonStyle.danger,
+            }
+            for component in definition.get("components") or []:
+                action = str(component.get("action") or "")
+                button = discord.ui.Button(
+                    label=str(component.get("label") or ""),
+                    style=style_map[str(component.get("style") or "secondary")],
+                    custom_id=f"{name}:{action}",
+                )
+                button.callback = self._callback_for(action)
+                self.add_item(button)
+
+        def _callback_for(self, action: str):
+            async def _callback(interaction: "discord.Interaction") -> None:
+                try:
+                    result = self.handler(interaction, action)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.exception(
+                        "Discord plugin component handler failed (view=%s action=%s)",
+                        self.name,
+                        action,
+                    )
+                    response = getattr(interaction, "response", None)
+                    send = getattr(response, "send_message", None)
+                    if callable(send):
+                        try:
+                            await send(
+                                "This action could not be completed safely.",
+                                ephemeral=True,
+                            )
+                        except Exception:
+                            pass
+
+            return _callback
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -16679,6 +16779,9 @@ async def _standalone_send(
     strict_single = bool(metadata and metadata.get("require_single_message"))
     raw_roles = metadata.get("allowed_role_mentions") if isinstance(metadata, dict) else None
     roles = [str(value) for value in (raw_roles or []) if str(value).isdigit()]
+    metadata_embed = metadata.get("_discord_embed") if isinstance(metadata, dict) else None
+    metadata_components = _discord_components_for_metadata(metadata)
+    thread_spec = metadata.get("_discord_thread") if isinstance(metadata, dict) else None
     if strict_single:
         if thread_id or media_files or caption or len(message) > 1800 or len(roles) != 1:
             return {
@@ -16690,6 +16793,30 @@ async def _standalone_send(
         if role_token not in message or mentions != [roles[0]] or "@everyone" in message or "@here" in message:
             return {
                 "error": "Discord strict review mention validation failed",
+                "side_effect_state": "proven_none",
+            }
+        if not isinstance(metadata_embed, dict) or metadata_components is None:
+            return {
+                "error": "Discord strict structured review payload is invalid",
+                "side_effect_state": "proven_none",
+            }
+        fields = metadata_embed.get("fields", [])
+        if (
+            len(str(metadata_embed.get("title") or "")) > 256
+            or len(str(metadata_embed.get("description") or "")) > 4096
+            or not isinstance(fields, list)
+            or len(fields) > 25
+            or any(
+                not isinstance(field, dict)
+                or not str(field.get("name") or "").strip()
+                or len(str(field.get("name") or "")) > 256
+                or not str(field.get("value") or "").strip()
+                or len(str(field.get("value") or "")) > 1024
+                for field in fields
+            )
+        ):
+            return {
+                "error": "Discord strict review embed validation failed",
                 "side_effect_state": "proven_none",
             }
     allowed_mentions = {
@@ -16851,6 +16978,10 @@ async def _standalone_send(
                 payload = {"content": message}
                 if allowed_mentions is not None:
                     payload["allowed_mentions"] = allowed_mentions
+                if isinstance(metadata_embed, dict):
+                    payload["embeds"] = [metadata_embed]
+                if metadata_components is not None:
+                    payload["components"] = metadata_components
                 async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await _standalone_read_text_limited(
@@ -16935,9 +17066,72 @@ async def _standalone_send(
                 "error": "Discord strict send returned no message identity",
                 "side_effect_state": "uncertain",
             }
+        detail_state = "pending"
+        detail_thread_id = None
+        if strict_single and isinstance(thread_spec, dict):
+            thread_name = str(thread_spec.get("name") or "Review details").strip()[:100]
+            detail_messages = thread_spec.get("messages")
+            if (
+                not thread_name
+                or not isinstance(detail_messages, list)
+                or not detail_messages
+                or any(
+                    not isinstance(item, str) or not item.strip() or len(item) > 1900
+                    for item in detail_messages
+                )
+            ):
+                detail_state = "proven_none"
+            else:
+                detail_state = "uncertain"
+                thread_url = f"https://discord.com/api/v10/channels/{chat_id}/messages/{message_id}/threads"
+                try:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
+                    ) as detail_session:
+                        async with detail_session.post(
+                            thread_url,
+                            headers=json_headers,
+                            json={"name": thread_name, "auto_archive_duration": 10080},
+                            **_req_kw,
+                        ) as detail_resp:
+                            if detail_resp.status not in {200, 201}:
+                                detail_state = "proven_none"
+                            else:
+                                detail_data = await _standalone_read_json_limited(
+                                    detail_resp,
+                                    _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                                )
+                                detail_thread_id = str(detail_data.get("id") or "")
+                        if detail_thread_id:
+                            detail_state = "confirmed"
+                            detail_url = (
+                                f"https://discord.com/api/v10/channels/{detail_thread_id}/messages"
+                            )
+                            for detail_message in detail_messages:
+                                async with detail_session.post(
+                                    detail_url,
+                                    headers=json_headers,
+                                    json={
+                                        "content": detail_message,
+                                        "allowed_mentions": {
+                                            "parse": [],
+                                            "roles": [],
+                                            "users": [],
+                                            "replied_user": False,
+                                        },
+                                    },
+                                    **_req_kw,
+                                ) as detail_resp:
+                                    if detail_resp.status not in {200, 201}:
+                                        detail_state = "uncertain"
+                                        break
+                except Exception:
+                    detail_state = "uncertain"
         result = {
             "success": True, "platform": "discord", "chat_id": chat_id,
             "message_id": message_id, "side_effect_state": "confirmed",
+            "detail_state": detail_state,
+            "thread_id": detail_thread_id,
         }
         if warnings:
             result["warnings"] = warnings
