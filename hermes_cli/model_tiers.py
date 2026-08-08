@@ -80,7 +80,7 @@ DEFAULT_MODEL_TIERS: dict[str, dict[str, Any]] = {
     "discord_action": {
         "model": "gpt-5.6-sol",
         "opencode_model": "hermes-codex/gpt-5.6-sol",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "high",
         "fast_mode": False,
     },
     # Discord observation starts at Sol/low. If the model discovers that the

@@ -1217,16 +1217,16 @@ choose a model and reasoning effort.
 | Tier | Model | Effort | Default routes |
 |------|-------|--------|----------------|
 | `trivial` | GPT-5.6 Luna | `medium` | Unpinned cron jobs |
-| `basic` | GPT-5.6 Terra | `medium` | Ordinary gateway sessions |
+| `basic` | GPT-5.6 Terra | `high` | Ordinary gateway sessions |
 | `intermediate` | GPT-5.6 Sol | `low` | Coding-worker build passes and Kanban `dev` |
 | `advanced` | GPT-5.6 Sol | `medium` | Complex coding-worker plans and Kanban `planner`, `reviewer`, and `foreman` |
-| `discord_action` | GPT-5.6 Sol | `medium` | Accepted Discord action requests |
+| `discord_action` | GPT-5.6 Sol | `high` | Accepted Discord action requests |
 | `discord_read_only` | GPT-5.6 Sol | `low` | Non-mutating Discord questions and observation |
 | `deep_review` | GPT-5.6 Sol | `high` | Explicit higher-reasoning Discord turns and authorized root delegation |
 
 These code-owned built-ins make the ordinary Hermes routes latency-conscious:
 repeatable work uses Luna, ordinary gateway work uses Terra, Discord observation
-uses Sol/`low`, and action orchestration uses Sol/`medium`. Explicit requests for
+uses Sol/`low`, and action orchestration uses Sol/`high`. Explicit requests for
 high or higher reasoning, `xhigh`, deeper thinking, or a deep review select the
 reserved Sol/`high` tier for that Discord turn. Hermes does not automatically
 promote ordinary high-risk wording to this tier. Explicit `model_tier` choices on

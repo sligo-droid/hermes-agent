@@ -68,7 +68,7 @@ def test_default_routes_reference_resolvable_tiers():
         "basic": "high",
         "intermediate": "low",
         "advanced": "medium",
-        "discord_action": "medium",
+        "discord_action": "high",
         "discord_read_only": "low",
     }
     assert {
