@@ -723,7 +723,7 @@ def test_historical_assimilation_rows_remain_readable_after_schema_v11(tmp_path)
     assert "honcho_projected" not in jobs
 
 
-def test_schema_v10_history_migrates_to_v11_without_rewriting_legacy_rows(tmp_path):
+def test_schema_v10_history_migrates_to_current_without_rewriting_legacy_rows(tmp_path):
     db = tmp_path / "private" / "intake.db"
     store = IntakeStore(db)
     artifact = _artifact()
@@ -752,10 +752,20 @@ def test_schema_v10_history_migrates_to_v11_without_rewriting_legacy_rows(tmp_pa
     with migrated._connect() as conn:
         assert conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "11"
+        ).fetchone()[0] == str(CURRENT_SCHEMA_VERSION)
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='client_knowledge_syntheses'"
         ).fetchone()[0] == "client_knowledge_syntheses"
+        assert {"parent_synthesis_id", "superseded_by_synthesis_id"} <= {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(client_knowledge_syntheses)"
+            ).fetchall()
+        }
+        assert {"retirement_state", "retired_at"} <= {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(client_knowledge_synthesis_notifications)"
+            ).fetchall()
+        }
 
 
 def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch):

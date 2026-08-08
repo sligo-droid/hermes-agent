@@ -73,6 +73,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     restore_revision.add_argument("--item-id", required=True)
     restore_revision.add_argument("--db-path", default="")
 
+    regenerate = subs.add_parser(
+        "regenerate-undecided-synthesis",
+        help="Replace one fully undecided unpublished synthesis from persisted extraction",
+    )
+    regenerate.add_argument("--synthesis-id", required=True)
+    regenerate.add_argument("--db-path", default="")
+
     run_once = subs.add_parser(
         "run-once",
         help="Run bounded Notion, extraction, synthesis, and review stages",
@@ -279,6 +286,57 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             changed = store.restore_synthesis_item_revision(item_id)
             print(json.dumps({"item_id": item_id, "restored": changed}, sort_keys=True))
             return 0 if changed else 1
+        if action == "regenerate-undecided-synthesis":
+            import asyncio
+
+            from agent.plugin_llm import PluginLlm
+            from hermes_cli.config import load_config
+
+            from .derived import DerivedStore
+            from .regeneration import regenerate_undecided_synthesis
+            from .review import (
+                retire_superseded_synthesis_review,
+                send_pending_review_notifications,
+            )
+
+            synthesis_id = str(args.synthesis_id or "").strip().lower()
+            if len(synthesis_id) != 64 or any(
+                ch not in "0123456789abcdef" for ch in synthesis_id
+            ):
+                raise ValueError("synthesis_id must be a canonical opaque id")
+            store.preflight_synthesis_regeneration(synthesis_id)
+            config = load_config() or {}
+            derived = DerivedStore()
+            replacement_id = regenerate_undecided_synthesis(
+                synthesis_id,
+                store=store,
+                derived=derived,
+                llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
+                config=config,
+            )
+            retirement_state = retire_superseded_synthesis_review(store, synthesis_id)
+            if retirement_state != "confirmed":
+                print(json.dumps({
+                    "synthesis_id": synthesis_id,
+                    "replacement_synthesis_id": replacement_id,
+                    "retirement_state": retirement_state,
+                    "delivery": "not_attempted",
+                }, sort_keys=True))
+                return 1
+            delivery = asyncio.run(send_pending_review_notifications(
+                store=store,
+                derived=derived,
+                config=config,
+                force=True,
+                synthesis_id=replacement_id,
+            ))
+            print(json.dumps({
+                "synthesis_id": synthesis_id,
+                "replacement_synthesis_id": replacement_id,
+                "retirement_state": retirement_state,
+                "delivery": delivery,
+            }, sort_keys=True))
+            return 0 if delivery["confirmed"] == 1 else 1
         if action == "migrate-legacy-review":
             import asyncio
 

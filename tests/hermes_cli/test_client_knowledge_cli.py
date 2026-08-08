@@ -27,8 +27,8 @@ def test_cli_parser_registers_operator_actions_including_narrow_legacy_migration
     actions = (
         "status", "list", "show", "retry", "quarantine", "reconcile", "reviews",
         "notify-reviews-once", "adopt-review-message", "requeue-review-notification",
-        "migrate-legacy-review", "restore-item-revision", "run-once", "gmail-poll-once",
-        "notion-preflight",
+        "migrate-legacy-review", "restore-item-revision", "regenerate-undecided-synthesis",
+        "run-once", "gmail-poll-once", "notion-preflight",
     )
     for action in actions:
         if action in {"show", "retry", "quarantine"}:
@@ -41,6 +41,8 @@ def test_cli_parser_registers_operator_actions_including_narrow_legacy_migration
             suffix = ["--review-id", "a" * 64]
         elif action == "restore-item-revision":
             suffix = ["--item-id", "a" * 64]
+        elif action == "regenerate-undecided-synthesis":
+            suffix = ["--synthesis-id", "a" * 64]
         else:
             suffix = []
         args = parser.parse_args([action, *suffix])
