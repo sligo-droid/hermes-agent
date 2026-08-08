@@ -31,7 +31,6 @@ def _frontmatter(project="pid"):
     return {
         "project": project,
         "status": "current",
-        "kind": "requirement",
         "effective_at": "2026-08-04",
         "updated_at": "2026-08-04T12:00:00Z",
         "source_refs": ["notion:page:synthetic-pid-001"],
@@ -39,7 +38,6 @@ def _frontmatter(project="pid"):
         "confidence": "high",
         "sensitivity": "internal",
         "impact": "ordinary",
-        "honcho_projection": "eligible",
     }
 
 
@@ -70,6 +68,15 @@ def test_frontmatter_requires_matching_project_and_notion_citations():
             project_key="pid",
             slug="projects/pid/requirements/reporting",
         )
+
+
+def test_new_page_frontmatter_allows_no_kind_and_never_exposes_honcho():
+    value = _frontmatter()
+    validated = validate_frontmatter(
+        value, project_key="pid", slug="projects/pid/learnings/item"
+    )
+    assert "kind" not in validated
+    assert "honcho_projection" not in validated
 
 
 def test_search_results_filter_foreign_but_fail_on_missing_identity():
@@ -209,6 +216,44 @@ def test_keyword_only_requires_db_plane_readback(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="must read back as true"):
         client.assert_keyword_only()
+
+
+def test_parse_markdown_invokes_pinned_parser_and_returns_exact_shape(monkeypatch, tmp_path):
+    checkout = tmp_path / "gbrain"
+    parser = checkout / "src" / "core" / "markdown.ts"
+    parser.parent.mkdir(parents=True)
+    parser.write_text("export function parseMarkdown() {}\n", encoding="utf-8")
+    binary = tmp_path / "bun"
+    binary.write_text("", encoding="utf-8")
+    binary.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    client = GBrainClient(GBrainSettings(binary, home, checkout=checkout))
+    monkeypatch.setattr(client, "assert_pinned_version", lambda: None)
+    monkeypatch.setattr(client, "assert_pinned_checkout", lambda: None)
+    captured = {}
+
+    def run(command, **kwargs):
+        captured.update({"command": command, **kwargs})
+        return type("Completed", (), {
+            "returncode": 0,
+            "stdout": json.dumps({
+                "errors": [], "slug": "projects/pid/learnings/item",
+                "title": "Client learning", "compiled_truth": "Statement.",
+                "timeline": "## Timeline",
+            }),
+        })()
+
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.client.subprocess.run", run)
+    result = client.parse_markdown(
+        b"Statement.",
+        file_path="projects/pid/learnings/item.md",
+        expected_slug="projects/pid/learnings/item",
+    )
+    assert result["compiled_truth"] == "Statement."
+    assert captured["input"] == "Statement."
+    assert captured["command"][:2] == [str(binary), "-e"]
+    assert parser.resolve().as_uri() in captured["command"][2]
 
 
 def test_tool_handlers_enforce_project_scope(monkeypatch):

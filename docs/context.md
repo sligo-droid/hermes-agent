@@ -35,6 +35,7 @@ Use the smallest stable home for each kind of knowledge:
 | Honcho / user memory | Compact stable recall such as user preferences, environment facts, and hard safety constraints. It is non-canonical and should be rebuildable from authoritative sources. |
 | Session search | Recall prior conversations and exact past claims when needed; do not encode session progress as memory. |
 | Notion | Client-facing documents, feedback, shared project folders, and source artifacts. |
+| GBrain | Canonical, reviewed, project-scoped client learnings used by agent retrieval. Client-knowledge publication does not project to Honcho. |
 | Discord | Live conversation, approvals, operator pings, and feature threads. Not canonical state by itself. |
 
 Boundary rule: if a note is an authoritative fact, put it in the source that owns it: code, tests, config, git/PRs, runtime evidence, a focused doc, or a runbook. Use `docs/project-state.md` only for tiny routing/pickup facts that tell future workers which source to inspect next. If a note says “why this product or architecture works this way,” put it here or in `docs/decisions/`. If it says “how to debug this class of incident,” keep it in a skill/reference and link to repo docs only when needed.

@@ -690,7 +690,7 @@ def test_external_receipts_and_cursors_are_idempotent(tmp_path):
     assert store.get_cursor("gmail.history") == "cursor-1"
 
 
-def test_noop_assimilation_skips_honcho_and_queues_complete(tmp_path):
+def test_historical_assimilation_rows_remain_readable_after_schema_v11(tmp_path):
     store = IntakeStore(tmp_path / "intake.db")
     spool = RawSpool(tmp_path / "raw")
     artifact = _artifact()
@@ -723,6 +723,41 @@ def test_noop_assimilation_skips_honcho_and_queues_complete(tmp_path):
     assert "honcho_projected" not in jobs
 
 
+def test_schema_v10_history_migrates_to_v11_without_rewriting_legacy_rows(tmp_path):
+    db = tmp_path / "private" / "intake.db"
+    store = IntakeStore(db)
+    artifact = _artifact()
+    store.insert_artifact(artifact)
+    now = 10.0
+    with store._write() as conn:
+        conn.execute(
+            "INSERT INTO honcho_projections VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("projection", "pid", "legacy/page", "a" * 64, "marker", "content",
+             "conclusion", None, "confirmed", now),
+        )
+        conn.execute(
+            "INSERT INTO extractions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("e" * 64, artifact.artifact_id, artifact.content_sha256, "m" * 64,
+             "ev", "lv", "rv", "extracted", "storage", "object", "x" * 64, 1, 1, "{}", now),
+        )
+        conn.execute("DROP TABLE client_knowledge_synthesis_publications")
+        conn.execute("DROP TABLE client_knowledge_synthesis_item_revisions")
+        conn.execute("DROP TABLE client_knowledge_synthesis_notifications")
+        conn.execute("DROP TABLE client_knowledge_synthesis_items")
+        conn.execute("DROP TABLE client_knowledge_syntheses")
+        conn.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
+    migrated = IntakeStore(db)
+    assert migrated.get_honcho_projection("pid", "legacy/page")["exact_content"] == "content"
+    assert migrated.get_extraction("e" * 64)["artifact_id"] == artifact.artifact_id
+    with migrated._connect() as conn:
+        assert conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0] == "11"
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='client_knowledge_syntheses'"
+        ).fetchone()[0] == "client_knowledge_syntheses"
+
+
 def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch):
     import plugins.client_knowledge_gbrain as plugin
 
@@ -748,21 +783,15 @@ def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch
     assert calls["tools"] == ["client_knowledge_search", "client_knowledge_get"]
     assert calls["cli"] == ["client-knowledge"]
     assert calls["hooks"] == ["pre_gateway_dispatch"]
-    assert [item["name"] for item in calls["views"]] == ["client-knowledge-review"]
+    assert [item["name"] for item in calls["views"]] == [
+        "client-knowledge-review-item", "client-knowledge-review",
+    ]
     assert [item["action"] for item in calls["views"][0]["components"]] == [
         "approve", "reject", "instructions",
     ]
     assert calls["aux"] == [
         (
-            "client_knowledge_interpret",
-            {
-                "model_tier": "advanced",
-                "required_model_tier": "advanced",
-                "configurable": False,
-            },
-        ),
-        (
-            "client_knowledge_assimilate",
+            "client_knowledge_synthesize",
             {
                 "model_tier": "advanced",
                 "required_model_tier": "advanced",
@@ -770,6 +799,16 @@ def test_plugin_registers_only_existing_tools_plus_operator_surfaces(monkeypatch
             },
         ),
     ]
+
+
+def test_fork_defaults_enable_synthesis_and_disable_legacy_live_stages():
+    from hermes_cli.fork_defaults import FORK_DEFAULT_ADDITIONS
+
+    client_knowledge = FORK_DEFAULT_ADDITIONS["client_knowledge"]
+    assert client_knowledge["synthesis"]["enabled"] is True
+    assert client_knowledge["interpretation"]["enabled"] is False
+    assert client_knowledge["assimilation"]["enabled"] is False
+    assert client_knowledge["honcho_projection"]["enabled"] is False
 
 
 def test_enabled_plugin_registers_cli_and_named_auxiliary_tasks(monkeypatch, tmp_path):
@@ -784,5 +823,4 @@ def test_enabled_plugin_registers_cli_and_named_auxiliary_tasks(monkeypatch, tmp
     manager.discover_and_load(force=True)
 
     assert "client-knowledge" in manager._cli_commands
-    assert manager._aux_tasks["client_knowledge_interpret"]["defaults"]["model_tier"] == "advanced"
-    assert manager._aux_tasks["client_knowledge_assimilate"]["defaults"]["model_tier"] == "advanced"
+    assert manager._aux_tasks["client_knowledge_synthesize"]["defaults"]["model_tier"] == "advanced"

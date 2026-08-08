@@ -16754,6 +16754,85 @@ async def _standalone_read_json_limited(resp: Any, limit_bytes: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _strict_discord_embed_is_valid(embed: Any) -> bool:
+    if not isinstance(embed, dict):
+        return False
+    fields = embed.get("fields", [])
+    footer = embed.get("footer")
+    author = embed.get("author")
+    total_units = (
+        utf16_len(str(embed.get("title") or ""))
+        + utf16_len(str(embed.get("description") or ""))
+        + (
+            utf16_len(str(footer.get("text") or ""))
+            if isinstance(footer, dict)
+            else 0
+        )
+        + (
+            utf16_len(str(author.get("name") or ""))
+            if isinstance(author, dict)
+            else 0
+        )
+    )
+    if not isinstance(fields, list) or len(fields) > 25:
+        return False
+    for field in fields:
+        if (
+            not isinstance(field, dict)
+            or not str(field.get("name") or "").strip()
+            or utf16_len(str(field.get("name") or "")) > 256
+            or not str(field.get("value") or "").strip()
+            or utf16_len(str(field.get("value") or "")) > 1024
+        ):
+            return False
+        total_units += utf16_len(str(field.get("name") or ""))
+        total_units += utf16_len(str(field.get("value") or ""))
+    return (
+        utf16_len(str(embed.get("title") or "")) <= 256
+        and utf16_len(str(embed.get("description") or "")) <= 4096
+        and (
+            not isinstance(footer, dict)
+            or utf16_len(str(footer.get("text") or "")) <= 2048
+        )
+        and (
+            not isinstance(author, dict)
+            or utf16_len(str(author.get("name") or "")) <= 256
+        )
+        and total_units <= 6000
+    )
+
+
+def _strict_discord_detail_messages_are_valid(spec: Any) -> bool:
+    if not isinstance(spec, dict):
+        return True
+    thread_name = str(spec.get("name") or "Review details").strip()
+    messages = spec.get("messages")
+    return bool(
+        thread_name
+        and isinstance(messages, list)
+        and messages
+        and all(
+            (
+                isinstance(item, str)
+                and item.strip()
+                and utf16_len(item) <= 1900
+            )
+            or (
+                isinstance(item, dict)
+                and isinstance(item.get("embeds"), list)
+                and len(item["embeds"]) == 1
+                and _strict_discord_embed_is_valid(item["embeds"][0])
+                and isinstance(item.get("components"), list)
+                and _discord_components_for_metadata(
+                    {"_discord_components": item.get("components")}
+                ) is not None
+                and utf16_len(str(item.get("content") or "")) <= 1900
+            )
+            for item in messages
+        )
+    )
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -16789,7 +16868,7 @@ async def _standalone_send(
     metadata_components = _discord_components_for_metadata(metadata)
     thread_spec = metadata.get("_discord_thread") if isinstance(metadata, dict) else None
     if strict_single:
-        if thread_id or media_files or caption or len(message) > 1800 or len(roles) != 1:
+        if thread_id or media_files or caption or utf16_len(message) > 1800 or len(roles) != 1:
             return {
                 "error": "Discord strict review notification validation failed",
                 "side_effect_state": "proven_none",
@@ -16801,25 +16880,21 @@ async def _standalone_send(
                 "error": "Discord strict review mention validation failed",
                 "side_effect_state": "proven_none",
             }
-        if not isinstance(metadata_embed, dict) or metadata_components is None:
+        if (
+            not isinstance(metadata_embed, dict)
+            or (
+                isinstance(metadata, dict)
+                and "_discord_components" in metadata
+                and metadata_components is None
+            )
+        ):
             return {
                 "error": "Discord strict structured review payload is invalid",
                 "side_effect_state": "proven_none",
             }
-        fields = metadata_embed.get("fields", [])
         if (
-            len(str(metadata_embed.get("title") or "")) > 256
-            or len(str(metadata_embed.get("description") or "")) > 4096
-            or not isinstance(fields, list)
-            or len(fields) > 25
-            or any(
-                not isinstance(field, dict)
-                or not str(field.get("name") or "").strip()
-                or len(str(field.get("name") or "")) > 256
-                or not str(field.get("value") or "").strip()
-                or len(str(field.get("value") or "")) > 1024
-                for field in fields
-            )
+            not _strict_discord_embed_is_valid(metadata_embed)
+            or not _strict_discord_detail_messages_are_valid(thread_spec)
         ):
             return {
                 "error": "Discord strict review embed validation failed",
@@ -17077,18 +17152,8 @@ async def _standalone_send(
         if strict_single and isinstance(thread_spec, dict):
             thread_name = str(thread_spec.get("name") or "Review details").strip()[:100]
             detail_messages = thread_spec.get("messages")
-            if (
-                not thread_name
-                or not isinstance(detail_messages, list)
-                or not detail_messages
-                or any(
-                    not isinstance(item, str) or not item.strip() or len(item) > 1900
-                    for item in detail_messages
-                )
-            ):
-                detail_state = "proven_none"
-            else:
-                detail_state = "uncertain"
+            detail_state = "uncertain"
+            if isinstance(detail_messages, list):
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/messages/{message_id}/threads"
                 try:
                     async with aiohttp.ClientSession(
@@ -17113,24 +17178,49 @@ async def _standalone_send(
                             detail_url = (
                                 f"https://discord.com/api/v10/channels/{detail_thread_id}/messages"
                             )
+                            detail_message_ids = []
                             for detail_message in detail_messages:
+                                if isinstance(detail_message, str):
+                                    detail_payload = {
+                                        "content": detail_message,
+                                        "allowed_mentions": {
+                                            "parse": [],
+                                            "roles": [],
+                                            "users": [],
+                                            "replied_user": False,
+                                        },
+                                    }
+                                else:
+                                    detail_payload = {
+                                        "content": str(detail_message.get("content") or ""),
+                                        "embeds": detail_message["embeds"],
+                                        "components": _discord_components_for_metadata(
+                                            {"_discord_components": detail_message["components"]}
+                                        ),
+                                        "allowed_mentions": {
+                                            "parse": [],
+                                            "roles": [],
+                                            "users": [],
+                                            "replied_user": False,
+                                        },
+                                    }
                                 delivered = False
                                 for attempt in range(3):
                                     async with detail_session.post(
                                         detail_url,
                                         headers=json_headers,
-                                        json={
-                                            "content": detail_message,
-                                            "allowed_mentions": {
-                                                "parse": [],
-                                                "roles": [],
-                                                "users": [],
-                                                "replied_user": False,
-                                            },
-                                        },
+                                        json=detail_payload,
                                         **_req_kw,
                                     ) as detail_resp:
                                         if detail_resp.status in {200, 201}:
+                                            detail_result = await _standalone_read_json_limited(
+                                                detail_resp,
+                                                _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                                            )
+                                            detail_id = str(detail_result.get("id") or "")
+                                            if not detail_id:
+                                                break
+                                            detail_message_ids.append(detail_id)
                                             delivered = True
                                             break
                                         if detail_resp.status != 429 or attempt == 2:
@@ -17157,6 +17247,8 @@ async def _standalone_send(
             "detail_state": detail_state,
             "thread_id": detail_thread_id,
         }
+        if strict_single and isinstance(thread_spec, dict):
+            result["detail_message_ids"] = locals().get("detail_message_ids", [])
         if warnings:
             result["warnings"] = warnings
         return result

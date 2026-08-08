@@ -316,6 +316,52 @@ class GBrainClient:
             raise RuntimeError("pinned GBrain get_page did not return an object")
         return result
 
+    def parse_markdown(
+        self,
+        content: bytes,
+        *,
+        file_path: str,
+        expected_slug: str,
+    ) -> dict[str, Any]:
+        """Parse one candidate page with the exact pinned GBrain parser."""
+        self.assert_pinned_version()
+        self.assert_pinned_checkout()
+        try:
+            text = bytes(content).decode("utf-8", "strict")
+        except UnicodeError as exc:
+            raise RuntimeError("candidate GBrain markdown is not UTF-8") from exc
+        checkout = self.settings.checkout
+        assert checkout is not None
+        parser_uri = (checkout / "src" / "core" / "markdown.ts").resolve().as_uri()
+        script = (
+            f"import {{ parseMarkdown }} from {json.dumps(parser_uri)};"
+            "const content = await Bun.stdin.text();"
+            f"const parsed = parseMarkdown(content, {json.dumps(file_path)}, "
+            f"{{validate:true,expectedSlug:{json.dumps(expected_slug)}}});"
+            "console.log(JSON.stringify(parsed));"
+        )
+        completed = subprocess.run(
+            [str(self.settings.executable), "-e", script],
+            cwd=str(checkout),
+            env=client_knowledge_environment(self.settings),
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=self.settings.timeout_seconds,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("pinned GBrain markdown parser failed")
+        if len(completed.stdout) > MAX_RAW_RESULT_CHARS:
+            raise RuntimeError("pinned GBrain parser response exceeded the raw result limit")
+        try:
+            result = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("pinned GBrain parser returned malformed JSON") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("pinned GBrain parser did not return an object")
+        return result
+
     def sync_no_pull(self) -> dict[str, Any]:
         self.assert_runtime_ready()
         result = self._run(

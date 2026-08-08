@@ -123,12 +123,12 @@ def validate_frontmatter(
     if _require_string(frontmatter, "project") != project_key:
         raise ClientKnowledgeValidationError("frontmatter.project does not match the path project")
     status = _require_string(frontmatter, "status")
-    kind = _require_string(frontmatter, "kind")
+    kind = frontmatter.get("kind")
     confidence = _require_string(frontmatter, "confidence")
     sensitivity = _require_string(frontmatter, "sensitivity")
     if status not in VALID_STATUSES:
         raise ClientKnowledgeValidationError("frontmatter.status is not supported")
-    if kind not in VALID_KINDS:
+    if kind is not None and kind not in VALID_KINDS:
         raise ClientKnowledgeValidationError("frontmatter.kind is not supported")
     if confidence not in VALID_CONFIDENCE:
         raise ClientKnowledgeValidationError("frontmatter.confidence is not supported")
@@ -215,7 +215,6 @@ def public_frontmatter(frontmatter: dict[str, Any], *, max_items: int = 20) -> d
     result = {
         "project": frontmatter["project"],
         "status": frontmatter["status"],
-        "kind": frontmatter["kind"],
         "effective_at": bounded_text(frontmatter["effective_at"], 100),
         "updated_at": bounded_text(frontmatter["updated_at"], 100),
         "source_refs": citations_from_frontmatter(frontmatter)[:max_items],
@@ -223,6 +222,8 @@ def public_frontmatter(frontmatter: dict[str, Any], *, max_items: int = 20) -> d
         "confidence": frontmatter["confidence"],
         "sensitivity": frontmatter["sensitivity"],
     }
+    if frontmatter.get("kind") in VALID_KINDS:
+        result["kind"] = frontmatter["kind"]
     if frontmatter.get("impact") in VALID_IMPACTS:
         result["impact"] = frontmatter["impact"]
     if frontmatter.get("honcho_projection") in VALID_PROJECTION_POLICIES:

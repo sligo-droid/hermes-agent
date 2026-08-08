@@ -59,29 +59,23 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     requeue_review.add_argument("--confirm-absent", action="store_true")
     requeue_review.add_argument("--db-path", default="")
 
-    refresh_review = subs.add_parser(
-        "refresh-review-notification",
-        help="Replace one confirmed legacy pending review with the native review UX",
+    migrate_legacy = subs.add_parser(
+        "migrate-legacy-review",
+        help="Convert one qualifying persisted legacy review to per-item review",
     )
-    refresh_review.add_argument("--review-id", required=True)
-    refresh_review.add_argument("--db-path", default="")
+    migrate_legacy.add_argument("--review-id", required=True)
+    migrate_legacy.add_argument("--db-path", default="")
 
-    repair_details = subs.add_parser(
-        "repair-review-details",
-        help="Append missing exact messages to one uncertain review detail thread",
+    restore_revision = subs.add_parser(
+        "restore-item-revision",
+        help="Restore one candidate after bounded Other-revision failures",
     )
-    repair_details.add_argument("--review-id", required=True)
-    repair_details.add_argument("--db-path", default="")
-
-    honcho = subs.add_parser(
-        "reconcile-honcho", help="Adopt deterministic Honcho projection markers"
-    )
-    honcho.add_argument("--project", required=True)
-    honcho.add_argument("--db-path", default="")
+    restore_revision.add_argument("--item-id", required=True)
+    restore_revision.add_argument("--db-path", default="")
 
     run_once = subs.add_parser(
         "run-once",
-        help="Run bounded Notion, extraction, and interpretation stages",
+        help="Run bounded Notion, extraction, synthesis, and review stages",
     )
     run_once.add_argument("--db-path", default="")
     run_once.add_argument(
@@ -156,8 +150,7 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             raw = raw if isinstance(raw, dict) else {}
             stage_enablement = {}
             for name in (
-                "notion", "extraction", "interpretation", "assimilation",
-                "review_notifications", "honcho_projection",
+                "notion", "extraction", "synthesis", "review_notifications",
             ):
                 stage_config = raw.get(name)
                 stage_enablement[name] = bool(
@@ -183,7 +176,32 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             return 0
         store = _store(getattr(args, "db_path", ""))
         if action == "status":
-            print(json.dumps({"stats": store.stats()}, sort_keys=True))
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+            client_knowledge = config.get("client_knowledge", {})
+            synthesis = (
+                client_knowledge.get("synthesis", {})
+                if isinstance(client_knowledge, dict)
+                else {}
+            )
+            print(json.dumps({
+                "stats": store.stats(),
+                "cutover": store.client_knowledge_cutover_status(),
+                "pipeline": {
+                    "live_stage": "synthesized",
+                    "synthesis_enabled": bool(
+                        synthesis.get("enabled", False)
+                        if isinstance(synthesis, dict)
+                        else False
+                    ),
+                    "legacy_live_stages": [],
+                    "persistent_component_views": [
+                        "client-knowledge-review",
+                        "client-knowledge-review-item",
+                    ],
+                },
+            }, sort_keys=True))
             return 0
         if action in {"list", "ls"}:
             jobs = store.list_jobs(
@@ -209,6 +227,7 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
             return 0
         if action == "reviews":
             reviews = store.list_open_reviews(limit=50)
+            syntheses = store.list_open_synthesis_reviews(limit=50)
             print(json.dumps({
                 "reviews": [
                     {
@@ -223,7 +242,8 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                         "revision_error_class": row.get("revision_error_class"),
                     }
                     for row in reviews
-                ]
+                ],
+                "syntheses": syntheses,
             }, sort_keys=True))
             return 0
         if action == "notify-reviews-once":
@@ -244,48 +264,51 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
         if action == "requeue-review-notification":
             if not bool(args.confirm_absent):
                 raise ValueError("operator absence confirmation is required")
-            changed = store.requeue_review_notification(str(args.review_id))
+            identity = str(args.review_id)
+            changed = store.requeue_synthesis_notification(identity)
+            if not changed:
+                changed = store.requeue_replacement_item_notification(identity)
+            if not changed:
+                changed = store.requeue_review_notification(identity)
             print(json.dumps({"review_id": str(args.review_id), "requeued": changed}, sort_keys=True))
             return 0 if changed else 1
-        if action == "refresh-review-notification":
-            review_id = str(args.review_id or "").strip().lower()
-            if len(review_id) != 64 or any(ch not in "0123456789abcdef" for ch in review_id):
-                raise ValueError("review_id must be a canonical opaque id")
-            changed = store.refresh_review_notification(review_id)
-            print(json.dumps({"review_id": review_id, "refreshed": changed}, sort_keys=True))
+        if action == "restore-item-revision":
+            item_id = str(args.item_id or "").strip().lower()
+            if len(item_id) != 64 or any(ch not in "0123456789abcdef" for ch in item_id):
+                raise ValueError("item_id must be a canonical opaque id")
+            changed = store.restore_synthesis_item_revision(item_id)
+            print(json.dumps({"item_id": item_id, "restored": changed}, sort_keys=True))
             return 0 if changed else 1
-        if action == "repair-review-details":
+        if action == "migrate-legacy-review":
+            import asyncio
+
             from .derived import DerivedStore
-            from .review import repair_review_details
+            from .legacy_migration import migrate_legacy_review
+            from .review import send_pending_review_notifications
 
             review_id = str(args.review_id or "").strip().lower()
             if len(review_id) != 64 or any(ch not in "0123456789abcdef" for ch in review_id):
                 raise ValueError("review_id must be a canonical opaque id")
-            changed = repair_review_details(store, DerivedStore(), review_id)
-            print(json.dumps({"review_id": review_id, "repaired": changed}, sort_keys=True))
-            return 0 if changed else 1
-        if action == "reconcile-honcho":
-            from hermes_cli.config import load_config
-            from .client import GBrainClient, load_settings
-            from .honcho_projection import reconcile_honcho_project
-
-            config = load_config() or {}
-            result = reconcile_honcho_project(
-                store=store,
-                client=GBrainClient(load_settings(config)),
-                project_key=str(args.project),
-                config=config,
+            store.preflight_legacy_review_migration(review_id)
+            derived = DerivedStore()
+            synthesis_id = migrate_legacy_review(
+                review_id, store=store, derived=derived
             )
-            print(json.dumps(result, sort_keys=True))
+            delivery = asyncio.run(
+                send_pending_review_notifications(store=store, derived=derived, force=True)
+            )
+            print(json.dumps({
+                "review_id": review_id,
+                "synthesis_id": synthesis_id,
+                "delivery": delivery,
+            }, sort_keys=True))
             return 0
         if action == "run-once":
             from agent.plugin_llm import PluginLlm
             from hermes_cli.config import load_config
             from .derived import DerivedStore
             from .extraction import run_extraction_once
-            from .interpretation import run_interpretation_once
-            from .assimilation import run_assimilation_once
-            from .honcho_projection import run_honcho_projection_once
+            from .synthesis import run_synthesis_once
             from .review import run_notification_once
             from .notion_archive import run_notion_once
             from .spool import RawSpool
@@ -298,13 +321,7 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                 "extraction": run_extraction_once(
                     store=store, spool=spool, derived=derived, config=config
                 ),
-                "interpretation": run_interpretation_once(
-                    store=store,
-                    derived=derived,
-                    llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
-                    config=config,
-                ),
-                "assimilation": run_assimilation_once(
+                "synthesis": run_synthesis_once(
                     store=store,
                     derived=derived,
                     llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
@@ -315,9 +332,6 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                     derived=derived,
                     config=config,
                     llm=PluginLlm(plugin_id="client-knowledge-gbrain"),
-                ),
-                "honcho_projection": run_honcho_projection_once(
-                    store=store, derived=derived, config=config,
                 ),
             }
             print(json.dumps({"mode": "client_knowledge_pipeline", **result, "stats": store.stats()}, sort_keys=True))

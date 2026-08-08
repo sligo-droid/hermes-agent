@@ -24,10 +24,10 @@ def test_persistent_plugin_view_keeps_free_text_action_last():
 
     view = PluginPersistentView(
         {
-            "name": "client-knowledge-review",
+            "name": "client-knowledge-review-item",
             "handler": handler,
             "components": [
-                {"action": "approve", "label": "Approve all", "style": "success"},
+                {"action": "approve", "label": "Approve", "style": "success"},
                 {"action": "reject", "label": "Reject", "style": "danger"},
                 {
                     "action": "instructions",
@@ -39,11 +39,11 @@ def test_persistent_plugin_view_keeps_free_text_action_last():
     )
     assert view.timeout is None
     assert [button.label for button in view.children] == [
-        "Approve all",
+        "Approve",
         "Reject",
         "✍️ Other",
     ]
-    assert view.children[-1].custom_id == "client-knowledge-review:instructions"
+    assert view.children[-1].custom_id == "client-knowledge-review-item:instructions"
     response = SimpleNamespace(defer=AsyncMock(), is_done=lambda: False)
     asyncio.run(view.children[-1].callback(SimpleNamespace(response=response)))
     response.defer.assert_awaited_once_with(ephemeral=True, thinking=False)
@@ -93,10 +93,10 @@ async def test_discord_cold_connect_registers_discovered_persistent_view(monkeyp
             return None
 
     definition = {
-        "name": "client-knowledge-review",
+        "name": "client-knowledge-review-item",
         "handler": AsyncMock(),
         "components": [
-            {"action": "approve", "label": "Approve all", "style": "success"},
+            {"action": "approve", "label": "Approve", "style": "success"},
             {"action": "reject", "label": "Reject", "style": "danger"},
             {
                 "action": "instructions",
@@ -123,7 +123,7 @@ async def test_discord_cold_connect_registers_discovered_persistent_view(monkeyp
     assert await adapter.connect() is True
     assert len(added_views) == 1
     assert [item.label for item in added_views[0].children] == [
-        "Approve all", "Reject", "✍️ Other"
+        "Approve", "Reject", "✍️ Other"
     ]
     await adapter.disconnect()
 
@@ -236,6 +236,7 @@ async def test_standalone_structured_review_sends_parent_then_detail_thread():
         "side_effect_state": "confirmed",
         "detail_state": "confirmed",
         "thread_id": "401",
+        "detail_message_ids": ["402", "403"],
     }
     parent = calls[0][1]
     assert parent["embeds"][0]["title"] == "PID knowledge review"
@@ -288,3 +289,97 @@ async def test_standalone_structured_review_retries_rate_limited_detail_message(
         for url, body in calls
         if "/channels/411/messages" in url and body
     ] == ["detail one", "detail one"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_structured_review_sends_structured_item_payloads_in_order():
+    chat_id = "220"
+    _remember_channel_is_forum(chat_id, False)
+    sessions, calls = _sessions([
+        [_resp(200, {"id": "420"})],
+        [_resp(201, {"id": "421"}), _resp(200, {"id": "422"}), _resp(200, {"id": "423"})],
+    ])
+    controls = [{"type": 1, "components": [
+        {"type": 2, "style": 3, "label": "Approve", "custom_id": "client-knowledge-review-item:approve"},
+        {"type": 2, "style": 4, "label": "Reject", "custom_id": "client-knowledge-review-item:reject"},
+        {"type": 2, "style": 2, "label": "✍️ Other", "custom_id": "client-knowledge-review-item:instructions"},
+    ]}]
+    metadata = {
+        "require_single_message": True,
+        "allowed_role_mentions": ["300"],
+        "strict_role_mentions": True,
+        "_discord_embed": {"title": "Request to Learn"},
+        "_discord_thread": {"name": "details", "messages": [
+            {"content": "", "embeds": [{"title": "Candidate 1"}], "components": controls},
+            {"content": "", "embeds": [{"title": "Candidate 2"}], "components": controls},
+        ]},
+    }
+    with patch("aiohttp.ClientSession", side_effect=sessions):
+        result = await _standalone_send(
+            SimpleNamespace(token="bot-token", extra={}), chat_id, "<@&300>", metadata=metadata
+        )
+    assert result["detail_message_ids"] == ["422", "423"]
+    detail_payloads = [body for url, body in calls if "/channels/421/messages" in url]
+    assert [value["embeds"][0]["title"] for value in detail_payloads] == [
+        "Candidate 1", "Candidate 2",
+    ]
+    assert all(len(value["components"][0]["components"]) == 3 for value in detail_payloads)
+
+
+@pytest.mark.asyncio
+async def test_standalone_structured_review_rejects_utf16_oversized_embed_before_send():
+    chat_id = "230"
+    _remember_channel_is_forum(chat_id, False)
+    metadata = {
+        "require_single_message": True,
+        "allowed_role_mentions": ["300"],
+        "strict_role_mentions": True,
+        "_discord_embed": {"title": "PID review", "description": "😀" * 2049},
+    }
+    result = await _standalone_send(
+        SimpleNamespace(token="bot-token", extra={}),
+        chat_id,
+        "<@&300>",
+        metadata=metadata,
+    )
+    assert result == {
+        "error": "Discord strict review embed validation failed",
+        "side_effect_state": "proven_none",
+    }
+
+
+@pytest.mark.asyncio
+async def test_standalone_review_rejects_detail_aggregate_embed_before_parent_post():
+    chat_id = "240"
+    _remember_channel_is_forum(chat_id, False)
+    controls = [{"type": 1, "components": [{
+        "type": 2, "style": 3, "label": "Approve",
+        "custom_id": "client-knowledge-review-item:approve",
+    }]}]
+    fields = [
+        {"name": f"Evidence {index}", "value": "x" * 1000, "inline": False}
+        for index in range(1, 7)
+    ]
+    metadata = {
+        "require_single_message": True,
+        "allowed_role_mentions": ["300"],
+        "strict_role_mentions": True,
+        "_discord_embed": {"title": "Request to Learn"},
+        "_discord_thread": {"name": "details", "messages": [{
+            "content": "",
+            "embeds": [{"title": "Candidate 1", "fields": fields}],
+            "components": controls,
+        }]},
+    }
+    with patch("aiohttp.ClientSession") as session:
+        result = await _standalone_send(
+            SimpleNamespace(token="bot-token", extra={}),
+            chat_id,
+            "<@&300>",
+            metadata=metadata,
+        )
+    assert result == {
+        "error": "Discord strict review embed validation failed",
+        "side_effect_state": "proven_none",
+    }
+    session.assert_not_called()

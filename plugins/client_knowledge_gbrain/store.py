@@ -19,7 +19,7 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Iterable, Mapping
 
 from hermes_constants import get_hermes_home
 from hermes_cli.config import cfg_get, load_config
@@ -37,9 +37,10 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DB_RELATIVE_PATH = "client-knowledge/intake.db"
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_SECONDS = 300.0
+SYNTHESIS_ITEM_CAPTURE_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
 DEFAULT_STALE_HEARTBEAT_GRACE_SECONDS = 300.0
 
@@ -48,6 +49,7 @@ _LINEAR_STAGES = (
     "raw_preserved",
     "notion_archived",
     "extracted",
+    "synthesized",
     "interpreted",
     "assimilated",
     "honcho_projected",
@@ -86,6 +88,16 @@ class ReviewRevisionClaim:
     revision_id: str
     source_review_id: str
     root_assimilation_id: str
+    instruction_text: str
+    claim_token: str
+    attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisItemRevisionClaim:
+    revision_id: str
+    source_item_id: str
+    synthesis_id: str
     instruction_text: str
     claim_token: str
     attempt_count: int
@@ -884,6 +896,146 @@ class IntakeStore:
                         "VALUES('schema_version', '10')"
                     )
                     version = 10
+                if version < 11:
+                    statements = (
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_syntheses (
+                            synthesis_id TEXT PRIMARY KEY,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            extraction_id TEXT NOT NULL REFERENCES extractions(extraction_id),
+                            project_key TEXT NOT NULL,
+                            notion_ref TEXT NOT NULL,
+                            synthesis_version TEXT NOT NULL,
+                            schema_version TEXT NOT NULL,
+                            prompt_version TEXT NOT NULL,
+                            derived_storage_id TEXT NOT NULL,
+                            derived_object_key TEXT NOT NULL,
+                            output_sha256 TEXT NOT NULL,
+                            output_bytes INTEGER NOT NULL,
+                            actual_provider TEXT NOT NULL,
+                            actual_model TEXT NOT NULL,
+                            selected_provider TEXT NOT NULL,
+                            selected_model TEXT NOT NULL,
+                            model_tier TEXT NOT NULL,
+                            route_fingerprint TEXT NOT NULL,
+                            input_tokens INTEGER NOT NULL,
+                            output_tokens INTEGER NOT NULL,
+                            total_tokens INTEGER NOT NULL,
+                            cache_read_tokens INTEGER NOT NULL,
+                            cache_write_tokens INTEGER NOT NULL,
+                            base_git_head TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            source_legacy_review_id TEXT UNIQUE REFERENCES client_knowledge_reviews(review_id),
+                            git_commit_sha TEXT,
+                            sync_verified INTEGER NOT NULL DEFAULT 0,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL,
+                            UNIQUE(artifact_id, synthesis_version)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_synthesis_items (
+                            item_id TEXT PRIMARY KEY,
+                            synthesis_id TEXT NOT NULL REFERENCES client_knowledge_syntheses(synthesis_id) ON DELETE CASCADE,
+                            position INTEGER NOT NULL,
+                            revision_number INTEGER NOT NULL DEFAULT 0,
+                            statement TEXT NOT NULL,
+                            evidence_json TEXT NOT NULL,
+                            item_sha256 TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            parent_item_id TEXT REFERENCES client_knowledge_synthesis_items(item_id),
+                            replacement_item_id TEXT REFERENCES client_knowledge_synthesis_items(item_id),
+                            notification_state TEXT NOT NULL DEFAULT 'pending',
+                            notification_message_id TEXT UNIQUE,
+                            reviewer_user_id TEXT,
+                            reviewer_role_id TEXT,
+                            decision_message_id TEXT,
+                            decision_reason TEXT,
+                            decided_at REAL,
+                            capture_user_id TEXT,
+                            capture_role_id TEXT,
+                            capture_thread_id TEXT,
+                            capture_started_at REAL,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL,
+                            UNIQUE(synthesis_id, position, revision_number)
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_synthesis_notifications (
+                            synthesis_id TEXT PRIMARY KEY REFERENCES client_knowledge_syntheses(synthesis_id) ON DELETE CASCADE,
+                            state TEXT NOT NULL DEFAULT 'pending',
+                            content_sha256 TEXT,
+                            message_id TEXT UNIQUE,
+                            guild_id TEXT,
+                            channel_id TEXT,
+                            role_id TEXT,
+                            marker TEXT,
+                            thread_id TEXT,
+                            items_sha256 TEXT,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL
+                        )""",
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_synthesis_item_revisions (
+                            revision_id TEXT PRIMARY KEY,
+                            source_item_id TEXT NOT NULL UNIQUE REFERENCES client_knowledge_synthesis_items(item_id),
+                            synthesis_id TEXT NOT NULL REFERENCES client_knowledge_syntheses(synthesis_id) ON DELETE CASCADE,
+                            replacement_item_id TEXT UNIQUE REFERENCES client_knowledge_synthesis_items(item_id),
+                            instruction_text TEXT NOT NULL,
+                            derived_storage_id TEXT,
+                            derived_object_key TEXT,
+                            output_sha256 TEXT,
+                            output_bytes INTEGER,
+                            actual_provider TEXT,
+                            actual_model TEXT,
+                            selected_provider TEXT,
+                            selected_model TEXT,
+                            model_tier TEXT,
+                            route_fingerprint TEXT,
+                            input_tokens INTEGER,
+                            output_tokens INTEGER,
+                            total_tokens INTEGER,
+                            cache_read_tokens INTEGER,
+                            cache_write_tokens INTEGER,
+                            state TEXT NOT NULL,
+                            attempt_count INTEGER NOT NULL DEFAULT 0,
+                            claim_token TEXT,
+                            lease_expires_at REAL,
+                            next_retry_at REAL,
+                            last_error_class TEXT,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL,
+                            completed_at REAL
+                        )""",
+                        """CREATE INDEX IF NOT EXISTS client_knowledge_synthesis_item_revisions_pickup_idx
+                        ON client_knowledge_synthesis_item_revisions(state, next_retry_at, created_at)""",
+                        """CREATE TABLE IF NOT EXISTS client_knowledge_synthesis_publications (
+                            synthesis_id TEXT PRIMARY KEY REFERENCES client_knowledge_syntheses(synthesis_id) ON DELETE CASCADE,
+                            artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                            synthesis_version TEXT NOT NULL,
+                            content_sha256 TEXT NOT NULL,
+                            branch_ref TEXT NOT NULL,
+                            expected_head TEXT NOT NULL,
+                            commit_sha TEXT,
+                            state TEXT NOT NULL,
+                            manifest_json TEXT NOT NULL,
+                            error_class TEXT,
+                            updated_at REAL NOT NULL
+                        )""",
+                    )
+                    for statement in statements:
+                        conn.execute(statement)
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute(
+                            "PRAGMA table_info(client_knowledge_reviews)"
+                        ).fetchall()
+                    }
+                    if "migrated_to_synthesis_id" not in columns:
+                        conn.execute(
+                            "ALTER TABLE client_knowledge_reviews ADD COLUMN "
+                            "migrated_to_synthesis_id TEXT"
+                        )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) "
+                        "VALUES('schema_version', '11')"
+                    )
+                    version = 11
                 if version != CURRENT_SCHEMA_VERSION:
                     raise RuntimeError(f"unsupported client knowledge schema version {version}")
                 conn.commit()
@@ -1383,6 +1535,7 @@ class IntakeStore:
             "WHEN 'raw_preserved' THEN 'discovered' "
             "WHEN 'notion_archived' THEN 'raw_preserved' "
             "WHEN 'extracted' THEN 'notion_archived' "
+            "WHEN 'synthesized' THEN 'extracted' "
             "WHEN 'interpreted' THEN 'extracted' "
             "WHEN 'assimilated' THEN 'interpreted' "
             "WHEN 'honcho_projected' THEN 'assimilated' "
@@ -1717,7 +1870,1171 @@ class IntakeStore:
                 columns = tuple(existing.keys())[:-1]
                 if tuple(existing[name] for name in columns) != values[:-1]:
                     raise ValueError("extraction identity conflicts with immutable metadata")
-            self._complete_claim_locked(conn, claim, receipt, now=now, next_stage="interpreted")
+            self._complete_claim_locked(conn, claim, receipt, now=now, next_stage="synthesized")
+
+    def get_extraction_for_synthesis_claim(
+        self, claim: JobClaim
+    ) -> tuple[IntakeArtifact, dict[str, Any], str]:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_stage_claim_locked(conn, claim, "synthesized", now=now)
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (claim.artifact_id,)
+            ).fetchone()
+            extraction_receipt = conn.execute(
+                "SELECT receipt_id FROM stage_receipts WHERE artifact_id=? AND stage='extracted'",
+                (claim.artifact_id,),
+            ).fetchone()
+            notion_receipt = conn.execute(
+                "SELECT receipt_id FROM stage_receipts WHERE artifact_id=? AND stage='notion_archived'",
+                (claim.artifact_id,),
+            ).fetchone()
+            if (
+                artifact is None
+                or extraction_receipt is None
+                or not str(extraction_receipt[0]).startswith("extraction:")
+                or notion_receipt is None
+                or not str(notion_receipt[0]).startswith("notion:page:")
+            ):
+                raise ValueError("synthesis claim lacks persisted extraction provenance")
+            extraction_id = str(extraction_receipt[0]).split(":", 1)[1]
+            extraction = conn.execute(
+                "SELECT * FROM extractions WHERE extraction_id=?", (extraction_id,)
+            ).fetchone()
+            if extraction is None:
+                raise ValueError("synthesis extraction metadata is missing")
+            return (
+                self._artifact_from_row(artifact),
+                dict(extraction),
+                str(notion_receipt[0]),
+            )
+
+    def get_synthesis(self, synthesis_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_syntheses WHERE synthesis_id=?",
+                (synthesis_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_synthesis_for_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_syntheses WHERE artifact_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (artifact_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_synthesis_items(
+        self, synthesis_id: str, *, active_only: bool = False
+    ) -> list[dict[str, Any]]:
+        query = (
+            "SELECT * FROM client_knowledge_synthesis_items WHERE synthesis_id=?"
+        )
+        if active_only:
+            query += " AND state!='superseded'"
+        query += " ORDER BY position, revision_number"
+        with self._connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(query, (synthesis_id,)).fetchall()
+            ]
+
+    def get_synthesis_item(self, item_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT items.*, notifications.guild_id, notifications.channel_id, "
+                "notifications.role_id, notifications.thread_id, notifications.state AS parent_notification_state, "
+                "syntheses.project_key, syntheses.artifact_id, syntheses.state AS synthesis_state "
+                "FROM client_knowledge_synthesis_items AS items "
+                "JOIN client_knowledge_syntheses AS syntheses USING(synthesis_id) "
+                "LEFT JOIN client_knowledge_synthesis_notifications AS notifications USING(synthesis_id) "
+                "WHERE items.item_id=?",
+                (item_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_synthesis_item_by_message(self, message_id: str) -> dict[str, Any] | None:
+        if not str(message_id or "").isdigit():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT items.*, notifications.guild_id, notifications.channel_id, "
+                "notifications.role_id, notifications.thread_id, notifications.state AS parent_notification_state, "
+                "syntheses.project_key, syntheses.artifact_id, syntheses.state AS synthesis_state "
+                "FROM client_knowledge_synthesis_items AS items "
+                "JOIN client_knowledge_syntheses AS syntheses USING(synthesis_id) "
+                "JOIN client_knowledge_synthesis_notifications AS notifications USING(synthesis_id) "
+                "WHERE items.notification_message_id=?",
+                (str(message_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def _insert_synthesis_locked(
+        conn: sqlite3.Connection,
+        synthesis: Mapping[str, Any],
+        items: Iterable[Mapping[str, Any]],
+        *,
+        now: float,
+    ) -> None:
+        values = (
+            synthesis["synthesis_id"], synthesis["artifact_id"], synthesis["extraction_id"],
+            synthesis["project_key"], synthesis["notion_ref"], synthesis["synthesis_version"],
+            synthesis["schema_version"], synthesis["prompt_version"],
+            synthesis["derived_storage_id"], synthesis["derived_object_key"],
+            synthesis["output_sha256"], int(synthesis["output_bytes"]),
+            synthesis["actual_provider"], synthesis["actual_model"],
+            synthesis["selected_provider"], synthesis["selected_model"],
+            synthesis["model_tier"], synthesis["route_fingerprint"],
+            int(synthesis.get("input_tokens") or 0), int(synthesis.get("output_tokens") or 0),
+            int(synthesis.get("total_tokens") or 0), int(synthesis.get("cache_read_tokens") or 0),
+            int(synthesis.get("cache_write_tokens") or 0), synthesis["base_git_head"],
+            synthesis.get("state") or "review_pending",
+            synthesis.get("source_legacy_review_id") or None,
+            synthesis.get("git_commit_sha") or None,
+            int(bool(synthesis.get("sync_verified"))), now, now,
+        )
+        existing = conn.execute(
+            "SELECT * FROM client_knowledge_syntheses WHERE synthesis_id=?",
+            (synthesis["synthesis_id"],),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO client_knowledge_syntheses VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+        elif tuple(existing[name] for name in tuple(existing.keys())[:28]) != values[:28]:
+            raise ValueError("synthesis identity conflicts with immutable metadata")
+        for item in items:
+            item_values = (
+                item["item_id"], synthesis["synthesis_id"], int(item["position"]),
+                int(item.get("revision_number") or 0), item["statement"],
+                item["evidence_json"], item["item_sha256"], item.get("state") or "pending",
+                item.get("parent_item_id") or None, item.get("replacement_item_id") or None,
+                item.get("notification_state") or "pending", item.get("notification_message_id") or None,
+                None, None, None, None, None, None, None, None, None, now, now,
+            )
+            existing_item = conn.execute(
+                "SELECT * FROM client_knowledge_synthesis_items WHERE item_id=?",
+                (item["item_id"],),
+            ).fetchone()
+            if existing_item is None:
+                conn.execute(
+                    "INSERT INTO client_knowledge_synthesis_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    item_values,
+                )
+            elif tuple(existing_item[name] for name in tuple(existing_item.keys())[:10]) != item_values[:10]:
+                raise ValueError("synthesis item identity conflicts with immutable metadata")
+        conn.execute(
+            "INSERT OR IGNORE INTO client_knowledge_synthesis_notifications"
+            "(synthesis_id, state, created_at, updated_at) VALUES(?,'pending',?,?)",
+            (synthesis["synthesis_id"], now, now),
+        )
+
+    def require_synthesis_review(
+        self,
+        claim: JobClaim,
+        *,
+        synthesis: Mapping[str, Any],
+        items: Iterable[Mapping[str, Any]],
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "synthesized", now=now)
+            self._insert_synthesis_locked(conn, synthesis, tuple(items), now=now)
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                "last_error_class, created_at, updated_at) VALUES(?,?,?,'operator_blocked',?,?,?,?)",
+                (
+                    secrets.token_hex(16), claim.artifact_id, "needs_review",
+                    DEFAULT_MAX_ATTEMPTS, "synthesis_items_pending", now, now,
+                ),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='operator_blocked', claim_token=NULL, owner_pid=NULL, "
+                "owner_host=NULL, owner_started_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, "
+                "next_retry_at=NULL, last_error_class='synthesis_items_pending', updated_at=? "
+                "WHERE job_id=? AND claim_token=?",
+                (now, claim.job_id, claim.claim_token),
+            )
+
+    def list_pending_synthesis_notifications(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        stale_before = time.time() - DEFAULT_LEASE_SECONDS
+        with self._connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT syntheses.*, notifications.state AS notification_state, "
+                    "notifications.content_sha256 AS notification_content_sha256, "
+                    "notifications.message_id AS notification_message_id, "
+                    "notifications.guild_id AS notification_guild_id, "
+                    "notifications.channel_id AS notification_channel_id, "
+                    "notifications.role_id AS notification_role_id, "
+                    "notifications.marker AS notification_marker, "
+                    "notifications.thread_id AS detail_thread_id, "
+                    "notifications.items_sha256 AS detail_content_sha256, "
+                    "notifications.updated_at AS notification_updated_at "
+                    "FROM client_knowledge_syntheses AS syntheses "
+                    "JOIN client_knowledge_synthesis_notifications AS notifications USING(synthesis_id) "
+                    "WHERE syntheses.state='review_pending' AND ("
+                    "notifications.state IN ('pending','proven_none') OR ("
+                    "notifications.state='uncertain' AND notifications.message_id IS NOT NULL) OR ("
+                    "notifications.state='repairing' AND notifications.message_id IS NOT NULL "
+                    "AND notifications.updated_at<=?)) "
+                    "ORDER BY syntheses.created_at LIMIT ?",
+                    (stale_before, max(1, min(limit, 500))),
+                ).fetchall()
+            ]
+
+    def get_synthesis_notification(self, synthesis_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_synthesis_notifications WHERE synthesis_id=?",
+                (synthesis_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_open_synthesis_reviews(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT syntheses.synthesis_id, syntheses.artifact_id, syntheses.project_key, "
+                    "syntheses.state, notifications.state AS notification_state, "
+                    "SUM(CASE WHEN items.state='approved' THEN 1 ELSE 0 END) AS approved_count, "
+                    "SUM(CASE WHEN items.state='rejected' THEN 1 ELSE 0 END) AS rejected_count, "
+                    "SUM(CASE WHEN items.state IN ('pending','instructions_pending') THEN 1 ELSE 0 END) "
+                    "AS unresolved_count FROM client_knowledge_syntheses AS syntheses "
+                    "JOIN client_knowledge_synthesis_notifications AS notifications USING(synthesis_id) "
+                    "JOIN client_knowledge_synthesis_items AS items USING(synthesis_id) "
+                    "WHERE syntheses.state IN ('review_pending','ready') "
+                    "GROUP BY syntheses.synthesis_id ORDER BY syntheses.created_at LIMIT ?",
+                    (max(1, min(limit, 500)),),
+                ).fetchall()
+            ]
+
+    def list_pending_replacement_items(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        stale_before = time.time() - DEFAULT_LEASE_SECONDS
+        with self._connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT items.*, syntheses.project_key, notifications.guild_id, "
+                    "notifications.channel_id, notifications.role_id, notifications.thread_id "
+                    "FROM client_knowledge_synthesis_items AS items "
+                    "JOIN client_knowledge_syntheses AS syntheses USING(synthesis_id) "
+                    "JOIN client_knowledge_synthesis_notifications AS notifications USING(synthesis_id) "
+                    "WHERE items.revision_number>0 AND items.state='pending' "
+                    "AND (items.notification_state IN ('pending','proven_none','uncertain') "
+                    "OR (items.notification_state='repairing' AND items.updated_at<=?)) "
+                    "AND notifications.state='confirmed' AND notifications.thread_id IS NOT NULL "
+                    "ORDER BY items.created_at LIMIT ?",
+                    (stale_before, max(1, min(limit, 500))),
+                ).fetchall()
+            ]
+
+    def claim_replacement_item_notification(self, item_id: str) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET notification_state='uncertain', "
+                "updated_at=? WHERE item_id=? AND revision_number>0 AND state='pending' "
+                "AND notification_state IN ('pending','proven_none')",
+                (now, item_id),
+            ).rowcount == 1
+
+    def claim_uncertain_replacement_item_notification(
+        self, item_id: str, *, expected_updated_at: float
+    ) -> bool:
+        now = time.time()
+        stale_before = now - DEFAULT_LEASE_SECONDS
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET notification_state='repairing', "
+                "updated_at=? WHERE item_id=? AND revision_number>0 AND state='pending' "
+                "AND (notification_state='uncertain' OR (notification_state='repairing' "
+                "AND updated_at<=?)) AND updated_at=?",
+                (now, item_id, stale_before, float(expected_updated_at)),
+            ).rowcount == 1
+
+    def claim_synthesis_notification(
+        self,
+        synthesis_id: str,
+        *,
+        content_sha256: str,
+        guild_id: str,
+        channel_id: str,
+        role_id: str,
+        marker: str,
+        items_sha256: str,
+    ) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT state, content_sha256, guild_id, channel_id, role_id, marker, items_sha256 "
+                "FROM client_knowledge_synthesis_notifications WHERE synthesis_id=?",
+                (synthesis_id,),
+            ).fetchone()
+            if row is None or row[0] not in {"pending", "proven_none"}:
+                return False
+            expected = (content_sha256, guild_id, channel_id, role_id, marker, items_sha256)
+            actual = tuple(str(value or "") for value in row[1:])
+            if any(actual) and actual != expected:
+                raise ValueError("synthesis notification identity conflicts")
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_notifications SET state='uncertain', "
+                "content_sha256=?, guild_id=?, channel_id=?, role_id=?, marker=?, items_sha256=?, "
+                "updated_at=? WHERE synthesis_id=? AND state IN ('pending','proven_none')",
+                (*expected, now, synthesis_id),
+            ).rowcount == 1
+
+    def claim_synthesis_detail_repair(
+        self, synthesis_id: str, *, expected_updated_at: float
+    ) -> bool:
+        now = time.time()
+        stale_before = now - DEFAULT_LEASE_SECONDS
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_notifications SET state='repairing', "
+                "updated_at=? WHERE synthesis_id=? AND message_id IS NOT NULL "
+                "AND (state='uncertain' OR (state='repairing' AND updated_at<=?)) "
+                "AND updated_at=?",
+                (now, synthesis_id, stale_before, float(expected_updated_at)),
+            ).rowcount == 1
+
+    def record_synthesis_notification(
+        self,
+        synthesis_id: str,
+        *,
+        state: str,
+        content_sha256: str,
+        guild_id: str,
+        channel_id: str,
+        role_id: str,
+        marker: str,
+        items_sha256: str,
+        message_id: str = "",
+        thread_id: str = "",
+        item_message_ids: Iterable[str] = (),
+    ) -> None:
+        if state not in {"confirmed", "proven_none", "uncertain"}:
+            raise ValueError("invalid synthesis notification state")
+        now = time.time()
+        item_ids = tuple(str(value) for value in item_message_ids)
+        with self._write() as conn:
+            notification = conn.execute(
+                "SELECT * FROM client_knowledge_synthesis_notifications WHERE synthesis_id=?",
+                (synthesis_id,),
+            ).fetchone()
+            if notification is None:
+                raise ValueError("synthesis notification does not exist")
+            expected = (content_sha256, guild_id, channel_id, role_id, marker, items_sha256)
+            actual = tuple(str(notification[key] or "") for key in (
+                "content_sha256", "guild_id", "channel_id", "role_id", "marker", "items_sha256"
+            ))
+            if actual != expected:
+                raise ValueError("synthesis notification identity conflicts")
+            if notification["message_id"] and message_id and notification["message_id"] != message_id:
+                raise ValueError("synthesis notification message identity conflicts")
+            active_items = conn.execute(
+                "SELECT item_id, notification_message_id FROM client_knowledge_synthesis_items "
+                "WHERE synthesis_id=? AND state!='superseded' AND revision_number=0 "
+                "ORDER BY position",
+                (synthesis_id,),
+            ).fetchall()
+            if state == "confirmed" and (
+                not message_id or not thread_id or len(item_ids) != len(active_items)
+            ):
+                raise ValueError("confirmed synthesis notification lacks item identities")
+            if len(item_ids) > len(active_items):
+                raise ValueError("synthesis notification has too many item identities")
+            for row, item_message_id in zip(active_items, item_ids):
+                if not item_message_id.isdigit():
+                    raise ValueError("synthesis item message id is invalid")
+                if row[1] and str(row[1]) != item_message_id:
+                    raise ValueError("synthesis item message identity conflicts")
+                conn.execute(
+                    "UPDATE client_knowledge_synthesis_items SET notification_state='confirmed', "
+                    "notification_message_id=COALESCE(notification_message_id, ?), updated_at=? "
+                    "WHERE item_id=?",
+                    (item_message_id, now, row[0]),
+                )
+            conn.execute(
+                "UPDATE client_knowledge_synthesis_notifications SET state=?, "
+                "message_id=COALESCE(message_id, ?), thread_id=COALESCE(thread_id, ?), updated_at=? "
+                "WHERE synthesis_id=?",
+                (state, message_id or None, thread_id or None, now, synthesis_id),
+            )
+
+    def record_replacement_item_notification(
+        self, item_id: str, *, state: str, message_id: str = ""
+    ) -> bool:
+        if state not in {"confirmed", "proven_none", "uncertain"}:
+            raise ValueError("invalid item notification state")
+        now = time.time()
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT state, notification_state, notification_message_id, revision_number "
+                "FROM client_knowledge_synthesis_items WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            if row is None or row[0] != "pending" or int(row[3]) <= 0:
+                return False
+            if row[1] not in {"pending", "proven_none", "uncertain", "repairing"}:
+                return False
+            if row[2] and message_id and str(row[2]) != message_id:
+                raise ValueError("replacement item message identity conflicts")
+            if state == "confirmed" and not str(message_id).isdigit():
+                raise ValueError("confirmed replacement item lacks message identity")
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET notification_state=?, "
+                "notification_message_id=COALESCE(notification_message_id, ?), updated_at=? "
+                "WHERE item_id=? AND state='pending'",
+                (state, message_id or None, now, item_id),
+            ).rowcount == 1
+
+    @staticmethod
+    def _release_synthesis_if_resolved_locked(
+        conn: sqlite3.Connection, synthesis_id: str, artifact_id: str, *, now: float
+    ) -> None:
+        unresolved = conn.execute(
+            "SELECT COUNT(*) FROM client_knowledge_synthesis_items "
+            "WHERE synthesis_id=? AND state IN ('pending','instructions_pending')",
+            (synthesis_id,),
+        ).fetchone()[0]
+        if unresolved:
+            return
+        conn.execute(
+            "UPDATE client_knowledge_syntheses SET state='ready', updated_at=? "
+            "WHERE synthesis_id=? AND state='review_pending'",
+            (now, synthesis_id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status='succeeded', last_error_class=NULL, updated_at=? "
+            "WHERE artifact_id=? AND stage='needs_review' AND status!='succeeded'",
+            (now, artifact_id),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO stage_receipts(artifact_id, stage, receipt_id, recorded_at) "
+            "VALUES(?,?,?,?)",
+            (artifact_id, "needs_review", f"synthesis-review:{synthesis_id}:resolved", now),
+        )
+        conn.execute(
+            "UPDATE jobs SET status='queued', attempt_count=0, next_retry_at=NULL, "
+            "last_error_class=NULL, updated_at=? WHERE artifact_id=? AND stage='synthesized' "
+            "AND status IN ('queued','failed','operator_blocked')",
+            (now, artifact_id),
+        )
+
+    def decide_synthesis_item(
+        self,
+        item_id: str,
+        *,
+        decision: str,
+        reviewer_user_id: str,
+        reviewer_role_id: str,
+        decision_message_id: str,
+    ) -> bool:
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("item decision must be approved or rejected")
+        now = time.time()
+        with self._write() as conn:
+            item = conn.execute(
+                "SELECT synthesis_id, state, notification_state, notification_message_id, "
+                "capture_user_id FROM client_knowledge_synthesis_items WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            if (
+                item is None
+                or item[1] != "pending"
+                or item[2] != "confirmed"
+                or not item[3]
+            ):
+                return False
+            changed = conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET state=?, reviewer_user_id=?, "
+                "reviewer_role_id=?, decision_message_id=?, decision_reason=NULL, "
+                "capture_user_id=NULL, capture_role_id=NULL, capture_thread_id=NULL, "
+                "capture_started_at=NULL, decided_at=?, updated_at=? "
+                "WHERE item_id=? AND state='pending' AND notification_state='confirmed'",
+                (
+                    decision, reviewer_user_id, reviewer_role_id or None,
+                    decision_message_id, now, now, item_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+            synthesis = conn.execute(
+                "SELECT artifact_id FROM client_knowledge_syntheses WHERE synthesis_id=?",
+                (item[0],),
+            ).fetchone()
+            if synthesis is None:
+                raise ValueError("synthesis disappeared during item decision")
+            self._release_synthesis_if_resolved_locked(
+                conn, str(item[0]), str(synthesis[0]), now=now
+            )
+            return True
+
+    def begin_synthesis_item_instruction(
+        self,
+        item_id: str,
+        *,
+        reviewer_user_id: str,
+        reviewer_role_id: str,
+        thread_id: str,
+    ) -> bool:
+        if not reviewer_user_id or not str(thread_id).isdigit():
+            raise ValueError("item instruction capture requires user and thread")
+        now = time.time()
+        with self._write() as conn:
+            self._expire_synthesis_item_captures_locked(conn, now=now)
+            if conn.execute(
+                "SELECT 1 FROM client_knowledge_synthesis_items WHERE capture_user_id=? "
+                "AND capture_thread_id=? AND state='pending' LIMIT 1",
+                (reviewer_user_id, thread_id),
+            ).fetchone() is not None:
+                return False
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET capture_user_id=?, capture_role_id=?, "
+                "capture_thread_id=?, capture_started_at=?, updated_at=? WHERE item_id=? "
+                "AND state='pending' AND notification_state='confirmed' AND capture_user_id IS NULL",
+                (
+                    reviewer_user_id, reviewer_role_id or None, thread_id,
+                    now, now, item_id,
+                ),
+            ).rowcount == 1
+
+    @staticmethod
+    def _expire_synthesis_item_captures_locked(
+        conn: sqlite3.Connection, *, now: float
+    ) -> int:
+        cutoff = now - SYNTHESIS_ITEM_CAPTURE_TIMEOUT_SECONDS
+        return conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET capture_user_id=NULL, "
+            "capture_role_id=NULL, capture_thread_id=NULL, capture_started_at=NULL, "
+            "updated_at=? WHERE state='pending' AND capture_started_at IS NOT NULL "
+            "AND capture_started_at<=?",
+            (now, cutoff),
+        ).rowcount
+
+    def get_synthesis_item_text_capture(
+        self, *, guild_id: str, thread_id: str, user_id: str
+    ) -> dict[str, Any] | None:
+        now = time.time()
+        with self._write() as conn:
+            self._expire_synthesis_item_captures_locked(conn, now=now)
+            row = conn.execute(
+                "SELECT items.*, notifications.guild_id, notifications.channel_id, "
+                "notifications.role_id, notifications.thread_id, syntheses.project_key "
+                "FROM client_knowledge_synthesis_items AS items "
+                "JOIN client_knowledge_syntheses AS syntheses USING(synthesis_id) "
+                "JOIN client_knowledge_synthesis_notifications AS notifications USING(synthesis_id) "
+                "WHERE items.state='pending' AND items.capture_user_id=? "
+                "AND items.capture_thread_id=? AND notifications.guild_id=? "
+                "ORDER BY items.capture_started_at LIMIT 1",
+                (user_id, thread_id, guild_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def record_synthesis_item_instruction(
+        self,
+        item_id: str,
+        *,
+        reviewer_user_id: str,
+        reviewer_role_id: str,
+        decision_message_id: str,
+        instruction: str,
+        expected_capture_started_at: float,
+        source_created_at: float,
+    ) -> bool:
+        text = str(instruction or "").strip()
+        if not text or len(text) > 4000:
+            raise ValueError("item instruction must be bounded non-empty text")
+        capture_started_at = float(expected_capture_started_at)
+        message_created_at = float(source_created_at)
+        now = time.time()
+        with self._write() as conn:
+            self._expire_synthesis_item_captures_locked(conn, now=now)
+            item = conn.execute(
+                "SELECT synthesis_id, state, capture_user_id, capture_started_at "
+                "FROM client_knowledge_synthesis_items "
+                "WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            if (
+                item is None
+                or item[1] != "pending"
+                or item[2] != reviewer_user_id
+                or item[3] is None
+                or float(item[3]) != capture_started_at
+                or message_created_at < float(item[3])
+                or float(item[3]) <= now - SYNTHESIS_ITEM_CAPTURE_TIMEOUT_SECONDS
+            ):
+                return False
+            revision_id = hashlib.sha256(
+                ("client-knowledge-synthesis-item-revision\0" + item_id + "\0" +
+                 decision_message_id + "\0" + text).encode("utf-8")
+            ).hexdigest()
+            changed = conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET state='instructions_pending', "
+                "reviewer_user_id=?, reviewer_role_id=?, decision_message_id=?, "
+                "decision_reason=?, capture_user_id=NULL, capture_role_id=NULL, "
+                "capture_thread_id=NULL, capture_started_at=NULL, decided_at=?, updated_at=? "
+                "WHERE item_id=? AND state='pending' AND capture_user_id=? "
+                "AND capture_started_at=?",
+                (
+                    reviewer_user_id, reviewer_role_id or None, decision_message_id,
+                    text, now, now, item_id, reviewer_user_id, capture_started_at,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+            existing_revision = conn.execute(
+                "SELECT revision_id, state FROM client_knowledge_synthesis_item_revisions "
+                "WHERE source_item_id=?",
+                (item_id,),
+            ).fetchone()
+            if existing_revision is None:
+                conn.execute(
+                    "INSERT INTO client_knowledge_synthesis_item_revisions("
+                    "revision_id, source_item_id, synthesis_id, instruction_text, state, created_at, updated_at) "
+                    "VALUES(?,?,?,?,'queued',?,?)",
+                    (revision_id, item_id, item[0], text, now, now),
+                )
+            elif existing_revision[1] == "restored":
+                conn.execute(
+                    "UPDATE client_knowledge_synthesis_item_revisions SET revision_id=?, "
+                    "instruction_text=?, replacement_item_id=NULL, derived_storage_id=NULL, "
+                    "derived_object_key=NULL, output_sha256=NULL, output_bytes=NULL, "
+                    "actual_provider=NULL, actual_model=NULL, selected_provider=NULL, "
+                    "selected_model=NULL, model_tier=NULL, route_fingerprint=NULL, "
+                    "input_tokens=NULL, output_tokens=NULL, total_tokens=NULL, "
+                    "cache_read_tokens=NULL, cache_write_tokens=NULL, state='queued', "
+                    "attempt_count=0, claim_token=NULL, lease_expires_at=NULL, "
+                    "next_retry_at=NULL, last_error_class=NULL, completed_at=NULL, "
+                    "created_at=?, updated_at=? WHERE source_item_id=? AND state='restored'",
+                    (revision_id, text, now, now, item_id),
+                )
+            else:
+                raise ValueError("synthesis item already has revision history")
+            return True
+
+    def claim_next_synthesis_item_revision(
+        self,
+        *,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        now: float | None = None,
+    ) -> SynthesisItemRevisionClaim | None:
+        timestamp = time.time() if now is None else float(now)
+        lease = max(1.0, float(lease_seconds))
+        attempts_limit = max(1, int(max_attempts))
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE client_knowledge_synthesis_item_revisions SET state='failed', "
+                "claim_token=NULL, lease_expires_at=NULL, next_retry_at=?, "
+                "last_error_class='synthesis_item_revision_claim_expired', updated_at=? "
+                "WHERE state='running' AND lease_expires_at<=?",
+                (timestamp, timestamp, timestamp),
+            )
+            conn.execute(
+                "UPDATE client_knowledge_synthesis_item_revisions "
+                "SET state='operator_blocked', next_retry_at=NULL, "
+                "last_error_class=COALESCE(last_error_class, 'synthesis_item_revision_attempts_exhausted'), "
+                "updated_at=? WHERE state IN ('queued','failed') AND attempt_count>=?",
+                (timestamp, attempts_limit),
+            )
+            row = conn.execute(
+                "SELECT revision_id, source_item_id, synthesis_id, instruction_text, attempt_count "
+                "FROM client_knowledge_synthesis_item_revisions WHERE state IN ('queued','failed') "
+                "AND attempt_count<? AND (next_retry_at IS NULL OR next_retry_at<=?) "
+                "ORDER BY created_at, revision_id LIMIT 1",
+                (attempts_limit, timestamp),
+            ).fetchone()
+            if row is None:
+                return None
+            token = secrets.token_urlsafe(24)
+            attempt = int(row[4]) + 1
+            if conn.execute(
+                "UPDATE client_knowledge_synthesis_item_revisions SET state='running', "
+                "attempt_count=?, claim_token=?, lease_expires_at=?, next_retry_at=NULL, "
+                "last_error_class=NULL, updated_at=? WHERE revision_id=? "
+                "AND state IN ('queued','failed')",
+                (attempt, token, timestamp + lease, timestamp, row[0]),
+            ).rowcount != 1:
+                return None
+            return SynthesisItemRevisionClaim(
+                str(row[0]), str(row[1]), str(row[2]), str(row[3]), token, attempt
+            )
+
+    def fail_synthesis_item_revision(
+        self,
+        claim: SynthesisItemRevisionClaim,
+        *,
+        error_class: str,
+        retry_delay: float,
+    ) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_item_revisions SET state='failed', "
+                "claim_token=NULL, lease_expires_at=NULL, next_retry_at=?, last_error_class=?, "
+                "updated_at=? WHERE revision_id=? AND state='running' AND claim_token=?",
+                (
+                    now + max(0.0, float(retry_delay)), _error_class(error_class), now,
+                    claim.revision_id, claim.claim_token,
+                ),
+            ).rowcount == 1
+
+    def block_synthesis_item_revision(
+        self,
+        claim: SynthesisItemRevisionClaim,
+        *,
+        error_class: str,
+    ) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_item_revisions SET state='operator_blocked', "
+                "claim_token=NULL, lease_expires_at=NULL, next_retry_at=NULL, last_error_class=?, "
+                "updated_at=? WHERE revision_id=? AND state='running' AND claim_token=?",
+                (_error_class(error_class), now, claim.revision_id, claim.claim_token),
+            ).rowcount == 1
+
+    def restore_synthesis_item_revision(self, item_id: str) -> bool:
+        """Restore one item after its bounded revision attempts were exhausted."""
+        now = time.time()
+        with self._write() as conn:
+            item = conn.execute(
+                "SELECT state FROM client_knowledge_synthesis_items WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            revision = conn.execute(
+                "SELECT revision_id, state FROM client_knowledge_synthesis_item_revisions "
+                "WHERE source_item_id=?",
+                (item_id,),
+            ).fetchone()
+            if (
+                item is None
+                or item[0] != "instructions_pending"
+                or revision is None
+                or revision[1] != "operator_blocked"
+            ):
+                return False
+            conn.execute(
+                "UPDATE client_knowledge_synthesis_item_revisions SET state='restored', "
+                "claim_token=NULL, lease_expires_at=NULL, next_retry_at=NULL, completed_at=?, "
+                "updated_at=? WHERE revision_id=? AND state='operator_blocked'",
+                (now, now, revision[0]),
+            )
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET state='pending', reviewer_user_id=NULL, "
+                "reviewer_role_id=NULL, decision_message_id=NULL, decision_reason=NULL, decided_at=NULL, "
+                "capture_user_id=NULL, capture_role_id=NULL, capture_thread_id=NULL, "
+                "capture_started_at=NULL, updated_at=? WHERE item_id=? "
+                "AND state='instructions_pending'",
+                (now, item_id),
+            ).rowcount == 1
+
+    def complete_synthesis_item_revision(
+        self,
+        claim: SynthesisItemRevisionClaim,
+        *,
+        replacement: Mapping[str, Any],
+    ) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            revision = conn.execute(
+                "SELECT state, claim_token, lease_expires_at, instruction_text "
+                "FROM client_knowledge_synthesis_item_revisions WHERE revision_id=?",
+                (claim.revision_id,),
+            ).fetchone()
+            source = conn.execute(
+                "SELECT * FROM client_knowledge_synthesis_items WHERE item_id=?",
+                (claim.source_item_id,),
+            ).fetchone()
+            if (
+                revision is None or revision[0] != "running" or revision[1] != claim.claim_token
+                or revision[2] is None or float(revision[2]) <= now
+                or str(revision[3]) != claim.instruction_text
+                or source is None or source["state"] != "instructions_pending"
+                or str(source["decision_reason"] or "") != claim.instruction_text
+            ):
+                return False
+            values = (
+                replacement["item_id"], claim.synthesis_id, int(source["position"]),
+                int(source["revision_number"]) + 1, replacement["statement"],
+                replacement["evidence_json"], replacement["item_sha256"], "pending",
+                claim.source_item_id, None, "pending", None,
+                None, None, None, None, None, None, None, None, None, now, now,
+            )
+            conn.execute(
+                "INSERT INTO client_knowledge_synthesis_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+            if conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET state='superseded', "
+                "replacement_item_id=?, updated_at=? WHERE item_id=? "
+                "AND state='instructions_pending'",
+                (replacement["item_id"], now, claim.source_item_id),
+            ).rowcount != 1:
+                raise ValueError("source synthesis item could not be superseded")
+            conn.execute(
+                "UPDATE client_knowledge_synthesis_item_revisions SET state='succeeded', "
+                "replacement_item_id=?, derived_storage_id=?, derived_object_key=?, "
+                "output_sha256=?, output_bytes=?, actual_provider=?, actual_model=?, "
+                "selected_provider=?, selected_model=?, model_tier=?, route_fingerprint=?, "
+                "input_tokens=?, output_tokens=?, total_tokens=?, cache_read_tokens=?, "
+                "cache_write_tokens=?, claim_token=NULL, lease_expires_at=NULL, "
+                "next_retry_at=NULL, last_error_class=NULL, completed_at=?, updated_at=? "
+                "WHERE revision_id=? AND state='running' AND claim_token=?",
+                (
+                    replacement["item_id"], replacement["derived_storage_id"],
+                    replacement["derived_object_key"], replacement["output_sha256"],
+                    int(replacement["output_bytes"]), replacement["actual_provider"],
+                    replacement["actual_model"], replacement["selected_provider"],
+                    replacement["selected_model"], replacement["model_tier"],
+                    replacement["route_fingerprint"], int(replacement.get("input_tokens") or 0),
+                    int(replacement.get("output_tokens") or 0),
+                    int(replacement.get("total_tokens") or 0),
+                    int(replacement.get("cache_read_tokens") or 0),
+                    int(replacement.get("cache_write_tokens") or 0),
+                    now, now, claim.revision_id, claim.claim_token,
+                ),
+            )
+            return True
+
+    def get_synthesis_for_publication_claim(
+        self, claim: JobClaim
+    ) -> tuple[IntakeArtifact, dict[str, Any], list[dict[str, Any]]]:
+        now = time.time()
+        with self._connect() as conn:
+            self._active_stage_claim_locked(conn, claim, "synthesized", now=now)
+            synthesis = conn.execute(
+                "SELECT * FROM client_knowledge_syntheses WHERE artifact_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (claim.artifact_id,),
+            ).fetchone()
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id=?", (claim.artifact_id,)
+            ).fetchone()
+            if synthesis is None or artifact is None or synthesis["state"] != "ready":
+                raise ValueError("synthesis is not ready for publication")
+            unresolved = conn.execute(
+                "SELECT COUNT(*) FROM client_knowledge_synthesis_items WHERE synthesis_id=? "
+                "AND state IN ('pending','instructions_pending')",
+                (synthesis["synthesis_id"],),
+            ).fetchone()[0]
+            if unresolved:
+                raise ValueError("synthesis still has unresolved items")
+            items = conn.execute(
+                "SELECT * FROM client_knowledge_synthesis_items WHERE synthesis_id=? "
+                "AND state!='superseded' ORDER BY position, revision_number",
+                (synthesis["synthesis_id"],),
+            ).fetchall()
+            return self._artifact_from_row(artifact), dict(synthesis), [dict(row) for row in items]
+
+    def migrate_legacy_review_to_synthesis(
+        self,
+        *,
+        legacy_review_id: str,
+        synthesis: Mapping[str, Any],
+        items: Iterable[Mapping[str, Any]],
+        persist_derived: Callable[[], Mapping[str, Any]],
+    ) -> str:
+        """Atomically replace one qualifying persisted legacy review."""
+        now = time.time()
+        item_values = tuple(items)
+        with self._write() as conn:
+            review = conn.execute(
+                "SELECT * FROM client_knowledge_reviews WHERE review_id=?",
+                (legacy_review_id,),
+            ).fetchone()
+            if review is None:
+                raise ValueError("legacy review does not exist")
+            if (
+                review["state"] != "pending"
+                or review["notification_state"] != "confirmed"
+                or not str(review["notification_message_id"] or "").isdigit()
+                or not str(review["detail_thread_id"] or "").isdigit()
+                or review["detail_state"] != "confirmed"
+                or review["parent_review_id"]
+                or review["superseded_by_review_id"]
+                or int(review["revision_number"] or 0) != 0
+                or review["migrated_to_synthesis_id"]
+            ):
+                raise ValueError("legacy review preflight failed")
+            if conn.execute(
+                "SELECT 1 FROM client_knowledge_review_revisions WHERE source_review_id=? "
+                "OR replacement_review_id=? LIMIT 1",
+                (legacy_review_id, legacy_review_id),
+            ).fetchone() is not None:
+                raise ValueError("legacy review has an active revision")
+            assimilation = conn.execute(
+                "SELECT * FROM assimilation_proposals WHERE assimilation_id=?",
+                (review["assimilation_id"],),
+            ).fetchone()
+            if assimilation is None or assimilation["artifact_id"] != review["artifact_id"]:
+                raise ValueError("legacy review assimilation preflight failed")
+            if conn.execute(
+                "SELECT 1 FROM publication_transactions WHERE assimilation_id=? LIMIT 1",
+                (review["assimilation_id"],),
+            ).fetchone() is not None:
+                raise ValueError("legacy review already has publication state")
+            existing = conn.execute(
+                "SELECT synthesis_id FROM client_knowledge_syntheses WHERE source_legacy_review_id=?",
+                (legacy_review_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("legacy review was already migrated")
+            if (
+                synthesis["artifact_id"] != review["artifact_id"]
+                or synthesis["project_key"] != review["project_key"]
+                or synthesis["source_legacy_review_id"] != legacy_review_id
+                or synthesis.get("state", "review_pending") != "review_pending"
+            ):
+                raise ValueError("legacy synthesis identity preflight failed")
+            persisted = dict(persist_derived())
+            required_persisted = {
+                "derived_storage_id", "derived_object_key", "output_sha256", "output_bytes"
+            }
+            if required_persisted - set(persisted):
+                raise ValueError("legacy synthesis derived receipt is incomplete")
+            synthesis_row = {**dict(synthesis), **persisted}
+            self._insert_synthesis_locked(conn, synthesis_row, item_values, now=now)
+            changed = conn.execute(
+                "UPDATE client_knowledge_reviews SET state='superseded', "
+                "migrated_to_synthesis_id=?, updated_at=? WHERE review_id=? "
+                "AND state='pending' AND notification_state='confirmed'",
+                (synthesis_row["synthesis_id"], now, legacy_review_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("legacy review could not be superseded")
+            conn.execute(
+                "UPDATE jobs SET status='quarantined', next_retry_at=NULL, "
+                "last_error_class='legacy_review_migrated', updated_at=? "
+                "WHERE artifact_id=? AND stage='assimilated' AND status!='succeeded'",
+                (now, review["artifact_id"]),
+            )
+            updated_review_job = conn.execute(
+                "UPDATE jobs SET status='operator_blocked', next_retry_at=NULL, "
+                "last_error_class='synthesis_items_pending', updated_at=? "
+                "WHERE artifact_id=? AND stage='needs_review'",
+                (now, review["artifact_id"]),
+            ).rowcount
+            if not updated_review_job:
+                conn.execute(
+                    "INSERT OR IGNORE INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                    "last_error_class, created_at, updated_at) "
+                    "VALUES(?,?,?,'operator_blocked',?,?,?,?)",
+                    (
+                        secrets.token_hex(16), review["artifact_id"], "needs_review",
+                        DEFAULT_MAX_ATTEMPTS, "synthesis_items_pending", now, now,
+                    ),
+                )
+            updated_synthesis_job = conn.execute(
+                "UPDATE jobs SET status='operator_blocked', attempt_count=0, claim_token=NULL, "
+                "owner_pid=NULL, owner_host=NULL, owner_started_at=NULL, lease_expires_at=NULL, "
+                "heartbeat_at=NULL, next_retry_at=NULL, last_error_class='synthesis_items_pending', "
+                "updated_at=? WHERE artifact_id=? AND stage='synthesized'",
+                (now, review["artifact_id"]),
+            ).rowcount
+            if not updated_synthesis_job:
+                conn.execute(
+                    "INSERT INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
+                    "last_error_class, created_at, updated_at) "
+                    "VALUES(?,?,?,'operator_blocked',?,?,?,?)",
+                    (
+                        secrets.token_hex(16), review["artifact_id"], "synthesized",
+                        DEFAULT_MAX_ATTEMPTS, "synthesis_items_pending", now, now,
+                    ),
+                )
+            return str(synthesis_row["synthesis_id"])
+
+    def requeue_synthesis_notification(self, synthesis_id: str) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_notifications SET state='proven_none', "
+                "message_id=NULL, thread_id=NULL, updated_at=? WHERE synthesis_id=? "
+                "AND state='uncertain' AND message_id IS NULL",
+                (now, synthesis_id),
+            ).rowcount == 1
+
+    def requeue_replacement_item_notification(self, item_id: str) -> bool:
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET notification_state='proven_none', "
+                "notification_message_id=NULL, updated_at=? WHERE item_id=? "
+                "AND revision_number>0 AND state='pending' "
+                "AND notification_state IN ('uncertain','repairing')",
+                (now, item_id),
+            ).rowcount == 1
+
+    def preflight_legacy_review_migration(self, legacy_review_id: str) -> dict[str, Any]:
+        """Validate the persisted legacy state without mutating any store."""
+        with self._connect() as conn:
+            review = conn.execute(
+                "SELECT * FROM client_knowledge_reviews WHERE review_id=?",
+                (legacy_review_id,),
+            ).fetchone()
+            if review is None:
+                raise ValueError("legacy review does not exist")
+            if (
+                review["state"] != "pending"
+                or review["notification_state"] != "confirmed"
+                or not str(review["notification_message_id"] or "").isdigit()
+                or not str(review["detail_thread_id"] or "").isdigit()
+                or review["detail_state"] != "confirmed"
+                or review["parent_review_id"]
+                or review["superseded_by_review_id"]
+                or int(review["revision_number"] or 0) != 0
+                or review["migrated_to_synthesis_id"]
+            ):
+                raise ValueError("legacy review preflight failed")
+            if conn.execute(
+                "SELECT 1 FROM client_knowledge_review_revisions WHERE source_review_id=? "
+                "OR replacement_review_id=? LIMIT 1",
+                (legacy_review_id, legacy_review_id),
+            ).fetchone() is not None:
+                raise ValueError("legacy review has an active revision")
+            assimilation = conn.execute(
+                "SELECT * FROM assimilation_proposals WHERE assimilation_id=?",
+                (review["assimilation_id"],),
+            ).fetchone()
+            if assimilation is None or assimilation["artifact_id"] != review["artifact_id"]:
+                raise ValueError("legacy review assimilation preflight failed")
+            if conn.execute(
+                "SELECT 1 FROM publication_transactions WHERE assimilation_id=? LIMIT 1",
+                (review["assimilation_id"],),
+            ).fetchone() is not None:
+                raise ValueError("legacy review already has publication state")
+            if conn.execute(
+                "SELECT 1 FROM client_knowledge_syntheses WHERE source_legacy_review_id=? LIMIT 1",
+                (legacy_review_id,),
+            ).fetchone() is not None:
+                raise ValueError("legacy review was already migrated")
+            return dict(review)
+
+    def record_synthesis_publication(
+        self,
+        *,
+        synthesis_id: str,
+        artifact_id: str,
+        synthesis_version: str,
+        content_sha256: str,
+        branch_ref: str,
+        expected_head: str,
+        manifest_json: str,
+        state: str,
+        commit_sha: str = "",
+        error_class: str = "",
+    ) -> None:
+        now = time.time()
+        with self._write() as conn:
+            existing = conn.execute(
+                "SELECT artifact_id, synthesis_version, content_sha256, branch_ref, "
+                "expected_head, manifest_json, commit_sha, state "
+                "FROM client_knowledge_synthesis_publications "
+                "WHERE synthesis_id=?",
+                (synthesis_id,),
+            ).fetchone()
+            identity = (
+                artifact_id, synthesis_version, content_sha256, branch_ref,
+                expected_head, manifest_json,
+            )
+            if existing is not None and tuple(existing[:6]) != identity:
+                raise ValueError("synthesis publication identity conflicts")
+            if existing is not None and existing[6] and commit_sha and existing[6] != commit_sha:
+                raise ValueError("synthesis publication commit identity conflicts")
+            allowed = {
+                None: {"prepared", "committed", "cas_succeeded_materialization_blocked"},
+                "prepared": {"prepared", "committed", "cas_succeeded_materialization_blocked"},
+                "cas_succeeded_materialization_blocked": {
+                    "cas_succeeded_materialization_blocked", "committed",
+                },
+                "committed": {"committed"},
+            }
+            previous_state = str(existing[7]) if existing is not None else None
+            if state not in allowed.get(previous_state, set()):
+                raise ValueError("synthesis publication state transition is invalid")
+            conn.execute(
+                "INSERT INTO client_knowledge_synthesis_publications("
+                "synthesis_id, artifact_id, synthesis_version, content_sha256, branch_ref, "
+                "expected_head, commit_sha, state, manifest_json, error_class, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(synthesis_id) DO UPDATE SET "
+                "commit_sha=COALESCE(client_knowledge_synthesis_publications.commit_sha, excluded.commit_sha), "
+                "state=excluded.state, error_class=excluded.error_class, updated_at=excluded.updated_at",
+                (
+                    synthesis_id, artifact_id, synthesis_version, content_sha256,
+                    branch_ref, expected_head, commit_sha or None, state, manifest_json,
+                    error_class or None, now,
+                ),
+            )
+
+    def get_synthesis_publication(self, synthesis_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM client_knowledge_synthesis_publications WHERE synthesis_id=?",
+                (synthesis_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def reset_prepared_synthesis_publication(
+        self,
+        *,
+        synthesis_id: str,
+        old_expected_head: str,
+        old_manifest_json: str,
+        new_expected_head: str,
+        new_manifest_json: str,
+    ) -> bool:
+        """Move one proven-uncommitted prepared attempt to a revalidated head."""
+        now = time.time()
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE client_knowledge_synthesis_publications SET expected_head=?, "
+                "manifest_json=?, error_class=NULL, updated_at=? WHERE synthesis_id=? "
+                "AND state='prepared' AND commit_sha IS NULL AND expected_head=? "
+                "AND manifest_json=?",
+                (
+                    new_expected_head,
+                    new_manifest_json,
+                    now,
+                    synthesis_id,
+                    old_expected_head,
+                    old_manifest_json,
+                ),
+            ).rowcount == 1
+
+    def complete_synthesis(
+        self,
+        claim: JobClaim,
+        *,
+        synthesis_id: str,
+        commit_sha: str,
+        output_sha256: str,
+        sync_verified: bool,
+    ) -> None:
+        now = time.time()
+        receipt = StageReceipt(
+            claim.artifact_id,
+            "synthesized",
+            f"synthesis:{synthesis_id}:{commit_sha}",
+            output_sha256,
+            recorded_at=now,
+        )
+        with self._write() as conn:
+            self._active_stage_claim_locked(conn, claim, "synthesized", now=now)
+            conn.execute(
+                "UPDATE client_knowledge_syntheses SET state='complete', git_commit_sha=?, "
+                "sync_verified=?, updated_at=? WHERE synthesis_id=? AND state='ready'",
+                (commit_sha or None, int(sync_verified), now, synthesis_id),
+            )
+            self._complete_claim_locked(conn, claim, receipt, now=now)
 
     def complete_interpretation(
         self,
@@ -3496,6 +4813,54 @@ class IntakeStore:
         result.update({str(row[0]): int(row[1]) for row in rows})
         result["total"] = sum(result.values())
         return result
+
+    def client_knowledge_cutover_status(self) -> dict[str, Any]:
+        """Return bounded counts that prove the legacy/new cutover state."""
+        with self._connect() as conn:
+            legacy = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN state='pending' AND migrated_to_synthesis_id IS NULL THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN migrated_to_synthesis_id IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM client_knowledge_reviews"
+            ).fetchone()
+            syntheses = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) FROM client_knowledge_syntheses GROUP BY state"
+                ).fetchall()
+            }
+            revisions = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) FROM client_knowledge_synthesis_item_revisions "
+                    "GROUP BY state"
+                ).fetchall()
+            }
+            publications = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) FROM client_knowledge_synthesis_publications "
+                    "GROUP BY state"
+                ).fetchall()
+            }
+            stages = {
+                str(row[0]): {"total": int(row[1]), "active": int(row[2])}
+                for row in conn.execute(
+                    "SELECT stage, COUNT(*), SUM(CASE WHEN status!='succeeded' THEN 1 ELSE 0 END) "
+                    "FROM jobs WHERE stage IN ('interpreted','assimilated','synthesized','needs_review') "
+                    "GROUP BY stage"
+                ).fetchall()
+            }
+        return {
+            "legacy_reviews": {
+                "pending_unmigrated": int(legacy[0] or 0),
+                "migrated": int(legacy[1] or 0),
+            },
+            "syntheses": syntheses,
+            "item_revisions": revisions,
+            "publications": publications,
+            "stage_jobs": stages,
+        }
 
 
 # Compact aliases make future stage workers less coupled to the class name.

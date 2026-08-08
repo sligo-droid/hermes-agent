@@ -375,6 +375,66 @@ class GitSourcePublisher:
             if self._sha256(blob) != row["content_sha256"]:
                 raise PublicationFailure("publication_blob_hash_mismatch")
 
+    def verify_committed(
+        self,
+        *,
+        expected_head: str,
+        commit_sha: str,
+        manifest_json: str,
+        files: Iterable[PublicationFile],
+    ) -> PublicationResult:
+        """Verify an audited committed publication that may precede current HEAD."""
+        self._validate_repository()
+        manifest, contents, targets = self._manifest(files, expected_head)
+        canonical_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        if canonical_manifest != manifest_json:
+            raise PublicationFailure("publication_manifest_identity_mismatch")
+        self._verify_committed_state(
+            expected_head=expected_head,
+            commit_sha=commit_sha,
+            manifest=manifest,
+            contents=contents,
+            targets=targets,
+        )
+        return PublicationResult(
+            commit_sha,
+            canonical_manifest,
+            tuple(row["path"] for row in manifest),
+        )
+
+    def _verify_committed_state(
+        self,
+        *,
+        expected_head: str,
+        commit_sha: str,
+        manifest: list[dict[str, Any]],
+        contents: Mapping[str, bytes | None],
+        targets: Mapping[str, Path],
+    ) -> None:
+        self._audit_commit(expected_head, commit_sha, manifest)
+        if not self._git_quiet_clean(
+            "merge-base", "--is-ancestor", commit_sha, self.branch_ref
+        ):
+            raise PublicationFailure("publication_commit_not_on_branch")
+        current_head = self.head()
+        self._workspace_snapshot(current_head)
+        for row in manifest:
+            path = row["path"]
+            desired = contents[path]
+            current = self._prior_bytes(path, current_head)
+            if current != desired:
+                raise PublicationFailure("publication_content_changed_after_commit")
+            target = targets[path]
+            if desired is None:
+                if target.exists() or target.is_symlink():
+                    raise PublicationFailure("publication_materialization_changed_after_commit")
+            elif (
+                target.is_symlink()
+                or not target.is_file()
+                or target.read_bytes() != desired
+            ):
+                raise PublicationFailure("publication_materialization_changed_after_commit")
+
     def _materialization_state_is_recoverable(
         self,
         expected_head: str,
@@ -568,9 +628,11 @@ class GitSourcePublisher:
         files: Iterable[PublicationFile],
         review_id: str = "",
         interpretation_id: str = "",
+        trailer_label: str = "Assimilation",
     ) -> PublicationResult:
         self._validate_repository()
-        manifest, contents, targets = self._manifest(files, expected_head)
+        file_values = tuple(files)
+        manifest, contents, targets = self._manifest(file_values, expected_head)
         manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
         if self.store is not None:
             self.store.record_publication(
@@ -582,16 +644,50 @@ class GitSourcePublisher:
         current_head = self._git_text("rev-parse", self.branch_ref)
         first_snapshot: dict[str, str] | None = None
         if current_head != expected_head:
-            message = self._git_text("show", "-s", "--format=%B", current_head)
+            identity_label = str(trailer_label or "Assimilation")
             trailers = (
                 f"Client-Knowledge-Artifact: {artifact_id}",
-                f"Client-Knowledge-Assimilation: {assimilation_id}",
-                f"Client-Knowledge-Assimilation-Version: {assimilation_version}",
-                f"Client-Knowledge-Proposal-SHA256: {proposal_sha256}",
+                f"Client-Knowledge-{identity_label}: {assimilation_id}",
+                f"Client-Knowledge-{identity_label}-Version: {assimilation_version}",
+                f"Client-Knowledge-{identity_label}-SHA256: {proposal_sha256}",
             )
-            if all(value in message for value in trailers):
-                self._audit_commit(expected_head, current_head, manifest)
-                commit_sha = current_head
+            matching_commits = []
+            for candidate in self._git_text(
+                "rev-list", "--reverse", f"{expected_head}..{current_head}"
+            ).splitlines():
+                message = self._git_text("show", "-s", "--format=%B", candidate)
+                if all(value in message for value in trailers):
+                    self._audit_commit(expected_head, candidate, manifest)
+                    matching_commits.append(candidate)
+            if len(matching_commits) > 1:
+                raise PublicationFailure("publication_commit_ambiguous")
+            if len(matching_commits) == 1:
+                commit_sha = matching_commits[0]
+                if commit_sha != current_head:
+                    self._verify_committed_state(
+                        expected_head=expected_head,
+                        commit_sha=commit_sha,
+                        manifest=manifest,
+                        contents=contents,
+                        targets=targets,
+                    )
+                    if self.store is not None:
+                        self.store.record_publication(
+                            assimilation_id=assimilation_id,
+                            artifact_id=artifact_id,
+                            assimilation_version=assimilation_version,
+                            proposal_sha256=proposal_sha256,
+                            branch_ref=self.branch_ref,
+                            expected_head=expected_head,
+                            manifest_json=manifest_json,
+                            state="committed",
+                            commit_sha=commit_sha,
+                        )
+                    return PublicationResult(
+                        commit_sha,
+                        manifest_json,
+                        tuple(row["path"] for row in manifest),
+                    )
                 self._recover_materialization_sidecars(
                     assimilation_id, manifest, contents, targets
                 )
@@ -626,52 +722,79 @@ class GitSourcePublisher:
                     manifest_json,
                     tuple(row["path"] for row in manifest),
                 )
-            else:
+            reset = getattr(self.store, "reset_publication", None)
+            if not callable(reset):
                 raise PublicationFailure("git_head_changed")
+            self._workspace_snapshot(current_head)
+            new_manifest, new_contents, new_targets = self._manifest(
+                file_values, current_head
+            )
+            new_manifest_json = json.dumps(
+                new_manifest, sort_keys=True, separators=(",", ":")
+            )
+            if not reset(
+                assimilation_id=assimilation_id,
+                old_expected_head=expected_head,
+                old_manifest_json=manifest_json,
+                new_expected_head=current_head,
+                new_manifest_json=new_manifest_json,
+            ):
+                raise PublicationFailure("publication_prepared_reset_lost")
+            expected_head = current_head
+            manifest = new_manifest
+            contents = new_contents
+            targets = new_targets
+            manifest_json = new_manifest_json
+            first_snapshot = self._workspace_snapshot(expected_head)
+            index_path = self._private / "index"
+            temp_env = {"GIT_INDEX_FILE": str(index_path)}
+            self._git("read-tree", expected_head, env=temp_env)
         else:
             first_snapshot = self._workspace_snapshot(expected_head)
             index_path = self._private / "index"
             temp_env = {"GIT_INDEX_FILE": str(index_path)}
             self._git("read-tree", expected_head, env=temp_env)
-            for row in manifest:
-                path = row["path"]
-                content = contents[path]
-                if content is None:
-                    self._git("update-index", "--force-remove", "--", path, env=temp_env)
-                else:
-                    blob = self._git_text("hash-object", "-w", "--no-filters", "--stdin", input_bytes=content, env=temp_env)
-                    self._git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=temp_env)
-            tree = self._git_text("write-tree", env=temp_env)
-            commit_message = (
-                f"client-knowledge: assimilate {artifact_id[:12]}\n\n"
-                f"Client-Knowledge-Artifact: {artifact_id}\n"
-                f"Client-Knowledge-Interpretation: {interpretation_id or 'unknown'}\n"
-                f"Client-Knowledge-Assimilation: {assimilation_id}\n"
-                f"Client-Knowledge-Assimilation-Version: {assimilation_version}\n"
-                f"Client-Knowledge-Proposal-SHA256: {proposal_sha256}\n"
-                f"Client-Knowledge-Review: {review_id or 'none'}\n"
-            ).encode("utf-8")
-            authored = f"@{max(1, int(authored_at))} +0000"
-            commit_env = {
-                "GIT_AUTHOR_NAME": "Hermes Client Knowledge",
-                "GIT_AUTHOR_EMAIL": "client-knowledge@localhost",
-                "GIT_COMMITTER_NAME": "Hermes Client Knowledge",
-                "GIT_COMMITTER_EMAIL": "client-knowledge@localhost",
-                "GIT_AUTHOR_DATE": authored,
-                "GIT_COMMITTER_DATE": authored,
-            }
-            commit_sha = self._git_text(
-                "commit-tree", tree, "-p", expected_head,
-                input_bytes=commit_message, env=commit_env,
-            )
-            self._audit_commit(expected_head, commit_sha, manifest)
-            second_snapshot = self._workspace_snapshot(expected_head)
-            if second_snapshot != first_snapshot:
-                raise PublicationFailure("git_workspace_changed_before_cas")
-            try:
-                self._git("update-ref", self.branch_ref, commit_sha, expected_head)
-            except PublicationFailure as exc:
-                raise PublicationFailure("git_cas_failed") from exc
+        for row in manifest:
+            path = row["path"]
+            content = contents[path]
+            if content is None:
+                self._git("update-index", "--force-remove", "--", path, env=temp_env)
+            else:
+                blob = self._git_text("hash-object", "-w", "--no-filters", "--stdin", input_bytes=content, env=temp_env)
+                self._git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=temp_env)
+        tree = self._git_text("write-tree", env=temp_env)
+        identity_label = str(trailer_label or "Assimilation")
+        verb = "synthesize" if identity_label == "Synthesis" else "assimilate"
+        commit_message = (
+            f"client-knowledge: {verb} {artifact_id[:12]}\n\n"
+            f"Client-Knowledge-Artifact: {artifact_id}\n"
+            f"Client-Knowledge-Interpretation: {interpretation_id or 'unknown'}\n"
+            f"Client-Knowledge-{identity_label}: {assimilation_id}\n"
+            f"Client-Knowledge-{identity_label}-Version: {assimilation_version}\n"
+            f"Client-Knowledge-{identity_label}-SHA256: {proposal_sha256}\n"
+            f"Client-Knowledge-Review: {review_id or 'none'}\n"
+        ).encode("utf-8")
+        authored = f"@{max(1, int(authored_at))} +0000"
+        commit_env = {
+            "GIT_AUTHOR_NAME": "Hermes Client Knowledge",
+            "GIT_AUTHOR_EMAIL": "client-knowledge@localhost",
+            "GIT_COMMITTER_NAME": "Hermes Client Knowledge",
+            "GIT_COMMITTER_EMAIL": "client-knowledge@localhost",
+            "GIT_AUTHOR_DATE": authored,
+            "GIT_COMMITTER_DATE": authored,
+        }
+        commit_sha = self._git_text(
+            "commit-tree", tree, "-p", expected_head,
+            input_bytes=commit_message, env=commit_env,
+        )
+        self._audit_commit(expected_head, commit_sha, manifest)
+        second_snapshot = self._workspace_snapshot(expected_head)
+        if second_snapshot != first_snapshot:
+            raise PublicationFailure("git_workspace_changed_before_cas")
+        try:
+            self._git("update-ref", self.branch_ref, commit_sha, expected_head)
+        except PublicationFailure as exc:
+            raise PublicationFailure("git_cas_failed") from exc
         assert first_snapshot is not None
         post_cas = self._workspace_snapshot(expected_head, require_branch=False)
         if post_cas != first_snapshot:

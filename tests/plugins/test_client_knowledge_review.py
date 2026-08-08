@@ -2,1295 +2,1214 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
-from plugins.client_knowledge_gbrain.models import IntakeArtifact
 from plugins.client_knowledge_gbrain.derived import canonical_json
-from plugins.client_knowledge_gbrain.store import IntakeStore
+from plugins.client_knowledge_gbrain.models import IntakeArtifact
 from plugins.client_knowledge_gbrain.review import (
-    _validate_revision_batch,
+    ProjectReviewConfig,
+    ReviewFailure,
     _render_notification,
     capture_review_text_hook,
-    fetch_and_reconcile_notification,
+    fetch_and_reconcile_replacement_notification,
     handle_discord_review_interaction,
-    process_pending_review_revisions,
-    repair_review_details,
-    reconcile_uncertain_notification,
+    item_review_components,
+    send_pending_replacement_notifications,
     send_pending_review_notifications,
 )
-from agent.plugin_llm import PluginLlmStructuredResult
-from plugins.client_knowledge_gbrain.assimilation import _canonical_markdown
+from plugins.client_knowledge_gbrain.synthesis import SynthesisFailure, SynthesisSettings
+from plugins.client_knowledge_gbrain.store import IntakeStore
 
 
 CFG = {
     "client_knowledge": {"review_notifications": {"enabled": True}},
-    "projects": {
-        "pid": {
-            "display_name": "PID",
-            "client_knowledge_review": {
-                "guild_id": "100",
-                "channel_id": "200",
-                "reviewer_role_id": "300",
-                "reviewer_user_ids": ["601"],
-            },
-        }
-    },
+    "projects": {"pid": {
+        "display_name": "PID",
+        "client_knowledge_review": {
+            "guild_id": "100", "channel_id": "200", "reviewer_role_id": "300",
+            "reviewer_user_ids": ["601"],
+        },
+    }},
 }
+EXTRACTION = {"segments": [
+    {"kind": "header", "label": "From", "text": "Alex <alex@example.test>"},
+    {"kind": "header", "label": "Subject", "text": "PID weekly reporting"},
+    {"kind": "header", "label": "Date", "text": "Fri, 7 Aug 2026 09:00:00 +0000"},
+]}
 
 
-def _interpretation(count: int = 6):
-    evidence = []
-    requirements = []
-    for index in range(1, count + 1):
-        quote = f"Synthetic evidence quote {index}: reports are due every Monday."
-        evidence_id = f"evidence-{index:03d}"
-        finding_id = f"requirement-{index}"
-        evidence.append(
-            {
-                "id": evidence_id,
-                "segment_id": "body-0001",
-                "start": 0,
-                "end": len(quote),
-                "quote": quote,
-            }
-        )
-        requirements.append(
-            {
-                "id": finding_id,
-                "text": f"Synthetic requirement {index}: send the report every Monday.",
-                "confidence": "high" if index % 2 else "medium",
-                "sensitivity": "internal",
-                "evidence_ids": [evidence_id],
-            }
-        )
-    return {
-        "summary": "Synthetic PID email summary.",
-        "candidate_learnings": [],
-        "decisions": [],
-        "requirements": requirements,
-        "preferences": [],
-        "risks": [],
-        "stakeholders": [],
-        "deadlines": [],
-        "open_questions": [],
-        "suggested_actions": [],
-        "evidence": evidence,
-    }
+def _evidence(quote):
+    return json.dumps([{
+        "segment_id": "body-0001", "start": 0, "end": len(quote), "quote": quote,
+    }], sort_keys=True, separators=(",", ":"))
 
 
-def _operation(index: int, *, ignored: bool = False):
-    if ignored:
-        return {
-            "operation": "ignore_transient",
-            "target_slug": "",
-            "title": "",
-            "kind": "",
-            "status": "",
-            "confidence": "",
-            "sensitivity": "",
-            "impact": "",
-            "honcho_projection": "",
-            "effective_at": "",
-            "source_refs": [],
-            "supersedes": [],
-            "claim": "",
-            "timeline_entry": "",
-            "expected_prior_sha256": "",
-            "finding_id": f"requirement-{index}",
-            "evidence_ids": [f"evidence-{index:03d}"],
-            "final_markdown": "",
-        }
-    return {
-        "operation": "add",
-        "target_slug": f"requirements/reporting-{index}",
-        "title": f"Weekly reporting rule {index}",
-        "kind": "requirement",
-        "status": "current",
-        "confidence": "high" if index % 2 else "medium",
-        "sensitivity": "internal",
-        "impact": "ordinary",
-        "honcho_projection": "eligible",
-        "effective_at": "2026-08-07",
-        "source_refs": ["notion:page:0123456789abcdef0123456789abcdef"],
-        "supersedes": [],
-        "claim": f"Synthetic requirement {index}: send the report every Monday.",
-        "timeline_entry": "Synthetic timeline entry.",
-        "expected_prior_sha256": "",
-        "finding_id": f"requirement-{index}",
-        "evidence_ids": [f"evidence-{index:03d}"],
-        "final_markdown": "Synthetic final markdown.",
-    }
-
-
-def _proposal(count: int = 6):
-    return {"operations": [
-        *[_operation(index) for index in range(1, count // 2 + 1)],
-        *[_operation(index, ignored=True) for index in range(count // 2 + 1, count + 1)],
-    ]}
-
-
-def _artifact():
-    return IntakeArtifact.from_bytes(
-        project_key="pid",
-        provider_id="gmail",
-        provider_artifact_id="mailbox@example.test:message:synthetic-1",
-        provider_message_id="synthetic-1",
-        occurred_at=1786089600,
-        source_url="https://mail.google.com/mail/u/0/#all/synthetic-1",
-        mime_type="message/rfc822",
-        original_filename="message.eml",
-        content=b"synthetic email",
-    )
-
-
-EXTRACTION = {
-    "segments": [
-        {"kind": "header", "label": "From", "text": "Alex Example <alex@example.test>"},
-        {"kind": "header", "label": "Subject", "text": "PID weekly reporting"},
-        {"kind": "header", "label": "Date", "text": "Fri, 7 Aug 2026 09:00:00 +0000"},
+def _items():
+    return [
+        {"item_id": "1" * 64, "position": 1, "revision_number": 0,
+         "statement": "Send a concise status report every Monday.",
+         "evidence_json": _evidence("Send a concise status report every Monday."),
+         "state": "pending"},
+        {"item_id": "2" * 64, "position": 2, "revision_number": 0,
+         "statement": "Use the existing approval flow for client-facing changes.",
+         "evidence_json": _evidence("Use the existing approval flow for client-facing changes."),
+         "state": "pending"},
     ]
-}
+
+
+def _synthesis():
+    return {
+        "synthesis_id": "s" * 64, "artifact_id": "a" * 64, "project_key": "pid",
+        "notion_ref": "notion:page:source", "output_sha256": "o" * 64,
+        "output_bytes": 1, "extraction_id": "e" * 64, "state": "review_pending",
+    }
+
+
+def test_parent_has_no_controls_and_each_item_has_exactly_three_static_controls():
+    content, _digest, _marker, embed, details, _items_digest = _render_notification(
+        _synthesis(), _items(), EXTRACTION, ProjectReviewConfig.from_config(CFG, "pid")
+    )
+    assert content == "<@&300>"
+    assert embed["title"] == "Request to Learn"
+    assert "2 publication candidates" in embed["description"]
+    assert "Alex" in str(embed)
+    assert all("components" in item for item in details)
+    assert [button["label"] for button in details[0]["components"][0]["components"]] == [
+        "Approve", "Reject", "✍️ Other",
+    ]
+    assert [button["custom_id"] for button in item_review_components()[0]["components"]] == [
+        "client-knowledge-review-item:approve",
+        "client-knowledge-review-item:reject",
+        "client-knowledge-review-item:instructions",
+    ]
+    assert details[0]["embeds"][0]["fields"][0]["value"].endswith(
+        r"Send a concise status report every Monday\."
+    )
+    assert details[0]["embeds"][0]["footer"]["text"] == "Learning 1 · revision 1"
+    assert "ignore_transient" not in str(details)
+
+
+def test_exact_evidence_is_split_without_utf16_truncation():
+    quote = "😀" * 800
+    item = {
+        "item_id": "1" * 64, "position": 1, "revision_number": 0,
+        "statement": "Durable statement.", "state": "pending",
+        "evidence_json": _evidence(quote),
+    }
+    _content, _digest, _marker, _embed, details, _items_digest = _render_notification(
+        _synthesis(), [item], EXTRACTION, ProjectReviewConfig.from_config(CFG, "pid")
+    )
+    fields = details[0]["embeds"][0]["fields"]
+    from gateway.platforms.base import utf16_len
+
+    assert len(fields) == 2
+    assert all(utf16_len(field["value"]) <= 1024 for field in fields)
+    rendered = fields[0]["value"].split("\n> ", 1)[1] + "".join(
+        field["value"][2:] for field in fields[1:]
+    )
+    assert rendered == quote
+
+
+def test_exact_evidence_split_never_breaks_markdown_escape_pair():
+    quote = "*" * 600
+    item = {
+        "item_id": "1" * 64, "position": 1, "revision_number": 0,
+        "statement": "Durable statement.", "state": "pending",
+        "evidence_json": _evidence(quote),
+    }
+    details = _render_notification(
+        _synthesis(), [item], EXTRACTION, ProjectReviewConfig.from_config(CFG, "pid")
+    )[4]
+    values = [field["value"] for field in details[0]["embeds"][0]["fields"]]
+    assert all(not value.endswith("\\") for value in values[:-1])
+
+
+def test_candidate_rejects_aggregate_embed_overflow_without_evidence_truncation():
+    evidence = [
+        {
+            "segment_id": f"body-{index:04d}",
+            "start": 0,
+            "end": 800,
+            "quote": "*" * 800,
+        }
+        for index in range(1, 4)
+    ]
+    item = {
+        "item_id": "1" * 64,
+        "position": 1,
+        "revision_number": 0,
+        "statement": "x" * 2000,
+        "state": "pending",
+        "evidence_json": json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+    }
+    with pytest.raises(ReviewFailure, match="aggregate embed"):
+        _render_notification(
+            _synthesis(), [item], EXTRACTION, ProjectReviewConfig.from_config(CFG, "pid")
+        )
 
 
 class _Store:
     def __init__(self):
-        self.review = {
-            "review_id": "a" * 64,
-            "assimilation_id": "b" * 64,
-            "artifact_id": "c" * 64,
-            "project_key": "pid",
-            "proposal_sha256": "d" * 64,
-            "assimilation_version": "v1",
-            "state": "pending",
-            "reason_code": "finding_grounding_mismatch",
-            "notification_state": "pending",
-            "notification_message_id": None,
-            "notification_guild_id": None,
-            "notification_channel_id": None,
-            "notification_role_id": None,
-            "notification_marker": None,
-            "notification_content_sha256": None,
-            "detail_state": "pending",
-            "detail_content_sha256": None,
-            "detail_thread_id": None,
-            "capture_mode": None,
-            "capture_user_id": None,
-            "capture_role_id": None,
-            "capture_channel_id": None,
-        }
+        self.synthesis = _synthesis()
+        self.items = _items()
+        self.parent = {"state": "pending"}
         self.decisions = []
-        self.instructions = []
 
-    def list_pending_reviews(self, limit=50):
-        return [dict(self.review)] if self.review["state"] == "pending" else []
-
-    def list_open_reviews(self, limit=50):
-        return [dict(self.review)] if self.review["state"] in {"pending", "instructions_pending"} else []
-
-    def get_assimilation(self, _):
-        return {
-            "assimilation_id": "b" * 64,
-            "interpretation_id": "f" * 64,
-            "output_sha256": "e" * 64,
-            "output_bytes": 1,
-        }
-
-    def get_interpretation(self, _):
-        return {
-            "interpretation_id": "f" * 64,
-            "extraction_id": "1" * 64,
-            "output_sha256": "2" * 64,
-            "output_bytes": 1,
-        }
+    def list_pending_synthesis_notifications(self, limit=50):
+        return [dict(self.synthesis)] if self.parent["state"] == "pending" else []
 
     def get_extraction(self, _):
-        return {"extraction_id": "1" * 64, "output_sha256": "3" * 64, "output_bytes": 1}
+        return {"extraction_id": "e" * 64, "output_sha256": "x" * 64, "output_bytes": 1}
 
-    def get_artifact(self, _):
-        return _artifact()
+    def list_synthesis_items(self, _id, active_only=False):
+        return [dict(item) for item in self.items if not active_only or item["state"] != "superseded"]
 
-    def get_completed_stage_receipt(self, _artifact_id, stage):
-        assert stage == "notion_archived"
-        return {"receipt_id": "notion:page:0123456789abcdef0123456789abcdef"}
-
-    def record_review_notification(self, _id, **kwargs):
-        self.review.update(
-            {
-                "notification_state": kwargs["state"],
-                "notification_content_sha256": kwargs["content_sha256"],
-                "notification_message_id": kwargs.get("message_id") or self.review.get("notification_message_id"),
-                "notification_guild_id": kwargs["guild_id"],
-                "notification_channel_id": kwargs["channel_id"],
-                "notification_role_id": kwargs["role_id"],
-                "notification_marker": kwargs["marker"],
-                "detail_state": kwargs.get("detail_state", "pending"),
-                "detail_content_sha256": kwargs.get("detail_content_sha256"),
-                "detail_thread_id": kwargs.get("detail_thread_id") or self.review.get("detail_thread_id"),
-            }
-        )
-
-    def claim_review_notification(self, _id, **kwargs):
-        if self.review["notification_state"] not in {"pending", "proven_none"}:
-            return False
-        self.record_review_notification(_id, state="uncertain", **kwargs)
+    def claim_synthesis_notification(self, *_args, **_kwargs):
+        self.parent["state"] = "uncertain"
         return True
 
-    def get_review(self, _):
-        return dict(self.review)
+    def record_synthesis_notification(self, _id, *, state, item_message_ids=(), **kwargs):
+        self.parent.update({"state": state, "thread_id": kwargs.get("thread_id"),
+                            "guild_id": kwargs["guild_id"], "channel_id": kwargs["channel_id"],
+                            "role_id": kwargs["role_id"]})
+        for item, message_id in zip(self.items, item_message_ids):
+            item["notification_message_id"] = message_id
+            item["notification_state"] = "confirmed"
 
-    def get_review_by_notification_message(self, message_id):
-        return dict(self.review) if message_id == self.review["notification_message_id"] else None
-
-    def decide_review(self, review_id, **kwargs):
-        if self.review["state"] != "pending":
-            return False
-        if self.review.get("capture_mode") and kwargs["decision"] == "approved":
-            return False
-        if kwargs["decision"] == "rejected" and self.review.get("capture_mode") != "reject_reason":
-            return False
-        self.decisions.append((review_id, kwargs))
-        self.review["state"] = kwargs["decision"]
-        self.review["capture_mode"] = None
-        return True
-
-    def begin_review_text_capture(self, review_id, **kwargs):
-        if self.review["state"] != "pending" or self.review.get("capture_mode"):
-            return False
-        self.review.update(
-            {
-                "capture_mode": kwargs["mode"],
-                "capture_user_id": kwargs["reviewer_user_id"],
-                "capture_role_id": kwargs["reviewer_role_id"],
-                "capture_channel_id": kwargs["channel_id"],
-            }
-        )
-        return True
-
-    def get_review_text_capture(self, **kwargs):
-        if (
-            self.review.get("capture_mode")
-            and self.review["notification_guild_id"] == kwargs["guild_id"]
-            and self.review["capture_channel_id"] == kwargs["channel_id"]
-            and self.review["capture_user_id"] == kwargs["user_id"]
-        ):
-            return dict(self.review)
+    def get_synthesis_item_by_message(self, message_id):
+        for item in self.items:
+            if item.get("notification_message_id") == message_id:
+                return {**item, "guild_id": self.parent.get("guild_id"),
+                        "channel_id": self.parent.get("channel_id"),
+                        "role_id": self.parent.get("role_id"),
+                        "thread_id": self.parent.get("thread_id"),
+                        "parent_notification_state": self.parent["state"],
+                        "project_key": "pid", "synthesis_state": "review_pending"}
         return None
 
-    def record_review_instruction(self, review_id, **kwargs):
-        if self.review.get("capture_mode") != "instructions":
+    def decide_synthesis_item(self, item_id, **kwargs):
+        item = next(value for value in self.items if value["item_id"] == item_id)
+        if item["state"] != "pending":
             return False
-        self.instructions.append((review_id, kwargs))
-        self.review["state"] = "instructions_pending"
-        self.review["capture_mode"] = None
+        item["state"] = kwargs["decision"]
+        self.decisions.append((item_id, kwargs["decision"]))
+        return True
+
+    def begin_synthesis_item_instruction(self, item_id, **kwargs):
+        item = next(value for value in self.items if value["item_id"] == item_id)
+        if item.get("capture_user_id"):
+            return False
+        item.update(kwargs)
+        item["capture_user_id"] = kwargs["reviewer_user_id"]
         return True
 
 
 class _Derived:
-    def __init__(self, count=6):
-        self.count = count
-
     def read_json(self, kind, *_args):
-        if kind == "assimilations":
-            return {"proposal": _proposal(self.count)}
-        if kind == "interpretations":
-            return {"interpretation": _interpretation(self.count)}
+        if kind == "syntheses":
+            return {"synthesis_id": "s" * 64}
         if kind == "extractions":
             return EXTRACTION
         raise AssertionError(kind)
 
 
-def _rendered(count=6):
-    review = _Store().review
-    from plugins.client_knowledge_gbrain.review import ProjectReviewConfig
-
-    return _render_notification(
-        review,
-        _proposal(count),
-        _interpretation(count),
-        _artifact(),
-        EXTRACTION,
-        ProjectReviewConfig.from_config(CFG, "pid"),
-        "notion:page:0123456789abcdef0123456789abcdef",
-    )
-
-
-def test_human_rendering_is_compact_and_keeps_full_details_out_of_parent():
-    content, _digest, marker, embed, details, _detail_digest = _rendered()
-    assert content == "<@&300>"
-    assert "Nothing has been published yet" not in content
-    assert marker not in content
-    assert embed == {
-        "title": "Request to Learn",
-        "description": (
-            "**3 proposed additions · 3 findings not proposed**\n"
-            "[Source in Notion](https://www.notion.so/0123456789abcdef0123456789abcdef)"
-        ),
-        "color": 0xF59E0B,
-        "fields": [{
-            "name": "Source",
-            "value": (
-                r"**Email sender:** Alex Example \<alex@example\.test\>" "\n"
-                "**Email subject:** PID weekly reporting\n"
-                r"**Email date:** Fri, 7 Aug 2026 09:00:00 \+0000"
-            ),
-        }],
-    }
-    assert "/client-knowledge" not in content
-    assert "a" * 64 not in content
-    assert "finding_grounding_mismatch" not in str(embed)
-    assert "Why this needs review" not in str(embed)
-    assert "How to decide" not in str(embed)
-    assert "Alex Example" in str(embed)
-    assert "Email sender" in str(embed)
-    assert "Email subject" in str(embed)
-    assert "Email date" in str(embed)
-    assert "https://mail.google.com" not in str(embed)
-    assert "https://www.notion.so/0123456789abcdef0123456789abcdef" in str(embed)
-    joined = "\n".join(details)
-    assert "Add new knowledge" in joined
-    assert "Weekly reporting rule 1" in joined
-    assert "Synthetic requirement 1" in joined
-    assert "Requirements › Reporting 1" in joined
-    assert "Synthetic evidence quote 1" in joined
-    assert "Do not add — not proposed for publication" in joined
-    assert "Synthetic requirement 4" in joined
-    assert "ignore_transient" not in joined
-    assert "notion:page:" not in joined
-    assert "requirements/reporting" not in joined
-
-
-def test_maximum_bounded_batch_preserves_every_claim_and_evidence():
-    _content, _digest, _marker, _embed, details, _detail_digest = _rendered(10)
-    joined = "\n".join(details)
-    for index in range(1, 11):
-        assert f"Synthetic requirement {index}" in joined
-        assert f"Synthetic evidence quote {index}" in joined
-    assert all(len(message) <= 1900 for message in details)
-
-
-def test_uncertain_detail_repair_appends_only_missing_exact_messages(monkeypatch):
-    store = _confirmed_store()
-    store.review.update({
-        "detail_state": "uncertain",
-        "detail_content_sha256": _rendered()[5],
-        "detail_thread_id": "401",
-        "notification_content_sha256": _rendered()[1],
-        "notification_marker": _rendered()[2],
-    })
-    details = _rendered()[4]
-    existing = details[:-1]
-    calls = []
-
-    def request(method, path, _token, params=None, body=None, timeout=15):
-        calls.append((method, path, body))
-        if method == "GET":
-            current = [*existing]
-            if any(item[0] == "POST" for item in calls):
-                current.append(details[-1])
-            return [{"content": item, "author": {"bot": True}} for item in current]
-        assert body["content"] == details[-1]
-        return {"id": "new"}
-
-    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
-    monkeypatch.setattr("tools.discord_tool._discord_request", request)
-    assert repair_review_details(store, _Derived(), "a" * 64, config=CFG) is True
-    posts = [item for item in calls if item[0] == "POST"]
-    assert len(posts) == 1
-    assert posts[0][2]["content"] == details[-1]
-    assert store.review["detail_state"] == "confirmed"
-
-
-def test_timed_out_parent_remains_uncertain_and_no_match_never_retries():
+def test_delivery_returns_ordered_message_ids_and_click_changes_only_one_item(monkeypatch):
     store = _Store()
-    calls = 0
-
-    async def sender(**_kwargs):
-        nonlocal calls
-        calls += 1
-        return {"error": "timeout", "side_effect_state": "uncertain"}
-
-    result = asyncio.run(
-        send_pending_review_notifications(store=store, derived=_Derived(), config=CFG, sender=sender)
-    )
-    assert result["uncertain"] == 1
-    assert store.review["notification_state"] == "uncertain"
-    assert reconcile_uncertain_notification(store, "a" * 64, []) is False
-    asyncio.run(
-        send_pending_review_notifications(store=store, derived=_Derived(), config=CFG, sender=sender)
-    )
-    assert calls == 1
-
-
-def test_delivery_sends_structured_parent_and_full_detail_thread_batch():
-    store = _Store()
-    sent = []
 
     async def sender(**kwargs):
-        sent.append(kwargs)
+        assert "components" not in kwargs["embed"]
         return {
-            "success": True,
-            "message_id": "400",
-            "thread_id": "401",
-            "side_effect_state": "confirmed",
-            "detail_state": "confirmed",
+            "success": True, "message_id": "400", "thread_id": "401",
+            "side_effect_state": "confirmed", "detail_state": "confirmed",
+            "detail_message_ids": ["402", "403"],
         }
 
-    result = asyncio.run(
-        send_pending_review_notifications(store=store, derived=_Derived(), config=CFG, sender=sender)
-    )
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=_Derived(), config=CFG, sender=sender
+    ))
     assert result["confirmed"] == 1
-    assert sent[0]["embed"]["title"] == "Request to Learn"
-    assert len(sent[0]["detail_messages"]) == 6
-    assert store.review["notification_message_id"] == "400"
-    assert store.review["detail_thread_id"] == "401"
-
-
-def test_uncertain_delivery_adopts_exact_one_message():
-    store = _Store()
-    store.record_review_notification(
-        "a" * 64,
-        state="uncertain",
-        content_sha256="f" * 64,
-        guild_id="100",
-        channel_id="200",
-        role_id="300",
-        marker="[marker]",
-    )
-    assert reconcile_uncertain_notification(
-        store,
-        "a" * 64,
-        [
-            {
-                "guild_id": "100",
-                "channel_id": "200",
-                "content_sha256": "f" * 64,
-                "content": "x [marker]",
-                "message_id": "400",
-                "author_is_bot": True,
-                "allowed_role_mentions": ["300"],
-            }
-        ],
-    ) is True
-    assert store.review["notification_message_id"] == "400"
-
-
-def test_operator_fetch_adopts_only_exact_message(monkeypatch):
-    store = _Store()
-    content = "review [marker]"
-    store.record_review_notification(
-        "a" * 64,
-        state="uncertain",
-        content_sha256=hashlib.sha256(content.encode()).hexdigest(),
-        guild_id="100",
-        channel_id="200",
-        role_id="300",
-        marker="[marker]",
-    )
-    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
-    monkeypatch.setattr(
-        "tools.discord_tool._discord_request",
-        lambda *_args, **_kwargs: {
-            "id": "400",
-            "guild_id": "100",
-            "channel_id": "200",
-            "content": content,
-            "author": {"bot": True},
-            "mention_roles": ["300"],
-        },
-    )
-    assert fetch_and_reconcile_notification(store, "a" * 64, "400") is True
-
-
-def test_new_ux_reconciliation_requires_exact_embed_and_components():
-    store = _Store()
-    content, digest, marker, embed, _details, _detail_digest = _rendered()
-    store.record_review_notification(
-        "a" * 64,
-        state="uncertain",
-        content_sha256=digest,
-        guild_id="100",
-        channel_id="200",
-        role_id="300",
-        marker=marker,
-    )
-    from plugins.client_knowledge_gbrain.review import _parent_payload_digest, _review_components
-
-    assert reconcile_uncertain_notification(
-        store,
-        "a" * 64,
-        [{
-            "guild_id": "100",
-            "channel_id": "200",
-            "content": content,
-            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-            "parent_payload_sha256": _parent_payload_digest(
-                content, embed, _review_components()
-            ),
-            "message_id": "400",
-            "author_is_bot": True,
-            "allowed_role_mentions": ["300"],
-        }],
-    ) is True
-
-    mismatch = _Store()
-    mismatch.record_review_notification(
-        "a" * 64,
-        state="uncertain",
-        content_sha256=digest,
-        guild_id="100",
-        channel_id="200",
-        role_id="300",
-        marker=marker,
-    )
-    assert reconcile_uncertain_notification(
-        mismatch,
-        "a" * 64,
-        [{
-            "guild_id": "100",
-            "channel_id": "200",
-            "content": content,
-            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-            "parent_payload_sha256": _parent_payload_digest(
-                content, {**embed, "title": "Changed"}, _review_components()
-            ),
-            "message_id": "400",
-            "author_is_bot": True,
-            "allowed_role_mentions": ["300"],
-        }],
-    ) is False
-
-
-def test_compact_ux_reconciliation_does_not_require_visible_marker():
-    store = _Store()
-    content, digest, marker, embed, _details, _detail_digest = _rendered()
-    assert marker.endswith(":ux4]")
-    assert marker not in content
-    store.record_review_notification(
-        "a" * 64,
-        state="uncertain",
-        content_sha256=digest,
-        guild_id="100",
-        channel_id="200",
-        role_id="300",
-        marker=marker,
-    )
-    from plugins.client_knowledge_gbrain.review import _parent_payload_digest, _review_components
-
-    assert reconcile_uncertain_notification(
-        store,
-        "a" * 64,
-        [{
-            "guild_id": "100",
-            "channel_id": "200",
-            "content": content,
-            "parent_payload_sha256": _parent_payload_digest(
-                content, embed, _review_components()
-            ),
-            "message_id": "400",
-            "author_is_bot": True,
-            "allowed_role_mentions": ["300"],
-        }],
-    ) is True
-
-
-def _interaction(*, user_id="600", roles=(300,), message_id="400", guild="100", channel="200"):
-    guild_obj = SimpleNamespace(id=int(guild), name="Synthetic Guild")
-    channel_obj = SimpleNamespace(id=int(channel), guild=guild_obj, name="pid", parent=None)
-    response_state = {"done": False}
-
-    async def defer(**_kwargs):
-        response_state["done"] = True
-
-    response = SimpleNamespace(
-        defer=AsyncMock(side_effect=defer),
-        send_message=AsyncMock(),
-        is_done=lambda: response_state["done"],
-    )
-    return SimpleNamespace(
-        id="500",
-        guild_id=guild,
-        channel_id=channel,
-        user=SimpleNamespace(
-            id=user_id,
-            display_name="Reviewer",
-            roles=[SimpleNamespace(id=value) for value in roles],
-        ),
-        message=SimpleNamespace(id=message_id),
-        guild=guild_obj,
-        channel=channel_obj,
-        response=response,
-        followup=SimpleNamespace(send=AsyncMock()),
-    )
-
-
-def _confirmed_store():
-    store = _Store()
-    store.review.update(
-        {
-            "notification_state": "confirmed",
-            "notification_message_id": "400",
-            "notification_guild_id": "100",
-            "notification_channel_id": "200",
-            "notification_role_id": "300",
-            "detail_state": "confirmed",
-            "detail_thread_id": "401",
-        }
-    )
-    return store
-
-
-def test_authorized_approve_is_idempotent_and_unauthorized_or_stale_controls_do_not_mutate(monkeypatch):
-    context = SimpleNamespace(
-        resolved=True, guild_id="100", channel_id="200", project_key="pid"
-    )
-    monkeypatch.setattr(
-        "gateway.discord_project_mapping.resolve_discord_project_context",
-        lambda *_args, **_kwargs: context,
-    )
-    store = _confirmed_store()
-    interaction = _interaction()
-    asyncio.run(handle_discord_review_interaction(interaction, "approve", store=store, config=CFG))
-    assert store.review["state"] == "approved"
-    assert len(store.decisions) == 1
-    interaction.response.defer.assert_awaited()
-    assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
-    asyncio.run(handle_discord_review_interaction(interaction, "approve", store=store, config=CFG))
-    assert len(store.decisions) == 1
-
-    unauthorized = _confirmed_store()
-    denied = _interaction(user_id="602", roles=())
-    asyncio.run(handle_discord_review_interaction(denied, "approve", store=unauthorized, config=CFG))
-    assert not unauthorized.decisions
-    assert denied.followup.send.await_args.kwargs["ephemeral"] is True
-
-    stale = _confirmed_store()
-    stale_interaction = _interaction(message_id="999")
-    asyncio.run(handle_discord_review_interaction(stale_interaction, "approve", store=stale, config=CFG))
-    assert not stale.decisions
-
-
-def test_parent_without_confirmed_detail_thread_cannot_be_decided(monkeypatch):
     monkeypatch.setattr(
         "gateway.discord_project_mapping.resolve_discord_project_context",
         lambda *_args, **_kwargs: SimpleNamespace(
             resolved=True, guild_id="100", channel_id="200", project_key="pid"
         ),
     )
-    store = _confirmed_store()
-    store.review.update({"detail_state": "uncertain", "detail_thread_id": None})
-    interaction = _interaction()
-    asyncio.run(handle_discord_review_interaction(interaction, "approve", store=store, config=CFG))
-    assert not store.decisions
-    assert store.review["state"] == "pending"
+    interaction = _interaction(message_id="402")
+    asyncio.run(handle_discord_review_interaction(
+        interaction, "approve", store=store, config=CFG
+    ))
+    assert [item["state"] for item in store.items] == ["approved", "pending"]
+    assert store.decisions == [("1" * 64, "approved")]
 
 
-def test_component_click_fails_closed_when_live_project_mapping_disagrees(monkeypatch):
+def _interaction(*, message_id="402", thread_id="401", user_id="600", roles=(300,), guild="100"):
+    guild_obj = SimpleNamespace(id=int(guild), name="Guild")
+    parent = SimpleNamespace(id=200, guild=guild_obj)
+    channel = SimpleNamespace(id=int(thread_id), guild=guild_obj, parent=parent, name="review")
+    state = {"done": False}
+
+    async def defer(**_kwargs):
+        state["done"] = True
+
+    return SimpleNamespace(
+        id="500", guild_id=guild, channel_id=thread_id,
+        user=SimpleNamespace(id=user_id, roles=[SimpleNamespace(id=value) for value in roles]),
+        message=SimpleNamespace(id=message_id), guild=guild_obj, channel=channel,
+        response=SimpleNamespace(defer=AsyncMock(side_effect=defer), send_message=AsyncMock(),
+                                 is_done=lambda: state["done"]),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+
+def test_cross_thread_stale_duplicate_and_unauthorized_interactions_fail_closed(monkeypatch):
     monkeypatch.setattr(
         "gateway.discord_project_mapping.resolve_discord_project_context",
         lambda *_args, **_kwargs: SimpleNamespace(
-            resolved=True, guild_id="100", channel_id="200", project_key="decoy"
+            resolved=True, guild_id="100", channel_id="200", project_key="pid"
         ),
     )
-    store = _confirmed_store()
+    for interaction in (
+        _interaction(thread_id="999"),
+        _interaction(message_id="999"),
+        _interaction(user_id="602", roles=()),
+    ):
+        store = _Store()
+        store.parent.update({"state": "confirmed", "thread_id": "401", "guild_id": "100",
+                             "channel_id": "200", "role_id": "300"})
+        store.items[0].update({"notification_message_id": "402", "notification_state": "confirmed"})
+        asyncio.run(handle_discord_review_interaction(
+            interaction, "approve", store=store, config=CFG
+        ))
+        assert not store.decisions
+    duplicate = _Store()
+    duplicate.parent.update({"state": "confirmed", "thread_id": "401", "guild_id": "100",
+                             "channel_id": "200", "role_id": "300"})
+    duplicate.items[0].update({"notification_message_id": "402", "notification_state": "confirmed"})
     interaction = _interaction()
-    asyncio.run(handle_discord_review_interaction(interaction, "approve", store=store, config=CFG))
-    assert not store.decisions
+    asyncio.run(handle_discord_review_interaction(interaction, "approve", store=duplicate, config=CFG))
+    asyncio.run(handle_discord_review_interaction(interaction, "approve", store=duplicate, config=CFG))
+    assert len(duplicate.decisions) == 1
 
 
-def _event(text: str, *, user_id="600", role=True):
+def _durable_store(tmp_path):
+    store = IntakeStore(tmp_path / "intake.db")
+    artifact = IntakeArtifact.from_bytes(
+        project_key="pid", provider_id="gmail", provider_artifact_id="message-1", content=b"source"
+    )
+    store.insert_artifact(artifact)
+    now = time.time()
+    synthesis = {
+        "synthesis_id": "s" * 64, "artifact_id": artifact.artifact_id,
+        "extraction_id": "e" * 64, "project_key": "pid", "notion_ref": "notion:page:source",
+        "synthesis_version": "v1", "schema_version": "sv1", "prompt_version": "pv1",
+        "derived_storage_id": "storage", "derived_object_key": "object",
+        "output_sha256": "o" * 64, "output_bytes": 1, "actual_provider": "provider",
+        "actual_model": "model", "selected_provider": "provider", "selected_model": "model",
+        "model_tier": "advanced", "route_fingerprint": "route", "base_git_head": "head",
+    }
+    with store._write() as conn:
+        conn.execute(
+            "INSERT INTO extractions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("e" * 64, artifact.artifact_id, artifact.content_sha256, "m" * 64, "ev", "lv", "rv",
+             "extracted", "storage", "object", "x" * 64, 1, 1, "{}", now),
+        )
+        store._insert_synthesis_locked(conn, synthesis, [
+            {"item_id": "1" * 64, "position": 1, "statement": "First.",
+             "evidence_json": _evidence("First."), "item_sha256": "a" * 64},
+            {"item_id": "2" * 64, "position": 2, "statement": "Second.",
+             "evidence_json": _evidence("Second."), "item_sha256": "b" * 64},
+        ], now=now)
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET state='confirmed', message_id='400', "
+            "guild_id='100', channel_id='200', role_id='300', thread_id='401' WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET notification_state='confirmed', "
+            "notification_message_id=CASE item_id WHEN ? THEN '402' ELSE '403' END",
+            ("1" * 64,),
+        )
+        for job_id, stage in (("a" * 32, "synthesized"), ("b" * 32, "needs_review")):
+            conn.execute(
+                "INSERT INTO jobs(job_id, artifact_id, stage, status, max_attempts, created_at, updated_at) "
+                "VALUES(?,?,?,'operator_blocked',3,?,?)",
+                (job_id, artifact.artifact_id, stage, now, now),
+            )
+    return store, artifact.artifact_id
+
+
+def _record_instruction(store, item_id, **kwargs):
+    item = store.get_synthesis_item(item_id)
+    capture_started_at = float(item["capture_started_at"])
+    return store.record_synthesis_item_instruction(
+        item_id,
+        expected_capture_started_at=capture_started_at,
+        source_created_at=capture_started_at + 1,
+        **kwargs,
+    )
+
+
+def test_partial_resolution_never_releases_and_final_resolution_releases(tmp_path):
+    store, artifact_id = _durable_store(tmp_path)
+    assert store.decide_synthesis_item(
+        "1" * 64, decision="approved", reviewer_user_id="600",
+        reviewer_role_id="300", decision_message_id="500",
+    ) is True
+    assert store.get_synthesis("s" * 64)["state"] == "review_pending"
+    assert store.get_job("a" * 32)["status"] == "operator_blocked"
+    assert store.decide_synthesis_item(
+        "2" * 64, decision="rejected", reviewer_user_id="600",
+        reviewer_role_id="300", decision_message_id="501",
+    ) is True
+    assert store.get_synthesis("s" * 64)["state"] == "ready"
+    assert store.get_job("a" * 32)["status"] == "queued"
+    assert store.get_synthesis_publication("s" * 64) is None
+
+
+def test_prepared_publication_reset_is_durable_compare_and_swap(tmp_path):
+    store, artifact_id = _durable_store(tmp_path)
+    old_manifest = '[{"path":"old"}]'
+    new_manifest = '[{"path":"new"}]'
+    store.record_synthesis_publication(
+        synthesis_id="s" * 64,
+        artifact_id=artifact_id,
+        synthesis_version="v1",
+        content_sha256="c" * 64,
+        branch_ref="refs/heads/main",
+        expected_head="old-head",
+        manifest_json=old_manifest,
+        state="prepared",
+    )
+    assert store.reset_prepared_synthesis_publication(
+        synthesis_id="s" * 64,
+        old_expected_head="old-head",
+        old_manifest_json=old_manifest,
+        new_expected_head="new-head",
+        new_manifest_json=new_manifest,
+    ) is True
+    row = store.get_synthesis_publication("s" * 64)
+    assert row["expected_head"] == "new-head"
+    assert row["manifest_json"] == new_manifest
+    assert store.reset_prepared_synthesis_publication(
+        synthesis_id="s" * 64,
+        old_expected_head="old-head",
+        old_manifest_json=old_manifest,
+        new_expected_head="other-head",
+        new_manifest_json="[]",
+    ) is False
+    store.record_synthesis_publication(
+        synthesis_id="s" * 64,
+        artifact_id=artifact_id,
+        synthesis_version="v1",
+        content_sha256="c" * 64,
+        branch_ref="refs/heads/main",
+        expected_head="new-head",
+        manifest_json=new_manifest,
+        state="committed",
+        commit_sha="d" * 40,
+    )
+    assert store.reset_prepared_synthesis_publication(
+        synthesis_id="s" * 64,
+        old_expected_head="new-head",
+        old_manifest_json=new_manifest,
+        new_expected_head="latest-head",
+        new_manifest_json="[]",
+    ) is False
+
+
+def test_uncertain_parent_and_items_can_be_adopted_by_exact_payload(tmp_path, monkeypatch):
+    store, _artifact_id = _durable_store(tmp_path)
+    extraction = {**EXTRACTION, "segments": [
+        *EXTRACTION["segments"],
+        {"segment_id": "body-0001", "kind": "body_plain", "label": "Email body",
+         "text": "First.Second."},
+    ]}
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET state='uncertain', "
+            "message_id=NULL, thread_id=NULL, content_sha256=NULL, marker=NULL, items_sha256=NULL "
+            "WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET notification_state='pending', "
+            "notification_message_id=NULL WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+    synthesis = store.get_synthesis("s" * 64)
+    items = store.list_synthesis_items("s" * 64, active_only=True)
+    content, digest, marker, embed, details, items_digest = _render_notification(
+        synthesis, items, extraction, ProjectReviewConfig.from_config(CFG, "pid")
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET content_sha256=?, guild_id='100', "
+            "channel_id='200', role_id='300', marker=?, items_sha256=? WHERE synthesis_id=?",
+            (digest, marker, items_digest, "s" * 64),
+        )
+    class Derived:
+        def read_json(self, kind, *_args):
+            if kind == "syntheses":
+                return {"synthesis_id": "s" * 64}
+            if kind == "extractions":
+                return extraction
+            raise AssertionError(kind)
+
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.DerivedStore", Derived)
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.load_config", lambda: CFG)
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+
+    def discord_request(method, path, _token, params=None):
+        if path == "/channels/200/messages/400":
+            return {
+                "id": "400", "guild_id": "100", "channel_id": "200", "content": content,
+                "author": {"bot": True}, "mention_roles": ["300"], "thread": {"id": "401"},
+                "embeds": [embed], "components": [],
+            }
+        assert method == "GET" and path == "/channels/401/messages"
+        return [
+            {"id": message_id, "content": payload["content"], "embeds": payload["embeds"],
+             "components": payload["components"], "author": {"bot": True}}
+            for message_id, payload in zip(("402", "403"), details)
+        ]
+
+    monkeypatch.setattr("tools.discord_tool._discord_request", discord_request)
+    from plugins.client_knowledge_gbrain.review import fetch_and_reconcile_notification
+
+    assert fetch_and_reconcile_notification(store, "s" * 64, "400") is True
+    assert [item["notification_message_id"] for item in store.list_synthesis_items("s" * 64)] == [
+        "402", "403",
+    ]
+
+
+def test_parent_reconciliation_paginates_beyond_one_hundred_messages(tmp_path, monkeypatch):
+    store, _artifact_id = _durable_store(tmp_path)
+    extraction = {**EXTRACTION, "segments": [
+        *EXTRACTION["segments"],
+        {"segment_id": "body-0001", "kind": "body_plain", "label": "Email body",
+         "text": "First.Second."},
+    ]}
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET state='uncertain', "
+            "message_id=NULL, thread_id=NULL, content_sha256=NULL, marker=NULL, items_sha256=NULL "
+            "WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET notification_state='pending', "
+            "notification_message_id=NULL WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+    synthesis = store.get_synthesis("s" * 64)
+    items = store.list_synthesis_items("s" * 64, active_only=True)
+    content, digest, marker, embed, details, items_digest = _render_notification(
+        synthesis, items, extraction, ProjectReviewConfig.from_config(CFG, "pid")
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET content_sha256=?, guild_id='100', "
+            "channel_id='200', role_id='300', marker=?, items_sha256=? WHERE synthesis_id=?",
+            (digest, marker, items_digest, "s" * 64),
+        )
+
+    class Derived:
+        def read_json(self, kind, *_args):
+            return {"synthesis_id": "s" * 64} if kind == "syntheses" else extraction
+
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.DerivedStore", Derived)
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.load_config", lambda: CFG)
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+    page_calls = []
+
+    def discord_request(_method, path, _token, params=None):
+        if path == "/channels/200/messages/400":
+            return {
+                "id": "400", "guild_id": "100", "channel_id": "200", "content": content,
+                "author": {"bot": True}, "mention_roles": ["300"], "thread": {"id": "401"},
+                "embeds": [embed], "components": [],
+            }
+        page_calls.append(dict(params or {}))
+        if len(page_calls) == 1:
+            return [
+                {"id": str(1000 - index), "content": f"unrelated-{index}",
+                 "embeds": [], "components": [], "author": {"bot": True}}
+                for index in range(100)
+            ]
+        return [
+            {"id": message_id, "content": payload["content"], "embeds": payload["embeds"],
+             "components": payload["components"], "author": {"bot": True}}
+            for message_id, payload in zip(("402", "403"), details)
+        ]
+
+    monkeypatch.setattr("tools.discord_tool._discord_request", discord_request)
+    from plugins.client_knowledge_gbrain.review import fetch_and_reconcile_notification
+
+    assert fetch_and_reconcile_notification(store, "s" * 64, "400") is True
+    assert page_calls == [{"limit": "100"}, {"limit": "100", "before": "901"}]
+    assert store.get_synthesis_notification("s" * 64)["state"] == "confirmed"
+
+
+def test_parent_reconciliation_remains_uncertain_when_history_cap_is_full(tmp_path, monkeypatch):
+    store, _artifact_id = _durable_store(tmp_path)
+    extraction = {**EXTRACTION, "segments": [
+        *EXTRACTION["segments"],
+        {"segment_id": "body-0001", "kind": "body_plain", "label": "Email body",
+         "text": "First.Second."},
+    ]}
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET state='uncertain', "
+            "message_id=NULL, thread_id=NULL, content_sha256=NULL, marker=NULL, items_sha256=NULL "
+            "WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET notification_state='pending', "
+            "notification_message_id=NULL WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+    synthesis = store.get_synthesis("s" * 64)
+    items = store.list_synthesis_items("s" * 64, active_only=True)
+    content, digest, marker, embed, _details, items_digest = _render_notification(
+        synthesis, items, extraction, ProjectReviewConfig.from_config(CFG, "pid")
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET content_sha256=?, guild_id='100', "
+            "channel_id='200', role_id='300', marker=?, items_sha256=? WHERE synthesis_id=?",
+            (digest, marker, items_digest, "s" * 64),
+        )
+
+    class Derived:
+        def read_json(self, kind, *_args):
+            return {"synthesis_id": "s" * 64} if kind == "syntheses" else extraction
+
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.DerivedStore", Derived)
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.load_config", lambda: CFG)
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+    page = 0
+
+    def discord_request(_method, path, _token, params=None):
+        nonlocal page
+        if path == "/channels/200/messages/400":
+            return {
+                "id": "400", "guild_id": "100", "channel_id": "200", "content": content,
+                "author": {"bot": True}, "mention_roles": ["300"], "thread": {"id": "401"},
+                "embeds": [embed], "components": [],
+            }
+        page += 1
+        start = 100_000 - (page - 1) * 100
+        return [
+            {"id": str(start - index), "content": "unrelated", "embeds": [],
+             "components": [], "author": {"bot": True}}
+            for index in range(100)
+        ]
+
+    monkeypatch.setattr("tools.discord_tool._discord_request", discord_request)
+    from plugins.client_knowledge_gbrain.review import fetch_and_reconcile_notification
+
+    assert fetch_and_reconcile_notification(store, "s" * 64, "400") is False
+    assert page == 10
+    assert store.get_synthesis_notification("s" * 64)["state"] == "uncertain"
+
+
+def test_uncertain_parent_adoption_persists_partial_prefix_for_repair(tmp_path, monkeypatch):
+    store, _artifact_id = _durable_store(tmp_path)
+    extraction = {**EXTRACTION, "segments": [
+        *EXTRACTION["segments"],
+        {"segment_id": "body-0001", "kind": "body_plain", "label": "Email body",
+         "text": "First.Second."},
+    ]}
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET state='uncertain', "
+            "message_id=NULL, thread_id=NULL, content_sha256=NULL, marker=NULL, items_sha256=NULL "
+            "WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET notification_state='pending', "
+            "notification_message_id=NULL WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+    synthesis = store.get_synthesis("s" * 64)
+    items = store.list_synthesis_items("s" * 64, active_only=True)
+    content, digest, marker, embed, details, items_digest = _render_notification(
+        synthesis, items, extraction, ProjectReviewConfig.from_config(CFG, "pid")
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET content_sha256=?, guild_id='100', "
+            "channel_id='200', role_id='300', marker=?, items_sha256=? WHERE synthesis_id=?",
+            (digest, marker, items_digest, "s" * 64),
+        )
+    class Derived:
+        def read_json(self, kind, *_args):
+            return {"synthesis_id": "s" * 64} if kind == "syntheses" else extraction
+
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.DerivedStore", Derived)
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review.load_config", lambda: CFG)
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+
+    def discord_request(_method, path, _token, params=None):
+        if path == "/channels/200/messages/400":
+            return {
+                "id": "400", "guild_id": "100", "channel_id": "200", "content": content,
+                "author": {"bot": True}, "mention_roles": ["300"], "thread": {"id": "401"},
+                "embeds": [embed], "components": [],
+            }
+        return [{
+            "id": "402", "content": details[0]["content"], "embeds": details[0]["embeds"],
+            "components": details[0]["components"], "author": {"bot": True},
+        }]
+
+    monkeypatch.setattr("tools.discord_tool._discord_request", discord_request)
+    from plugins.client_knowledge_gbrain.review import fetch_and_reconcile_notification
+
+    assert fetch_and_reconcile_notification(store, "s" * 64, "400")
+    assert store.get_synthesis_notification("s" * 64)["state"] == "uncertain"
+    assert store.get_synthesis_item("1" * 64)["notification_message_id"] == "402"
+    assert store.get_synthesis_item("2" * 64)["notification_message_id"] is None
+
+
+def _prepare_partial_notification(store, extraction, *, thread_id="401", first_id="402"):
+    synthesis = store.get_synthesis("s" * 64)
+    items = store.list_synthesis_items("s" * 64, active_only=True)
+    _content, digest, marker, _embed, _details, items_digest = _render_notification(
+        synthesis, items, extraction, ProjectReviewConfig.from_config(CFG, "pid")
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_notifications SET state='uncertain', "
+            "content_sha256=?, guild_id='100', channel_id='200', role_id='300', marker=?, "
+            "items_sha256=?, message_id='400', thread_id=? WHERE synthesis_id=?",
+            (digest, marker, items_digest, thread_id, "s" * 64),
+        )
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET notification_state='pending', "
+            "notification_message_id=NULL WHERE synthesis_id=?",
+            ("s" * 64,),
+        )
+        if first_id:
+            conn.execute(
+                "UPDATE client_knowledge_synthesis_items SET notification_state='confirmed', "
+                "notification_message_id=? WHERE item_id=?",
+                (first_id, "1" * 64),
+            )
+
+
+def test_partial_initial_delivery_resumes_missing_item_without_duplicate_parent(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    _prepare_partial_notification(store, EXTRACTION)
+    parent_sender = AsyncMock(side_effect=AssertionError("parent must not be resent"))
+    detail_sender = AsyncMock(return_value={
+        "success": True, "message_id": "403", "side_effect_state": "confirmed",
+    })
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=_Derived(), config=CFG,
+        sender=parent_sender, detail_sender=detail_sender,
+    ))
+    assert result["confirmed"] == 1
+    parent_sender.assert_not_awaited()
+    assert [item["notification_message_id"] for item in store.list_synthesis_items("s" * 64)] == [
+        "402", "403",
+    ]
+
+
+def test_crash_after_detail_send_adopts_exact_existing_message_before_retry(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    _prepare_partial_notification(store, EXTRACTION)
+    detail_sender = AsyncMock(side_effect=AssertionError("detail must not be duplicated"))
+    detail_resolver = AsyncMock(return_value={
+        "success": True, "message_id": "403", "side_effect_state": "confirmed",
+    })
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=_Derived(), config=CFG,
+        sender=AsyncMock(side_effect=AssertionError("parent must not be resent")),
+        detail_sender=detail_sender, detail_resolver=detail_resolver,
+    ))
+    assert result["confirmed"] == 1
+    detail_sender.assert_not_awaited()
+    assert store.get_synthesis_item("2" * 64)["notification_message_id"] == "403"
+
+
+def test_parent_only_delivery_recovers_thread_and_all_items(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    _prepare_partial_notification(store, EXTRACTION, thread_id=None, first_id=None)
+    ids = iter(("402", "403"))
+    detail_sender = AsyncMock(side_effect=lambda **_kwargs: {
+        "success": True, "message_id": next(ids), "side_effect_state": "confirmed",
+    })
+    result = asyncio.run(send_pending_review_notifications(
+        store=store, derived=_Derived(), config=CFG,
+        sender=AsyncMock(side_effect=AssertionError("parent must not be resent")),
+        detail_sender=detail_sender,
+        thread_creator=AsyncMock(return_value={
+            "success": True, "thread_id": "401", "side_effect_state": "confirmed",
+        }),
+    ))
+    assert result["confirmed"] == 1
+    assert store.get_synthesis_notification("s" * 64)["thread_id"] == "401"
+
+
+def test_uncertain_replacement_can_be_adopted_by_exact_payload(tmp_path, monkeypatch):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    assert _record_instruction(store,
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="700", instruction="Use plainer wording.",
+    )
+    claim = store.claim_next_synthesis_item_revision()
+    replacement_id = "3" * 64
+    assert store.complete_synthesis_item_revision(claim, replacement={
+        "item_id": replacement_id, "statement": "Revised first.",
+        "evidence_json": _evidence("First."), "item_sha256": "c" * 64,
+        "derived_storage_id": "storage", "derived_object_key": "object",
+        "output_sha256": "d" * 64, "output_bytes": 1, "actual_provider": "provider",
+        "actual_model": "model", "selected_provider": "provider", "selected_model": "model",
+        "model_tier": "advanced", "route_fingerprint": "route",
+    })
+    assert store.record_replacement_item_notification(
+        replacement_id, state="uncertain"
+    )
+    payload = __import__(
+        "plugins.client_knowledge_gbrain.review", fromlist=["_item_payload"]
+    )._item_payload(store.get_synthesis_item(replacement_id))
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+    monkeypatch.setattr("tools.discord_tool._discord_request", lambda *_a, **_k: {
+        "id": "404", "channel_id": "401", "author": {"bot": True}, **payload,
+    })
+    assert fetch_and_reconcile_replacement_notification(
+        store, replacement_id, "404"
+    )
+    assert store.get_synthesis_item(replacement_id)["notification_message_id"] == "404"
+
+
+def test_replacement_reconciliation_includes_revision_footer_identity(tmp_path, monkeypatch):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    assert _record_instruction(store,
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="700", instruction="Use plainer wording.",
+    )
+    claim = store.claim_next_synthesis_item_revision()
+    replacement_id = "3" * 64
+    assert store.complete_synthesis_item_revision(claim, replacement={
+        "item_id": replacement_id, "statement": "Revised first.",
+        "evidence_json": _evidence("First."), "item_sha256": "c" * 64,
+        "derived_storage_id": "storage", "derived_object_key": "object",
+        "output_sha256": "d" * 64, "output_bytes": 1, "actual_provider": "provider",
+        "actual_model": "model", "selected_provider": "provider", "selected_model": "model",
+        "model_tier": "advanced", "route_fingerprint": "route",
+    })
+    assert store.record_replacement_item_notification(replacement_id, state="uncertain")
+    payload = __import__(
+        "plugins.client_knowledge_gbrain.review", fromlist=["_item_payload"]
+    )._item_payload(store.get_synthesis_item(replacement_id))
+    payload["embeds"][0]["footer"]["text"] = "Learning 1 · revision 1"
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+    monkeypatch.setattr("tools.discord_tool._discord_request", lambda *_a, **_k: {
+        "id": "404", "channel_id": "401", "author": {"bot": True}, **payload,
+    })
+    assert fetch_and_reconcile_replacement_notification(
+        store, replacement_id, "404"
+    ) is False
+    assert store.get_synthesis_item(replacement_id)["notification_state"] == "uncertain"
+
+
+def test_uncertain_replacement_worker_adopts_existing_before_retry(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    assert _record_instruction(store,
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="700", instruction="Use plainer wording.",
+    )
+    claim = store.claim_next_synthesis_item_revision()
+    replacement_id = "3" * 64
+    assert store.complete_synthesis_item_revision(claim, replacement={
+        "item_id": replacement_id, "statement": "Revised first.",
+        "evidence_json": _evidence("First."), "item_sha256": "c" * 64,
+        "derived_storage_id": "storage", "derived_object_key": "object",
+        "output_sha256": "d" * 64, "output_bytes": 1, "actual_provider": "provider",
+        "actual_model": "model", "selected_provider": "provider", "selected_model": "model",
+        "model_tier": "advanced", "route_fingerprint": "route",
+    })
+    assert store.record_replacement_item_notification(replacement_id, state="uncertain")
+    sender = AsyncMock(side_effect=AssertionError("replacement must not be duplicated"))
+    result = asyncio.run(send_pending_replacement_notifications(
+        store=store, config=CFG, sender=sender,
+        resolver=AsyncMock(return_value={
+            "success": True, "message_id": "404", "side_effect_state": "confirmed",
+        }),
+    ))
+    assert result["confirmed"] == 1
+    sender.assert_not_awaited()
+    assert store.get_synthesis_item(replacement_id)["notification_message_id"] == "404"
+
+
+def _event(
+    text,
+    *,
+    thread_id="401",
+    user_id="600",
+    message_id="700",
+    created_at=None,
+):
     raw = SimpleNamespace(
-        id=700,
-        author=SimpleNamespace(roles=[SimpleNamespace(id=300)] if role else []),
+        id=int(message_id),
+        author=SimpleNamespace(roles=[SimpleNamespace(id=300)]),
     )
     source = SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="200",
-        chat_type="group",
-        user_id=user_id,
-        scope_id="100",
-        project_key="pid",
-        project_channel_id="200",
-        project_mapping_resolved=True,
-        message_id="700",
+        platform=Platform.DISCORD, chat_id=thread_id, chat_type="thread", user_id=user_id,
+        scope_id="100", project_key="pid", project_channel_id="200",
+        project_mapping_resolved=True, thread_id=thread_id, message_id=message_id,
     )
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=source,
         raw_message=raw,
-        message_id="700",
+        message_id=message_id,
+        timestamp=created_at or datetime.now(timezone.utc),
     )
 
 
-def test_reject_collects_authorized_reason_without_slash_command(monkeypatch):
-    monkeypatch.setattr(
-        "gateway.discord_project_mapping.resolve_discord_project_context",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            resolved=True, guild_id="100", channel_id="200", project_key="pid"
-        ),
-    )
-    store = _confirmed_store()
-    interaction = _interaction()
-    asyncio.run(handle_discord_review_interaction(interaction, "reject", store=store, config=CFG))
-    assert store.review["capture_mode"] == "reject_reason"
-
+def test_other_revises_only_one_item_and_replacement_still_needs_decision(tmp_path, monkeypatch):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    ) is True
     monkeypatch.setattr("plugins.client_knowledge_gbrain.review.IntakeStore", lambda: store)
     monkeypatch.setattr("plugins.client_knowledge_gbrain.review.load_config", lambda: CFG)
-    adapter = SimpleNamespace(send=AsyncMock())
-    gateway = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    monkeypatch.setattr("plugins.client_knowledge_gbrain.review._kick_review_revision", lambda _gateway: None)
+    gateway = SimpleNamespace(_adapter_for_source=lambda _source: SimpleNamespace(send=AsyncMock()))
     result = asyncio.run(capture_review_text_hook(
-        event=_event("The wording overstates the synthetic source."), gateway=gateway
+        event=_event("Use plainer wording."), gateway=gateway
     ))
     assert result == {"action": "skip", "reason": "client_knowledge_review_text_captured"}
-    assert store.review["state"] == "rejected"
-    assert store.decisions[0][1]["reason"] == "The wording overstates the synthetic source."
+    assert store.get_synthesis_item("1" * 64)["state"] == "instructions_pending"
+    assert store.get_synthesis_item("2" * 64)["state"] == "pending"
+    claim = store.claim_next_synthesis_item_revision()
+    replacement_id = "3" * 64
+    assert store.complete_synthesis_item_revision(claim, replacement={
+        "item_id": replacement_id, "statement": "Revised first.",
+        "evidence_json": _evidence("First."), "item_sha256": "c" * 64,
+        "derived_storage_id": "storage", "derived_object_key": "object",
+        "output_sha256": "d" * 64, "output_bytes": 1, "actual_provider": "provider",
+        "actual_model": "model", "selected_provider": "provider", "selected_model": "model",
+        "model_tier": "advanced", "route_fingerprint": "route",
+    }) is True
+    assert store.get_synthesis_item("1" * 64)["state"] == "superseded"
+    assert store.get_synthesis_item(replacement_id)["state"] == "pending"
+    assert store.get_synthesis("s" * 64)["state"] == "review_pending"
 
 
-def test_mixed_free_text_instruction_is_durable_and_keeps_publication_blocked(monkeypatch):
-    monkeypatch.setattr(
-        "gateway.discord_project_mapping.resolve_discord_project_context",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            resolved=True, guild_id="100", channel_id="200", project_key="pid"
-        ),
+def test_explicit_decision_cancels_abandoned_other_capture(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
     )
-    store = _confirmed_store()
-    interaction = _interaction()
-    asyncio.run(
-        handle_discord_review_interaction(interaction, "instructions", store=store, config=CFG)
+    assert store.decide_synthesis_item(
+        "1" * 64, decision="approved", reviewer_user_id="600",
+        reviewer_role_id="300", decision_message_id="701",
     )
-    assert store.review["capture_mode"] == "instructions"
+    assert store.get_synthesis_item_text_capture(
+        guild_id="100", thread_id="401", user_id="600"
+    ) is None
+
+
+def test_stale_other_capture_expires_transactionally_before_text_can_apply(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET capture_started_at=? WHERE item_id=?",
+            (time.time() - 901, "1" * 64),
+        )
+    assert store.get_synthesis_item_text_capture(
+        guild_id="100", thread_id="401", user_id="600"
+    ) is None
+    expired = store.get_synthesis_item("1" * 64)
+    assert expired["capture_user_id"] is None
+    assert expired["capture_started_at"] is None
+    assert store.record_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="700", instruction="Too late.",
+        expected_capture_started_at=time.time() - 901,
+        source_created_at=time.time() - 900,
+    ) is False
+    assert store.begin_synthesis_item_instruction(
+        "2" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    ) is True
+
+
+def test_delayed_old_capture_text_falls_through_and_new_capture_text_is_accepted(
+    tmp_path, monkeypatch
+):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    old_capture_started_at = time.time() - 901
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_synthesis_items SET capture_started_at=? WHERE item_id=?",
+            (old_capture_started_at, "1" * 64),
+        )
+    assert store.begin_synthesis_item_instruction(
+        "2" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    new_capture_started_at = float(
+        store.get_synthesis_item("2" * 64)["capture_started_at"]
+    )
     monkeypatch.setattr("plugins.client_knowledge_gbrain.review.IntakeStore", lambda: store)
     monkeypatch.setattr("plugins.client_knowledge_gbrain.review.load_config", lambda: CFG)
-    kicked = []
     monkeypatch.setattr(
-        "plugins.client_knowledge_gbrain.review._kick_review_revision",
-        lambda gateway: kicked.append(gateway),
+        "plugins.client_knowledge_gbrain.review._kick_review_revision", lambda _gateway: None
     )
     adapter = SimpleNamespace(send=AsyncMock())
     gateway = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
-    instruction = "Accept 1 and 3, reject 2, and reword 1 to say weekly status report."
-    result = asyncio.run(capture_review_text_hook(event=_event(instruction), gateway=gateway))
-    assert result == {"action": "skip", "reason": "client_knowledge_review_text_captured"}
-    assert store.review["state"] == "instructions_pending"
-    assert store.instructions[0][1]["instruction"] == instruction
-    assert not store.decisions
-    assert adapter.send.await_args.args[1] == (
-        "Instructions saved. Hermes will prepare a revised review; nothing will be "
-        "published until you approve it."
-    )
-    assert kicked == [gateway]
 
-
-def test_text_capture_reauthorizes_exact_project_mapping():
-    store = _confirmed_store()
-    store.begin_review_text_capture(
-        "a" * 64,
-        mode="instructions",
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        channel_id="200",
-    )
-    from plugins.client_knowledge_gbrain.review import _authorize_event_for_capture, ProjectReviewConfig
-
-    event = _event("instructions")
-    assert _authorize_event_for_capture(
-        event, store.review, ProjectReviewConfig.from_config(CFG, "pid")
-    )[0] is True
-    event.source.project_mapping_resolved = False
-    assert _authorize_event_for_capture(
-        event, store.review, ProjectReviewConfig.from_config(CFG, "pid")
-    )[0] is False
-
-
-def _durable_review_store(path):
-    store = IntakeStore(path)
-    artifact = _artifact()
-    store.insert_artifact(artifact)
-    now = time.time()
-    review_id = "a" * 64
-    with store._write() as conn:
-        conn.execute(
-            "INSERT INTO extractions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "1" * 64, artifact.artifact_id, artifact.content_sha256, "2" * 64,
-                "ev1", "lv1", "rv1", "extracted", "storage", "object",
-                "3" * 64, 1, 1, "{}", now,
+    delayed = asyncio.run(capture_review_text_hook(
+        event=_event(
+            "Instructions intended for the old candidate.",
+            message_id="701",
+            created_at=datetime.fromtimestamp(
+                old_capture_started_at + 1, tz=timezone.utc
             ),
-        )
-        conn.execute(
-            "INSERT INTO interpretation_envelopes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "4" * 64, artifact.artifact_id, "pid", artifact.content_sha256,
-                "1" * 64, "3" * 64, "ev1", "sv1", "pv1", "task",
-                "storage", "object", "5" * 64, 1, now,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO interpretations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "6" * 64, "4" * 64, artifact.artifact_id, "1" * 64,
-                "sv1", "pv1", "storage", "object", "7" * 64, 1,
-                "provider", "model", "provider", "model", "advanced", "route",
-                1, 1, 2, 0, 0, now,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO assimilation_proposals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "8" * 64, artifact.artifact_id, "6" * 64, "av1", "sv1", "pv1",
-                "policy", "pid", "9" * 64, "storage", "object", "b" * 64, 1,
-                "provider", "model", "provider", "model", "advanced", "route",
-                1, "finding_grounding_mismatch", "head", None, 0, now,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO client_knowledge_reviews("
-            "review_id, assimilation_id, artifact_id, project_key, proposal_sha256, "
-            "assimilation_version, state, reason_code, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,'pending',?,?,?)",
-            (
-                review_id, "8" * 64, artifact.artifact_id, "pid", "9" * 64,
-                "av1", "finding_grounding_mismatch", now, now,
-            ),
-        )
-        for job_id, stage in (("c" * 32, "assimilated"), ("d" * 32, "needs_review")):
-            conn.execute(
-                "INSERT INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
-                "last_error_class, created_at, updated_at) VALUES(?,?,?,'operator_blocked',3,?,?,?)",
-                (job_id, artifact.artifact_id, stage, "review_pending", now, now),
-            )
-        for index, stage, receipt_id in (
-            ("e" * 32, "notion_archived", "notion:page:0123456789abcdef0123456789abcdef"),
-            ("f" * 32, "extracted", "extraction:" + "1" * 64),
-            ("0" * 32, "interpreted", "interpretation:" + "6" * 64),
-        ):
-            conn.execute(
-                "INSERT INTO jobs(job_id, artifact_id, stage, status, max_attempts, "
-                "created_at, updated_at) VALUES(?,?,?,'succeeded',3,?,?)",
-                (index, artifact.artifact_id, stage, now, now),
-            )
-            conn.execute(
-                "INSERT INTO stage_receipts(artifact_id, stage, receipt_id, recorded_at) "
-                "VALUES(?,?,?,?)",
-                (artifact.artifact_id, stage, receipt_id, now),
-            )
-    store.record_review_notification(
-        review_id,
-        state="confirmed",
-        content_sha256="e" * 64,
-        guild_id="100",
-        channel_id="200",
-        role_id="300",
-        marker="[ck-review:synthetic:ux2]",
-        message_id="400",
-        detail_state="confirmed",
-        detail_content_sha256="f" * 64,
-        detail_thread_id="401",
-    )
-    return store, review_id, artifact.artifact_id
-
-
-def test_real_store_reject_and_mixed_instruction_transitions_remain_fail_closed(tmp_path):
-    rejected, review_id, artifact_id = _durable_review_store(
-        tmp_path / "reject" / "intake.db"
-    )
-    assert rejected.get_publication("8" * 64) is None
-    assert rejected.begin_review_text_capture(
-        review_id,
-        mode="reject_reason",
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        channel_id="200",
-    ) is True
-    assert rejected.decide_review(
-        review_id,
-        decision="rejected",
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        decision_message_id="700",
-        reason="Synthetic source does not support this wording.",
-    ) is True
-    assert rejected.get_review(review_id)["state"] == "rejected"
-    with rejected._connect() as conn:
-        status = conn.execute(
-            "SELECT status FROM jobs WHERE artifact_id=? AND stage='assimilated'",
-            (artifact_id,),
-        ).fetchone()[0]
-    assert status == "quarantined"
-    assert rejected.get_publication("8" * 64) is None
-
-    instructed, review_id, artifact_id = _durable_review_store(
-        tmp_path / "instructions" / "intake.db"
-    )
-    assert instructed.begin_review_text_capture(
-        review_id,
-        mode="instructions",
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        channel_id="200",
-    ) is True
-    instruction = "Accept 1 and 3, reject 2, and use plainer wording for 1."
-    assert instructed.record_review_instruction(
-        review_id,
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        decision_message_id="701",
-        instruction=instruction,
-    ) is True
-    review = instructed.get_review(review_id)
-    assert review["state"] == "instructions_pending"
-    assert review["decision_reason"] == instruction
-    revision = instructed.get_review_revision_for_source(review_id)
-    assert revision["state"] == "queued"
-    assert revision["instruction_text"] == instruction
-    with instructed._connect() as conn:
-        jobs = dict(conn.execute(
-            "SELECT stage, status FROM jobs WHERE artifact_id=?", (artifact_id,)
-        ).fetchall())
-    assert jobs["assimilated"] == "operator_blocked"
-    assert jobs["needs_review"] == "operator_blocked"
-    assert instructed.get_publication("8" * 64) is None
-
-
-def _revised_operation(index: int, *, ignored: bool = False):
-    operation = _operation(index, ignored=ignored)
-    if ignored:
-        return operation
-    operation["claim"] = f"Revised requirement {index}: send a concise status report every Monday."
-    operation["final_markdown"] = _canonical_markdown(operation, project_key="pid")
-    return operation
-
-
-def test_revision_batch_rejects_outside_findings_drops_and_evidence_changes():
-    original = _proposal(2)
-    outside = {"operations": [dict(item) for item in original["operations"]]}
-    outside["operations"][0] = {**outside["operations"][0], "finding_id": "outside"}
-    try:
-        _validate_revision_batch(original, outside)
-    except ValueError as exc:
-        assert str(exc) == "review_revision_outside_batch_finding"
-    else:
-        raise AssertionError("outside finding was accepted")
-
-    dropped = {"operations": [dict(original["operations"][0])]}
-    try:
-        _validate_revision_batch(original, dropped)
-    except ValueError as exc:
-        assert str(exc) == "review_revision_implicit_finding_drop"
-    else:
-        raise AssertionError("implicit finding drop was accepted")
-
-    changed = {"operations": [dict(item) for item in original["operations"]]}
-    changed["operations"][0]["evidence_ids"] = ["evidence-999"]
-    try:
-        _validate_revision_batch(original, changed)
-    except ValueError as exc:
-        assert str(exc) == "review_revision_evidence_changed"
-    else:
-        raise AssertionError("evidence change was accepted")
-
-
-def test_revision_worker_creates_linked_replacement_review_requiring_approval(
-    tmp_path, monkeypatch
-):
-    store, review_id, _artifact_id = _durable_review_store(
-        tmp_path / "revision" / "intake.db"
-    )
-    original_proposal = {
-        "artifact_id": _artifact().artifact_id,
-        "interpretation_id": "6" * 64,
-        "project_key": "pid",
-        "operations": [_operation(1), _operation(2, ignored=True)],
-    }
-    revised_proposal = {
-        **original_proposal,
-        "operations": [_revised_operation(1), _operation(2, ignored=True)],
-    }
-    original_sha = hashlib.sha256(
-        canonical_json(original_proposal)
-    ).hexdigest()
-    with store._write() as conn:
-        conn.execute(
-            "UPDATE assimilation_proposals SET proposal_sha256=? WHERE assimilation_id=?",
-            (original_sha, "8" * 64),
-        )
-        conn.execute(
-            "UPDATE client_knowledge_reviews SET proposal_sha256=? WHERE review_id=?",
-            (original_sha, review_id),
-        )
-
-    class Derived:
-        def __init__(self):
-            self.saved = {}
-
-        def read_json(self, kind, *_args):
-            if kind == "assimilations":
-                return {"proposal": original_proposal}
-            if kind == "interpretations":
-                interpretation = _interpretation(2)
-                return {"interpretation": interpretation}
-            if kind == "extractions":
-                return EXTRACTION
-            raise AssertionError(kind)
-
-        def put_json(self, kind, object_id, value):
-            from plugins.client_knowledge_gbrain.derived import DerivedRecord, canonical_json
-
-            data = canonical_json(value)
-            self.saved[object_id] = value
-            return DerivedRecord(
-                object_id,
-                kind,
-                "storage",
-                f"{kind}/{object_id}",
-                hashlib.sha256(data).hexdigest(),
-                len(data),
-                tmp_path / "object.json",
-            )
-
-    class Llm:
-        def complete_structured(self, **_kwargs):
-            return PluginLlmStructuredResult(
-                text="{}",
-                parsed=revised_proposal,
-                content_type="json",
-                provider="provider",
-                model="model",
-                agent_id="agent",
-                audit={
-                    "selected_provider": "provider",
-                    "selected_model": "model",
-                    "model_tier": "advanced",
-                    "route_fingerprint": "route",
-                },
-            )
-
-    class Client:
-        settings = SimpleNamespace(
-            source_id="client-knowledge",
-            source_branch="main",
-            source_checkout=tmp_path,
-        )
-
-        def search(self, *_args, **_kwargs):
-            return []
-
-        def assert_source_checkout(self):
-            return tmp_path
-
-    monkeypatch.setattr(
-        "plugins.client_knowledge_gbrain.review.GitSourcePublisher.head",
-        lambda _self: "head",
-    )
-    assert store.begin_review_text_capture(
-        review_id,
-        mode="instructions",
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        channel_id="200",
-    ) is True
-    instruction = "Keep item 1 but use plainer wording; do not publish item 2."
-    assert store.record_review_instruction(
-        review_id,
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        decision_message_id="701",
-        instruction=instruction,
-    ) is True
-    result = process_pending_review_revisions(
-        store=store,
-        derived=Derived(),
-        config={
-            "client_knowledge": {
-                "assimilation": {
-                    "enabled": True,
-                    "max_jobs_per_run": 1,
-                    "retry_delay_seconds": 60,
-                }
-            }
-        },
-        llm=Llm(),
-        client=Client(),
-    )
-    revision_status = store.get_review_revision_for_source(review_id)
-    assert result == {"processed": 1, "succeeded": 1, "failed": 0}, (
-        revision_status["last_error_class"]
-    )
-    source = store.get_review(review_id)
-    assert source["state"] == "superseded"
-    replacement = store.get_review(source["superseded_by_review_id"])
-    assert replacement["state"] == "pending"
-    assert replacement["parent_review_id"] == review_id
-    assert replacement["revision_number"] == 1
-    assert replacement["reason_code"] == "human_instruction_revision"
-    revision = store.get_review_revision_for_source(review_id)
-    assert revision["state"] == "succeeded"
-    assert revision["replacement_review_id"] == replacement["review_id"]
-    assert store.get_publication(replacement["assimilation_id"]) is None
-    store.record_review_notification(
-        replacement["review_id"],
-        state="confirmed",
-        content_sha256="1" * 64,
-        guild_id="100",
-        channel_id="200",
-        role_id="300",
-        marker="[ck-review:replacement:ux2]",
-        message_id="402",
-        detail_state="confirmed",
-        detail_content_sha256="2" * 64,
-        detail_thread_id="403",
-    )
-    assert store.decide_review(
-        replacement["review_id"],
-        decision="approved",
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        decision_message_id="704",
-    ) is True
-    active = store.get_active_review_for_assimilation("8" * 64)
-    assert active["review_id"] == replacement["review_id"]
-    assert active["state"] == "approved"
-
-
-def test_original_controls_are_stale_after_replacement_exists(tmp_path, monkeypatch):
-    store, review_id, _artifact_id = _durable_review_store(
-        tmp_path / "stale-original" / "intake.db"
-    )
-    replacement_id = "b" * 64
-    with store._write() as conn:
-        conn.execute(
-            "UPDATE client_knowledge_reviews SET state='superseded', "
-            "superseded_by_review_id=? WHERE review_id=?",
-            (replacement_id, review_id),
-        )
-    monkeypatch.setattr(
-        "gateway.discord_project_mapping.resolve_discord_project_context",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            resolved=True, guild_id="100", channel_id="200", project_key="pid"
         ),
+        gateway=gateway,
+    ))
+    assert delayed is None
+    adapter.send.assert_not_awaited()
+    assert store.get_synthesis_item("2" * 64)["state"] == "pending"
+    assert store.get_synthesis_item("2" * 64)["capture_started_at"] == new_capture_started_at
+    with store._connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM client_knowledge_synthesis_item_revisions"
+        ).fetchone()[0] == 0
+
+    accepted = asyncio.run(capture_review_text_hook(
+        event=_event(
+            "Use plainer wording for the new candidate.",
+            message_id="702",
+            created_at=datetime.fromtimestamp(
+                new_capture_started_at + 1, tz=timezone.utc
+            ),
+        ),
+        gateway=gateway,
+    ))
+    assert accepted == {
+        "action": "skip",
+        "reason": "client_knowledge_review_text_captured",
+    }
+    adapter.send.assert_awaited_once()
+    assert store.get_synthesis_item("2" * 64)["state"] == "instructions_pending"
+    with store._connect() as conn:
+        revision = conn.execute(
+            "SELECT source_item_id, instruction_text FROM "
+            "client_knowledge_synthesis_item_revisions"
+        ).fetchone()
+    assert tuple(revision) == (
+        "2" * 64,
+        "Use plainer wording for the new candidate.",
     )
-    interaction = _interaction()
-    asyncio.run(
-        handle_discord_review_interaction(
-            interaction, "approve", store=store, config=CFG
+
+
+def test_decision_vs_capture_text_race_has_one_transactional_winner(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    capture_started_at = float(
+        store.get_synthesis_item("1" * 64)["capture_started_at"]
+    )
+    barrier = Barrier(2)
+
+    def decide():
+        barrier.wait()
+        return store.decide_synthesis_item(
+            "1" * 64,
+            decision="approved",
+            reviewer_user_id="600",
+            reviewer_role_id="300",
+            decision_message_id="710",
         )
-    )
-    assert store.get_review(review_id)["state"] == "superseded"
-    assert "already been resolved" in interaction.followup.send.await_args.args[0]
+
+    def capture():
+        barrier.wait()
+        return store.record_synthesis_item_instruction(
+            "1" * 64,
+            reviewer_user_id="600",
+            reviewer_role_id="300",
+            decision_message_id="711",
+            instruction="Use plainer wording.",
+            expected_capture_started_at=capture_started_at,
+            source_created_at=capture_started_at + 1,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(decide), executor.submit(capture)]
+        outcomes = [future.result() for future in results]
+    assert sorted(outcomes) == [False, True]
+    item = store.get_synthesis_item("1" * 64)
+    with store._connect() as conn:
+        revision_count = conn.execute(
+            "SELECT COUNT(*) FROM client_knowledge_synthesis_item_revisions "
+            "WHERE source_item_id=?",
+            ("1" * 64,),
+        ).fetchone()[0]
+    assert (item["state"], revision_count) in {
+        ("approved", 0),
+        ("instructions_pending", 1),
+    }
 
 
-def test_revision_failure_stays_retryable_and_operator_visible(tmp_path):
-    store, review_id, _artifact_id = _durable_review_store(
-        tmp_path / "revision-failure" / "intake.db"
+def test_duplicate_capture_processing_creates_only_one_revision(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
     )
-    assert store.begin_review_text_capture(
-        review_id,
-        mode="instructions",
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        channel_id="200",
-    ) is True
-    assert store.record_review_instruction(
-        review_id,
-        reviewer_user_id="600",
-        reviewer_role_id="300",
-        decision_message_id="701",
-        instruction="Use plainer wording.",
-    ) is True
-    original = _proposal(2)
-    original.update(
-        {
-            "artifact_id": _artifact().artifact_id,
-            "interpretation_id": "6" * 64,
-            "project_key": "pid",
-        }
+    capture_started_at = float(
+        store.get_synthesis_item("1" * 64)["capture_started_at"]
     )
-    original_sha = hashlib.sha256(canonical_json(original)).hexdigest()
+    barrier = Barrier(2)
+
+    def capture():
+        barrier.wait()
+        return store.record_synthesis_item_instruction(
+            "1" * 64,
+            reviewer_user_id="600",
+            reviewer_role_id="300",
+            decision_message_id="720",
+            instruction="Use plainer wording.",
+            expected_capture_started_at=capture_started_at,
+            source_created_at=capture_started_at + 1,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(capture), executor.submit(capture)]
+        outcomes = [future.result() for future in results]
+    assert sorted(outcomes) == [False, True]
+    with store._connect() as conn:
+        revisions = conn.execute(
+            "SELECT revision_id, source_item_id, instruction_text FROM "
+            "client_knowledge_synthesis_item_revisions"
+        ).fetchall()
+    assert len(revisions) == 1
+    assert tuple(revisions[0][1:]) == ("1" * 64, "Use plainer wording.")
+
+
+def test_bounded_revision_failure_can_be_restored_for_operator_review(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    assert _record_instruction(store,
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="700", instruction="Use plainer wording.",
+    )
+    claim = store.claim_next_synthesis_item_revision()
+    assert store.block_synthesis_item_revision(claim, error_class="provider_failed")
+    assert store.restore_synthesis_item_revision("1" * 64)
+    assert store.get_synthesis_item("1" * 64)["state"] == "pending"
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    assert _record_instruction(store,
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="701", instruction="Use simpler wording instead.",
+    )
+    replacement_claim = store.claim_next_synthesis_item_revision()
+    assert replacement_claim is not None
+    assert replacement_claim.instruction_text == "Use simpler wording instead."
+    assert replacement_claim.attempt_count == 1
+
+
+def test_revision_claim_exhaustion_becomes_operator_blocked_without_reclaim(tmp_path):
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    assert _record_instruction(store,
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="700", instruction="Use plainer wording.",
+    )
+    claim = store.claim_next_synthesis_item_revision(max_attempts=1)
+    assert store.fail_synthesis_item_revision(
+        claim, error_class="worker_crashed", retry_delay=0
+    )
+    assert store.claim_next_synthesis_item_revision(max_attempts=1) is None
+    with store._connect() as conn:
+        state = conn.execute(
+            "SELECT state FROM client_knowledge_synthesis_item_revisions "
+            "WHERE source_item_id=?",
+            ("1" * 64,),
+        ).fetchone()[0]
+    assert state == "operator_blocked"
+
+
+def test_revision_worker_rejects_unchanged_statement(tmp_path):
+    from plugins.client_knowledge_gbrain.review import _process_item_revision
+    from plugins.client_knowledge_gbrain.derived import DerivedStore
+
+    store, _artifact_id = _durable_store(tmp_path)
+    assert store.begin_synthesis_item_instruction(
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300", thread_id="401"
+    )
+    assert _record_instruction(store,
+        "1" * 64, reviewer_user_id="600", reviewer_role_id="300",
+        decision_message_id="700", instruction="Keep the wording.",
+    )
+    claim = store.claim_next_synthesis_item_revision()
+    derived = DerivedStore(tmp_path / "derived")
+    extraction = {
+        "segments": [{
+            "segment_id": "body-0001", "text": "First.",
+        }],
+    }
+    record = derived.put_json("extractions", "e" * 64, extraction)
     with store._write() as conn:
         conn.execute(
-            "UPDATE assimilation_proposals SET proposal_sha256=? WHERE assimilation_id=?",
-            (original_sha, "8" * 64),
+            "UPDATE extractions SET derived_storage_id=?, derived_object_key=?, "
+            "output_sha256=?, output_bytes=? WHERE extraction_id=?",
+            (record.storage_id, record.object_key, record.sha256, record.byte_size, "e" * 64),
         )
-        conn.execute(
-            "UPDATE client_knowledge_reviews SET proposal_sha256=? WHERE review_id=?",
-            (original_sha, review_id),
-        )
-
-    class FailureDerived(_Derived):
-        def read_json(self, kind, *_args):
-            if kind == "assimilations":
-                return {"proposal": original}
-            return super().read_json(kind, *_args)
-
-    class UnavailableClient:
-        settings = SimpleNamespace(source_id="client-knowledge")
-
-        def search(self, *_args, **_kwargs):
-            raise ConnectionError("temporarily unavailable")
-
-    result = process_pending_review_revisions(
-        store=store,
-        derived=FailureDerived(2),
-        config={
-            "client_knowledge": {
-                "assimilation": {
-                    "enabled": True,
-                    "max_jobs_per_run": 1,
-                    "retry_delay_seconds": 60,
-                }
-            }
+    llm = SimpleNamespace(complete_structured=lambda **_kwargs: SimpleNamespace(
+        parsed={
+            "statement": "First.",
+            "evidence": [{
+                "segment_id": "body-0001", "start": 0, "end": 6, "quote": "First.",
+            }],
         },
-        llm=SimpleNamespace(),
-        client=UnavailableClient(),
-    )
-    assert result == {"processed": 1, "succeeded": 0, "failed": 1}
-    review = store.get_review(review_id)
-    assert review["state"] == "instructions_pending"
-    visible = store.list_open_reviews()
-    assert visible[0]["revision_state"] == "failed"
-    assert visible[0]["revision_attempt_count"] == 1
-    assert visible[0]["revision_error_class"] == "review_revision_internal_error"
-    assert store.claim_next_review_revision(
-        now=time.time() + 61
-    ) is not None
-
-
-def test_refresh_can_replace_previous_native_card(tmp_path):
-    store, review_id, _artifact_id = _durable_review_store(
-        tmp_path / "refresh" / "intake.db"
-    )
-    assert store.refresh_review_notification(review_id) is True
-    review = store.get_review(review_id)
-    assert review["state"] == "pending"
-    assert review["notification_state"] == "pending"
-    assert review["notification_message_id"] is None
-
-
-def test_refresh_does_not_replace_healthy_compact_native_card(tmp_path):
-    store, review_id, _artifact_id = _durable_review_store(
-        tmp_path / "compact-refresh" / "intake.db"
-    )
-    with store._write() as conn:
-        conn.execute(
-            "UPDATE client_knowledge_reviews SET notification_marker=? WHERE review_id=?",
-            ("[ck-review:synthetic:ux4]", review_id),
+        provider="provider", model="model",
+        audit={"selected_provider": "provider", "selected_model": "model",
+               "model_tier": "advanced", "route_fingerprint": "route"},
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2,
+                              cache_read_tokens=0, cache_write_tokens=0),
+    ))
+    with pytest.raises(SynthesisFailure, match="unchanged"):
+        _process_item_revision(
+            claim, store=store, derived=derived, llm=llm,
+            settings=SynthesisSettings(True, 1, 300, 60, 180, 4096, 600_000, 100_000),
         )
-    assert store.refresh_review_notification(review_id) is False
-
-
-def test_refresh_can_replace_incomplete_compact_native_card(tmp_path):
-    store, review_id, _artifact_id = _durable_review_store(
-        tmp_path / "compact-incomplete-refresh" / "intake.db"
-    )
-    with store._write() as conn:
-        conn.execute(
-            "UPDATE client_knowledge_reviews SET notification_marker=?, detail_state='uncertain' "
-            "WHERE review_id=?",
-            ("[ck-review:synthetic:ux4]", review_id),
-        )
-    assert store.refresh_review_notification(review_id) is True
