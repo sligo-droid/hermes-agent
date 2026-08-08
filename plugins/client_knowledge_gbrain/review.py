@@ -11,7 +11,6 @@ import socket
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping
 
 from agent.plugin_llm import (
@@ -89,19 +88,19 @@ def _review_components() -> list[dict[str, Any]]:
                 {
                     "type": 2,
                     "style": 3,
-                    "label": "Approve all",
+                    "label": "✅",
                     "custom_id": "client-knowledge-review:approve",
                 },
                 {
                     "type": 2,
                     "style": 4,
-                    "label": "Reject",
+                    "label": "❌",
                     "custom_id": "client-knowledge-review:reject",
                 },
                 {
                     "type": 2,
                     "style": 2,
-                    "label": "Other",
+                    "label": "✍️",
                     "custom_id": "client-knowledge-review:instructions",
                 },
             ],
@@ -362,30 +361,6 @@ def _render_detail_messages(
     return messages
 
 
-def _source_context(
-    *,
-    project: ProjectReviewConfig,
-    artifact: Any,
-    extraction: Mapping[str, Any],
-    notion_ref: str,
-) -> list[str]:
-    headers = _header_values(extraction)
-    context = [f"**Project:** {_safe_text(project.project_label)}"]
-    if headers.get("From"):
-        context.append(f"**Email sender:** {headers['From']}")
-    if headers.get("Subject"):
-        context.append(f"**Email subject:** {headers['Subject']}")
-    if headers.get("Date"):
-        context.append(f"**Email date:** {headers['Date']}")
-    elif getattr(artifact, "occurred_at", None):
-        date = datetime.fromtimestamp(float(artifact.occurred_at), timezone.utc).strftime("%Y-%m-%d")
-        context.append(f"**Source date:** {date}")
-    notion_url = _notion_url(notion_ref)
-    if notion_url:
-        context.append(f"[Open archived source in Notion]({notion_url})")
-    return context
-
-
 def _render_notification(
     review: Mapping[str, Any],
     proposal: Mapping[str, Any],
@@ -418,31 +393,21 @@ def _render_notification(
         if subject and len(subject) <= 180
         else f"{config.project_label} knowledge review"
     )[:256]
-    marker = (
-        f"[ck-review:{review['review_id']}:{str(review['proposal_sha256'])[:16]}:ux2]"
-    )
-    content = (
-        f"<@&{config.role_id}> **{_safe_text(title)}**\n"
-        f"🛡️ **Nothing has been published yet.**\n"
-        f"{summary}\n\n"
-        "Review the details, then choose an option below.\n"
-        f"||{marker}||"
-    )
+    marker = f"[ck-review:{review['review_id']}:{str(review['proposal_sha256'])[:16]}:ux3]"
+    content = f"<@&{config.role_id}>"
     if len(content) > _MAX_PARENT_CONTENT:
         raise ReviewFailure("review notification exceeds the single-message limit")
     mentions = re.findall(r"<@&?(\d+)>", content)
     if mentions != [config.role_id] or "@everyone" in content or "@here" in content:
         raise ReviewFailure("review notification contains an unsafe mention")
-    source = _source_context(
-        project=config, artifact=artifact, extraction=extraction, notion_ref=notion_ref
-    )
+    notion_url = _notion_url(notion_ref)
+    description = f"**{summary}**"
+    if notion_url:
+        description += f"\n[Source in Notion]({notion_url})"
     embed = {
         "title": title,
-        "description": f"🛡️ **Nothing has been published yet.**\n\n**{summary}**",
+        "description": description,
         "color": 0xF59E0B,
-        "fields": [
-            {"name": "Source", "value": "\n".join(source)},
-        ],
     }
     details = _render_detail_messages(proposal, interpretation)
     detail_digest = hashlib.sha256(canonical_json(details)).hexdigest()
@@ -928,6 +893,9 @@ def reconcile_uncertain_notification(
     review = store.get_review(review_id)
     if review is None or review["notification_state"] != "uncertain":
         return False
+    marker = str(review["notification_marker"] or "")
+    compact = marker.endswith(":ux3]")
+    native = marker.endswith((":ux2]", ":ux3]"))
     matches = [
         item
         for item in messages
@@ -937,12 +905,12 @@ def reconcile_uncertain_notification(
             item.get("parent_payload_sha256")
             or (
                 item.get("content_sha256")
-                if not str(review["notification_marker"] or "").endswith(":ux2]")
+                if not native
                 else ""
             )
             or ""
         ) == str(review["notification_content_sha256"])
-        and str(review["notification_marker"] or "") in str(item.get("content") or "")
+        and (compact or marker in str(item.get("content") or ""))
         and item.get("author_is_bot") is True
         and [str(value) for value in (item.get("allowed_role_mentions") or [])]
         == [str(review["notification_role_id"])]
