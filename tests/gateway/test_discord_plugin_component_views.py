@@ -27,11 +27,11 @@ def test_persistent_plugin_view_keeps_free_text_action_last():
             "name": "client-knowledge-review",
             "handler": handler,
             "components": [
-                {"action": "approve", "label": "✅", "style": "success"},
-                {"action": "reject", "label": "❌", "style": "danger"},
+                {"action": "approve", "label": "Approve all", "style": "success"},
+                {"action": "reject", "label": "Reject", "style": "danger"},
                 {
                     "action": "instructions",
-                    "label": "✍️",
+                    "label": "✍️ Other",
                     "style": "secondary",
                 },
             ],
@@ -39,9 +39,9 @@ def test_persistent_plugin_view_keeps_free_text_action_last():
     )
     assert view.timeout is None
     assert [button.label for button in view.children] == [
-        "✅",
-        "❌",
-        "✍️",
+        "Approve all",
+        "Reject",
+        "✍️ Other",
     ]
     assert view.children[-1].custom_id == "client-knowledge-review:instructions"
     response = SimpleNamespace(defer=AsyncMock(), is_done=lambda: False)
@@ -96,11 +96,11 @@ async def test_discord_cold_connect_registers_discovered_persistent_view(monkeyp
         "name": "client-knowledge-review",
         "handler": AsyncMock(),
         "components": [
-            {"action": "approve", "label": "✅", "style": "success"},
-            {"action": "reject", "label": "❌", "style": "danger"},
+            {"action": "approve", "label": "Approve all", "style": "success"},
+            {"action": "reject", "label": "Reject", "style": "danger"},
             {
                 "action": "instructions",
-                "label": "✍️",
+                "label": "✍️ Other",
                 "style": "secondary",
             },
         ],
@@ -122,7 +122,9 @@ async def test_discord_cold_connect_registers_discovered_persistent_view(monkeyp
 
     assert await adapter.connect() is True
     assert len(added_views) == 1
-    assert [item.label for item in added_views[0].children] == ["✅", "❌", "✍️"]
+    assert [item.label for item in added_views[0].children] == [
+        "Approve all", "Reject", "✍️ Other"
+    ]
     await adapter.disconnect()
 
 
@@ -195,19 +197,19 @@ async def test_standalone_structured_review_sends_parent_then_detail_thread():
                     {
                         "type": 2,
                         "style": 3,
-                        "label": "✅",
+                        "label": "Approve all",
                         "custom_id": "client-knowledge-review:approve",
                     },
                     {
                         "type": 2,
                         "style": 4,
-                        "label": "❌",
+                        "label": "Reject",
                         "custom_id": "client-knowledge-review:reject",
                     },
                     {
                         "type": 2,
                         "style": 2,
-                        "label": "✍️",
+                        "label": "✍️ Other",
                         "custom_id": "client-knowledge-review:instructions",
                     },
                 ],
@@ -238,7 +240,7 @@ async def test_standalone_structured_review_sends_parent_then_detail_thread():
     parent = calls[0][1]
     assert parent["embeds"][0]["title"] == "PID knowledge review"
     assert [item["label"] for item in parent["components"][0]["components"]] == [
-        "✅", "❌", "✍️"
+        "Approve all", "Reject", "✍️ Other"
     ]
     assert calls[1][0].endswith("/messages/400/threads")
     assert calls[2][1]["content"] == "detail one"
@@ -267,7 +269,7 @@ async def test_standalone_structured_review_retries_rate_limited_detail_message(
         "strict_role_mentions": True,
         "_discord_embed": {"title": "PID review"},
         "_discord_components": [{"type": 1, "components": [{
-            "type": 2, "style": 2, "label": "✍️",
+            "type": 2, "style": 2, "label": "✍️ Other",
             "custom_id": "client-knowledge-review:instructions",
         }]}],
         "_discord_thread": {"name": "details", "messages": ["detail one"]},

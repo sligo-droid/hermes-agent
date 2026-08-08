@@ -48,11 +48,11 @@ def register(ctx) -> None:
     ctx.register_discord_component_view(
         name="client-knowledge-review",
         components=[
-            {"action": "approve", "label": "✅", "style": "success"},
-            {"action": "reject", "label": "❌", "style": "danger"},
+            {"action": "approve", "label": "Approve all", "style": "success"},
+            {"action": "reject", "label": "Reject", "style": "danger"},
             {
                 "action": "instructions",
-                "label": "✍️",
+                "label": "✍️ Other",
                 "style": "secondary",
             },
         ],

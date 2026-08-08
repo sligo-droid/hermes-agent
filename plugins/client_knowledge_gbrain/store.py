@@ -2594,7 +2594,7 @@ class IntakeStore:
                 or review["notification_state"] != "confirmed"
                 or not review["notification_message_id"]
                 or (
-                    str(review["notification_marker"] or "").endswith(":ux3]")
+                    str(review["notification_marker"] or "").endswith(":ux4]")
                     and review["detail_state"] == "confirmed"
                     and review["detail_thread_id"]
                 )

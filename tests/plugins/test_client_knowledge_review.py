@@ -325,21 +325,30 @@ def test_human_rendering_is_compact_and_keeps_full_details_out_of_parent():
     assert "Nothing has been published yet" not in content
     assert marker not in content
     assert embed == {
-        "title": "PID: PID weekly reporting",
+        "title": "Request to Learn",
         "description": (
             "**3 proposed additions · 3 findings not proposed**\n"
             "[Source in Notion](https://www.notion.so/0123456789abcdef0123456789abcdef)"
         ),
         "color": 0xF59E0B,
+        "fields": [{
+            "name": "Source",
+            "value": (
+                r"**Email sender:** Alex Example \<alex@example\.test\>" "\n"
+                "**Email subject:** PID weekly reporting\n"
+                r"**Email date:** Fri, 7 Aug 2026 09:00:00 \+0000"
+            ),
+        }],
     }
     assert "/client-knowledge" not in content
     assert "a" * 64 not in content
     assert "finding_grounding_mismatch" not in str(embed)
     assert "Why this needs review" not in str(embed)
     assert "How to decide" not in str(embed)
-    assert "Alex Example" not in str(embed)
-    assert "Email sender" not in str(embed)
-    assert "Email date" not in str(embed)
+    assert "Alex Example" in str(embed)
+    assert "Email sender" in str(embed)
+    assert "Email subject" in str(embed)
+    assert "Email date" in str(embed)
     assert "https://mail.google.com" not in str(embed)
     assert "https://www.notion.so/0123456789abcdef0123456789abcdef" in str(embed)
     joined = "\n".join(details)
@@ -435,7 +444,7 @@ def test_delivery_sends_structured_parent_and_full_detail_thread_batch():
         send_pending_review_notifications(store=store, derived=_Derived(), config=CFG, sender=sender)
     )
     assert result["confirmed"] == 1
-    assert sent[0]["embed"]["title"] == "PID: PID weekly reporting"
+    assert sent[0]["embed"]["title"] == "Request to Learn"
     assert len(sent[0]["detail_messages"]) == 6
     assert store.review["notification_message_id"] == "400"
     assert store.review["detail_thread_id"] == "401"
@@ -559,7 +568,7 @@ def test_new_ux_reconciliation_requires_exact_embed_and_components():
 def test_compact_ux_reconciliation_does_not_require_visible_marker():
     store = _Store()
     content, digest, marker, embed, _details, _detail_digest = _rendered()
-    assert marker.endswith(":ux3]")
+    assert marker.endswith(":ux4]")
     assert marker not in content
     store.record_review_notification(
         "a" * 64,
@@ -1269,7 +1278,7 @@ def test_refresh_does_not_replace_healthy_compact_native_card(tmp_path):
     with store._write() as conn:
         conn.execute(
             "UPDATE client_knowledge_reviews SET notification_marker=? WHERE review_id=?",
-            ("[ck-review:synthetic:ux3]", review_id),
+            ("[ck-review:synthetic:ux4]", review_id),
         )
     assert store.refresh_review_notification(review_id) is False
 
@@ -1282,6 +1291,6 @@ def test_refresh_can_replace_incomplete_compact_native_card(tmp_path):
         conn.execute(
             "UPDATE client_knowledge_reviews SET notification_marker=?, detail_state='uncertain' "
             "WHERE review_id=?",
-            ("[ck-review:synthetic:ux3]", review_id),
+            ("[ck-review:synthetic:ux4]", review_id),
         )
     assert store.refresh_review_notification(review_id) is True
