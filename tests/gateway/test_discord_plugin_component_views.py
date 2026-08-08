@@ -308,7 +308,7 @@ async def test_standalone_structured_review_sends_structured_item_payloads_in_or
         "require_single_message": True,
         "allowed_role_mentions": ["300"],
         "strict_role_mentions": True,
-        "_discord_embed": {"title": "Request to Learn"},
+        "_discord_embed": {"title": "Self-Education"},
         "_discord_thread": {"name": "details", "messages": [
             {"content": "", "embeds": [{"title": "Candidate 1"}], "components": controls},
             {"content": "", "embeds": [{"title": "Candidate 2"}], "components": controls},
@@ -364,7 +364,7 @@ async def test_standalone_review_rejects_detail_aggregate_embed_before_parent_po
         "require_single_message": True,
         "allowed_role_mentions": ["300"],
         "strict_role_mentions": True,
-        "_discord_embed": {"title": "Request to Learn"},
+        "_discord_embed": {"title": "Self-Education"},
         "_discord_thread": {"name": "details", "messages": [{
             "content": "",
             "embeds": [{"title": "Candidate 1", "fields": fields}],

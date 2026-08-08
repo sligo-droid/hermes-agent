@@ -135,39 +135,41 @@ def _truncate_utf16(value: str, limit: int) -> str:
 def _evidence_fields(evidence: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     fields: list[dict[str, Any]] = []
     for index, value in enumerate(evidence, start=1):
-        prefix = f"`{value['segment_id']}:{value['start']}-{value['end']}`\n> "
+        identity = f"`{value['segment_id']}:{value['start']}-{value['end']}`\n"
         quote = _safe_text(value["quote"])
         first = True
-        while quote:
-            budget = 1024 - utf16_len(prefix if first else "> ")
-            chunk = []
+        offset = 0
+        while offset < len(quote):
+            prefix = identity + "> " if first else "> "
+            budget = 1024 - utf16_len(prefix)
+            chunk: list[str] = []
             used = 0
-            for char in quote:
-                width = utf16_len(char)
+            while offset < len(quote):
+                char = quote[offset]
+                consumed = 1
+                if char == "\\" and offset + 1 < len(quote):
+                    token = quote[offset:offset + 2]
+                    consumed = 2
+                elif char == "\n":
+                    token = "\n> "
+                else:
+                    token = char
+                width = utf16_len(token)
                 if used + width > budget:
                     break
-                chunk.append(char)
+                chunk.append(token)
                 used += width
-            while chunk and chunk[-1] == "\\" and len(chunk) < len(quote):
-                slash_count = 0
-                for char in reversed(chunk):
-                    if char != "\\":
-                        break
-                    slash_count += 1
-                if slash_count % 2 == 0:
-                    break
-                used -= utf16_len(chunk.pop())
+                offset += consumed
             if not chunk:
                 raise ReviewFailure("exact evidence cannot fit Discord UTF-16 limits")
             text = "".join(chunk)
-            quote = quote[len(text):]
             fields.append({
                 "name": (
                     f"Exact evidence {index}"
                     if first
                     else f"Exact evidence {index} continued"
                 ),
-                "value": (prefix if first else "> ") + text,
+                "value": prefix + text,
                 "inline": False,
             })
             first = False
@@ -250,25 +252,27 @@ def _render_notification(
     extraction: Mapping[str, Any],
     config: ProjectReviewConfig,
 ) -> tuple[str, str, str, dict[str, Any], list[dict[str, Any]], str]:
-    if not 1 <= len(items) <= 3:
-        raise ReviewFailure("synthesis review must contain 1-3 active items")
+    if not 1 <= len(items) <= 10:
+        raise ReviewFailure("synthesis review must contain 1-10 active items")
     content = f"<@&{config.role_id}>"
     if re.findall(r"<@&?(\d+)>", content) != [config.role_id]:
         raise ReviewFailure("review notification contains an unsafe mention")
     notion_url = _notion_url(str(synthesis["notion_ref"]))
-    description = f"**{len(items)} publication candidate{'s' if len(items) != 1 else ''}**"
+    headers = _header_values(extraction)
+    subject = _truncate_utf16(headers.get("Subject") or "Client learning review", 500)
+    description = (
+        f"{subject}\n\n"
+        f"**{len(items)} publication candidate{'s' if len(items) != 1 else ''}**"
+    )
     if notion_url:
         description += f"\n[Source in Notion]({notion_url})"
-    headers = _header_values(extraction)
     source = []
     if headers.get("From"):
         source.append(f"**Email sender:** {_truncate_utf16(headers['From'], 300)}")
-    if headers.get("Subject"):
-        source.append(f"**Email subject:** {_truncate_utf16(headers['Subject'], 300)}")
     if headers.get("Date"):
         source.append(f"**Email date:** {_truncate_utf16(headers['Date'], 300)}")
     embed: dict[str, Any] = {
-        "title": "Request to Learn",
+        "title": "Self-Education",
         "description": description,
         "color": 0xF59E0B,
     }
@@ -632,6 +636,7 @@ async def send_pending_review_notifications(
     thread_creator: Callable[..., Awaitable[Mapping[str, Any]]] | None = None,
     detail_resolver: Callable[..., Awaitable[Mapping[str, Any]]] | None = None,
     force: bool = False,
+    synthesis_id: str = "",
 ) -> dict[str, int]:
     effective = dict(config or load_config() or {})
     raw = effective.get("client_knowledge")
@@ -649,7 +654,15 @@ async def send_pending_review_notifications(
         else _skip_existing_detail_resolution
     )
     result = {"processed": 0, "confirmed": 0, "proven_none": 0, "uncertain": 0}
-    for synthesis in store.list_pending_synthesis_notifications(limit=50):
+    pending = (
+        [row]
+        if synthesis_id
+        and (row := store.get_pending_synthesis_notification(synthesis_id)) is not None
+        else []
+        if synthesis_id
+        else store.list_pending_synthesis_notifications(limit=50)
+    )
+    for synthesis in pending:
         try:
             extraction, items = _load_synthesis_material(
                 store=store, derived=derived, synthesis=synthesis
@@ -736,6 +749,66 @@ async def send_pending_review_notifications(
         )
         result[state] += 1
     return result
+
+
+def retire_superseded_synthesis_review(
+    store: IntakeStore,
+    synthesis_id: str,
+    *,
+    request: Callable[..., Any] | None = None,
+    token: str = "",
+) -> str:
+    """Remove stale controls and archive one superseded Discord review thread."""
+    retirement = store.get_pending_synthesis_retirement(synthesis_id)
+    if retirement is None:
+        notification = store.get_synthesis_notification(synthesis_id)
+        return "confirmed" if notification and notification.get("retirement_state") == "confirmed" else "none"
+    if request is None or not token:
+        from tools.discord_tool import _discord_request, _get_bot_token
+
+        request = request or _discord_request
+        token = token or str(_get_bot_token() or "")
+    if not token:
+        store.record_synthesis_retirement(synthesis_id, state="uncertain")
+        return "uncertain"
+
+    def mutate(method: str, path: str, body: Mapping[str, Any]) -> bool:
+        try:
+            request(method, path, token, body=dict(body))
+            return True
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
+
+    try:
+        for message_id in retirement["item_message_ids"]:
+            if not mutate(
+                "PATCH",
+                f"/channels/{retirement['thread_id']}/messages/{message_id}",
+                {"components": []},
+            ):
+                raise ReviewFailure("Discord item retirement is uncertain")
+        if not mutate(
+            "PATCH",
+            f"/channels/{retirement['channel_id']}/messages/{retirement['message_id']}",
+            {
+                "content": "Superseded client-learning review.",
+                "embeds": [],
+                "components": [],
+                "allowed_mentions": {"parse": []},
+            },
+        ):
+            raise ReviewFailure("Discord parent retirement is uncertain")
+        if not mutate(
+            "PATCH",
+            f"/channels/{retirement['thread_id']}",
+            {"archived": True, "locked": True},
+        ):
+            raise ReviewFailure("Discord thread retirement is uncertain")
+    except Exception:
+        store.record_synthesis_retirement(synthesis_id, state="uncertain")
+        return "uncertain"
+    store.record_synthesis_retirement(synthesis_id, state="confirmed")
+    return "confirmed"
 
 
 async def send_pending_replacement_notifications(
@@ -1554,6 +1627,7 @@ __all__ = [
     "handle_discord_review_interaction",
     "item_review_components",
     "process_pending_item_revisions",
+    "retire_superseded_synthesis_review",
     "run_notification_once",
     "send_pending_replacement_notifications",
     "send_pending_review_notifications",

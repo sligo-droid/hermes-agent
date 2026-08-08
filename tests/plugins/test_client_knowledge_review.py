@@ -81,9 +81,14 @@ def test_parent_has_no_controls_and_each_item_has_exactly_three_static_controls(
         _synthesis(), _items(), EXTRACTION, ProjectReviewConfig.from_config(CFG, "pid")
     )
     assert content == "<@&300>"
-    assert embed["title"] == "Request to Learn"
+    assert embed["title"] == "Self-Education"
+    assert embed["description"].startswith("PID weekly reporting\n\n")
     assert "2 publication candidates" in embed["description"]
+    assert "Source in Notion" in embed["description"]
     assert "Alex" in str(embed)
+    assert "Email subject" not in str(embed.get("fields"))
+    assert "Email sender" in str(embed.get("fields"))
+    assert "Email date" in str(embed.get("fields"))
     assert all("components" in item for item in details)
     assert [button["label"] for button in details[0]["components"][0]["components"]] == [
         "Approve", "Reject", "✍️ Other",
@@ -119,6 +124,29 @@ def test_exact_evidence_is_split_without_utf16_truncation():
         field["value"][2:] for field in fields[1:]
     )
     assert rendered == quote
+
+
+def test_multiline_exact_evidence_keeps_quote_prefix_across_continuation_fields():
+    quote = ("first line\n" + "second line " * 120 + "\nthird line")
+    item = {
+        "item_id": "1" * 64, "position": 1, "revision_number": 0,
+        "statement": "Durable statement.", "state": "pending",
+        "evidence_json": _evidence(quote),
+    }
+    details = _render_notification(
+        _synthesis(), [item], EXTRACTION, ProjectReviewConfig.from_config(CFG, "pid")
+    )[4]
+    fields = details[0]["embeds"][0]["fields"]
+    assert len(fields) >= 2
+    chunks = []
+    for index, field in enumerate(fields):
+        value = field["value"]
+        if index == 0:
+            value = value.split("\n", 1)[1]
+        assert value.startswith("> ")
+        assert all(line.startswith("> ") for line in value.splitlines())
+        chunks.append(value[2:].replace("\n> ", "\n"))
+    assert "".join(chunks) == quote
 
 
 def test_exact_evidence_split_never_breaks_markdown_escape_pair():
