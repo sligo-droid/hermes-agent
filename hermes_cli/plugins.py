@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -1163,6 +1164,58 @@ class PluginContext:
             action_id,
         )
 
+    def register_discord_component_view(
+        self,
+        *,
+        name: str,
+        components: List[Dict[str, str]],
+        handler: Callable,
+    ) -> None:
+        """Register one restart-safe Discord button view owned by a plugin.
+
+        Each component needs a stable ``action``, human ``label``, and optional
+        Discord style name (``primary``, ``secondary``, ``success``, or
+        ``danger``). The adapter registers the resulting timeout-free view on
+        every gateway start and invokes ``handler(interaction, action)``.
+        """
+        clean_name = str(name or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", clean_name):
+            raise ValueError("Discord component view name is invalid")
+        if not callable(handler):
+            raise ValueError("Discord component view handler must be callable")
+        normalized: List[Dict[str, str]] = []
+        for component in components:
+            if not isinstance(component, dict):
+                raise ValueError("Discord component view entries must be mappings")
+            action = str(component.get("action") or "").strip().lower()
+            label = str(component.get("label") or "").strip()
+            style = str(component.get("style") or "secondary").strip().lower()
+            if (
+                not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", action)
+                or not label
+                or len(label) > 80
+                or style not in {"primary", "secondary", "success", "danger"}
+            ):
+                raise ValueError("Discord component view entry is invalid")
+            normalized.append({"action": action, "label": label, "style": style})
+        if not normalized or len(normalized) > 25:
+            raise ValueError("Discord component views require 1 to 25 buttons")
+        if len({item["action"] for item in normalized}) != len(normalized):
+            raise ValueError("Discord component view actions must be unique")
+        self._manager._discord_component_views.append(
+            {
+                "name": clean_name,
+                "components": normalized,
+                "handler": handler,
+                "plugin": self.manifest.name,
+            }
+        )
+        logger.debug(
+            "Plugin %s registered Discord component view: %s",
+            self.manifest.name,
+            clean_name,
+        )
+
     # -- session artifact provider registration ----------------------------
 
     def register_session_artifact_provider(self, provider: Callable) -> None:
@@ -1434,6 +1487,7 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._discord_component_views: List[Dict[str, Any]] = []
         # Synchronous callbacks that expose safe links to artifacts associated
         # with a session. Entries are (callback, plugin_name) tuples and remain
         # registration-ordered.
@@ -1467,6 +1521,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
+            self._discord_component_views.clear()
             self._session_artifact_providers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
@@ -2058,11 +2113,42 @@ class PluginManager:
         for cb in callbacks:
             try:
                 ret = cb(**kwargs)
+                if inspect.isawaitable(ret):
+                    logger.warning(
+                        "Hook '%s' callback %s returned an awaitable to the synchronous "
+                        "hook runner; use invoke_hook_async for this hook",
+                        hook_name,
+                        getattr(cb, "__name__", repr(cb)),
+                    )
+                    close = getattr(ret, "close", None)
+                    if callable(close):
+                        close()
+                    continue
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+        return results
+
+    async def invoke_hook_async(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Call sync or async hook callbacks in registration order."""
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for cb in self._hooks.get(hook_name, []):
+            try:
+                ret = cb(**kwargs)
+                if inspect.isawaitable(ret):
+                    ret = await ret
+                if ret is not None:
+                    results.append(ret)
+            except Exception as exc:
+                logger.warning(
+                    "Async hook '%s' callback %s raised: %s",
                     hook_name,
                     getattr(cb, "__name__", repr(cb)),
                     exc,
@@ -2115,6 +2201,10 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_discord_component_views(self) -> List[Dict[str, Any]]:
+        """Return plugin-owned persistent Discord component view definitions."""
+        return list(self._discord_component_views)
 
     # -----------------------------------------------------------------------
     # Session artifact collection
@@ -2316,6 +2406,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke plugin hooks while awaiting any async callbacks."""
+    return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
@@ -2674,6 +2769,11 @@ def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
     """
     manager = _ensure_plugins_discovered()
     return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
+
+
+def get_discord_component_views() -> List[Dict[str, Any]]:
+    """Return persistent Discord component views after plugin discovery."""
+    return _ensure_plugins_discovered().get_discord_component_views()
 
 
 def get_plugin_toolsets() -> List[tuple]:

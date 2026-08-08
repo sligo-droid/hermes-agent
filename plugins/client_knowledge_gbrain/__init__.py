@@ -12,12 +12,16 @@ from plugins.client_knowledge_gbrain.tools import (
 from plugins.client_knowledge_gbrain.cli import client_knowledge_command, register_cli
 
 
-def _handle_review_command(*args, **kwargs):
-    from plugins.client_knowledge_gbrain.review import (
-        handle_client_knowledge_review_command,
-    )
+def _capture_review_text(*args, **kwargs):
+    from plugins.client_knowledge_gbrain.review import capture_review_text_hook
 
-    return handle_client_knowledge_review_command(*args, **kwargs)
+    return capture_review_text_hook(*args, **kwargs)
+
+
+async def _handle_review_component(interaction, action):
+    from plugins.client_knowledge_gbrain.review import handle_discord_review_interaction
+
+    await handle_discord_review_interaction(interaction, action)
 
 
 def register(ctx) -> None:
@@ -40,11 +44,19 @@ def register(ctx) -> None:
             "Operator-only queue, bounded Gmail polling, and Notion archive controls."
         ),
     )
-    ctx.register_command(
-        name="client-knowledge",
-        handler=_handle_review_command,
-        description="Approve or reject a client-knowledge review.",
-        args_hint="approve|reject <review-id> [reason]",
+    ctx.register_hook("pre_gateway_dispatch", _capture_review_text)
+    ctx.register_discord_component_view(
+        name="client-knowledge-review",
+        components=[
+            {"action": "approve", "label": "Approve all", "style": "success"},
+            {"action": "reject", "label": "Reject", "style": "danger"},
+            {
+                "action": "instructions",
+                "label": "Tell Hermes what to change",
+                "style": "secondary",
+            },
+        ],
+        handler=_handle_review_component,
     )
     ctx.register_auxiliary_task(
         key="client_knowledge_interpret",

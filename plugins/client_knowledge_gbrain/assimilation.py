@@ -341,6 +341,70 @@ def _current_page_map(
     return pages
 
 
+def load_current_pages_for_proposal(
+    client: GBrainClient,
+    *,
+    project_key: str,
+    query: str,
+    max_pages: int,
+    required_slugs: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load bounded search context plus exact existing proposal targets."""
+    pages = _current_page_map(
+        client,
+        project_key=project_key,
+        query=query,
+        max_pages=max_pages,
+    )
+    required = list(dict.fromkeys(str(value) for value in (required_slugs or []) if value))
+    if len(required) > max_pages:
+        raise AssimilationFailure("assimilation_current_page_limit", quarantine=True)
+    source_root = client.assert_source_checkout()
+    for relative in required:
+        if relative in pages:
+            continue
+        slug = full_project_slug(project_key, relative)
+        page = validate_page(
+            client.get_page(slug),
+            project_key=project_key,
+            source_id=client.settings.source_id,
+        )
+        if page["frontmatter"]["status"] not in {"current", "tentative", "disputed"}:
+            raise AssimilationFailure("assimilation_target_missing")
+        pages[relative] = {
+            "slug": slug,
+            "title": str(page.get("title") or "")[:300],
+            "frontmatter": page["frontmatter"],
+            "compiled_truth": str(page.get("compiled_truth") or "")[:8000],
+            "timeline": str(page.get("timeline") or ""),
+            "markdown_sha256": _page_prior_sha(source_root, project_key, relative),
+        }
+    return pages
+
+
+def required_existing_page_slugs(
+    proposal: Mapping[str, Any], *, project_key: str
+) -> list[str]:
+    """Return exact current-page dependencies for a proposal."""
+    required: list[str] = []
+    prefix = f"projects/{project_key}/"
+    for operation in proposal.get("operations", []):
+        if not isinstance(operation, Mapping):
+            continue
+        if operation.get("operation") in {
+            "confirm",
+            "refine",
+            "contradict",
+            "mark_tentative",
+        }:
+            required.append(str(operation.get("target_slug") or ""))
+        for superseded in operation.get("supersedes", []):
+            value = str(superseded)
+            if value.startswith(prefix):
+                required.append(value[len(prefix):])
+    return list(dict.fromkeys(value for value in required if value))
+
+
 def _verify_synced_pages(
     client: GBrainClient,
     *,
@@ -430,6 +494,7 @@ def validate_proposal(
     current_pages: Mapping[str, Mapping[str, Any]],
     source_root: Path,
     max_output_bytes: int,
+    allow_revised_claim: bool = False,
 ) -> tuple[dict[str, Any], bool, str]:
     if not isinstance(parsed, dict):
         raise AssimilationFailure("assimilation_schema_mismatch")
@@ -485,14 +550,15 @@ def validate_proposal(
         ):
             raise AssimilationFailure("assimilation_finding_grounding_mismatch", quarantine=True)
         if (
-            item["claim"] != finding["text"]
+            (not allow_revised_claim and item["claim"] != finding["text"])
             or list(item["evidence_ids"]) != finding["evidence_ids"]
             or item["kind"] != finding["kind"]
             or item["confidence"] != finding["confidence"]
             or item["sensitivity"] != finding["sensitivity"]
         ):
             finding_grounding_mismatch = True
-            item["claim"] = finding["text"]
+            if not allow_revised_claim:
+                item["claim"] = finding["text"]
             item["evidence_ids"] = list(finding["evidence_ids"])
             item["kind"] = finding["kind"]
             item["confidence"] = finding["confidence"]
@@ -788,27 +854,75 @@ class AssimilationWorker:
             existing = self.store.get_assimilation(assimilation_id)
         proposal_sha = str(existing["proposal_sha256"])
         if review_required:
-            review_id = versioned_identity("client-knowledge-review", assimilation_id, proposal_sha)
-            review = self.store.get_review(review_id)
+            root_review_id = versioned_identity(
+                "client-knowledge-review", assimilation_id, proposal_sha
+            )
+            review = self.store.get_active_review_for_assimilation(assimilation_id)
             if review is None:
                 self.store.require_assimilation_review(
-                    claim, assimilation_id=assimilation_id, review_id=review_id,
+                    claim, assimilation_id=assimilation_id, review_id=root_review_id,
                     proposal_sha256=proposal_sha, assimilation_version=ASSIMILATION_VERSION,
                     project_key=artifact.project_key, reason_code=review_reason,
                 )
                 return assimilation_id
             if review["state"] == "pending":
                 self.store.require_assimilation_review(
-                    claim, assimilation_id=assimilation_id, review_id=review_id,
-                    proposal_sha256=proposal_sha, assimilation_version=ASSIMILATION_VERSION,
+                    claim, assimilation_id=str(review["assimilation_id"]),
+                    review_id=str(review["review_id"]),
+                    proposal_sha256=str(review["proposal_sha256"]),
+                    assimilation_version=str(review["assimilation_version"]),
                     project_key=artifact.project_key, reason_code=review_reason,
                 )
                 return assimilation_id
+            if review["state"] == "instructions_pending":
+                raise AssimilationFailure("review_instructions_pending", operator_blocked=True)
+            if review["state"] == "superseded":
+                raise AssimilationFailure("review_revision_incomplete", operator_blocked=True)
             if review["state"] != "approved":
                 raise AssimilationFailure("review_rejected", quarantine=True)
-            review_id_value = review_id
+            review_id_value = str(review["review_id"])
+            active_assimilation_id = str(review["assimilation_id"])
+            if active_assimilation_id != assimilation_id:
+                active_assimilation = self.store.get_assimilation(active_assimilation_id)
+                if active_assimilation is None:
+                    raise AssimilationFailure(
+                        "review_revision_assimilation_missing", operator_blocked=True
+                    )
+                active_value = self.derived.read_json(
+                    "assimilations",
+                    active_assimilation_id,
+                    active_assimilation["output_sha256"],
+                    active_assimilation["output_bytes"],
+                )
+                active_proposal = (
+                    active_value.get("proposal")
+                    if isinstance(active_value, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(active_proposal, Mapping)
+                    or hashlib.sha256(canonical_json(active_proposal)).hexdigest()
+                    != str(review["proposal_sha256"])
+                ):
+                    raise AssimilationFailure(
+                        "review_revision_provenance_invalid", operator_blocked=True
+                    )
+                assimilation_id = active_assimilation_id
+                existing = active_assimilation
+                proposal = dict(active_proposal)
+                proposal_sha = str(review["proposal_sha256"])
+                current_pages = load_current_pages_for_proposal(
+                    self.client,
+                    project_key=artifact.project_key,
+                    query=query,
+                    max_pages=self.settings.max_current_pages,
+                    required_slugs=required_existing_page_slugs(
+                        proposal, project_key=artifact.project_key
+                    ),
+                )
         else:
             review_id_value = ""
+        publication_assimilation_version = str(existing["assimilation_version"])
         operations = proposal["operations"]
         if all(item["operation"] == "ignore_transient" for item in operations):
             self.store.complete_assimilation(
@@ -876,7 +990,7 @@ class AssimilationWorker:
                 publication = publisher.publish(
                     artifact_id=artifact.artifact_id,
                     assimilation_id=assimilation_id,
-                    assimilation_version=ASSIMILATION_VERSION,
+                    assimilation_version=publication_assimilation_version,
                     proposal_sha256=proposal_sha,
                     expected_head=str(existing["base_git_head"]),
                     authored_at=int(artifact.occurred_at),
@@ -957,5 +1071,6 @@ def run_assimilation_once(
 __all__ = [
     "ASSIMILATION_SCHEMA", "ASSIMILATION_VERSION", "AssimilationFailure",
     "AssimilationSettings", "AssimilationWorker", "POLICY_VERSION", "PROMPT_VERSION",
-    "SCHEMA_VERSION", "run_assimilation_once", "validate_proposal",
+    "SCHEMA_VERSION", "load_current_pages_for_proposal", "required_existing_page_slugs",
+    "run_assimilation_once", "validate_proposal",
 ]

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from plugins.client_knowledge_gbrain.cli import client_knowledge_command, register_cli
 from plugins.client_knowledge_gbrain.models import IntakeArtifact
@@ -32,6 +33,11 @@ def test_cli_parser_registers_all_operator_actions():
         "retry",
         "quarantine",
         "reconcile",
+        "reviews",
+        "notify-reviews-once",
+        "adopt-review-message",
+        "requeue-review-notification",
+        "refresh-review-notification",
         "run-once",
         "gmail-poll-once",
         "notion-preflight",
@@ -40,6 +46,10 @@ def test_cli_parser_registers_all_operator_actions():
             suffix = ["0" * 32]
         elif action == "notion-preflight":
             suffix = ["--project", "pid"]
+        elif action == "adopt-review-message":
+            suffix = ["--review-id", "a" * 64, "--message-id", "123"]
+        elif action in {"requeue-review-notification", "refresh-review-notification"}:
+            suffix = ["--review-id", "a" * 64]
         else:
             suffix = []
         args = parser.parse_args([action] + suffix)
@@ -186,3 +196,80 @@ def test_real_cli_dry_run_does_not_import_stages_or_create_ledger(tmp_path):
     assert lines[0]["ledger_writes"] is False
     assert not ledger.exists()
     assert not ledger.parent.exists()
+
+
+def test_refresh_review_notification_archives_legacy_card_without_deciding(tmp_path, capsys):
+    store = IntakeStore(tmp_path / "private" / "intake.db")
+    artifact = _artifact()
+    store.insert_artifact(artifact)
+    now = time.time()
+    review_id = "a" * 64
+    with store._write() as conn:
+        conn.execute(
+            "INSERT INTO extractions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "x" * 64, artifact.artifact_id, artifact.content_sha256, "m" * 64,
+                "ev1", "lv1", "rv1", "extracted", "storage", "object",
+                "1" * 64, 1, 1, "{}", now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO interpretation_envelopes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "e" * 64, artifact.artifact_id, "pid", artifact.content_sha256,
+                "x" * 64, "1" * 64, "ev1", "sv1", "pv1", "task",
+                "storage", "object", "2" * 64, 1, now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO interpretations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "i" * 64, "e" * 64, artifact.artifact_id, "x" * 64,
+                "sv1", "pv1", "storage", "object", "3" * 64, 1,
+                "provider", "model", "provider", "model", "advanced", "route",
+                1, 1, 2, 0, 0, now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO assimilation_proposals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "b" * 64, artifact.artifact_id, "i" * 64, "av1", "sv1", "pv1",
+                "policy", "pid", "d" * 64, "storage", "object", "4" * 64, 1,
+                "provider", "model", "provider", "model", "advanced", "route",
+                1, "finding_grounding_mismatch", "head", None, 0, now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO client_knowledge_reviews("
+            "review_id, assimilation_id, artifact_id, project_key, proposal_sha256, "
+            "assimilation_version, state, reason_code, notification_state, "
+            "notification_content_sha256, notification_message_id, notification_guild_id, "
+            "notification_channel_id, notification_role_id, notification_marker, "
+            "created_at, updated_at) VALUES(?,?,?,?,?,?,'pending',?,'confirmed',?,?,?,?,?,?,?,?)",
+            (
+                review_id, "b" * 64, artifact.artifact_id, "pid", "d" * 64, "av1",
+                "finding_grounding_mismatch", "5" * 64, "400", "100", "200", "300",
+                "[ck-review:legacy]", now, now,
+            ),
+        )
+
+    args = argparse.Namespace(
+        client_knowledge_action="refresh-review-notification",
+        review_id=review_id,
+        db_path=str(store.path),
+    )
+    assert client_knowledge_command(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"refreshed": True, "review_id": review_id}
+    review = store.get_review(review_id)
+    assert review["state"] == "pending"
+    assert review["notification_state"] == "pending"
+    assert review["notification_message_id"] is None
+    with store._connect() as conn:
+        history = conn.execute(
+            "SELECT message_id, marker FROM client_knowledge_review_notification_history "
+            "WHERE review_id=?",
+            (review_id,),
+        ).fetchone()
+    assert tuple(history) == ("400", "[ck-review:legacy]")
+    assert client_knowledge_command(args) == 1
