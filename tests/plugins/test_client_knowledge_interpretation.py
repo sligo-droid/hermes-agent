@@ -9,6 +9,7 @@ from agent.plugin_llm import PluginLlmStructuredResult, PluginLlmUsage
 from plugins.client_knowledge_gbrain.models import IntakeArtifact
 from plugins.client_knowledge_gbrain.store import IntakeStore, JobClaim
 from plugins.client_knowledge_gbrain.synthesis import (
+    SYNTHESIS_INSTRUCTIONS,
     SYNTHESIS_SCHEMA,
     SynthesisFailure,
     SynthesisSettings,
@@ -47,10 +48,26 @@ def _learning(statement="Send a concise status report every Monday."):
     }
 
 
+def _learnings(count):
+    statements = [
+        "Schedule weekly status delivery for Monday mornings.",
+        "Route client-facing changes through the existing approval workflow.",
+        "Keep interface copy concise for executive readers.",
+        "Record launch blockers in the delivery checklist.",
+        "Assign one owner to production incident communication.",
+        "Preserve audit history when project permissions change.",
+        "Show deadline reminders beside open governance proposals.",
+        "Use accessible color contrast for dashboard warnings.",
+        "Retain delegate voting power during balance recalculation.",
+        "Document rollout dependencies before implementation starts.",
+    ]
+    return [_learning(statement) for statement in statements[:count]]
+
+
 def test_synthesis_schema_is_plain_bounded_and_has_no_taxonomy_or_publication_fields():
     assert SYNTHESIS_SCHEMA["required"] == ["learnings"]
-    assert SYNTHESIS_SCHEMA["properties"]["learnings"]["minItems"] == 1
-    assert SYNTHESIS_SCHEMA["properties"]["learnings"]["maxItems"] == 3
+    assert SYNTHESIS_SCHEMA["properties"]["learnings"]["minItems"] == 3
+    assert SYNTHESIS_SCHEMA["properties"]["learnings"]["maxItems"] == 10
     item = SYNTHESIS_SCHEMA["properties"]["learnings"]["items"]
     assert set(item["properties"]) == {"statement", "evidence"}
     forbidden = {
@@ -61,15 +78,22 @@ def test_synthesis_schema_is_plain_bounded_and_has_no_taxonomy_or_publication_fi
 
 
 def test_synthesis_accepts_exact_evidence_and_repairs_one_unique_offset():
-    parsed = {"learnings": [_learning()]}
+    parsed = {"learnings": _learnings(3)}
     parsed["learnings"][0]["evidence"][0]["start"] = 1
     parsed["learnings"][0]["evidence"][0]["end"] += 1
     value = validate_synthesis(parsed, EXTRACTION, max_output_bytes=100_000)
     assert value["learnings"][0]["evidence"][0]["start"] == 0
 
 
-@pytest.mark.parametrize("count", [0, 4])
-def test_synthesis_rejects_outside_one_to_three(count):
+@pytest.mark.parametrize("count", [3, 4, 7, 10])
+def test_synthesis_accepts_full_natural_count_range(count):
+    assert len(validate_synthesis(
+        {"learnings": _learnings(count)}, EXTRACTION, max_output_bytes=100_000
+    )["learnings"]) == count
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 11])
+def test_synthesis_rejects_outside_three_to_ten(count):
     with pytest.raises(SynthesisFailure, match="synthesis_schema_mismatch"):
         validate_synthesis(
             {"learnings": [_learning(f"Learning {index}") for index in range(count)]},
@@ -78,12 +102,26 @@ def test_synthesis_rejects_outside_one_to_three(count):
         )
 
 
-def test_synthesis_rejects_overlapping_statements_and_ambiguous_evidence():
+def test_synthesis_prompt_requires_natural_distinct_count_without_padding():
+    folded = SYNTHESIS_INSTRUCTIONS.casefold()
+    assert "natural count from 3 to 10" in folded
+    assert "durable source richness" in folded
+    assert "never pad" in folded
+    assert "restate the same underlying idea" in folded
+    assert "mutually distinct" in folded
+
+
+def test_synthesis_rejects_semantic_restatement_and_ambiguous_evidence():
     with pytest.raises(SynthesisFailure, match="synthesis_statements_overlap"):
         validate_synthesis(
             {"learnings": [
-                _learning("Send a status report every Monday."),
-                _learning("Send a status report every Monday. Include blockers."),
+                _learning(
+                    "Agora permission changes must preserve the project role model and governance workflow."
+                ),
+                _learning(
+                    "When implementing Agora, reuse project permission roles and protect the governance workflow."
+                ),
+                _learning("Send a concise status report every Monday."),
             ]},
             EXTRACTION,
             max_output_bytes=100_000,
@@ -95,7 +133,67 @@ def test_synthesis_rejects_overlapping_statements_and_ambiguous_evidence():
         "segment_id": "body-0001", "start": 99, "end": 105, "quote": "Monday"
     }
     with pytest.raises(SynthesisFailure, match="synthesis_evidence_mismatch"):
-        validate_synthesis({"learnings": [item]}, duplicate, max_output_bytes=100_000)
+        validate_synthesis(
+            {"learnings": [item, *_learnings(2)]},
+            duplicate,
+            max_output_bytes=100_000,
+        )
+
+
+def test_synthesis_allows_distinct_actions_that_share_project_terms():
+    value = validate_synthesis(
+        {"learnings": [
+            _learning("Configure Agora proposal notifications with actionable deadline reminders."),
+            _learning("Preserve Agora delegate voting power during token balance recalculation."),
+            _learning("Document Agora rollout ownership in the weekly project status report."),
+        ]},
+        EXTRACTION,
+        max_output_bytes=100_000,
+    )
+    assert len(value["learnings"]) == 3
+
+
+def test_synthesis_rejects_live_political_positioning_restatement():
+    quote = (
+        "I would love to avoid labeling ourselves as a Political Site because I believe "
+        "we want to be more in spite of the momentary shock value of the rhetoric and theater."
+    )
+    extraction = {
+        **EXTRACTION,
+        "segments": [{
+            "segment_id": "body-0001",
+            "kind": "body_plain",
+            "label": "Email body",
+            "text": quote,
+        }],
+    }
+    evidence = [{
+        "segment_id": "body-0001",
+        "start": 0,
+        "end": len(quote),
+        "quote": quote,
+    }]
+    with pytest.raises(SynthesisFailure, match="synthesis_statements_overlap"):
+        validate_synthesis(
+            {"learnings": [
+                {
+                    "statement": (
+                        "Agora is conceived as a public signal index whose scope extends "
+                        "beyond campaign politics."
+                    ),
+                    "evidence": evidence,
+                },
+                {
+                    "statement": (
+                        "John Iwaniec prefers to avoid labeling Agora as a Political Site."
+                    ),
+                    "evidence": evidence,
+                },
+                _learning("Send a concise status report every Monday."),
+            ]},
+            extraction,
+            max_output_bytes=100_000,
+        )
 
 
 class _Derived:
@@ -151,7 +249,7 @@ def test_worker_uses_one_synthesis_model_call_and_persists_bounded_attribution(m
         def complete_structured(self, **kwargs):
             captured["call"] = kwargs
             return PluginLlmStructuredResult(
-                text="{}", parsed={"learnings": [_learning()]}, content_type="json",
+                text="{}", parsed={"learnings": _learnings(3)}, content_type="json",
                 provider="provider", model="model", agent_id="agent",
                 audit={
                     "selected_provider": "provider", "selected_model": "model",
@@ -173,7 +271,7 @@ def test_worker_uses_one_synthesis_model_call_and_persists_bounded_attribution(m
     )
     assert synthesis_id == captured["synthesis"]["synthesis_id"]
     assert captured["call"]["task"] == "client_knowledge_synthesize"
-    assert len(captured["items"]) == 1
+    assert len(captured["items"]) == 3
     assert captured["synthesis"]["total_tokens"] == 15
     assert captured["synthesis"]["base_git_head"] == "publication-time"
     assert "operation" not in str(captured["call"]["json_schema"])
@@ -229,7 +327,17 @@ def test_worker_rejects_aggregate_discord_overflow_before_persistence():
     ]
     llm = SimpleNamespace(complete_structured=lambda **_kwargs: PluginLlmStructuredResult(
         text="{}",
-        parsed={"learnings": [{"statement": "x" * 2000, "evidence": evidence}]},
+        parsed={"learnings": [
+            {"statement": "x" * 2000, "evidence": evidence},
+            {
+                "statement": "Schedule weekly executive reporting for Monday morning.",
+                "evidence": [evidence[0]],
+            },
+            {
+                "statement": "Preserve the existing approval workflow for client-facing changes.",
+                "evidence": [evidence[1]],
+            },
+        ]},
         content_type="json",
         provider="provider",
         model="model",
