@@ -38,6 +38,7 @@ def test_cli_parser_registers_all_operator_actions():
         "adopt-review-message",
         "requeue-review-notification",
         "refresh-review-notification",
+        "repair-review-details",
         "run-once",
         "gmail-poll-once",
         "notion-preflight",
@@ -48,7 +49,10 @@ def test_cli_parser_registers_all_operator_actions():
             suffix = ["--project", "pid"]
         elif action == "adopt-review-message":
             suffix = ["--review-id", "a" * 64, "--message-id", "123"]
-        elif action in {"requeue-review-notification", "refresh-review-notification"}:
+        elif action in {
+            "requeue-review-notification", "refresh-review-notification",
+            "repair-review-details",
+        }:
             suffix = ["--review-id", "a" * 64]
         else:
             suffix = []

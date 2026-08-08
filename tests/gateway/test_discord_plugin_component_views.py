@@ -31,7 +31,7 @@ def test_persistent_plugin_view_keeps_free_text_action_last():
                 {"action": "reject", "label": "Reject", "style": "danger"},
                 {
                     "action": "instructions",
-                    "label": "Tell Hermes what to change",
+                    "label": "Other",
                     "style": "secondary",
                 },
             ],
@@ -41,10 +41,12 @@ def test_persistent_plugin_view_keeps_free_text_action_last():
     assert [button.label for button in view.children] == [
         "Approve all",
         "Reject",
-        "Tell Hermes what to change",
+        "Other",
     ]
     assert view.children[-1].custom_id == "client-knowledge-review:instructions"
-    asyncio.run(view.children[-1].callback(SimpleNamespace()))
+    response = SimpleNamespace(defer=AsyncMock(), is_done=lambda: False)
+    asyncio.run(view.children[-1].callback(SimpleNamespace(response=response)))
+    response.defer.assert_awaited_once_with(ephemeral=True, thinking=False)
     assert calls == ["instructions"]
 
 
@@ -98,7 +100,7 @@ async def test_discord_cold_connect_registers_discovered_persistent_view(monkeyp
             {"action": "reject", "label": "Reject", "style": "danger"},
             {
                 "action": "instructions",
-                "label": "Tell Hermes what to change",
+                "label": "Other",
                 "style": "secondary",
             },
         ],
@@ -121,7 +123,7 @@ async def test_discord_cold_connect_registers_discovered_persistent_view(monkeyp
     assert await adapter.connect() is True
     assert len(added_views) == 1
     assert [item.label for item in added_views[0].children][-1] == (
-        "Tell Hermes what to change"
+        "Other"
     )
     await adapter.disconnect()
 
@@ -207,7 +209,7 @@ async def test_standalone_structured_review_sends_parent_then_detail_thread():
                     {
                         "type": 2,
                         "style": 2,
-                        "label": "Tell Hermes what to change",
+                        "label": "Other",
                         "custom_id": "client-knowledge-review:instructions",
                     },
                 ],
@@ -238,8 +240,51 @@ async def test_standalone_structured_review_sends_parent_then_detail_thread():
     parent = calls[0][1]
     assert parent["embeds"][0]["title"] == "PID knowledge review"
     assert parent["components"][0]["components"][-1]["label"] == (
-        "Tell Hermes what to change"
+        "Other"
     )
     assert calls[1][0].endswith("/messages/400/threads")
     assert calls[2][1]["content"] == "detail one"
     assert calls[3][1]["content"] == "detail two"
+
+
+@pytest.mark.asyncio
+async def test_standalone_structured_review_retries_rate_limited_detail_message(monkeypatch):
+    chat_id = "210"
+    _remember_channel_is_forum(chat_id, False)
+    sessions, calls = _sessions(
+        [
+            [_resp(200, {"id": "410"})],
+            [
+                _resp(201, {"id": "411"}),
+                _resp(429, {"retry_after": 0.01}),
+                _resp(200, {"id": "412"}),
+            ],
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr("plugins.platforms.discord.adapter.asyncio.sleep", sleep)
+    metadata = {
+        "require_single_message": True,
+        "allowed_role_mentions": ["300"],
+        "strict_role_mentions": True,
+        "_discord_embed": {"title": "PID review"},
+        "_discord_components": [{"type": 1, "components": [{
+            "type": 2, "style": 2, "label": "Other",
+            "custom_id": "client-knowledge-review:instructions",
+        }]}],
+        "_discord_thread": {"name": "details", "messages": ["detail one"]},
+    }
+    with patch("aiohttp.ClientSession", side_effect=sessions):
+        result = await _standalone_send(
+            SimpleNamespace(token="bot-token", extra={}),
+            chat_id,
+            "<@&300> review",
+            metadata=metadata,
+        )
+    assert result["detail_state"] == "confirmed"
+    sleep.assert_awaited_once()
+    assert [
+        body["content"]
+        for url, body in calls
+        if "/channels/411/messages" in url and body
+    ] == ["detail one", "detail one"]

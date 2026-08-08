@@ -52,7 +52,7 @@ def register(ctx) -> None:
             {"action": "reject", "label": "Reject", "style": "danger"},
             {
                 "action": "instructions",
-                "label": "Tell Hermes what to change",
+                "label": "Other",
                 "style": "secondary",
             },
         ],

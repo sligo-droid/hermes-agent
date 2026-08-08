@@ -8,6 +8,8 @@ import inspect
 import json
 import re
 import socket
+import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping
@@ -44,30 +46,6 @@ from .store import IntakeStore, ReviewRevisionClaim
 class ReviewFailure(ValueError):
     pass
 
-
-_REASON_LABELS = {
-    "finding_grounding_mismatch": (
-        "Hermes corrected or added source-grounded findings, so a person must review the final wording."
-    ),
-    "outside_auto_publication_allowlist": (
-        "These changes are outside the narrow set Hermes may publish automatically."
-    ),
-    "high_impact_claim": "At least one proposed item could have a high project impact.",
-    "sensitive_claim": "At least one proposed item contains sensitive information.",
-    "unresolved_or_tentative_claim": (
-        "At least one proposed item is tentative or disputed."
-    ),
-    "confirmation_target_missing": (
-        "Hermes could not safely match a confirmation to existing knowledge."
-    ),
-    "confirmation_changes_truth": (
-        "The source would change existing knowledge rather than only confirm it."
-    ),
-    "human_instruction_revision": (
-        "Hermes prepared this revision from a reviewer's instructions. The revised "
-        "proposal still requires explicit approval."
-    ),
-}
 
 _ACTION_LABELS = {
     "add": "Add new knowledge",
@@ -123,7 +101,7 @@ def _review_components() -> list[dict[str, Any]]:
                 {
                     "type": 2,
                     "style": 2,
-                    "label": "Tell Hermes what to change",
+                    "label": "Other",
                     "custom_id": "client-knowledge-review:instructions",
                 },
             ],
@@ -251,11 +229,6 @@ def _safe_text(value: Any) -> str:
     text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
     text = text.replace("<@", "<@\u200b")
     return re.sub(r"([\\`*_{}\[\]()<>#+\-.!|~])", r"\\\1", text)
-
-
-def _safe_url(value: Any) -> str:
-    text = str(value or "").strip()
-    return text if re.fullmatch(r"https?://[^\s<>()[\]]{1,2000}", text) else ""
 
 
 def _notion_url(reference: str) -> str:
@@ -407,9 +380,6 @@ def _source_context(
     elif getattr(artifact, "occurred_at", None):
         date = datetime.fromtimestamp(float(artifact.occurred_at), timezone.utc).strftime("%Y-%m-%d")
         context.append(f"**Source date:** {date}")
-    gmail_url = _safe_url(getattr(artifact, "source_url", ""))
-    if gmail_url:
-        context.append(f"[Open original email]({gmail_url})")
     notion_url = _notion_url(notion_ref)
     if notion_url:
         context.append(f"[Open archived source in Notion]({notion_url})")
@@ -441,10 +411,6 @@ def _render_notification(
             f"{not_proposed} finding{'s' if not_proposed != 1 else ''} not proposed"
         )
     summary = " · ".join(summary_parts)
-    reason = _REASON_LABELS.get(
-        str(review.get("reason_code") or ""),
-        "Hermes needs a person to confirm what should become durable project knowledge.",
-    )
     headers = _header_values(extraction)
     subject = headers.get("Subject", "")
     title = (
@@ -475,15 +441,7 @@ def _render_notification(
         "description": f"🛡️ **Nothing has been published yet.**\n\n**{summary}**",
         "color": 0xF59E0B,
         "fields": [
-            {"name": "Why this needs review", "value": reason},
             {"name": "Source", "value": "\n".join(source)},
-            {
-                "name": "How to decide",
-                "value": (
-                    "Approve everything, reject it with a reason, or tell Hermes exactly "
-                    "which items to accept, reject, or reword."
-                ),
-            },
         ],
     }
     details = _render_detail_messages(proposal, interpretation)
@@ -1045,6 +1003,104 @@ def fetch_and_reconcile_notification(store: IntakeStore, review_id: str, message
     return reconcile_uncertain_notification(store, review_id, [candidate])
 
 
+def repair_review_details(
+    store: IntakeStore,
+    derived: DerivedStore,
+    review_id: str,
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> bool:
+    """Append only missing exact detail messages and confirm the existing thread."""
+    review = store.get_review(review_id)
+    if (
+        review is None
+        or review["state"] != "pending"
+        or review["notification_state"] != "confirmed"
+        or review.get("detail_state") not in {"pending", "uncertain"}
+        or not str(review.get("notification_message_id") or "").isdigit()
+        or not str(review.get("detail_thread_id") or "").isdigit()
+    ):
+        return False
+    proposal, interpretation, artifact, extraction, notion_ref = _load_review_material(
+        store=store, derived=derived, review=review
+    )
+    effective = dict(config or load_config() or {})
+    project = ProjectReviewConfig.from_config(effective, str(review["project_key"]))
+    content, digest, marker, _embed, details, detail_digest = _render_notification(
+        review, proposal, interpretation, artifact, extraction, project, notion_ref
+    )
+    if (
+        digest != str(review.get("notification_content_sha256") or "")
+        or marker != str(review.get("notification_marker") or "")
+        or detail_digest != str(review.get("detail_content_sha256") or "")
+    ):
+        raise ReviewFailure("review detail identity changed")
+    from tools.discord_tool import DiscordAPIError, _discord_request, _get_bot_token
+
+    token = _get_bot_token()
+    if not token:
+        raise ReviewFailure("Discord bot token is unavailable")
+    thread_id = str(review["detail_thread_id"])
+
+    def _fetch_contents() -> list[str]:
+        rows = _discord_request(
+            "GET", f"/channels/{thread_id}/messages", token, params={"limit": "100"}
+        )
+        return [
+            str(item.get("content") or "")
+            for item in (rows or [])
+            if isinstance(item, Mapping) and bool((item.get("author") or {}).get("bot"))
+        ]
+
+    remaining = Counter(details)
+    for existing in _fetch_contents():
+        if remaining[existing] > 0:
+            remaining[existing] -= 1
+    for detail in details:
+        if remaining[detail] <= 0:
+            continue
+        for attempt in range(3):
+            try:
+                _discord_request(
+                    "POST",
+                    f"/channels/{thread_id}/messages",
+                    token,
+                    body={
+                        "content": detail,
+                        "allowed_mentions": {
+                            "parse": [], "roles": [], "users": [], "replied_user": False,
+                        },
+                    },
+                )
+                remaining[detail] -= 1
+                break
+            except DiscordAPIError as exc:
+                if exc.status != 429 or attempt == 2:
+                    raise
+                try:
+                    retry_after = float((json.loads(exc.body) or {}).get("retry_after") or 1)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    retry_after = 1.0
+                time.sleep(max(0.05, min(retry_after, 5.0)))
+    observed = Counter(_fetch_contents())
+    if any(observed[item] < count for item, count in Counter(details).items()):
+        return False
+    store.record_review_notification(
+        review_id,
+        state="confirmed",
+        content_sha256=digest,
+        guild_id=project.guild_id,
+        channel_id=project.channel_id,
+        role_id=project.role_id,
+        marker=marker,
+        message_id=str(review["notification_message_id"]),
+        detail_state="confirmed",
+        detail_content_sha256=detail_digest,
+        detail_thread_id=thread_id,
+    )
+    return True
+
+
 def _member_role_ids(raw: Any) -> set[str]:
     member = getattr(raw, "user", None) or getattr(raw, "author", None)
     return {
@@ -1094,9 +1150,26 @@ def _interaction_project_matches(
 
 async def _ephemeral(interaction: Any, text: str) -> None:
     response = getattr(interaction, "response", None)
+    is_done = getattr(response, "is_done", None)
+    if callable(is_done) and is_done():
+        followup = getattr(interaction, "followup", None)
+        send = getattr(followup, "send", None)
+        if callable(send):
+            await send(text, ephemeral=True)
+        return
     send = getattr(response, "send_message", None)
     if callable(send):
         await send(text, ephemeral=True)
+
+
+async def _defer_ephemeral(interaction: Any) -> None:
+    response = getattr(interaction, "response", None)
+    is_done = getattr(response, "is_done", None)
+    if callable(is_done) and is_done():
+        return
+    defer = getattr(response, "defer", None)
+    if callable(defer):
+        await defer(ephemeral=True, thinking=False)
 
 
 async def handle_discord_review_interaction(
@@ -1107,6 +1180,7 @@ async def handle_discord_review_interaction(
     config: Mapping[str, Any] | None = None,
 ) -> None:
     """Resolve a persistent review button against durable message identity."""
+    await _defer_ephemeral(interaction)
     if action not in {"approve", "reject", "instructions"}:
         await _ephemeral(interaction, "This review action is not available.")
         return
@@ -1358,6 +1432,7 @@ __all__ = [
     "fetch_and_reconcile_notification",
     "handle_discord_review_interaction",
     "process_pending_review_revisions",
+    "repair_review_details",
     "reconcile_uncertain_notification",
     "run_notification_once",
     "send_pending_review_notifications",

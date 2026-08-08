@@ -19,6 +19,7 @@ from plugins.client_knowledge_gbrain.review import (
     fetch_and_reconcile_notification,
     handle_discord_review_interaction,
     process_pending_review_revisions,
+    repair_review_details,
     reconcile_uncertain_notification,
     send_pending_review_notifications,
 )
@@ -326,10 +327,11 @@ def test_human_rendering_shows_summary_sources_claims_and_evidence_without_inter
     assert "/client-knowledge" not in content
     assert "a" * 64 not in content.replace(marker, "")
     assert "finding_grounding_mismatch" not in str(embed)
-    assert "corrected or added source-grounded findings" in str(embed)
+    assert "Why this needs review" not in str(embed)
+    assert "How to decide" not in str(embed)
     assert "Alex Example" in str(embed)
     assert "PID weekly reporting" in str(embed)
-    assert "https://mail.google.com/mail/u/0/#all/synthetic-1" in str(embed)
+    assert "https://mail.google.com" not in str(embed)
     assert "https://www.notion.so/0123456789abcdef0123456789abcdef" in str(embed)
     joined = "\n".join(details)
     assert "Add new knowledge" in joined
@@ -351,6 +353,38 @@ def test_maximum_bounded_batch_preserves_every_claim_and_evidence():
         assert f"Synthetic requirement {index}" in joined
         assert f"Synthetic evidence quote {index}" in joined
     assert all(len(message) <= 1900 for message in details)
+
+
+def test_uncertain_detail_repair_appends_only_missing_exact_messages(monkeypatch):
+    store = _confirmed_store()
+    store.review.update({
+        "detail_state": "uncertain",
+        "detail_content_sha256": _rendered()[5],
+        "detail_thread_id": "401",
+        "notification_content_sha256": _rendered()[1],
+        "notification_marker": _rendered()[2],
+    })
+    details = _rendered()[4]
+    existing = details[:-1]
+    calls = []
+
+    def request(method, path, _token, params=None, body=None, timeout=15):
+        calls.append((method, path, body))
+        if method == "GET":
+            current = [*existing]
+            if any(item[0] == "POST" for item in calls):
+                current.append(details[-1])
+            return [{"content": item, "author": {"bot": True}} for item in current]
+        assert body["content"] == details[-1]
+        return {"id": "new"}
+
+    monkeypatch.setattr("tools.discord_tool._get_bot_token", lambda: "token")
+    monkeypatch.setattr("tools.discord_tool._discord_request", request)
+    assert repair_review_details(store, _Derived(), "a" * 64, config=CFG) is True
+    posts = [item for item in calls if item[0] == "POST"]
+    assert len(posts) == 1
+    assert posts[0][2]["content"] == details[-1]
+    assert store.review["detail_state"] == "confirmed"
 
 
 def test_timed_out_parent_remains_uncertain_and_no_match_never_retries():
@@ -516,6 +550,16 @@ def test_new_ux_reconciliation_requires_exact_embed_and_components():
 def _interaction(*, user_id="600", roles=(300,), message_id="400", guild="100", channel="200"):
     guild_obj = SimpleNamespace(id=int(guild), name="Synthetic Guild")
     channel_obj = SimpleNamespace(id=int(channel), guild=guild_obj, name="pid", parent=None)
+    response_state = {"done": False}
+
+    async def defer(**_kwargs):
+        response_state["done"] = True
+
+    response = SimpleNamespace(
+        defer=AsyncMock(side_effect=defer),
+        send_message=AsyncMock(),
+        is_done=lambda: response_state["done"],
+    )
     return SimpleNamespace(
         id="500",
         guild_id=guild,
@@ -528,7 +572,8 @@ def _interaction(*, user_id="600", roles=(300,), message_id="400", guild="100", 
         message=SimpleNamespace(id=message_id),
         guild=guild_obj,
         channel=channel_obj,
-        response=SimpleNamespace(send_message=AsyncMock()),
+        response=response,
+        followup=SimpleNamespace(send=AsyncMock()),
     )
 
 
@@ -561,6 +606,8 @@ def test_authorized_approve_is_idempotent_and_unauthorized_or_stale_controls_do_
     asyncio.run(handle_discord_review_interaction(interaction, "approve", store=store, config=CFG))
     assert store.review["state"] == "approved"
     assert len(store.decisions) == 1
+    interaction.response.defer.assert_awaited()
+    assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
     asyncio.run(handle_discord_review_interaction(interaction, "approve", store=store, config=CFG))
     assert len(store.decisions) == 1
 
@@ -568,7 +615,7 @@ def test_authorized_approve_is_idempotent_and_unauthorized_or_stale_controls_do_
     denied = _interaction(user_id="602", roles=())
     asyncio.run(handle_discord_review_interaction(denied, "approve", store=unauthorized, config=CFG))
     assert not unauthorized.decisions
-    assert denied.response.send_message.await_args.kwargs["ephemeral"] is True
+    assert denied.followup.send.await_args.kwargs["ephemeral"] is True
 
     stale = _confirmed_store()
     stale_interaction = _interaction(message_id="999")
@@ -1083,7 +1130,7 @@ def test_original_controls_are_stale_after_replacement_exists(tmp_path, monkeypa
         )
     )
     assert store.get_review(review_id)["state"] == "superseded"
-    assert "already been resolved" in interaction.response.send_message.await_args.args[0]
+    assert "already been resolved" in interaction.followup.send.await_args.args[0]
 
 
 def test_revision_failure_stays_retryable_and_operator_visible(tmp_path):

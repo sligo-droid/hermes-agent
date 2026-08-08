@@ -15535,6 +15535,12 @@ def _define_discord_view_classes() -> None:
         def _callback_for(self, action: str):
             async def _callback(interaction: "discord.Interaction") -> None:
                 try:
+                    response = getattr(interaction, "response", None)
+                    is_done = getattr(response, "is_done", None)
+                    if not (callable(is_done) and is_done()):
+                        defer = getattr(response, "defer", None)
+                        if callable(defer):
+                            await defer(ephemeral=True, thinking=False)
                     result = self.handler(interaction, action)
                     if inspect.isawaitable(result):
                         await result
@@ -15544,8 +15550,8 @@ def _define_discord_view_classes() -> None:
                         self.name,
                         action,
                     )
-                    response = getattr(interaction, "response", None)
-                    send = getattr(response, "send_message", None)
+                    followup = getattr(interaction, "followup", None)
+                    send = getattr(followup, "send", None)
                     if callable(send):
                         try:
                             await send(
@@ -17108,23 +17114,41 @@ async def _standalone_send(
                                 f"https://discord.com/api/v10/channels/{detail_thread_id}/messages"
                             )
                             for detail_message in detail_messages:
-                                async with detail_session.post(
-                                    detail_url,
-                                    headers=json_headers,
-                                    json={
-                                        "content": detail_message,
-                                        "allowed_mentions": {
-                                            "parse": [],
-                                            "roles": [],
-                                            "users": [],
-                                            "replied_user": False,
+                                delivered = False
+                                for attempt in range(3):
+                                    async with detail_session.post(
+                                        detail_url,
+                                        headers=json_headers,
+                                        json={
+                                            "content": detail_message,
+                                            "allowed_mentions": {
+                                                "parse": [],
+                                                "roles": [],
+                                                "users": [],
+                                                "replied_user": False,
+                                            },
                                         },
-                                    },
-                                    **_req_kw,
-                                ) as detail_resp:
-                                    if detail_resp.status not in {200, 201}:
-                                        detail_state = "uncertain"
-                                        break
+                                        **_req_kw,
+                                    ) as detail_resp:
+                                        if detail_resp.status in {200, 201}:
+                                            delivered = True
+                                            break
+                                        if detail_resp.status != 429 or attempt == 2:
+                                            break
+                                        retry_payload = await _standalone_read_json_limited(
+                                            detail_resp,
+                                            _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
+                                        )
+                                        try:
+                                            retry_after = float(
+                                                (retry_payload or {}).get("retry_after") or 1
+                                            )
+                                        except (TypeError, ValueError):
+                                            retry_after = 1.0
+                                    await asyncio.sleep(max(0.05, min(retry_after, 5.0)))
+                                if not delivered:
+                                    detail_state = "uncertain"
+                                    break
                 except Exception:
                     detail_state = "uncertain"
         result = {
