@@ -26,10 +26,11 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
    API, process-inspection, disposable verification, and read-only delegation
    capabilities.
 2. Deterministic mutation and operational requests enter the existing `action`
-   runtime directly. After explicit read-only constraints, observational task
-   shapes, greetings, and informational questions are recognized, unresolved
-   ambiguity also prefers `action`. Occasional false-positive action routing is
-   accepted to avoid the latency of a read-only turn followed by replay.
+   runtime directly. Explicit read-only constraints, observational task shapes,
+   greetings, informational questions, and unresolved ambiguity use `read_only`.
+   The read-only agent escalates transactionally when observation or surrounding
+   context confirms that mutation is required. This accepts more replay latency
+   to avoid mutable worktrees and action-tier reasoning on uncertain turns.
 3. Audits, research, verification, plans, and recommendations remain read-only
    even when they require tools. Explicit constraints such as "do not
    implement," "plan only," "recommend only," and "tell me what you would do"
@@ -82,11 +83,11 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
     tier. This is a model-route choice only: `discord_action_runtime` remains the
     separate authority for mutable worktrees, action prompts, zero tool delay,
     verification-on-stop, and action lifecycle behavior. The deterministic intake
-    classifier intentionally biases unresolved requests toward the action runtime;
-    read-only is reserved for recognized informational or observational work and
-    explicit no-action constraints. If read-only observation nevertheless reveals
-    that mutation is required, `escalate_to_action` ends the turn and the gateway
-    replays the original request through `discord_action` Sol/medium with its
+    classifier sends unresolved requests to read-only while retaining direct action
+    routing for recognized mutation, operational requests, and narrow referential
+    approvals in established action threads. If read-only observation reveals that
+    mutation is required, `escalate_to_action` ends the turn and the gateway
+    replays the original request through `discord_action` Sol/high with its
     isolated worktree and lifecycle policy. Explicit human requests for higher
     reasoning select `deep_review` Sol/high for that turn; ordinary risk wording
     does not automatically promote the route. Read-only orchestration should
@@ -96,9 +97,9 @@ Discord has one explicit per-turn capability: `read_only` or `action`.
 
 ## Consequences
 
-- Recognized answers and active observation use the low-latency read-only
-  runtime, while unresolved requests prefer direct action routing and avoid an
-  extra replay in the common likely-mutation case.
+- Recognized answers, active observation, and unresolved requests use the
+  low-latency read-only runtime. Ambiguous mutation requests pay one explicit
+  transactional replay after the agent confirms action is required.
 - Clear mutations retain their direct fast path and all existing action
   isolation, verification, lifecycle, and closeout semantics.
 - Explicit non-implementation constraints remain safe in long-running action

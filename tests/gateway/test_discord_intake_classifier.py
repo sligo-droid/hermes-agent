@@ -140,6 +140,10 @@ def test_explanation_status_and_short_factual_questions_remain_intake(adapter, m
         "support is investigating the incident",
         "change was approved yesterday",
         "yes do that",
+        (
+            "sorry for the thrash. Let’s say we don’t go with one API. "
+            "What were the limitations with the fifty individual states approach?"
+        ),
     ],
 )
 def test_heuristic_defers_ambiguous_messages(adapter, message):
@@ -174,19 +178,22 @@ def test_informational_action_questions_remain_read_only(adapter, message):
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_message_defaults_to_action_without_llm(
+async def test_ambiguous_message_defaults_to_read_only_without_llm(
     adapter,
 ):
     with patch("agent.auxiliary_client.call_llm") as call_llm:
-        result = await adapter._classify_discord_action_request(
-            "yes do that",
+        result = await adapter._classify_discord_runtime_mode(
+            (
+                "sorry for the thrash. Let’s say we don’t go with one API. "
+                "What were the limitations with the fifty individual states approach?"
+            ),
             context_lines=[
                 "channel: #deploys",
                 "alex: Please rerun the failed deploy.",
             ],
         )
 
-    assert result is True
+    assert result is RuntimeMode.READ_ONLY
     call_llm.assert_not_called()
 
 

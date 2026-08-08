@@ -4104,12 +4104,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return RuntimeMode.READ_ONLY
         if heuristic is True or force_action:
             return RuntimeMode.ACTION
-        # Unresolved ambiguity prefers the action runtime. Explicit read-only
-        # constraints, observational task shapes, greetings, and informational
-        # questions have already returned READ_ONLY above. This bias avoids a
-        # second model call for likely work requests while keeping the safe
-        # replay path available when read-only observation discovers mutation.
-        return RuntimeMode.ACTION
+        # Unresolved ambiguity starts read-only. The read-only agent can answer
+        # directly or request a transactional action replay after it confirms
+        # that mutation is required. This accepts more escalation hops in return
+        # for avoiding mutable worktrees and action-tier reasoning on uncertain
+        # conversational turns.
+        return RuntimeMode.READ_ONLY
 
     async def _classify_discord_action_request(
         self,

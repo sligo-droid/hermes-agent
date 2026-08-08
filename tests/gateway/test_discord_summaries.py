@@ -2928,9 +2928,26 @@ async def test_tagged_thread_question_gets_direct_answer_prompt(adapter, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_existing_action_thread_exact_direct_question_keeps_summary_and_sets_false_intent(
+@pytest.mark.parametrize(
+    ("message_id", "content"),
+    [
+        (
+            1527747538797465641,
+            "<@999> Without building anything, can you give me some concrete "
+            'examples of the sort of items in the "include only" list?',
+        ),
+        (
+            1535689113758605364,
+            "<@999> sorry for the thrash. Let’s say we don’t go with one API. "
+            "What were the limitations with the fifty individual states approach?",
+        ),
+    ],
+)
+async def test_existing_action_thread_question_keeps_summary_and_uses_read_only(
     adapter,
     monkeypatch,
+    message_id,
+    content,
 ):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     parent = FakeTextChannel(channel_id=100)
@@ -2948,18 +2965,15 @@ async def test_existing_action_thread_exact_direct_question_keeps_summary_and_se
         _make_message(
             adapter,
             channel=thread,
-            message_id=1527747538797465641,
-            content=(
-                "<@999> Without building anything, can you give me some concrete "
-                'examples of the sort of items in the "include only" list?'
-            ),
+            message_id=message_id,
+            content=content,
         )
     )
 
     adapter.initialize_feature_summary.assert_not_awaited()
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.message_id == "1527747538797465641"
+    assert event.message_id == str(message_id)
     assert event.feature_summary is feature_summary
     assert event.discord_runtime_mode == "read_only"
     assert event.discord_action_request_intent is None
