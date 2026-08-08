@@ -88,19 +88,19 @@ def _review_components() -> list[dict[str, Any]]:
                 {
                     "type": 2,
                     "style": 3,
-                    "label": "✅",
+                    "label": "Approve all",
                     "custom_id": "client-knowledge-review:approve",
                 },
                 {
                     "type": 2,
                     "style": 4,
-                    "label": "❌",
+                    "label": "Reject",
                     "custom_id": "client-knowledge-review:reject",
                 },
                 {
                     "type": 2,
                     "style": 2,
-                    "label": "✍️",
+                    "label": "✍️ Other",
                     "custom_id": "client-knowledge-review:instructions",
                 },
             ],
@@ -387,13 +387,7 @@ def _render_notification(
         )
     summary = " · ".join(summary_parts)
     headers = _header_values(extraction)
-    subject = headers.get("Subject", "")
-    title = (
-        f"{config.project_label}: {subject[:180]}"
-        if subject and len(subject) <= 180
-        else f"{config.project_label} knowledge review"
-    )[:256]
-    marker = f"[ck-review:{review['review_id']}:{str(review['proposal_sha256'])[:16]}:ux3]"
+    marker = f"[ck-review:{review['review_id']}:{str(review['proposal_sha256'])[:16]}:ux4]"
     content = f"<@&{config.role_id}>"
     if len(content) > _MAX_PARENT_CONTENT:
         raise ReviewFailure("review notification exceeds the single-message limit")
@@ -404,11 +398,20 @@ def _render_notification(
     description = f"**{summary}**"
     if notion_url:
         description += f"\n[Source in Notion]({notion_url})"
+    source = []
+    if headers.get("From"):
+        source.append(f"**Email sender:** {headers['From']}")
+    if headers.get("Subject"):
+        source.append(f"**Email subject:** {headers['Subject']}")
+    if headers.get("Date"):
+        source.append(f"**Email date:** {headers['Date']}")
     embed = {
-        "title": title,
+        "title": "Request to Learn",
         "description": description,
         "color": 0xF59E0B,
     }
+    if source:
+        embed["fields"] = [{"name": "Source", "value": "\n".join(source)}]
     details = _render_detail_messages(proposal, interpretation)
     detail_digest = hashlib.sha256(canonical_json(details)).hexdigest()
     digest = _parent_payload_digest(content, embed, _review_components())
@@ -894,8 +897,8 @@ def reconcile_uncertain_notification(
     if review is None or review["notification_state"] != "uncertain":
         return False
     marker = str(review["notification_marker"] or "")
-    compact = marker.endswith(":ux3]")
-    native = marker.endswith((":ux2]", ":ux3]"))
+    compact = marker.endswith((":ux3]", ":ux4]"))
+    native = marker.endswith((":ux2]", ":ux3]", ":ux4]"))
     matches = [
         item
         for item in messages
