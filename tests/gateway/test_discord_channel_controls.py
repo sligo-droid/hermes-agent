@@ -161,6 +161,21 @@ async def test_non_ignored_channel_processes_normally(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_message_event_preserves_source_creation_timestamp(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    created_at = datetime(2026, 8, 8, 12, 34, 56, tzinfo=timezone.utc)
+    message = make_message(channel=FakeTextChannel(channel_id=700), content="hello")
+    message.created_at = created_at
+
+    await adapter._handle_message(message)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.timestamp == created_at
+
+
+@pytest.mark.asyncio
 async def test_reply_to_bot_counts_as_mention(adapter, monkeypatch):
     """Replying to the bot should pass the same gate as tagging it."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")

@@ -35,6 +35,7 @@ VALID_STAGES = frozenset(
         "raw_preserved",
         "notion_archived",
         "extracted",
+        "synthesized",
         "interpreted",
         "assimilated",
         "honcho_projected",

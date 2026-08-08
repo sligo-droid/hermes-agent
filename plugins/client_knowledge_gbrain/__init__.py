@@ -24,6 +24,13 @@ async def _handle_review_component(interaction, action):
     await handle_discord_review_interaction(interaction, action)
 
 
+async def _handle_legacy_review_component(interaction, _action):
+    """Keep historical persistent buttons restart-safe without reviving legacy writes."""
+    from plugins.client_knowledge_gbrain.review import handle_legacy_discord_review_interaction
+
+    await handle_legacy_discord_review_interaction(interaction)
+
+
 def register(ctx) -> None:
     """Register the two bounded read-only tools and operator-only controls."""
     ctx.register_tool(
@@ -46,9 +53,9 @@ def register(ctx) -> None:
     )
     ctx.register_hook("pre_gateway_dispatch", _capture_review_text)
     ctx.register_discord_component_view(
-        name="client-knowledge-review",
+        name="client-knowledge-review-item",
         components=[
-            {"action": "approve", "label": "Approve all", "style": "success"},
+            {"action": "approve", "label": "Approve", "style": "success"},
             {"action": "reject", "label": "Reject", "style": "danger"},
             {
                 "action": "instructions",
@@ -58,20 +65,23 @@ def register(ctx) -> None:
         ],
         handler=_handle_review_component,
     )
-    ctx.register_auxiliary_task(
-        key="client_knowledge_interpret",
-        display_name="Client knowledge interpretation",
-        description="Interpret a validated client-knowledge artifact.",
-        defaults={
-            "model_tier": "advanced",
-            "required_model_tier": "advanced",
-            "configurable": False,
-        },
+    ctx.register_discord_component_view(
+        name="client-knowledge-review",
+        components=[
+            {"action": "approve", "label": "Approve", "style": "success"},
+            {"action": "reject", "label": "Reject", "style": "danger"},
+            {
+                "action": "instructions",
+                "label": "✍️ Other",
+                "style": "secondary",
+            },
+        ],
+        handler=_handle_legacy_review_component,
     )
     ctx.register_auxiliary_task(
-        key="client_knowledge_assimilate",
-        display_name="Client knowledge assimilation",
-        description="Assimilate validated interpretation into canonical knowledge.",
+        key="client_knowledge_synthesize",
+        display_name="Client knowledge synthesis",
+        description="Synthesize durable client learnings with exact evidence.",
         defaults={
             "model_tier": "advanced",
             "required_model_tier": "advanced",

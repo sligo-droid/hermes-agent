@@ -88,7 +88,14 @@ class DerivedStore:
             raise ValueError("derived store identity is invalid")
 
     def path_for(self, kind: str, object_id: str) -> tuple[str, Path]:
-        if kind not in {"extractions", "envelopes", "interpretations", "assimilations"}:
+        if kind not in {
+            "extractions",
+            "envelopes",
+            "interpretations",
+            "assimilations",
+            "syntheses",
+            "synthesis-item-revisions",
+        }:
             raise ValueError("derived object kind is invalid")
         if len(object_id) != 64 or any(ch not in "0123456789abcdef" for ch in object_id):
             raise ValueError("derived object identity is invalid")

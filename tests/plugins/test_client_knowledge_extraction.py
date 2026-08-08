@@ -94,7 +94,7 @@ def test_email_alternative_html_sanitization_redaction_and_unsupported_pdf(tmp_p
     assert value["unsupported_attachments"][0]["reason_code"] == "unsupported_pdf_v1"
     receipt = store.get_completed_stage_receipt(parent.artifact_id, "extracted")
     assert receipt["receipt_id"] == f"extraction:{extraction_id}"
-    assert store.get_job(store.ensure_job(parent.artifact_id, "interpreted"))["status"] == "queued"
+    assert store.get_job(store.ensure_job(parent.artifact_id, "synthesized"))["status"] == "queued"
 
 
 def test_plain_part_wins_over_html_and_identity_is_versioned(tmp_path):
