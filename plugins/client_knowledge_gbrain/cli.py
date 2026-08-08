@@ -66,6 +66,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     refresh_review.add_argument("--review-id", required=True)
     refresh_review.add_argument("--db-path", default="")
 
+    repair_details = subs.add_parser(
+        "repair-review-details",
+        help="Append missing exact messages to one uncertain review detail thread",
+    )
+    repair_details.add_argument("--review-id", required=True)
+    repair_details.add_argument("--db-path", default="")
+
     honcho = subs.add_parser(
         "reconcile-honcho", help="Adopt deterministic Honcho projection markers"
     )
@@ -246,6 +253,16 @@ def client_knowledge_command(args: argparse.Namespace) -> int:
                 raise ValueError("review_id must be a canonical opaque id")
             changed = store.refresh_review_notification(review_id)
             print(json.dumps({"review_id": review_id, "refreshed": changed}, sort_keys=True))
+            return 0 if changed else 1
+        if action == "repair-review-details":
+            from .derived import DerivedStore
+            from .review import repair_review_details
+
+            review_id = str(args.review_id or "").strip().lower()
+            if len(review_id) != 64 or any(ch not in "0123456789abcdef" for ch in review_id):
+                raise ValueError("review_id must be a canonical opaque id")
+            changed = repair_review_details(store, DerivedStore(), review_id)
+            print(json.dumps({"review_id": review_id, "repaired": changed}, sort_keys=True))
             return 0 if changed else 1
         if action == "reconcile-honcho":
             from hermes_cli.config import load_config
