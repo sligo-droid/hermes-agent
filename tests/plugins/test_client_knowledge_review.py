@@ -319,18 +319,27 @@ def _rendered(count=6):
     )
 
 
-def test_human_rendering_shows_summary_sources_claims_and_evidence_without_internal_syntax():
+def test_human_rendering_is_compact_and_keeps_full_details_out_of_parent():
     content, _digest, marker, embed, details, _detail_digest = _rendered()
-    assert "PID: PID weekly reporting" in content
-    assert "Nothing has been published yet" in content
-    assert "3 proposed additions · 3 findings not proposed" in content
+    assert content == "<@&300>"
+    assert "Nothing has been published yet" not in content
+    assert marker not in content
+    assert embed == {
+        "title": "PID: PID weekly reporting",
+        "description": (
+            "**3 proposed additions · 3 findings not proposed**\n"
+            "[Source in Notion](https://www.notion.so/0123456789abcdef0123456789abcdef)"
+        ),
+        "color": 0xF59E0B,
+    }
     assert "/client-knowledge" not in content
-    assert "a" * 64 not in content.replace(marker, "")
+    assert "a" * 64 not in content
     assert "finding_grounding_mismatch" not in str(embed)
     assert "Why this needs review" not in str(embed)
     assert "How to decide" not in str(embed)
-    assert "Alex Example" in str(embed)
-    assert "PID weekly reporting" in str(embed)
+    assert "Alex Example" not in str(embed)
+    assert "Email sender" not in str(embed)
+    assert "Email date" not in str(embed)
     assert "https://mail.google.com" not in str(embed)
     assert "https://www.notion.so/0123456789abcdef0123456789abcdef" in str(embed)
     joined = "\n".join(details)
@@ -545,6 +554,39 @@ def test_new_ux_reconciliation_requires_exact_embed_and_components():
             "allowed_role_mentions": ["300"],
         }],
     ) is False
+
+
+def test_compact_ux_reconciliation_does_not_require_visible_marker():
+    store = _Store()
+    content, digest, marker, embed, _details, _detail_digest = _rendered()
+    assert marker.endswith(":ux3]")
+    assert marker not in content
+    store.record_review_notification(
+        "a" * 64,
+        state="uncertain",
+        content_sha256=digest,
+        guild_id="100",
+        channel_id="200",
+        role_id="300",
+        marker=marker,
+    )
+    from plugins.client_knowledge_gbrain.review import _parent_payload_digest, _review_components
+
+    assert reconcile_uncertain_notification(
+        store,
+        "a" * 64,
+        [{
+            "guild_id": "100",
+            "channel_id": "200",
+            "content": content,
+            "parent_payload_sha256": _parent_payload_digest(
+                content, embed, _review_components()
+            ),
+            "message_id": "400",
+            "author_is_bot": True,
+            "allowed_role_mentions": ["300"],
+        }],
+    ) is True
 
 
 def _interaction(*, user_id="600", roles=(300,), message_id="400", guild="100", channel="200"):
@@ -1209,18 +1251,37 @@ def test_revision_failure_stays_retryable_and_operator_visible(tmp_path):
     ) is not None
 
 
-def test_refresh_can_replace_incomplete_native_card_but_not_healthy_native_card(tmp_path):
+def test_refresh_can_replace_previous_native_card(tmp_path):
     store, review_id, _artifact_id = _durable_review_store(
         tmp_path / "refresh" / "intake.db"
     )
-    assert store.refresh_review_notification(review_id) is False
-    with store._write() as conn:
-        conn.execute(
-            "UPDATE client_knowledge_reviews SET detail_state='uncertain' WHERE review_id=?",
-            (review_id,),
-        )
     assert store.refresh_review_notification(review_id) is True
     review = store.get_review(review_id)
     assert review["state"] == "pending"
     assert review["notification_state"] == "pending"
     assert review["notification_message_id"] is None
+
+
+def test_refresh_does_not_replace_healthy_compact_native_card(tmp_path):
+    store, review_id, _artifact_id = _durable_review_store(
+        tmp_path / "compact-refresh" / "intake.db"
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_reviews SET notification_marker=? WHERE review_id=?",
+            ("[ck-review:synthetic:ux3]", review_id),
+        )
+    assert store.refresh_review_notification(review_id) is False
+
+
+def test_refresh_can_replace_incomplete_compact_native_card(tmp_path):
+    store, review_id, _artifact_id = _durable_review_store(
+        tmp_path / "compact-incomplete-refresh" / "intake.db"
+    )
+    with store._write() as conn:
+        conn.execute(
+            "UPDATE client_knowledge_reviews SET notification_marker=?, detail_state='uncertain' "
+            "WHERE review_id=?",
+            ("[ck-review:synthetic:ux3]", review_id),
+        )
+    assert store.refresh_review_notification(review_id) is True

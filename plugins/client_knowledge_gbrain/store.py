@@ -2578,9 +2578,9 @@ class IntakeStore:
     def refresh_review_notification(self, review_id: str) -> bool:
         """Archive one pending card and queue a replacement when safe.
 
-        A legacy card is always refreshable. A native card is refreshable only
-        when its detail thread was not fully confirmed; a healthy native card
-        is never duplicated.
+        An older card is always refreshable. The current native card is
+        refreshable only when its detail thread was not fully confirmed; a
+        healthy current card is never duplicated.
         """
         now = time.time()
         with self._write() as conn:
@@ -2594,7 +2594,7 @@ class IntakeStore:
                 or review["notification_state"] != "confirmed"
                 or not review["notification_message_id"]
                 or (
-                    str(review["notification_marker"] or "").endswith(":ux2]")
+                    str(review["notification_marker"] or "").endswith(":ux3]")
                     and review["detail_state"] == "confirmed"
                     and review["detail_thread_id"]
                 )
