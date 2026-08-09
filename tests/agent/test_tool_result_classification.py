@@ -77,6 +77,9 @@ def test_coding_worker_mutation_promotes_parent_visual_gate_and_order():
         _turn_runtime_stats={"tool_calls": 3},
         _turn_mutation_generation=0,
         _turn_mutation_boundary=0,
+        _visual_qa_tool_calls=3,
+        _visual_qa_total_calls=4,
+        _visual_qa_followup_turns=1,
         _runtime_mode="action",
         _current_task_id="worker-visual-mutation",
         visual_qa_config={"mode": "enforce_explicit"},
@@ -98,6 +101,9 @@ def test_coding_worker_mutation_promotes_parent_visual_gate_and_order():
     assert agent.visual_qa_requirement["level"] == "surface"
     assert agent._turn_mutation_generation == 1
     assert agent._turn_mutation_boundary == 4
+    assert agent._visual_qa_tool_calls == 0
+    assert agent._visual_qa_total_calls == 0
+    assert agent._visual_qa_followup_turns == 0
 
 
 def test_side_effect_classification_keeps_session_mutations():

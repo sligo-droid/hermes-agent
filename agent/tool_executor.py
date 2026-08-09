@@ -67,8 +67,8 @@ _CLOSEOUT_FINALIZATION_REQUIRED = (
     "return one concise final response from the recorded evidence."
 )
 _CLOSEOUT_LOG_BUDGET = BudgetConfig(preview_size=0)
-_MAX_VISUAL_QA_EXECUTIONS_PER_TURN = 3
-_MAX_VISUAL_QA_CALLS_PER_TURN = 4
+_MAX_VISUAL_QA_EXECUTIONS_PER_GENERATION = 3
+_MAX_VISUAL_QA_CALLS_PER_GENERATION = 4
 _PENDING_CLOSEOUT_VISUAL_TOOLS = frozenset(
     {
         "visual_qa",
@@ -104,8 +104,8 @@ def _reserve_visual_qa_call(agent: Any, function_name: str) -> bool:
         int(getattr(agent, "_visual_qa_total_calls", 0) or 0),
     )
     if (
-        execution_count >= _MAX_VISUAL_QA_EXECUTIONS_PER_TURN
-        or total_count >= _MAX_VISUAL_QA_CALLS_PER_TURN
+        execution_count >= _MAX_VISUAL_QA_EXECUTIONS_PER_GENERATION
+        or total_count >= _MAX_VISUAL_QA_CALLS_PER_GENERATION
     ):
         return False
     agent._visual_qa_tool_calls = execution_count + 1
@@ -142,7 +142,8 @@ def _append_visual_qa_limit_tool_result(
             "visual_qa",
             (
                 "[Tool execution skipped — visual_qa permits three executable calls plus one "
-                "malformed-contract repair per turn. Continue from the recorded result.]"
+                "malformed-contract repair for the current rendered code generation. "
+                "Continue from the recorded result.]"
             ),
             tool_call.id,
             effect_disposition="none",
@@ -1165,7 +1166,7 @@ def _record_visual_qa_edit_order(
     task_id: str = "",
     tool_runtime_recorded: bool = False,
 ) -> None:
-    """Remember the last landed edit's tool order for receipt freshness."""
+    """Start a fresh bounded visual-QA generation after every landed edit."""
     try:
         from agent.tool_result_classification import file_mutation_result_landed
 
@@ -1178,6 +1179,13 @@ def _record_visual_qa_edit_order(
         mutation_generation = int(getattr(agent, "_turn_mutation_generation", 0) or 0) + 1
         agent._turn_mutation_generation = mutation_generation
         agent._turn_mutation_boundary = mutation_boundary
+        # Visual receipts and retry budgets belong to one rendered code
+        # generation.  A later edit makes earlier checks stale, so it must also
+        # restore the bounded execution and closeout-followup opportunities for
+        # the new page state.
+        agent._visual_qa_tool_calls = 0
+        agent._visual_qa_total_calls = 0
+        agent._visual_qa_followup_turns = 0
         if isinstance(stats, dict):
             stats["mutation_generation"] = mutation_generation
             stats["mutation_boundary"] = mutation_boundary

@@ -229,6 +229,25 @@ def test_orchestrated_contract_preserves_rich_semantics_only_transiently():
     assert "issue-attention-graph" not in serialized
 
 
+def test_orchestrated_contract_normalizes_provider_limit_overages():
+    raw = _incident_contract()
+    raw["assertions"][0]["expectation"] = "balanced layout " * 30
+    raw["assertions"].extend(
+        {
+            "kind": "text_present",
+            "text": f"requested label {index}",
+        }
+        for index in range(6)
+    )
+
+    diagnosed = diagnose_orchestrated_visual_contract(raw, max_assertions=6)
+
+    assert diagnosed["reason_code"] == ""
+    assert len(diagnosed["contract"]["assertions"]) == 6
+    assert diagnosed["contract"]["assertions"][0]["kind"] == "screenshot_appearance"
+    assert 200 <= len(diagnosed["contract"]["assertions"][0]["expectation"]) <= 240
+
+
 def test_orchestrated_contract_omits_diagnostics_without_host_cursor():
     raw = _incident_contract()
     raw["assertions"].append({"kind": "no_new_diagnostics"})
