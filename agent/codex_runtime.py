@@ -231,11 +231,14 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
-def _close_codex_app_server_session(agent) -> None:
+def _close_codex_app_server_session(agent) -> str:
     session = getattr(agent, "_codex_session", None)
+    pending_steer = ""
     if session is not None:
         try:
-            session.close()
+            closed_pending = session.close()
+            if isinstance(closed_pending, str):
+                pending_steer = closed_pending
         except Exception:
             pass
         try:
@@ -257,6 +260,7 @@ def _close_codex_app_server_session(agent) -> None:
     agent._codex_worker_home = None
     agent._codex_worker_credential_id = None
     agent._codex_worker_home_lease = None
+    return pending_steer
 
 
 def _record_codex_app_server_runtime(agent, duration: float) -> None:
@@ -863,6 +867,8 @@ def run_codex_app_server_turn(
 
     while api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0:
         if agent._interrupt_requested:
+            interrupt_message = agent._interrupt_message
+            agent.clear_interrupt()
             return {
                 "final_response": "",
                 "messages": messages,
@@ -870,8 +876,8 @@ def run_codex_app_server_turn(
                 "completed": False,
                 "partial": True,
                 "interrupted": True,
-                "interrupt_message": agent._interrupt_message,
-                "error": agent._interrupt_message or "interrupted",
+                "interrupt_message": interrupt_message,
+                "error": interrupt_message or "interrupted",
             }
 
         api_call_count += 1
@@ -881,6 +887,29 @@ def run_codex_app_server_turn(
             break
 
         _ensure_codex_session()
+        agent._codex_session.prepare_turn_steering()
+        if agent._interrupt_requested:
+            interrupt_message = agent._interrupt_message
+            agent.clear_interrupt()
+            return {
+                "final_response": "",
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "partial": True,
+                "interrupted": True,
+                "interrupt_message": interrupt_message,
+                "error": interrupt_message or "interrupted",
+            }
+
+        take_startup_steer = getattr(agent, "_take_pending_steer", None)
+        startup_steer = (
+            take_startup_steer() if callable(take_startup_steer) else None
+        )
+        if isinstance(startup_steer, str) and startup_steer.strip():
+            from agent.prompt_builder import format_steer_marker
+
+            codex_input = f"{codex_input}\n\n{format_steer_marker(startup_steer)}"
 
         codex_api_start = time.perf_counter()
         runtime_span = start_agent_runtime_span(
@@ -910,7 +939,7 @@ def run_codex_app_server_turn(
             logger.exception("codex app-server turn failed")
             # Crash -> unconditionally drop the session so the next turn
             # respawns from scratch instead of reusing a dead client.
-            _close_codex_app_server_session(agent)
+            pending_steer = _close_codex_app_server_session(agent)
             final_response = (
                 f"Codex app-server turn failed: {exc}. "
                 f"Fall back to default runtime with `/codex-runtime auto`."
@@ -930,6 +959,7 @@ def run_codex_app_server_turn(
                 "completed": False,
                 "partial": True,
                 "error": str(exc),
+                "pending_steer": pending_steer or None,
             }
         try:
             from agent.codex_worker_auth import sync_codex_worker_home
@@ -965,7 +995,13 @@ def run_codex_app_server_turn(
                 "codex app-server session retired (turn error: %s)",
                 turn.error,
             )
-            _close_codex_app_server_session(agent)
+            closed_pending = _close_codex_app_server_session(agent)
+            if closed_pending:
+                turn.pending_steer = (
+                    f"{turn.pending_steer}\n{closed_pending}"
+                    if turn.pending_steer
+                    else closed_pending
+                )
 
 
         if getattr(turn, "timed_out", False):
@@ -987,6 +1023,12 @@ def run_codex_app_server_turn(
                 max_attempts=agent.max_iterations,
                 error=last_timeout_error,
             )
+            retry_steer = getattr(turn, "pending_steer", "") or ""
+            if retry_steer:
+                from agent.prompt_builder import format_steer_marker
+
+                codex_input = f"{codex_input}\n\n{format_steer_marker(retry_steer)}"
+                turn.pending_steer = ""
             continue
 
         break
@@ -1013,6 +1055,7 @@ def run_codex_app_server_turn(
             "completed": False,
             "partial": True,
             "error": last_timeout_error or "Codex app-server turn timed out",
+            "pending_steer": getattr(turn, "pending_steer", "") or None,
         }
 
     final_response = turn.final_text
@@ -1085,15 +1128,29 @@ def run_codex_app_server_turn(
     agent._cleanup_task_resources(effective_task_id)
     agent._persist_session(messages, conversation_history)
 
+    pending_steer = getattr(turn, "pending_steer", "") or ""
+    close_and_take = getattr(agent, "_close_steer_intake_and_take", None)
+    late_steer = close_and_take() if callable(close_and_take) else None
+    if isinstance(late_steer, str) and late_steer:
+        pending_steer = (
+            f"{pending_steer}\n{late_steer}" if pending_steer else late_steer
+        )
+    interrupted = bool(turn.interrupted or agent._interrupt_requested)
+    interrupt_message = agent._interrupt_message if agent._interrupt_requested else None
+    agent.clear_interrupt()
+
     return {
         "final_response": final_response,
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
         "partial": turn.interrupted or turn.error is not None,
+        "interrupted": interrupted,
+        "interrupt_message": interrupt_message,
         "error": turn.error,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        "pending_steer": pending_steer or None,
         "agent_persisted": True,
         **usage_result,
     }

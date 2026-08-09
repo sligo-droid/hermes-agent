@@ -8,6 +8,7 @@ and prompt-cache integrity.
 from __future__ import annotations
 
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -239,12 +240,57 @@ class TestSteerClearedOnInterrupt:
         agent.clear_interrupt()
         assert agent._pending_steer is None
 
-
-class TestUnsupportedSteering:
-    def test_codex_app_server_style_turn_rejects_live_steer(self):
+    def test_hard_interrupt_reaches_codex_app_server_session(self):
         agent = _bare_agent()
-        agent._open_steer_intake(supported=False)
-        assert agent.steer("cannot be consumed") is False
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = MagicMock()
+        agent._interrupt_requested = False
+        agent._interrupt_message = None
+        agent._interrupt_thread_signal_pending = False
+        agent._execution_thread_id = None
+        agent._tool_worker_threads = None
+        agent._tool_worker_threads_lock = None
+        agent._active_children_lock = threading.Lock()
+        agent._active_children = []
+        agent.quiet_mode = True
+
+        agent.interrupt("stop")
+
+        agent._codex_session.request_interrupt.assert_called_once_with()
+
+
+class TestCodexAppServerSteering:
+    def test_codex_app_server_turn_delegates_live_steer_to_session(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = MagicMock()
+        agent._codex_session.steer.return_value = True
+
+        assert agent.steer("focus on the worker") is True
+        agent._codex_session.steer.assert_called_once_with("focus on the worker")
+        assert agent._pending_steer is None
+
+    def test_codex_startup_falls_back_to_hermes_turn_buffer(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = MagicMock()
+        agent._codex_session.steer.return_value = False
+        agent._codex_session.steer_state.return_value = "closed"
+
+        assert agent.steer("include the read-only context") is True
+        assert agent.steer_state() == "open"
+        assert agent._pending_steer == "include the read-only context"
+
+    def test_codex_app_server_closed_turn_rejects_delivery_time_steer(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = MagicMock()
+        agent._codex_session.steer.return_value = False
+        agent._codex_session.steer_state.return_value = "closed"
+        agent._close_steer_intake_and_take()
+
+        assert agent.steer("start another task") is False
+        assert agent.steer_state() == "closed"
         assert agent._pending_steer is None
 
 

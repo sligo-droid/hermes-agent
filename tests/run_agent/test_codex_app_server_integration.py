@@ -133,6 +133,67 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_interrupt_during_first_session_creation_stops_before_turn(self, monkeypatch):
+        original_init = CodexAppServerSession.__init__
+        run_turn = MagicMock()
+        agent = None
+
+        def interrupting_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            agent.interrupt("stop during startup")
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", interrupting_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", run_turn)
+        agent = _make_codex_agent()
+
+        result = agent.run_conversation("start work")
+
+        assert result["interrupted"] is True
+        assert result["interrupt_message"] == "stop during startup"
+        assert agent._interrupt_requested is False
+        run_turn.assert_not_called()
+
+    def test_hard_interrupted_turn_clears_before_followup(self, monkeypatch):
+        calls = {"count": 0}
+        agent = None
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                agent._interrupt_requested = True
+                agent._interrupt_message = "stop"
+                return TurnResult(
+                    final_text="",
+                    interrupted=True,
+                    turn_id="turn-interrupted",
+                    thread_id="thread-stub-1",
+                )
+            return TurnResult(
+                final_text="follow-up completed",
+                projected_messages=[
+                    {"role": "assistant", "content": "follow-up completed"}
+                ],
+                turn_id="turn-followup",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        )
+        agent = _make_codex_agent()
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            interrupted = agent.run_conversation("start work")
+            followup = agent.run_conversation("what is the status?")
+
+        assert interrupted["interrupted"] is True
+        assert interrupted["interrupt_message"] == "stop"
+        assert agent._interrupt_requested is False
+        assert followup["completed"] is True
+        assert followup["final_response"] == "follow-up completed"
+        assert calls["count"] == 2
+
     def test_read_only_turn_does_not_start_mutating_codex_runtime(
         self, monkeypatch, tmp_path
     ):
@@ -505,6 +566,7 @@ class TestRunConversationCodexPath:
                     thread_id="thread-timeout",
                     timed_out=True,
                     should_retire=True,
+                    pending_steer="include the read-only context",
                 )
             return TurnResult(
                 final_text="done after retry",
@@ -540,6 +602,7 @@ class TestRunConversationCodexPath:
         assert calls[0][1]["turn_timeout"] == 12.0
         assert "timeout is not a signal" in calls[1][0]
         assert "finish the task" in calls[1][0]
+        assert "include the read-only context" in calls[1][0]
 
     def test_repeated_timeout_stops_at_iteration_budget(self, monkeypatch):
         def timed_out_turn(self, user_input: str, **kwargs):
@@ -553,6 +616,7 @@ class TestRunConversationCodexPath:
                 thread_id="thread-timeout",
                 timed_out=True,
                 should_retire=True,
+                pending_steer="start the manual run",
             )
 
         monkeypatch.setattr(CodexAppServerSession, "ensure_started",
@@ -570,6 +634,7 @@ class TestRunConversationCodexPath:
         assert result["partial"] is True
         assert result["api_calls"] == 1
         assert "turn budget (1/1)" in result["final_response"]
+        assert result["pending_steer"] == "start the manual run"
 
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures

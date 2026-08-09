@@ -2792,6 +2792,17 @@ class AIAgent:
             if _lock is not None:
                 with _lock:
                     self._pending_steer = None
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            session = getattr(self, "_codex_session", None)
+            request_session_interrupt = getattr(session, "request_interrupt", None)
+            if callable(request_session_interrupt):
+                try:
+                    request_session_interrupt()
+                except Exception:
+                    logger.debug(
+                        "Failed to interrupt active Codex app-server turn",
+                        exc_info=True,
+                    )
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -2878,6 +2889,17 @@ class AIAgent:
             if _lock is not None:
                 with _lock:
                     self._pending_steer = None
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            session = getattr(self, "_codex_session", None)
+            clear_session_interrupt = getattr(session, "clear_interrupt", None)
+            if callable(clear_session_interrupt):
+                try:
+                    clear_session_interrupt()
+                except Exception:
+                    logger.debug(
+                        "Failed to clear Codex app-server interrupt state",
+                        exc_info=True,
+                    )
 
     def _open_steer_intake(self, *, supported: bool = True) -> None:
         """Open a fresh turn's steer intake when Hermes can consume it."""
@@ -2900,6 +2922,14 @@ class AIAgent:
 
     def _clear_steer_intake(self) -> None:
         """Close intake and discard guidance after a destructive interrupt."""
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            session = getattr(self, "_codex_session", None)
+            clear_session_steer = getattr(session, "clear_steer_intake", None)
+            if callable(clear_session_steer):
+                try:
+                    clear_session_steer()
+                except Exception:
+                    pass
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             self._pending_steer = None
@@ -2943,6 +2973,17 @@ class AIAgent:
 
     def steer_state(self) -> str:
         """Return whether this turn can accept live steering."""
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            session = getattr(self, "_codex_session", None)
+            if session is not None:
+                state = getattr(session, "steer_state", None)
+                if callable(state):
+                    try:
+                        session_state = str(state() or "closed")
+                        if session_state == "open":
+                            return "open"
+                    except Exception:
+                        pass
         _lock = getattr(self, "_pending_steer_lock", None)
 
         def _state() -> str:
@@ -2977,6 +3018,16 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            session = getattr(self, "_codex_session", None)
+            if session is not None:
+                steer_turn = getattr(session, "steer", None)
+                if callable(steer_turn):
+                    try:
+                        if steer_turn(cleaned):
+                            return True
+                    except Exception:
+                        pass
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             if not (
