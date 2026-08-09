@@ -81,6 +81,15 @@ def _bounded_text(value: Any, limit: int) -> str:
     return text
 
 
+def _bounded_prose(value: Any, limit: int) -> str:
+    """Normalize descriptive model prose without rejecting harmless overflow."""
+
+    text = " ".join(str(value or "").split())
+    if not text or _UNSAFE_RE.search(text):
+        return ""
+    return text[:limit].rstrip()
+
+
 def _normalize_locator(value: Any) -> dict[str, str] | None:
     raw = value if isinstance(value, dict) else {}
     by = str(raw.get("by") or "").strip().lower()
@@ -143,7 +152,7 @@ def validate_visual_assertions(
                 continue
             item.update({"text": text, "policy": "literal_request_text"})
         elif kind == "screenshot_appearance":
-            expectation = _bounded_text(raw.get("expectation"), 240)
+            expectation = _bounded_prose(raw.get("expectation"), 240)
             if not expectation:
                 continue
             item["expectation"] = expectation
@@ -173,7 +182,7 @@ def _normalize_contract_target(value: Any) -> dict[str, Any] | None:
     raw = value if isinstance(value, dict) else {}
     if set(raw) - {"description", "locator"}:
         return None
-    description = _bounded_text(raw.get("description"), _MAX_TARGET_DESCRIPTION)
+    description = _bounded_prose(raw.get("description"), _MAX_TARGET_DESCRIPTION)
     if not description:
         return None
     target: dict[str, Any] = {"description": description}
@@ -190,7 +199,7 @@ def _normalize_contract_page(value: Any) -> dict[str, str] | None:
     if set(raw) - {"state", "description"}:
         return None
     state = str(raw.get("state") or "").strip().lower()
-    description = _bounded_text(raw.get("description"), _MAX_PAGE_DESCRIPTION)
+    description = _bounded_prose(raw.get("description"), _MAX_PAGE_DESCRIPTION)
     if state not in _PAGE_STATES or not description:
         return None
     return {"state": state, "description": description}
@@ -200,7 +209,7 @@ def _normalize_contract_viewport(value: Any) -> dict[str, Any] | None:
     raw = value if isinstance(value, dict) else {}
     if set(raw) - {"description", "width", "height"}:
         return None
-    description = _bounded_text(raw.get("description"), _MAX_VIEWPORT_DESCRIPTION)
+    description = _bounded_prose(raw.get("description"), _MAX_VIEWPORT_DESCRIPTION)
     if not description:
         return None
     viewport: dict[str, Any] = {"description": description}
@@ -225,7 +234,7 @@ def _normalize_contract_state(value: Any) -> list[str]:
         return []
     state: list[str] = []
     for raw in value:
-        item = _bounded_text(raw, _MAX_STATE_DESCRIPTION)
+        item = _bounded_prose(raw, _MAX_STATE_DESCRIPTION)
         if not item or item in state:
             return []
         state.append(item)
@@ -265,7 +274,7 @@ def _normalize_contract_artifacts(
         if set(raw) - {"kind", "description", "locator", "viewport"}:
             return []
         kind = str(raw.get("kind") or "").strip().lower()
-        description = _bounded_text(raw.get("description"), _MAX_STATE_DESCRIPTION)
+        description = _bounded_prose(raw.get("description"), _MAX_STATE_DESCRIPTION)
         if kind not in _SCREENSHOT_ARTIFACT_KINDS or not description:
             return []
         locator = None
@@ -379,8 +388,10 @@ def diagnose_orchestrated_visual_contract(
         limit = max(1, min(int(max_assertions), 6))
     except (TypeError, ValueError):
         limit = 6
-    if len(raw_assertions) > limit:
-        return invalid("contract_assertion_limit")
+    # Provider-side structured-output enforcement is not uniform.  Keep the
+    # contract bounded locally instead of wasting a QA attempt when a model
+    # supplies one harmless auxiliary assertion beyond the advertised limit.
+    raw_assertions = raw_assertions[:limit]
 
     assertions: list[dict[str, Any]] = []
     seen_payloads: set[str] = set()

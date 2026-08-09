@@ -467,9 +467,8 @@ def test_visual_qa_allows_two_correction_retries_per_turn():
     assert execute_call.call_count == 3
     assert result["final_response"] == "Stopped after the bounded retry."
     assert any(
-        "three executable calls plus one malformed-contract repair" in str(
-            message.get("content")
-        )
+        "three executable calls plus one malformed-contract repair "
+        "for the current rendered code generation" in str(message.get("content"))
         for message in result["messages"]
         if message.get("role") == "tool"
     )
@@ -528,9 +527,8 @@ def test_visual_qa_malformed_correction_does_not_consume_execution_slot():
     assert execute_call.call_count == 4
     assert result["final_response"] == "Stopped after contract repair and bounded retry."
     assert any(
-        "three executable calls plus one malformed-contract repair" in str(
-            message.get("content")
-        )
+        "three executable calls plus one malformed-contract repair "
+        "for the current rendered code generation" in str(message.get("content"))
         for message in result["messages"]
         if message.get("role") == "tool"
     )
