@@ -74,6 +74,23 @@ _DESIRED_STATE_RE = re.compile(
     re.IGNORECASE,
 )
 _DOC_ONLY_RE = re.compile(r"\b(?:docs?|documentation|readme|changelog)\b", re.IGNORECASE)
+_PLAN_DELIVERABLE_RE = re.compile(
+    r"\b(?:create|draft|prepare|produce|provide|return|write)\s+"
+    r"(?:(?:an?|the)\s+)?plan\b",
+    re.IGNORECASE,
+)
+_PLAN_EXECUTION_ACTION = (
+    r"(?:apply|build|deploy|execute|fix|implement|ship|"
+    r"(?:change|edit|modify|write)\s+(?:the\s+)?(?:code|implementation))"
+)
+_PLAN_PLUS_EXECUTION_RE = re.compile(
+    rf"(?:\bplan\b.{{0,120}}(?:\band\s+(?:then\s+)?|[.;]\s*(?:then\s+)?)"
+    rf"(?:please\s+)?(?:also\s+)?\b{_PLAN_EXECUTION_ACTION}\b|"
+    rf"\b{_PLAN_EXECUTION_ACTION}\b.{{0,120}}\band\b.{{0,40}}"
+    r"\b(?:create|draft|prepare|produce|provide|return|write)\s+"
+    r"(?:(?:an?|the)\s+)?plan\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 _CONCRETE_IMPLEMENTATION_ACTION_RE = re.compile(
     r"\b(?:add|build|create|fix|implement|redesign|render|replace)\b",
     re.IGNORECASE,
@@ -355,6 +372,8 @@ def classify_visual_requirement(
     has_action = bool(_ACTION_RE.search(text))
     has_desired_state = bool(_DESIRED_STATE_RE.search(text))
     explicit_visual_qa_check = bool(_EXPLICIT_VISUAL_QA_CHECK_RE.search(text))
+    if _PLAN_DELIVERABLE_RE.search(text) and not _PLAN_PLUS_EXECUTION_RE.search(text):
+        return {"level": "none", "target": "", "assertions": []}
     if not (
         has_action
         or has_desired_state

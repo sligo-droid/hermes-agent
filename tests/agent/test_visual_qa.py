@@ -66,6 +66,31 @@ def test_classifier_excludes_review_only_work():
     assert classify_visual_requirement("Update the responsive layout documentation.")["level"] == "none"
 
 
+def test_classifier_excludes_plan_only_visual_work():
+    request = (
+        "The search bar at the top of the page is jarring because it breaks up "
+        "the flow of the layout. Please create a plan for making this improvement."
+    )
+
+    assert classify_visual_requirement(request, worker_route="action")["level"] == "none"
+    assert (
+        classify_visual_requirement(
+            "Create a plan to fix the dashboard search layout.",
+            worker_route="action",
+        )["level"]
+        == "none"
+    )
+
+
+def test_classifier_keeps_plan_plus_implementation_visual_work():
+    requirement = classify_visual_requirement(
+        "Create a plan for the dashboard search bar and implement it.",
+        worker_route="action",
+    )
+
+    assert requirement["level"] == "surface"
+
+
 def test_classifier_recognizes_explicit_visual_qa_check_without_code_action():
     requirement = classify_visual_requirement(
         "Confirm you can use the visual QA tool successfully now. Mimic the closeout flow.",
