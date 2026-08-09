@@ -1379,6 +1379,29 @@ async def _defer_ephemeral(interaction: Any) -> None:
         await defer(ephemeral=True, thinking=False)
 
 
+async def _mark_discord_review_message_resolved(interaction: Any) -> bool:
+    """Remove item controls and mark the Discord message as handled."""
+    message = getattr(interaction, "message", None)
+    edit = getattr(message, "edit", None)
+    add_reaction = getattr(message, "add_reaction", None)
+    updated = True
+    if callable(edit):
+        try:
+            await edit(view=None)
+        except Exception:
+            updated = False
+    else:
+        updated = False
+    if callable(add_reaction):
+        try:
+            await add_reaction("✅")
+        except Exception:
+            updated = False
+    else:
+        updated = False
+    return updated
+
+
 async def handle_discord_review_interaction(
     interaction: Any,
     action: str,
@@ -1432,6 +1455,8 @@ async def handle_discord_review_interaction(
                 reviewer_role_id=reviewer_role,
                 decision_message_id=interaction_id,
             )
+            if changed:
+                await _mark_discord_review_message_resolved(interaction)
             await _ephemeral(
                 interaction,
                 ("Candidate approved." if action == "approve" else "Candidate rejected.")
