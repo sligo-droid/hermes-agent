@@ -3789,13 +3789,21 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._explicit_no_action_constraint_reason(cleaned):
             return False
 
+        observational_deliverable = (
+            r"(?:review|audit|inspection|investigation|analysis|assessment|"
+            r"research|test|verification|report|plan|findings|recommendations|"
+            r"list\s+of\s+recommendations)"
+        )
+
         # Mixed requests with a concrete operational tail are actionable even
-        # when an earlier clause asks for explanation or diagnosis. Explicit
-        # read-only constraints above still win.
+        # when an earlier clause asks for explanation or diagnosis. Creating
+        # an observational deliverable is still read-only work.
         if any(
             re.search(
                 r"(?:[.;,:]\s*|\b(?:and|then)\s+)(?:please\s+)?"
-                r"(?:repair|fix|implement|build|create|update|change|rerun|re-run|"
+                r"(?:repair|fix|implement|build|"
+                rf"create(?!\s+(?:(?:an?|the)\s+)?{observational_deliverable}\b)|"
+                r"update|change|rerun|re-run|"
                 r"restart|deploy|ship|execute|commit|push|merge|"
                 r"apply|run\s+(?:the\s+)?(?:pipeline|workflow|job|command))\b",
                 candidate,
@@ -3812,11 +3820,6 @@ class DiscordAdapter(BasePlatformAdapter):
             r"(?:review|audit|inspect|investigate|research|analy[sz]e|assess|"
             r"evaluate|test|verify|validate|diagnose|trace|reproduce|survey|"
             r"inventory|compare|confirm|plan|look\s+(?:through|into|over)|check)"
-        )
-        observational_deliverable = (
-            r"(?:review|audit|inspection|investigation|analysis|assessment|"
-            r"research|test|verification|report|plan|findings|recommendations|"
-            r"list\s+of\s+recommendations)"
         )
         task_clause_patterns = (
             re.compile(rf"^(?:please\s+)?{observational_task_verb}\b"),

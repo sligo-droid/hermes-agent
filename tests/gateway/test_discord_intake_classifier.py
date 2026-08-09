@@ -100,6 +100,15 @@ def test_narrative_prefixed_observational_task_is_read_only(adapter):
     assert adapter._heuristic_action_request_intent(message) is False
 
 
+def test_narrative_prefixed_plan_request_is_read_only(adapter):
+    message = (
+        "The search bar at the top of the page is jarring because it breaks up "
+        "the flow of the layout. Please create a plan for making this improvement."
+    )
+
+    assert adapter._heuristic_action_request_intent(message) is False
+
+
 @pytest.mark.parametrize(
     "message",
     [

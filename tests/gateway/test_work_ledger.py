@@ -390,6 +390,31 @@ def test_visual_requirement_uses_reply_and_goal_thread_context(tmp_path):
     assert item["visual_qa_requirement"]["level"] == "surface"
 
 
+def test_plan_only_visual_request_has_no_ledger_requirement(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(
+        message_id="plan-only-visual",
+        text=(
+            "The search bar at the top of the page is jarring because it breaks up "
+            "the flow of the layout. Please create a plan for making this improvement."
+        ),
+    )
+
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+        visual_qa_config={"mode": "enforce_explicit"},
+    )
+
+    assert item is not None
+    assert item["visual_qa_requirement"] == {
+        "level": "none",
+        "target": "",
+        "assertions": [],
+    }
+
+
 def test_post_edit_visual_promotion_tightens_closeout_policy(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="promote", text="Implement the requested behavior.")
