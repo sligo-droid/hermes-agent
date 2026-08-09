@@ -1,7 +1,7 @@
 ---
 name: plan
 description: "Write an actionable plan to .hermes/plans/; no execution."
-version: 2.0.0
+version: 2.0.1
 author: Hermes Agent (writing-craft adapted from obra/superpowers)
 license: MIT
 platforms: [linux, macos, windows]
@@ -55,7 +55,9 @@ If not, create a sensible timestamped filename yourself under `.hermes/plans/`.
 - If the request is clear enough, write the plan directly.
 - If no explicit instruction accompanies `/plan`, infer the task from the current conversation context.
 - If it is genuinely underspecified, ask a brief clarifying question instead of guessing.
-- After saving the plan, reply briefly with what you planned and the saved path.
+- After saving the plan, reply briefly with what you planned.
+- Outside Discord, include the saved path when useful.
+- On Discord, never post the plan filename, filesystem path, or link. This includes relative paths under `.hermes/plans/` and absolute workspace paths. Say only that the plan was saved in the workspace.
 
 ---
 
