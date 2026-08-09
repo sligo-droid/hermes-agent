@@ -937,9 +937,12 @@ class TestPromptBuilderConstants:
         assert "asd-ste100-inspired simplified technical english" in hint
         assert "active voice" in hint
         assert "20 words or fewer" in hint
-        assert "every response must also include" in hint
         assert "wit, flair, or personality" in hint
+        assert "only when it fits the context and the user's tone" in hint
+        assert "standalone closing quip" in hint
+        assert "never add a personality line" in hint
         assert "separate from instructions" in hint
+        assert "every response must also include" not in hint
 
     def test_cli_hint_does_not_suggest_media_tags(self):
         # Regression: MEDIA:/path tags are intercepted only by messaging
