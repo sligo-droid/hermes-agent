@@ -29,11 +29,15 @@ _DETERMINISTIC = frozenset({
     "vite_fs_allow",
     "missing_environment",
     "application_bootstrap",
+    "hmr_origin_mismatch",
 })
 _SUMMARIES = {
     "vite_fs_allow": "Vite refused files outside the configured serving allow-list.",
     "missing_environment": "The preview bootstrap is missing required environment configuration.",
     "application_bootstrap": "The local route reached an application bootstrap error.",
+    "hmr_origin_mismatch": (
+        "The local preview reloaded through an external HMR origin before browser QA could complete."
+    ),
     "transient_browser_network": (
         "The browser could not reach the target because of a transient "
         "network/navigation failure."
@@ -102,6 +106,14 @@ def classify_preview_failure(result: Any) -> PreviewFailure | None:
         or "<title>internal error</title>" in text
     ):
         failure_class = "application_bootstrap"
+    elif (
+        "browser login page reloaded before authentication completed" in text
+        or (
+            "vite server connection lost" in text
+            and ("cloudflareaccess.com" in text or "external hmr" in text)
+        )
+    ):
+        failure_class = "hmr_origin_mismatch"
     elif any(
         marker in text
         for marker in (

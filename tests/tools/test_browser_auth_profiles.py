@@ -230,6 +230,70 @@ def test_supervisor_authentication_keeps_secrets_out_of_source_and_result():
     assert "top-secret-password" not in json.dumps(result)
 
 
+def test_supervisor_authentication_fails_fast_when_login_page_reloads():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    supervisor = CDPSupervisor(task_id="auth-reload-test", cdp_url="ws://example.test")
+    supervisor._loop = loop
+    supervisor._active = True
+    supervisor._page_session_id = "page-1"
+    submitted = False
+    time_origin = 1000.0
+
+    async def fake_cdp(method, params=None, **kwargs):
+        nonlocal submitted, time_origin
+        if method == "Runtime.evaluate" and params.get("expression") == "globalThis":
+            return {"result": {"result": {"objectId": "global-1"}}}
+        if method == "Runtime.evaluate":
+            expression = params.get("expression", "")
+            if expression == "document.readyState === 'complete'":
+                value = True
+            elif expression == "performance.timeOrigin":
+                value = time_origin
+            elif "aria-invalid" in expression:
+                value = False
+            elif "performance.timeOrigin !==" in expression:
+                value = submitted
+            else:
+                value = False
+            return {"result": {"result": {"value": value}}}
+        if method == "Runtime.callFunctionOn":
+            if "requestSubmit" in params["functionDeclaration"]:
+                submitted = True
+                time_origin = 2000.0
+            return {"result": {"result": {"value": True}}}
+        if method == "Input.insertText":
+            return {"result": {}}
+        raise AssertionError(method)
+
+    supervisor._cdp = fake_cdp
+    try:
+        result = supervisor.authenticate_form(
+            username="hermes_qa",
+            password="top-secret-password",
+            username_selector="#login-user",
+            password_selector="#login-pass",
+            submit_selector="button[type=submit]",
+            success_selector="#header",
+            timeout=2,
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+    assert result == {
+        "ok": False,
+        "error": (
+            "browser login page reloaded before authentication completed; "
+            "use a stable local preview without external HMR redirects"
+        ),
+    }
+    assert "hermes_qa" not in json.dumps(result)
+    assert "top-secret-password" not in json.dumps(result)
+
+
 def test_browser_authenticate_returns_only_profile_metadata(monkeypatch):
     class FakeSupervisor:
         def select_page(self, url):

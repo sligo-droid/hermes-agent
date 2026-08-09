@@ -61,6 +61,12 @@ def test_preview_failure_classifier_distinguishes_deterministic_and_transient_fa
         "title": "Internal Error",
         "snapshot": 'heading "Internal Error"',
     })
+    hmr = classify_preview_failure({
+        "error": (
+            "browser login page reloaded before authentication completed; "
+            "use a stable local preview without external HMR redirects"
+        )
+    })
     transient = classify_preview_failure({
         "error": "net::ERR_CONNECTION_REFUSED while navigating"
     })
@@ -72,6 +78,10 @@ def test_preview_failure_classifier_distinguishes_deterministic_and_transient_fa
     )
     assert (internal.failure_class, internal.deterministic) == (
         "application_bootstrap",
+        True,
+    )
+    assert (hmr.failure_class, hmr.deterministic) == (
+        "hmr_origin_mismatch",
         True,
     )
     assert (transient.failure_class, transient.deterministic) == (
