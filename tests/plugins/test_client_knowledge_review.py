@@ -279,6 +279,8 @@ def test_delivery_returns_ordered_message_ids_and_click_changes_only_one_item(mo
     ))
     assert [item["state"] for item in store.items] == ["approved", "pending"]
     assert store.decisions == [("1" * 64, "approved")]
+    interaction.message.edit.assert_awaited_once_with(view=None)
+    interaction.message.add_reaction.assert_awaited_once_with("✅")
 
 
 def _interaction(*, message_id="402", thread_id="401", user_id="600", roles=(300,), guild="100"):
@@ -293,7 +295,12 @@ def _interaction(*, message_id="402", thread_id="401", user_id="600", roles=(300
     return SimpleNamespace(
         id="500", guild_id=guild, channel_id=thread_id,
         user=SimpleNamespace(id=user_id, roles=[SimpleNamespace(id=value) for value in roles]),
-        message=SimpleNamespace(id=message_id), guild=guild_obj, channel=channel,
+        message=SimpleNamespace(
+            id=message_id,
+            edit=AsyncMock(),
+            add_reaction=AsyncMock(),
+        ),
+        guild=guild_obj, channel=channel,
         response=SimpleNamespace(defer=AsyncMock(side_effect=defer), send_message=AsyncMock(),
                                  is_done=lambda: state["done"]),
         followup=SimpleNamespace(send=AsyncMock()),
