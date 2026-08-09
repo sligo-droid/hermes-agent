@@ -1395,11 +1395,10 @@ def run_conversation(
     # keyed by (provider, pool-entry-id).
     agent._auth_pool_refresh_counts = {}
 
-    # Only Hermes' normal loop can consume the in-process steer buffer.
-    # codex_app_server owns its own turn protocol, so leave intake closed and
-    # make callers queue an immediate continuation instead of acknowledging a
-    # steer that the external runtime will never see.
-    agent._open_steer_intake(supported=agent.api_mode != "codex_app_server")
+    # Hermes' normal loop consumes the in-process steer buffer directly.
+    # Codex app-server consumes any startup steer before turn/start, then uses
+    # its native turn/steer RPC once the external turn has an ID.
+    agent._open_steer_intake(supported=True)
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching

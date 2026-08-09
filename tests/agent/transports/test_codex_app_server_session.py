@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -281,6 +282,149 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+        assert s.steer_state() == "closed"
+        assert s.steer("too late") is False
+
+    def test_live_steer_uses_turn_steer_on_active_turn(self):
+        client = FakeClient()
+        turn_started = threading.Event()
+        steer_sent = threading.Event()
+
+        def handle_request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                turn_started.set()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/steer":
+                assert params == {
+                    "threadId": "thread-fake-001",
+                    "input": [{"type": "text", "text": "focus on the worker"}],
+                    "expectedTurnId": "turn-fake-001",
+                }
+                steer_sent.set()
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={"id": "turn-fake-001", "status": "completed", "error": None},
+                )
+                return {"turnId": "turn-fake-001"}
+            return {}
+
+        client._request_handler = handle_request
+        session = make_session(client)
+        result_box = {}
+        worker = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result", session.run_turn("implement it", turn_timeout=2.0)
+            )
+        )
+        worker.start()
+        assert turn_started.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while session.steer_state() != "open" and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert session.steer_state() == "open"
+
+        assert session.steer("focus on the worker") is True
+        assert steer_sent.wait(timeout=1.0)
+        worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert result_box["result"].pending_steer == ""
+        assert session.steer_state() == "closed"
+
+    def test_startup_steer_waits_for_turn_id_then_uses_turn_steer(self):
+        client = FakeClient()
+        turn_start_entered = threading.Event()
+        release_turn_start = threading.Event()
+        steer_sent = threading.Event()
+
+        def handle_request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                turn_start_entered.set()
+                assert release_turn_start.wait(timeout=1.0)
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/steer":
+                assert params["expectedTurnId"] == "turn-fake-001"
+                assert params["input"] == [
+                    {"type": "text", "text": "include the read-only context"}
+                ]
+                steer_sent.set()
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={"id": "turn-fake-001", "status": "completed", "error": None},
+                )
+                return {"turnId": "turn-fake-001"}
+            return {}
+
+        client._request_handler = handle_request
+        session = make_session(client)
+        result_box = {}
+        worker = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result", session.run_turn("implement it", turn_timeout=2.0)
+            )
+        )
+        worker.start()
+        assert turn_start_entered.wait(timeout=1.0)
+
+        assert session.steer_state() == "open"
+        assert session.steer("include the read-only context") is True
+        release_turn_start.set()
+
+        assert steer_sent.wait(timeout=1.0)
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert result_box["result"].pending_steer == ""
+        assert session.steer_state() == "closed"
+
+    def test_rejected_delivery_edge_steer_is_returned_for_next_turn(self):
+        client = FakeClient()
+        turn_started = threading.Event()
+
+        def handle_request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                turn_started.set()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/steer":
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={"id": "turn-fake-001", "status": "completed", "error": None},
+                )
+                raise session_mod.CodexAppServerError(
+                    code=-32602,
+                    message="no active turn",
+                )
+            return {}
+
+        client._request_handler = handle_request
+        session = make_session(client)
+        result_box = {}
+        worker = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result", session.run_turn("implement it", turn_timeout=2.0)
+            )
+        )
+        worker.start()
+        assert turn_started.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while session.steer_state() != "open" and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert session.steer_state() == "open"
+
+        assert session.steer("start the manual run") is True
+        worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert result_box["result"].pending_steer == "start the manual run"
+        assert session.steer_state() == "closed"
 
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
@@ -544,27 +688,179 @@ class TestRunTurn:
 
     def test_interrupt_during_turn_issues_turn_interrupt(self):
         client = FakeClient()
-        # Don't queue turn/completed — the loop has to interrupt out
-        client.queue_notification(
-            "item/completed",
-            item={"type": "commandExecution", "id": "x", "command": "sleep 60",
-                  "cwd": "/", "status": "inProgress",
-                  "aggregatedOutput": None, "exitCode": None,
-                  "commandActions": []},
-            threadId="t", turnId="tu1",
-        )
+        turn_started = threading.Event()
+        interrupt_sent = threading.Event()
+
+        def handle_request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                turn_started.set()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/interrupt":
+                interrupt_sent.set()
+                return {}
+            return {}
+
+        client._request_handler = handle_request
         s = make_session(client)
-        s.ensure_started()
-        # Trip the interrupt before run_turn even consumes the notification.
-        # The loop will see interrupt set on its first iteration and bail.
+        result_box = {}
+        worker = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result",
+                s.run_turn(
+                    "loop forever",
+                    turn_timeout=2.0,
+                    notification_poll_timeout=0.01,
+                ),
+            )
+        )
+        worker.start()
+        assert turn_started.wait(timeout=1.0)
+
         s.request_interrupt()
-        r = s.run_turn("loop forever", turn_timeout=2.0)
+        assert interrupt_sent.wait(timeout=1.0)
+        worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        r = result_box["result"]
         assert r.interrupted is True
+        assert r.timed_out is False
         # turn/interrupt was requested with the right turnId
         assert any(
             method == "turn/interrupt" and params.get("turnId") == "turn-fake-001"
             for (method, params) in client.requests
         )
+
+    def test_pre_start_interrupt_survives_turn_preparation(self):
+        client = FakeClient()
+        s = make_session(client)
+        s.request_interrupt()
+
+        s.prepare_turn_steering()
+        r = s.run_turn(
+            "do not start this work",
+            turn_timeout=2.0,
+            notification_poll_timeout=0.01,
+        )
+
+        assert r.interrupted is True
+        assert r.timed_out is False
+        assert any(
+            method == "turn/interrupt" and params.get("turnId") == "turn-fake-001"
+            for method, params in client.requests
+        )
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TimeoutError("timeout"),
+            session_mod.CodexAppServerError(code=-32603, message="interrupt failed"),
+        ],
+    )
+    def test_uncertain_hard_interrupt_retires_session(self, error):
+        client = FakeClient()
+        turn_started = threading.Event()
+
+        def handle_request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                turn_started.set()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/interrupt":
+                raise error
+            return {}
+
+        client._request_handler = handle_request
+        session = make_session(client)
+        result_box = {}
+        worker = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result",
+                session.run_turn(
+                    "loop forever",
+                    turn_timeout=2.0,
+                    notification_poll_timeout=0.01,
+                ),
+            )
+        )
+        worker.start()
+        assert turn_started.wait(timeout=1.0)
+
+        session.request_interrupt()
+        worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        assert result_box["result"].interrupted is True
+        assert result_box["result"].should_retire is True
+
+    def test_close_rejects_new_steer_before_blocking_client_teardown(self):
+        client = FakeClient()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+
+        def blocking_close():
+            close_entered.set()
+            assert release_close.wait(timeout=1.0)
+            client._closed = True
+
+        client.close = blocking_close
+        s = make_session(client)
+        s.ensure_started()
+        s.prepare_turn_steering()
+        assert s.steer("accepted before teardown") is True
+        result_box = {}
+        worker = threading.Thread(
+            target=lambda: result_box.setdefault("pending", s.close())
+        )
+        worker.start()
+        assert close_entered.wait(timeout=1.0)
+
+        assert s.steer_state() == "closed"
+        assert s.steer("during teardown") is False
+        release_close.set()
+        worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        assert result_box["pending"] == "accepted before teardown"
+
+    @pytest.mark.parametrize("error", [TimeoutError("timeout"), RuntimeError("closed")])
+    def test_uncertain_turn_steer_failure_is_not_replayed(self, error):
+        client = FakeClient()
+        turn_started = threading.Event()
+
+        def handle_request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                turn_started.set()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/steer":
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={"id": "turn-fake-001", "status": "completed", "error": None},
+                )
+                raise error
+            return {}
+
+        client._request_handler = handle_request
+        session = make_session(client)
+        result_box = {}
+        worker = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result", session.run_turn("implement it", turn_timeout=2.0)
+            )
+        )
+        worker.start()
+        assert turn_started.wait(timeout=1.0)
+        assert session.steer("possibly delivered") is True
+        worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert result_box["result"].pending_steer == ""
+        assert result_box["result"].should_retire is True
 
     def test_deadline_exceeded_records_error(self):
         client = FakeClient()

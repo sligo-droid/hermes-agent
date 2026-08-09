@@ -483,6 +483,28 @@ class TestBusySessionAck:
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio
+    async def test_read_only_intake_steers_active_action_turn(self, monkeypatch):
+        import gateway.run as _gr
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        event = _make_event(text="is this still proceeding?")
+        event.discord_runtime_mode = "read_only"
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        agent.steer.assert_called_once_with("is this still proceeding?")
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
     async def test_first_steer_ack_is_visible_after_generic_busy_ack(self, monkeypatch):
         import gateway.run as _gr
 
