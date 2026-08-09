@@ -20,6 +20,7 @@ Core workflows:
 
 - **Hermes repo development:** code/doc changes in worktrees under `/home/droid/workspaces/`, reviewed and merged back to `main` after focused tests/CI.
 - **Discord dev-shop intake:** action requests and project work enter through Discord, with long-running work moving through worker boards/Kanban where appropriate. “Action request” means any ask to do work, not only product-feature work.
+- **Discord plan privacy:** Discord responses may say that a plan was saved, but must never include the plan artifact's filename, filesystem path, or link. This includes relative paths under `.hermes/plans/` and absolute workspace paths.
 - **Command Center operation:** Sligo Command Center shows Sources, Work Items, Worker Runs, and project tabs. It should be the operator ledger, not another competing board.
 - **Cron/self-improvement:** scheduled audits and proposals may create work, but they are intake/provenance. Accepted work should attach to the same work-item model.
 - **Runtime troubleshooting:** gateway, dashboard, Kanban, model routing, and cron issues require evidence from logs/state DB/systemd/runtime checks before claims.
