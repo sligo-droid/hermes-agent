@@ -9423,6 +9423,8 @@ class _GatewayRunnerCore(
         work_id = str(item.get("id") or "")
         if not work_id:
             return
+        if not ledger.preview_delivery_satisfied(work_id):
+            return
         expected_run_state = ledger.run_state_snapshot(item)
         try:
             event = ledger.event_from_item(item)

@@ -1735,6 +1735,67 @@ async def test_partial_terminal_delivery_persists_prefix_and_restart_does_not_re
 
 
 @pytest.mark.asyncio
+async def test_restart_terminal_delivery_waits_for_preview_completion(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    item, state = _pending_item(ledger)
+    head_sha = "8" * 40
+    terminal = dict(state)
+    terminal["status"] = "pr_published"
+    terminal["next_due_at"] = None
+    terminal["policy"] = {**terminal["policy"], "require_preview": True}
+    terminal["pr"] = {
+        **terminal["pr"],
+        "url": "https://github.com/acme/example/pull/13",
+        "state": "OPEN",
+        "head_sha": head_sha,
+    }
+    terminal["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": head_sha,
+        "url": "https://example-git-restart.vercel.app",
+        "deployment_id": "48",
+    }
+    persisted = ledger.update_closeout(
+        item["id"],
+        terminal,
+        expected_revision=state["revision"],
+    )
+    assert persisted is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Visual QA passed for the draft PR.",
+    )
+    agent_done = ledger.get(item["id"])
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="terminal-after-preview")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(agent_done)
+    adapter._send_with_retry.assert_not_awaited()
+
+    owner = "restart-preview"
+    assert ledger.claim_preview_delivery(item["id"], owner=owner) is not None
+    assert ledger.begin_preview_send_attempt(item["id"], owner=owner) is True
+    assert ledger.complete_preview_delivery(
+        item["id"],
+        owner=owner,
+        result_message_id="restart-preview-message",
+    ) is True
+
+    await runner._resume_finished_discord_work_item(ledger.get(item["id"]))
+    adapter._send_with_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_partial_normal_delivery_is_blocked_and_restart_does_not_replay(
     monkeypatch, tmp_path
 ):
