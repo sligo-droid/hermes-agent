@@ -10539,12 +10539,14 @@ class _GatewayRunnerCore(
         )
         if not began:
             return
+        exact_head = str(delivery.get("head_sha") or "")
         content = (
-            "Preview ready.\n\n"
+            f"Preview ready for exact commit `{exact_head}`.\n\n"
             f"- Preview: {delivery.get('preview_url')}\n"
             f"- Draft PR: {delivery.get('pr_url')}\n"
             "- Main: untouched\n"
-            "- Visual QA: running in the background; I’ll post the result here."
+            "- Visual QA: running for this commit in the background; I’ll post the result here.\n"
+            "- If the branch advances, the newer commit will get a separate preview message."
         )
         try:
             from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source

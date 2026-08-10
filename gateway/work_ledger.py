@@ -4912,6 +4912,31 @@ class GatewayWorkLedger:
             self._write(data)
             return True
 
+    def pending_preview_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return preview sends that need a first attempt or lease recovery."""
+
+        now = self._now()
+        pending: list[dict[str, Any]] = []
+        for item in self._read().get("items", {}).values():
+            delivery = item.get("preview_delivery") if isinstance(item, dict) else None
+            if not isinstance(item, dict) or not isinstance(delivery, dict):
+                continue
+            if _required_async_completion_state(item).get("attempt_cancelled") is True:
+                continue
+            status = str(delivery.get("status") or "")
+            if status == "pending" or (
+                status in {"delivering", "sending"}
+                and float(delivery.get("lease_until") or 0) <= now
+            ):
+                pending.append(dict(item))
+        pending.sort(
+            key=lambda item: (
+                float(item.get("preview_delivery", {}).get("created_at") or 0),
+                str(item.get("id") or ""),
+            )
+        )
+        return pending[: max(1, min(200, int(limit)))]
+
     def pending_closeouts(
         self,
         *,

@@ -2419,6 +2419,51 @@ def test_head_advance_cancels_unclaimed_old_preview_delivery(tmp_path):
     assert ledger.claim_preview_delivery(item["id"], owner="sender-old") is None
 
 
+def test_terminal_closeout_keeps_pending_preview_discoverable(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: 100.0)
+    event = _repo_discord_event(message_id="preview-terminal-retry")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/tmp/project-worktree",
+        repository="acme/project",
+        branch="feature/test",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    head_sha = "e" * 40
+    terminal = deepcopy(attached)
+    terminal["status"] = "pr_published"
+    terminal["next_due_at"] = None
+    terminal["pr"].update(
+        {
+            "url": "https://github.com/acme/project/pull/10",
+            "state": "OPEN",
+            "head_sha": head_sha,
+        }
+    )
+    terminal["preview"] = {
+        "provider": "vercel",
+        "status": "ready",
+        "observed_sha": head_sha,
+        "url": "https://feature-terminal.vercel.app",
+    }
+    assert ledger.update_closeout(
+        item["id"],
+        terminal,
+        expected_revision=attached["revision"],
+    ) is not None
+
+    assert ledger.pending_closeouts(due_at=100.0) == []
+    pending = ledger.pending_preview_deliveries()
+    assert [row["id"] for row in pending] == [item["id"]]
+    assert pending[0]["preview_delivery"]["status"] == "pending"
+
+
 def test_optional_canonical_sync_does_not_hide_private_runtime_lag(tmp_path):
     item = {
         "platform": "discord",

@@ -123,19 +123,20 @@ class TrustedCloseoutWatcher:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._marker_path = closeout_dirty_marker_path()
 
-    async def _notify_preview_ready(self, work_id: str) -> None:
+    async def _notify_preview_ready(self, work_id: str) -> bool:
         callback = self.on_preview
         if callback is None:
-            return
+            return False
         item = self.ledger.get(work_id)
         delivery = item.get("preview_delivery") if isinstance(item, dict) else None
         if not isinstance(item, dict) or not isinstance(delivery, dict):
-            return
-        if str(delivery.get("status") or "") != "pending":
-            return
+            return False
+        if str(delivery.get("status") or "") not in {"pending", "delivering", "sending"}:
+            return False
         callback_result = callback(item)
         if asyncio.iscoroutine(callback_result):
             await callback_result
+        return True
 
     def notify(self, work_item_id: str = "", *, cross_process: bool = False) -> None:
         if cross_process:
@@ -434,6 +435,7 @@ class TrustedCloseoutWatcher:
                     )
                     if finalized is None:
                         return False
+                    await self._notify_preview_ready(work_id)
                     callback = self.on_terminal
                     if callback is not None:
                         callback_result = callback(finalized)
@@ -462,18 +464,31 @@ class TrustedCloseoutWatcher:
         """Reconcile one bounded due batch."""
 
         self._loop = asyncio.get_running_loop()
+        preview_items = await asyncio.to_thread(
+            self.ledger.pending_preview_deliveries,
+            limit=self.max_concurrency,
+        )
+        preview_results = await asyncio.gather(
+            *(
+                self._notify_preview_ready(str(item.get("id") or ""))
+                for item in preview_items
+            ),
+            return_exceptions=False,
+        )
         items = await asyncio.to_thread(
             self.ledger.pending_closeouts,
             limit=self.max_concurrency,
         )
         if not items:
-            return 0
+            return sum(result is True for result in preview_results)
         semaphore = asyncio.Semaphore(self.max_concurrency)
         results = await asyncio.gather(
             *(self._reconcile_item(item, semaphore) for item in items),
             return_exceptions=False,
         )
-        return sum(result is True for result in results)
+        return sum(result is True for result in preview_results) + sum(
+            result is True for result in results
+        )
 
     async def _wait_for_wakeup(self) -> None:
         """Wait for an event while polling the cross-process marker cheaply."""
