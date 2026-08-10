@@ -1163,6 +1163,7 @@ def _record_visual_qa_edit_order(
     function_name: str,
     function_result: Any,
     *,
+    function_args: Any = None,
     task_id: str = "",
     tool_runtime_recorded: bool = False,
 ) -> None:
@@ -1170,7 +1171,11 @@ def _record_visual_qa_edit_order(
     try:
         from agent.tool_result_classification import file_mutation_result_landed
 
-        if not file_mutation_result_landed(function_name, function_result):
+        if not file_mutation_result_landed(
+            function_name,
+            function_result,
+            function_args,
+        ):
             return
         stats = getattr(agent, "_turn_runtime_stats", None)
         prior_calls = int(stats.get("tool_calls") or 0) if isinstance(stats, dict) else 0
@@ -2069,6 +2074,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         agent,
                         function_name,
                         function_result,
+                        function_args=function_args,
                         task_id=effective_task_id,
                     )
                 except Exception as _ver_err:
@@ -2938,6 +2944,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent,
                     function_name,
                     function_result,
+                    function_args=function_args,
                     task_id=effective_task_id,
                     tool_runtime_recorded=True,
                 )

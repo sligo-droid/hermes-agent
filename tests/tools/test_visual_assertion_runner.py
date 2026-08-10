@@ -527,6 +527,176 @@ async def test_exactly_one_retry_after_trusted_state_change():
 
 
 @pytest.mark.asyncio
+async def test_state_change_retry_receives_a_fresh_vision_budget():
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self):
+            return {"ok": True, "image_bytes": b"png"}
+
+    sweeps = 0
+    inspections = 0
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        nonlocal sweeps
+        sweeps += 1
+        on_provider_start()
+        return True
+
+    async def evaluator(*_args, on_provider_start, **_kwargs):
+        nonlocal inspections
+        inspections += 1
+        on_provider_start()
+        return {
+            "status": "failed" if inspections == 1 else "passed",
+            "results": [
+                {
+                    "id": _APPEARANCE_ID,
+                    "status": "failed" if inspections == 1 else "passed",
+                    "code": "appearance_mismatch" if inspections == 1 else "appearance_satisfied",
+                }
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="state-change-vision-budget",
+        requirement=_APPEARANCE_REQUIREMENT,
+        assertions=[
+            {
+                "id": _APPEARANCE_ID,
+                "kind": "screenshot_appearance",
+                "expectation": "balanced layout",
+            }
+        ],
+        supervisor=ScreenshotSupervisor(fingerprints=("before", "after", "after")),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "passed"
+    assert sweeps == 2
+    assert inspections == 2
+    assert [attempt["vision_calls"] for attempt in result["attempts"]] == [2, 2]
+    assert result["visual_qa_receipt"]["vision_calls"] == 4
+
+
+@pytest.mark.asyncio
+async def test_transient_vision_failure_retries_without_page_state_change():
+    class ScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self):
+            return {"ok": True, "image_bytes": b"png"}
+
+    inspections = 0
+
+    async def sweeper(*_args, on_provider_start, **_kwargs):
+        on_provider_start()
+        return True
+
+    async def evaluator(*_args, on_provider_start, **_kwargs):
+        nonlocal inspections
+        inspections += 1
+        on_provider_start()
+        status = "uncertain" if inspections == 1 else "passed"
+        return {
+            "status": status,
+            "results": [
+                {
+                    "id": _APPEARANCE_ID,
+                    "status": status,
+                    "code": "vision_call_failed" if inspections == 1 else "appearance_satisfied",
+                }
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="transient-vision-retry",
+        requirement=_APPEARANCE_REQUIREMENT,
+        assertions=[
+            {
+                "id": _APPEARANCE_ID,
+                "kind": "screenshot_appearance",
+                "expectation": "balanced layout",
+            }
+        ],
+        supervisor=ScreenshotSupervisor(fingerprints=("same", "same", "same")),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "passed"
+    assert inspections == 2
+    assert [attempt["vision_calls"] for attempt in result["attempts"]] == [2, 2]
+
+
+@pytest.mark.asyncio
+async def test_partial_screenshot_capture_uses_remaining_trusted_evidence():
+    class PartialScreenshotSupervisor(FakeSupervisor):
+        def capture_screenshot_memory(self, *, locator=None):
+            if locator:
+                return {"ok": False, "error": "focused target moved"}
+            return {"ok": True, "image_bytes": b"context-png"}
+
+    seen_context = {}
+    seen_images = []
+
+    async def sweeper(images, *, on_provider_start, **_kwargs):
+        seen_images.extend(images)
+        on_provider_start()
+        return True
+
+    async def evaluator(
+        images,
+        assertions,
+        *,
+        execution_context,
+        on_provider_start,
+        **_kwargs,
+    ):
+        seen_context.update(execution_context)
+        on_provider_start()
+        return {
+            "status": "passed",
+            "results": [
+                {"id": item["id"], "status": "passed", "code": "appearance_satisfied"}
+                for item in assertions
+            ],
+        }
+
+    result = await run_visual_assertions(
+        task_id="partial-screenshot-evidence",
+        requirement={"level": "none", "target": "", "assertions": []},
+        contract={
+            "target": {"description": "Preview page"},
+            "page": {"state": "already_open", "description": "Preview loaded"},
+            "viewport": {"description": "desktop"},
+            "state": ["page loaded"],
+            "artifacts": [
+                {
+                    "kind": "focused",
+                    "description": "Moved heading",
+                    "locator": {"by": "role", "value": "heading", "name": "Agora"},
+                },
+                {"kind": "context", "description": "Full preview"},
+            ],
+            "assertions": [
+                {"kind": "screenshot_appearance", "expectation": "balanced layout"}
+            ],
+        },
+        supervisor=PartialScreenshotSupervisor(),
+        vision_sweeper=sweeper,
+        vision_evaluator=evaluator,
+    )
+
+    assert result["status"] == "passed"
+    assert len(seen_images) == 1
+    assert seen_context["artifacts"] == [
+        {
+            "kind": "context",
+            "description": "Full preview",
+            "viewport": {"description": "desktop"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_missing_browser_is_blocked_and_receipt_contains_no_protected_data():
     result = await run_visual_assertions(
         task_id="task",
@@ -579,7 +749,7 @@ async def test_trusted_mutation_generation_allows_exactly_one_retry():
 
 
 @pytest.mark.asyncio
-async def test_timed_out_vision_attempt_consumes_single_provider_budget():
+async def test_each_timed_out_vision_attempt_has_one_bounded_provider_pair():
     class ScreenshotSupervisor(FakeSupervisor):
         def capture_screenshot_memory(self):
             return {"ok": True, "image_bytes": b"png"}
@@ -621,9 +791,9 @@ async def test_timed_out_vision_attempt_consumes_single_provider_budget():
         },
     )
 
-    assert len(calls) == 1
-    assert result["visual_qa_receipt"]["vision_calls"] == 2
-    assert [attempt["vision_calls"] for attempt in result["attempts"]] == [2, 0]
+    assert len(calls) == 2
+    assert result["visual_qa_receipt"]["vision_calls"] == 4
+    assert [attempt["vision_calls"] for attempt in result["attempts"]] == [2, 2]
     assert result["status"] != "passed"
 
 
