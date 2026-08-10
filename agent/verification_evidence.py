@@ -1315,6 +1315,42 @@ def classify_tool_verification_evidence(
                 ]
         return []
 
+    if name == "read_only_verify":
+        nested = (
+            data.get("verification_evidence")
+            if isinstance(data.get("verification_evidence"), dict)
+            else {}
+        )
+        success = data.get("success") is True and data.get("exit_code") == 0 and not is_error
+        evidence = {
+            "schema_version": 1,
+            "surface": "verification",
+            "check_name": check_name or name,
+            "status": "success" if success else "failure",
+            "order": int(order or 0),
+            "detail": result_text[:240],
+        }
+        if success and str(nested.get("status") or "") == "passed":
+            repository_root = str(nested.get("repository_root") or "").strip()
+            canonical_command = str(nested.get("canonical_command") or "").strip()
+            scope = str(nested.get("scope") or "").strip()
+            verified_head_sha = str(nested.get("verified_head_sha") or "").strip().lower()
+            if (
+                repository_root
+                and canonical_command
+                and scope in {"full", "targeted"}
+                and _SHA_RE.fullmatch(verified_head_sha)
+            ):
+                evidence.update(
+                    {
+                        "repository_root": repository_root,
+                        "canonical_command": canonical_command,
+                        "scope": scope,
+                        "verified_head_sha": verified_head_sha,
+                    }
+                )
+        return [evidence]
+
     if name == "terminal" and _PROTECTED_CHECKOUT_GUARDRAIL_RE.search(result_text):
         return []
 

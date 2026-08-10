@@ -41,7 +41,7 @@ Adopt two related, bounded mechanisms.
 - Reconcile with a storage-neutral, synchronous one-shot engine. One pass has a bounded command budget, never sleeps, never calls a model, and returns a normalized state plus `next_due_at`.
 - Let the gateway watcher own durable scheduling. It wakes from same-process signals, an identifier-only cross-process dirty marker, or a bounded periodic fallback; claims work with revision-checked leases; runs a bounded concurrent batch off the event loop; and persists the next state with compare-and-swap semantics.
 - Do not replay a model turn merely to continue closeout. Do not synthesize terminal delivery over a live model/worker turn; persist terminal state and let the existing owner finish delivery first.
-- Push the exact feature-branch head and create or refresh a draft pull request. Hermes never marks the pull request ready and never merges it.
+- Push the exact feature-branch head and create or refresh a draft pull request. After current-head visual QA and the other closeout gates pass, Hermes marks that exact PR ready before the terminal response. Missing, failed, unavailable, uncertain, or stale visual QA leaves the PR draft. Hermes never merges it as part of closeout.
 - Prove readiness through GitHub Deployments for the exact PR head, `Preview` environment, feature branch, and a Vercel creator identity. Then publish the HTTPS `*-git-*.vercel.app` branch alias from the Vercel bot's PR comment, not the immutable deployment hostname.
 - As soon as the exact-head preview is ready, persist one durable Discord delivery obligation and post the preview URL with the draft PR URL in the originating thread. State that `main` is untouched and visual QA continues in the background.
 - Continue current-head CI and visual QA asynchronously. Post a separate terminal result in the same thread after those gates pass or require repair.
@@ -54,6 +54,8 @@ Adopt two related, bounded mechanisms.
 - A preview is publishable only when its deployment SHA equals the current PR head, its deployment ref matches the feature branch or exact head SHA, and the Vercel bot comment supplies the branch alias for that PR.
 - A preview delivery is keyed by preview URL, draft PR URL, and exact head SHA. A completed delivery is not sent again; an uncertain send requires operator repair instead of risking a duplicate.
 - A changed PR head invalidates the prior preview and creates a new delivery obligation only after Vercel reports the new exact-head URL.
+- Hermes initiates draft-to-ready only after a passing visual-QA receipt for the current exact head. It durably records a confirm-or-restore obligation before the mutation, re-reads GitHub afterward, and does not publish terminal success until that same head is confirmed non-draft. If the mutation outcome or refreshed head is uncertain, Hermes confirms the fenced head or restores the observed PR to draft before it evaluates later gates.
+- GitHub does not provide an expected-head condition for draft-to-ready. The same-head confirmation is therefore a bounded publication check, not a permanent branch lock. A later external push invalidates every Hermes head-bound gate, and the Dev-reaction merge path still rejects the PR until the new exact head passes all checks; GitHub can retain its non-draft bit until a later reconciliation or operator action.
 - PR publication never depends on mergeability, canonical checkout sync, post-merge CI, production deployment, restart, or live-runtime pickup.
 
 ## Rollout and rollback
@@ -79,7 +81,7 @@ Positive:
 
 - Visual evidence is faster and cheaper without turning screenshots or browser state into an unbounded durable record.
 - Premium visual-model spend is concentrated on design judgement and one rendered review while mechanical implementation remains on the normal coding worker.
-- Draft PR publication, preview delivery, CI, and visual-QA ownership survive gateway restarts without foreground polling or model replay.
+- Draft PR publication, preview delivery, CI, visual-QA ownership, and post-QA readiness survive gateway restarts without foreground polling or model replay.
 - A newer PR head or mismatched preview deployment fails closed instead of inheriting stale success.
 - Every Discord feature thread can receive its own feature-branch preview before visual QA completes.
 
