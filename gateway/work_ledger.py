@@ -4936,10 +4936,12 @@ class GatewayWorkLedger:
         if policy.get("require_preview") is not True:
             return True
         delivery = item.get("preview_delivery") if isinstance(item.get("preview_delivery"), dict) else {}
-        return (
-            str(delivery.get("status") or "") == "completed"
-            and _preview_delivery_matches_closeout(item, delivery)
-        )
+        if not delivery or not _preview_delivery_matches_closeout(item, delivery):
+            # Failures before a PR/preview exists have no preview obligation to
+            # order before their error response. Exact-head ready previews are
+            # persisted with a matching delivery in the same ledger write.
+            return True
+        return str(delivery.get("status") or "") == "completed"
 
     def pending_preview_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Return preview sends that need a first attempt or lease recovery."""

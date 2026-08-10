@@ -1796,6 +1796,47 @@ async def test_restart_terminal_delivery_waits_for_preview_completion(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_pre_closeout_failure_delivers_without_impossible_preview(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger(tmp_path / "ledger.json", now_fn=lambda: 100.0)
+    event = _event(message_id="failure-before-closeout")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=3600,
+    )
+    attached = ledger.attach_closeout_workspace(
+        item["id"],
+        workspace_path="/mutable/worktree",
+        mode="enforce",
+        policy={"require_preview": True},
+    )
+    assert attached is not None
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Implementation failed before a pull request was created.",
+        summary_status="Blocked",
+    )
+    failed = ledger.get(item["id"])
+    assert "preview_delivery" not in failed
+    assert ledger.preview_delivery_satisfied(item["id"]) is True
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    adapter = SimpleNamespace(
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="failure-message")
+        )
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    await runner._resume_finished_discord_work_item(failed)
+
+    adapter._send_with_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_partial_normal_delivery_is_blocked_and_restart_does_not_replay(
     monkeypatch, tmp_path
 ):
