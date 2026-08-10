@@ -3517,8 +3517,9 @@ def _discord_action_worktree_target(
     repo_root: Path,
     source: Any,
     session_key: str,
+    pr_generation: int = 1,
 ) -> tuple[str, Path]:
-    """Return a stable, collision-resistant branch/path pair for one thread."""
+    """Return a stable branch/path pair for one thread PR generation."""
     repo_slug = _discord_action_worktree_slug(repo_root.name)
     thread_identity = (
         getattr(source, "thread_id", None)
@@ -3536,8 +3537,16 @@ def _discord_action_worktree_target(
         )
     )
     digest = hashlib.sha256(route_identity.encode("utf-8", errors="replace")).hexdigest()[:12]
-    stem = f"{repo_slug}-discord-action-{digest}"
-    return f"discord-action/{repo_slug}-{digest}", _DISCORD_ACTION_WORKTREE_ROOT / stem
+    try:
+        generation = max(1, int(pr_generation))
+    except (TypeError, ValueError, OverflowError):
+        generation = 1
+    generation_suffix = "" if generation == 1 else f"-pr{generation}"
+    stem = f"{repo_slug}-discord-action-{digest}{generation_suffix}"
+    return (
+        f"discord-action/{repo_slug}-{digest}{generation_suffix}",
+        _DISCORD_ACTION_WORKTREE_ROOT / stem,
+    )
 
 
 def _path_within(path: Path, root: Path) -> bool:
@@ -3555,6 +3564,7 @@ def _discord_action_worktree_cwd(
     config: Optional[dict] = None,
     *,
     provision: bool = True,
+    pr_generation: int = 1,
 ) -> tuple[Optional[str], Optional[str]]:
     """Resolve, and optionally create, a Discord action-thread worktree.
 
@@ -3627,11 +3637,56 @@ def _discord_action_worktree_cwd(
             + (f": {detail}" if detail else ".")
         )
 
+    try:
+        generation = max(1, int(pr_generation))
+    except (TypeError, ValueError, OverflowError):
+        generation = 1
     base_branch, base_path = _discord_action_worktree_target(
         info.repo_root,
         source,
         session_key,
+        generation,
     )
+
+    rollover_start_point = "HEAD"
+    rollover_base_refreshed = False
+
+    def _refresh_rollover_base() -> tuple[Optional[str], Optional[str]]:
+        nonlocal rollover_base_refreshed, rollover_start_point
+        if generation <= 1 or rollover_base_refreshed:
+            return rollover_start_point, None
+        rollover_base_refreshed = True
+        branch_result = _git(
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            timeout=10.0,
+        )
+        base_name = str(branch_result.stdout or "").strip()
+        if branch_result.returncode != 0 or not base_name:
+            return None, (
+                "the protected canonical checkout has no branch to refresh for "
+                f"Discord PR generation {generation}"
+            )
+        remote_ref = f"refs/remotes/origin/{base_name}"
+        fetched = _git(
+            [
+                "fetch",
+                "--no-tags",
+                "origin",
+                f"refs/heads/{base_name}:{remote_ref}",
+            ],
+            timeout=120.0,
+        )
+        if fetched.returncode != 0:
+            detail = " ".join((fetched.stderr or fetched.stdout or "").split())[:600]
+            return None, (
+                "Git could not refresh the merged base before starting the next PR"
+                + (f": {detail}" if detail else ".")
+            )
+        verified = _git(["rev-parse", "--verify", f"{remote_ref}^{{commit}}"], timeout=10.0)
+        if verified.returncode != 0:
+            return None, "Git did not expose the refreshed remote base commit"
+        rollover_start_point = remote_ref
+        return rollover_start_point, None
 
     def _resolved_record_path(record: dict[str, str]) -> Optional[Path]:
         raw = str(record.get("path") or "").strip()
@@ -3692,11 +3747,20 @@ def _discord_action_worktree_cwd(
                 ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
                 timeout=10.0,
             ).returncode == 0
-            add_args = (
-                ["worktree", "add", str(target_path), branch]
-                if branch_exists
-                else ["worktree", "add", "-b", branch, str(target_path), "HEAD"]
-            )
+            if branch_exists:
+                add_args = ["worktree", "add", str(target_path), branch]
+            else:
+                start_point, refresh_error = _refresh_rollover_base()
+                if refresh_error:
+                    return None, refresh_error
+                add_args = [
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(target_path),
+                    str(start_point or "HEAD"),
+                ]
             created = _git(add_args)
         except Exception as exc:
             return None, (
@@ -3769,6 +3833,7 @@ def _resolve_gateway_turn_cwd(
     config: Optional[dict],
     session_key: str,
     runtime_mode: Any = RuntimeMode.ACTION,
+    pr_generation: int = 1,
 ) -> tuple[str, Optional[str], Optional[str]]:
     """Resolve a turn CWD, provisioning only for explicit ACTION authority."""
     fallback = _resolve_gateway_session_cwd(source, config)
@@ -3782,6 +3847,7 @@ def _resolve_gateway_turn_cwd(
         session_key,
         config,
         provision=mode is RuntimeMode.ACTION,
+        pr_generation=pr_generation,
     )
     if mode is RuntimeMode.READ_ONLY and error:
         logger.debug(
@@ -7027,6 +7093,10 @@ class _GatewayRunnerCore(
             item = promoted
         event.work_item_id = item.get("id")
         event.defer_work_completion = defer_completion
+        event.discord_pr_generation = ledger.normalize_discord_pr_generation(
+            item.get("discord_pr_generation")
+        )
+        event.discord_pr_rollover = bool(item.get("discord_pr_rollover", False))
         event.visual_qa_requirement, event.visual_qa_config = _normalize_gateway_visual_qa_contract(
             item.get("visual_qa_requirement"),
             item.get("visual_qa_config"),
@@ -7061,6 +7131,10 @@ class _GatewayRunnerCore(
         if item and item.get("id"):
             event.work_item_id = item.get("id")
             event.defer_work_completion = True
+            event.discord_pr_generation = ledger.normalize_discord_pr_generation(
+                item.get("discord_pr_generation")
+            )
+            event.discord_pr_rollover = bool(item.get("discord_pr_rollover", False))
             ledger.claim(str(item["id"]))
         return item
 
@@ -8510,6 +8584,14 @@ class _GatewayRunnerCore(
             else True
         )
         event.discord_drain_recovery = bool(item.get("drain_recovery", False))
+        try:
+            event.discord_pr_generation = max(
+                1,
+                int(item.get("discord_pr_generation") or 1),
+            )
+        except (TypeError, ValueError, OverflowError):
+            event.discord_pr_generation = 1
+        event.discord_pr_rollover = bool(item.get("discord_pr_rollover", False))
         session_id = str(item.get("session_id") or "").strip()
         if session_id:
             event.session_id = session_id
@@ -16959,6 +17041,11 @@ class _GatewayRunnerCore(
         _quick_key = self._session_key_for_source(source)
         self._hydrate_discord_feature_summary_from_adapter(event)
         _work_item = self._accept_discord_work_item(event, _quick_key)
+        if source.platform == Platform.DISCORD and not _work_item:
+            event.discord_pr_generation = self._ledger().discord_pr_generation(
+                _quick_key
+            )
+            event.discord_pr_rollover = False
         if (
             _work_item
             and _work_item.get("_existing")
@@ -19057,6 +19144,7 @@ class _GatewayRunnerCore(
                 _pcfg,
                 session_key,
                 discord_runtime_mode,
+                getattr(event, "discord_pr_generation", 1),
             )
         if session_cwd_error:
             logger.error(
@@ -19150,6 +19238,27 @@ class _GatewayRunnerCore(
                 + "\n\n"
                 + self._discord_default_kanban_intake_prompt(source)
             ).strip()
+        if source.platform == Platform.DISCORD:
+            try:
+                pr_generation = max(
+                    1,
+                    int(getattr(event, "discord_pr_generation", 1)),
+                )
+            except (TypeError, ValueError, OverflowError):
+                pr_generation = 1
+            if pr_generation > 1:
+                rollover_prompt = (
+                    f"Discord PR generation: {pr_generation}. Earlier PRs in this "
+                    "thread are immutable and already merged. Use only the current "
+                    "workspace and branch for this generation. Publish a new PR and "
+                    "Vercel preview; never amend, reopen, or push to an earlier PR branch."
+                )
+                if getattr(event, "discord_pr_rollover", False):
+                    rollover_prompt += (
+                        " In the first visible progress update, tell the user that this "
+                        "follow-up is starting a new PR in the same thread."
+                    )
+                context_prompt = f"{context_prompt}\n\n{rollover_prompt}".strip()
 
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -26581,6 +26690,8 @@ class _GatewayRunnerCore(
                 getattr(event, "feature_summary", None),
                 cfg,
                 session_key,
+                RuntimeMode.ACTION,
+                getattr(event, "discord_pr_generation", 1),
             )
             if session_cwd_error:
                 logger.error(
@@ -26732,6 +26843,8 @@ class _GatewayRunnerCore(
                 getattr(event, "feature_summary", None),
                 cfg,
                 session_key,
+                RuntimeMode.ACTION,
+                getattr(event, "discord_pr_generation", 1),
             )
             if session_cwd_error:
                 logger.error(
