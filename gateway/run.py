@@ -34031,16 +34031,20 @@ class _GatewayRunnerCore(
                             )
                             pending_event.source = next_source
                             self._cache_session_source(next_session_key, next_source)
+                    if getattr(next_source, "platform", None) == Platform.DISCORD:
                         next_pr_generation = self._discord_action_pr_generation(
                             pending_event
                         )
-                        if next_pr_generation is not None:
-                            self.__dict__.setdefault(
-                                "_running_discord_pr_generations", {}
-                            )[next_session_key] = next_pr_generation
-                            self.__dict__.setdefault(
-                                "_running_discord_runtime_modes", {}
-                            )[next_session_key] = RuntimeMode.ACTION.value
+                        if next_pr_generation is None:
+                            next_pr_generation = self._ledger().discord_pr_generation(
+                                next_session_key
+                            )
+                        self.__dict__.setdefault(
+                            "_running_discord_pr_generations", {}
+                        )[next_session_key] = next_pr_generation
+                        self.__dict__.setdefault(
+                            "_running_discord_runtime_modes", {}
+                        )[next_session_key] = next_runtime_mode.value
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
